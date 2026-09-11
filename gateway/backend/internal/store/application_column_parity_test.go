@@ -114,11 +114,19 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 		// a true for ANY kind, and something has to seed one.
 		//
 		// Nothing did before: every ResponsesLiveTimingsEnabled: true in this
-		// package sat on llama_cpp or vllm (here, in
-		// TestConformanceApplicationResponsesLiveTimings, and on the spec side in
-		// TestRoutingStoreRuntimeSpecs, whose /usr/bin/llama-server binary detects
-		// to llama_cpp), so a store path that "helpfully" cleared the flag for an
-		// incapable kind would have passed the entire suite.
+		// package sat on llama_cpp or vllm, so a store path that "helpfully"
+		// cleared the flag for an incapable kind would have passed the entire
+		// suite.
+		//
+		// This row is the applications half of that fix, and it covers
+		// CreateApplication plus the three applications readers ALONE. The spec
+		// upsert is a different statement in a different file and cannot be
+		// reached from here, so TestRoutingStoreRuntimeSpecs
+		// (routing_store_conformance_test.go) now seeds its own true on an
+		// incapable EFFECTIVE kind and carries the same guard.
+		// TestConformanceApplicationResponsesLiveTimings still seeds llama_cpp,
+		// which costs nothing: it writes through the CreateApplication this row
+		// already covers.
 		types := [applicationParityRows]string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP}
 		// Checked rather than asserted in prose, so the tie to the real
 		// definition of "capable" cannot rot: if routing's capable set ever grew to

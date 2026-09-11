@@ -26,10 +26,15 @@ import "testing"
 //     default-off rather than being read as "unset, therefore fine".
 //   - "LLAMA_CPP" and " llama_cpp" are FALSE. The lookup is a plain map hit on
 //     an ALREADY-NORMALIZED kind: case-sensitive like portal.validEndpointMode,
-//     but -- unlike that function -- it does not trim either, because
-//     normalizeApplicationType (portal/service_applications.go:1000) and
-//     validRuntimeSpecType (portal/service_runtime.go:997) have already trimmed
-//     everything that can reach a stored Type.
+//     but -- unlike that function -- it does not trim either. Nothing untrimmed
+//     can reach a stored Type, by two DIFFERENT mechanisms and not by one
+//     shared one: normalizeApplicationType trims inside its own switch
+//     (portal/service_applications.go:1001), whereas validRuntimeSpecType
+//     (portal/service_runtime.go:997) trims nothing -- its single caller trims
+//     req.Type first and stores that value (portal/service_runtime.go:631-632,
+//     :802). Its own doc comment says "callers pass req.Type through
+//     untouched", which is about the EMPTY value being a legitimate stored
+//     kind, not about whitespace; reading it as "it trims" is the trap.
 func TestLiveTimingsCapableKind(t *testing.T) {
 	cases := []struct {
 		kind string
@@ -86,6 +91,35 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 		if _, listed := wantByKind[kind]; !listed {
 			t.Errorf("liveTimingsCapableKinds contains %q, which no row above answers for: every member of the set needs its own row", kind)
 		}
+	}
+}
+
+// TestLiveTimingsCapableKindsSizeIsPinned is a breadcrumb, not a property: it
+// asserts the SIZE of the set and nothing about its contents, so that changing
+// the size cannot happen without an edit right here -- at a site whose failure
+// message names the OTHER hand-written list the set has to stay level with.
+//
+// Why a size pin is needed on top of everything else. The two-test pair around
+// internal/provider's TestLiveProgressUpstreamsMatchesRoutingCapableKinds is
+// exact in the gate => capable direction only, because that direction ranges
+// over the real liveProgressUpstreams map. The capable => gate direction runs
+// through a hand-listed enumeration of both vocabularies over there, and the
+// staleness loop that guards that enumeration iterates the GATE's keys. So a
+// COHERENT capable-side addition of a kind that neither vocabulary lists yet
+// slips through every check we have: add a future ProviderSGLang = "sglang" to
+// liveTimingsCapableKinds and a {ProviderSGLang, true} row to the table above,
+// and routing's tests pass, all three loops in the provider-side tripwire stay
+// silent, and the portal would default the opt-in ON for a kind the gate never
+// sends the parameters to. Closing that for real needs an exported accessor
+// for this set, i.e. production API whose only caller is a test; this is the
+// cheap mitigation instead.
+func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
+	// Changing this number is the deliberate act. Read the failure message
+	// before you do.
+	const pinnedSize = 2
+	if len(liveTimingsCapableKinds) != pinnedSize {
+		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here, so go read internal/provider/live_progress.go and make liveProgressUpstreams agree -- its parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet",
+			len(liveTimingsCapableKinds), pinnedSize)
 	}
 }
 

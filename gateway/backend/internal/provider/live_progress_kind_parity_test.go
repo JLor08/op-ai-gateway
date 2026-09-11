@@ -21,17 +21,33 @@ import (
 // changes no production code here, and part 1 of issue #81 deliberately touches
 // none of this package's behaviour.
 //
-// It is the only thing that notices a COHERENT one-sided change -- one where
-// that side's own tests were updated in the same edit, which is what a
-// deliberate change looks like. Measured, not assumed: adding "ollama" to
-// routing's set together with its two rows in TestLiveTimingsCapableKind, and
-// separately adding it to liveProgressUpstreams together with its four
-// expectations here (TestWantsLiveProgressAllowList,
-// TestWantsLiveProgressThreeLayerRule twice, and
-// TestWantsLiveProgressReadsTheJoinedVerdict), each leave the ENTIRE backend
-// suite green except this test. An incoherent edit does also trip that side's
-// own tests -- they pin every kind in both vocabularies behaviourally -- but
-// those are the tests the same edit would update.
+// For a COHERENT one-sided change -- one where that side's own tests were
+// updated in the same edit, which is what a deliberate change looks like --
+// this is what notices. Measured, and the two sides do NOT measure the same:
+//
+//   - GATE side: adding "ollama" to liveProgressUpstreams together with its
+//     four expectations here (TestWantsLiveProgressAllowList,
+//     TestWantsLiveProgressThreeLayerRule twice, and
+//     TestWantsLiveProgressReadsTheJoinedVerdict) leaves the ENTIRE backend
+//     suite green except this test, which then fails in both directions.
+//     Nothing else in the tree can see that edit.
+//   - CAPABLE side: adding "ollama" to routing's set together with its two
+//     rows in TestLiveTimingsCapableKind and the size pin in
+//     TestLiveTimingsCapableKindsSizeIsPinned leaves this test failing and TWO
+//     more tests with it, both in internal/store and both INTENDED: the
+//     applications parity fixture
+//     (application_column_parity_test.go -- "every row seeding
+//     responses_live_timings_enabled true has a live-timings-capable type",
+//     on both dialects) and the spec fixture in
+//     TestRoutingStoreRuntimeSpecs (all three backends). Those two seed their
+//     `true` on a kind this predicate calls INCAPABLE on purpose, so that a
+//     store path clearing the flag by kind fails; widening the capable set to
+//     cover such a row is exactly what they are built to report. Three
+//     failures, one cause -- not a suite that stayed green.
+//
+// An INCOHERENT edit also trips that side's own tests either way -- they pin
+// every kind in both vocabularies behaviourally -- but those are the tests the
+// same edit would update.
 //
 // The two directions are NOT symmetric, because only one of the two sets is
 // visible from here:
@@ -43,6 +59,17 @@ import (
 //     TestLiveTimingsCapableKind, which ranges over the set and fails for any
 //     member it has no row for. The staleness check at the end is what keeps
 //     this enumeration from quietly falling behind the vocabularies.
+//
+// That asymmetry leaves one case open, and it is worth naming rather than
+// rounding off to "exact in both directions": a kind that is in NEITHER
+// vocabulary today. Add a future routing.ProviderSGLang = "sglang" to
+// liveTimingsCapableKinds with its row in TestLiveTimingsCapableKind and
+// nothing here fires -- the enumeration never mentions it, and the staleness
+// loop iterates the GATE's keys, where it does not appear either. Closing that
+// from this side needs an exported accessor for routing's set, i.e. production
+// API whose only caller is a test. The mitigation instead lives next to the
+// set: routing's TestLiveTimingsCapableKindsSizeIsPinned fails on any change
+// to its SIZE with a message pointing back at live_progress.go.
 func TestLiveProgressUpstreamsMatchesRoutingCapableKinds(t *testing.T) {
 	for kind := range liveProgressUpstreams {
 		if !routing.LiveTimingsCapableKind(kind) {

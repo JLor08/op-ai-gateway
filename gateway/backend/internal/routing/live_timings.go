@@ -33,9 +33,14 @@ var liveTimingsCapableKinds = map[string]struct{}{
 // flag, so nothing about it belongs to the request path.
 //
 // The argument must already be normalized: the lookup is a plain map hit, so it
-// is case-sensitive AND whitespace-sensitive. Every stored Type has been
-// through portal.normalizeApplicationType or portal.validRuntimeSpecType, both
-// of which trim, so callers on the write paths have nothing left to trim.
+// is case-sensitive AND whitespace-sensitive. Nothing untrimmed can reach a
+// stored Type -- but the two write paths arrive there by DIFFERENT mechanisms,
+// and only one of them trims inside the validator:
+// portal.normalizeApplicationType trims its own input
+// (portal/service_applications.go:1001), while portal.validRuntimeSpecType
+// trims nothing at all -- its single caller trims req.Type first and stores
+// that trimmed value (portal/service_runtime.go:631-632, :802). Either way a
+// caller on a write path has nothing left to trim.
 func LiveTimingsCapableKind(kind string) bool {
 	_, ok := liveTimingsCapableKinds[kind]
 	return ok

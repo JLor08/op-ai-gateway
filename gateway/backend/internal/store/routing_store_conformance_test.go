@@ -1097,9 +1097,42 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
 			ResponsesMode: routing.EndpointModeTranslate, MessagesMode: routing.EndpointModeDisabled,
+			Type:                        string(routing.RuntimeSpecTypeOllama),
 			ResponsesLiveTimingsEnabled: true,
 			CreatedAt:                   now,
 			UpdatedAt:                   now,
+		}
+		// The one spec in this package that seeds
+		// responses_live_timings_enabled = true carries an INCAPABLE effective
+		// kind, for the same reason the applications parity fixture does
+		// (application_column_parity_test.go): the store is policy-free about
+		// this flag -- issue #81 decision (e) puts the "an incapable kind may
+		// not store true" refusal in the portal, as a 400 naming the type,
+		// never in SQL -- so a store path that "helpfully" cleared it by kind
+		// has to fail somewhere, and agent_runtime_specs has no parity fixture
+		// of its own to fail in.
+		//
+		// It did not fail anywhere before this row changed: every spec seeding
+		// a true in this package resolved to llama_cpp, so a by-kind clear
+		// inside UpsertRuntimeSpec (sqlite_runtime.go) passed the whole suite.
+		// The applications-side fixture cannot stand in for this one -- it
+		// writes through CreateApplication (sqlite_applications.go), a
+		// different statement in a different file, and neither path can see the
+		// other.
+		//
+		// Reaching "incapable" is a deliberate choice rather than an omission,
+		// because EffectiveRuntimeSpecType never answers "": with Type left
+		// empty, this spec's /usr/bin/llama-server binary DETECTS as llama_cpp,
+		// which is capable. Hence the explicit ollama Type -- which also
+		// outranks detection, so it survives the binary overwrite further down
+		// and every copy derived from this literal keeps the same effective
+		// kind. (An explicit Type that disagrees with the binary is exactly
+		// what the field is for, and the store must not second-guess it;
+		// TestConformanceRuntimeSpecs pairs Type "vllm" with the same
+		// llama-server binary for the same reason.)
+		if kind := routing.EffectiveRuntimeSpecType(spec); !spec.ResponsesLiveTimingsEnabled || routing.LiveTimingsCapableKind(string(kind)) {
+			t.Fatalf("this fixture must seed responses_live_timings_enabled=true on a spec whose EFFECTIVE kind is not live-timings-capable (seeded=%v, effective kind %q): otherwise a store path that clears the flag by kind passes this test unchanged",
+				spec.ResponsesLiveTimingsEnabled, kind)
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert: %v", err)
