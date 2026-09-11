@@ -5,6 +5,7 @@ package routing
 
 import (
 	"context"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"testing"
@@ -66,11 +67,16 @@ func seedLiveTimingsStore(t *testing.T, now time.Time, appType string, appLiveTi
 //   - app false / spec true -> true rules out "the application always wins" and
 //     "the field is hard-wired false".
 //   - app TRUE / spec FALSE -> false is the only row that distinguishes "the
-//     spec's value is PREFERRED" from "the two are OR-ed together". A field
-//     seeded unconditionally from app.ResponsesLiveTimingsEnabled -- the
-//     app-only shape Target.OpportunisticMetrics uses, which is the mistake
-//     most likely to be made here -- passes every other row in this table and
-//     fails only this one.
+//     spec's value is PREFERRED" from "the two are OR-ed together": an OR
+//     passes every other row here and fails only this one, because
+//     disagreement needs a spec AND an app true AND a spec false.
+//
+// The app-only shape -- a field seeded unconditionally from
+// app.ResponsesLiveTimingsEnabled, which is what Target.OpportunisticMetrics
+// does and the mistake most likely to be made here -- fails BOTH
+// server_agent-with-spec rows, not just the opposed one, because the row above
+// has the application false where the spec says true. Measured, not assumed.
+// Do not read either row as redundant for it.
 //
 // The server_agent row with NO spec pins the documented fallback: an absent
 // spec leaves the application's value in place, which is why it expects true
@@ -160,8 +166,12 @@ func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 			target, err := resolver.Resolve(ctx, auth.Token{ID: "tok", UserID: "u", Active: true}, inference.Request{Model: "m", APIFlavor: "openai_responses"})
 			must(t, err)
 			if target.ResponsesLiveTimingsEnabled != tc.want {
-				t.Fatalf("target.ResponsesLiveTimingsEnabled = %v, want %v (app=%v spec=%v)",
-					target.ResponsesLiveTimingsEnabled, tc.want, tc.appLiveTimings, tc.spec)
+				spec := "none"
+				if tc.spec != nil {
+					spec = fmt.Sprintf("%v", *tc.spec)
+				}
+				t.Fatalf("target.ResponsesLiveTimingsEnabled = %v, want %v (app=%v spec=%s)",
+					target.ResponsesLiveTimingsEnabled, tc.want, tc.appLiveTimings, spec)
 			}
 			if target.OpportunisticMetrics != appOpportunistic {
 				t.Fatalf("target.OpportunisticMetrics = %v, want %v -- the two neighbouring Target bools look transposed",
