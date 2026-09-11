@@ -64,8 +64,11 @@ func (s *Server) handlePortalMappingRuntimeSpec(w http.ResponseWriter, r *http.R
 // portalRuntimeSpecErrRows are writePortalRuntimeSpecError's mapper-specific
 // rows (checked before sharedErrorMap); portal.ErrMappingNotFound (the
 // 404-no-leak collapse from authorizeMapping) maps identically elsewhere and
-// lives in sharedErrorMap instead. Every sentinel here is 400 except
-// ErrRuntimeSpecNotFound (404 — nothing to delete).
+// lives in sharedErrorMap instead. Every sentinel here is 400 except two:
+// ErrRuntimeSpecNotFound is 404 (nothing to delete) and
+// ErrRuntimeSpecServerBenchmarking is 409 (well-formed, but a benchmark run
+// holds the server — see that row's own note). Deliberately no count: a
+// number here goes stale the next time a row is added.
 var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotFound, status: http.StatusNotFound, code: portal.CodeRuntimeSpecNotFound, msg: msgRuntimeSpecNotFound},
 	{err: portal.ErrRuntimeSpecBinaryRequired, status: http.StatusBadRequest, code: "runtime_spec.binary_required", msg: "runtime spec binary is required and must be an absolute path"},

@@ -742,17 +742,26 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	// both probe paths, both endpoint modes and the flavors -- runs above this
 	// and RETURNS rather than falling through, so this brand-new check can
 	// never rewrite the answer to a body that was already invalid for a
-	// SHIPPED reason. Placed beside the type check instead, a doubly-invalid
+	// SHIPPED reason. Two refusals that turn on STATE rather than on the body
+	// are above it as well, so they are safe for the same reason without
+	// belonging to that list: this function's opening server_agent gate on the
+	// parent application's type, and PutRuntimeSpec's benchmark-reservation
+	// 409, which never enters this shared body at all. Placed beside the type check instead, a doubly-invalid
 	// body reported this 400 where it used to report
 	// runtime_spec.metrics_path_invalid, runtime_spec.endpoint_mode_invalid or
-	// runtime_spec.flavor_invalid. What is left below it, in this function, is
-	// capture.SealSecret's keyless-store rejection (capture.ErrKeyRequired ->
-	// 400 runtime_spec.api_token_key_required), which is write-path
-	// preparation rather than a request validation -- the same line the
-	// application write paths draw, and the request-SHAPE validation of the
-	// token pair has already run above -- plus the two json.Marshal error
-	// returns for args/env, which no request can reach at all ([]string and
-	// map[string]string have no unmarshalable shape).
+	// runtime_spec.flavor_invalid. Exactly one REQUEST-REFUSING rejection is
+	// left below it in this function -- capture.SealSecret's keyless-store
+	// failure (capture.ErrKeyRequired -> 400
+	// runtime_spec.api_token_key_required), returned from either token branch
+	// that seals, "random" or "set" -- and it is write-path preparation rather
+	// than a request validation, the same line the application write paths
+	// draw; the request-SHAPE validation of the token pair has already run
+	// above. The two json.Marshal error returns for args/env below are not a
+	// second rejection: no request body can reach them, because a []string and
+	// a map[string]string have no shape encoding/json rejects. Every other
+	// return down there -- the store reads and writes, the secret generation,
+	// the DTO mapper's corrupt-stored-row pair -- reports a failure of the
+	// SERVER or of an already-stored row, never of this request.
 	//
 	// One sentinel, 400 in every shape. Because the document always carries
 	// the Type/Binary the kind is resolved from, the refused kind is always one

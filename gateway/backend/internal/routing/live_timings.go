@@ -38,10 +38,11 @@ var liveTimingsCapableKinds = map[string]struct{}{
 // and only one of them trims inside the validator:
 // portal.normalizeApplicationType trims its own input (it switches over
 // strings.TrimSpace(raw), so every value it returns is already trimmed),
-// while portal.validRuntimeSpecType trims nothing at all -- its single caller
-// trims req.Type first and stores that trimmed value
-// (portal/service_runtime.go:631-632, :802). Either way a caller on a write
-// path has nothing left to trim.
+// while portal.validRuntimeSpecType trims nothing at all -- the trim lives in
+// its caller instead: portal.putRuntimeSpec, the only function that calls it,
+// binds specType from strings.TrimSpace(req.Type) BEFORE validating it and
+// stores that same trimmed local as the spec's Type. Either way a caller on a
+// write path has nothing left to trim.
 func LiveTimingsCapableKind(kind string) bool {
 	_, ok := liveTimingsCapableKinds[kind]
 	return ok

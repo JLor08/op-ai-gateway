@@ -28,13 +28,15 @@ import "testing"
 //     an ALREADY-NORMALIZED kind: case-sensitive like portal.validEndpointMode,
 //     but -- unlike that function -- it does not trim either. Nothing untrimmed
 //     can reach a stored Type, by two DIFFERENT mechanisms and not by one
-//     shared one: normalizeApplicationType trims inside its own switch
-//     (portal/service_applications.go:1001), whereas validRuntimeSpecType
-//     (portal/service_runtime.go:997) trims nothing -- its single caller trims
-//     req.Type first and stores that value (portal/service_runtime.go:631-632,
-//     :802). Its own doc comment says "callers pass req.Type through
-//     untouched", which is about the EMPTY value being a legitimate stored
-//     kind, not about whitespace; reading it as "it trims" is the trap.
+//     shared one: portal.normalizeApplicationType trims inside its own switch
+//     (it switches over strings.TrimSpace(raw)), whereas
+//     portal.validRuntimeSpecType trims nothing -- portal.putRuntimeSpec, the
+//     only function that calls it, binds specType from
+//     strings.TrimSpace(req.Type) before validating it and stores that same
+//     trimmed local as the spec's Type. Its own doc comment says "callers pass
+//     req.Type through untouched", which is about the EMPTY value being a
+//     legitimate stored kind, not about whitespace; reading it as "it trims"
+//     is the trap.
 func TestLiveTimingsCapableKind(t *testing.T) {
 	cases := []struct {
 		kind string

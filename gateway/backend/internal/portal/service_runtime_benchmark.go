@@ -57,13 +57,16 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		// this mapper inventing a non-mention the document does not contain.
 		//
 		// In the ORDINARY case the pointer changes nothing, and this says so
-		// rather than claiming a danger it averts: this mapper's only caller
-		// resolved the spec by id before calling it
+		// rather than claiming a danger it averts: this mapper's only
+		// PRODUCTION caller resolved the spec by id before calling it
 		// (SetBenchmarkRuntimeSpecAdminState, which returns
 		// ErrRuntimeSpecNotFound when there is no such row), so putRuntimeSpec
 		// always finds an existing spec and a nil would take the PRESERVE
 		// branch -- putting back exactly what was read. The create-time default
-		// is unreachable from here.
+		// is unreachable from here. "Production" is load-bearing: four test
+		// call sites also spread a document through this mapper, and a SECOND
+		// production caller that did not resolve the spec first would put the
+		// create default back in reach.
 		//
 		// What the pointer changes is the ONE pathological case: a stored true
 		// on a kind that cannot honour it. A nil would let the clear arm wipe
