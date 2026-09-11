@@ -833,6 +833,134 @@ func TestConformanceApplicationBenchmarkModes(t *testing.T) {
 	})
 }
 
+// TestConformanceApplicationResponsesLiveTimings verifies the migration-80
+// responses_live_timings_enabled column round-trips through create, update,
+// the direct read and -- the reason this test exists -- the ROUTING JOIN, on
+// both dialects.
+//
+// ActiveMappingsForModel is the dangerous reader. applications carries FIVE
+// independently hand-maintained column lists in sqlite_applications.go
+// (insert, update set, ApplicationByID, ApplicationsByServer,
+// ActiveMappingsForModel) feeding TWO differently shaped scanners, and
+// ActiveMappingsForModel is the one query that decides where live traffic
+// goes. A column missed THERE reads back as a clean zero while every
+// memory-backed portal test still passes, because routing.MemoryStore holds
+// Application by value and gets a new Go field for free -- an operator switch
+// that works in the UI and is ignored the moment traffic is actually routed.
+// docs/architecture/cross-cutting/persistence.md:425-435 records that hazard
+// and names forEachDialect (not forEachRoutingStore, whose memory driver
+// cannot see the defect) as the right harness for it. A round-trip through
+// ApplicationByID alone would leave exactly that reader unguarded.
+func TestConformanceApplicationResponsesLiveTimings(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_lt", Name: "Live Timings", Domain: "lt.local", Provider: routing.ProviderLlamaCPP,
+			Endpoint: "http://lt.local:8080", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+
+		// Unset on create reads back false: the migration-80 DDL default, which
+		// is the whole of the upgrade story (no running deployment changes
+		// behaviour).
+		def := routing.Application{
+			ID: "app_def", ServerID: "srv_lt", Type: routing.ProviderLlamaCPP, Port: 8001, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable,
+			CreatedAt:       now, UpdatedAt: now,
+		}
+		if err := s.CreateApplication(ctx, def); err != nil {
+			t.Fatalf("create default application: %v", err)
+		}
+		gotDef, err := s.ApplicationByID(ctx, "app_def")
+		if err != nil {
+			t.Fatalf("application by id (default): %v", err)
+		}
+		if gotDef.ResponsesLiveTimingsEnabled {
+			t.Fatalf("default responses live timings = true, want false (the migration-80 DDL default)")
+		}
+
+		app := routing.Application{
+			ID: "app_lt", ServerID: "srv_lt", Type: routing.ProviderLlamaCPP, Port: 8002, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode:             routing.HealthCheckModeAlwaysReachable,
+			ResponsesLiveTimingsEnabled: true,
+			CreatedAt:                   now, UpdatedAt: now,
+		}
+		if err := s.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		got, err := s.ApplicationByID(ctx, "app_lt")
+		if err != nil {
+			t.Fatalf("application by id: %v", err)
+		}
+		if !got.ResponsesLiveTimingsEnabled {
+			t.Fatalf("after create responses live timings = false, want true")
+		}
+
+		// The update path is its own hand-maintained set-list plus its own arg
+		// list, so it needs its own assertion in both directions.
+		got.ResponsesLiveTimingsEnabled = false
+		got.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateApplication(ctx, got); err != nil {
+			t.Fatalf("update application (off): %v", err)
+		}
+		got, err = s.ApplicationByID(ctx, "app_lt")
+		if err != nil {
+			t.Fatalf("application by id (2): %v", err)
+		}
+		if got.ResponsesLiveTimingsEnabled {
+			t.Fatalf("after update responses live timings = true, want false")
+		}
+		got.ResponsesLiveTimingsEnabled = true
+		got.UpdatedAt = now.Add(2 * time.Minute)
+		if err := s.UpdateApplication(ctx, got); err != nil {
+			t.Fatalf("update application (on): %v", err)
+		}
+		got, err = s.ApplicationByID(ctx, "app_lt")
+		if err != nil {
+			t.Fatalf("application by id (3): %v", err)
+		}
+		if !got.ResponsesLiveTimingsEnabled {
+			t.Fatalf("after update back on responses live timings = false, want true")
+		}
+
+		// The list reader is the second copy of the select list, feeding the
+		// same scanner as ApplicationByID.
+		byServer, err := s.ApplicationsByServer(ctx, "srv_lt")
+		if err != nil {
+			t.Fatalf("applications by server: %v", err)
+		}
+		for _, a := range byServer {
+			if a.ID == "app_lt" && !a.ResponsesLiveTimingsEnabled {
+				t.Fatalf("ApplicationsByServer lost responses_live_timings_enabled")
+			}
+			if a.ID == "app_def" && a.ResponsesLiveTimingsEnabled {
+				t.Fatalf("ApplicationsByServer invented responses_live_timings_enabled on the default row")
+			}
+		}
+
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_lt", ApplicationID: "app_lt", GatewayModelName: "lt-model", AppModelName: "up-lt",
+			Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+		candidates, err := s.ActiveMappingsForModel(ctx, "lt-model", routing.APIFlavorOpenAI)
+		if err != nil || len(candidates) != 1 {
+			t.Fatalf("active mappings: err=%v n=%d", err, len(candidates))
+		}
+		if !candidates[0].Application.ResponsesLiveTimingsEnabled {
+			t.Fatalf("the ROUTING join lost responses_live_timings_enabled: a column missed in ActiveMappingsForModel reads back as a clean zero while every memory-backed portal test still passes")
+		}
+	})
+}
+
 // TestConformanceApplicationAdmissionQueueTimeout verifies the per-application CP4
 // admission_queue_timeout_seconds column round-trips through create, direct read,
 // and the routing join on both dialects, and that an unset field reads back 0.

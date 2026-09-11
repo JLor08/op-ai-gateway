@@ -37,11 +37,26 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // seedMigration78Mappings creates one server, one application and one mapping
 // per id, so each id can then be forced into its own pre-78 column shape.
 //
-// It goes through the PUBLIC store API, which no longer writes the eleven
-// columns migration 79 dropped -- they are `not null default` at version 77,
-// so an insert that omits them still lands. Forcing a legacy value is then
-// the caller's own raw `update` (mustExec), which needs a database stopped
-// before 79: see forEachDialectMigratedTo.
+// The mapping and server rows go through the PUBLIC store API, which no longer
+// writes the eleven columns migration 79 dropped -- they are
+// `not null default` at version 77, so an insert that omits them still lands.
+// Forcing a legacy value is then the caller's own raw `update` (mustExec),
+// which needs a database stopped before 79: see forEachDialectMigratedTo.
+//
+// The APPLICATION row does NOT, and cannot: the public store API always speaks
+// the column set of the CURRENT migration head, while every caller here hands
+// it a database deliberately stopped at version 77. Those two agreed only for
+// as long as no migration above 77 added an applications column -- migration
+// 80's responses_live_timings_enabled is the first one that does, and
+// CreateApplication naming it turned this helper into
+// "table applications has no column named ...". The raw insert below names the
+// original column set instead, every member of which exists at every version
+// this helper is ever used at, so the application row is what it always was
+// here: an FK parent whose own shape is not the subject of any migration-78 or
+// -79 test. Any future applications column is additive with a DDL default and
+// needs no edit here. (ai_servers and model_mappings carry the same latent
+// coupling through CreateAIServer / CreateMapping; the same fix applies to
+// whichever of them a post-77 migration touches first.)
 func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now time.Time, ids ...string) {
 	t.Helper()
 	if err := s.CreateAIServer(ctx, routing.AIServer{
@@ -50,14 +65,12 @@ func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now
 	}); err != nil {
 		t.Fatalf("create server: %v", err)
 	}
-	if err := s.CreateApplication(ctx, routing.Application{
-		ID: "app_m78", ServerID: "srv_m78", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http",
-		APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
-		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
-		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create application: %v", err)
-	}
+	mustExec(ctx, t, s, `insert into applications (
+		id, server_id, type, port, scheme, api_flavors, priority, weight,
+		timeout_ms, affinity_ttl_seconds, status, created_at, updated_at
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"app_m78", "srv_m78", routing.ProviderVLLM, 8000, "http", `["openai"]`,
+		1, 1, 30000, 300, routing.ServerStatusActive, now, now)
 	for _, id := range ids {
 		if err := s.CreateMapping(ctx, routing.ModelMapping{
 			ID: id, ApplicationID: "app_m78", GatewayModelName: id + "-model",

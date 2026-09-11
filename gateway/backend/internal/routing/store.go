@@ -561,6 +561,17 @@ type Application struct {
 	BenchmarkScheduleEnabled         bool
 	BenchmarkScheduleIntervalSeconds int
 	OpportunisticMetricsEnabled      bool
+	// ResponsesLiveTimingsEnabled is the operator's per-application opt-in to
+	// asking a capable upstream for MID-STREAM timings on a passthrough
+	// /v1/responses stream (migration 80). It is ORTHOGONAL to ResponsesMode,
+	// not a fourth value of it: passthrough and telemetry are two axes, and an
+	// unknown EndpointMode is served as translate by tryProxyNative's default
+	// branch, so a fourth enum value would silently downgrade Codex traffic on a
+	// rollback while a boolean defaulting off cannot. Default false = off, so an
+	// upgrade changes no running deployment's behaviour. For a server_agent
+	// mapping the RESOLVED RuntimeSpec's own copy of this field wins -- see
+	// RuntimeSpec.ResponsesLiveTimingsEnabled and Resolver.targetFrom.
+	ResponsesLiveTimingsEnabled bool
 	// ProxyListenPort is the TLS port the agent's local proxy listens on for this
 	// application (P4 gateway-guided HTTPS switch: the app's Port stays the local
 	// plaintext upstream the gateway reaches directly; ProxyListenPort is the
