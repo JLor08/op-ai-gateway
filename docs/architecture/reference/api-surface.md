@@ -527,6 +527,35 @@ Wire notes a client must know:
   ([Agent-Managed Model Runtime
   §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows));
   a direct API client gets no such convenience.
+- **`responses_live_timings_enabled`** is a separate opt-in that rides the
+  same two surfaces: it is a `bool` on `ApplicationDTO` and on
+  `RuntimeSpecDTO`, and a `*bool` on `CreateApplicationRequest`,
+  `UpdateApplicationRequest` and `PutRuntimeSpecRequest`. It is **orthogonal
+  to `responses_mode`**, not a fourth value of it, and it is offered on the
+  Responses side only — there is no `/v1/messages` equivalent.
+  - On all three request shapes **absent is not the same as `false`**. Absent
+    on a create — or on a **first** spec write, which is what a full-document
+    upsert means by "create" — takes the kind-dependent default: `true` for
+    `llama_cpp`/`vllm`, `false` for every other kind. An explicit `false` is a
+    deliberate off, honoured on any kind.
+  - Absent on an update keeps the stored value, **except** that it is
+    **cleared** whenever the *resulting* type cannot honour the flag. That is
+    a property of the row the write leaves behind, not of a retype: an
+    application `PATCH` that sends no `type` at all still clears a stored
+    `true` when the application's own type is incapable (the clear reads the
+    post-mutation type, unguarded by whether the request sent one — pinned by
+    `TestUpdateApplicationLiveTimingsClearIsAPropertyOfTheStoredRowNotTheRequest`),
+    and a spec `PUT` clears one whenever its **effective** type — the explicit
+    `type` when set, else detected from `binary` — is not capable.
+  - An explicit `true` against such a resulting type is **refused**, never
+    stored as `false`, so a caller always ends up with either the value it
+    asked for or an error naming the kind that refused it.
+  - The refusal's status depends on where the offending type came from:
+    **400** when the request supplied it (every create, an application `PATCH`
+    that also sends `type`, and every runtime-spec `PUT`, which always
+    restates its own `type`/`binary`), and **409** on the one shape where it
+    did not — an application `PATCH` that asserts the flag while sending no
+    `type`, which is well-formed and conflicts only with stored state.
 
 New stable error codes:
 
@@ -537,8 +566,11 @@ New stable error codes:
 | `application.endpoint_mode_invalid` | 400 | `CreateApplicationRequest`/`UpdateApplicationRequest` carries an unrecognized `responses_mode`/`messages_mode` |
 | `runtime_spec.endpoint_mode_invalid` | 400 | `PutRuntimeSpecRequest` carries an unrecognized `responses_mode`/`messages_mode` |
 | `runtime_spec.flavor_invalid` | 400 | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic` |
+| `application.responses_live_timings_unsupported` | 400 | the request sent an incapable `type` alongside `responses_live_timings_enabled: true` — every create, whose `type` is always the request's own, and a `PATCH` that sends both. The message names the type |
+| `application.responses_live_timings_conflict` | 409 | a `PATCH` asserts `responses_live_timings_enabled: true`, sends no `type`, and the application's **stored** type cannot honour it: the request is well-formed and conflicts with the application's own state. The message names that stored type |
+| `runtime_spec.responses_live_timings_unsupported` | 400 | a spec `PUT` asserts `true` and its **effective** type — the explicit `type` when set, else detected from `binary` — cannot honour it. The message names the effective type, which may be one the caller never typed. There is no 409 on this surface: a spec `PUT` is a full document and always carries the type it is judged against |
 
-All five codes above are wired end to end and answer the listed status.
+All eight codes above are wired end to end and answer the listed status.
 `internal/portal.Service` returns the three validation sentinels
 (`ErrApplicationEndpointModeInvalid`, `ErrRuntimeSpecEndpointModeInvalid`,
 `ErrRuntimeSpecFlavorInvalid`), and each is mapped to 400 in the corresponding
@@ -552,7 +584,14 @@ level without initially being added to the gateway's HTTP error-code table, so
 a request that tripped one of the three fell through to the generic 500
 fallback instead (`application.request_failed` for the application write,
 `runtime_spec.request_failed` for the runtime-spec write) until the rows
-above were added.
+above were added. The three live-timings codes are wired on the same pattern:
+`internal/portal.Service` returns
+`ErrApplicationResponsesLiveTimingsUnsupported`,
+`ErrApplicationResponsesLiveTimingsConflict` and
+`ErrRuntimeSpecResponsesLiveTimingsUnsupported`, mapped in
+`portalApplicationErrRows` (400 and 409) and `portalRuntimeSpecErrRows` (400)
+— each of those three rows with an `msgFn` rather than a static `msg`, so the
+message names the offending type.
 
 ### Groups, projects, services, resource-groups (governance model)
 

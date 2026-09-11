@@ -3742,6 +3742,18 @@ application's own values no longer apply to a mapping that has a spec (full
 semantics, including the effective-served rule and the disabled-endpoint 404:
 [Compatibility & Inference
 §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+`responses_live_timings_enabled` joins that per-spec set (migration 80), and
+for a `server_agent` model the resolved spec's copy is the one the request
+path reads: the flag qualifies `responses_mode`, which for a managed model
+comes from the spec, so reading the parent application's copy would attach the
+flag to a decision the application never made. Its write rule is the spec's
+own kind, not the operator's optimism — a PUT that sets it `true` on a spec
+whose **effective** type (the explicit `type`, else detected from `binary`) is
+not `llama_cpp`/`vllm` is refused with **400**, never 409, because the
+document always carries the type it is judged against; a PUT that omits it on
+such a type clears any stored `true`. **No operator control for it ships in
+this cut** — the value is reachable through the API only, and a visible toggle
+that did nothing would be worse than the blank cell it promises to fix.
 **Snapshot, not inheritance:** opening the **create** form pre-fills the three
 fields from the parent application's *current* values (`openCreate` in
 `RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/
