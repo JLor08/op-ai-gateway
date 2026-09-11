@@ -42,9 +42,16 @@ var droppedCapabilityColumns = []string{
 // did nothing, or added a column with the wrong shape, would still leave the
 // source looking correct.
 //
-// The shape is the TYPE plus nullability plus default, normalised into one
-// dialect-neutral string ("integer not null default 0"), because the type
-// alone does not pin what callers actually depend on. A column declared
+// The shape is the TYPE plus nullability plus default, folded into one string
+// ("integer not null default 0"), because the type alone does not pin what
+// callers actually depend on. That string is NOT dialect-neutral and must not
+// be compared across dialects: SQLite's pragma reports the canonical `INTEGER`
+// for a column declared lowercase, while PostgreSQL's information_schema
+// reports `integer`, so the same real DDL folds to two strings differing only
+// in case. Every caller compares within ONE dialect -- a column against a
+// sibling column, or a fresh install against an upgraded one on the same
+// engine -- which is what makes the fold safe here; a cross-dialect comparison
+// would be exactly the silent case-mismatch this helper exists to catch. A column declared
 // `integer` where the precedent is `integer not null default 0` gives every
 // existing row NULL instead of 0 -- same data_type, and every later Scan of
 // that column behaves differently. The three together are what ADR-005's
