@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +13,8 @@ import (
 
 // TestPortalApplicationLiveTimingsRefusalReachesTheWire pins the WIRE
 // contract (status + code + the offending type in the MESSAGE) of BOTH
-// live-timings refusal sentinels, across the three request shapes that can
-// produce one, plus a fourth subtest pinning the two PATCH shapes apart.
+// live-timings refusal sentinels, across the four request shapes that can
+// produce one.
 //
 // The two statuses are the point of the test, not an incidental detail:
 //
@@ -28,10 +29,14 @@ import (
 //     table ("the request shape is fine, it is simply refused given the
 //     server's current state", portal_application_endpoints.go:203-206).
 //
-// The last subtest compares the two PATCH statuses directly, because the
-// likely implementation slip is ONE sentinel returned for both shapes: that
-// version passes every service-level errors.Is check written loosely, and it
-// passes two of the three shape subtests here as well.
+// The likely implementation slip is ONE sentinel returned for both PATCH
+// shapes -- a version that passes every service-level errors.Is check written
+// loosely. Each exact-status assertion below is what catches it: collapsing to
+// the 400 breaks the 409 subtest, collapsing to the 409 breaks all three 400
+// ones. A separate subtest asserting only that the two statuses DIFFER was
+// tried here and removed: it could not fail unless one of those subtests
+// already had, and "differ" is also satisfied by a 500, so it restated the
+// invariant without testing it.
 //
 // The message assertion is not decoration either: the whole reason this
 // request is refused instead of quietly stored as false is that the caller
@@ -73,6 +78,30 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 		}
 	})
 
+	// The shape the portal itself sends. ApplicationSection.tsx's buildBody()
+	// restates "type" on EVERY save, so from part 2 onward this -- not the
+	// retype above -- is the body an operator actually produces by ticking the
+	// box on an incapable application. It is an ordinary HTTP request, and it
+	// is the only wire shape that separates "the request supplied the type"
+	// from "the request CHANGED the type": a service reading the branch off
+	// *req.Type != app.Type answers 409 here while every other subtest in this
+	// file stays green.
+	t.Run("restating the stored incapable type alongside true is 400", func(t *testing.T) {
+		appID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8105,"scheme":"http"}`)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+appID,
+			`{"type":"ollama","responses_live_timings_enabled":true}`))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (the body SUPPLIED the type it is judged against, unchanged or not), body = %s", rec.Code, rec.Body.String())
+		}
+		if code := errorBodyOf(t, rec); code != "application.responses_live_timings_unsupported" {
+			t.Fatalf("error code = %q, want application.responses_live_timings_unsupported, body = %s", code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "ollama") {
+			t.Fatalf("the refusal does not name the offending kind: %s", rec.Body.String())
+		}
+	})
+
 	t.Run("true against a stored incapable kind, no type sent, is 409", func(t *testing.T) {
 		appID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8102,"scheme":"http"}`)
 		rec := httptest.NewRecorder()
@@ -88,24 +117,60 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 			t.Fatalf("the refusal does not name the offending kind: %s", rec.Body.String())
 		}
 	})
+}
 
-	// The anti-slip pin. One sentinel returned for both PATCH shapes gives
-	// them the SAME status, and the two subtests above would then disagree
-	// about which one is wrong; this one says plainly what the invariant is.
-	t.Run("the two PATCH shapes do not share a status", func(t *testing.T) {
-		retypeID := createTestApplication(t, srv, serverID, `{"type":"llama_cpp","port":8103,"scheme":"http"}`)
-		retypeRec := httptest.NewRecorder()
-		srv.ServeHTTP(retypeRec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+retypeID,
-			`{"type":"litellm","responses_live_timings_enabled":true}`))
+// TestPortalApplicationLiveTimingsJSONKeyReachesTheWire pins the RESPONSE-side
+// JSON tag of ApplicationDTO.ResponsesLiveTimingsEnabled by decoding it out of
+// real success bodies, by name.
+//
+// The service-level DTO test reads the Go FIELD through applicationDTO, so it
+// cannot see the tag at all: a typo in `json:"responses_live_timings_enabled"`
+// leaves every Go test green and every status 2xx, and surfaces only when the
+// frontend reads the key and finds undefined. Both write responses are checked
+// -- the 201 from a create and the 200 from a PATCH -- because each marshals
+// the DTO at its own call site, and both values are checked, because a tag
+// typo and a dropped mapper line look identical if you only ever assert true.
+func TestPortalApplicationLiveTimingsJSONKeyReachesTheWire(t *testing.T) {
+	srv := NewTestServerWithGroups([]string{"gateway:use", "admin"})
+	serverID := newProxyExclusionTestServer(t, srv, "live-timings-json.example.test")
 
-		storedID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8104,"scheme":"http"}`)
-		storedRec := httptest.NewRecorder()
-		srv.ServeHTTP(storedRec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+storedID,
-			`{"responses_live_timings_enabled":true}`))
-
-		if retypeRec.Code == storedRec.Code {
-			t.Fatalf("both refusal shapes answered %d: the request-supplied type (400) and the stored type (409) must not collapse into one status -- check that the service returns TWO sentinels and that both have their own errRow",
-				retypeRec.Code)
+	decode := func(t *testing.T, rec *httptest.ResponseRecorder) bool {
+		t.Helper()
+		var body struct {
+			Value *bool `json:"responses_live_timings_enabled"`
 		}
-	})
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal application: %v, body = %s", err, rec.Body.String())
+		}
+		if body.Value == nil {
+			t.Fatalf("the success body carries no \"responses_live_timings_enabled\" key (check the json tag on ApplicationDTO): %s", rec.Body.String())
+		}
+		return *body.Value
+	}
+
+	createRec := httptest.NewRecorder()
+	srv.ServeHTTP(createRec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications",
+		`{"type":"llama_cpp","port":8110,"scheme":"http"}`))
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+	if !decode(t, createRec) {
+		t.Fatalf("created llama_cpp application reports the key as false, want the kind-dependent true: %s", createRec.Body.String())
+	}
+
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal id: %v", err)
+	}
+	patchRec := httptest.NewRecorder()
+	srv.ServeHTTP(patchRec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+created.ID,
+		`{"responses_live_timings_enabled":false}`))
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", patchRec.Code, patchRec.Body.String())
+	}
+	if decode(t, patchRec) {
+		t.Fatalf("the PATCH response still reports true after an explicit false: %s", patchRec.Body.String())
+	}
 }

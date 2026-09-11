@@ -3486,3 +3486,179 @@ func TestApplicationDTOCarriesResponsesLiveTimings(t *testing.T) {
 		t.Fatalf("ListApplications dropped the stored true (applicationDTO is missing the field)")
 	}
 }
+
+// TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations
+// pins the ORDER of the live-timings refusal relative to the checks that
+// shipped before it, on the create path.
+//
+// The refusal is brand new; every check in this test is not. A new check
+// placed ahead of them does not merely add a rejection -- it CHANGES the
+// answer to a body that was already invalid, and the change is silent because
+// the body is still refused, just with a different status and code. Both legs
+// below would pass with the refusal in either position if they asserted only
+// "some error"; they assert the SPECIFIC pre-existing error precisely because
+// that is the part the ordering decides.
+//
+// Leg 1 is the expensive one: ErrServerAgentApplicationExists is a 409, so a
+// refusal running first rewrites a shipped 409 into this 400. Leg 2 is a 400
+// whose CODE would change. Only bodies carrying responses_live_timings_enabled
+// are affected at all, which is why this ordering is free to fix today and
+// would be a breaking change once a client depends on it.
+func TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	// The server already has its one server_agent application, so a second
+	// one is refused by the uniqueness invariant -- and server_agent is also
+	// an incapable kind, which is what makes the body doubly invalid.
+	seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	_, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderServerAgent, Port: 8330, Scheme: "http",
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrServerAgentApplicationExists) {
+		t.Errorf("err = %v, want ErrServerAgentApplicationExists: the live-timings refusal must not pre-empt a shipped 409", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) || errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v: a body invalid for a PRE-EXISTING reason reported the brand-new live-timings refusal instead", err)
+	}
+
+	// Leg 2: a pre-existing 400 whose code the new check would displace.
+	_, err = svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLiteLLM, Port: 8331, Scheme: "http", Priority: -1,
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationTuningInvalid) {
+		t.Errorf("err = %v, want ErrApplicationTuningInvalid: the live-timings refusal must not pre-empt a shipped 400", err)
+	}
+}
+
+// TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations is
+// the update-path half of the same ordering pin, and the path where the
+// problem is worse: the refusal sits in the validate-before-mutate block,
+// which is exactly where every other PATCH validation lives, so "first in that
+// block" is an easy accident.
+//
+// Leg 1 rewrites a shipped 409 (ErrServerAgentApplicationExists, reached by
+// retyping onto a server that already has its server_agent application); leg 2
+// rewrites a shipped 400 (ErrApplicationBenchmarkIntervalInvalid) and, unlike
+// leg 1, reaches the 409 arm of the refusal rather than the 400 arm -- so the
+// two legs together cover both sentinels.
+func TestUpdateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	seedServerAgentApplication(t, routeStore, server.ID, now)
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderOllama, Port: 8340, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Retype onto server_agent (incapable) on a server that already has one,
+	// AND assert the flag: the request supplies the type, so the refusal's 400
+	// arm would fire -- over a shipped 409.
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		Type:                        strPtr(routing.ProviderServerAgent),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrServerAgentApplicationExists) {
+		t.Errorf("err = %v, want ErrServerAgentApplicationExists: the live-timings refusal must not pre-empt a shipped 409", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v: a PATCH invalid for a PRE-EXISTING reason reported the brand-new live-timings 400 instead", err)
+	}
+
+	// No type sent, so this one would hit the refusal's 409 arm instead --
+	// over a shipped 400.
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		BenchmarkScheduleIntervalSeconds: intPtr(-1),
+		ResponsesLiveTimingsEnabled:      boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationBenchmarkIntervalInvalid) {
+		t.Errorf("err = %v, want ErrApplicationBenchmarkIntervalInvalid: the live-timings refusal must not pre-empt a shipped 400", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v: a PATCH invalid for a PRE-EXISTING reason reported the brand-new live-timings 409 instead", err)
+	}
+
+	// Neither refused PATCH may have written anything: both are refused inside
+	// the validate-before-mutate block, ahead of the first mutation.
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Type != routing.ProviderOllama {
+		t.Errorf("a refused PATCH wrote the type anyway: %q, want %q", reloaded.Type, routing.ProviderOllama)
+	}
+	if reloaded.BenchmarkScheduleIntervalSeconds != 0 {
+		t.Errorf("a refused PATCH wrote the invalid interval: %d", reloaded.BenchmarkScheduleIntervalSeconds)
+	}
+}
+
+// TestUpdateApplicationLiveTimingsClearIsAPropertyOfTheStoredRowNotTheRequest
+// closes the one hole the clear arm's own comment warns about and no other
+// test reaches: whether the clear is conditioned on the RESULTING ROW's type
+// or merely on the request having sent one.
+//
+// Every other clearing test in this file retypes, so every one of them also
+// sends "type" -- which means rewriting the arm as
+//
+//	case req.Type != nil && !routing.LiveTimingsCapableKind(app.Type):
+//
+// keeps all of them green. This test is the one that does not: the row is
+// seeded DIRECTLY through the store with an incapable type and the flag
+// already true (the state a pre-refusal write, a migration, or a hand-edited
+// database can leave behind), and the PATCH touches only the port. Nothing in
+// the request mentions the type or the flag, so a request-shape check has
+// nothing to fire on and the stale true survives -- which is precisely the
+// state the clear exists to prevent.
+//
+// The shape is not hypothetical: cmd/gateway/main.go's dev seed writes an
+// application straight through the store with Type: routing.ProviderMock, a
+// kind normalizeApplicationType does not even accept from a request.
+func TestUpdateApplicationLiveTimingsClearIsAPropertyOfTheStoredRowNotTheRequest(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	if err := routeStore.CreateApplication(context.Background(), routing.Application{
+		ID: "app_stale_lt", ServerID: server.ID, Type: routing.ProviderOllama, Port: 8350,
+		Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+		ResponsesLiveTimingsEnabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed application: %v", err)
+	}
+	before, err := svc.GetApplication(context.Background(), ownerToken(), "app_stale_lt")
+	if err != nil {
+		t.Fatalf("reload before the PATCH: %v", err)
+	}
+	if !before.ResponsesLiveTimingsEnabled || routing.LiveTimingsCapableKind(before.Type) {
+		t.Fatalf("precondition: want a stale true on an INCAPABLE kind, got %v on %q",
+			before.ResponsesLiveTimingsEnabled, before.Type)
+	}
+
+	// Only the port. No "type", no "responses_live_timings_enabled".
+	upd, err := svc.UpdateApplication(context.Background(), ownerToken(), "app_stale_lt", UpdateApplicationRequest{
+		Port: intPtr(8351),
+	})
+	if err != nil {
+		t.Fatalf("patch the port: %v", err)
+	}
+	if upd.Port != 8351 {
+		t.Fatalf("port = %d, want 8351 (the PATCH did not take effect at all)", upd.Port)
+	}
+	if upd.ResponsesLiveTimingsEnabled {
+		t.Errorf("the returned dto still carries the stale true on %q: the clear is keyed on the request's shape, not on the row's type", upd.Type)
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), "app_stale_lt")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.ResponsesLiveTimingsEnabled {
+		t.Errorf("stored value = true after a PATCH that touched only the port, on incapable type %q", reloaded.Type)
+	}
+}
