@@ -221,6 +221,38 @@ var portalApplicationErrRows = []errRow{
 	// above: the request SHAPE is fine, it conflicts with the target's own state.
 	{err: portal.ErrApplicationProxyExcludedPortConflict, status: http.StatusConflict, code: "application.proxy_excluded_port_conflict", msg: "an excluded application cannot hold a proxy listen port"},
 	{err: portal.ErrApplicationProxyEntryScheme, status: http.StatusConflict, code: "application.proxy_entry_scheme", msg: "a proxied application must serve plaintext http on its own port"},
+	// The first two rows in this table with a DYNAMIC message: the service
+	// wraps the sentinel with the offending type (fmt.Errorf("%w: ...")), and
+	// naming the kind is the entire point of refusing the write instead of
+	// storing something else. errRow.msgFn exists for exactly this ("a row
+	// that must surface the underlying error's own text", error_map.go:15-18).
+	// Each sentinel's own text IS its API code -- the convention every row here
+	// follows -- so it is trimmed off rather than repeated inside the message.
+	//
+	// TWO rows because there are two sentinels and they answer with DIFFERENT
+	// statuses. 400 when the request supplied the incapable type itself (every
+	// create, and a PATCH that sends "type"): the body is contradictory on its
+	// own terms. 409 when the type came from the stored row and the request
+	// left it alone: the request SHAPE is fine, it conflicts with the target's
+	// own state -- the same reading ErrServerManagedRuntimeOnly (:203-206) and
+	// the three proxy sentinels (:220-221) already get. Collapsing them into
+	// one row would report a well-formed request as malformed.
+	{
+		err:    portal.ErrApplicationResponsesLiveTimingsUnsupported,
+		status: http.StatusBadRequest,
+		code:   "application.responses_live_timings_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationResponsesLiveTimingsUnsupported.Error()+": ")
+		},
+	},
+	{
+		err:    portal.ErrApplicationResponsesLiveTimingsConflict,
+		status: http.StatusConflict,
+		code:   "application.responses_live_timings_conflict",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationResponsesLiveTimingsConflict.Error()+": ")
+		},
+	},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeApplicationNotFound, msg: msgApplicationNotFound},
 }
 

@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
@@ -74,6 +75,41 @@ var (
 	// gateway flips it to https itself once the agent's TLS listener is
 	// confirmed.
 	ErrApplicationProxyEntryScheme = errors.New("application.proxy_entry_scheme")
+	// ErrApplicationResponsesLiveTimingsUnsupported rejects an EXPLICIT
+	// responses_live_timings_enabled:true whose RESULTING application type is
+	// not a live-timings-capable kind (routing.LiveTimingsCapableKind), in the
+	// case where the REQUEST ITSELF supplied that type: every create (whose
+	// "type" is always the request's own) and any PATCH that sends "type"
+	// alongside the flag. HTTP 400 -- such a body is internally contradictory
+	// and can be judged without reading the stored row at all.
+	//
+	// The message names the offending type: the caller asserted something
+	// about this row that its kind cannot carry, and storing false while
+	// answering 200 would be a write that lies about its result. That is
+	// ErrApplicationProxyExcludedPortConflict's argument above, applied to a
+	// second field: "silently zeroing what the caller asked for in the same
+	// breath would be a lie."
+	//
+	// An ABSENT field is never this error. It is the kind-dependent default on
+	// create, and on update it is a CLEAR when the resulting type cannot
+	// honour the flag -- clearing overrides nothing the operator said, because
+	// a request that does not mention the field says nothing about it.
+	ErrApplicationResponsesLiveTimingsUnsupported = errors.New("application.responses_live_timings_unsupported")
+	// ErrApplicationResponsesLiveTimingsConflict rejects the SAME explicit
+	// true when the incapable type is the one already STORED and the request
+	// does not send "type" at all. HTTP 409, not 400: the request is
+	// well-formed -- it would be accepted verbatim against a capable
+	// application -- and it collides with this application's own state, which
+	// is exactly the line ErrServerManagedRuntimeOnly and the three proxy
+	// sentinels above already draw ("the request SHAPE is fine, it conflicts
+	// with the target's own state", gateway/portal_application_endpoints.go:220-221).
+	//
+	// The distinction is drawn on req.Type != nil, NOT on whether the type
+	// changed: a PATCH restating the same incapable type still supplied the
+	// type it is judged against, so that is the 400 above. It reaches exactly
+	// this one shape -- there is no create path to it, since a create always
+	// carries its own type.
+	ErrApplicationResponsesLiveTimingsConflict = errors.New("application.responses_live_timings_conflict")
 
 	// CodeMappingNotFound is ErrMappingNotFound's API error code, exported for
 	// the same reason as CodeApplicationNotFound above (portal_mapping_endpoints.go).
@@ -203,6 +239,14 @@ type ApplicationDTO struct {
 	BenchmarkScheduleEnabled         bool `json:"benchmark_schedule_enabled"`
 	BenchmarkScheduleIntervalSeconds int  `json:"benchmark_schedule_interval_seconds"`
 	OpportunisticMetricsEnabled      bool `json:"opportunistic_metrics_enabled"`
+	// ResponsesLiveTimingsEnabled is the operator's opt-in to asking a capable
+	// upstream for mid-stream timings on a passthrough /v1/responses stream
+	// (migration 80). Set from the RAW column and always the STORED value --
+	// which, given the write paths' refusal rule, is also always a value this
+	// application's TYPE can honour: a create/update that asks for true on a
+	// kind that cannot is refused -- 400 when the request supplied that kind,
+	// 409 when it is the stored one -- and never stored as false.
+	ResponsesLiveTimingsEnabled bool `json:"responses_live_timings_enabled"`
 	// ProxyListenPort is the gateway-managed TLS port the agent's local proxy
 	// listens on for this application (P4 HTTPS-switch); 0 = not yet assigned
 	// (the gateway auto-assigns it once the app needs one). Not user-editable
@@ -253,6 +297,21 @@ type CreateApplicationRequest struct {
 	BenchmarkScheduleEnabled         bool     `json:"benchmark_schedule_enabled"`
 	BenchmarkScheduleIntervalSeconds int      `json:"benchmark_schedule_interval_seconds"`
 	OpportunisticMetricsEnabled      bool     `json:"opportunistic_metrics_enabled"`
+	// ResponsesLiveTimingsEnabled opts this application in to the
+	// live-timings request parameter on its passthrough /v1/responses streams.
+	//
+	// A POINTER, like ProxyExcluded below, and for both of that field's
+	// reasons at once. First, absent must be distinguishable from an explicit
+	// false, because absent is what gets the kind-dependent default (ON for
+	// llama_cpp and vllm) and false is a deliberate off; with a plain bool the
+	// default could never fire for any client that sends the key -- which
+	// includes every portal form, since they send one whole body for create
+	// and update alike. Second, absent is what distinguishes a NON-MENTION
+	// from an ASSERTION: an explicit true on a kind that cannot honour it is
+	// refused (ErrApplicationResponsesLiveTimingsUnsupported), while an absent
+	// field on such a kind simply takes the default. A plain bool collapses
+	// those into one request and neither rule can be written.
+	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// ProxyListenPort: 0 = auto-assign (default; gateway-managed). A caller may
 	// set it explicitly, validated unique per server + in the TCP port range.
 	ProxyListenPort int `json:"proxy_listen_port"`
@@ -295,6 +354,12 @@ type UpdateApplicationRequest struct {
 	BenchmarkScheduleEnabled         *bool   `json:"benchmark_schedule_enabled,omitempty"`
 	BenchmarkScheduleIntervalSeconds *int    `json:"benchmark_schedule_interval_seconds,omitempty"`
 	OpportunisticMetricsEnabled      *bool   `json:"opportunistic_metrics_enabled,omitempty"`
+	// ResponsesLiveTimingsEnabled: nil = keep the stored value, the house
+	// sentinel -- except that a nil against a resulting type that cannot
+	// honour the flag CLEARS it, and a non-nil true against such a type is
+	// refused. Whether the request ALSO sends Type above decides which of the
+	// two refusal sentinels comes back (400 vs 409). See UpdateApplication.
+	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// ProxyListenPort: nil = keep the stored value (gateway-managed; the portal
 	// UI never sends this). 0 resets to auto-assign; a positive value sets it
 	// explicitly, validated unique per server + in the TCP port range.
@@ -378,6 +443,44 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 			return ApplicationDTO{}, ErrApplicationEndpointModeInvalid
 		}
 		messagesMode = m
+	}
+	// Decision (d): a newly created application on an upstream kind whose
+	// request schema tolerates the parameter starts with the opt-in ON; every
+	// other kind gets the DDL default. A server_agent application is NOT such a
+	// kind at this point and cannot be: it has no binary, no spec type and no
+	// mappings yet -- runtime specs are per-mapping and are created later by
+	// PutRuntimeSpec, which applies the per-kind default from the spec's own
+	// resolved type.
+	//
+	// Decision (e), create half: an EXPLICIT true on a kind that cannot honour
+	// it is REFUSED, not stored as false. Nothing has been persisted at this
+	// point -- the first store write is s.routes.CreateApplication below -- so
+	// a refused create leaves nothing behind. An explicit false is honoured on
+	// every kind (it asks for nothing the kind cannot do), and an ABSENT field
+	// is never refused: that is what the pointer buys, and it is why a caller
+	// who says nothing gets the default rather than an error.
+	//
+	// ALWAYS the 400 sentinel here, never the 409 one. req.Type is a plain
+	// string on this request, so the type this refusal names is always the
+	// caller's own, and there is no prior state for anything to conflict with:
+	// a create body that pairs an incapable type with true is contradictory on
+	// its own terms. The stored-state shape exists only on UpdateApplication.
+	//
+	// appType has already been through normalizeApplicationType, so the %q can
+	// only ever print one of its six accepted values. Keep the message a
+	// statement about the type the caller sent; do NOT grow it into a list of
+	// capable-versus-incapable kinds, because such a list would have to mention
+	// "mock", which is a routing provider constant but NOT an accepted
+	// application type -- a body with "type":"mock" is already dead on
+	// ErrApplicationTypeInvalid above.
+	liveTimingsCapable := routing.LiveTimingsCapableKind(appType)
+	liveTimings := liveTimingsCapable
+	if req.ResponsesLiveTimingsEnabled != nil {
+		if *req.ResponsesLiveTimingsEnabled && !liveTimingsCapable {
+			return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
+				ErrApplicationResponsesLiveTimingsUnsupported, appType)
+		}
+		liveTimings = *req.ResponsesLiveTimingsEnabled
 	}
 	status, err := normalizeApplicationStatus(req.Status)
 	if err != nil {
@@ -469,6 +572,7 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 		BenchmarkScheduleEnabled:         req.BenchmarkScheduleEnabled,
 		BenchmarkScheduleIntervalSeconds: req.BenchmarkScheduleIntervalSeconds,
 		OpportunisticMetricsEnabled:      req.OpportunisticMetricsEnabled,
+		ResponsesLiveTimingsEnabled:      liveTimings,
 		ProxyListenPort:                  proxyListenPort,
 		CreatedAt:                        now,
 		UpdatedAt:                        now,
@@ -607,6 +711,42 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 		}
 		messagesMode = m
 	}
+	// Validate-before-mutate for the live-timings opt-in, judged over the
+	// RESULTING type: appType when this PATCH retypes, the stored app.Type
+	// otherwise. The type is the authority on whether the flag can be honest,
+	// so a body that retypes AND asserts true in one breath is refused on the
+	// NEW type rather than accepted against the old one. Refused here, before
+	// the mutation block, so a rejected PATCH writes nothing at all -- not the
+	// flag and not the type -- which is the same discipline the two mode
+	// blocks above and applyProxyExclusion's RULE 2 follow.
+	//
+	// WHETHER to refuse is a property of the resulting ROW; WHICH sentinel to
+	// refuse with is a property of the REQUEST, and the two must not be
+	// conflated:
+	//
+	//   - the request sent "type", so it supplied the incapable type itself
+	//     and the body is contradictory on its own terms -> ...Unsupported,
+	//     400;
+	//   - the request did not, so the incapable type is the stored one and
+	//     this PATCH leaves it exactly as it was -> ...Conflict, 409. The
+	//     request is well-formed; it collides with this application's state.
+	//
+	// Read off req.Type != nil, deliberately NOT off *req.Type != app.Type: a
+	// PATCH restating the type it already had still SUPPLIED the type it is
+	// being judged against, so it belongs in the 400 arm. A value comparison
+	// would also drop the portal's own saves into the 409 arm, since
+	// ApplicationSection.tsx's buildBody() restates "type" on every save.
+	resultingType := app.Type
+	liveTimingsRefusal := ErrApplicationResponsesLiveTimingsConflict
+	if req.Type != nil {
+		resultingType = appType
+		liveTimingsRefusal = ErrApplicationResponsesLiveTimingsUnsupported
+	}
+	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled &&
+		!routing.LiveTimingsCapableKind(resultingType) {
+		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
+			liveTimingsRefusal, resultingType)
+	}
 	if req.BenchmarkScheduleIntervalSeconds != nil {
 		if err := validateApplicationBenchmarkInterval(*req.BenchmarkScheduleIntervalSeconds); err != nil {
 			return ApplicationDTO{}, err
@@ -731,6 +871,33 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	}
 	if req.OpportunisticMetricsEnabled != nil {
 		app.OpportunisticMetricsEnabled = *req.OpportunisticMetricsEnabled
+	}
+	// Decision (e), update half. The pointer separates an ASSERTION from a
+	// NON-MENTION and the two get opposite treatment:
+	//
+	//   - non-nil: the caller's value, already validated above -- a true here
+	//     implies a capable resulting type, or the function has returned;
+	//   - nil with an incapable resulting type: the stored value is CLEARED,
+	//     so a retype away from llama_cpp/vllm cannot leave a stale true
+	//     behind for a kind that can never honour it (LiteLLM, for one,
+	//     forwards unknown body keys downstream and OpenAI/Azure answer 400).
+	//     This overrides nothing the operator said in THIS request -- they
+	//     said nothing about the flag -- which is exactly why a clear is
+	//     legitimate here while a silent rewrite of an explicit true is not.
+	//
+	// It reads app.Type, the POST-mutation type (assigned in the mutation block
+	// above), for the same reason normalizeApplicationTimeoutMS reads it. That
+	// also makes the condition a property of the RESULTING ROW rather than of
+	// the request's shape -- the distinction applyProxyExclusion's RULE 4
+	// spells out, where a request-shape-only check turned out to be the hole
+	// the bad state arrived through. A retype TO a capable kind deliberately
+	// does NOT switch it on: decision (d) scopes the kind-dependent 1 to
+	// create.
+	switch {
+	case req.ResponsesLiveTimingsEnabled != nil:
+		app.ResponsesLiveTimingsEnabled = *req.ResponsesLiveTimingsEnabled
+	case !routing.LiveTimingsCapableKind(app.Type):
+		app.ResponsesLiveTimingsEnabled = false
 	}
 	if req.ProxyListenPort != nil {
 		app.ProxyListenPort = proxyListenPort
@@ -860,6 +1027,7 @@ func applicationDTO(server routing.AIServer, app routing.Application) Applicatio
 		BenchmarkScheduleEnabled:         app.BenchmarkScheduleEnabled,
 		BenchmarkScheduleIntervalSeconds: app.BenchmarkScheduleIntervalSeconds,
 		OpportunisticMetricsEnabled:      app.OpportunisticMetricsEnabled,
+		ResponsesLiveTimingsEnabled:      app.ResponsesLiveTimingsEnabled,
 		ProxyListenPort:                  app.ProxyListenPort,
 		ProxyExcluded:                    app.ProxyExcluded,
 		// Default to reachable; enrichReachability overrides it only when the

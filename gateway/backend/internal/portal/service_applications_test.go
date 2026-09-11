@@ -2960,3 +2960,529 @@ func assertNoRawToken(t *testing.T, dto ApplicationDTO, rawToken string) {
 		t.Fatalf("DTO JSON leaks the raw token: %s", blob)
 	}
 }
+
+// TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind pins
+// decision (d)'s create-path default for EVERY type normalizeApplicationType
+// accepts, with the key ABSENT: a newly created application on an upstream
+// kind whose request schema tolerates the live-progress parameter starts with
+// the opt-in ON, and every other kind gets the DDL default (off).
+//
+// Six rows, not seven: normalizeApplicationType's set is closed at
+// ollama/vllm/llama_cpp/llama_swap/litellm/server_agent
+// (service_applications.go:1000-1017), and "mock" is NOT in it -- a
+// `"type":"mock"` body dies on ErrApplicationTypeInvalid long before anything
+// this test covers, so a mock row would prove nothing about the default.
+// routing.ProviderMock's false is pinned where it is reachable, in routing's
+// own TestLiveTimingsCapableKind.
+//
+// The rows deliberately DISAGREE: two want true, four want false. A table
+// where every row expects the same value passes against an implementation
+// that ignores the kind entirely.
+//
+// server_agent is false and cannot be anything else at this point: such an
+// application has no binary, no spec type and no mappings yet -- runtime specs
+// are per-mapping and are created later by PutRuntimeSpec, which applies the
+// per-kind default from the spec's OWN resolved type (Task 7). Asking this
+// path to guess would be asking it about a runtime that does not exist.
+func TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	cases := []struct {
+		appType string
+		port    int
+		want    bool
+	}{
+		{routing.ProviderLlamaCPP, 8200, true},
+		{routing.ProviderVLLM, 8201, true},
+		{routing.ProviderOllama, 8202, false},
+		{routing.ProviderLlamaSwap, 8203, false},
+		{routing.ProviderLiteLLM, 8204, false},
+		// At most one server_agent application per server
+		// (serverAgentApplicationExistsOnServer), so exactly one row may carry
+		// it -- and this server is not ManagedRuntimeOnly, so the other five
+		// types are accepted on it too.
+		{routing.ProviderServerAgent, 8205, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.appType, func(t *testing.T) {
+			dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+				Type: tc.appType, Port: tc.port, Scheme: "http",
+				// ResponsesLiveTimingsEnabled absent on purpose.
+			})
+			if err != nil {
+				t.Fatalf("CreateApplication(%s): %v", tc.appType, err)
+			}
+			if dto.ResponsesLiveTimingsEnabled != tc.want {
+				t.Fatalf("%s: ResponsesLiveTimingsEnabled = %v, want %v", tc.appType, dto.ResponsesLiveTimingsEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateApplicationResponsesLiveTimingsAbsentIsNotFalse is the pointer's
+// whole purpose in one test: an ABSENT key takes the kind-dependent default
+// (true on llama_cpp), an EXPLICIT false is honoured. With a plain bool on
+// CreateApplicationRequest those two are the SAME request, so one of the two
+// assertions below must fail -- which is exactly what mutation (b) shows.
+//
+// Both halves are reloaded through GetApplication, so this pins what was
+// STORED rather than what the write path happened to echo.
+func TestCreateApplicationResponsesLiveTimingsAbsentIsNotFalse(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	absent, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8210, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create with the key absent: %v", err)
+	}
+	if !absent.ResponsesLiveTimingsEnabled {
+		t.Fatalf("absent key on llama_cpp = false, want true (the kind-dependent default)")
+	}
+
+	explicitFalse, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8211, Scheme: "http",
+		ResponsesLiveTimingsEnabled: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("create with an explicit false: %v", err)
+	}
+	if explicitFalse.ResponsesLiveTimingsEnabled {
+		t.Fatalf("explicit false on llama_cpp = true, want false (the default must not override an explicit value)")
+	}
+
+	reloadedAbsent, err := svc.GetApplication(context.Background(), ownerToken(), absent.ID)
+	if err != nil {
+		t.Fatalf("reload the absent-key application: %v", err)
+	}
+	if !reloadedAbsent.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value for the absent key = false, want true")
+	}
+	reloadedFalse, err := svc.GetApplication(context.Background(), ownerToken(), explicitFalse.ID)
+	if err != nil {
+		t.Fatalf("reload the explicit-false application: %v", err)
+	}
+	if reloadedFalse.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value for the explicit false = true, want false")
+	}
+}
+
+// TestCreateApplicationResponsesLiveTimingsHonoursAnExplicitFalseOnAnIncapableKind
+// pins the half of decision (e) that is NOT a refusal: an explicit false asks
+// for nothing the kind cannot do, so it is honoured on every kind, incapable
+// ones included.
+func TestCreateApplicationResponsesLiveTimingsHonoursAnExplicitFalseOnAnIncapableKind(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLiteLLM, Port: 8220, Scheme: "http",
+		ResponsesLiveTimingsEnabled: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("explicit false on litellm was refused: %v", err)
+	}
+	if dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("ResponsesLiveTimingsEnabled = true, want false")
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), dto.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value = true, want false")
+	}
+}
+
+// TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind pins
+// decision (e)'s create half: an EXPLICIT true on a kind that cannot honour it
+// is REFUSED naming the kind, not quietly stored as false. A 200 that stores
+// something other than what it was asked to store is a write that lies about
+// its result -- ErrApplicationProxyExcludedPortConflict's own argument.
+//
+// Create is ALWAYS the 400 sentinel and never the 409 one:
+// CreateApplicationRequest.Type is a plain string, so the type this refusal
+// names is always the caller's own, on every create and for every kind, and
+// there is no prior state for anything to conflict with. The
+// !errors.Is(...Conflict) assertion is what holds that line.
+//
+// The "nothing was stored" assertion is what distinguishes a refusal from a
+// rewrite, so it is not optional: mutation (c) -- the silent normalisation
+// this task replaced -- fails on the error AND on that count.
+func TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	_, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLiteLLM, Port: 8230, Scheme: "http",
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	// t.Errorf, not t.Fatalf: the four assertions are independent, and the
+	// "nothing was stored" one below is the whole point -- a silent rewrite
+	// must be reported as a REFUSAL failure and as a WRITE failure in the same
+	// run, not hidden behind the first fatal.
+	if !errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v, want ErrApplicationResponsesLiveTimingsUnsupported", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v, must NOT be the 409 conflict sentinel: a create has no prior state to conflict with", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), routing.ProviderLiteLLM) {
+		t.Errorf("err = %v, want the offending kind %q named in the message", err, routing.ProviderLiteLLM)
+	}
+	list, listErr := svc.ListApplications(context.Background(), ownerToken(), server.ID)
+	if listErr != nil {
+		t.Fatalf("ListApplications: %v", listErr)
+	}
+	if len(list.Data) != 0 {
+		t.Fatalf("a refused create stored %d application(s): %#v", len(list.Data), list.Data)
+	}
+}
+
+// TestUpdateApplicationResponsesLiveTimingsKeepsIfNil is the house keep-if-nil
+// discipline for this field, mirroring
+// TestUpdateApplicationPartialUpdatePreservesOtherFields: a PATCH that touches
+// only Port leaves the stored opt-in exactly as it was.
+func TestUpdateApplicationResponsesLiveTimingsKeepsIfNil(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8240, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if !app.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: created llama_cpp application has the flag off")
+	}
+	newPort := 8241
+	upd, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{Port: &newPort})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !upd.ResponsesLiveTimingsEnabled {
+		t.Fatalf("a PATCH that says nothing about the flag cleared it")
+	}
+	if upd.Port != newPort {
+		t.Fatalf("port = %d, want %d", upd.Port, newPort)
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value = false, want the preserved true")
+	}
+}
+
+// TestUpdateApplicationResponsesLiveTimingsFlipsBothWays pins that a non-nil
+// value is written in both directions on a capable kind -- the ordinary
+// operator toggle.
+func TestUpdateApplicationResponsesLiveTimingsFlipsBothWays(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8250, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	off, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		ResponsesLiveTimingsEnabled: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("update to false: %v", err)
+	}
+	if off.ResponsesLiveTimingsEnabled {
+		t.Fatalf("explicit false was not stored")
+	}
+	if reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID); err != nil {
+		t.Fatalf("reload after false: %v", err)
+	} else if reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value after the explicit false = true")
+	}
+	on, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("update to true: %v", err)
+	}
+	if !on.ResponsesLiveTimingsEnabled {
+		t.Fatalf("explicit true was not stored")
+	}
+	if reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID); err != nil {
+		t.Fatalf("reload after true: %v", err)
+	} else if !reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value after the explicit true = false")
+	}
+}
+
+// TestUpdateApplicationRetypeAwayFromACapableKindClearsResponsesLiveTimings
+// pins the CLEAR: a retype that says nothing about the flag has asserted
+// nothing, so a stored true that the resulting type can no longer honour is
+// cleared rather than left behind as an "on but inert" state. That is what
+// lets part 2 ship a switch with no indicator explaining why it does nothing.
+//
+// The pre-PATCH true is asserted explicitly: a clearing test that only checks
+// the post state passes against a field that was never set in the first place.
+func TestUpdateApplicationRetypeAwayFromACapableKindClearsResponsesLiveTimings(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8260, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	before, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload before the PATCH: %v", err)
+	}
+	if !before.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: the stored value is already false, so a clear would prove nothing")
+	}
+
+	if _, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		Type: strPtr(routing.ProviderLiteLLM),
+	}); err != nil {
+		t.Fatalf("retype to litellm: %v", err)
+	}
+	after, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload after the PATCH: %v", err)
+	}
+	if after.Type != routing.ProviderLiteLLM {
+		t.Fatalf("type = %q, want %q", after.Type, routing.ProviderLiteLLM)
+	}
+	if after.ResponsesLiveTimingsEnabled {
+		t.Fatalf("a retype away from a capable kind left the opt-in on for %q", after.Type)
+	}
+}
+
+// TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected pins the 400
+// shape of the refusal: the request supplied the incapable type itself, so the
+// body is self-contradictory on its own terms and needs no stored state to
+// judge. The refusal is measured against the RESULTING type -- litellm, the
+// new one -- not against the old capable llama_cpp.
+//
+// It also pins that a refused PATCH writes NOTHING: not the flag, and not the
+// type either. The refusal lives in the validate-before-mutate block for
+// exactly that reason.
+func TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaCPP, Port: 8270, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if !app.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: created llama_cpp application has the flag off")
+	}
+
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		Type:                        strPtr(routing.ProviderLiteLLM),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	// t.Errorf for the same reason as the create refusal above: the two state
+	// assertions below must still run when the refusal itself is missing.
+	if !errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v, want ErrApplicationResponsesLiveTimingsUnsupported (the request supplied the type)", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v, must NOT be the 409 conflict sentinel: this body named the offending type itself", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), routing.ProviderLiteLLM) {
+		t.Errorf("err = %v, want the RESULTING kind %q named in the message", err, routing.ProviderLiteLLM)
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Type != routing.ProviderLlamaCPP {
+		t.Errorf("a refused PATCH wrote the type anyway: %q, want %q", reloaded.Type, routing.ProviderLlamaCPP)
+	}
+	if !reloaded.ResponsesLiveTimingsEnabled {
+		t.Errorf("a refused PATCH cleared the stored flag")
+	}
+}
+
+// TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind
+// proves two separate things at once.
+//
+// First, the rule is phrased over the RESULTING type, not over a retype: there
+// is no transition in this request at all, and it is still refused, because
+// the stored ollama cannot honour the flag.
+//
+// Second, the two refusal shapes return DIFFERENT sentinels. Here the
+// offending type is the stored one and the request does not change it, so the
+// body is well-formed and collides with the application's own state: the 409
+// ...Conflict sentinel, the reading ErrServerManagedRuntimeOnly already
+// established for this table. Paired with
+// TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected's opposite
+// assertion, this is what catches the likely slip -- ONE sentinel returned for
+// both shapes -- inside the service, before the wire test sees it.
+func TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderOllama, Port: 8280, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if app.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: ollama must not default the flag on")
+	}
+
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Errorf("err = %v, want ErrApplicationResponsesLiveTimingsConflict (the incapable type is the stored one)", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v, must NOT be the 400 sentinel: this request is well-formed and sent no type at all", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), routing.ProviderOllama) {
+		t.Errorf("err = %v, want the stored kind %q named in the message", err, routing.ProviderOllama)
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("a refused PATCH stored the true anyway")
+	}
+}
+
+// TestUpdateApplicationResponsesLiveTimingsRestatingTheSameIncapableTypeIsTheRequestsOwnAssertion
+// pins WHY the status branch is read off req.Type != nil rather than off a
+// value comparison. Nothing changes about this row -- the PATCH restates the
+// ollama it already had -- yet the request still SUPPLIED the type it is being
+// judged against, so it is the 400 shape.
+//
+// Written as `req.Type != nil && *req.Type != app.Type` instead, the branch
+// would answer 409 here and no other test in this file would notice, because
+// every other leg either omits "type" or changes it. It would also drop the
+// portal's own saves into the 409 arm: ApplicationSection.tsx's buildBody()
+// restates "type" on every save.
+func TestUpdateApplicationResponsesLiveTimingsRestatingTheSameIncapableTypeIsTheRequestsOwnAssertion(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderOllama, Port: 8290, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	_, err = svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		Type:                        strPtr(routing.ProviderOllama),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported) {
+		t.Fatalf("err = %v, want ErrApplicationResponsesLiveTimingsUnsupported: the request supplied the type it is judged against, unchanged or not", err)
+	}
+	if errors.Is(err, ErrApplicationResponsesLiveTimingsConflict) {
+		t.Fatalf("err = %v, must NOT be the 409 sentinel: the status is read off req.Type != nil, not off a value comparison", err)
+	}
+}
+
+// TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn scopes decision
+// (d)'s kind-dependent 1 to CREATE: a retype TO llama_cpp must not silently
+// switch a feature on for an operator who never asked for it. The clear is
+// one-directional on purpose -- it removes an impossible true, it does not
+// install a possible one.
+func TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	app, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderOllama, Port: 8300, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	upd, err := svc.UpdateApplication(context.Background(), ownerToken(), app.ID, UpdateApplicationRequest{
+		Type: strPtr(routing.ProviderLlamaCPP),
+	})
+	if err != nil {
+		t.Fatalf("retype to llama_cpp: %v", err)
+	}
+	if upd.Type != routing.ProviderLlamaCPP {
+		t.Fatalf("type = %q, want %q", upd.Type, routing.ProviderLlamaCPP)
+	}
+	if upd.ResponsesLiveTimingsEnabled {
+		t.Fatalf("a retype to a capable kind switched the opt-in on by itself")
+	}
+	reloaded, err := svc.GetApplication(context.Background(), ownerToken(), app.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored value = true after a bare retype, want the preserved false")
+	}
+}
+
+// TestApplicationDTOCarriesResponsesLiveTimings is the only guard on the
+// hand-written applicationDTO mapper: a field present on the DTO but missing
+// from the mapper is the Go zero value on the wire, with no compile error and
+// a 200 OK. The row is seeded straight through the routes store -- the same
+// direct-store seeding seedServerAgentApplication uses, and for the same
+// reason -- so this reads the mapper rather than the write path that produced
+// the value.
+//
+// Both read paths are checked, because ListApplications and GetApplication
+// are two separate call sites of the same mapper.
+func TestApplicationDTOCarriesResponsesLiveTimings(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	if err := routeStore.CreateApplication(context.Background(), routing.Application{
+		ID: "app_dto_lt", ServerID: server.ID, Type: routing.ProviderLlamaCPP, Port: 8310,
+		Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,
+		ResponsesLiveTimingsEnabled: true, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed application: %v", err)
+	}
+
+	got, err := svc.GetApplication(context.Background(), ownerToken(), "app_dto_lt")
+	if err != nil {
+		t.Fatalf("GetApplication: %v", err)
+	}
+	if !got.ResponsesLiveTimingsEnabled {
+		t.Fatalf("GetApplication dropped the stored true (applicationDTO is missing the field)")
+	}
+	list, err := svc.ListApplications(context.Background(), ownerToken(), server.ID)
+	if err != nil {
+		t.Fatalf("ListApplications: %v", err)
+	}
+	if len(list.Data) != 1 {
+		t.Fatalf("listed %d applications, want 1", len(list.Data))
+	}
+	if !list.Data[0].ResponsesLiveTimingsEnabled {
+		t.Fatalf("ListApplications dropped the stored true (applicationDTO is missing the field)")
+	}
+}
