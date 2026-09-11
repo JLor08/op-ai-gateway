@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -117,6 +118,28 @@ var (
 	// portal before it can ever reach the agent. HTTP 400.
 	ErrRuntimeSpecMetricsPathInvalid      = errors.New("runtime_spec.metrics_path_invalid")
 	ErrRuntimeSpecContextProbePathInvalid = errors.New("runtime_spec.context_probe_path_invalid")
+	// ErrRuntimeSpecResponsesLiveTimingsUnsupported rejects an EXPLICIT
+	// responses_live_timings_enabled:true on a spec whose EFFECTIVE kind
+	// (routing.EffectiveRuntimeSpecType: the explicit Type when set, else
+	// detected from the binary's basename) is not live-timings capable. HTTP
+	// 400, and the message names that effective kind -- which may be a kind
+	// the caller never typed, because an empty Type means the binary decided.
+	//
+	// Refused rather than stored as false because a 200 that stores something
+	// other than what it was asked to store is a write that lies about its
+	// result. An ABSENT field is never this error: on a first write it takes
+	// the kind-dependent default, on a later save it keeps the stored value,
+	// and on a document whose kind cannot honour the flag it is CLEARED --
+	// which overrides nothing the caller said, since they said nothing.
+	//
+	// 400 in EVERY shape, and one sentinel is therefore enough here. The
+	// application surface splits its refusal (ErrApplication...Unsupported,
+	// 400, vs ErrApplication...Conflict, 409) by whether the request supplied
+	// the offending type; a spec write is a full document that always states
+	// its own Type and Binary, so the refused kind is always one this body
+	// supplied -- typed, or named by the binary it is detected from. There is
+	// no spec shape whose refusal rests on state the request left alone.
+	ErrRuntimeSpecResponsesLiveTimingsUnsupported = errors.New("runtime_spec.responses_live_timings_unsupported")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -390,6 +413,14 @@ type RuntimeSpecDTO struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// ResponsesLiveTimingsEnabled is this spec's own copy of the live-timings
+	// opt-in (migration 80) -- stored explicitly on the spec rather than
+	// inherited from the parent server_agent application, exactly like the trio
+	// above, and for a server_agent model the RESOLVED spec's copy is the one
+	// the request path reads. Always the STORED value, which is always a value
+	// this spec's EFFECTIVE kind can honour: a PUT that asks for true on a kind
+	// that cannot is refused with 400, never stored as false.
+	ResponsesLiveTimingsEnabled bool `json:"responses_live_timings_enabled"`
 	// VisibleDevicesMode is "env" | "args": how set_visible_devices is
 	// enforced. Only meaningful when SetVisibleDevices is on; default "env".
 	VisibleDevicesMode string `json:"visible_devices_mode"`
@@ -457,6 +488,18 @@ type PutRuntimeSpecRequest struct {
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
+	// ResponsesLiveTimingsEnabled: a POINTER inside an otherwise
+	// apply-verbatim full-document request, the same exception APIToken below
+	// already makes (nil = keep the stored value), and it carries two loads.
+	// nil must mean "no opinion", so that a FIRST write can get the
+	// kind-dependent default (ON for a llama_cpp/vllm spec) while a later save
+	// of an existing spec keeps whatever the operator last stored; a plain
+	// bool would arrive as false on every full-document PUT and the default
+	// could never fire. And nil is what separates a NON-MENTION from an
+	// ASSERTION: an explicit true on an effective kind that cannot honour it
+	// is refused (ErrRuntimeSpecResponsesLiveTimingsUnsupported), while an
+	// absent field on such a kind is simply cleared.
+	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// VisibleDevicesMode: see RuntimeSpecDTO's doc. Absent (empty/"")
 	// defaults to "env" — see putRuntimeSpec.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
@@ -670,6 +713,58 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	// The spec's OWN effective kind decides whether the live-timings opt-in
+	// can be honest here: the explicit Type when set, else detected from the
+	// binary's basename. Same resolver the inference path consults through
+	// Target.LiveProgressSpecType, so the portal and the gateway cannot
+	// disagree about what actually serves.
+	//
+	// EffectiveRuntimeSpecType, NOT specType: validRuntimeSpecType accepts ""
+	// as a real value ("auto-detect from Binary", not a collapsed default) and
+	// LiveTimingsCapableKind("") is false, so asking about the raw type would
+	// refuse an explicit true on a {"binary": ".../llama-server"} spec -- the
+	// commonest managed configuration there is -- and, in the resolution
+	// below, silently default it OFF. It would also refuse the VRAM
+	// benchmark's own deferred restore, which replays a stored Type of ""
+	// verbatim through putRequestFromDTO alongside an explicit true.
+	//
+	// An EXPLICIT true on a kind that cannot honour it is refused, naming that
+	// kind. Judged over THIS document's kind rather than over a type change:
+	// a PUT is a full document and carries no retype signal -- hadExisting
+	// says a row was there, never that its kind changed -- and a first write
+	// asserting true on an incapable kind has to be refused too, though no
+	// transition is involved in it at all.
+	//
+	// POSITION, deliberately: LAST of this function's request validations.
+	// Every check a body could already fail on -- the binary, the tuning
+	// values, admin_state, the GPU rows, the env keys, the four
+	// visible-devices checks, the four api_token shapes, validRuntimeSpecType,
+	// both probe paths, both endpoint modes and the flavors -- runs above this
+	// and RETURNS rather than falling through, so this brand-new check can
+	// never rewrite the answer to a body that was already invalid for a
+	// SHIPPED reason. Placed beside the type check instead, a doubly-invalid
+	// body reported this 400 where it used to report
+	// runtime_spec.metrics_path_invalid, runtime_spec.endpoint_mode_invalid or
+	// runtime_spec.flavor_invalid. What is left below it, in this function, is
+	// capture.SealSecret's keyless-store rejection (capture.ErrKeyRequired ->
+	// 400 runtime_spec.api_token_key_required), which is write-path
+	// preparation rather than a request validation -- the same line the
+	// application write paths draw, and the request-SHAPE validation of the
+	// token pair has already run above -- plus the two json.Marshal error
+	// returns for args/env, which no request can reach at all ([]string and
+	// map[string]string have no unmarshalable shape).
+	//
+	// One sentinel, 400 in every shape. Because the document always carries
+	// the Type/Binary the kind is resolved from, the refused kind is always one
+	// THIS request supplied, so there is no well-formed-but-conflicting shape
+	// here for the application side's 409 sentinel to answer. hadExisting is
+	// read below for the default-versus-preserve decision only, never here.
+	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: specType, Binary: binary})
+	liveTimingsCapable := routing.LiveTimingsCapableKind(string(effectiveSpecKind))
+	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !liveTimingsCapable {
+		return RuntimeSpecDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
+			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
+	}
 	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
 	// behavior); a bad value is a LATER task's validation (mode validation
 	// is not wired up yet — this resolves the stored typed value only).
@@ -721,6 +816,34 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		for _, g := range existingGPUs {
 			measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
 		}
+	}
+	// The live-timings opt-in. !hadExisting is what "create" means on a
+	// full-document upsert, so a first write takes the kind-dependent default
+	// while a later save of an existing spec that omits the key keeps the
+	// stored value -- re-saving a llama.cpp spec never re-enables a flag the
+	// operator turned off, nor clears one they turned on.
+	//
+	// The two arms below are the pointer's whole point. A non-nil value is the
+	// caller's, already validated above (a true here implies a capable kind,
+	// or putRuntimeSpec has already returned). A nil against a document whose
+	// kind cannot honour the flag CLEARS it, so a PUT that retypes an
+	// llama_cpp spec to ollama cannot leave a stale true behind -- and since
+	// the caller said nothing about the flag, the clear contradicts nothing
+	// they asked for. That is the asymmetry of this feature: the assertion is
+	// refused, the non-mention is normalised.
+	//
+	// liveTimingsCapable is the local the refusal above computed, from the
+	// EFFECTIVE kind. Do not recompute it from specType here: that is how an
+	// auto-detect llama-server spec ends up defaulting off.
+	liveTimings := liveTimingsCapable
+	if hadExisting {
+		liveTimings = existing.ResponsesLiveTimingsEnabled
+	}
+	switch {
+	case req.ResponsesLiveTimingsEnabled != nil:
+		liveTimings = *req.ResponsesLiveTimingsEnabled
+	case !liveTimingsCapable:
+		liveTimings = false
 	}
 	// Per-spec API token (design §2): compute the SEALED value to persist
 	// STRICTLY BEFORE the store write, so a keyless-disk seal rejection
@@ -799,6 +922,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 		APIFlavors:                  flavors,
 		ResponsesMode:               respMode,
 		MessagesMode:                msgMode,
+		ResponsesLiveTimingsEnabled: liveTimings,
 		Type:                        specType,
 		MetricsPath:                 metricsPath,
 		ContextProbePath:            contextProbePath,
@@ -1178,6 +1302,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
+		ResponsesLiveTimingsEnabled: spec.ResponsesLiveTimingsEnabled,
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		APITokenMode:                normalizeRuntimeAPITokenMode(spec.APITokenMode),
 		APITokenSet:                 spec.APIToken != "",

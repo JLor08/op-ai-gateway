@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,6 +157,93 @@ func TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400(t *testing.T) {
 	}
 	if code := errorBodyOf(t, rec); code != "runtime_spec.type_invalid" {
 		t.Fatalf("error code = %q, want runtime_spec.type_invalid", code)
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400
+// pins the WIRE contract of
+// portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported, mirroring
+// TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400 above -- and the
+// MESSAGE too, not only the code: the request is refused rather than quietly
+// stored as false so that the caller is told which kind cannot honour it, and
+// a 400 that withholds the kind gives them nothing the silent rewrite would
+// not have.
+//
+// The status assertion is exact on purpose. The application surface splits
+// this refusal into 400 and 409 by whether the request supplied the offending
+// type; a spec PUT is a full document and always does supply it, so 400 is the
+// only answer a spec write can give. This is the test that says so: a 409 here
+// would mean somebody carried the application surface's stored-state branch
+// into a path that has no such shape.
+//
+// It is also where PutRuntimeSpecRequest's JSON tag is pinned BY NAME, which
+// no internal/portal test can do: the key lives in a raw body string here, so
+// a renamed tag drops it, the refusal never fires, and this test reports a
+// 200 (measured). The sibling below cannot hold that line -- with the key
+// dropped its spec takes the capable-kind default and its echo still reads
+// true.
+func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/ollama","type":"ollama","responses_live_timings_enabled":true}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.responses_live_timings_unsupported" {
+		t.Fatalf("error code = %q, want runtime_spec.responses_live_timings_unsupported", code)
+	}
+	if !strings.Contains(rec.Body.String(), "ollama") {
+		t.Fatalf("the 400 does not name the offending kind: %s", rec.Body.String())
+	}
+}
+
+// TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted
+// is the accepting direction of the same resolution, over HTTP: no "type" at
+// all, a llama-server binary, and the flag asserted true. It must be a 200
+// whose BODY says true.
+//
+// The service asks routing.LiveTimingsCapableKind about the spec's EFFECTIVE
+// type (the explicit one when set, else detected from the binary), and this
+// is the body that proves it: validRuntimeSpecType accepts "" as a real value
+// and LiveTimingsCapableKind("") is FALSE, so a refusal written against the
+// raw req.Type would answer 400 here -- to the single most common managed
+// llama.cpp configuration there is.
+//
+// The echo assertion, not the status, is this test's whole content. This
+// endpoint decodes with a plain json.Unmarshal and nothing in this module
+// sets DisallowUnknownFields, so 200 is what it already answered to this body
+// before responses_live_timings_enabled existed as a field at all -- the key
+// was simply discarded. Reading the value back out of the response is the
+// only way the test can tell "accepted and stored" from "ignored".
+//
+// What it does NOT do is pin either JSON tag, which is worth stating because
+// the shape of it invites the opposite assumption. Rename the REQUEST tag and
+// this body's key is dropped -- but an absent key then takes the llama_cpp
+// create default, which is true, so the echo still reads true and this test
+// still passes. The test that catches that rename is the incapable-kind one
+// above, whose raw body needs the key to arrive for the refusal to fire at
+// all: measured, it answers 200 instead of 400. Rename the DTO tag and
+// nothing here notices either, because this test decodes through the very
+// struct the response was encoded from; the guard for that one is
+// TestPutRequestFromDTOCoversEveryWritableField in internal/portal, whose
+// tag-name loops compare the two structs' tag sets in both directions.
+func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/bin/llama-server","responses_live_timings_enabled":true}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	var dto portal.RuntimeSpecDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
+		t.Fatalf("unmarshal: %v, body = %s", err, rec.Body.String())
+	}
+	if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = false, want true: a 200 that did not store what it was asked to store, body = %s", rec.Body.String())
 	}
 }
 

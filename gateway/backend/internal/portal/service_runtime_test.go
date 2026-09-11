@@ -3058,3 +3058,464 @@ func TestPutRuntimeSpecAPITokenSealKeylessDiskRejected(t *testing.T) {
 	}
 	assertUnchanged("after failed random")
 }
+
+// liveTimingsSpecFixture seeds the server -> server_agent application ->
+// service chain the responses-live-timings spec tests share, and returns a
+// mapping factory with it. Several of those tests turn on the difference
+// between a FIRST spec write and a later save of the same spec, so they need
+// more than one mapping -- one spec each -- inside a single service. The
+// parent application is returned because one test has to seed a value onto it
+// that the application API refuses to store.
+func liveTimingsSpecFixture(t *testing.T) (*Service, *routing.MemoryStore, routing.Application, func(string) string) {
+	t.Helper()
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	newMapping := func(name string) string {
+		t.Helper()
+		mapping, err := svc.CreateMapping(context.Background(), ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: name, AppModelName: name})
+		if err != nil {
+			t.Fatalf("CreateMapping(%q): %v", name, err)
+		}
+		return mapping.ID
+	}
+	return svc, routeStore, app, newMapping
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsDefaultsFromTheSpecsOwnKind pins the
+// create default: a FIRST write (no existing spec row) that omits
+// responses_live_timings_enabled stores what the spec's own EFFECTIVE kind
+// implies -- on for llama_cpp/vllm, off for every other kind.
+//
+// The middle case pins WHICH resolver decides that, and nothing else in this
+// file does. Its type is "" and its binary is llama-server, so
+// routing.EffectiveRuntimeSpecType falls back to
+// routing.DetectRuntimeSpecType and answers llama_cpp, while
+// routing.LiveTimingsCapableKind("") is false: a default asked about the raw
+// req.Type would store false for it -- the commonest managed llama.cpp
+// configuration there is -- with both explicitly-typed cases still green.
+func TestPutRuntimeSpecResponsesLiveTimingsDefaultsFromTheSpecsOwnKind(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	cases := []struct {
+		name string
+		req  PutRuntimeSpecRequest
+		want bool
+	}{
+		{
+			name: "explicit-llama-cpp",
+			req:  PutRuntimeSpecRequest{Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp)},
+			want: true,
+		},
+		{
+			name: "auto-detected-llama-cpp",
+			req:  PutRuntimeSpecRequest{Binary: "/usr/bin/llama-server"},
+			want: true,
+		},
+		{
+			name: "explicit-ollama",
+			req:  PutRuntimeSpecRequest{Binary: "/usr/local/bin/ollama", Type: string(routing.RuntimeSpecTypeOllama)},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping(tc.name), tc.req)
+		if err != nil {
+			t.Fatalf("%s: PutRuntimeSpec: %v", tc.name, err)
+		}
+		if dto.ResponsesLiveTimingsEnabled != tc.want {
+			t.Fatalf("%s: responses_live_timings_enabled = %v, want %v (a first write with the key absent takes the effective kind's default)",
+				tc.name, dto.ResponsesLiveTimingsEnabled, tc.want)
+		}
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsDoesNotInheritTheParentApplication
+// extends PutRuntimeSpec's standing "no backend inheritance" contract (the
+// same contract TestPutRuntimeSpecDoesNotInheritAppModes pins for the
+// flavors/modes trio) to the live-timings opt-in: the spec's own effective
+// kind decides, never the parent server_agent application's stored flag.
+//
+// The FIRST leg is the pin, and it is the only direction that can fail. Its
+// parent is a server_agent application whose own flag is false -- the only
+// value that kind can hold, and what seedServerAgentApplication already
+// writes -- under a capable llama_cpp spec, so an implementation seeding from
+// app.ResponsesLiveTimingsEnabled (app is a putRuntimeSpec parameter, right
+// there to be misused) answers false where the kind default is true.
+//
+// The second leg is a COHERENCE leg, not a pin, and must not be read as one:
+// on an incapable kind the resolution forces false whatever the seed was, so
+// false there is satisfied by the kind default, by the clear of a stored
+// value, and by a complete inheritance defect alike. Its true seed has to
+// bypass the service because CreateApplication/UpdateApplication refuse to
+// store true on a server_agent application at all -- that refusal is itself
+// the invariant this feature establishes, not a gap in this test -- so the
+// fixture state is written straight through routing.MemoryStore.
+func TestPutRuntimeSpecResponsesLiveTimingsDoesNotInheritTheParentApplication(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, app, newMapping := liveTimingsSpecFixture(t)
+	if app.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: the seeded server_agent application's flag is on, want off")
+	}
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("pin"), PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = false, want true: a llama_cpp spec took its parent application's false instead of its own kind default")
+	}
+
+	seeded := app
+	seeded.ResponsesLiveTimingsEnabled = true
+	if err := routeStore.UpdateApplication(ctx, seeded); err != nil {
+		t.Fatalf("seed the parent application's flag directly: %v", err)
+	}
+	dto, err = svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("coherence"), PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/ollama", Type: string(routing.RuntimeSpecTypeOllama),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = true on an ollama spec, want false")
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsPreservesAnExistingValueWhenAbsent
+// pins the later-save half of the four-way resolution, in both directions: on
+// a full-document PUT that omits the key, an EXISTING spec keeps what the
+// operator last stored. A kind-dependent default firing on every save would
+// re-enable a flag they turned off; an over-eager clear would drop one they
+// turned on.
+func TestPutRuntimeSpecResponsesLiveTimingsPreservesAnExistingValueWhenAbsent(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+	mappingID := newMapping("m")
+	capable := PutRuntimeSpecRequest{Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp)}
+
+	off := capable
+	off.ResponsesLiveTimingsEnabled = boolPtr(false)
+	if dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, off); err != nil {
+		t.Fatalf("PutRuntimeSpec(false): %v", err)
+	} else if dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("an explicit false was not stored")
+	}
+	if dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, capable); err != nil {
+		t.Fatalf("PutRuntimeSpec(absent after false): %v", err)
+	} else if dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = true, want false: a later save with the key absent re-enabled a flag the operator turned off")
+	}
+
+	on := capable
+	on.ResponsesLiveTimingsEnabled = boolPtr(true)
+	if dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, on); err != nil {
+		t.Fatalf("PutRuntimeSpec(true): %v", err)
+	} else if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("an explicit true was not stored")
+	}
+	if dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, capable); err != nil {
+		t.Fatalf("PutRuntimeSpec(absent after true): %v", err)
+	} else if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = false, want true: a later save with the key absent cleared a flag the operator turned on")
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsAbsentIsNotFalseOnAFirstWrite is the
+// pointer's whole purpose on the spec side: with a plain bool on
+// PutRuntimeSpecRequest the two calls below would be the SAME request. The
+// absent-key leg would arrive as false, the kind-dependent default could
+// never fire, and the preserve branch would have nothing to distinguish
+// either.
+//
+// This test cannot measure that by swapping the field's type -- boolPtr(...)
+// into a bool field is a compile failure in this very file, and editing a
+// test to measure a mutation is not a measurement. The behavioural
+// equivalent -- replacing the whole resolution below with
+// "absent means false" -- is measured as a production-only edit with this
+// change instead.
+func TestPutRuntimeSpecResponsesLiveTimingsAbsentIsNotFalseOnAFirstWrite(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+	capable := PutRuntimeSpecRequest{Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp)}
+
+	absent, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("absent"), capable)
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec(absent): %v", err)
+	}
+	if !absent.ResponsesLiveTimingsEnabled {
+		t.Fatalf("absent: responses_live_timings_enabled = false, want true (the llama_cpp create default)")
+	}
+
+	explicitFalse := capable
+	explicitFalse.ResponsesLiveTimingsEnabled = boolPtr(false)
+	off, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("explicit-false"), explicitFalse)
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec(false): %v", err)
+	}
+	if off.ResponsesLiveTimingsEnabled {
+		t.Fatalf("explicit false: responses_live_timings_enabled = true, want false (an explicit off is a deliberate off, on any kind)")
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsHonoursAnExplicitValue: a non-nil
+// value is the caller's, stored verbatim and echoed by the returned DTO, and
+// a reload reports the same thing.
+//
+// The third leg is the ACCEPTING direction of the effective-kind resolution,
+// and the only test here that catches a refusal written against the raw
+// req.Type: routing.LiveTimingsCapableKind("") is false, so such a refusal
+// would reject an explicit true on a {"binary": ".../llama-server"} spec,
+// while every explicitly-typed leg above stayed green.
+func TestPutRuntimeSpecResponsesLiveTimingsHonoursAnExplicitValue(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+	mappingID := newMapping("typed")
+	typed := PutRuntimeSpecRequest{Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp)}
+
+	for _, want := range []bool{true, false} {
+		req := typed
+		req.ResponsesLiveTimingsEnabled = boolPtr(want)
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, req)
+		if err != nil {
+			t.Fatalf("PutRuntimeSpec(%v): %v", want, err)
+		}
+		if dto.ResponsesLiveTimingsEnabled != want {
+			t.Fatalf("echoed responses_live_timings_enabled = %v, want %v", dto.ResponsesLiveTimingsEnabled, want)
+		}
+		reloaded, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+		if err != nil {
+			t.Fatalf("GetRuntimeSpec: %v", err)
+		}
+		if reloaded.ResponsesLiveTimingsEnabled != want {
+			t.Fatalf("stored responses_live_timings_enabled = %v, want %v", reloaded.ResponsesLiveTimingsEnabled, want)
+		}
+	}
+
+	autoDetected, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("auto"), PutRuntimeSpecRequest{
+		Binary: "/usr/bin/llama-server", ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("an explicit true on a type-less llama-server spec was refused: %v", err)
+	}
+	if !autoDetected.ResponsesLiveTimingsEnabled {
+		t.Fatalf("auto-detect: responses_live_timings_enabled = false, want true")
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind pins
+// decision (e) on this surface: an EXPLICIT true on a spec whose effective
+// kind cannot honour it is REFUSED, naming that kind, with nothing written --
+// not quietly stored as false, because a 200 that stores something other than
+// what it was asked to store is a write that lies about its result.
+//
+// The two legs are jointly the evidence for this surface having ONE sentinel
+// where the application surface has two. The first refuses against a stored
+// row, the second against no row at all, and both are the same 400: in both,
+// the caller supplied the offending kind in this very body -- by typing it,
+// or by naming the binary it is detected from. There is no spec shape where
+// the refused kind comes from state the request left alone, which is the one
+// shape the application surface answers 409 on.
+//
+// t.Errorf on the error-shape legs, with an err == nil guard before every
+// err.Error(): each leg reports two independent facts about one call, and the
+// "nothing was written" fact is the one that needs reporting in exactly the
+// run where the refusal is missing -- the silent-normalisation mutation this
+// feature replaced, measured with this change. With t.Fatalf that run would
+// abort first, and an unguarded err.Error() on a nil err would panic rather
+// than fail.
+func TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	// Leg 1: a stored llama_cpp spec with the flag on, retyped to ollama in
+	// the same body that asserts the flag. The seed's Type is EXPLICIT rather
+	// than auto-detected because the assertion below reads the DTO's raw
+	// stored Type -- runtimeSpecDTO echoes spec.Type and reports the resolved
+	// kind separately as EffectiveType -- so a type-less seed would store ""
+	// and fail for a reason with nothing to do with this feature.
+	stored := newMapping("stored")
+	seed, err := svc.PutRuntimeSpec(ctx, ownerToken(), stored, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("seed PutRuntimeSpec: %v", err)
+	}
+	if !seed.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: the seeded llama_cpp spec has the flag off")
+	}
+	_, err = svc.PutRuntimeSpec(ctx, ownerToken(), stored, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/ollama", Type: string(routing.RuntimeSpecTypeOllama),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v, want ErrRuntimeSpecResponsesLiveTimingsUnsupported", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), string(routing.RuntimeSpecTypeOllama)) {
+		t.Errorf("err = %v, want the offending effective kind %q named in the message", err, routing.RuntimeSpecTypeOllama)
+	}
+	reloaded, err := svc.GetRuntimeSpec(ctx, ownerToken(), stored)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if reloaded.Type != string(routing.RuntimeSpecTypeLlamaCpp) {
+		t.Errorf("a refused PUT wrote the type anyway: %q, want %q", reloaded.Type, routing.RuntimeSpecTypeLlamaCpp)
+	}
+	if !reloaded.ResponsesLiveTimingsEnabled {
+		t.Errorf("a refused PUT overwrote the stored flag")
+	}
+
+	// Leg 2: a FIRST write, with no type at all. The message must still name
+	// ollama -- the kind the caller never typed -- precisely because an empty
+	// type means the binary decided.
+	fresh := newMapping("fresh")
+	_, err = svc.PutRuntimeSpec(ctx, ownerToken(), fresh, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/ollama", ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if !errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported) {
+		t.Errorf("err = %v, want ErrRuntimeSpecResponsesLiveTimingsUnsupported", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), string(routing.RuntimeSpecTypeOllama)) {
+		t.Errorf("err = %v, want the DETECTED kind %q named in the message", err, routing.RuntimeSpecTypeOllama)
+	}
+	unconfigured, err := svc.GetRuntimeSpec(ctx, ownerToken(), fresh)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if unconfigured.Configured {
+		t.Errorf("a refused first write created a spec row: %#v", unconfigured)
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsClearsAStoredTrueWhenTheDocumentsKindCannotHonourIt
+// is the other half of decision (e), and the asymmetry is the point: an
+// ASSERTION against an incapable kind is refused, a NON-MENTION is
+// normalised. A PUT that retypes a llama_cpp spec to ollama without
+// mentioning the flag cannot leave a stale true behind -- and clearing it
+// contradicts nothing the caller asked for, because they asked for nothing.
+//
+// The precondition assertion is what makes this test mean anything: without
+// it, false at the end would also be what a spec that never had the flag on
+// reports.
+func TestPutRuntimeSpecResponsesLiveTimingsClearsAStoredTrueWhenTheDocumentsKindCannotHonourIt(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+	mappingID := newMapping("m")
+
+	seed, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp),
+		ResponsesLiveTimingsEnabled: boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("seed PutRuntimeSpec: %v", err)
+	}
+	if !seed.ResponsesLiveTimingsEnabled {
+		t.Fatalf("precondition: the seeded llama_cpp spec has the flag off, so this test could not observe a change")
+	}
+
+	retyped, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/ollama", Type: string(routing.RuntimeSpecTypeOllama),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec(absent on an incapable kind): %v", err)
+	}
+	if retyped.ResponsesLiveTimingsEnabled {
+		t.Fatalf("echoed responses_live_timings_enabled = true, want false: a stored true survived a retype to ollama")
+	}
+	reloaded, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if reloaded.ResponsesLiveTimingsEnabled {
+		t.Fatalf("stored responses_live_timings_enabled = true, want false")
+	}
+}
+
+// TestRuntimeSpecDTOCarriesResponsesLiveTimings reads a spec written OUTSIDE
+// the service -- straight into the routes store, with no putRuntimeSpec in
+// the path -- so it still speaks if the whole value resolution is gone. That
+// is its only exclusive claim: it is NOT the only guard on the hand-written
+// runtimeSpecDTO mapper, because putRuntimeSpec returns runtimeSpecDTO too,
+// so every test above reads that mapper as well (deleting the mapper's line
+// fails all eight, not only this one).
+func TestRuntimeSpecDTOCarriesResponsesLiveTimings(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, _, newMapping := liveTimingsSpecFixture(t)
+	mappingID := newMapping("m")
+
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID:        "rspec_live_timings",
+		MappingID: mappingID,
+		Binary:    "/usr/local/bin/llama-server",
+		Type:      string(routing.RuntimeSpecTypeLlamaCpp),
+		// Args/Env are stored JSON TEXT, and runtimeSpecDTO parses both: a
+		// zero-value "" is not valid JSON and the mapper answers
+		// ErrRuntimeSpecArgsInvalid before it ever reaches the field under
+		// test. Every spec written through the service carries "[]"/"{}"
+		// here; a hand-written store seed has to say so itself.
+		Args:                        "[]",
+		Env:                         "{}",
+		ResponsesLiveTimingsEnabled: true,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+
+	dto, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if !dto.ResponsesLiveTimingsEnabled {
+		t.Fatalf("responses_live_timings_enabled = false, want true: the DTO mapper drops the stored value")
+	}
+}
+
+// TestPutRuntimeSpecResponsesLiveTimingsRefusalRunsAfterThePreExistingValidations
+// pins the POSITION of the live-timings refusal, and is the only test that
+// can: every other test in this file passes wherever in the
+// validate-before-mutate block the refusal sits.
+//
+// Each leg is a body that is invalid for a SHIPPED reason and also carries an
+// impossible true, on an ollama binary and an explicit ollama type so the
+// refusal really is armed. A refusal placed beside the type check would
+// answer runtime_spec.responses_live_timings_unsupported to all three, where
+// they used to answer runtime_spec.metrics_path_invalid,
+// runtime_spec.endpoint_mode_invalid and runtime_spec.flavor_invalid -- a
+// behaviour change to three shipped codes dressed up as an addition. Modelled
+// on TestCreateApplicationLiveTimingsRefusalRunsAfterThePreExistingValidations,
+// which exists because the application surface shipped that defect once.
+//
+// Both halves of each leg are t.Errorf: one leg reports both facts about one
+// call -- that the shipped sentinel came back, and that the new one did not.
+func TestPutRuntimeSpecResponsesLiveTimingsRefusalRunsAfterThePreExistingValidations(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	legs := []struct {
+		name string
+		req  PutRuntimeSpecRequest
+		want error
+	}{
+		{name: "metrics-path", req: PutRuntimeSpecRequest{MetricsPath: "//evil"}, want: ErrRuntimeSpecMetricsPathInvalid},
+		{name: "endpoint-mode", req: PutRuntimeSpecRequest{ResponsesMode: "bogus"}, want: ErrRuntimeSpecEndpointModeInvalid},
+		{name: "flavor", req: PutRuntimeSpecRequest{APIFlavors: []string{"nope"}}, want: ErrRuntimeSpecFlavorInvalid},
+	}
+	for _, leg := range legs {
+		req := leg.req
+		req.Binary = "/usr/local/bin/ollama"
+		req.Type = string(routing.RuntimeSpecTypeOllama)
+		req.ResponsesLiveTimingsEnabled = boolPtr(true)
+
+		_, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping(leg.name), req)
+		if !errors.Is(err, leg.want) {
+			t.Errorf("%s: err = %v, want %v: the live-timings refusal must not pre-empt a shipped validation", leg.name, err, leg.want)
+		}
+		if errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported) {
+			t.Errorf("%s: a body invalid for a PRE-EXISTING reason reported the brand-new live-timings refusal instead", leg.name)
+		}
+	}
+}
