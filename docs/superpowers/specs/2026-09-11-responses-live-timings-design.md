@@ -44,8 +44,38 @@ These are settled; this document records them rather than arguing them.
   kind.** An upgrade must not change any running deployment's behaviour; a newly
   created llama.cpp application gets it on. Precedent:
   `opportunistic_metrics_enabled integer not null default 0`.
-- **(e) A type change clears it.** Retyping an application away from a capable
-  kind resets the boolean rather than leaving a stale `true` behind.
+- **(e) An impossible `true` is refused; a non-mention is cleared.** A request
+  may not set `responses_live_timings_enabled` to **true** when the resulting
+  type — the application type, or the runtime spec's effective type, that the
+  write leaves behind — is not a live-timings-capable kind; such a request is
+  **rejected with 400**, naming the kind. An **absent** field is never a
+  rejection: on create the server picks by kind (decision (d)), and on update a
+  stored `true` is **cleared** when the resulting type is incapable.
+
+  This **supersedes** this decision's earlier wording, "A type change clears
+  it.", and with it the silent normalisation that wording invited — storing
+  `false` for a caller who explicitly asked for `true` and answering 200. The
+  reason is one sentence: a write that stores something other than what it was
+  asked to store is its own defect class, a write that lies about its result.
+  (The same argument the tree already makes at
+  `ErrApplicationProxyExcludedPortConflict`: "silently zeroing what the caller
+  asked for in the same breath would be a lie".)
+
+  What makes the pair usable is **assertion versus non-mention**. A retype that
+  does not mention the field asserts nothing, so clearing overrides nothing the
+  operator said; an explicit `true` against an incapable resulting type *is* an
+  assertion that cannot hold, so it is refused rather than quietly rewritten.
+  This works only because the request field is a **pointer** — absent and false
+  must stay distinguishable, which §4 already requires for decision (d)'s sake.
+  The rule is phrased over the *resulting* type, not over a transition, because
+  the runtime-spec write is a full-document PUT with no retype event
+  (decision (c)) — and because the invariant is a property of the resolved row,
+  which is the shape `applyProxyExclusion`'s own RULE 4 already argues for.
+
+  The invariant obtained: a stored `true` always means "this will inject once
+  the verdict allows" (decision (f)). No "on but inert" state exists — which is
+  the second reason for this variant, because part 2's operator control then
+  needs no indicator explaining why a switch is doing nothing.
 - **(f) Never optimistic** (part 2): injection happens only where the gateway
   already *knows* the upstream tolerates the key, through the existing
   three-layer `wantsLiveProgress` rule. No new guessing.
@@ -84,8 +114,9 @@ Scope:
    field, with `targetFrom` giving the spec precedence where it has one — the
    same precedence the modes already use.
 4. The portal accepts and returns it: a **pointer** on both request shapes, the
-   kind-dependent create default, the retype reset, and the hand-written DTO
-   mappers on both the application and the runtime-spec side.
+   kind-dependent create default, decision (e)'s 400 for an explicit `true` on
+   an incapable resulting type, the clear for an absent field on one, and the
+   hand-written DTO mappers on both the application and the runtime-spec side.
 
 ## 4. The hazards this design must survive
 
@@ -103,9 +134,12 @@ silent defect.
 - **The PostgreSQL leg skips silently** without
   `OP_AI_GATEWAY_TEST_POSTGRES_DSN`. This is a store change, so the leg is
   mandatory and its pass count must be stated, not assumed.
-- **A plain Go `bool` on a request shape kills decision (d).** Absent and false
-  are the same value, so the kind-dependent create default could never fire for
-  any client that sends the key. Both request shapes take a pointer.
+- **A plain Go `bool` on a request shape kills decisions (d) AND (e).** Absent
+  and false are the same value, so the kind-dependent create default could never
+  fire for any client that sends the key — and "the caller asserted `true`" could
+  never be told apart from "the caller said nothing", which is the distinction
+  decision (e)'s refuse-or-clear split rests on. Both request shapes take a
+  pointer.
 - **`putRequestFromDTO` is a hand-written spread and compiles without the new
   field.** Its own doc records that a defect of exactly this kind was already
   paid for once.
@@ -117,6 +151,15 @@ silent defect.
   `applicationTypeDefaults.ts` gains a per-type `true` and the form sends the key
   unconditionally, the backend's kind-dependent default can never fire. Part 1
   ships no frontend default at all.
+- **Decision (e)'s 400 reaches the portal form, not only API clients**
+  (part 2). `ApplicationSection.tsx`'s `buildBody()` is one literal reused
+  verbatim for create and update, so a field added there is restated on every
+  save — and a retype in the portal would then assert the flag against the new
+  type and earn a 400. The control must therefore gate *what it sends*, not
+  only what it renders, exactly as `proxy_excluded` already does
+  (`if (proxyExcluded === proxyExcludedSeed) delete body.proxy_excluded;`, with
+  the create path gated on whether the control was rendered at all). The
+  runtime-spec form is a full-document PUT and needs the same care.
 - **Renaming `data-model.md`'s "Migration history (79 migrations)" heading breaks
   seven anchor links.** Update them with it.
 
