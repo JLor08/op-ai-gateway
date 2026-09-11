@@ -48,9 +48,39 @@ These are settled; this document records them rather than arguing them.
   may not set `responses_live_timings_enabled` to **true** when the resulting
   type — the application type, or the runtime spec's effective type, that the
   write leaves behind — is not a live-timings-capable kind; such a request is
-  **rejected with 400**, naming the kind. An **absent** field is never a
-  rejection: on create the server picks by kind (decision (d)), and on update a
-  stored `true` is **cleared** when the resulting type is incapable.
+  **rejected**, naming the kind, with the status split by **where the offending
+  type came from**:
+
+  - **400** when the request itself **supplies** the incapable type alongside
+    the `true`. The request is internally contradictory and can be judged
+    without consulting stored state at all.
+  - **409** when the incapable type comes from **stored state** and the request
+    does not change it. The request is well-formed and collides with the
+    target's own state.
+
+  An **absent** field is never a rejection: on create the server picks by kind
+  (decision (d)), and on update a stored `true` is **cleared** when the
+  resulting type is incapable.
+
+  Why the split rather than one status for both shapes: a 400 on a request that
+  is well-formed is factually wrong, and this tree already draws exactly that
+  line — `ErrApplicationProxyExcludedPortConflict` carries "Conflict" in its
+  own name and answers **409** for precisely "the request SHAPE is fine, it
+  conflicts with the target's own state", which is the reading
+  `ErrServerManagedRuntimeOnly` established for the whole group
+  (`portal_application_endpoints.go:203-206`, `:220-221`). What tipped the
+  decision is an asymmetry rather than taste: there is no API client for this
+  field yet, so the correct version costs one extra sentinel and one extra
+  error-table row **today**, while changing a status code later is a breaking
+  change for something a client may by then branch on.
+
+  **409 reaches exactly one shape**, recorded here so nobody over-builds for
+  it: an application **update** that asserts `true` and does **not** name a
+  type. Create has no prior state, so every rejection there is a 400; and a
+  runtime-spec write is a full-document PUT that always carries its own
+  resulting type (decision (c)), so its rejection is a 400 as well. The
+  implementation addition is therefore **one branch** — "did the request name
+  the type?" — answerable because the request fields are pointers.
 
   This **supersedes** this decision's earlier wording, "A type change clears
   it.", and with it the silent normalisation that wording invited — storing
@@ -114,9 +144,11 @@ Scope:
    field, with `targetFrom` giving the spec precedence where it has one — the
    same precedence the modes already use.
 4. The portal accepts and returns it: a **pointer** on both request shapes, the
-   kind-dependent create default, decision (e)'s 400 for an explicit `true` on
-   an incapable resulting type, the clear for an absent field on one, and the
-   hand-written DTO mappers on both the application and the runtime-spec side.
+   kind-dependent create default, decision (e)'s refusal of an explicit `true`
+   on an incapable resulting type (400 when the request supplied that type, 409
+   on the one shape where it comes from stored state), the clear for an absent
+   field on one, and the hand-written DTO mappers on both the application and
+   the runtime-spec side.
 
 ## 4. The hazards this design must survive
 
@@ -155,7 +187,10 @@ silent defect.
   (part 2). `ApplicationSection.tsx`'s `buildBody()` is one literal reused
   verbatim for create and update, so a field added there is restated on every
   save — and a retype in the portal would then assert the flag against the new
-  type and earn a 400. The control must therefore gate *what it sends*, not
+  type and earn a 400. It is always the **400** shape and never the 409 one,
+  because that same literal restates `type` on every save, so the portal's
+  request always supplies the type it is judged against. The control must
+  therefore gate *what it sends*, not
   only what it renders, exactly as `proxy_excluded` already does
   (`if (proxyExcluded === proxyExcludedSeed) delete body.proxy_excluded;`, with
   the create path gated on whether the control was rendered at all). The

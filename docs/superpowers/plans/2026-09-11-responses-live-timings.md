@@ -34,8 +34,14 @@
   A run whose SKIP count is non-zero for a `postgres` subtest has **not** tested PostgreSQL — fix the DSN and re-run. Paste both counts into the task's commit body.
 - **`ActiveMappingsForModel` is the dangerous reader.** `applications` has THREE independently hand-maintained select lists (`internal/store/sqlite_applications.go:140-151`, `:159-166`, `:453-461`) feeding TWO scan functions, and `ActiveMappingsForModel` is the one that decides where live traffic goes. A column missed *there* reads back as a clean zero while every memory-backed portal test still passes (`docs/architecture/cross-cutting/persistence.md:425-435` records this). A test must fail if the column is missing from **that** query specifically — `TestConformanceApplicationReadersAgreeOnEveryColumn` (`application_column_parity_test.go:80`) is that test, and it only sees the new column once the column is seeded into `applicationParityBools`.
 - **A reordered select list does not fail loudly.** Both scan functions have fixed arity, so an *omitted* column errors at `Scan` ("expected N destination arguments"), but two same-typed columns **swapped** read each other's values silently. The guard is `applicationParityBools` (`application_column_parity_test.go:41-46`): one distinct, non-all-false bit pattern per integer-boolean column across three seeded rows. This plan widens it from `[4][3]bool` to `[5][3]bool` (a compile error if forgotten), adds the fifth pattern, seeds the field from it, appends the column name to the `names` list at `:228-231`, and fixes the `2^r >= 4` arithmetic comment at `:15-23` to `>= 5`. On the spec side the two copies of the column order — `runtimeSpecCols` (`sqlite_runtime.go:78-84`) and `runtimeSpecColsPrefixed` (`:86-96`) — must be edited **together**; a divergence produces a positionally wrong read only on `RuntimeSpecsByApplication`, the list read, so a spot check through `RuntimeSpecByMapping` looks fine.
-- **Request shapes take a POINTER, never a plain `bool`.** Absent and false are the same value for a plain `bool`, so the kind-dependent create default would be dead code for any client that sends the key — and the portal's own forms always send the whole body. The house precedent, with its own justification, is `ProxyExcluded *bool \`json:"proxy_excluded,omitempty"\`` at `internal/portal/service_applications.go:259-265`. `*bool` on `CreateApplicationRequest`, on `UpdateApplicationRequest`, and on `PutRuntimeSpecRequest`. A plain `bool` on the two **DTOs** (a DTO always states the stored value). The pointer carries a **second** load now: it is what separates an ASSERTION from a NON-MENTION, which is what decision (e) rests on — an explicit `true` on an incapable resulting type is a 400, an absent field on one is a clear. With a plain `bool` the two are the same request and neither rule can be written.
-- **Decision (e) is REJECTION, not normalisation** (settled 2026-09-11, superseding the earlier "a type change clears it"). A write may not store `true` for a row whose resulting kind cannot honour it, and it may not *quietly rewrite* such a request either: an explicit `responses_live_timings_enabled: true` against an incapable resulting type is **400, naming the kind**; an **absent** field is never refused — create takes the kind-dependent default, update **clears** a stored `true` when the resulting type is incapable. A 200 that stores something other than what it was asked to store is a write that lies about its result. The invariant this buys: a stored `true` always means "this will inject once part 2's verdict allows", so there is no "on but inert" state for a later operator control to have to explain. Tasks 6 and 7 own it; Tasks 1–5 are unaffected (the column, the structs and the predicate say nothing about request shapes).
+- **Request shapes take a POINTER, never a plain `bool`.** Absent and false are the same value for a plain `bool`, so the kind-dependent create default would be dead code for any client that sends the key — and the portal's own forms always send the whole body. The house precedent, with its own justification, is `ProxyExcluded *bool \`json:"proxy_excluded,omitempty"\`` at `internal/portal/service_applications.go:259-265`. `*bool` on `CreateApplicationRequest`, on `UpdateApplicationRequest`, and on `PutRuntimeSpecRequest`. A plain `bool` on the two **DTOs** (a DTO always states the stored value). The pointer carries a **second** load now: it is what separates an ASSERTION from a NON-MENTION, which is what decision (e) rests on — an explicit `true` on an incapable resulting type is refused, an absent field on one is a clear. With a plain `bool` the two are the same request and neither rule can be written. `UpdateApplicationRequest.Type *string` carries a third: whether the request NAMED the type is what selects the refusal's status (the next bullet), and it is read as `req.Type != nil`, never by comparing the value to the stored one.
+- **Decision (e) is REJECTION, not normalisation, and the rejection has TWO statuses** (settled 2026-09-11, superseding the earlier "a type change clears it" and the single-400 wording that replaced it). A write may not store `true` for a row whose resulting kind cannot honour it, and it may not *quietly rewrite* such a request either. An explicit `responses_live_timings_enabled: true` against an incapable **resulting** type is refused, naming the kind, with the status split by where that type came from:
+  - **400** when the REQUEST ITSELF supplies the incapable type alongside the `true` — the body is internally contradictory and can be judged without consulting stored state at all;
+  - **409** when the incapable type comes from STORED STATE and the request does not change it — the request is well-formed and collides with the target's own state.
+
+  An **absent** field is never refused on either status — create takes the kind-dependent default, update **clears** a stored `true` when the resulting type is incapable. A 200 that stores something other than what it was asked to store is a write that lies about its result; a 400 on a request that is well-formed is a second, smaller lie, and this tree already draws that line — `ErrApplicationProxyExcludedPortConflict` carries "Conflict" in its own name, and it plus the two proxy sentinels beside it answer 409 for exactly "the request SHAPE is fine, it conflicts with the target's own state", the reading `ErrServerManagedRuntimeOnly` established for the group (`internal/gateway/portal_application_endpoints.go:203-206`, `:220-221`). What tipped it: no API client consumes this field yet, so the correct version costs one extra sentinel and one extra error-row **today**, while moving a status code later is a breaking change for something a client may by then branch on.
+
+  **409 reaches exactly ONE shape** — an application PATCH that asserts `true` and does **not** send `type`. Create has no prior state, so every rejection in Task 6's create path is a 400; a runtime-spec PUT is a full document that always carries its own resulting type, so every rejection in Task 7 is a 400 and Task 7 adds no 409 at all. The whole implementation addition is one branch, `req.Type != nil`. The invariant all of it buys: a stored `true` always means "this will inject once part 2's verdict allows", so there is no "on but inert" state for a later operator control to have to explain. Tasks 6 and 7 own this; Tasks 1–5 are unaffected (the column, the structs and the predicate say nothing about request shapes).
 - **`putRequestFromDTO` is a hand-written spread that compiles without the new field** (`internal/portal/service_runtime_benchmark.go:30-58`). Its own doc (`:16-22`) records that this exact class of defect was already paid for once: a spec write assembled from a hand-picked field list quietly reset the operator's binary path, args, timeouts and GPU rows while a narrow test passed. `TestPutRequestFromDTOCoversEveryWritableField` (`service_runtime_benchmark_test.go:78-204`) catches it by comparing JSON **tag names** in both directions — so the `bool` DTO field and the `*bool` request field pass that half, and the `reflect.DeepEqual` half then needs the pointer conversion to be right.
 - **The DTO mappers are hand-written and the application side has no coverage test.** `applicationDTO` (`service_applications.go:836-870`) and `runtimeSpecDTO` (`service_runtime.go:1158-1194`) are literals; a field added to a DTO but not to its mapper is the Go zero value on the wire, with no compile error and a 200 OK. The spec side is guarded by the reflection test above; the application side must be walked by hand and pinned by an explicit assertion.
 - **One name in every layer.** Column `responses_live_timings_enabled`; Go field `ResponsesLiveTimingsEnabled` on `routing.Application`, `routing.RuntimeSpec`, `routing.Target`, `ApplicationDTO`, `CreateApplicationRequest`, `UpdateApplicationRequest`, `RuntimeSpecDTO`, `PutRuntimeSpecRequest`; JSON tag `responses_live_timings_enabled`. `Target.OpportunisticMetrics` drops its `Enabled` suffix, but uniformity is worth more here than that one precedent — do not shorten the name in any layer.
@@ -60,11 +66,11 @@ Production:
 - `gateway/backend/internal/routing/store.go` — `Application.ResponsesLiveTimingsEnabled` and `RuntimeSpec.ResponsesLiveTimingsEnabled`, the fields both SQL drivers round-trip and `MemoryStore` carries for free.
 - `gateway/backend/internal/routing/resolver.go` — `Target.ResponsesLiveTimingsEnabled` and the spec-precedence seeding in `targetFrom`.
 - `gateway/backend/internal/routing/live_timings.go` (new) — `LiveTimingsCapableKind(kind string) bool`, the exported two-kind set the portal's create default reads. The only new production file.
-- `gateway/backend/internal/portal/service_applications.go` — the new sentinel `ErrApplicationResponsesLiveTimingsUnsupported`; the field on `ApplicationDTO` (`bool`), on `CreateApplicationRequest` (`*bool`) and on `UpdateApplicationRequest` (`*bool`); the kind-dependent create default; the explicit-`true`-on-an-incapable-resulting-type refusal on both write paths; the update arm and the absent-field clear; the `applicationDTO` mapper line.
+- `gateway/backend/internal/portal/service_applications.go` — **two** new sentinels, `ErrApplicationResponsesLiveTimingsUnsupported` (400: the request supplied the incapable type) and `ErrApplicationResponsesLiveTimingsConflict` (409: the incapable type is the stored one and the request does not touch it); the field on `ApplicationDTO` (`bool`), on `CreateApplicationRequest` (`*bool`) and on `UpdateApplicationRequest` (`*bool`); the kind-dependent create default; the explicit-`true`-on-an-incapable-resulting-type refusal on both write paths, with the update path choosing between the two sentinels on `req.Type != nil`; the update arm and the absent-field clear; the `applicationDTO` mapper line.
 - `gateway/backend/internal/portal/service_runtime.go` — the new sentinel `ErrRuntimeSpecResponsesLiveTimingsUnsupported`; the field on `RuntimeSpecDTO` (`bool`) and `PutRuntimeSpecRequest` (`*bool`); the `!hadExisting` kind-dependent default; the same refusal, over the spec's *effective* kind; the absent-field clear; the `runtimeSpecDTO` mapper line.
 - `gateway/backend/internal/portal/service_runtime_benchmark.go` — `putRequestFromDTO`'s spread gains the pointer conversion.
-- `gateway/backend/internal/gateway/portal_application_endpoints.go` — one `errRow` mapping the new application sentinel to 400, with `msgFn` so the message names the offending type. Without it the sentinel falls through to the 500 `application.request_failed` fallback — the pre-existing defect two rows in that same table already record.
-- `gateway/backend/internal/gateway/portal_runtime_endpoints.go` — the same one row for the runtime-spec sentinel in `portalRuntimeSpecErrRows`.
+- `gateway/backend/internal/gateway/portal_application_endpoints.go` — **two** `errRow`s, one per application sentinel: 400 for `…Unsupported`, 409 for `…Conflict`, both with `msgFn` so the message names the offending type. `errRow.status` is a plain `int` (`internal/gateway/error_map.go:21`) written verbatim by `writeMappedError` (`:75`), and `msgFn` (`:24`, honoured at `:72-74`) is independent of it, so the table expresses 409-with-a-dynamic-message with no change to the mechanism. Without a row a sentinel falls through to the 500 `application.request_failed` fallback — the pre-existing defect two rows in that same table already record.
+- `gateway/backend/internal/gateway/portal_runtime_endpoints.go` — one row for the single runtime-spec sentinel in `portalRuntimeSpecErrRows`, 400. No 409 on this side: a spec PUT is a full document and always carries the type it is judged against.
 
 Tests:
 
@@ -75,8 +81,8 @@ Tests:
 - `gateway/backend/internal/routing/resolver_live_timings_test.go` (new) — `targetFrom`'s precedence, all four cases.
 - `gateway/backend/internal/routing/live_timings_test.go` (new) — the capable-kind predicate over every provider constant.
 - `gateway/backend/internal/provider/live_progress_kind_parity_test.go` (new) — the drift tripwire: `liveProgressUpstreams`' keys and `routing.LiveTimingsCapableKind` must agree. Test-only; **no** production change in `internal/provider`.
-- `gateway/backend/internal/portal/service_applications_test.go` — create default per kind, explicit pointer both ways, absent-is-not-false, PATCH keep-if-nil, the retype clear, the two refusals (create and update) with nothing stored, DTO echo.
-- `gateway/backend/internal/gateway/portal_application_live_timings_test.go` (new) — the refusal's WIRE contract (400 + code + the type named in the message) on POST and PATCH. Modelled on `portal_application_endpoint_mode_test.go`.
+- `gateway/backend/internal/portal/service_applications_test.go` — create default per kind, explicit pointer both ways, absent-is-not-false, PATCH keep-if-nil, the retype clear, the three refusals (create, retype-plus-assert, assert-against-stored-state) each with nothing stored and each asserting WHICH of the two sentinels came back, DTO echo.
+- `gateway/backend/internal/gateway/portal_application_live_timings_test.go` (new) — the refusals' WIRE contract (status + code + the type named in the message) on POST and on both PATCH shapes, plus one subtest pinning that the two PATCH shapes do not share a status. Modelled on `portal_application_endpoint_mode_test.go`.
 - `gateway/backend/internal/portal/service_runtime_test.go` — spec create default per effective kind, no-inheritance, update-preserves, absent-is-not-false, the incapable-kind refusal, the absent-field clear, DTO echo.
 - `gateway/backend/internal/gateway/portal_runtime_endpoints_test.go` — the spec refusal's wire contract, beside the existing `…PutBadTypeReturns400`.
 - `gateway/backend/internal/portal/service_runtime_benchmark_test.go` — the fully-populated DTO in `TestPutRequestFromDTOCoversEveryWritableField` gains the field.
@@ -874,38 +880,51 @@ Then add `ProviderOllama: {},` to `liveTimingsCapableKinds` in `internal/routing
 ### Task 6: The portal's application surface — accept, default, refuse, clear, return
 
 **Files:**
-- Modify: `gateway/backend/internal/portal/service_applications.go` (the `"fmt"` import; the new sentinel after `ErrApplicationProxyEntryScheme` at `:76`; `ApplicationDTO` field after `:205`; `CreateApplicationRequest` field after `:255`; `UpdateApplicationRequest` field after `:297`; the create refusal + default after the `messagesMode` block at `:381`, assigned in the literal after `:471`; the update refusal in the validate-before-mutate block after `:609`; the update arm + clear after `:733`; the `applicationDTO` mapper line after `:862`)
-- Modify: `gateway/backend/internal/gateway/portal_application_endpoints.go` (one `errRow` in `portalApplicationErrRows`, after `:223`)
+- Modify: `gateway/backend/internal/portal/service_applications.go` (the `"fmt"` import; the **two** new sentinels after `ErrApplicationProxyEntryScheme` at `:76`; `ApplicationDTO` field after `:205`; `CreateApplicationRequest` field after `:255`; `UpdateApplicationRequest` field after `:297`; the create refusal + default after the `messagesMode` block at `:381`, assigned in the literal after `:471`; the update refusal in the validate-before-mutate block after `:609`; the update arm + clear after `:733`; the `applicationDTO` mapper line after `:862`)
+- Modify: `gateway/backend/internal/gateway/portal_application_endpoints.go` (**two** `errRow`s in `portalApplicationErrRows`, after `:223`)
 - Modify: `gateway/backend/internal/portal/service_applications_test.go` (new tests; leave `TestApplicationBenchmarkModesCreatePatchAndValidation` at `:353` and `TestCreateApplicationEndpointModeDefaultsToPassthrough` at `:546` untouched and passing)
 - Create: `gateway/backend/internal/gateway/portal_application_live_timings_test.go`
 
 **Interfaces:**
-- Consumes: `routing.LiveTimingsCapableKind(kind string) bool` (Task 5); `routing.Application.ResponsesLiveTimingsEnabled bool` (Task 2); `normalizeApplicationType(raw string) (string, error)` (`service_applications.go:1000-1017`, the closed six-value set — `ollama`, `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent` — resolved at `:347` before every other normalization).
-- Produces: JSON key `responses_live_timings_enabled` — `bool` on `ApplicationDTO`, `*bool` on `CreateApplicationRequest` and on `UpdateApplicationRequest`; and **one new error sentinel**, `portal.ErrApplicationResponsesLiveTimingsUnsupported` (`errors.New("application.responses_live_timings_unsupported")`), mapped to HTTP 400 with a message that names the offending type.
+- Consumes: `routing.LiveTimingsCapableKind(kind string) bool` (Task 5, `internal/routing/live_timings.go:44`, a case- and whitespace-sensitive map hit over exactly `"llama_cpp"` and `"vllm"`); `routing.Application.ResponsesLiveTimingsEnabled bool` (Task 2); `normalizeApplicationType(raw string) (string, error)` (`service_applications.go:1000-1017`, the closed six-value set — `ollama`, `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent` — resolved at `:347` before every other normalization). Note what that set does **not** contain: **`mock` is not an accepted application type**, so `routing.ProviderMock` is unreachable from this path — a body with `"type":"mock"` dies on `ErrApplicationTypeInvalid` at `:347`, long before any live-timings check. Task 5's predicate answers `false` for it, correctly, but no message or test in THIS task may imply an operator can send it.
+- Produces: JSON key `responses_live_timings_enabled` — `bool` on `ApplicationDTO`, `*bool` on `CreateApplicationRequest` and on `UpdateApplicationRequest`; and **two new error sentinels**:
+  - `portal.ErrApplicationResponsesLiveTimingsUnsupported` (`errors.New("application.responses_live_timings_unsupported")`) → HTTP **400**, for a request that supplied the incapable type itself;
+  - `portal.ErrApplicationResponsesLiveTimingsConflict` (`errors.New("application.responses_live_timings_conflict")`) → HTTP **409**, for a request that asserts `true` against a type it did not send and therefore did not change.
+
+  Both carry a message naming the offending type. Two sentinels rather than one, because **one validation computes both outcomes** and the HTTP layer maps by sentinel identity (`errors.Is` against `errRow.err`, `internal/gateway/error_map.go:68-78`) and has nothing else to branch on.
 
 **The rule this task implements, stated once.** `responses_live_timings_enabled` is stored `true` only on a row whose upstream kind is live-timings capable — and a request that *asks* for `true` on a kind that is not is **refused**, never rewritten. The pointer is what makes that possible: it separates an **assertion** from a **non-mention**, and the two get opposite treatment.
 
-- **Create**: absent → `routing.LiveTimingsCapableKind(appType)` (decision (d): a newly created llama.cpp or vLLM application gets it on); explicit `false` → honoured on every kind; explicit `true` on a kind that is not capable → **400**, naming the type, with nothing persisted.
-- **Update**: the *resulting* type is the authority — `appType` when this PATCH retypes, the stored `app.Type` otherwise. An explicit `true` against an incapable resulting type → **400** (so a body that retypes *and* asserts `true` in one breath is judged on the new type, not the old one). Absent → keep the stored value, except that an incapable resulting type **clears** it.
+- **Create**: absent → `routing.LiveTimingsCapableKind(appType)` (decision (d): a newly created llama.cpp or vLLM application gets it on); explicit `false` → honoured on every kind; explicit `true` on a kind that is not capable → **400** (`…Unsupported`), naming the type, with nothing persisted. **Create is 400 and only ever 400**: `CreateApplicationRequest.Type` is a plain `string` (`:230`), so the type always comes from the request, and there is no prior state for anything to conflict with. Do not add a stored-state branch to the create path — there is nothing for it to read.
+- **Update**: the *resulting* type is the authority — `appType` when this PATCH retypes, the stored `app.Type` otherwise. An explicit `true` against an incapable resulting type is refused, and the **status depends on where that type came from**:
+  - `req.Type != nil` → the request named the type, so the body is self-contradictory on its own terms: **400** (`…Unsupported`). This is the retype-and-assert-in-one-breath body, judged on the new type, not the old one.
+  - `req.Type == nil` → the incapable type is the one already stored, and this request does not change it: the body is well-formed and collides with the application's own state: **409** (`…Conflict`).
+
+  Absent flag → keep the stored value, except that an incapable resulting type **clears** it.
+- The status branch reads **`req.Type != nil`, never a value comparison.** A PATCH that restates the same incapable type it already had still *supplied* that type, so it is the 400 shape; deriving the status from `*req.Type != app.Type` instead would make it depend on whether the operator's form happened to change a field the client cannot see — and would put the portal's own saves in the 409 bucket, since `ApplicationSection.tsx`'s `buildBody()` restates `type` on every save (`gateway/frontend/src/components/ApplicationSection.tsx:391`).
+- Why the split at all: a 400 on a well-formed request is factually wrong, and this table already draws the line — `ErrServerManagedRuntimeOnly` answers 409 for "the request shape is fine, it is simply refused given the server's current state" (`internal/gateway/portal_application_endpoints.go:203-206`), and the three proxy sentinels for "the request SHAPE is fine, it conflicts with the target's own state" (`:220-221`). It costs one extra sentinel and one extra error-row now; it would be a breaking change to any client branching on the status later.
 - Why a clear is legitimate where a silent rewrite is not: a retype that says nothing about the flag has asserted nothing, so clearing overrides nothing the operator said. An explicit `true` that cannot hold *is* an assertion, and answering 200 while storing `false` would be a write that lies about its result — the argument `ErrApplicationProxyExcludedPortConflict`'s own doc already makes at `:64-69` ("silently zeroing what the caller asked for in the same breath would be a lie").
-- The clear is gated on the resulting **type**, not on `req.Type != nil`, deliberately: the invariant is a property of the resolved row, not of the request's shape. That is the same reasoning `applyProxyExclusion`'s RULE 4 spells out at `:1100-1125`, where a request-shape-only check was found to be exactly the hole through which the bad state arrived.
+- The **clear** is gated on the resulting **type**, not on `req.Type != nil`, deliberately: the invariant is a property of the resolved row, not of the request's shape. That is the same reasoning `applyProxyExclusion`'s RULE 4 spells out at `:1100-1125`, where a request-shape-only check was found to be exactly the hole through which the bad state arrived. Note that the two rules read the request differently on purpose, and this is the one place in the task where that is easy to get wrong: **whether to refuse** is a property of the row (the resulting type), **which status to refuse with** is a property of the request (did it name the type), and **whether to clear** is again a property of the row.
 - The invariant obtained, in one sentence: **a stored `true` always means the row's kind can honour it.** No "on but inert" state exists, which is what lets part 2 ship a switch with no indicator explaining why it is doing nothing.
+
+**An option this task MAY take, not a requirement.** Task 5 shipped its capable-kind set unexported, with `TestLiveTimingsCapableKindsSizeIsPinned` (`internal/routing/live_timings_test.go:116-124`) as a deliberate stand-in: a size pin forces a *look* at `internal/provider`'s `liveProgressUpstreams` when the set changes, but it proves no agreement, and both that test's doc (`:102-115`) and the provider-side tripwire's (`internal/provider/live_progress_kind_parity_test.go:63-72`) record why it stopped there — closing the gap needed "an exported accessor for this set, i.e. production API whose only caller is a test". That objection expires with this task: Task 6 adds the **first real production caller** of the predicate. So if Step 1's tests end up enumerating kinds anyway, exporting the set from `routing` (e.g. a `LiveTimingsCapableKinds() []string` beside the predicate) would have a production caller and a test caller, and `internal/provider`'s `capable ⇒ gate` direction could range over the real set instead of a hand-listed enumeration — which would let the size pin be deleted rather than maintained. Do it or do not; if not, change nothing about Task 5, and do not weaken the size pin.
 
 - [ ] **Step 1: Write the failing service tests.**
 
 In `service_applications_test.go`, add these, using the fixture the neighbouring application tests use — `svc, routeStore := newServerTestService(t, now)` plus `server := createTestServer(t, svc, "S", "s.example.test")` and `ownerToken()` (they run on `routing.NewMemoryStore()`, so no DSN is needed here):
 
-1. `TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind` — create with the key **absent** for each of the six types `normalizeApplicationType` accepts; assert the returned DTO's `ResponsesLiveTimingsEnabled` is `true` for `routing.ProviderLlamaCPP` and `routing.ProviderVLLM` and `false` for `routing.ProviderOllama`, `routing.ProviderLlamaSwap`, `routing.ProviderLiteLLM` and `routing.ProviderServerAgent`. Two fixture facts the service enforces and the table must respect: at most **one** `server_agent` application per server (`serverAgentApplicationExistsOnServer`, called from the create path at `service_applications.go:427-434`, backed by `idx_applications_single_server_agent` from migration 68 at `migrate.go:3149`), and a server with `ManagedRuntimeOnly` set refuses every other type (`:344`) — so seed an ordinary server and put the `server_agent` case on a server of its own, or run each case against a fresh server. The comment must say why `server_agent` is `false` and cannot be anything else: at create time a `server_agent` application has no binary, no spec type and no mappings — specs are per-mapping and created later by `PutRuntimeSpec` — so the real per-kind default for a managed runtime is applied on the spec path (Task 7), not here.
+1. `TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind` — create with the key **absent** for each of the six types `normalizeApplicationType` accepts; assert the returned DTO's `ResponsesLiveTimingsEnabled` is `true` for `routing.ProviderLlamaCPP` and `routing.ProviderVLLM` and `false` for `routing.ProviderOllama`, `routing.ProviderLlamaSwap`, `routing.ProviderLiteLLM` and `routing.ProviderServerAgent`. Two fixture facts the service enforces and the table must respect: at most **one** `server_agent` application per server (`serverAgentApplicationExistsOnServer`, called from the create path at `service_applications.go:427-434`, backed by `idx_applications_single_server_agent` from migration 68 at `migrate.go:3149`), and a server with `ManagedRuntimeOnly` set refuses every other type (`:344`) — so seed an ordinary server and put the `server_agent` case on a server of its own, or run each case against a fresh server. The comment must say why `server_agent` is `false` and cannot be anything else: at create time a `server_agent` application has no binary, no spec type and no mappings — specs are per-mapping and created later by `PutRuntimeSpec` — so the real per-kind default for a managed runtime is applied on the spec path (Task 7), not here. **Six rows, not seven**: there is no `routing.ProviderMock` row, because `normalizeApplicationType` does not accept `mock` — such a row would fail on `ErrApplicationTypeInvalid` before reaching anything this task added, and would prove nothing about the default. (`mock`'s `false` is pinned where it is reachable, in Task 5's predicate table.)
 2. `TestCreateApplicationResponsesLiveTimingsAbsentIsNotFalse` — create a `llama_cpp` application with the key **absent** and assert `true`; create a second `llama_cpp` application (different port) with `ResponsesLiveTimingsEnabled: boolPtr(false)` and assert `false`; reload both through `GetApplication` to assert the values were **stored**, not just echoed. This is the pointer's whole purpose in one test: with a plain `bool` these are the same request and one of the two assertions must fail. Say that in the doc comment.
 3. `TestCreateApplicationResponsesLiveTimingsHonoursAnExplicitFalseOnAnIncapableKind` — create a `litellm` application with `boolPtr(false)`; assert no error and a stored `false`. An explicit `false` is never refused on any kind: it asks for nothing the kind cannot do.
-4. `TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind` — create a `litellm` application with `boolPtr(true)`. Assert three things: `errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported)`; `strings.Contains(err.Error(), routing.ProviderLiteLLM)` (the message must name the kind, which is the point of refusing rather than rewriting); and that **nothing was stored** — `svc.ListApplications(ctx, ownerToken(), server.ID)` reports zero rows for that server. The last assertion is the one that distinguishes a refusal from a rewrite, so it is not optional.
+4. `TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind` — create a `litellm` application with `boolPtr(true)`. Assert four things: `errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported)`; **`!errors.Is(err, ErrApplicationResponsesLiveTimingsConflict)`**, because the create path has no prior state to conflict with and must never reach for the 409 sentinel; `strings.Contains(err.Error(), routing.ProviderLiteLLM)` (the message must name the kind, which is the point of refusing rather than rewriting); and that **nothing was stored** — `svc.ListApplications(ctx, ownerToken(), server.ID)` reports zero rows for that server. The last assertion is the one that distinguishes a refusal from a rewrite, so it is not optional. The doc comment must say that **create is always the 400 sentinel**: `CreateApplicationRequest.Type` is a plain `string`, so the type is always the request's own, on every create, for every kind.
 5. `TestUpdateApplicationResponsesLiveTimingsKeepsIfNil` — create `llama_cpp` with the flag on; PATCH with only `Port` set; assert the flag survives and `Port` changed. (The house keep-if-nil discipline, mirroring `TestUpdateApplicationPartialUpdatePreservesOtherFields` at `:1067`.)
 6. `TestUpdateApplicationResponsesLiveTimingsFlipsBothWays` — PATCH `boolPtr(false)` then `boolPtr(true)` on a `llama_cpp` application; assert each is stored.
 7. `TestUpdateApplicationRetypeAwayFromACapableKindClearsResponsesLiveTimings` — create `llama_cpp` with the flag on, then PATCH `Type: strPtr(routing.ProviderLiteLLM)` **and nothing else**. Assert the reload reports `ResponsesLiveTimingsEnabled == false` **and** `Type == routing.ProviderLiteLLM`, and assert it was `true` before the PATCH — a clearing test must show the stored value actually *changed*, otherwise it passes against a field that was never set.
-8. `TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected` — the same `llama_cpp` application with the flag on, PATCHed with `Type: strPtr(routing.ProviderLiteLLM)` **together with** `ResponsesLiveTimingsEnabled: boolPtr(true)`. Assert the sentinel, that the message names `litellm` (the **new** type — the refusal is judged on the resulting type, not the stored one), and that the reload still reports `Type == routing.ProviderLlamaCPP` **and** the flag still `true`: a refused PATCH writes nothing at all, not even the type.
-9. `TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind` — create `ollama` (so the flag is off), then PATCH `ResponsesLiveTimingsEnabled: boolPtr(true)` with **no** `Type`. Assert the sentinel and that the message names `ollama`. This is the leg that proves the rule is phrased over the resulting type rather than over a retype: there is no transition here at all.
-10. `TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn` — create `ollama` (flag off), PATCH `Type: strPtr(routing.ProviderLlamaCPP)`; assert the flag is still `false`. Decision (d) scopes the `1` to CREATE; a retype must not silently switch a feature on.
-11. `TestApplicationDTOCarriesResponsesLiveTimings` — store an application with the flag on directly through the routes store (`routeStore.CreateApplication(ctx, routing.Application{ID: "app_dto_lt", ServerID: server.ID, Type: routing.ProviderLlamaCPP, Port: 8300, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, ResponsesLiveTimingsEnabled: true, CreatedAt: now, UpdatedAt: now})`, the same direct-store seeding `seedServerAgentApplication` does in `service_runtime_test.go:32-48` and for the same reason), then read it through `ListApplications` **and** `GetApplication`; assert both report `true`. This is the only guard on the hand-written `applicationDTO` mapper: a field on the DTO but not in the mapper is the Go zero value with no compile error.
+8. `TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected` — the same `llama_cpp` application with the flag on, PATCHed with `Type: strPtr(routing.ProviderLiteLLM)` **together with** `ResponsesLiveTimingsEnabled: boolPtr(true)`. Assert `errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported)` — the **400** sentinel, because the request supplied the offending type itself — and `!errors.Is(err, ErrApplicationResponsesLiveTimingsConflict)`; that the message names `litellm` (the **new** type — the refusal is judged on the resulting type, not the stored one); and that the reload still reports `Type == routing.ProviderLlamaCPP` **and** the flag still `true`: a refused PATCH writes nothing at all, not even the type.
+9. `TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind` — create `ollama` (so the flag is off), then PATCH `ResponsesLiveTimingsEnabled: boolPtr(true)` with **no** `Type`. Assert `errors.Is(err, ErrApplicationResponsesLiveTimingsConflict)` — the **409** sentinel, because the offending type is the stored one and this request does not change it — and `!errors.Is(err, ErrApplicationResponsesLiveTimingsUnsupported)`; that the message names `ollama`; and that the reload still reports the flag `false`, so nothing was written. This is the leg that proves two separate things at once, and the doc comment must name both: that the rule is phrased over the resulting type rather than over a retype (there is no transition here at all), and that the two refusal shapes return **different** sentinels — the single-sentinel implementation is the likely slip, and this pair of `errors.Is` assertions with test 8's is what catches it inside the service, before the wire test sees it.
+10. `TestUpdateApplicationResponsesLiveTimingsRestatingTheSameIncapableTypeIsTheRequestsOwnAssertion` — create `ollama`, then PATCH `Type: strPtr(routing.ProviderOllama)` (the **same** type it already has) **together with** `ResponsesLiveTimingsEnabled: boolPtr(true)`. Assert the **`…Unsupported`** sentinel, not `…Conflict`. Nothing changed about the row, yet the request still supplied the type it is being judged against, so it is the 400 shape. This is the test that fails if the status branch is written as `req.Type != nil && *req.Type != app.Type` instead of `req.Type != nil` — and nothing else in this list would notice, because every other leg either omits `type` or changes it.
+11. `TestUpdateApplicationRetypeToACapableKindDoesNotSwitchItOn` — create `ollama` (flag off), PATCH `Type: strPtr(routing.ProviderLlamaCPP)`; assert the flag is still `false`. Decision (d) scopes the `1` to CREATE; a retype must not silently switch a feature on.
+12. `TestApplicationDTOCarriesResponsesLiveTimings` — store an application with the flag on directly through the routes store (`routeStore.CreateApplication(ctx, routing.Application{ID: "app_dto_lt", ServerID: server.ID, Type: routing.ProviderLlamaCPP, Port: 8300, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, ResponsesLiveTimingsEnabled: true, CreatedAt: now, UpdatedAt: now})`, the same direct-store seeding `seedServerAgentApplication` does in `service_runtime_test.go:32-48` and for the same reason), then read it through `ListApplications` **and** `GetApplication`; assert both report `true`. This is the only guard on the hand-written `applicationDTO` mapper: a field on the DTO but not in the mapper is the Go zero value with no compile error.
 
 The package already has the two pointer helpers these tests need — `func strPtr(s string) *string` and `func boolPtr(b bool) *bool`, both at `internal/portal/service_test.go:1345-1346`, and both already used by `TestApplicationBenchmarkModesCreatePatchAndValidation` (`:394-409`). Use them; do not add a second pair. `errors` and `strings` are already imported by this test file.
 
@@ -913,23 +932,44 @@ The package already has the two pointer helpers these tests need — `func strPt
 
 The service returning an error is only half the contract: a sentinel that is not in `portalApplicationErrRows` falls through to the 500 `application.request_failed` fallback, which two rows in that table already record as a defect paid for once (`portal_application_endpoints.go:212-219`). Pin the wire contract before writing either half.
 
-Create `gateway/backend/internal/gateway/portal_application_live_timings_test.go` (`package gateway`, SPDX header as in `portal_application_endpoint_mode_test.go:1-2`, imports `encoding/json`, `net/http`, `net/http/httptest`, `strings`, `testing`), modelled line for line on `TestPortalApplicationEndpointModeErrorsReachTheWire` (`portal_application_endpoint_mode_test.go:26-66`) — including its reuse of `newProxyExclusionTestServer` (`portal_application_proxy_excluded_test.go:14`), which POSTs a plain AI server and returns its id. Do **not** add a second server helper.
+Create `gateway/backend/internal/gateway/portal_application_live_timings_test.go` (`package gateway`, SPDX header as in `portal_application_endpoint_mode_test.go:1-2`, imports `net/http`, `net/http/httptest`, `strings`, `testing`), modelled on `TestPortalApplicationEndpointModeErrorsReachTheWire` (`portal_application_endpoint_mode_test.go:26-66`) — including its reuse of `newProxyExclusionTestServer` (`portal_application_proxy_excluded_test.go:14`), which POSTs a plain AI server and returns its id. Do **not** add a second server helper.
+
+Three of the four subtests need an existing application to PATCH. **Do not write a helper for that**: `createTestApplication(t *testing.T, srv *Server, serverID string, body string) string` already exists in this package (`server_test.go:4281-4295`) and does exactly the POST-and-return-the-id dance, asserting 201 on the way. The endpoint-mode test next door inlines it by hand; reuse the helper instead — which is why the import list above has no `encoding/json` in it. The one subtest that does **not** use the helper is the create refusal, because the helper asserts 201 and that request must answer 400.
 
 ```go
 // TestPortalApplicationLiveTimingsRefusalReachesTheWire pins the WIRE
-// contract (status + code + the offending type in the MESSAGE) of
-// portal.ErrApplicationResponsesLiveTimingsUnsupported on both the create
-// (POST) and update (PATCH) paths.
+// contract (status + code + the offending type in the MESSAGE) of BOTH
+// live-timings refusal sentinels, across the three request shapes that can
+// produce one, plus a fourth subtest pinning the two PATCH shapes apart.
 //
-// The message assertion is not decoration: the whole reason this request is
-// refused instead of quietly stored as false is that the caller asked for
-// something this row cannot do, and a 400 that does not say WHICH kind
-// cannot do it leaves them no better off than the silent rewrite would have.
+// The two statuses are the point of the test, not an incidental detail:
+//
+//   - 400 application.responses_live_timings_unsupported when the REQUEST
+//     supplied the incapable type -- a create (whose "type" is always the
+//     request's own) and a PATCH that sends "type" alongside the flag. Such a
+//     body is self-contradictory and needs no stored row to judge it.
+//   - 409 application.responses_live_timings_conflict when the PATCH asserts
+//     the flag and does NOT send "type" -- the request is well-formed and
+//     collides with the application's own stored state. That is the
+//     distinction ErrServerManagedRuntimeOnly already records in the same
+//     table ("the request shape is fine, it is simply refused given the
+//     server's current state", portal_application_endpoints.go:203-206).
+//
+// The last subtest compares the two PATCH statuses directly, because the
+// likely implementation slip is ONE sentinel returned for both shapes: that
+// version passes every service-level errors.Is check written loosely, and it
+// passes two of the three shape subtests here as well.
+//
+// The message assertion is not decoration either: the whole reason this
+// request is refused instead of quietly stored as false is that the caller
+// asked for something this row cannot do, and a refusal that does not say
+// WHICH kind cannot do it leaves them no better off than the silent rewrite
+// would have.
 func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 	srv := NewTestServerWithGroups([]string{"gateway:use", "admin"})
 	serverID := newProxyExclusionTestServer(t, srv, "live-timings.example.test")
 
-	t.Run("create true on an incapable kind", func(t *testing.T) {
+	t.Run("create true on an incapable kind is 400", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		body := `{"type":"litellm","port":8100,"scheme":"http","responses_live_timings_enabled":true}`
 		srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications", body))
@@ -940,25 +980,14 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 			t.Fatalf("error code = %q, want application.responses_live_timings_unsupported, body = %s", code, rec.Body.String())
 		}
 		if !strings.Contains(rec.Body.String(), "litellm") {
-			t.Fatalf("the 400 does not name the offending kind: %s", rec.Body.String())
+			t.Fatalf("the refusal does not name the offending kind: %s", rec.Body.String())
 		}
 	})
 
-	t.Run("retype plus true on the new incapable kind", func(t *testing.T) {
-		createRec := httptest.NewRecorder()
-		srv.ServeHTTP(createRec, newJSONRequest(http.MethodPost, "/api/portal/servers/"+serverID+"/applications",
-			`{"type":"llama_cpp","port":8101,"scheme":"http"}`))
-		if createRec.Code != http.StatusCreated {
-			t.Fatalf("create application status = %d, body = %s", createRec.Code, createRec.Body.String())
-		}
-		var created struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
-			t.Fatalf("unmarshal application: %v, body = %s", err, createRec.Body.String())
-		}
+	t.Run("retype plus true on the new incapable kind is 400", func(t *testing.T) {
+		appID := createTestApplication(t, srv, serverID, `{"type":"llama_cpp","port":8101,"scheme":"http"}`)
 		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+created.ID,
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+appID,
 			`{"type":"litellm","responses_live_timings_enabled":true}`))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
@@ -966,11 +995,50 @@ func TestPortalApplicationLiveTimingsRefusalReachesTheWire(t *testing.T) {
 		if code := errorBodyOf(t, rec); code != "application.responses_live_timings_unsupported" {
 			t.Fatalf("error code = %q, want application.responses_live_timings_unsupported, body = %s", code, rec.Body.String())
 		}
+		if !strings.Contains(rec.Body.String(), "litellm") {
+			t.Fatalf("the refusal does not name the offending kind: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("true against a stored incapable kind, no type sent, is 409", func(t *testing.T) {
+		appID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8102,"scheme":"http"}`)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+appID,
+			`{"responses_live_timings_enabled":true}`))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409, body = %s", rec.Code, rec.Body.String())
+		}
+		if code := errorBodyOf(t, rec); code != "application.responses_live_timings_conflict" {
+			t.Fatalf("error code = %q, want application.responses_live_timings_conflict, body = %s", code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "ollama") {
+			t.Fatalf("the refusal does not name the offending kind: %s", rec.Body.String())
+		}
+	})
+
+	// The anti-slip pin. One sentinel returned for both PATCH shapes gives
+	// them the SAME status, and the two subtests above would then disagree
+	// about which one is wrong; this one says plainly what the invariant is.
+	t.Run("the two PATCH shapes do not share a status", func(t *testing.T) {
+		retypeID := createTestApplication(t, srv, serverID, `{"type":"llama_cpp","port":8103,"scheme":"http"}`)
+		retypeRec := httptest.NewRecorder()
+		srv.ServeHTTP(retypeRec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+retypeID,
+			`{"type":"litellm","responses_live_timings_enabled":true}`))
+
+		storedID := createTestApplication(t, srv, serverID, `{"type":"ollama","port":8104,"scheme":"http"}`)
+		storedRec := httptest.NewRecorder()
+		srv.ServeHTTP(storedRec, newJSONRequest(http.MethodPatch, "/api/portal/applications/"+storedID,
+			`{"responses_live_timings_enabled":true}`))
+
+		if retypeRec.Code == storedRec.Code {
+			t.Fatalf("both refusal shapes answered %d: the request-supplied type (400) and the stored type (409) must not collapse into one status -- check that the service returns TWO sentinels and that both have their own errRow",
+				retypeRec.Code)
+		}
 	})
 }
 ```
 
-Note on the status: 400, per the settled decision, on **both** shapes. The house's closest precedent would argue 409 for the second one (`ErrServerManagedRuntimeOnly`'s doc at `portal_application_endpoints.go:203-206`: "the request shape is fine, it is simply refused given the server's current state"), and the decision overrides that on purpose — the type and the flag are **one assertion about the resulting row**, judged together, so a body that cannot describe a coherent row is a malformed request rather than a state conflict. Do not "fix" this to 409.
+Note on the two statuses, so nobody "fixes" one into the other. The split is the settled decision: 400 where the request itself supplies the incapable type (create, and a PATCH that sends `type`), 409 where the incapable type is the stored one and the request leaves it alone. `errRow.status` is a plain `int` written verbatim by `writeMappedError`, and `msgFn` is honoured regardless of status (`internal/gateway/error_map.go:21`, `:24`, `:72-75`), so both rows are ordinary entries in the same table — nothing about the mechanism has to change to express a 409 with a dynamic message, and no row does it yet (the three `msgFn` rows in this package are all 400: `agent_runtime.go:479`, `agent_ingest.go:1774`, `:1912`).
 
 - [ ] **Step 3: Run them and watch them fail.**
 
@@ -979,7 +1047,7 @@ cd /Users/jlor08/Developer/codex/op-ai-gateway/.worktrees/responses-live-timings
 go test ./internal/portal/ -run 'ResponsesLiveTimings' -count=1
 go test ./internal/gateway/ -run 'LiveTimingsRefusalReachesTheWire' -count=1
 ```
-Expected: compile failures on the unknown DTO/request fields and on the unknown sentinel.
+Expected: compile failures on the unknown DTO/request fields and on both unknown sentinels.
 
 - [ ] **Step 4: The DTO field.**
 
@@ -991,7 +1059,8 @@ In `ApplicationDTO`, after `OpportunisticMetricsEnabled bool \`json:"opportunist
 	// (migration 80). Set from the RAW column and always the STORED value --
 	// which, given the write paths' refusal rule, is also always a value this
 	// application's TYPE can honour: a create/update that asks for true on a
-	// kind that cannot is refused with 400, never stored as false.
+	// kind that cannot is refused -- 400 when the request supplied that kind,
+	// 409 when it is the stored one -- and never stored as false.
 	ResponsesLiveTimingsEnabled bool `json:"responses_live_timings_enabled"`
 ```
 
@@ -1023,21 +1092,27 @@ In `UpdateApplicationRequest`, after `OpportunisticMetricsEnabled *bool` (`:297`
 	// ResponsesLiveTimingsEnabled: nil = keep the stored value, the house
 	// sentinel -- except that a nil against a resulting type that cannot
 	// honour the flag CLEARS it, and a non-nil true against such a type is
-	// refused. See UpdateApplication.
+	// refused. Whether the request ALSO sends Type above decides which of the
+	// two refusal sentinels comes back (400 vs 409). See UpdateApplication.
 	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 ```
 
-- [ ] **Step 6: The sentinel.**
+- [ ] **Step 6: The two sentinels.**
 
-In the `var (…)` block, after `ErrApplicationProxyEntryScheme` (`:76`) and before the blank line that precedes `CodeMappingNotFound`'s comment:
+One validation computes both refusal outcomes, and the HTTP layer maps by sentinel identity and has nothing else to branch on (`errors.Is` against `errRow.err`, `internal/gateway/error_map.go:68-78`), so the split needs two sentinels, not one with a status argument. In the `var (…)` block, after `ErrApplicationProxyEntryScheme` (`:76`) and before the blank line that precedes `CodeMappingNotFound`'s comment:
 
 ```go
 	// ErrApplicationResponsesLiveTimingsUnsupported rejects an EXPLICIT
 	// responses_live_timings_enabled:true whose RESULTING application type is
-	// not a live-timings-capable kind (routing.LiveTimingsCapableKind). HTTP
-	// 400, and the message names the offending type -- the caller asserted
-	// something about this row that its kind cannot carry, and storing false
-	// while answering 200 would be a write that lies about its result. That is
+	// not a live-timings-capable kind (routing.LiveTimingsCapableKind), in the
+	// case where the REQUEST ITSELF supplied that type: every create (whose
+	// "type" is always the request's own) and any PATCH that sends "type"
+	// alongside the flag. HTTP 400 -- such a body is internally contradictory
+	// and can be judged without reading the stored row at all.
+	//
+	// The message names the offending type: the caller asserted something
+	// about this row that its kind cannot carry, and storing false while
+	// answering 200 would be a write that lies about its result. That is
 	// ErrApplicationProxyExcludedPortConflict's argument above, applied to a
 	// second field: "silently zeroing what the caller asked for in the same
 	// breath would be a lie."
@@ -1047,9 +1122,24 @@ In the `var (…)` block, after `ErrApplicationProxyEntryScheme` (`:76`) and bef
 	// honour the flag -- clearing overrides nothing the operator said, because
 	// a request that does not mention the field says nothing about it.
 	ErrApplicationResponsesLiveTimingsUnsupported = errors.New("application.responses_live_timings_unsupported")
+	// ErrApplicationResponsesLiveTimingsConflict rejects the SAME explicit
+	// true when the incapable type is the one already STORED and the request
+	// does not send "type" at all. HTTP 409, not 400: the request is
+	// well-formed -- it would be accepted verbatim against a capable
+	// application -- and it collides with this application's own state, which
+	// is exactly the line ErrServerManagedRuntimeOnly and the three proxy
+	// sentinels above already draw ("the request SHAPE is fine, it conflicts
+	// with the target's own state", gateway/portal_application_endpoints.go:220-221).
+	//
+	// The distinction is drawn on req.Type != nil, NOT on whether the type
+	// changed: a PATCH restating the same incapable type still supplied the
+	// type it is judged against, so that is the 400 above. It reaches exactly
+	// this one shape -- there is no create path to it, since a create always
+	// carries its own type.
+	ErrApplicationResponsesLiveTimingsConflict = errors.New("application.responses_live_timings_conflict")
 ```
 
-The error text is the API code, the convention every sentinel in this block follows. The message detail is wrapped on at the call sites with `fmt.Errorf("%w: …", …)` — the idiom `service_system_settings.go:3013` uses for `ErrCertInvalid` — so **add `"fmt"` to this file's import block**, between `"errors"` and `"log/slog"` (the block is one alphabetically sorted list with the `op-ai-gateway/...` paths mixed in; gofumpt will reject any other position).
+Each sentinel's error text is its API code, the convention every sentinel in this block follows. The message detail is wrapped on at the call sites with `fmt.Errorf("%w: …", …)` — the idiom `service_system_settings.go:3013` uses for `ErrCertInvalid` — so **add `"fmt"` to this file's import block**, between `"errors"` and `"log/slog"` (the block is one alphabetically sorted list with the `op-ai-gateway/...` paths mixed in; gofumpt will reject any other position).
 
 - [ ] **Step 7: The create path — refuse, then default.**
 
@@ -1070,7 +1160,13 @@ In `CreateApplication`, after the `messagesMode` block (`:374-381`) and before t
 	// a refused create leaves nothing behind. An explicit false is honoured on
 	// every kind (it asks for nothing the kind cannot do), and an ABSENT field
 	// is never refused: that is what the pointer buys, and it is why a caller
-	// who says nothing gets the default rather than a 400.
+	// who says nothing gets the default rather than an error.
+	//
+	// ALWAYS the 400 sentinel here, never the 409 one. req.Type is a plain
+	// string on this request, so the type this refusal names is always the
+	// caller's own, and there is no prior state for anything to conflict with:
+	// a create body that pairs an incapable type with true is contradictory on
+	// its own terms. The stored-state shape exists only on UpdateApplication.
 	liveTimingsCapable := routing.LiveTimingsCapableKind(appType)
 	liveTimings := liveTimingsCapable
 	if req.ResponsesLiveTimingsEnabled != nil {
@@ -1082,6 +1178,8 @@ In `CreateApplication`, after the `messagesMode` block (`:374-381`) and before t
 	}
 ```
 
+`appType` has already been through `normalizeApplicationType`, so the `%q` can only ever print one of its six accepted values. Keep the message a statement about the type the caller sent; do **not** grow it into a list of capable-versus-incapable kinds, because such a list would have to mention `mock`, which is a `routing` provider constant but **not** an accepted application type — a body with `"type":"mock"` is already dead at `:347` with `application.type_invalid`, and a message implying an operator could send it would be actively wrong.
+
 Then in the `routing.Application` literal, after `OpportunisticMetricsEnabled: req.OpportunisticMetricsEnabled,` (`:471`):
 
 ```go
@@ -1090,11 +1188,11 @@ Then in the `routing.Application` literal, after `OpportunisticMetricsEnabled: r
 
 Do **not** put this in a trailing normalizer beside `applyProxyExclusion` (`:479`). That call is last because it establishes a cross-field invariant with `ProxyListenPort`; this field's only relationship is with the type, which is settled at `:347` and cannot change afterwards on this path.
 
-- [ ] **Step 8: The update path — refuse before mutating, then the arm and the clear.**
+- [ ] **Step 8: The update path — refuse before mutating, with the status branch, then the arm and the clear.**
 
 Two insertions, in this order.
 
-First, in the **validate-before-mutate** block, immediately after the two endpoint-mode blocks (`:591-609`) and before `if req.BenchmarkScheduleIntervalSeconds != nil` (`:610`):
+First, in the **validate-before-mutate** block, immediately after the two endpoint-mode blocks (`:591-609`) and before `if req.BenchmarkScheduleIntervalSeconds != nil` (`:610`). This is the only place in the task where the two refusal sentinels are chosen between, so the branch lives here and nowhere else:
 
 ```go
 	// Validate-before-mutate for the live-timings opt-in, judged over the
@@ -1105,16 +1203,37 @@ First, in the **validate-before-mutate** block, immediately after the two endpoi
 	// the mutation block, so a rejected PATCH writes nothing at all -- not the
 	// flag and not the type -- which is the same discipline the two mode
 	// blocks above and applyProxyExclusion's RULE 2 follow.
+	//
+	// WHETHER to refuse is a property of the resulting ROW; WHICH sentinel to
+	// refuse with is a property of the REQUEST, and the two must not be
+	// conflated:
+	//
+	//   - the request sent "type", so it supplied the incapable type itself
+	//     and the body is contradictory on its own terms -> ...Unsupported,
+	//     400;
+	//   - the request did not, so the incapable type is the stored one and
+	//     this PATCH leaves it exactly as it was -> ...Conflict, 409. The
+	//     request is well-formed; it collides with this application's state.
+	//
+	// Read off req.Type != nil, deliberately NOT off *req.Type != app.Type: a
+	// PATCH restating the type it already had still SUPPLIED the type it is
+	// being judged against, so it belongs in the 400 arm. A value comparison
+	// would also drop the portal's own saves into the 409 arm, since
+	// ApplicationSection.tsx's buildBody() restates "type" on every save.
 	resultingType := app.Type
+	liveTimingsRefusal := ErrApplicationResponsesLiveTimingsConflict
 	if req.Type != nil {
 		resultingType = appType
+		liveTimingsRefusal = ErrApplicationResponsesLiveTimingsUnsupported
 	}
 	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled &&
 		!routing.LiveTimingsCapableKind(resultingType) {
 		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
-			ErrApplicationResponsesLiveTimingsUnsupported, resultingType)
+			liveTimingsRefusal, resultingType)
 	}
 ```
+
+One `fmt.Errorf` with a sentinel chosen above it, rather than two formatted returns: the message is identical either way (it names the resulting type, which is all a caller needs), and only the wrapped sentinel differs. Whichever way it is written, the mutation in Step 12(g) must fail — one sentinel for both shapes is the slip this task is most likely to ship.
 
 Second, in the mutation block, immediately after the `OpportunisticMetricsEnabled` arm (`:732-733`):
 
@@ -1163,20 +1282,29 @@ In `applicationDTO`, after `OpportunisticMetricsEnabled: app.OpportunisticMetric
 		ResponsesLiveTimingsEnabled:      app.ResponsesLiveTimingsEnabled,
 ```
 
-This mapper is the single one for every application read path — `ListApplications` (`:311`), `GetApplication` (`:505`), and the returns of both writes (`:493`, `:779`) — and it has no reflection guard on this side of the portal, which is why Step 1's test 11 exists.
+This mapper is the single one for every application read path — `ListApplications` (`:311`), `GetApplication` (`:505`), and the returns of both writes (`:493`, `:779`) — and it has no reflection guard on this side of the portal, which is why Step 1's test 12 exists.
 
-- [ ] **Step 10: The status mapping.**
+- [ ] **Step 10: The status mapping — two rows, two statuses.**
 
-In `internal/gateway/portal_application_endpoints.go`, append one row to `portalApplicationErrRows` after `ErrApplicationProxyEntryScheme`'s (`:223`) and before `store.ErrNotFound`'s (`:224`):
+In `internal/gateway/portal_application_endpoints.go`, append **both** rows to `portalApplicationErrRows` after `ErrApplicationProxyEntryScheme`'s (`:223`) and before `store.ErrNotFound`'s (`:224`). `errRow.status` is a plain `int` (`error_map.go:21`) that `writeMappedError` writes verbatim (`:75`), and `msgFn` (`:24`, honoured at `:72-74`) is independent of the status — so a 409 with a dynamic message is an ordinary row and needs no change to the mechanism. It is, however, the first row in the package to combine the two (the three existing `msgFn` rows are all 400: `agent_runtime.go:479`, `agent_ingest.go:1774`, `:1912`), so write both rows in one edit and let the wire test confirm the pair:
 
 ```go
-	// 400, and the ONLY row in this table with a dynamic message: the service
+	// The first two rows in this table with a DYNAMIC message: the service
 	// wraps the sentinel with the offending type (fmt.Errorf("%w: ...")), and
 	// naming the kind is the entire point of refusing the write instead of
 	// storing something else. errRow.msgFn exists for exactly this ("a row
 	// that must surface the underlying error's own text", error_map.go:15-18).
-	// The sentinel's own text IS the API code -- the convention every row here
+	// Each sentinel's own text IS its API code -- the convention every row here
 	// follows -- so it is trimmed off rather than repeated inside the message.
+	//
+	// TWO rows because there are two sentinels and they answer with DIFFERENT
+	// statuses. 400 when the request supplied the incapable type itself (every
+	// create, and a PATCH that sends "type"): the body is contradictory on its
+	// own terms. 409 when the type came from the stored row and the request
+	// left it alone: the request SHAPE is fine, it conflicts with the target's
+	// own state -- the same reading ErrServerManagedRuntimeOnly (:203-206) and
+	// the three proxy sentinels (:220-221) already get. Collapsing them into
+	// one row would report a well-formed request as malformed.
 	{
 		err:    portal.ErrApplicationResponsesLiveTimingsUnsupported,
 		status: http.StatusBadRequest,
@@ -1185,9 +1313,17 @@ In `internal/gateway/portal_application_endpoints.go`, append one row to `portal
 			return strings.TrimPrefix(err.Error(), portal.ErrApplicationResponsesLiveTimingsUnsupported.Error()+": ")
 		},
 	},
+	{
+		err:    portal.ErrApplicationResponsesLiveTimingsConflict,
+		status: http.StatusConflict,
+		code:   "application.responses_live_timings_conflict",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrApplicationResponsesLiveTimingsConflict.Error()+": ")
+		},
+	},
 ```
 
-`strings` and `net/http` are already imported by this file; `errRow`'s `msgFn` field is at `error_map.go:24` and is honoured at `:71-74`.
+`strings` and `net/http` are already imported by this file. Note that `writeMappedError` returns on the **first** matching row and the two sentinels are distinct `errors.New` values that wrap nothing, so their order in the table does not matter; do not add a `sharedErrorMap` entry for either — both are application-specific, and `sharedErrorMap` rows are written without `msgFn` at all (`error_map.go:79-84`).
 
 - [ ] **Step 11: Run the new tests and watch them pass.**
 
@@ -1201,17 +1337,19 @@ Both packages must be green — in particular `TestCreateApplicationEndpointMode
 
 - [ ] **Step 12: Mutations.**
 
-(a) Delete the `ResponsesLiveTimingsEnabled:` line from `applicationDTO` — test 11 (and several others) must fail; this is the silent-zero-value defect, demonstrated. Restore.
+(a) Delete the `ResponsesLiveTimingsEnabled:` line from `applicationDTO` — test 12 (and several others) must fail; this is the silent-zero-value defect, demonstrated. Restore.
 (b) Change `CreateApplicationRequest`'s field from `*bool` to `bool` and adjust the create block to read it directly — test 2's two halves can no longer both pass, and test 1's `llama_cpp`/`vllm` rows fail as well, because an absent key now arrives as `false` and the kind-dependent default never fires. Restore.
-(c) Replace the refusal with the silent normalisation this task replaced — on the create path, `if !liveTimingsCapable { liveTimings = false }` and no error: test 4 must fail on the error assertion **and** on "nothing stored", because the create then succeeds. Then the same on the update path, dropping the validate-before-mutate refusal and letting the clear swallow the explicit `true`: tests 8 and 9 must fail the same way, and test 8's "the type did not change either" assertion must fail too. Restore both. This mutation is the decision itself, so record its output verbatim in the commit body.
+(c) Replace the refusal with the silent normalisation this task replaced — on the create path, `if !liveTimingsCapable { liveTimings = false }` and no error: test 4 must fail on the error assertion **and** on "nothing stored", because the create then succeeds. Then the same on the update path, dropping the validate-before-mutate refusal and letting the clear swallow the explicit `true`: tests 8, 9 and 10 must fail the same way, and test 8's "the type did not change either" assertion must fail too. Restore both. This mutation is the decision itself, so record its output verbatim in the commit body.
 (d) Delete the `case !routing.LiveTimingsCapableKind(app.Type):` arm — test 7 fails and only test 7. Restore.
 (e) Change the update refusal to read `app.Type` instead of `resultingType` — test 8 fails (the retype-plus-true body is accepted against the OLD capable type) while test 9 still passes. Restore.
-(f) Delete the `errRow` from Step 10 — the wire test's code assertion fails with `application.request_failed` and a 500, which is the fall-through defect that table's own comment records. Restore.
+(f) Delete the 400 `errRow` from Step 10, then (separately) the 409 one — each time the corresponding wire subtest's code assertion fails with `application.request_failed` and a 500, which is the fall-through defect that table's own comment records. Note that deleting the 409 row leaves the "do not share a status" subtest failing too, since both shapes then answer 500. Restore.
+(g) **The status-split mutation, and the most important one in this task.** Collapse the two sentinels into one: in the update path's validate-before-mutate block, replace the `liveTimingsRefusal` branch with an unconditional `ErrApplicationResponsesLiveTimingsUnsupported`. Service test 9 must fail (it gets `…Unsupported` where it asserted `…Conflict`, and its `!errors.Is(…Unsupported)` assertion fails too), and the wire test's 409 subtest **and** its "the two PATCH shapes do not share a status" subtest must fail with both shapes answering 400. Then do the inverse — unconditional `…Conflict` — and tests 4, 8 and 10 must fail while 9 passes, with the create's refusal now arriving as a 409 on a request that had no prior state at all. Restore. Record both outputs verbatim: a single helper returning one sentinel for both shapes is the implementation this task exists to rule out, and the two halves of this mutation are the evidence that the branch is real rather than decorative.
+(h) Change the status branch from `req.Type != nil` to a value comparison, `req.Type != nil && *req.Type != app.Type` — test 10 fails (a PATCH restating the same incapable type is answered 409 when the request did supply that type) and nothing else does. Restore. This is the mutation that pins *why* the branch is written off the pointer.
 Record which mutation broke which test.
 
 - [ ] **Step 13: Gates and commit.**
 
-`fmt --diff` (a new struct field re-aligns the whole tag column — expect gofumpt to have an opinion), `run`, `go test ./... -count=1`. Commit body: the pointer's two loads, the assertion-versus-non-mention rule in one sentence, why the refusal is judged over the resulting type, why the status is 400 on both shapes, and the six mutations.
+`fmt --diff` (a new struct field re-aligns the whole tag column — expect gofumpt to have an opinion), `run`, `go test ./... -count=1`. Commit body: the pointer's three loads; the assertion-versus-non-mention rule in one sentence; why the refusal is judged over the resulting type while the status is judged over the request's shape; why create is 400-only; the two sentinels and the two error rows with their statuses; and the eight mutations, with (c) and (g) quoted verbatim.
 
 ---
 
@@ -1219,7 +1357,7 @@ Record which mutation broke which test.
 
 **Files:**
 - Modify: `gateway/backend/internal/portal/service_runtime.go` (the `"fmt"` import; the new sentinel after `ErrRuntimeSpecContextProbePathInvalid` at `:119`; `RuntimeSpecDTO` field after `:392`; `PutRuntimeSpecRequest` field after `:459`; the effective-kind refusal in the validate-before-mutate block after the `validRuntimeSpecType` check at `:634`; the value resolution after the `existing, hadExisting` read at `:711`; the `routing.RuntimeSpec` literal after `:801`; the `runtimeSpecDTO` mapper line after `:1180`)
-- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints.go` (one `errRow` in `portalRuntimeSpecErrRows`, after `:84`)
+- Modify: `gateway/backend/internal/gateway/portal_runtime_endpoints.go` (one `errRow` in `portalRuntimeSpecErrRows`, after `:84` — **one**, at 400; this task adds no 409)
 - Modify: `gateway/backend/internal/portal/service_runtime_benchmark.go` (`putRequestFromDTO`, after `MessagesMode: dto.MessagesMode,` at `:51`)
 - Modify: `gateway/backend/internal/portal/service_runtime_benchmark_test.go` (the fully-populated DTO at `:138-175` and the `want` literal at `:174-201`)
 - Modify: `gateway/backend/internal/portal/service_runtime_test.go` (new tests)
@@ -1227,8 +1365,8 @@ Record which mutation broke which test.
 - Modify: `docs/architecture/reference/api-surface.md` (`:494-538`), `docs/architecture/cross-cutting/agent-runtime-manager.md` (`:3738-3748`)
 
 **Interfaces:**
-- Consumes: `routing.LiveTimingsCapableKind(kind string) bool` (Task 5); `routing.RuntimeSpec.ResponsesLiveTimingsEnabled bool` (Task 3); `routing.EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType` (`internal/routing/runtime_spec_type.go:56`); `routing.DetectRuntimeSpecType(binary string) RuntimeSpecType` (`:36`, what the former falls back to); `binary := strings.TrimSpace(req.Binary)` (`service_runtime.go:600`); `specType := strings.TrimSpace(req.Type)` (`:631`); `existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)` (`:711`).
-- Produces: JSON key `responses_live_timings_enabled` — `bool` on `RuntimeSpecDTO`, `*bool` on `PutRuntimeSpecRequest`; carried across by `putRequestFromDTO`; and **one new error sentinel**, `portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported` (`errors.New("runtime_spec.responses_live_timings_unsupported")`), mapped to HTTP 400 with a message that names the offending effective kind.
+- Consumes: `routing.LiveTimingsCapableKind(kind string) bool` (Task 5); `routing.RuntimeSpec.ResponsesLiveTimingsEnabled bool` (Task 3); `routing.EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType` (`internal/routing/runtime_spec_type.go:56`); `routing.DetectRuntimeSpecType(binary string) RuntimeSpecType` (`:36`, what the former falls back to); `binary := strings.TrimSpace(req.Binary)` (`service_runtime.go:600`); `specType := strings.TrimSpace(req.Type)` (`:631`); `validRuntimeSpecType(s string) bool` (`:997`, doc `:990-996`) — which **accepts `""` as a first-class value**, meaning "auto-detect from `Binary`", not a default that has already collapsed into one of the five kinds; `existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)` (`:711`).
+- Produces: JSON key `responses_live_timings_enabled` — `bool` on `RuntimeSpecDTO`, `*bool` on `PutRuntimeSpecRequest`; carried across by `putRequestFromDTO`; and **one new error sentinel**, `portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported` (`errors.New("runtime_spec.responses_live_timings_unsupported")`), mapped to HTTP **400** with a message that names the offending effective kind. **One sentinel and one status on this side.** The application surface (Task 6) splits its refusal into 400 and 409 by whether the request supplied the offending type; a runtime-spec write cannot reach the 409 shape at all, for the reason spelled out two paragraphs below — it is a full document that always carries the type it is judged against. Do not add a second sentinel here, and do not import Task 6's `…Conflict`.
 
 **The rule, stated once.** `PutRuntimeSpec` is a full-document upsert ("create on first write, full-document replace thereafter", `:534-535`), so `!hadExisting` is what "create" means here, and the kind is the spec's **own** `routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: specType, Binary: binary})` — the explicit type when set, else detected from the binary's basename, which is the same resolver the inference path consults through `Target.LiveProgressSpecType`. So:
 
@@ -1237,7 +1375,13 @@ Record which mutation broke which test.
 - present `false` → honoured, on any kind;
 - present `true` on an effective kind that is not capable → **400**, naming that kind, with nothing written.
 
-**Why the rule is phrased over the RESULTING type and not over a transition** — read this before looking for a retype signal, because there is none to find. A spec PUT is a full document: it restates `Type` and `Binary` on every save and carries no "the type used to be X" input. `hadExisting` tells you whether a row was there, not whether its kind changed, and comparing `existing.Type` to `req.Type` would answer a question the rule does not ask (a *first* write of an incapable spec asserting `true` must be refused too, and there is no transition in it at all). Judging the resulting document is therefore the only faithful reading — and it is the same shape decision (e) takes on the application side, where the clear reads the post-mutation `app.Type` rather than `req.Type != nil`. What changed since the first draft of this plan: a `true` that cannot hold is now **refused** rather than quietly stored as `false`. An **absent** field is still never refused; on an incapable kind it is cleared, which overrides nothing the caller said because the caller said nothing.
+The **effective** kind, not `req.Type`, and this is not a nicety: `validRuntimeSpecType` accepts `""` as a first-class value (auto-detect from `Binary`), `routing.LiveTimingsCapableKind("")` is **false**, and an empty `type` with a `llama-server` binary is the common managed configuration. A refusal or a default written against the raw `req.Type` would therefore reject an operator's perfectly capable auto-detect spec *and* silently default every such spec **off**. Every live-timings question in this task is asked of `routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: specType, Binary: binary})` — both the refusal in Step 7 and the create default in Step 8.
+
+**Why the rule is phrased over the RESULTING type and not over a transition, and why that makes the status 400 in every shape** — read this before looking for a retype signal, because there is none to find. A spec PUT is a full document: it restates `Type` and `Binary` on every save and carries no "the type used to be X" input. `hadExisting` tells you whether a row was there, not whether its kind changed, and comparing `existing.Type` to `req.Type` would answer a question the rule does not ask (a *first* write of an incapable spec asserting `true` must be refused too, and there is no transition in it at all). Judging the resulting document is therefore the only faithful reading — and it is the same shape decision (e) takes on the application side, where the clear reads the post-mutation `app.Type` rather than `req.Type != nil`.
+
+That same property settles the status. Task 6's application surface answers **409** on exactly one shape — a PATCH that asserts the flag while leaving the stored type untouched, so the refusal turns on state the request never mentioned. **No spec write can be that shape.** The request always carries `Type` and `Binary`, so the kind a spec refusal names is always one the caller supplied in this very body, whether by typing it or by naming the binary it is detected from; such a body is contradictory on its own terms and 400 is the honest answer. So: one sentinel, one status, and **no stored-state branch anywhere in this task** — `hadExisting` is consulted for the default-versus-preserve decision only, never for the refusal.
+
+What changed since the first draft of this plan: a `true` that cannot hold is now **refused** rather than quietly stored as `false`. An **absent** field is still never refused; on an incapable kind it is cleared, which overrides nothing the caller said because the caller said nothing.
 
 - The spec never inherits the parent application's value. That is `PutRuntimeSpec`'s standing "no backend inheritance" contract (`:648-652`, pinned by `TestPutRuntimeSpecDoesNotInheritAppModes`), and it matters doubly here: a `server_agent` parent's own flag is necessarily `false` — the application path refuses to store anything else for that kind — so inheriting would default every managed spec off.
 
@@ -1253,6 +1397,8 @@ In `service_runtime_test.go`, following the shape of the existing `PutRuntimeSpe
 6. `TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind` — two legs, each asserting `errors.Is(err, ErrRuntimeSpecResponsesLiveTimingsUnsupported)`, the effective kind named in `err.Error()`, and that **nothing was written**:
    - an existing `llama_cpp` spec with the flag on, PUT with `Type: string(routing.RuntimeSpecTypeOllama)` **and** `boolPtr(true)` → refused naming `ollama`; then `svc.GetRuntimeSpec` must still report `Type == "llama_cpp"` **and** the flag still `true`. A refused PUT writes nothing, not even the type.
    - a *first* write with `Type: ""` and `Binary: "/usr/local/bin/ollama"` plus `boolPtr(true)` → refused naming `ollama`, the kind the caller never typed. Then `GetRuntimeSpec` must still report the unconfigured DTO (`Configured == false`), proving no row was created. The comment must say that the message names the **effective** kind precisely because an empty `Type` means the binary decided.
+
+   The doc comment must also say what these two legs are jointly evidence for, because it is the reason this task has no second sentinel: the first leg has a stored row and the second has none, and **both** are the same refusal, because in both the caller supplied the offending kind in this very body. There is no spec shape where the refused kind comes from state the request left alone, which is the shape the application surface answers 409 on (Task 6).
 7. `TestPutRuntimeSpecResponsesLiveTimingsClearsAStoredTrueWhenTheDocumentsKindCannotHonourIt` — an existing `llama_cpp` spec with the flag on (assert `true` first, so the change is visible), then a PUT with `Type: string(routing.RuntimeSpecTypeOllama)` and the key **absent** → the DTO and a `GetRuntimeSpec` reload both report `false`. This is the clear, and the assertion that it *changed* from `true` is what makes the test mean anything.
 8. `TestRuntimeSpecDTOCarriesResponsesLiveTimings` — upsert a spec with the flag on through the routes store (`routeStore.UpsertRuntimeSpec`), read it through `GetRuntimeSpec`; assert `true`. Guards the hand-written `runtimeSpecDTO` mapper, which has no compile-time link to the DTO.
 
@@ -1271,6 +1417,13 @@ In `internal/gateway/portal_runtime_endpoints_test.go`, after `TestHandlePortalM
 // stored as false so that the caller is told which kind cannot honour it, and
 // a 400 that withholds the kind gives them nothing the silent rewrite would
 // not have.
+//
+// The status assertion is exact on purpose. The application surface splits
+// this refusal into 400 and 409 by whether the request supplied the offending
+// type; a spec PUT is a full document and always does supply it, so 400 is the
+// only answer a spec write can give. This is the test that says so: a 409 here
+// would mean somebody carried Task 6's stored-state branch into a path that
+// has no such shape.
 func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400(t *testing.T) {
 	srv := NewTestServer()
 	mappingID := seedRuntimeSpecMapping(t, srv)
@@ -1289,7 +1442,32 @@ func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400(t
 }
 ```
 
-Check the file's import block first: it must have `strings` for that last assertion (add it if absent, keeping gofumpt's ordering).
+Then add its auto-detect sibling in the same file, because the wire is where an operator's real body arrives and the common managed body types no `type` at all:
+
+```go
+// TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted
+// is the accepting direction of the same resolution, over HTTP: no "type" at
+// all, a llama-server binary, and the flag asserted true. It must be a 200.
+//
+// The service asks routing.LiveTimingsCapableKind about the spec's EFFECTIVE
+// type (the explicit one when set, else detected from the binary), and this
+// is the body that proves it: validRuntimeSpecType accepts "" as a real value
+// and LiveTimingsCapableKind("") is FALSE, so a refusal written against the
+// raw req.Type would answer 400 here -- to the single most common managed
+// llama.cpp configuration there is.
+func TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnAnAutoDetectCapableKindIsAccepted(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/bin/llama-server","responses_live_timings_enabled":true}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+}
+```
+
+One import to add: the file's block (`:6-16`) has `context`, `encoding/json`, `net/http`, `net/http/httptest`, `op-ai-gateway/internal/portal`, `op-ai-gateway/internal/routing`, `strconv`, `testing`, `time` — but **not `strings`**, which the message assertion needs. Add it between `strconv` and `testing` (one alphabetically sorted list; gofumpt will reject any other position). The `http.StatusOK` in the second test is this endpoint's own happy-path status, not a guess: the existing PUT tests assert it, including one whose whole body is `{"binary":"/usr/local/bin/llama-server"}` (`:286-287`).
 
 - [ ] **Step 3: Run them and watch them fail.**
 
@@ -1352,12 +1530,22 @@ In the `var (…)` block, after `ErrRuntimeSpecContextProbePathInvalid` (`:119`)
 	// the kind-dependent default, on a later save it keeps the stored value,
 	// and on a document whose kind cannot honour the flag it is CLEARED --
 	// which overrides nothing the caller said, since they said nothing.
+	//
+	// 400 in EVERY shape, and one sentinel is therefore enough here. The
+	// application surface splits its refusal (ErrApplication...Unsupported,
+	// 400, vs ErrApplication...Conflict, 409) by whether the request supplied
+	// the offending type; a spec write is a full document that always states
+	// its own Type and Binary, so the refused kind is always one this body
+	// supplied -- typed, or named by the binary it is detected from. There is
+	// no spec shape whose refusal rests on state the request left alone.
 	ErrRuntimeSpecResponsesLiveTimingsUnsupported = errors.New("runtime_spec.responses_live_timings_unsupported")
 ```
 
 The error text is the API code, the convention every sentinel in this block follows; the detail is wrapped on at the call site with `fmt.Errorf("%w: …", …)`. **Add `"fmt"` to this file's import block**, between `"errors"` and `"op-ai-gateway/internal/auth"` (one alphabetically sorted list; gofumpt will reject any other position).
 
-- [ ] **Step 7: Refuse an impossible `true`, in the validate-before-mutate block.**
+- [ ] **Step 7: Refuse an impossible `true`, in the validate-before-mutate block — asking the EFFECTIVE kind, not `req.Type`.**
+
+Read this before writing the condition, because it is the one line in the task that has a silent-wrong version. **Ask `routing.LiveTimingsCapableKind` about `routing.EffectiveRuntimeSpecType(...)`, never about `req.Type` or `specType`.** `validRuntimeSpecType` (`:997`, doc `:990-996`) accepts `""` as a legitimate value meaning "auto-detect from `Binary`" — "not a default that collapses into one of the five kinds" — and `routing.LiveTimingsCapableKind("")` is **false**. A condition written against the raw type therefore refuses an explicit `true` on `{"binary":"/usr/bin/llama-server"}`, and Step 8's default written the same way stores `false` for it: the single most common managed llama.cpp spec there is, silently defaulted off, with every incapable-kind test in this task still green. Step 1's test 1 second case, test 5's third leg and Step 2's auto-detect wire test are the three that fail if this is got wrong; mutation 13(e) is where that is demonstrated.
 
 `putRuntimeSpec` opens with "Validate everything that can fail BEFORE mutating/persisting anything" (`:599`). The refusal belongs there, not beside the value resolution in Step 8 — insert it immediately after the `validRuntimeSpecType` check (`:631-634`), where `specType` and `binary` (`:600`) are both in scope and nothing has been read from or written to the store yet:
 
@@ -1368,12 +1556,25 @@ The error text is the API code, the convention every sentinel in this block foll
 	// Target.LiveProgressSpecType, so the portal and the gateway cannot
 	// disagree about what actually serves.
 	//
+	// EffectiveRuntimeSpecType, NOT specType: validRuntimeSpecType accepts ""
+	// as a real value ("auto-detect from Binary", not a collapsed default) and
+	// LiveTimingsCapableKind("") is false, so asking about the raw type would
+	// refuse an explicit true on a {"binary": ".../llama-server"} spec -- the
+	// commonest managed configuration there is -- and, in the resolution
+	// below, silently default it OFF.
+	//
 	// An EXPLICIT true on a kind that cannot honour it is refused, naming that
 	// kind. Judged over THIS document's kind rather than over a type change:
 	// a PUT is a full document and carries no retype signal -- hadExisting
 	// says a row was there, never that its kind changed -- and a first write
 	// asserting true on an incapable kind has to be refused too, though no
 	// transition is involved in it at all.
+	//
+	// One sentinel, 400 in every shape. Because the document always carries
+	// the Type/Binary the kind is resolved from, the refused kind is always one
+	// THIS request supplied, so there is no well-formed-but-conflicting shape
+	// here for the application side's 409 sentinel to answer. hadExisting is
+	// read below for the default-versus-preserve decision only, never here.
 	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: specType, Binary: binary})
 	liveTimingsCapable := routing.LiveTimingsCapableKind(string(effectiveSpecKind))
 	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !liveTimingsCapable {
@@ -1401,6 +1602,10 @@ The `existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID
 	// the caller said nothing about the flag, the clear contradicts nothing
 	// they asked for. That asymmetry is decision (e): the assertion is
 	// refused, the non-mention is normalised.
+	//
+	// liveTimingsCapable is Step 7's local, computed from the EFFECTIVE kind.
+	// Do not recompute it from specType here: that is how an auto-detect
+	// llama-server spec ends up defaulting off.
 	liveTimings := liveTimingsCapable
 	if hadExisting {
 		liveTimings = existing.ResponsesLiveTimingsEnabled
@@ -1429,9 +1634,9 @@ In `runtimeSpecDTO`, after `MessagesMode: string(spec.MessagesMode),` (`:1180`):
 
 `GetRuntimeSpec`'s not-yet-configured DTO (`:508-530`) needs **no** entry: it sets neither `ResponsesMode` nor `MessagesMode` either, and the new boolean's zero value there is the honest answer for a spec that does not exist yet.
 
-- [ ] **Step 10: The status mapping.**
+- [ ] **Step 10: The status mapping — ONE row, at 400.**
 
-In `internal/gateway/portal_runtime_endpoints.go`, append one row to `portalRuntimeSpecErrRows` after `ErrRuntimeSpecTypeInvalid`'s (`:84`):
+In `internal/gateway/portal_runtime_endpoints.go`, append one row to `portalRuntimeSpecErrRows` after `ErrRuntimeSpecTypeInvalid`'s (`:84`). One row, because this side has one sentinel: unlike Task 6's table this one gets **no** 409 entry, since no spec write can reach the stored-state shape. (There is already an unrelated 409 in this table — `ErrRuntimeSpecServerBenchmarking` at `:105`, refused because a benchmark run is holding the server — so a 409 here is not novel; it is simply not this sentinel's answer.)
 
 ```go
 	// The one row in this table with a dynamic message. The service wraps the
@@ -1442,6 +1647,12 @@ In `internal/gateway/portal_runtime_endpoints.go`, append one row to `portalRunt
 	// for exactly this ("a row that must surface the underlying error's own
 	// text", error_map.go:15-18); the sentinel's own text IS the API code, per
 	// the convention above, so it is trimmed rather than repeated.
+	//
+	// 400 and never 409: the application table splits this refusal in two
+	// (portal_application_endpoints.go) because a PATCH can assert the flag
+	// against a type it never sent, and the request is then well-formed. A
+	// spec PUT always states its own Type and Binary, so the kind named here
+	// always came from this body.
 	{
 		err:    portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported,
 		status: http.StatusBadRequest,
@@ -1499,20 +1710,27 @@ go test ./internal/portal/ ./internal/gateway/ -count=1
 (b) Delete the `if hadExisting { liveTimings = existing.… }` branch — test 3 fails. Restore.
 (c) Delete the refusal from Step 7 and let the `case !liveTimingsCapable:` arm swallow the explicit `true` instead (the silent normalisation this task replaced) — test 6 must fail on the error assertion **and** on "nothing was written", since the PUT then succeeds. Restore. This mutation is the decision itself; record its output verbatim in the commit body.
 (d) Delete the `case !liveTimingsCapable:` arm — test 7 fails and only test 7. Restore. With (c) this is a pair proving the two halves are independent: (c) shows the assertion must be refused, (d) shows the non-mention must still be cleared.
-(e) Replace both uses of the effective kind with the raw `specType` — `routing.LiveTimingsCapableKind(specType)` in Step 7's condition and in Step 8's `liveTimings := …` seed. Test 5's third leg fails (an explicit `true` on a `Type: ""` llama-server spec is wrongly refused, since `LiveTimingsCapableKind("")` is false) and test 1's second case fails (the same spec's absent-key default comes out `false`). Restore. This is the mutation that pins *which* resolver decides.
+(e) **The resolver mutation, and the one most worth recording.** Replace both uses of the effective kind with the raw `specType` — `routing.LiveTimingsCapableKind(specType)` in Step 7's condition and in Step 8's `liveTimings := …` seed. Test 5's third leg fails (an explicit `true` on a `Type: ""` llama-server spec is wrongly refused, since `LiveTimingsCapableKind("")` is false), test 1's second case fails (the same spec's absent-key default comes out `false`), and Step 2's `…OnAnAutoDetectCapableKindIsAccepted` wire test fails with a 400 where a 200 belongs. Note what does **not** fail: every explicitly-typed case, capable and incapable alike, and every refusal test — which is exactly why this needs a mutation rather than a code review. Restore.
 (f) Delete the `runtimeSpecDTO` line — test 8 fails. Restore.
 (g) Delete the `errRow` from Step 10 — the wire test's code assertion fails with `runtime_spec.request_failed` and a 500. Restore.
+(h) Change Step 10's row from `http.StatusBadRequest` to `http.StatusConflict` — the wire test's exact status assertion must fail. Restore. This is the pin on "a spec refusal is 400, not 409": the codes would still match, so only the status assertion catches it.
 Record each.
 
 - [ ] **Step 14: The wire contract in `api-surface.md`.**
 
-Under `#### API-variant endpoint modes (responses_mode / messages_mode)` (`:494`), after the three existing "Wire notes a client must know" bullets (`:510-529`), add one bullet block for the new field. It must state: the JSON key and that it appears on `ApplicationDTO`/`CreateApplicationRequest`/`UpdateApplicationRequest` **and** `RuntimeSpecDTO`/`PutRuntimeSpecRequest`; that it is a `*bool` on all three request shapes, where **absent is not the same as false** — absent on a create (or a first spec write) gets the kind-dependent default, `true` for `llama_cpp`/`vllm` and `false` for every other kind, while an explicit `false` is a deliberate off; that absent on an update keeps the stored value, except that it is **cleared** when the resulting type cannot honour the flag (an application retyped away from a capable kind, or a spec PUT whose effective type is not capable); that an explicit `true` against such a resulting type is **refused with 400**, not stored as `false`, so a caller always ends up with the value it asked for or an error saying which kind refused it; that it is **orthogonal** to `responses_mode` rather than a fourth value of it; and that it is offered on the Responses side only and never for `/v1/messages`.
+Under `#### API-variant endpoint modes (responses_mode / messages_mode)` (`:494`), after the three existing "Wire notes a client must know" bullets (`:510-529`), add one bullet block for the new field. It must state: the JSON key and that it appears on `ApplicationDTO`/`CreateApplicationRequest`/`UpdateApplicationRequest` **and** `RuntimeSpecDTO`/`PutRuntimeSpecRequest`; that it is a `*bool` on all three request shapes, where **absent is not the same as false** — absent on a create (or a first spec write) gets the kind-dependent default, `true` for `llama_cpp`/`vllm` and `false` for every other kind, while an explicit `false` is a deliberate off; that absent on an update keeps the stored value, except that it is **cleared** when the resulting type cannot honour the flag (an application retyped away from a capable kind, or a spec PUT whose effective type is not capable); that an explicit `true` against such a resulting type is **refused**, not stored as `false`, so a caller always ends up with the value it asked for or an error saying which kind refused it; that the refusal's status depends on where the offending type came from — **400** when the request supplied it (every create, an application PATCH that also sends `type`, and every runtime-spec PUT, which always restates its own `type`/`binary`) and **409** on the one shape where it did not, an application PATCH that asserts the flag while sending no `type`; that it is **orthogonal** to `responses_mode` rather than a fourth value of it; and that it is offered on the Responses side only and never for `/v1/messages`.
 
-Then add the two new rows to the error table at `:533-538`: `application.responses_live_timings_unsupported` and `runtime_spec.responses_live_timings_unsupported`, both 400, both with the offending kind in the message. (The earlier draft of this plan said no error code was needed — that was the silent-normalisation variant, and it is superseded.)
+Then add **three** new rows to the "New stable error codes" table at `:533-538`, which is a `| Code | Status | Source |` table — keep that column shape and that one-sentence-in-the-Source-cell style:
+
+- `application.responses_live_timings_unsupported` — **400** — the request sent an incapable `type` alongside `responses_live_timings_enabled: true` (every create, whose `type` is always the request's own; a PATCH that sends both). The message names the type.
+- `application.responses_live_timings_conflict` — **409** — a PATCH asserts `responses_live_timings_enabled: true`, sends no `type`, and the application's **stored** type cannot honour it: the request is well-formed and conflicts with the application's own state. The message names that stored type.
+- `runtime_spec.responses_live_timings_unsupported` — **400** — a spec PUT asserts `true` and its **effective** type — the explicit `type` when set, else detected from `binary` — cannot honour it. The message names the effective type, which may be one the caller never typed. There is no 409 on this surface: a spec PUT is a full document and always carries the type it is judged against.
+
+(An earlier draft of this plan said no error code was needed at all — that was the silent-normalisation variant — and the draft after it put both application rows at 400; both are superseded.)
 
 - [ ] **Step 15: The spec-snapshot note in `agent-runtime-manager.md`.**
 
-At `:3738-3748`, where the `api_flavors`/`responses_mode`/`messages_mode` spec snapshot is described, add one sentence: `responses_live_timings_enabled` joins that per-spec set (migration 80), and for a `server_agent` model the resolved spec's copy is what the request path reads — with the reason: the flag qualifies `responses_mode`, which for a managed model comes from the spec, so reading the parent application's copy would attach the flag to a decision the application never made. Add a second sentence for the write rule, because this is the page an operator-facing reader lands on: a PUT that sets it `true` on a spec whose effective type is not `llama_cpp`/`vllm` is refused with 400, and a PUT that omits it on such a type clears any stored `true`. State also that no operator control for it ships in this cut.
+At `:3738-3748`, where the `api_flavors`/`responses_mode`/`messages_mode` spec snapshot is described, add one sentence: `responses_live_timings_enabled` joins that per-spec set (migration 80), and for a `server_agent` model the resolved spec's copy is what the request path reads — with the reason: the flag qualifies `responses_mode`, which for a managed model comes from the spec, so reading the parent application's copy would attach the flag to a decision the application never made. Add a second sentence for the write rule, because this is the page an operator-facing reader lands on: a PUT that sets it `true` on a spec whose **effective** type (the explicit `type`, else detected from `binary`) is not `llama_cpp`/`vllm` is refused with **400** — never 409, because the document always carries the type it is judged against — and a PUT that omits it on such a type clears any stored `true`. State also that no operator control for it ships in this cut.
 
 - [ ] **Step 16: Docs and Go gates, then commit.**
 
@@ -1527,9 +1745,9 @@ cd /Users/jlor08/Developer/codex/op-ai-gateway/.worktrees/responses-live-timings
 grep -rn 'ResponsesLiveTimingsEnabled' --include='*.go' gateway/backend/internal/gateway/ gateway/backend/internal/provider/ | grep -v '_test.go'   # must print nothing
 git diff --name-only main... -- gateway/frontend/                                                                                                  # must print nothing
 ```
-(The first grep excludes `_test.go`, so this task's own wire test does not trip it; the two new `errRow`s name the **sentinel**, not the field, so they do not either. Nothing in `internal/gateway` reads the boolean for a request decision, which is what the check is for.)
+(The first grep excludes `_test.go`, so this task's own wire test does not trip it; the three `errRow`s added across Tasks 6 and 7 name the **sentinel**, not the field, so they do not either. Nothing in `internal/gateway` reads the boolean for a request decision, which is what the check is for.)
 
-Commit body: the four-way resolution, why `!hadExisting` is what "create" means here, why the rule is judged over the resulting document rather than a transition, the no-inheritance contract, the pointer conversion in the spread and the two ways its guard fires, the seven mutations, and the two doc files.
+Commit body: the four-way resolution, why `!hadExisting` is what "create" means here, why the rule is judged over the resulting document rather than a transition, why that same property makes every spec refusal a 400 and leaves this side with one sentinel where the application side has two, why the predicate is asked about the effective type and not `req.Type`, the no-inheritance contract, the pointer conversion in the spread and the two ways its guard fires, the eight mutations, and the two doc files.
 
 ---
 
@@ -1550,10 +1768,13 @@ Commit body: the four-way resolution, why `!hadExisting` is what "create" means 
 | Not on `routing.ModelMapping`; no `MappingCandidate` field | Global Constraints; Task 2 Interfaces |
 | A plain `bool` kills the kind-dependent create default AND the assertion-vs-non-mention rule | Task 6 Steps 5, 12(b); Task 7 Steps 5, 13 |
 | `putRequestFromDTO` compiles without the new field | Task 7 Steps 1, 11, 13(a) |
-| Hand-written DTO mappers, no coverage test on the application side | Task 6 Steps 1(test 11), 9, 12(a); Task 7 Steps 1(test 8), 9, 13(f) |
+| Hand-written DTO mappers, no coverage test on the application side | Task 6 Steps 1(test 12), 9, 12(a); Task 7 Steps 1(test 8), 9, 13(f) |
 | A `server_agent` application's create-time default can only be `false` | Task 5 Step 1 (the predicate row); Task 6 Step 1(test 1), 7; Task 7 Step 1(test 2) |
-| The retype path is undefined | Task 6 Steps 1(tests 7, 8, 9, 10), 8; Task 7 Steps 1(tests 6, 7), 7, 8 |
-| An impossible `true` must be REFUSED, not silently stored as `false` (decision (e), settled 2026-09-11) | Global Constraints; Task 6 Steps 1(tests 4, 8, 9), 6, 7, 8, 12(c); Task 7 Steps 1(test 6), 6, 7, 13(c) |
+| The retype path is undefined | Task 6 Steps 1(tests 7, 8, 9, 10, 11), 8; Task 7 Steps 1(tests 6, 7), 7, 8 |
+| An impossible `true` must be REFUSED, not silently stored as `false` (decision (e), settled 2026-09-11) | Global Constraints; Task 6 Steps 1(tests 4, 8, 9, 10), 6, 7, 8, 12(c); Task 7 Steps 1(test 6), 6, 7, 13(c) |
+| The refusal's status is SPLIT: 400 when the request supplied the incapable type, 409 when it came from stored state (refined 2026-09-11, superseding the single-400 wording) | Global Constraints; Task 6 Steps 1(tests 4, 8, 9, 10), 2, 6, 8, 10, 12(g), 12(h); Task 7's "why the rule is phrased over the RESULTING type" (why no 409 exists there), Steps 2, 6, 10, 13(h) |
+| `mock` is not an accepted application type, so it is unreachable from create and must not be implied by the 400's message | Task 6 Interfaces; Steps 1(test 1), 7 |
+| `validRuntimeSpecType` accepts `""` and the capable predicate is false for it, so a spec check must ask `EffectiveRuntimeSpecType` | Task 7 Interfaces; the rule block; Steps 2, 7, 8, 13(e) |
 | A new sentinel absent from the error-row table falls through to a 500 | Task 6 Steps 2, 10, 12(f); Task 7 Steps 2, 10, 13(g) |
 | A spec PUT has no retype signal, so the rule must read the resulting document | Task 7's "why the rule is phrased over the RESULTING type"; Steps 7, 13(e) |
 | Two hand-maintained "79 migrations" prose counts, no test | Task 1 Step 9 |
@@ -1562,14 +1783,15 @@ Commit body: the four-way resolution, why `!hadExisting` is what "create" means 
 | A second hand-written capable-kind list would drift from the gate's | Task 5 Steps 5, 6 |
 | `PutRuntimeSpecRequest` derived by TS `Omit` → a required request field | **Part 2** — declared out of scope in Global Constraints |
 | Frontend and backend defaults both claiming authority (`applicationTypeDefaults.ts`) | **Part 2** — declared out of scope in Global Constraints |
-| The portal form restates every field, so a retype would earn decision (e)'s 400 | **Part 2** — see "What part 1 deliberately leaves on the table" |
+| The portal form restates every field, so a retype would earn decision (e)'s 400 (always the 400, never the 409: `buildBody()` restates `type` on every save) | **Part 2** — see "What part 1 deliberately leaves on the table" |
+| Task 5's capable-set size pin forces a look at the gate's list but proves no agreement; Task 6 is the first production caller, so an exported set would stop being test-only API | **Optional in Task 6** — recorded under its rule block, deliberately not a requirement |
 
 ## What part 1 deliberately leaves on the table
 
 These are named so a later reader does not mistake them for oversights:
 
 - **No operator control, no TypeScript, no i18n.** A visible toggle that does nothing would be worse than the blank cell it promises to fix.
-- **Decision (e)'s 400 has a consequence part 2 must design around, and this is the note that says so.** `gateway/frontend/src/components/ApplicationSection.tsx`'s `buildBody()` (`:381-434`) is ONE literal reused verbatim for create and update, so a field added there is restated on every save — and a save that retypes the application would then *assert* `responses_live_timings_enabled` against the new type and earn a `400 application.responses_live_timings_unsupported`. The control must therefore gate **what it sends**, not only what it renders. The shape to copy is already in that file, for `proxy_excluded` and for exactly this class of reason: the create path sends the key only when the control was rendered (`...(showProxyControls ? { proxy_excluded: proxyExcluded } : {})`, `:425`) and the update path deletes it when it has not changed from the value captured as the form OPENED (`if (proxyExcluded === proxyExcludedSeed) delete body.proxy_excluded;`, `:461`, whose own comment explains why sending it unconditionally "would compile, pass a 'the switch works' test, and still be a defect"). `RuntimeAdminSection.tsx`'s spec form needs the same care for a different reason: a spec PUT is a full document, so it always restates `type`/`binary` alongside the flag. The gain that pays for this care: because a stored `true` can never be inert, the control needs no second indicator explaining why a switch that is on is doing nothing.
+- **Decision (e)'s 400 has a consequence part 2 must design around, and this is the note that says so.** `gateway/frontend/src/components/ApplicationSection.tsx`'s `buildBody()` (`:381-434`) is ONE literal reused verbatim for create and update, so a field added there is restated on every save — and a save that retypes the application would then *assert* `responses_live_timings_enabled` against the new type and earn a `400 application.responses_live_timings_unsupported`. Always that one, never the 409 sibling: the same literal restates `type` on every save (`:391`), so the portal's request always supplies the type it is judged against, which is precisely the 400 shape. The control must therefore gate **what it sends**, not only what it renders. The shape to copy is already in that file, for `proxy_excluded` and for exactly this class of reason: the create path sends the key only when the control was rendered (`...(showProxyControls ? { proxy_excluded: proxyExcluded } : {})`, `:425`) and the update path deletes it when it has not changed from the value captured as the form OPENED (`if (proxyExcluded === proxyExcludedSeed) delete body.proxy_excluded;`, `:461`, whose own comment explains why sending it unconditionally "would compile, pass a 'the switch works' test, and still be a defect"). `RuntimeAdminSection.tsx`'s spec form needs the same care for a different reason: a spec PUT is a full document, so it always restates `type`/`binary` alongside the flag. The gain that pays for this care: because a stored `true` can never be inert, the control needs no second indicator explaining why a switch that is on is doing nothing.
 - **No gate, no injection, no retry, no capture change.** `wantsLiveProgress` and `liveProgressMemo` are unexported in `internal/provider` and the memo hangs off `*OpenAICompatibleClient` while the gateway holds a `provider.Client`; that package-boundary decision is part 2's and is not prejudged here.
 - **The non-injection prose stays as written.** `telemetry-usage-observability.md` §8.4.3 states it twice — at `:755-766` ("`timings_per_token` is READ when the client set it, and never injected", framed as one of "Two rules on this path must survive any later change") and again in the three-layer-rule passage further down the same long section, at `:1536-1550` ("Native passthrough gets neither parameter") — and `compatibility-and-inference.md` §6 states it a third time, at `:263-267` and `:370-386`. After part 1 all three are still **true**: nothing injects anything. Reversing them belongs in the commit that reverses the behaviour, together with the ADR (next number: ADR-041; ADR-030 at `09-architecture-decisions.md:306` is its closest structural precedent) if one is written. Note for part 2: `docs/architecture/reference/data-model.md` §4's anchor will by then read `#4-migration-history-80-migrations`.
 - **The two vacuous "must not grow a `timings_per_token` flag" assertions** (`internal/gateway/passthrough_progress_test.go:292`, `:623`) are left exactly as they are. They pass today and will pass after part 1; part 2 owns re-documenting which one is the negative case and why its fixture is incapable, and adding a genuinely capable fixture for the positive.
