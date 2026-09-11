@@ -50,6 +50,67 @@ type usageScanner struct {
 	// the merged output-token count alone cannot say whether it came from a real
 	// total or from a placeholder snapshot.
 	haveTerminalUsage bool
+	// finalPromptPerSecond / finalTokensPerSecond are the LATEST rates any frame
+	// reported for ITSELF, frozen at the first authoritative terminal frame (see
+	// takeFinalRates) and held OUTSIDE the max-merged accumulator, so usage()
+	// can hand the recording path the generation's FINAL rate rather than its
+	// PEAK.
+	//
+	// The accumulator is right to max-merge everything else and wrong to
+	// max-merge these two. Every COUNT it holds — input/output/total/cached
+	// tokens, and `timings.draft_n` — grows monotonically over a turn, so its
+	// max IS its final value, which is the whole reason a fragment-by-fragment
+	// scan can work at all. A RATE does not: llama.cpp's
+	// prompt_per_second/predicted_per_second are cumulative averages over the
+	// generation, so predicted_per_second falls as the KV cache grows
+	// (publishProgress's doc comment states the same fact for the live column)
+	// while swinging frame to frame, and the max of such a series is a
+	// mid-stream peak.
+	//
+	// MEASURED, not inferred — on the operator's own deployment (llama.cpp build
+	// b10448-ad1de39e0 serving an MTP model, reached through the server-agent's
+	// runtime router). The figures come from SEPARATE flagged requests, and
+	// which run each one belongs to matters:
+	//
+	//   - Measured DIRECT to the runtime router, one 48-frame Responses stream:
+	//     39 of those frames carried a top-level `timings` object — on
+	//     response.reasoning_text.delta and response.output_text.delta alike.
+	//   - Measured THROUGH this gateway, a second, separate request: 41
+	//     timings-bearing frames, whose terminal frame reported
+	//     predicted_per_second = 47.389 while the maximum over them was 52.200 —
+	//     and 52.200240121104564 is what this gateway recorded, the peak,
+	//     +10.2%, straight into the routing EWMA below.
+	//
+	// The series is a sawtooth rather than a monotone decay (0.0, 16.62, 33.24,
+	// 49.86, 34.06, 42.57, 51.09, …), so the max can sit anywhere in the stream:
+	// another run peaked at 53.222 mid-stream against a terminal 48.490.
+	// prompt_per_second's max EQUALLED its terminal value in both runs that
+	// reported a terminal figure, which is why only one of the two fields shows
+	// a measurable bias — taking prompt_per_second from the same frame is
+	// defensive rather than corrective. Those are figures from THAT build on
+	// THAT deployment, not a guarantee about every llama.cpp build.
+	//
+	// The precondition is a client's own `timings_per_token`, RELAYED UNTOUCHED
+	// (a rule this path pins deliberately — see
+	// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate). The
+	// flag is what puts `timings` on the partials at all: the SAME PROMPT
+	// REPLAYED WITHOUT the flag produced exactly ONE timings-bearing frame, the
+	// terminal response.completed. A replay, not the same request — a request
+	// either carried the flag or it did not. So the peak is reachable whenever a
+	// client asks for mid-stream timings, and this capture is a measured no-op
+	// for traffic that does not. A recorded rate is a ROUTING input — recordUsage
+	// feeds it into the mapping's throughput EWMA
+	// (UpdateMappingOpportunisticMetrics, inference_complete.go), which the
+	// scorer and a model group's MinTokensPerSecond gate read back — so a peak
+	// recorded as the end-of-request figure does not merely misreport one row,
+	// it steers routing.
+	//
+	// A zero never overwrites a rate already held (takeLastNonZeroF): a frame
+	// can carry a `timings` object whose predicted_per_second is 0.0 — the
+	// measured series above opens with exactly that — and "this frame had
+	// nothing to report yet" must not erase what the stream did report.
+	finalPromptPerSecond float64
+	finalTokensPerSecond float64
 	// lastAt is the timestamp of the most recent feed/finish call: the best
 	// available estimate of "generation completed" for the Anthropic fallback
 	// rate's generation-window end (see usage below).
@@ -100,6 +161,11 @@ func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) 
 // per-field `take` is a running max, so re-merging the same or overlapping
 // bytes could only ever leave recorded values unchanged or move them up, never
 // corrupt them. See mergePassthroughUsage's doc comment (native_passthrough.go).
+// The two RATE fields do not ride on that monotonicity — they are not
+// max-merged at all (see the final* fields) — but they are equally immune to a
+// repeat: a re-scanned payload replays the same frames in the same order, so a
+// last-wins capture lands on the same value, and once an authoritative frame has
+// frozen the capture, re-seeing any frame takes nothing at all.
 func (s *usageScanner) feed(chunk []byte, at time.Time) {
 	if s == nil {
 		return
@@ -148,12 +214,68 @@ func (s *usageScanner) finish(at time.Time) {
 
 // scan stamps the first-content-frame timestamp and the
 // authoritative-terminal-usage flag — each once, the first time such a frame is
-// seen — publishes each frame's own reported facts to the live progress counter,
+// seen — keeps the LATEST rate the frames themselves report for the recording
+// path, publishes each frame's own reported facts to the live progress counter,
 // and merges payload's usage/timings fields into the running total.
 //
 // The per-payload probe stops running as soon as both flags are set, EXCEPT when
 // a progress counter is attached: the live column is fed from every frame, not
 // just the first of each kind, so for a displayed stream the loop keeps going.
+//
+// ONE scratch read of each frame serves both the recorded rate and the live
+// column (takeFinalRates and publishProgress below): mergePassthroughUsage over
+// a SINGLE payload into a scratch inference.Usage is precisely "what did this
+// frame report" (jsonPayloads passes a lone JSON object through untouched), and
+// doing it HERE rather than inside each consumer is what keeps the two
+// consumers on ONE read of each frame instead of two. Reading those fields any
+// other way would mean a FOURTH copy of the per-flavor usage switch, and this
+// codebase deliberately keeps exactly three (mergePassthroughUsage,
+// isContentFrame, isTerminalUsageFrame).
+//
+// What that costs, stated exactly rather than rounded to nothing: the read sits
+// BEFORE publishProgress's `progress == nil || !haveFirstContent` guard, where
+// the live column's own read used to sit AFTER it. So a displayed stream pays
+// +ONE parse per PRE-CONTENT frame and none after — roughly four such frames
+// for Responses (response.created, response.in_progress,
+// response.output_item.added, response.content_part.added) and roughly two for
+// Anthropic (message_start, content_block_start). A stream with NO counter
+// attached pays one small parse per frame until the authoritative frame and
+// none after it.
+//
+// `frame` is declared INSIDE the loop body and must stay there. The per-frame
+// reset is load-bearing for BOTH surfaces: multiple SSE frames per payload is
+// the normal case (nativeCopier.run reads in 32 KB chunks, so one scan call
+// routinely covers several frames), and mergePassthroughUsage's per-field take
+// is a running MAX — so a single `frame` hoisted out of the loop, the textbook
+// "allocate once outside the loop" edit, would make the live cell AND the
+// recorded rate a per-payload PEAK. That is this defect, relocated into the
+// live column. Pinned by
+// TestUsageScannerTwoRateBearingFramesInOnePayloadTakeTheLastFramesRate.
+//
+// The capture is FROZEN by the first authoritative frame: takeFinalRates
+// self-gates on haveTerminalUsage, which is set immediately after it, so that
+// frame's own rate is the last one taken. The loop's own condition is what makes
+// both halves of that well-defined, in both directions:
+//
+//   - The condition includes !s.haveTerminalUsage, so the flag can never be set
+//     while the loop is skipped, and the loop can never be skipped while the
+//     flag is unset: the FIRST authoritative frame is always iterated,
+//     regardless of the progress counter. Nothing LATER enjoys that guarantee —
+//     with no counter attached the loop stops the moment both flags are set
+//     while the accumulator merge below goes on for every remaining chunk — so a
+//     capture left open past that frame would silently read a DIFFERENT frame
+//     depending on whether the row was being displayed.
+//   - Symmetrically, while NO authoritative frame has arrived that same
+//     condition keeps the loop running for EVERY payload. That is what makes
+//     keeping the latest rate free of the very hazard above rather than subject
+//     to it: the only case where the latest rate decides the recorded figure — a
+//     stream cut off before its terminal frame — is exactly the case where the
+//     loop runs throughout, counter or no counter.
+//
+// For `openai_responses` the first authoritative frame is also the last
+// (`response.completed` occurs once per response); for `anthropic_messages`
+// EVERY `message_delta` is authoritative, and freezing at the first is what
+// keeps that difference from mattering there.
 func (s *usageScanner) scan(payload []byte, at time.Time) {
 	if !s.haveFirstContent || !s.haveTerminalUsage || s.progress != nil {
 		for _, p := range jsonPayloads(payload) {
@@ -162,13 +284,78 @@ func (s *usageScanner) scan(payload []byte, at time.Time) {
 				s.firstContentAt = at
 			}
 			authoritative := isTerminalUsageFrame(s.apiFlavor, p)
+			var frame inference.Usage
+			mergePassthroughUsage(&frame, s.apiFlavor, p)
+			s.takeFinalRates(frame)
 			if authoritative {
 				s.haveTerminalUsage = true
 			}
-			s.publishProgress(p, authoritative)
+			s.publishProgress(frame, authoritative)
 		}
 	}
 	mergePassthroughUsage(&s.acc, s.apiFlavor, payload)
+}
+
+// takeFinalRates keeps ONE frame's own rate fields as the figures usage() hands
+// the recording path in place of the accumulator's running max, and is FROZEN by
+// the first authoritative terminal frame: scan sets haveTerminalUsage
+// immediately after calling this, so that frame's own rates are the last ones
+// taken and every frame after it is ignored. See the final* fields for why a max
+// is right for every count and wrong for these two, and scan for the loop
+// guarantee both halves rest on.
+//
+// Until such a frame arrives the LATEST frame's rate stands. That is not a
+// compromise for the responses that end without one — it is the only real
+// measurement they have:
+//
+//   - A stream that ends before its `response.completed` carries `timings` on
+//     its partials and no authoritative frame at all. Its last reported rate is
+//     the generation's last measured value, where the accumulator's would be the
+//     peak — the same defect, in the one case a terminal-only capture could not
+//     reach. WHICH SURFACE that reaches depends on the recorded status, and the
+//     distinction is worth keeping straight: a stream that ends CLEANLY at 200
+//     without a `response.completed` — a `response.failed` or
+//     `response.incomplete` terminal event (this repo's own translate path
+//     emits `response.failed`, inference_complete.go), or an upstream that
+//     simply stops — is recorded status "success", so its rate reaches the
+//     routing EWMA too (recordUsage's feed is gated on success). A client
+//     disconnect, a copy error or an idle timeout is recorded status "error"
+//     (nativeTerminalStatus, native_passthrough.go), so it reaches only the
+//     Activity row — where a peak is still a misreport, just not a routing
+//     input.
+//   - A BUFFERED body is ONE payload, so its own reported rate is trivially both
+//     the latest and the only one. No `type` discriminator is needed to arrive
+//     at it, which is why this needs no special case: a buffered body is not
+//     authoritative, and the latest-rate rule already says its own figure.
+//
+// frame is the scratch Usage scan merged this payload into, shared with
+// publishProgress — see scan for why the read lives there.
+//
+// The choice deliberately does NOT live inside mergeResponsesUsage. That
+// function is also publishProgress's per-frame reader, and per-frame is the live
+// column's FEATURE for the very reason above — a falling cumulative average must
+// be shown falling, not pinned at the stream's peak — so a max-versus-latest
+// decision baked into the merge would silently take that away. Keeping the
+// choice here also preserves feed's documented "a line may be scanned more than
+// once" tolerance, which rests on the merge itself being monotone.
+func (s *usageScanner) takeFinalRates(frame inference.Usage) {
+	if s.haveTerminalUsage {
+		return
+	}
+	takeLastNonZeroF(&s.finalPromptPerSecond, frame.PromptPerSecond)
+	takeLastNonZeroF(&s.finalTokensPerSecond, frame.TokensPerSecond)
+}
+
+// takeLastNonZeroF is the RATE counterpart to native_passthrough.go's takeMaxF:
+// last-wins rather than running max, because a rate is a cumulative average
+// whose latest value — never its largest — is the answer, and a zero counts as
+// "this frame reported nothing" so it cannot erase a real measurement. Both uses
+// are that one rule: takeFinalRates taking a frame's rate, and usage()
+// substituting the result over the accumulator's max.
+func takeLastNonZeroF(dst *float64, v float64) {
+	if v > 0 {
+		*dst = v
+	}
 }
 
 // publishProgress reports ONE frame's own upstream-reported facts to the live
@@ -200,18 +387,14 @@ func (s *usageScanner) scan(payload []byte, at time.Time) {
 //     would pin the live column at whatever the stream's early peak was and
 //     never come down. observeDelta stores the value it is given, exactly as it
 //     does for a translated chunk.
-func (s *usageScanner) publishProgress(payload []byte, authoritativeUsage bool) {
+//
+// frame is the scratch Usage scan merged this payload into — one frame's own
+// numbers, under the same per-flavor rules the recorded row reads. See scan for
+// why that read lives there and is shared with the recorded rate.
+func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage bool) {
 	if s.progress == nil || !s.haveFirstContent {
 		return
 	}
-	// One frame's own numbers, merged into a scratch Usage rather than read by a
-	// second parser: mergePassthroughUsage over a single payload is exactly
-	// "what did this frame report" (jsonPayloads passes a lone JSON object
-	// through untouched), so the live column reads the same fields under the
-	// same per-flavor rules as the recorded row -- and this file grows no
-	// FOURTH copy of the flavor switch to be forgotten when a flavor is added.
-	var frame inference.Usage
-	mergePassthroughUsage(&frame, s.apiFlavor, payload)
 	prog := inference.StreamProgress{TokensPerSecond: frame.TokensPerSecond}
 	if authoritativeUsage {
 		prog.OutputTokens = frame.OutputTokens
@@ -219,7 +402,12 @@ func (s *usageScanner) publishProgress(payload []byte, authoritativeUsage bool) 
 	s.progress.observeDelta(s.firstContentAt, &prog)
 }
 
-// usage returns the accumulated usage for the recording path.
+// usage returns the accumulated usage for the recording path — with the two
+// RATE fields taken from the frames themselves rather than from the
+// accumulator's running max (see the final* fields and takeFinalRates), because
+// a max over a cumulative average that falls and swings is the generation's
+// mid-stream peak. The figure is the authoritative terminal frame's own where
+// one arrived, and the last rate the stream reported where none did.
 //
 // For the Anthropic flavor only, when the upstream reported an output-token
 // count but no rate of its own (Anthropic carries no `timings` object on any
@@ -265,6 +453,27 @@ func (s *usageScanner) usage() inference.Usage {
 	}
 	u := s.acc
 	finalizeTotalTokens(&u)
+	// The rates the frames reported for THEMSELVES replace the accumulator's
+	// running max (see the final* fields for why a rate must not be max-merged):
+	// for `openai_responses` this is what turns a recorded PEAK back into the
+	// generation's final figure, whether the stream ended with a
+	// `response.completed` or was cut off before one.
+	//
+	// Written flavor-agnostically on purpose. It costs `anthropic_messages`
+	// nothing and adds no fourth per-flavor switch: mergeAnthropicUsage
+	// (native_passthrough.go) writes no rate field at all — its anthropicUsage
+	// struct has none, because llama.cpp attaches no `timings` object to any
+	// Anthropic frame — so for that flavor both sides are 0 and the fallback gate
+	// below opens in exactly the same cases as before this substitution existed.
+	//
+	// Substituting only a NON-ZERO figure (takeLastNonZeroF) is what keeps that a
+	// no-op rather than an assumption to be believed. isTerminalUsageFrame
+	// accepts EVERY Anthropic `message_delta`, so the capture freezes at the
+	// first one; if some flavor's merge ever did read a rate from frames this
+	// capture does not see, the worst case is that the accumulator's figure
+	// stands — never that a real measurement is overwritten with a 0.
+	takeLastNonZeroF(&u.PromptPerSecond, s.finalPromptPerSecond)
+	takeLastNonZeroF(&u.TokensPerSecond, s.finalTokensPerSecond)
 	if s.apiFlavor == "anthropic_messages" && u.TokensPerSecond == 0 && u.OutputTokens > 0 &&
 		s.haveFirstContent && s.haveTerminalUsage {
 		if window := s.lastAt.Sub(s.firstContentAt); window >= minGatewayRateWindow {
@@ -348,9 +557,25 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 // deferred Active.Remove. Pinned by
 // TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves.
 //
-// For the RECORDED row it changes nothing: usage()'s derived rate is Anthropic-
-// only, so the Responses shape takes no derived rate there (see usage()), and a
-// buffered Responses body carries no `type` discriminator to match on.
+// It is load-bearing for the RECORDED row as well, though for a different
+// value: the frame this branch identifies FREEZES takeFinalRates's capture, so
+// `response.completed`'s own rate — not the accumulator's mid-stream peak, and
+// not a rate from anything after it — is what the recording path gets. usage()'s
+// DERIVED rate remains Anthropic-only, so the Responses shape still takes none
+// of that (see usage()).
+//
+// What this branch does NOT decide is whether a rate is recorded at all. A
+// response it never matches keeps the last rate its own frames reported, which
+// covers both shapes that reach that state: a TRUNCATED stream (partial
+// `timings`, no `response.completed` — a client that disconnects or an upstream
+// that fails mid-generation), and a buffered body, whose single payload makes
+// its own reported figure trivially the latest one. The buffered case needs no
+// rule of its own for a second reason as well: this repo's own account of the
+// shapes llama.cpp bolts `timings` onto (parsePassthroughUsage,
+// native_passthrough.go, and §8.4.3 of
+// docs/architecture/cross-cutting/telemetry-usage-observability.md) has the
+// non-streaming `/v1/responses` body carrying no `timings` object at all, so
+// there is no buffered Responses rate for any rule to protect.
 func isTerminalUsageFrame(apiFlavor string, payload []byte) bool {
 	var probe struct {
 		Type string `json:"type"`

@@ -304,20 +304,28 @@ func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.
 // a count this gateway may claim.
 //
 // What the FIXTURE pins is this gateway's HANDLING of a partial-frame `timings`
-// object — read it, label it "upstream", display the latest one — not a captured
-// llama.cpp behaviour. The flag's effect on partial frames is established for
-// llama.cpp's CHAT streams; nothing in this repo has captured a Responses partial
-// carrying `timings`, and the rate cell of the per-flavor table in
-// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3 states
-// that same caveat. The Responses frame shape anchored to a documented-real one is
-// the TERMINAL frame, pinned by
-// TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves below.
+// object — read it, label it "upstream", display the latest one. The upstream
+// behaviour it assumes is now MEASURED rather than carried over from the CHAT
+// streams: on the operator's deployment (llama.cpp build b10448-ad1de39e0
+// serving an MTP model, through the server-agent's runtime router), one flagged
+// Responses request measured DIRECT to the runtime router had 39 of its 48
+// frames carry a top-level `timings` object — on response.reasoning_text.delta
+// and response.output_text.delta alike — while the SAME PROMPT REPLAYED WITHOUT
+// the flag had exactly ONE, the terminal response.completed. (A replay, not the
+// same request: a request either carried the flag or it did not.) That is one
+// build on one deployment, not a guarantee about every llama.cpp build, but the
+// partial-frame `timings` object this fixture is built on is no longer
+// hypothetical. §8.4.3 of
+// docs/architecture/cross-cutting/telemetry-usage-observability.md carries the
+// same measurement, including the separate through-the-gateway run the recorded
+// figures below come from.
 //
 // The two frames report a DECREASING rate on purpose. llama.cpp's
-// predicted_per_second is a cumulative average over the generation, so it
-// commonly falls as the KV cache grows; the assertion is on the LATEST value, so
-// an implementation that fed the accumulator's running max would pin the column
-// at the stream's early peak (42.5) and fail here.
+// predicted_per_second is a cumulative average over the generation, so it falls
+// as the KV cache grows while swinging frame to frame (the measured series is a
+// sawtooth: 0.0, 16.62, 33.24, 49.86, 34.06, 42.57, 51.09, …); the assertion is
+// on the LATEST value, so an implementation that fed the column the
+// accumulator's running max would pin it at 42.5 and fail here.
 func TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate(t *testing.T) {
 	var got liveRow
 	prov := &progressObservingProxyProvider{
@@ -351,6 +359,52 @@ func TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate(t *test
 	}
 	if got.outputTokens != 0 {
 		t.Fatalf("live output_tokens = %d, want 0 (timings_per_token yields a rate; the partials still report no usage)", got.outputTokens)
+	}
+	// The RECORDED row of this same request is asserted here because this stream
+	// is the TRUNCATED shape: partial `timings` and no `response.completed`, so
+	// no authoritative terminal frame ever arrives. The recorded rate must still
+	// be the last figure the upstream actually reported (38.25), never the
+	// accumulator's running max (42.5) — recording a PEAK is the very defect this
+	// commit removes, and it is no less a defect for a stream that ended early.
+	//
+	// This request is the shape that is BOTH truncated and success-status, which
+	// is what makes it a ROUTING case and not merely a display one: the upstream
+	// simply stops after its last partial and the response closes cleanly at
+	// 200 with no `response.completed`. nativeTerminalStatus
+	// (native_passthrough.go) records that status "success", and recordUsage's
+	// EWMA feed (inference_complete.go) is gated on success, so this rate does
+	// reach UpdateMappingOpportunisticMetrics — the throughput figure the scorer
+	// and a group's MinTokensPerSecond gate read back. The other truncated
+	// shapes — a client disconnect, a copy error, an idle timeout — are recorded
+	// status "error" by that same function and reach only the Activity row,
+	// where a peak is still a misreport of what the upstream measured, just not
+	// a routing one. Getting that backwards is how this assertion gets read as
+	// cosmetic and dropped.
+	//
+	// The reachability is exactly the flagged stream above's: the client sets
+	// `timings_per_token`, llama.cpp attaches `timings` to the partials, and no
+	// terminal event arrives — a `response.failed`/`response.incomplete` end
+	// (this repo's own translate path emits `response.failed`,
+	// inference_complete.go) or an upstream that stops. usageScanner keeps the
+	// latest reported rate for precisely it — see takeFinalRates, and scan for
+	// why the per-payload loop is already running for every frame in this case
+	// (its condition includes `!haveTerminalUsage`, which stays true throughout
+	// a stream that has no authoritative frame).
+	//
+	// That the live cell and the recorded row AGREE here is not the point of
+	// either assertion; the two are separate surfaces, pinned as such by
+	// TestUsageScannerResponsesTerminalRateSurvivesLaterFramesAndTheLoopsFrequency
+	// (passthrough_usage_scan_test.go), whose live counter ends on a later
+	// frame's rate than the recorded row's. A stream that DOES send a terminal
+	// frame is TestPassthroughResponsesRecordsTheTerminalRateNotThePeak in the
+	// same file, where the recorded row is the terminal frame's 30.0 rather than
+	// the 42.5 peak.
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].TokensPerSecond != 38.25 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 38.25 — the LAST rate this cut-off stream reported; 42.5 is the accumulator's mid-stream peak, and recording a peak is the defect, terminal frame or no terminal frame", events[0].TokensPerSecond)
 	}
 	// The flag is present upstream because the CLIENT sent it — read, never
 	// injected. rewriteModelField re-serializes the object, so only the field's
