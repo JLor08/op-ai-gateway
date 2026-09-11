@@ -2968,10 +2968,11 @@ func assertNoRawToken(t *testing.T, dto ApplicationDTO, rawToken string) {
 // the opt-in ON, and every other kind gets the DDL default (off).
 //
 // Six rows, not seven: normalizeApplicationType's set is closed at
-// ollama/vllm/llama_cpp/llama_swap/litellm/server_agent
-// (service_applications.go:1000-1017), and "mock" is NOT in it -- a
-// `"type":"mock"` body dies on ErrApplicationTypeInvalid long before anything
-// this test covers, so a mock row would prove nothing about the default.
+// ollama/vllm/llama_cpp/llama_swap/litellm/server_agent (its switch has one
+// case per accepted type and returns ErrApplicationTypeInvalid by default),
+// and "mock" is NOT in it -- a `"type":"mock"` body dies on
+// ErrApplicationTypeInvalid long before anything this test covers, so a mock
+// row would prove nothing about the default.
 // routing.ProviderMock's false is pinned where it is reachable, in routing's
 // own TestLiveTimingsCapableKind.
 //
