@@ -1097,7 +1097,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
 			ResponsesMode: routing.EndpointModeTranslate, MessagesMode: routing.EndpointModeDisabled,
-			CreatedAt: now, UpdatedAt: now,
+			ResponsesLiveTimingsEnabled: true,
+			CreatedAt:                   now,
+			UpdatedAt:                   now,
 		}
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert: %v", err)
@@ -1112,8 +1114,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
 		if got.ResponsesMode != routing.EndpointModeTranslate || got.MessagesMode != routing.EndpointModeDisabled ||
+			!got.ResponsesLiveTimingsEnabled ||
 			!reflect.DeepEqual(got.APIFlavors, []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}) {
-			t.Fatalf("flavor/mode round-trip mismatch: %+v", got)
+			t.Fatalf("flavor/mode/live-timings round-trip mismatch: %+v", got)
 		}
 
 		// RuntimeSpecByID: the same row, keyed by its own primary key rather
@@ -1139,6 +1142,44 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt2")
 		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("overwrite must keep created_at, got %+v", got)
+		}
+
+		// The same spec saved again with responses_live_timings_enabled
+		// CLEARED. Two independent hazards, one assertion.
+		//
+		// (1) The SQL upsert's `on conflict (mapping_id) do update set` list is
+		// hand-maintained SEPARATELY from its insert column list. A column
+		// named in the insert but missing from the do-update list is written
+		// on a spec's FIRST save and then silently ignored by every later one
+		// -- and every other round-trip assertion in this test writes the
+		// same value twice, so none of them can see that.
+		//
+		// (2) agent_runtime_specs has NO applicationParityBools-style parity
+		// fixture (application_column_parity_test.go); this round trip is the
+		// whole guard for its five integer-boolean columns. Both column-order
+		// consts have fixed arity, so an OMITTED column errors at Scan, but
+		// two same-typed columns SWAPPED read each other's values in silence
+		// -- and the fixture above seeds enabled, pinned, vram_locked,
+		// set_visible_devices AND responses_live_timings_enabled all true, so
+		// while that holds a swap among them is invisible. One row in which
+		// this column differs from all four of its same-typed neighbours is
+		// what makes such a reorder observable.
+		flipped := spec
+		flipped.ResponsesLiveTimingsEnabled = false
+		flipped.UpdatedAt = now.Add(2 * time.Minute)
+		if err := s.UpsertRuntimeSpec(ctx, flipped); err != nil {
+			t.Fatalf("upsert live-timings off: %v", err)
+		}
+		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt2")
+		if got.ResponsesLiveTimingsEnabled {
+			t.Fatalf("re-saving a spec with responses_live_timings_enabled cleared read back true: the upsert's do-update list writes the column on the first insert only: %+v", got)
+		}
+		if !got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices {
+			t.Fatalf("clearing responses_live_timings_enabled disturbed another integer boolean, so two same-typed columns are transposed in a column list: %+v", got)
+		}
+		// Back on, so the list read below still describes a true row.
+		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
+			t.Fatalf("upsert live-timings back on: %v", err)
 		}
 
 		// A spec id reused for a DIFFERENT mapping is the primary-key
@@ -1174,6 +1215,10 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		// and is written second.
 		second := spec
 		second.ID, second.MappingID = "rspec_aaa", "map_rt2_b"
+		// ... and it deliberately disagrees with rspec_rt2 on
+		// responses_live_timings_enabled while agreeing on every OTHER
+		// integer boolean, for the list-read assertion below.
+		second.ResponsesLiveTimingsEnabled = false
 		if err := s.UpsertRuntimeSpec(ctx, second); err != nil {
 			t.Fatalf("upsert second spec: %v", err)
 		}
@@ -1183,6 +1228,23 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		}
 		if specs[0].ID != "rspec_aaa" || specs[1].ID != "rspec_rt2" {
 			t.Fatalf("specs must read ordered by id, got [%s %s]", specs[0].ID, specs[1].ID)
+		}
+		// runtimeSpecCols and runtimeSpecColsPrefixed (sqlite_runtime.go) are
+		// two independent, hand-maintained copies of ONE column order, and the
+		// `s.`-qualified one serves this list read ALONE -- so both a column
+		// MISSING from it and a column at a DIFFERENT OFFSET in it are
+		// invisible to the RuntimeSpecByMapping / RuntimeSpecByID assertions
+		// above. An omission errors at Scan on the destination count; a SWAP
+		// of two same-typed columns does not, which is why rspec_aaa was
+		// written with this one integer boolean cleared and the other four
+		// set. Reading identical values back for both rows would mean the
+		// column is not being read at all.
+		if specs[0].ResponsesLiveTimingsEnabled || !specs[1].ResponsesLiveTimingsEnabled {
+			t.Fatalf("the s.-qualified column list (runtimeSpecColsPrefixed) disagrees with runtimeSpecCols: rspec_aaa stored responses_live_timings_enabled=false and rspec_rt2 stored true, the list read returned %v/%v",
+				specs[0].ResponsesLiveTimingsEnabled, specs[1].ResponsesLiveTimingsEnabled)
+		}
+		if !specs[0].SetVisibleDevices || !specs[1].SetVisibleDevices {
+			t.Fatalf("the list read lost set_visible_devices, which both rows stored as true: it is transposed with responses_live_timings_enabled in runtimeSpecColsPrefixed: %+v", specs)
 		}
 		// Leave only rspec_rt2 behind, so the GPU-row and delete assertions
 		// below still describe a single-spec application.

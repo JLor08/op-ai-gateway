@@ -29,9 +29,9 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			idle_timeout_seconds, admission_wait_timeout_seconds, pinned,
 			admin_state, vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
 			visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
-			type, metrics_path, context_probe_path,
+			type, metrics_path, context_probe_path, responses_live_timings_enabled,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env, work_dir = excluded.work_dir,
@@ -51,6 +51,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			api_token_header = excluded.api_token_header,
 			type = excluded.type, metrics_path = excluded.metrics_path,
 			context_probe_path = excluded.context_probe_path,
+			responses_live_timings_enabled = excluded.responses_live_timings_enabled,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
@@ -58,7 +59,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		spec.AdmissionWaitTimeoutSeconds, spec.Pinned, spec.AdminState,
 		spec.VRAMLocked, spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
 		string(spec.VisibleDevicesMode), spec.APITokenMode, spec.APIToken, spec.APITokenHeaderSource, spec.APITokenHeader,
-		spec.Type, spec.MetricsPath, spec.ContextProbePath,
+		spec.Type, spec.MetricsPath, spec.ContextProbePath, spec.ResponsesLiveTimingsEnabled,
 		spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
@@ -80,7 +81,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, work_d
 	idle_timeout_seconds, admission_wait_timeout_seconds, pinned, admin_state,
 	vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
 	visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
-	type, metrics_path, context_probe_path,
+	type, metrics_path, context_probe_path, responses_live_timings_enabled,
 	created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
@@ -92,7 +93,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.idle_timeout_seconds, s.admission_wait_timeout_seconds, s.pinned, s.admin_state,
 	s.vram_locked, s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode,
 	s.visible_devices_mode, s.api_token_mode, s.api_token, s.api_token_header_source, s.api_token_header,
-	s.type, s.metrics_path, s.context_probe_path,
+	s.type, s.metrics_path, s.context_probe_path, s.responses_live_timings_enabled,
 	s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
@@ -352,7 +353,7 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
-	var enabled, pinned, vramLocked, setVisibleDevices int64
+	var enabled, pinned, vramLocked, setVisibleDevices, liveTimings int64
 	var apiFlavors string
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
 		&spec.Env, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
@@ -362,7 +363,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&apiFlavors, &spec.ResponsesMode, &spec.MessagesMode,
 		&spec.VisibleDevicesMode,
 		&spec.APITokenMode, &spec.APIToken, &spec.APITokenHeaderSource, &spec.APITokenHeader,
-		&spec.Type, &spec.MetricsPath, &spec.ContextProbePath,
+		&spec.Type, &spec.MetricsPath, &spec.ContextProbePath, &liveTimings,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound
@@ -372,6 +373,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	}
 	spec.Enabled, spec.Pinned, spec.VRAMLocked = enabled != 0, pinned != 0, vramLocked != 0
 	spec.SetVisibleDevices = setVisibleDevices != 0
+	spec.ResponsesLiveTimingsEnabled = liveTimings != 0
 	flavors, err := decodeAPIFlavors(apiFlavors)
 	if err != nil {
 		return routing.RuntimeSpec{}, err
