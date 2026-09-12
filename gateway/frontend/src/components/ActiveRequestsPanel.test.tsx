@@ -388,10 +388,12 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   });
 });
 
-// The live output-tokens column. It renders the DTO field the panel has carried
-// since the passthrough bridge (`output_tokens`, already populated for
-// anthropic_messages) -- there is no new wire field and no new type member here,
-// only a column that shows one.
+// The live output-tokens column. It renders a field older than this branch:
+// `output_tokens` entered activeRequestDTO and the TypeScript ActiveRequest
+// together, with the live per-request tokens/sec and TTFT work (#51), already
+// populated for anthropic_messages; the native-passthrough bridge (#77) came
+// later and added row shapes, not keys. So there is no new wire field and no new
+// type member here, only a column that shows one.
 describe('ActiveRequestsPanel live output-tokens column', () => {
   it('stays hidden by default and is offered in the column menu', async () => {
     render(

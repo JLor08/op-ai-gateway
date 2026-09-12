@@ -46,7 +46,11 @@ function formatLiveTps(value: number): string {
 // DOES distinguish native passthrough from translation — it differs from `req_path`
 // exactly when translation is happening — but that is not the axis this absence
 // turns on: nothing on this DTO records whether the client set `timings_per_token`,
-// and no flavor-plus-mode combination narrows the absence to a single cause. The
+// nothing on it records the operator's Responses live-timings switch either (that
+// one is recorded on the gateway's per-request debug line, deliberately not on this
+// wire shape — so do not go looking for a field here, and do not reach for
+// `provider_path` or `api_flavor` as a stand-in for one), and no flavor-plus-mode
+// combination narrows the absence to a single cause. The
 // same empty source arises from a translated stream whose provider reports neither
 // an exact count nor a rate; from a native-passthrough openai_responses stream that
 // NOBODY asked for timings on — neither the CLIENT nor the operator's Responses
@@ -228,6 +232,16 @@ export function ActiveRequestsPanel({
     // accessor: '—' is not a number, so ListTable's `numeric` sort sinks an
     // unreported count in BOTH directions instead of ranking it as the smallest
     // real value.
+    //
+    // "By default" and "between live_tps and ttft" both mean: for a profile with
+    // nothing stored. reconcileHiddenIds applies defaultHidden ONLY when the
+    // persisted hidden value is not an array, so an operator who has ever toggled a
+    // column on this panel carries a stored array that cannot mention a column
+    // added after it, and sees this one VISIBLE. Independently, reconcileOrder
+    // appends a catalogue id missing from a stored order at the END — after
+    // `elapsed` — for an operator who has ever reordered or reset. Both are
+    // inherited by every optional column in this codebase rather than anything this
+    // one does, and the column menu's reset restores both to the values here.
     {
       id: 'output_tokens',
       label: t.activityColLiveOutputTokens,
