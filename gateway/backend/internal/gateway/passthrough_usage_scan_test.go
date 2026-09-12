@@ -157,9 +157,14 @@ func TestMergeResponsesUsageDraftTokensTakesRunningMax(t *testing.T) {
 // every COUNT this merge writes being monotone. predicted_n is monotone over a
 // generation, so a max is its final value.
 //
-// The last case is the shape nothing was ever observed emitting -- a `timings`
-// object with no `predicted_n` key -- and it must report no count rather than
-// infer one from the rate sitting beside it.
+// The last case is a `timings` object with no `predicted_n` key. Scoped
+// precisely, because this package contains the counter-example: no measured
+// PARTIAL carrying a `timings` object lacked a `predicted_n` (90 of 90 carried
+// one), but the merge is not partial-only, and the terminal-frame fixtures two
+// files over -- including the subtest named "llama.cpp: the terminal frame
+// carries its own timings" -- use exactly this shape, with publishProgress's
+// authoritative arm supplying their count. Either way the rule is one rule:
+// report no count rather than infer one from the rate sitting beside it.
 func TestMergeResponsesUsagePredictedNLandsInTheLiveFieldOnly(t *testing.T) {
 	var u inference.Usage
 	mergeResponsesUsage(&u, []byte(`{"timings":{"predicted_per_second":38.25,"predicted_n":12}}`))

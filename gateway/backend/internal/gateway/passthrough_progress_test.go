@@ -300,9 +300,15 @@ func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.
 }
 
 // TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate pins the
-// one cell of the `openai_responses` column that a CLIENT can fill: a `timings`
-// object on a PARTIAL frame, which llama.cpp attaches once the client set
-// `timings_per_token`. Such a rate is a real upstream measurement, so it is
+// TWO cells of the `openai_responses` column that a CLIENT's own
+// `timings_per_token` fills mid-stream, and asserts both: one `timings` object on
+// a PARTIAL frame, which llama.cpp attaches once the client set the flag, carries
+// the rate AND the count. (TTFT is the third live cell and is not one of them --
+// content frames stamp it with or without the flag, as the sibling test above
+// pins. A count also reaches the row WITHOUT the flag, but only at the end, off
+// the terminal frame's own response.usage --
+// TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves.) Such a
+// rate is a real upstream measurement, so it is
 // displayed and labelled "upstream" rather than "gateway" — the label is what
 // makes a client-dependent difference in completeness visible instead of
 // mysterious. The token count is the upstream's own `timings.predicted_n` off

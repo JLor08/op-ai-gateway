@@ -117,7 +117,15 @@ type Usage struct {
 	DraftTokens int `json:"draft_tokens,omitempty"`
 	// LiveOutputTokens is llama.cpp's own `timings.predicted_n`: the number of
 	// tokens the upstream reports having GENERATED so far. It exists for the
-	// running-connections panel's live column and for nothing else.
+	// running-connections panel's live CELLS and for nothing else.
+	//
+	// Cells, plural: it is the mid-stream count the active-requests DTO reports
+	// for this flavor, and on a row where no upstream rate has arrived it also
+	// decides the live RATE cell. liveProgressDTO derives a rate only over an
+	// exact upstream count, labels such a row `gateway`, and the panel's tooltip
+	// for that label interpolates this very number ("computed by the gateway from
+	// N tokens the server reported"). So a wrong value here is not confined to
+	// one cell.
 	//
 	// It is deliberately NOT OutputTokens and NOT TotalTokens. Those two are what
 	// usageScanner.usage hands recordUsage, and thence usage_events, the Activity
