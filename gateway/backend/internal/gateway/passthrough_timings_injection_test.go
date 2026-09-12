@@ -18,12 +18,16 @@ import (
 	"time"
 )
 
-// The tests in this file are the ONLY ones that exercise the opted-IN direction
-// of the Responses live-timings switch (issue #81 part 2). That matters more
-// than it sounds: the two standing "the relayed body must not grow a
-// timings_per_token flag" assertions in passthrough_progress_test.go hold for
-// TWO independent reasons, either of which alone would be enough --
-// newNativeModeTestServerOn seeds no live-timings flag and no runtime spec, so
+// The tests in this file are the ONLY ones that carry the opted-IN direction of
+// the Responses live-timings switch (issue #81 part 2) through proxyNative and
+// look at the body the upstream was handed. TestWantsResponsesLiveTimings has
+// opted-in rows of its own, but it builds a Target and calls the predicate
+// directly, so there is no relayed body there to inspect and no call site under
+// test. That matters more than it sounds: the two standing "the relayed body
+// must not grow a timings_per_token flag" assertions in
+// passthrough_progress_test.go hold for TWO independent reasons, either of
+// which alone would be enough -- newNativeModeTestServerOn seeds no
+// live-timings flag and no runtime spec, so
 // its resolved target has the flag false AND an effective kind of "custom" (its
 // application Type is server_agent, and an absent spec detects to "custom").
 // The flavor, the stream and the veto conditions all PASS for those fixtures,
