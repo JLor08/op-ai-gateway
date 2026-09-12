@@ -150,12 +150,13 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // Deliberately broader than the old literal: pinning the full phrase would let a
     // reworded "the upstream does not report a count mid-stream" reintroduce the same
     // false cause and still pass. The demonstrative is what does the blaming, so it is
-    // what is banned — the honest string names the server as one of two dependency
-    // axes ("the upstream" in en, "vom Inferenzserver" in de, which uses that one term
-    // throughout the sentence rather than mixing it with the anglicism), never "this
-    // upstream" / "dieser Inferenzserver" as the reason. The German term is banned in
-    // any declension, and the anglicism's ban stays so the guard does not go quiet if
-    // the wording is ever swapped back to "Upstream".
+    // what is banned — the honest string names the server as one of THREE dependency
+    // axes, beside what the client requested and the operator's Responses live-timings
+    // switch ("the upstream" in en, "vom Inferenzserver" in de, which uses that one
+    // term throughout the sentence rather than mixing it with the anglicism), never
+    // "this upstream" / "dieser Inferenzserver" as the reason. The German term is
+    // banned in any declension, and the anglicism's ban stays so the guard does not go
+    // quiet if the wording is ever swapped back to "Upstream".
     expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream/i);
     expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream/i);
     expect(messages.de.activityLiveTpsNone).not.toMatch(/dies\w* Inferenzserver/i);
@@ -167,8 +168,9 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // deliberately about the derivation and not about the count's existence — a row
     // whose exact count has arrived inside the gateway's 50ms derivation floor
     // reaches this same string with a positive count, so "no count to derive one
-    // from" would be false there. The client is named as one of the two dependency
-    // axes, which is what stops the sentence reading as an upstream limitation.
+    // from" would be false there. The client is named as one of the three dependency
+    // axes — beside the upstream and the operator's Responses live-timings switch —
+    // which is what stops the sentence reading as an upstream limitation.
     expect(messages.en.activityLiveTpsNone).toMatch(/not measured/i);
     expect(messages.en.activityLiveTpsNone).toMatch(/client/i);
     expect(messages.de.activityLiveTpsNone).toMatch(/nicht gemessen/i);
@@ -199,6 +201,20 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
       expect(m.activityLiveTpsUpstream).not.toContain('{n}');
       expect(m.activityLiveTpsGateway).toContain('{n}');
     }
+  });
+
+  it('names the operator switch beside the client as a third dependency axis', () => {
+    // The string ends by naming what the absence depends on, and it named two
+    // things: the upstream, and what the client requested. Part 2 of issue #81
+    // adds a third -- the operator's switch, which makes the gateway ask
+    // llama.cpp for timings_per_token on a streaming /v1/responses passthrough.
+    // So a row can be empty because the SWITCH is off while the client asked for
+    // nothing, and can carry a rate no client ever asked for. A two-item list
+    // presented as the whole list is the same class of defect as the wrong cause
+    // the first case in this describe bans: the sentence has to be complete, not
+    // merely free of false blame.
+    expect(messages.en.activityLiveTpsNone).toMatch(/switch/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/Schalter/i);
   });
 });
 

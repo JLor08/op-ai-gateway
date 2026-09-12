@@ -66,10 +66,11 @@ function formatLiveTps(value: number): string {
 // would drift.
 //
 // So activityLiveTpsNone claims only what holds across all of them — no rate
-// reported, none derivable yet — and names both dependency axes without asserting
-// which applies. Note the second clause is about the DERIVATION, not about the
-// count: on that last row an exact count exists, so a sentence denying one would be
-// false there.
+// reported, none derivable yet — and names all three dependency axes (the upstream,
+// what the client requested, and the operator's Responses live-timings switch)
+// without asserting which applies. Note the second clause is about the DERIVATION,
+// not about the count: on that last row an exact count exists, so a sentence denying
+// one would be false there.
 function liveTpsTitle(t: Translation, a: ActiveRequest): string {
   if (a.tokens_per_second_source === 'upstream') return t.activityLiveTpsUpstream;
   if (a.tokens_per_second_source === 'gateway') {
