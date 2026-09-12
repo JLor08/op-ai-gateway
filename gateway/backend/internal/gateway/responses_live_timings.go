@@ -47,12 +47,19 @@ const liveTimingsVerdictUnsupported = "unsupported"
 //     this path must not act on.
 //  3. The flavor is the Responses endpoint's own. proxyNative serves
 //     /v1/responses and /v1/messages from one function, and /v1/messages is out
-//     of scope for issue #81 -- nothing was measured about whether a llama.cpp
-//     Anthropic frame carries a `timings` object at all, so the gate refuses
-//     rather than guesses. The FINE flavor is a parameter rather than
-//     target.APIFlavor because that field carries the COARSE value
-//     (routing.Resolver.Resolve fills it from NormalizeAPIFlavor), which cannot
-//     tell this endpoint from /v1/chat/completions.
+//     of scope for issue #81. This repository states in several places -- among
+//     them usageScanner.usage and parsePassthroughUsage in this package, and the
+//     telemetry architecture document -- that llama.cpp attaches no `timings` to
+//     any Anthropic frame, and the derived-rate fallback for that shape is built
+//     on it. But none of those sites cites a MEASUREMENT for it, where the same
+//     document records the Responses side's attachment with a build identifier,
+//     a frame count and a without-flag replay. So this exclusion rests on the
+//     design's say-so rather than on a verified upstream fact: reason enough to
+//     refuse, not reason enough to widen the gate later without measuring first.
+//     The FINE flavor is a parameter rather than target.APIFlavor because that
+//     field carries the COARSE value (routing.Resolver.Resolve fills it from
+//     NormalizeAPIFlavor), which cannot tell this endpoint from
+//     /v1/chat/completions.
 //  4. The request is streaming. The flag exists to put a rate on a PARTIAL
 //     frame; a buffered response has none, and proxyNative allocates no
 //     live-progress counter for one.

@@ -70,12 +70,18 @@ var liveTimingsCapableKinds = map[string]struct{}{
 
 // LiveTimingsCapableKind reports whether kind -- an Application.Type or the
 // string form of an EffectiveRuntimeSpecType -- is one of the kinds above.
-// Exported because its callers live in other packages: the portal's create
-// paths, which use it to pick the stored default, and the request path's own
-// gate, gateway.wantsResponsesLiveTimings, which re-asks it about the
-// EFFECTIVE kind of an already-resolved target. It is still a statement about a
-// KIND and reads no stored flag -- the request-path caller supplies the kind
-// and ANDs the answer with the stored opt-in itself, which is exactly what lets
+// Exported because all five of its callers live in other packages, and the
+// portal holds four of them -- UPDATE paths included, not creates alone.
+// portal.CreateApplication asks once and uses the answer twice, to pick the
+// stored default and to refuse an explicit true. portal.UpdateApplication asks
+// twice: once to refuse an asserted true, and once to clear a stored true that
+// an incapable retype left behind. portal.putRuntimeSpec asks in its own
+// refusal arm, judging the spec's EFFECTIVE type. The fifth caller is issue
+// #81's part-2 gate, gateway.wantsResponsesLiveTimings, which re-asks about the
+// EFFECTIVE kind of an already-resolved target -- that gate is not wired into
+// the request path yet, but it is what will ask there. It is still a statement
+// about a KIND and reads no stored flag: every caller supplies the kind and
+// combines the answer with the stored opt-in itself, which is exactly what lets
 // the store stay policy-free about which kinds may hold a true.
 //
 // The argument must already be normalized: the lookup is a plain map hit, so it
