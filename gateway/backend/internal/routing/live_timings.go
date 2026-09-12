@@ -3,27 +3,52 @@
 
 package routing
 
-// liveTimingsCapableKinds is the closed set of upstream kinds whose request
-// schema is known to tolerate a live-progress request parameter, and therefore
-// the set for which a NEWLY CREATED application or runtime spec gets the
-// responses live-timings opt-in switched on by default.
+// liveTimingsCapableKinds is the closed set of upstream kinds whose
+// /v1/responses implementation is known to ANSWER a live-progress request
+// parameter with per-token timings, and therefore the set for which a NEWLY
+// CREATED application or runtime spec gets the responses live-timings opt-in
+// switched on by default.
 //
-// It is keyed on the string value BOTH vocabularies share: ProviderLlamaCPP ==
-// "llama_cpp" == RuntimeSpecTypeLlamaCpp, and likewise ProviderVLLM == "vllm"
-// == RuntimeSpecTypeVLLM. So one lookup serves an ordinary application's Type
-// and a server_agent child's EffectiveRuntimeSpecType alike -- which is exactly
-// the trick internal/provider's liveProgressUpstreams already relies on, and
-// why TestLiveProgressUpstreamsMatchesRoutingCapableKinds pins the two sets
-// together rather than letting a second hand-written list drift.
+// ONE member. It is keyed on the string value BOTH vocabularies share --
+// ProviderLlamaCPP == "llama_cpp" == RuntimeSpecTypeLlamaCpp -- so one lookup
+// serves an ordinary application's Type and a server_agent child's
+// EffectiveRuntimeSpecType alike. ProviderVLLM == "vllm" == RuntimeSpecTypeVLLM
+// holds in exactly the same way and is still pinned by
+// TestLiveTimingsCapableKindsShareOneStringAcrossBothVocabularies, because
+// internal/provider's gate still needs that equality -- it just no longer buys
+// a membership here.
 //
-// Deliberately NOT listed: server_agent (not an inference server at all -- ask
-// EffectiveRuntimeSpecType what actually serves), llama_swap and litellm (both
-// resolve a model to an arbitrary downstream that can be api.openai.com, which
-// answers 400 on an unrecognized body key), ollama, tgi, custom, mock. The
-// default is OFF, so a kind added later never opts in silently.
+// THIS SET IS NO LONGER internal/provider's liveProgressUpstreams. The two
+// were one set for one reason: both were read as "does this kind TOLERATE the
+// parameter?". Measured on 2026-09-12 against a live vLLM upstream serving
+// /v1/responses through this gateway, a streamed request carrying
+// timings_per_token produced 48 data frames and NOT ONE of them carried a
+// top-level timings object -- neither the partials nor the terminal frame.
+// vLLM accepts the key (its request models allow unknown fields) and does
+// nothing with it. Tolerance was never the question THIS set answers;
+// DELIVERY is, because a switch that is offered, defaults on for new
+// applications, and provably delivers nothing is worse than one that is not
+// offered. (One deployment, one build, whose build identifier was not
+// recorded -- the same scope caveat the repository already applies to #80's
+// measurement. Record the build before revisiting this.)
+//
+// liveProgressUpstreams keeps vllm on purpose: it gates a different parameter
+// PAIR (timings_per_token AND stream_options.continuous_usage_stats) on a
+// different endpoint (/v1/chat/completions), and continuous_usage_stats is a
+// first-class vLLM field that works there. So the relationship is now "every
+// kind here is also in the gate", with exactly one recorded divergence in the
+// other direction, pinned by internal/provider's
+// TestLiveProgressUpstreamsCoverEveryRoutingCapableKind. Do not re-level the
+// two lists into one.
+//
+// Deliberately NOT listed: vllm (above), server_agent (not an inference server
+// at all -- ask EffectiveRuntimeSpecType what actually serves), llama_swap and
+// litellm (both resolve a model to an arbitrary downstream that can be
+// api.openai.com, which answers 400 on an unrecognized body key), ollama, tgi,
+// custom, mock. The default is OFF, so a kind added later never opts in
+// silently.
 var liveTimingsCapableKinds = map[string]struct{}{
 	ProviderLlamaCPP: {},
-	ProviderVLLM:     {},
 }
 
 // LiveTimingsCapableKind reports whether kind -- an Application.Type or the

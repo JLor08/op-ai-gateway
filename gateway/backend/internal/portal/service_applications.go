@@ -303,7 +303,7 @@ type CreateApplicationRequest struct {
 	// A POINTER, like ProxyExcluded below, and for both of that field's
 	// reasons at once. First, absent must be distinguishable from an explicit
 	// false, because absent is what gets the kind-dependent default (ON for
-	// llama_cpp and vllm) and false is a deliberate off; with a plain bool the
+	// llama_cpp) and false is a deliberate off; with a plain bool the
 	// default could never fire for any client that sends the key -- which
 	// includes every portal form, since they send one whole body for create
 	// and update alike. Second, absent is what distinguishes a NON-MENTION
@@ -899,7 +899,7 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	//     becomes load bearing for real, which is what the refusal's HAZARD
 	//     note says and why it says it conditionally;
 	//   - nil with an incapable resulting type: the stored value is CLEARED,
-	//     so a retype away from llama_cpp/vllm cannot leave a stale true
+	//     so a retype away from llama_cpp cannot leave a stale true
 	//     behind for a kind that can never honour it (LiteLLM, for one,
 	//     forwards unknown body keys downstream and OpenAI/Azure answer 400).
 	//     This overrides nothing the operator said in THIS request -- they

@@ -3086,7 +3086,8 @@ func liveTimingsSpecFixture(t *testing.T) (*Service, *routing.MemoryStore, routi
 // TestPutRuntimeSpecResponsesLiveTimingsDefaultsFromTheSpecsOwnKind pins the
 // create default: a FIRST write (no existing spec row) that omits
 // responses_live_timings_enabled stores what the spec's own EFFECTIVE kind
-// implies -- on for llama_cpp/vllm, off for every other kind.
+// implies -- on for llama_cpp, off for every other kind (vllm included since
+// 2026-09-12; see routing.liveTimingsCapableKinds).
 //
 // The middle case pins WHICH resolver decides that, and nothing else in this
 // file does. Its type is "" and its binary is llama-server, so

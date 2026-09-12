@@ -9,7 +9,7 @@ import "testing"
 // in front of LiveTimingsCapableKind -- all seven application types and all
 // five RuntimeSpecTypes -- because the predicate's whole job is to answer for a
 // string drawn from EITHER of them (an Application.Type, or the string form of
-// an EffectiveRuntimeSpecType), and only two values may answer true.
+// an EffectiveRuntimeSpecType), and only ONE value may answer true.
 //
 // The load-bearing rows:
 //   - ProviderServerAgent is FALSE. A server_agent application is not an
@@ -21,7 +21,22 @@ import "testing"
 //     fronts a llama.cpp: both resolve a model to an arbitrary downstream that
 //     can be api.openai.com, which answers 400 on an unrecognized body key.
 //     internal/provider/live_progress.go records the same reasoning for the
-//     gate's own set, which is why the two sets agree here.
+//     gate's own set, and on these two kinds the two sets still agree -- but
+//     they are no longer the same set. See the vllm bullet below.
+//   - ProviderVLLM and RuntimeSpecTypeVLLM are FALSE, and they are the ONE
+//     place this set and internal/provider's liveProgressUpstreams disagree.
+//     vLLM's /v1/responses accepts timings_per_token and does nothing with it:
+//     measured 2026-09-12 against a live vLLM upstream through the gateway,
+//     a streamed request carrying the flag produced 48 data frames and NOT ONE
+//     carrying a timings object -- not on the partials, not on the terminal
+//     frame. (One deployment, one build, whose build identifier was not
+//     recorded; the same scope caveat the repository already applies to #80's
+//     measurement.) The opt-in this set decides defaults ON for a newly
+//     created application, so keeping vllm here would default a switch on that
+//     provably delivers nothing. The GATE keeps vllm, because the pair it
+//     sends on /v1/chat/completions -- timings_per_token AND
+//     stream_options.continuous_usage_stats -- includes a first-class vLLM
+//     field that works there.
 //   - "" is FALSE, so a spec whose type never resolved to anything takes the
 //     default-off rather than being read as "unset, therefore fine".
 //   - "LLAMA_CPP" and " llama_cpp" are FALSE. The lookup is a plain map hit on
@@ -43,9 +58,9 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 		want bool
 	}{
 		{ProviderLlamaCPP, true},
-		{ProviderVLLM, true},
+		{ProviderVLLM, false},
 		{string(RuntimeSpecTypeLlamaCpp), true},
-		{string(RuntimeSpecTypeVLLM), true},
+		{string(RuntimeSpecTypeVLLM), false},
 		{ProviderMock, false},
 		{ProviderOllama, false},
 		{ProviderLlamaSwap, false},
@@ -86,7 +101,7 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 		}
 	}
 	if capableRows != len(liveTimingsCapableKinds) {
-		t.Errorf("the table expects %d capable kinds but liveTimingsCapableKinds has %d: widen the table and re-check internal/provider's liveProgressUpstreams",
+		t.Errorf("the table expects %d capable kinds but liveTimingsCapableKinds has %d: fix the table to match the set. Do NOT reflexively re-level internal/provider's liveProgressUpstreams -- since 2026-09-12 the two are no longer one set, and the only rule left is that every kind HERE is also in the gate",
 			capableRows, len(liveTimingsCapableKinds))
 	}
 	for kind := range liveTimingsCapableKinds {
@@ -99,12 +114,18 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 // TestLiveTimingsCapableKindsSizeIsPinned is a breadcrumb, not a property: it
 // asserts the SIZE of the set and nothing about its contents, so that changing
 // the size cannot happen without an edit right here -- at a site whose failure
-// message names the OTHER hand-written list the set has to stay level with.
+// message names the OTHER hand-written list and says how far the two still have
+// to agree: every kind HERE is in the gate, and the gate deliberately holds one
+// kind this set does not.
 //
-// Why a size pin is needed on top of everything else. The two-test pair around
-// internal/provider's TestLiveProgressUpstreamsMatchesRoutingCapableKinds is
-// exact in the gate => capable direction only, because that direction ranges
-// over the real liveProgressUpstreams map. The capable => gate direction runs
+// Why a size pin is needed on top of everything else. internal/provider's
+// TestLiveProgressUpstreamsCoverEveryRoutingCapableKind no longer checks
+// equality in either direction: the contract since 2026-09-12 is that the
+// capable set is a SUBSET of the gate, with exactly one recorded divergence
+// (vllm, which the gate keeps and this set dropped). The only direction it can
+// check exactly is "every member of the GATE is either capable or that one
+// divergence", because that direction ranges over the real
+// liveProgressUpstreams map. The capable => gate direction runs
 // through a hand-listed enumeration of both vocabularies over there, and the
 // staleness loop that guards that enumeration iterates the GATE's keys. So a
 // COHERENT capable-side addition of a kind that neither vocabulary lists yet
@@ -118,9 +139,9 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 	// Changing this number is the deliberate act. Read the failure message
 	// before you do.
-	const pinnedSize = 2
+	const pinnedSize = 1
 	if len(liveTimingsCapableKinds) != pinnedSize {
-		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here, so go read internal/provider/live_progress.go and make liveProgressUpstreams agree -- its parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet",
+		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here. Do NOT go and make internal/provider's liveProgressUpstreams match -- that is the wrong half to follow: the two sets stopped being one set on 2026-09-12 and the gate deliberately holds vllm, which this set does not. The rule is only that every kind HERE is also in the gate; read the divergence note on liveTimingsCapableKinds first. And note that the provider-side parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet",
 			len(liveTimingsCapableKinds), pinnedSize)
 	}
 }
@@ -128,8 +149,10 @@ func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 // TestLiveTimingsCapableKindsShareOneStringAcrossBothVocabularies pins the
 // coincidence the single-map design rests on: an application type and a
 // RuntimeSpecType are different Go types with different validators, and
-// LiveTimingsCapableKind serves both from ONE map only because the two kinds
-// that may answer true spell themselves identically. internal/provider's
+// LiveTimingsCapableKind serves both from ONE map only because the kinds the
+// two vocabularies have IN COMMON spell themselves identically -- llama_cpp,
+// the one kind that may answer true, and vllm, which answers false here and is
+// still looked up through that same single map. internal/provider's
 // wantsLiveProgress leans on the same equality when it swaps target.Provider
 // for target.LiveProgressSpecType on a server_agent target.
 //
@@ -138,21 +161,31 @@ func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 // every runtime spec, with no type error anywhere. The pairs are compared
 // through a slice so the check is a real runtime comparison and not a constant
 // the compiler folds away.
+//
+// The vllm pair is still here even though vllm is no longer capable, and the
+// two halves of each row are now checked SEPARATELY, because the string
+// equality outlived the membership: internal/provider's wantsLiveProgress
+// swaps target.Provider for target.LiveProgressSpecType on a server_agent
+// target and looks the result up in liveProgressUpstreams, which still lists
+// vllm. Delete this row and that swap loses its only guard. The capable column
+// is what says which vocabulary-crossing kind this set still opts in.
 func TestLiveTimingsCapableKindsShareOneStringAcrossBothVocabularies(t *testing.T) {
 	for _, pair := range []struct {
 		provider string
 		specType RuntimeSpecType
+		capable  bool
 	}{
-		{ProviderLlamaCPP, RuntimeSpecTypeLlamaCpp},
-		{ProviderVLLM, RuntimeSpecTypeVLLM},
+		{ProviderLlamaCPP, RuntimeSpecTypeLlamaCpp, true},
+		{ProviderVLLM, RuntimeSpecTypeVLLM, false},
 	} {
 		if pair.provider != string(pair.specType) {
-			t.Errorf("provider %q and runtime spec type %q no longer share one string: LiveTimingsCapableKind's single map cannot serve both vocabularies any more",
+			t.Errorf("provider %q and runtime spec type %q no longer share one string: LiveTimingsCapableKind's single map cannot serve both vocabularies any more, and internal/provider's wantsLiveProgress loses the same equality",
 				pair.provider, pair.specType)
 			continue
 		}
-		if !LiveTimingsCapableKind(pair.provider) {
-			t.Errorf("LiveTimingsCapableKind(%q) is false for a kind both vocabularies call capable", pair.provider)
+		if got := LiveTimingsCapableKind(pair.provider); got != pair.capable {
+			t.Errorf("LiveTimingsCapableKind(%q) = %v, want %v: one string, one verdict -- both vocabularies have to get the same answer out of the single map",
+				pair.provider, got, pair.capable)
 		}
 	}
 }

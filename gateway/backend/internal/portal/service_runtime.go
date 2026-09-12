@@ -492,7 +492,7 @@ type PutRuntimeSpecRequest struct {
 	// apply-verbatim full-document request, the same exception APIToken below
 	// already makes (nil = keep the stored value), and it carries two loads.
 	// nil must mean "no opinion", so that a FIRST write can get the
-	// kind-dependent default (ON for a llama_cpp/vllm spec) while a later save
+	// kind-dependent default (ON for a llama_cpp spec) while a later save
 	// of an existing spec keeps whatever the operator last stored; a plain
 	// bool would arrive as false on every full-document PUT and the default
 	// could never fire. And nil is what separates a NON-MENTION from an
