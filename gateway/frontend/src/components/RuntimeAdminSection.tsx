@@ -64,6 +64,7 @@ import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
+import { runtimeSpecLiveTimingsKind } from './shared/liveTimings';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -2216,6 +2217,15 @@ export function RuntimeAdminSection({
   const [specType, setSpecType] = useState<RuntimeSpec['type']>('');
   const [metricsPath, setMetricsPath] = useState('');
   const [contextProbePath, setContextProbePath] = useState('');
+  // undefined = "no opinion", and the request field is optional so this form
+  // can say it. It genuinely has to: with Type on "Auto" the effective kind
+  // is detected from the binary's basename, and that detection is Go-only --
+  // so a `true` here might be refused and a `false` would silently disagree
+  // with the llama.cpp create default. The only correct thing to send is
+  // nothing, and the backend then applies the kind's own default on a first
+  // write or keeps the stored value on a later one.
+  const [specLiveTimings, setSpecLiveTimings] = useState<boolean | undefined>(undefined);
+  const specLiveTimingsKind = runtimeSpecLiveTimingsKind(specType);
 
   /**
    * The newest VRAM measurement this mapping has, for the per-GPU APPLY
@@ -2299,6 +2309,7 @@ export function RuntimeAdminSection({
     setApiTokenRotate(false);
     setGpuRows([]);
     setSpecType('');
+    setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
   }
@@ -2340,6 +2351,11 @@ export function RuntimeAdminSection({
     setSpecResponsesMode(spec.responses_mode);
     setSpecMessagesMode(spec.messages_mode);
     setSpecType(spec.type);
+    // `configured: false` means the mapping has no spec row and every other
+    // field is a zero value -- so that `false` is not an operator decision
+    // and must not become one. Edit is ungated and reaches exactly that
+    // document, and the write it leads to is a FIRST write.
+    setSpecLiveTimings(spec.configured ? spec.responses_live_timings_enabled : undefined);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
   }
@@ -3771,9 +3787,12 @@ export function RuntimeAdminSection({
               apiFlavors={specApiFlavors}
               responsesMode={specResponsesMode}
               messagesMode={specMessagesMode}
+              liveTimings={specLiveTimings}
+              liveTimingsKind={specLiveTimingsKind}
               onFlavorsChange={setSpecApiFlavors}
               onResponsesModeChange={setSpecResponsesMode}
               onMessagesModeChange={setSpecMessagesMode}
+              onLiveTimingsChange={setSpecLiveTimings}
             />
             <FormControlLabel
               control={

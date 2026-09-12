@@ -6613,3 +6613,70 @@ describe('RuntimeAdminSection API-token backend hints', () => {
     expect(screen.queryByText(t.runtimeSpecApiTokenBackendBanner)).not.toBeInTheDocument();
   });
 });
+
+// Responses live timings on the launch-spec surface (issue #81 part 2, design
+// D10). This form's capability signal is the WRITABLE Type select, which is
+// the first branch of routing.EffectiveRuntimeSpecType; only "Auto" falls
+// through to the binary-basename detection, which is Go-only and is the one
+// case this form answers "unknown".
+describe('RuntimeAdminSection responses live timings', () => {
+  it('shows the Auto caption on create and no tick, because the kind is not known yet', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+    expect(screen.getByText(t.applicationLiveTimingsAutoNote)).toBeInTheDocument();
+  });
+
+  it('ticks the box once Type is set to llama_cpp, and hides it for an incapable Type', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    // Nothing was ticked by hand: with a known-capable kind and no opinion,
+    // what the backend will apply on a first write is ON, so the box says so.
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeOllama }));
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsUnsupportedNote)).toBeInTheDocument();
+  });
+
+  it('hydrates the box from a CONFIGURED spec, and treats an unconfigured one as no opinion', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          type: 'llama_cpp',
+          binary: '/usr/bin/llama-server',
+          responses_live_timings_enabled: false,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+    cleanup();
+
+    // Edit is deliberately ungated and is reachable on a mapping with NO spec
+    // row. That document's `false` is a ZERO VALUE, not an operator decision:
+    // hydrating it would make this form's FIRST write send an explicit false
+    // and lose the llama.cpp create default.
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ mapping_id: 'map_1', type: 'llama_cpp' }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+  });
+});
