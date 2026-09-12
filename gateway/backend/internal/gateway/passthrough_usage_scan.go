@@ -90,16 +90,23 @@ type usageScanner struct {
 	// defensive rather than corrective. Those are figures from THAT build on
 	// THAT deployment, not a guarantee about every llama.cpp build.
 	//
-	// The precondition is a client's own `timings_per_token`, RELAYED UNTOUCHED
-	// (a rule this path pins deliberately — see
-	// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate). The
-	// flag is what puts `timings` on the partials at all: the SAME PROMPT
-	// REPLAYED WITHOUT the flag produced exactly ONE timings-bearing frame, the
-	// terminal response.completed. A replay, not the same request — a request
-	// either carried the flag or it did not. So the peak is reachable whenever a
-	// client asks for mid-stream timings, and this capture is a measured no-op
-	// for traffic that does not. A recorded rate is a ROUTING input — recordUsage
-	// feeds it into the mapping's throughput EWMA
+	// The precondition is a `timings_per_token` on the outgoing request, and it
+	// now has TWO sources: the client's own, RELAYED UNTOUCHED (a rule this path
+	// pins deliberately — see
+	// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate), or
+	// one proxyNative added at its body-building step because the operator
+	// switched the per-endpoint opt-in on for a capable upstream (issue #81
+	// part 2). The flag is what puts `timings` on the partials at all: the SAME
+	// PROMPT REPLAYED WITHOUT the flag produced exactly ONE timings-bearing
+	// frame, the terminal response.completed. A replay, not the same request — a
+	// request either carried the flag or it did not. So the peak is reachable
+	// whenever mid-stream timings were asked for by EITHER party, and this
+	// capture is a measured no-op only for traffic where neither did — which
+	// matters below, because the operator's switch, not only a client, now
+	// decides which requests reach the EWMA with an upstream-reported rate.
+	//
+	// A recorded rate is a ROUTING input — recordUsage feeds it into the
+	// mapping's throughput EWMA
 	// (UpdateMappingOpportunisticMetrics, inference_complete.go), which the
 	// scorer and a model group's MinTokensPerSecond gate read back — so a peak
 	// recorded as the end-of-request figure does not merely misreport one row,
