@@ -129,19 +129,23 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 // through a hand-listed enumeration of both vocabularies over there, and the
 // staleness loop that guards that enumeration iterates the GATE's keys. So a
 // COHERENT capable-side addition of a kind that neither vocabulary lists yet
-// slips through every check we have: add a future ProviderSGLang = "sglang" to
-// liveTimingsCapableKinds and a {ProviderSGLang, true} row to the table above,
-// and routing's tests pass, all three loops in the provider-side tripwire stay
-// silent, and the portal would default the opt-in ON for a kind the gate never
-// sends the parameters to. Closing that for real needs an exported accessor
-// for this set, i.e. production API whose only caller is a test; this is the
-// cheap mitigation instead.
+// slips through every OTHER check we have: add a future ProviderSGLang =
+// "sglang" to liveTimingsCapableKinds and a {ProviderSGLang, true} row to the
+// table above, and TestLiveTimingsCapableKind passes, all three loops in the
+// provider-side tripwire stay silent, and the portal would default the opt-in
+// ON for a kind the gate never sends the parameters to. THIS test is the only
+// thing that fires, because the size moved -- which is the whole reason it
+// exists. Do not soften that back into "routing's tests pass": this test is
+// one of them.
+// Closing the hole for real needs an exported accessor for this set, i.e.
+// production API whose only caller is a test; the size pin is the cheap
+// mitigation instead.
 func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 	// Changing this number is the deliberate act. Read the failure message
 	// before you do.
 	const pinnedSize = 1
 	if len(liveTimingsCapableKinds) != pinnedSize {
-		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here. Do NOT go and make internal/provider's liveProgressUpstreams match -- that is the wrong half to follow: the two sets stopped being one set on 2026-09-12 and the gate deliberately holds vllm, which this set does not. The rule is only that every kind HERE is also in the gate; read the divergence note on liveTimingsCapableKinds first. And note that the provider-side parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet",
+		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here. Do NOT go and make internal/provider's liveProgressUpstreams match -- that is the wrong half to follow: the two sets stopped being one set on 2026-09-12 and the gate deliberately holds vllm, which this set does not. The rule is only that every kind HERE is also in the gate; read the divergence note on liveTimingsCapableKinds first. And note that the provider-side parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet. Two architecture documents also state this set's membership, in prose that no test and no link check can see: docs/architecture/reference/api-surface.md (the responses_live_timings_enabled default and the refusal that shares this predicate) and docs/architecture/cross-cutting/agent-runtime-manager.md (the runtime-spec refusal in 11.5). Change them in the same edit",
 			len(liveTimingsCapableKinds), pinnedSize)
 	}
 }
@@ -167,8 +171,14 @@ func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 // equality outlived the membership: internal/provider's wantsLiveProgress
 // swaps target.Provider for target.LiveProgressSpecType on a server_agent
 // target and looks the result up in liveProgressUpstreams, which still lists
-// vllm. Delete this row and that swap loses its only guard. The capable column
-// is what says which vocabulary-crossing kind this set still opts in.
+// vllm. Delete this row and that swap loses its guard in THIS package -- but
+// not its only guard: internal/provider's TestWantsLiveProgressThreeLayerRule
+// catches the same rename from the other side, on its "undetermined +
+// server_agent whose effective spec type is vllm" row, which is written
+// against RuntimeSpecTypeVLLM while liveProgressUpstreams is keyed on
+// ProviderVLLM. Measured 2026-09-12: renaming RuntimeSpecTypeVLLM's value
+// fails exactly that row over there and this test here. The capable column is
+// what says which vocabulary-crossing kind this set still opts in.
 func TestLiveTimingsCapableKindsShareOneStringAcrossBothVocabularies(t *testing.T) {
 	for _, pair := range []struct {
 		provider string

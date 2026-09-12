@@ -30,6 +30,15 @@ import (
 // gate would mean the portal defaults an opt-in ON for a kind the gate refuses
 // to send anything to.
 //
+// It has a blind spot, named so it is not met as a surprise, and it exists
+// because the relation now spans TWO endpoints: a kind measured to ANSWER
+// timings_per_token on /v1/responses while rejecting this map's parameter pair
+// on /v1/chat/completions would belong in routing's capable set and NOT here,
+// and the second loop below would report that correct configuration as an
+// error. The first loop's recorded-divergence escape hatch covers only the
+// opposite direction. Such a kind needs its own exception, argued for the way
+// vllm's was.
+//
 // It lives in package provider because liveProgressUpstreams is unexported.
 //
 // The two directions are NOT symmetric, because only one of the two sets is

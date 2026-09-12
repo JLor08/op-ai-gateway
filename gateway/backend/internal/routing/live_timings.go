@@ -37,16 +37,33 @@ package routing
 // different endpoint (/v1/chat/completions), and continuous_usage_stats is a
 // first-class vLLM field that works there. So the relationship is now "every
 // kind here is also in the gate", with exactly one recorded divergence in the
-// other direction, pinned by internal/provider's
-// TestLiveProgressUpstreamsCoverEveryRoutingCapableKind. Do not re-level the
-// two lists into one.
+// other direction. internal/provider's
+// TestLiveProgressUpstreamsCoverEveryRoutingCapableKind pins that relation,
+// and that vllm is the ONLY divergence -- but it does NOT pin that vllm is
+// still in the gate: remove it there and all three of that test's loops stay
+// silent. What fails then is three expectations in two other tests of that
+// package, TestWantsLiveProgressAllowList and
+// TestWantsLiveProgressThreeLayerRule twice. Do not re-level the two lists
+// into one.
+//
+// The surviving relation has one blind spot, named here so it is not met as a
+// surprise: it spans TWO endpoints. A kind measured to ANSWER
+// timings_per_token on /v1/responses while rejecting the gate's parameter pair
+// on /v1/chat/completions would belong HERE and not in the gate, and the
+// parity test's subset loop would report that correct configuration as an
+// error. Loop 1's recorded-divergence escape hatch covers only the opposite
+// direction, so such a kind needs a second exception, argued for there the way
+// vllm's was.
 //
 // Deliberately NOT listed: vllm (above), server_agent (not an inference server
 // at all -- ask EffectiveRuntimeSpecType what actually serves), llama_swap and
 // litellm (both resolve a model to an arbitrary downstream that can be
 // api.openai.com, which answers 400 on an unrecognized body key), ollama, tgi,
-// custom, mock. The default is OFF, so a kind added later never opts in
-// silently.
+// custom, mock, and "" -- the empty spec type, which means "auto-detect from
+// the binary" and is a legitimate STORED value, so it has to be answered for
+// rather than assumed absent. That is all ten strings the two vocabularies
+// hold between them, minus the one member above. The default is OFF, so a kind
+// added later never opts in silently.
 var liveTimingsCapableKinds = map[string]struct{}{
 	ProviderLlamaCPP: {},
 }

@@ -558,9 +558,23 @@ Wire notes a client must know:
     object at all: vLLM accepts the key and does nothing with it, so the
     default promised a figure that never arrives — and, for the same reason,
     an explicit `true` on a `vllm` application or on a spec whose effective
-    type is `vllm` is now **refused** by the same three error codes below. The
-    gateway's own shape clause for the `/v1/chat/completions` live-progress
-    parameters still lists `vllm`; the two lists are no longer one list.
+    type is `vllm` is now **refused** by the same three error codes below.
+    Nothing pins that refusal on `vllm` by name, deliberately: it is two
+    already-pinned facts composed. The predicate answers `false` for `vllm`
+    (`TestLiveTimingsCapableKind`, with `TestLiveTimingsCapableKindsSizeIsPinned`
+    on the set's size), and each refusal arm is a kind-generic read of that one
+    predicate, pinned per code on another incapable kind —
+    `TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind`
+    (400),
+    `TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind`
+    (409) and
+    `TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind` (400).
+    A `vllm` copy of any of them would be a third instance of one rule. What
+    that composition cannot survive is a **kind-specific** arm added to any of
+    those three paths: every test named here would stay green while this
+    sentence quietly stopped being true. The gateway's own shape clause for the
+    `/v1/chat/completions` live-progress parameters still lists `vllm`; the two
+    lists are no longer one list.
   - Absent on an update keeps the stored value, **except** that it is
     **cleared** whenever the *resulting* type cannot honour the flag. That is
     a property of the row the write leaves behind, not of a retype: an
