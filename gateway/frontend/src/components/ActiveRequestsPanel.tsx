@@ -48,9 +48,10 @@ function formatLiveTps(value: number): string {
 // turns on: nothing on this DTO records whether the client set `timings_per_token`,
 // and no flavor-plus-mode combination narrows the absence to a single cause. The
 // same empty source arises from a translated stream whose provider reports neither
-// an exact count nor a rate; from a native-passthrough openai_responses stream whose
-// CLIENT did not ask for timings, where the very same llama.cpp upstream would have
-// attached its own `timings` to the partial frames had it been asked (the per-flavor
+// an exact count nor a rate; from a native-passthrough openai_responses stream that
+// NOBODY asked for timings on — neither the CLIENT nor the operator's Responses
+// live-timings switch — where the very same llama.cpp upstream would have attached
+// its own `timings` to the partial frames had it been asked (the per-flavor
 // table in docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3,
 // under "Native passthrough is on this panel too", spells this out); from a row that
 // is merely EARLY, the first content frame having landed (so there is a TTFT) with no

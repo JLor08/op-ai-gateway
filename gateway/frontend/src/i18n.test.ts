@@ -190,11 +190,13 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
   });
 
   it('leaves the upstream-reported string free of any token claim', () => {
-    // A native-passthrough openai_responses stream WITH timings_per_token produces
-    // the row shape "rate present, token count 0": the upstream's own rate arrives
-    // on the partial frames while those partials carry no usage. This is the string
-    // shown there, so interpolating a count into it (as activityLiveTpsGateway
-    // legitimately does) would make it claim "computed from 0 tokens".
+    // A native-passthrough openai_responses stream WITH timings_per_token can
+    // produce the row shape "rate present, token count 0": the mid-stream count
+    // is `timings.predicted_n` and nothing else, so a partial whose `timings`
+    // object carries a rate and no predicted_n puts a rate on the row and no
+    // count. This is the string shown there, so interpolating a count into it (as
+    // activityLiveTpsGateway legitimately does) would make it claim "computed
+    // from 0 tokens".
     expect(messages.en.activityLiveTpsUpstream).not.toMatch(/token/i);
     expect(messages.de.activityLiveTpsUpstream).not.toMatch(/token/i);
     for (const m of [messages.de, messages.en]) {

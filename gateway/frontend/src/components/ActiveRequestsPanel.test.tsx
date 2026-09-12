@@ -195,11 +195,13 @@ describe('ActiveRequestsPanel live metrics columns', () => {
 // tokens_per_second, its source and ttft_ms alone.
 describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   it('shows a TTFT beside an em-dash rate when the stream has a first-content stamp and nothing else', () => {
-    // openai_responses passthrough, mid-generation, client did NOT set
-    // timings_per_token: the first content frame stamped a TTFT, the *.delta
-    // partials carry no usage, and the upstream attached no timings. So: a real
-    // TTFT, no count, no rate — and the rate cell must read as not-applicable,
-    // never as a zero (which would read as "stalled").
+    // openai_responses passthrough, mid-generation, with timings_per_token set by
+    // NOBODY -- neither the client nor the operator's Responses live-timings
+    // switch: the first content frame stamped a TTFT and the upstream attached no
+    // `timings` to any partial, so there is neither a rate to report nor a
+    // predicted_n to count. So: a real TTFT, no count, no rate -- and the rate
+    // cell must read as not-applicable, never as a zero (which would read as
+    // "stalled").
     render(
       <ActiveRequestsPanel
         t={t}
@@ -235,12 +237,19 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
   });
 
   it('shows an upstream-reported rate on a row whose token count is still zero, and claims no count', () => {
-    // Same stream WITH the client's timings_per_token: llama.cpp attaches its own
-    // `timings` to the partial frames, so a real rate arrives while output_tokens
-    // stays 0 (the Responses partials carry no usage). "rate present, tokens
-    // absent" is a legitimate row here, so the tooltip for an upstream-reported
-    // rate must make no claim about a count — a "computed from 0 tokens" reading
-    // would be false in exactly the case that produces this row.
+    // Same stream WITH timings_per_token set -- by the client, or by the
+    // operator's Responses live-timings switch: llama.cpp attaches its own
+    // `timings` to the partial frames, so a real rate arrives. The count can
+    // still be 0, because the mid-stream count is `timings.predicted_n` and
+    // nothing else: a partial whose `timings` object carries a rate and no
+    // predicted_n reports a rate and no count, the shape pinned by the first case
+    // of TestPassthroughResponsesPartialPredictedNDecidesTheMidStreamCount
+    // (passthrough_progress_test.go). ("The Responses partials carry no usage"
+    // was the reason until predicted_n was read; it is no longer one.) "rate
+    // present, tokens absent" is therefore still a legitimate row here, so the
+    // tooltip for an upstream-reported rate must make no claim about a count -- a
+    // "computed from 0 tokens" reading would be false in exactly the case that
+    // produces this row.
     render(
       <ActiveRequestsPanel
         t={t}
