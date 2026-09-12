@@ -128,10 +128,11 @@ to report back what it sent. Issue #81 suggested `provider.ProxyNative` "where
 the memo lives"; D2 removes the memo from the design, and with it that reason.
 
 **The new body must be a new slice.** In the no-op case the current helper
-returns a slice aliasing the request's backing array — bytes the HTTP transport
-is still reading while the request is in flight, and which are read again
-afterwards to build the capture record. An in-place edit would race the send and
-corrupt the capture.
+returns a slice aliasing the request's backing array — that is, the **client's
+own bytes**, which are read again afterwards to build the capture record. The
+hazard is not a race: the capture is assembled after the relay finishes, and
+nothing writes during the send. It is that an in-place edit would make the
+capture record a key the client never sent.
 
 ### D2 — The gate is the operator's switch, the kind, the flavor and the stream — with a recorded rejection as a veto
 
