@@ -247,8 +247,11 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 // streams the raw response back byte-for-byte, so protocol-specific content (Codex
 // tool calls, reasoning items, Claude Code content blocks) is preserved exactly. It
 // mirrors completeStream's idle-watchdog / write-deadline / capture / usage-record
-// machinery. The only body edit is rewriting the `model` field to the upstream's
-// mapped name (lossless; all other fields untouched).
+// machinery. Exactly two body edits are possible, both value-lossless and both
+// described at the body-building step below: the `model` field is rewritten to
+// the upstream's mapped name, and -- only where the operator switched it on for
+// a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
+// field reaches the upstream as the client wrote it.
 func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, path string, raw []byte, pfReq inference.Request) {
 	start := time.Now()
 	id := nextRequestID()
@@ -279,27 +282,47 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		return
 	}
 
-	// The ONLY edit made to a relayed body, ever. Passthrough means the client's
-	// bytes reach the upstream as the client wrote them, apart from the mapped
-	// model name.
+	// The only two edits ever made to a relayed body. Passthrough still means
+	// the client's bytes reach the upstream as the client wrote them, apart
+	// from the mapped model name and -- under the operator's opt-in below --
+	// llama.cpp's `timings_per_token`.
 	//
-	// In particular the gateway does NOT add llama.cpp's `timings_per_token`,
-	// however tempting that looks: a `timings` object on a PARTIAL frame is the
-	// only thing that can put a live tokens/sec figure on an /v1/responses
-	// passthrough row while generation is still running, and that flag is what
-	// makes llama.cpp attach one to a chat stream's partials. Whether its
-	// Responses implementation does the same on partials is not something this
-	// repo has captured — the gateway simply reads a `timings` object wherever
-	// one appears. Note "while still running": the terminal `response.completed`
-	// frame carries its own `timings`, so a rate does arrive at the end without
-	// any flag (see the per-flavor table under "Native passthrough is on this
-	// panel too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
-	// §8.4.3). The flag is READ when the client set it and never set here.
-	// Injecting it would change the upstream's response shape — new frames' worth
-	// of fields the client never asked for, flowing through to a client that must
-	// parse them — to improve a gateway display column. A missing live rate is
-	// rendered as "not measured" and is honest; a silently rewritten client
-	// request is not.
+	// That flag is what makes llama.cpp attach a top-level `timings` object to
+	// PARTIAL frames, and such an object is the only thing that can put a live
+	// tokens/sec figure on an /v1/responses passthrough row while generation is
+	// still running. That its Responses implementation does attach one is
+	// MEASURED rather than carried over from its chat streams: one flagged
+	// 48-frame stream carried `timings` on 39 of its frames while the same
+	// prompt replayed WITHOUT the flag carried exactly one, the terminal
+	// `response.completed` (usageScanner's doc comment in
+	// passthrough_usage_scan.go records the measurement and its scope caveat).
+	// Note "while still running": that terminal frame carries its own `timings`
+	// with or without the flag, so a rate does arrive at the END regardless --
+	// the flag buys the mid-stream figure and nothing else (see the per-flavor
+	// table under "Native passthrough is on this panel too" in
+	// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3).
+	//
+	// Adding it is not the silent rewriting of a client request that this path
+	// refuses to do, because every part of it is the operator's own decision and
+	// none of it overrides the client's. wantsResponsesLiveTimings requires the
+	// per-endpoint opt-in, a llama.cpp upstream, the Responses flavor and a
+	// streaming request, and lets a recorded live-progress rejection veto the
+	// lot; injectTimingsPerToken then tests for the key's PRESENCE rather than
+	// its value, so a client that sent `timings_per_token: false` keeps it --
+	// llama.cpp treats an explicit false exactly as it treats an absent key.
+	// What the client does pay is fields it did not ask for on frames it has to
+	// parse, and that cost is measured rather than guessed: in a separate
+	// flagged/unflagged pair of the same prompt, both terminating at the same
+	// `output_tokens`, the flagged run carried 2.49x the wire bytes. The
+	// operator accepted that by switching this on, which is the whole reason
+	// this is an operator's switch and not a default. No retry accompanies the
+	// injection: the endpoint was measured accepting unknown top-level keys, so
+	// a retry's trigger could not be exercised against any upstream this
+	// repository can point at (issue #81).
+	//
+	// The payload capture keeps recording the CLIENT's bytes, so the debug line
+	// below is where an operator debugging a 400 learns that the gateway added
+	// a key at all.
 	upstreamBody := rewriteModelField(raw, target.ProviderModel)
 
 	// The operator's opt-in, applied as a SECOND, separate edit rather than
