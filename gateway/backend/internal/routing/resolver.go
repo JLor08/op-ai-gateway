@@ -81,13 +81,17 @@ type Target struct {
 	// otherwise -- the same precedence ResponsesMode/MessagesMode use above,
 	// and deliberately NOT OpportunisticMetrics' app-only shape, because this
 	// flag qualifies a decision (ResponsesMode == passthrough) that comes from
-	// the spec for a server_agent child. NOTHING ON THE REQUEST PATH READS IT
-	// YET. What exists is the part-2 gate of issue #81,
-	// gateway.wantsResponsesLiveTimings, which ANDs this flag with the
-	// effective upstream kind, the Responses flavor and the stream flag and
-	// lets a recorded live-progress rejection veto the lot -- but its only
-	// caller today is its own table test, and wiring it into proxyNative is a
-	// later step of that part. No retry will accompany it either: llama.cpp was
+	// the spec for a server_agent child. THE REQUEST PATH READS IT, on every
+	// native passthrough request: gateway.proxyNative passes the resolved
+	// target to issue #81's part-2 gate, gateway.wantsResponsesLiveTimings,
+	// which ANDs this flag with the effective upstream kind, the Responses
+	// flavor and the stream flag and lets a recorded live-progress rejection
+	// veto the lot; when all of those hold, the body relayed upstream grows
+	// llama.cpp's `timings_per_token`. So this field has a live consumer
+	// outside its own table test -- a dead-code pass that concludes otherwise
+	// is reading a stale claim. Still ahead in that part: the portal's visible
+	// control for the flag, and the live per-token count the `timings` objects
+	// it buys can feed. No retry accompanies the injection: llama.cpp was
 	// measured accepting the injected key on this endpoint, so a retry's
 	// trigger could not be exercised against any upstream this repository can
 	// point at.

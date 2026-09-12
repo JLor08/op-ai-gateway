@@ -339,6 +339,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// still read further down to build the payload capture, and handed to the
 	// HTTP transport as `upstreamBody` while the request is in flight -- is
 	// never written to.
+	//
 	// injectedLiveTimings is false for a request the gate refused AND for one
 	// whose client already sent the key -- two different reasons for a panel
 	// cell that stays blank with the switch on, which is why it is recorded

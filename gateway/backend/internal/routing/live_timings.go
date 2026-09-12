@@ -78,8 +78,10 @@ var liveTimingsCapableKinds = map[string]struct{}{
 // an incapable retype left behind. portal.putRuntimeSpec asks in its own
 // refusal arm, judging the spec's EFFECTIVE type. The fifth caller is issue
 // #81's part-2 gate, gateway.wantsResponsesLiveTimings, which re-asks about the
-// EFFECTIVE kind of an already-resolved target -- that gate is not wired into
-// the request path yet, but it is what will ask there. It is still a statement
+// EFFECTIVE kind of an already-resolved target -- and that gate IS wired into
+// the request path: gateway.proxyNative consults it for every native
+// passthrough request, so changing this set changes what real traffic carries
+// upstream, not only what the portal accepts and stores. It is still a statement
 // about a KIND and reads no stored flag: every caller supplies the kind and
 // combines the answer with the stored opt-in itself, which is exactly what lets
 // the store stay policy-free about which kinds may hold a true.

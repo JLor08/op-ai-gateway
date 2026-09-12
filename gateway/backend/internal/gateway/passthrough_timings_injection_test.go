@@ -4,7 +4,11 @@
 package gateway
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
@@ -36,10 +40,13 @@ import (
 // untested with every test green. Those two assertions are kept, re-scoped to
 // "flag off => no injection"; these are the other half.
 //
-// Everything here asserts on the body the provider fake was HANDED, because
-// that is the only place the injection is observable: the payload capture
-// deliberately keeps recording the CLIENT's bytes (part 2's D7), so the capture
-// record cannot be used to see what was sent.
+// The body the provider fake was HANDED is where most of this file looks, and
+// it is the only place the relayed request is observable at all: the payload
+// capture deliberately keeps recording the CLIENT's bytes (part 2's D7), so the
+// capture record cannot be used to see what was sent. Two tests below look
+// somewhere else on purpose -- one reads the injection off the per-request
+// debug line, the other asserts the capture really is still the client's body,
+// which is the premise the first sentence rests on.
 
 // liveTimingsSeed describes one seeded deployment. Every field is named at each
 // call site rather than relying on the zero value, because the whole hazard this
@@ -372,5 +379,67 @@ func TestPassthroughNativeDebugLineRecordsTheInjection(t *testing.T) {
 				t.Fatalf("no %q debug record was emitted at all", "inference request (native passthrough)")
 			}
 		})
+	}
+}
+
+// TestPassthroughResponsesCaptureStillRecordsTheClientsBody pins the premise the
+// rest of this file rests on, and that the block comment at proxyNative's
+// body-building step states as fact: the payload capture records the bytes the
+// CLIENT sent, not the bytes the gateway relayed (part 2's D7).
+//
+// Nothing else in the repository pinned it. proxyNative is package-private, so
+// its capture argument can be switched from the client's bytes to the outgoing
+// ones -- a one-token edit that reads like an improvement, "show what was
+// actually sent" -- with the whole package still green. D7 would then invert:
+// the capture would show a timings_per_token the client never sent, an operator
+// would read it as the client's own request, and the confusion the debug field
+// exists to prevent would become the default.
+//
+// The fixture is an opted-in one, so the injection really happens and the two
+// bodies really differ. The relayed body is re-asserted here rather than taken
+// on trust, because a version of this test that compared two identical bodies
+// would pass for the wrong reason.
+func TestPassthroughResponsesCaptureStillRecordsTheClientsBody(t *testing.T) {
+	captures := store.NewMemoryCaptureStore(0)
+	prov := &recordingProxyProvider{respBody: terminalOnlyResponsesStream}
+	srv := newLiveTimingsTestServer(t, prov, llamaCppOptedIn())
+	// Capture is per-token opt-in; the override is the one switch that turns it
+	// on for this fixture without changing the shared seed's token. No cipher is
+	// wired, so persistCapture takes its RAM fallback and the blob is plain gzip.
+	srv.Captures = captures
+	srv.CaptureOverride = func() bool { return true }
+
+	relayed := postPassthrough(t, srv, prov, "/v1/responses", liveTimingsStreamBody)
+
+	if !strings.Contains(relayed, `"timings_per_token":true`) {
+		t.Fatalf("the relayed body carries no injected flag, so this test would be comparing two identical bodies and would prove nothing: %s", relayed)
+	}
+	events := srv.Usage.ByUser("usr_dev")
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want exactly 1 (the capture is keyed by that event's id)", len(events))
+	}
+	row, err := captures.Capture(context.Background(), events[0].ID)
+	if err != nil {
+		t.Fatalf("Capture(%q): %v", events[0].ID, err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(row.Blob))
+	if err != nil {
+		t.Fatalf("capture blob is not plain gzip (no cipher is wired, so it must be): %v", err)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read capture blob: %v", err)
+	}
+	var env captureEnvelope
+	if err := json.Unmarshal(plain, &env); err != nil {
+		t.Fatalf("unmarshal capture envelope: %v", err)
+	}
+	if strings.Contains(env.ReqBody, timingsPerTokenKey) {
+		t.Fatalf("the capture recorded the gateway's injected key, so an operator reading it as the client's request sees a body the client never sent: %s", env.ReqBody)
+	}
+	// Exact, not merely "carries no injected key": the capture is the CLIENT's
+	// request, so the mapped provider model must not have reached it either.
+	if env.ReqBody != liveTimingsStreamBody {
+		t.Fatalf("captured request body = %s, want the client's own bytes %s", env.ReqBody, liveTimingsStreamBody)
 	}
 }
