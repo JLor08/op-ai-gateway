@@ -1664,3 +1664,46 @@ describe('ApplicationSection managed_runtime_only create button reason', () => {
     expect(banner.parentElement).toBe(blocked.parentElement);
   });
 });
+
+// Responses live timings (issue #81 part 2, design D10). The control is
+// rendered by the shared ApiVariantControls block; what is pinned HERE is the
+// part this form owns -- which kind it reports, what it seeds, and (next
+// describe) what it puts in the body.
+describe('ApplicationSection responses live timings', () => {
+  it('hides the control for an incapable type and shows it TICKED once a capable type is chosen', async () => {
+    renderSection();
+    openCreate();
+    // The create form opens on ollama.
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsUnsupportedNote)).toBeInTheDocument();
+
+    await selectType('llama_cpp');
+    // Ticked without the operator touching anything: the API's create default
+    // for a capable type is ON, and a control that opened unticked would turn
+    // the feature off for every application created through this portal.
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+  });
+
+  // BOTH directions in one case, deliberately: asserting only the stored
+  // `false` would still pass if openEdit stopped seeding at all, because the
+  // create default would be left standing -- for `false` that happens to look
+  // right. The stored `true` half is what fails then.
+  it('seeds the control from the loaded application on edit, not from the create default', async () => {
+    renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+    cleanup();
+
+    renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: false })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+  });
+});
