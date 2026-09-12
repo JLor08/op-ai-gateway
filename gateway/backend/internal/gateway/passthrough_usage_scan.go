@@ -379,14 +379,25 @@ func takeLastNonZeroF(dst *float64, v float64) {
 //     TTFT; publishing an earlier bookkeeping frame (Anthropic's message_start)
 //     would stamp it before any content existed.
 //
-//   - The output-token count is published only from an AUTHORITATIVE usage frame
-//     (isTerminalUsageFrame), never from any frame that merely carries a usage
-//     object. This is usage()'s placeholder gate applied to the live column, for
-//     a sharper reason: message_start's `output_tokens: 1` is indistinguishable
-//     from a real total, and liveProgressDTO would divide that 1 by the
-//     generation window and DISPLAY the result as a measured rate for the rest
-//     of the stream. The recorded row tolerates the placeholder count because it
-//     is presented as a count; a live rate derived from it would not be.
+//   - The output-token count comes from exactly two sources and never from a
+//     frame that merely carries a usage object. An AUTHORITATIVE usage frame
+//     (isTerminalUsageFrame) publishes its own OutputTokens; every other frame
+//     publishes LiveOutputTokens, which only mergeResponsesUsage writes and only
+//     out of llama.cpp's `timings.predicted_n`. The SEPARATE FIELD is what makes
+//     that safe to open up. The old gate was "authoritative frames only", and its
+//     reason was Anthropic's message_start: it carries `output_tokens: 1` as a
+//     PLACEHOLDER that the merge cannot tell from a real total, and liveProgressDTO
+//     would divide that 1 by the generation window and DISPLAY the result as a
+//     measured rate for the rest of the stream. mergeAnthropicUsage writes no
+//     LiveOutputTokens at all, so the placeholder cannot reach the row through the
+//     new door either -- the gate is now "an authoritative frame, or a field that
+//     only the Responses `timings` object fills".
+//
+//     On the terminal Responses frame BOTH are present and they report the same
+//     quantity (measured: a naturally ending generation's terminal predicted_n
+//     equals that response's usage.output_tokens). The authoritative count wins
+//     by the explicit branch above rather than by observeDelta's last write, so
+//     which of the two lands on the row is a rule and not an ordering accident.
 //
 //   - The rate is read from THIS frame, not from the max-merged accumulator.
 //     llama.cpp's `predicted_per_second` is a cumulative average over the
@@ -405,6 +416,8 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 	prog := inference.StreamProgress{TokensPerSecond: frame.TokensPerSecond}
 	if authoritativeUsage {
 		prog.OutputTokens = frame.OutputTokens
+	} else {
+		prog.OutputTokens = frame.LiveOutputTokens
 	}
 	s.progress.observeDelta(s.firstContentAt, &prog)
 }

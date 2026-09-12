@@ -707,6 +707,7 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 		Timings *struct {
 			PromptPerSecond    float64 `json:"prompt_per_second"`
 			PredictedPerSecond float64 `json:"predicted_per_second"`
+			PredictedN         int     `json:"predicted_n"`
 			DraftN             int     `json:"draft_n"`
 		} `json:"timings"`
 	}
@@ -728,6 +729,16 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 	if m.Timings != nil {
 		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
 		takeMaxF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
+		// predicted_n lands in its OWN field and never in OutputTokens or
+		// TotalTokens. This function writes to TWO destinations -- scan's
+		// per-frame scratch Usage, which the live column reads, and the
+		// scanner's accumulator, which usage() hands recordUsage -- so whatever
+		// is written here reaches the accumulator by construction. A separate
+		// field is what makes that harmless: recordUsage assembles usage.Event
+		// field by field and has no member for this one. See
+		// inference.Usage.LiveOutputTokens for what would be rewritten
+		// otherwise.
+		takeMax(&dst.LiveOutputTokens, m.Timings.PredictedN)
 		takeMax(&dst.DraftTokens, m.Timings.DraftN)
 	}
 }

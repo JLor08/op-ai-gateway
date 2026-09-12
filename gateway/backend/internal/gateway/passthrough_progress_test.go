@@ -305,8 +305,9 @@ func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.
 // `timings_per_token`. Such a rate is a real upstream measurement, so it is
 // displayed and labelled "upstream" rather than "gateway" — the label is what
 // makes a client-dependent difference in completeness visible instead of
-// mysterious. The token count stays absent: `timings_per_token` buys a rate, not
-// a count this gateway may claim.
+// mysterious. The token count is the upstream's own `timings.predicted_n` off
+// those same partial frames — a count of what the UPSTREAM has generated, which
+// is a fact it reported, not a count of delta frames this gateway added up.
 //
 // What the FIXTURE pins is this gateway's HANDLING of a partial-frame `timings`
 // object — read it, label it "upstream", display the latest one. The upstream
@@ -336,9 +337,9 @@ func TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate(t *test
 	prov := &progressObservingProxyProvider{
 		pieces: []string{
 			"event: response.output_text.delta\n" +
-				`data: {"type":"response.output_text.delta","delta":"hi","timings":{"predicted_per_second":42.5}}` + "\n\n",
+				`data: {"type":"response.output_text.delta","delta":"hi","timings":{"predicted_per_second":42.5,"predicted_n":7}}` + "\n\n",
 			"event: response.output_text.delta\n" +
-				`data: {"type":"response.output_text.delta","delta":" there","timings":{"predicted_per_second":38.25}}` + "\n\n",
+				`data: {"type":"response.output_text.delta","delta":" there","timings":{"predicted_per_second":38.25,"predicted_n":12}}` + "\n\n",
 		},
 		gap: framePacing,
 	}
@@ -362,8 +363,8 @@ func TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate(t *test
 	if got.tps != 38.25 {
 		t.Fatalf("live tokens_per_second = %v, want 38.25 (the MOST RECENT frame's predicted_per_second, not the running max 42.5)", got.tps)
 	}
-	if got.outputTokens != 0 {
-		t.Fatalf("live output_tokens = %d, want 0 (timings_per_token yields a rate; the partials still report no usage)", got.outputTokens)
+	if got.outputTokens != 12 {
+		t.Fatalf("live output_tokens = %d, want 12 — the LATEST partial's timings.predicted_n, the upstream's own count of what it has generated so far", got.outputTokens)
 	}
 	// The RECORDED row of this same request is asserted here because this stream
 	// is the TRUNCATED shape: partial `timings` and no `response.completed`, so
@@ -411,11 +412,119 @@ func TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate(t *test
 	if events[0].TokensPerSecond != 38.25 {
 		t.Fatalf("recorded TokensPerSecond = %v, want 38.25 — the LAST rate this cut-off stream reported; 42.5 is the accumulator's mid-stream peak, and recording a peak is the defect, terminal frame or no terminal frame", events[0].TokensPerSecond)
 	}
+	// The same request's RECORDED row is the other half of the rule: the live
+	// count rides a field of its own, so no frame of this stream having reported
+	// a usage object must still mean the recorded row reports none. What it
+	// guards against is predicted_n reaching the accumulator's recorded counts,
+	// the mutation that would silently rewrite usage_events, the Activity
+	// totals, the timeseries and the limiter's input for every flagged stream.
+	//
+	// It is the only place that damage is observed END TO END -- through the
+	// real scanner, the real accumulator and recordUsage -- but it is not the
+	// only assertion that catches it, and the difference is worth stating
+	// because it decides what a red run means. Writing predicted_n into
+	// OutputTokens IN ADDITION to LiveOutputTokens reds exactly two assertions:
+	// this one, and TestMergeResponsesUsagePredictedNLandsInTheLiveFieldOnly's
+	// own negative one a layer down (passthrough_usage_scan_test.go). Writing it
+	// there INSTEAD reaches NEITHER: both tests abort earlier, this one on the
+	// live-count assertion above and that one on its first assertion, so the
+	// recorded row is never examined in that run.
+	if events[0].OutputTokens != 0 || events[0].TotalTokens != 0 {
+		t.Fatalf("recorded OutputTokens/TotalTokens = %d/%d, want 0/0 — this stream reported no usage object on any frame, so the RECORDED row must report no tokens; 12 in either field means timings.predicted_n reached the accumulator's recorded counts", events[0].OutputTokens, events[0].TotalTokens)
+	}
 	// The flag is present upstream because the CLIENT sent it — read, never
 	// injected. rewriteModelField re-serializes the object, so only the field's
 	// survival is asserted, not byte identity.
 	if !strings.Contains(string(prov.gotBody), `"timings_per_token":true`) {
 		t.Fatalf("relayed body dropped the client's own timings_per_token flag: %s", prov.gotBody)
+	}
+}
+
+// TestPassthroughResponsesPartialPredictedNDecidesTheMidStreamCount pins the two
+// halves of the live count's source, each of which an implementation can get
+// wrong while the other stays green.
+//
+// FIRST CASE — a `timings` object is not itself a count. llama.cpp was never
+// observed emitting one WITHOUT `predicted_n` on this endpoint (every measured
+// partial that carried a `timings` object carried one), but "the object is
+// present" and "the count is present" are different facts, and the reader must
+// not turn the first into the second. The rate is still displayed; the count
+// cell stays empty.
+//
+// SECOND CASE — `predicted_n` with no rate beside it, which is the shape that
+// decides the row's LABEL, and it is reachable rather than contrived: the
+// measured predicted_per_second series OPENS AT 0.0 (see the final* fields in
+// passthrough_usage_scan.go for the recorded series), and observeDelta stores a
+// rate only when it is positive. So the first timings-bearing partials of a real
+// flagged stream hand the row an exact upstream count and no upstream rate, at
+// which point liveProgressDTO's window derivation over that exact count fires
+// and the cell is labelled "gateway". That state did not exist for this flavor
+// mid-stream before a mid-stream count did. It is the feature's EXISTING rule,
+// not a new one -- a gateway rate is only ever derived over an exact upstream
+// count (liveProgressDTO, request_progress.go) -- and it is asserted here so
+// that it is a decision on the record instead of an accident nobody noticed.
+//
+// Neither case asserts anything about the relayed body: this reader works on a
+// CLIENT-set timings_per_token, which is what the fixture sends, and coupling
+// these assertions to what the gateway may or may not inject would make them
+// fail for a reason that is not theirs.
+func TestPassthroughResponsesPartialPredictedNDecidesTheMidStreamCount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// timings is the object attached to BOTH partial frames, the two cases
+		// differing only in which of its two keys is present.
+		timings    string
+		wantTokens int
+		wantSource string
+	}{
+		{
+			name:       "a timings object without predicted_n is a rate and nothing more",
+			timings:    `{"predicted_per_second":38.25}`,
+			wantTokens: 0,
+			wantSource: "upstream",
+		},
+		{
+			name:       "predicted_n with no rate beside it is an exact count, and the rate is gateway-derived",
+			timings:    `{"predicted_n":12}`,
+			wantTokens: 12,
+			wantSource: "gateway",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got liveRow
+			prov := &progressObservingProxyProvider{
+				pieces: []string{
+					"event: response.output_text.delta\n" +
+						`data: {"type":"response.output_text.delta","delta":"hi","timings":` + tc.timings + `}` + "\n\n",
+					"event: response.output_text.delta\n" +
+						`data: {"type":"response.output_text.delta","delta":" there","timings":` + tc.timings + `}` + "\n\n",
+				},
+				gap: framePacing,
+			}
+			srv := newNativeProxyTestServer(prov, true, false)
+			prov.observe = func() { got = snapshotLiveRow(t, srv) }
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi","timings_per_token":true}`))
+			req.Header.Set("Authorization", "Bearer dev-secret")
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if got.ttftMS <= 0 {
+				t.Fatalf("live ttft_ms = %d, want > 0 (content did arrive; only the count and the label are in question here)", got.ttftMS)
+			}
+			if got.outputTokens != tc.wantTokens {
+				t.Fatalf("live output_tokens = %d, want %d — the mid-stream count is timings.predicted_n and nothing else: never inferred from a sibling timings field, never a count of delta frames", got.outputTokens, tc.wantTokens)
+			}
+			if got.source != tc.wantSource {
+				t.Fatalf("live tokens_per_second_source = %q, want %q", got.source, tc.wantSource)
+			}
+			if got.tps <= 0 {
+				t.Fatalf("live tokens_per_second = %v, want > 0 for a %q-labelled cell", got.tps, tc.wantSource)
+			}
+		})
 	}
 }
 

@@ -137,6 +137,55 @@ func TestMergeResponsesUsageDraftTokensTakesRunningMax(t *testing.T) {
 	}
 }
 
+// TestMergeResponsesUsagePredictedNLandsInTheLiveFieldOnly pins the carrier
+// rule at the merge itself: llama.cpp's `timings.predicted_n` becomes
+// LiveOutputTokens and touches neither OutputTokens nor TotalTokens.
+//
+// The rule needs a test of its own because this merge writes to TWO
+// destinations. scan (passthrough_usage_scan.go) calls mergePassthroughUsage
+// once into a per-frame scratch Usage -- what the live column reads -- and once
+// into the scanner's ACCUMULATOR, which usage() hands recordUsage. A field added
+// to the timings struct therefore reaches the accumulator BY CONSTRUCTION.
+// Choosing a separate field is the only thing that keeps it out of the recorded
+// row, and so out of usage_events, the Activity totals, the usage timeseries and
+// the principal rate limiter's input. The negative assertion below is what turns
+// that from a reviewed fact into a pinned one.
+//
+// The running max is asserted in both directions for the same reason
+// DraftTokens asserts it above: mergeResponsesUsage runs once per SSE frame, and
+// feed()'s documented tolerance for scanning a line more than once rests on
+// every COUNT this merge writes being monotone. predicted_n is monotone over a
+// generation, so a max is its final value.
+//
+// The last case is the shape nothing was ever observed emitting -- a `timings`
+// object with no `predicted_n` key -- and it must report no count rather than
+// infer one from the rate sitting beside it.
+func TestMergeResponsesUsagePredictedNLandsInTheLiveFieldOnly(t *testing.T) {
+	var u inference.Usage
+	mergeResponsesUsage(&u, []byte(`{"timings":{"predicted_per_second":38.25,"predicted_n":12}}`))
+	if u.LiveOutputTokens != 12 {
+		t.Fatalf("LiveOutputTokens = %d, want 12 (timings.predicted_n)", u.LiveOutputTokens)
+	}
+	if u.OutputTokens != 0 || u.TotalTokens != 0 {
+		t.Fatalf("OutputTokens/TotalTokens = %d/%d, want 0/0 — predicted_n must land in NEITHER: those two are what usageScanner.usage hands recordUsage, and thence usage_events, the Activity totals, the timeseries and the rate limiter", u.OutputTokens, u.TotalTokens)
+	}
+
+	mergeResponsesUsage(&u, []byte(`{"timings":{"predicted_n":9}}`))
+	if u.LiveOutputTokens != 12 {
+		t.Fatalf("LiveOutputTokens = %d, want 12 (a later, smaller predicted_n must not overwrite the running max)", u.LiveOutputTokens)
+	}
+	mergeResponsesUsage(&u, []byte(`{"timings":{"predicted_n":20}}`))
+	if u.LiveOutputTokens != 20 {
+		t.Fatalf("LiveOutputTokens = %d, want 20 (a later, larger predicted_n must raise the running max)", u.LiveOutputTokens)
+	}
+
+	var absent inference.Usage
+	mergeResponsesUsage(&absent, []byte(`{"timings":{"predicted_per_second":38.25}}`))
+	if absent.LiveOutputTokens != 0 {
+		t.Fatalf("LiveOutputTokens = %d, want 0 — a timings object carrying no predicted_n key reports no count, and none may be inferred from the rate beside it", absent.LiveOutputTokens)
+	}
+}
+
 // TestPassthroughAnthropicRateUsesGenerationWindow pins step 7's ambiguity
 // resolution #4: the Anthropic fallback rate is computed over the GENERATION
 // WINDOW (first content frame -> completion), never the whole request. Here
