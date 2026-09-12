@@ -180,6 +180,46 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     );
   });
 
+  /**
+   * Part 1's three live-timings refusals, pinned as LITERALS for the same
+   * reason the VRAM codes above are: the whole-map invariants cannot catch a
+   * code STRING drifting from the backend's, and an unmapped code is not an
+   * error reported badly -- `formatPortalError` falls back to the raw English
+   * the server sent, in a portal that is otherwise fully localized.
+   *
+   * Declared in Go as the sentinels
+   * `portal.ErrApplicationResponsesLiveTimingsUnsupported` /
+   * `...Conflict` / `portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported`,
+   * wired to these exact codes in the `errRow` tables in
+   * `internal/gateway/portal_application_endpoints.go` and
+   * `portal_runtime_endpoints.go`. Two application codes, not one: the same
+   * refusal answers 400 when the request supplied the incapable type and 409
+   * when the type came from the stored row.
+   */
+  const liveTimingsWireCodes = [
+    'application.responses_live_timings_unsupported',
+    'application.responses_live_timings_conflict',
+    'runtime_spec.responses_live_timings_unsupported',
+  ] as const;
+
+  it('carries every live-timings refusal code, by its exact wire string', () => {
+    for (const code of liveTimingsWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    // Both directions, like the VRAM list above: a fourth
+    // `*.responses_live_timings_*` code added to the map without being named
+    // here fails too.
+    expect(
+      entries
+        .filter(([code]) => code.includes('responses_live_timings'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(liveTimingsWireCodes.slice().sort());
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is
