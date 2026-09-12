@@ -3755,7 +3755,8 @@ behaviour and produces no mid-stream tokens/sec; the gate, the injection and
 the retry are part 2 of issue #81. Its write rule is already enforced, though,
 and it is the spec's own kind rather than the operator's optimism — a PUT that
 sets it `true` on a spec whose **effective** type (the explicit `type`, else
-detected from `binary`) is not `llama_cpp`/`vllm` is refused with **400**,
+detected from `binary`) is not `llama_cpp` is refused with **400** (`vllm` left
+that set on 2026-09-12, measured inert on `/v1/responses`),
 never 409, because the document always carries the type it is judged against;
 a PUT that omits it on such a type clears any stored `true`. **No operator
 control for it ships in this cut either** — the value is reachable through the

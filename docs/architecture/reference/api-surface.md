@@ -551,8 +551,16 @@ Wire notes a client must know:
   - On all three request shapes **absent is not the same as `false`**. Absent
     on a create — or on a **first** spec write, which is what a full-document
     upsert means by "create" — takes the kind-dependent default: `true` for
-    `llama_cpp`/`vllm`, `false` for every other kind. An explicit `false` is a
-    deliberate off, honoured on any kind.
+    `llama_cpp`, `false` for every other kind. An explicit `false` is a
+    deliberate off, honoured on any kind. `vllm` was on that list until
+    2026-09-12, when a streamed vLLM `/v1/responses` request carrying
+    `timings_per_token` was measured to produce 48 frames and **no** `timings`
+    object at all: vLLM accepts the key and does nothing with it, so the
+    default promised a figure that never arrives — and, for the same reason,
+    an explicit `true` on a `vllm` application or on a spec whose effective
+    type is `vllm` is now **refused** by the same three error codes below. The
+    gateway's own shape clause for the `/v1/chat/completions` live-progress
+    parameters still lists `vllm`; the two lists are no longer one list.
   - Absent on an update keeps the stored value, **except** that it is
     **cleared** whenever the *resulting* type cannot honour the flag. That is
     a property of the row the write leaves behind, not of a retype: an
