@@ -252,9 +252,14 @@ func TestPassthroughAnthropicPlaceholderTokensNeverReachTheLiveRow(t *testing.T)
 // count with — so the token count has no honest source; with no count and no
 // upstream `timings`, neither does a rate.
 //
-// It also pins the non-injection rule from the other side: the relayed body must
-// not have grown a `timings_per_token` flag the client never sent, which is the
-// one edit that would turn this row's two em-dashes into numbers.
+// It also pins the GATE from the other side. This fixture's resolved target has
+// the operator's live-timings opt-in off — newNativeModeTestServerOn seeds no
+// such flag and no runtime spec — so the relayed body must not have grown a
+// `timings_per_token` flag: an UNGATED injection, one that dropped
+// wantsResponsesLiveTimings from proxyNative's body-building step, is exactly
+// the edit that would turn this row's two em-dashes into numbers, and this
+// assertion is what catches it. The opted-IN direction is a different fixture
+// and lives in passthrough_timings_injection_test.go.
 func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.T) {
 	var got liveRow
 	prov := &progressObservingProxyProvider{
@@ -290,7 +295,7 @@ func TestPassthroughResponsesStreamWithoutClientTimingsShowsTTFTOnly(t *testing.
 		t.Fatalf("live rate = %v (source %q), want 0/\"\" (no upstream timings, and no count to derive one from)", got.tps, got.source)
 	}
 	if strings.Contains(string(prov.gotBody), "timings_per_token") {
-		t.Fatalf("relayed body grew a timings_per_token flag the client never sent: %s", prov.gotBody)
+		t.Fatalf("relayed body grew a timings_per_token flag: the client sent none and this fixture's operator opt-in is off, so nothing may add one: %s", prov.gotBody)
 	}
 }
 
@@ -620,8 +625,11 @@ func TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves(t *te
 			case tc.wantTPS == 0 && got.tps <= 0:
 				t.Fatalf("live tokens_per_second = %v, want > 0 (40 tokens over the generation window)", got.tps)
 			}
+			// The second copy of the same tripwire, on the terminal-frame shape:
+			// this fixture's opt-in is off too, so an ungated injection reddens
+			// both rather than only the partial-frames test above.
 			if strings.Contains(string(prov.gotBody), "timings_per_token") {
-				t.Fatalf("relayed body grew a timings_per_token flag the client never sent: %s", prov.gotBody)
+				t.Fatalf("relayed body grew a timings_per_token flag: the client sent none and this fixture's operator opt-in is off, so nothing may add one: %s", prov.gotBody)
 			}
 		})
 	}
