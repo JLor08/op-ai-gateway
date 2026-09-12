@@ -267,7 +267,11 @@ are rewritten to record that M4 retired that reason.
 
 The size pin's failure message currently says to go and make the provider-side
 gate agree — **the wrong half to follow here**; it is amended in the same edit.
-The routing-side companions are mechanical.
+
+The companions are not all mechanical: one is a live assertion outside both
+packages. The portal's create-default table has a vLLM row expecting `true`,
+and it fails the moment the predicate narrows. Its own doc comment says the
+rows deliberately disagree, so the row is corrected rather than deleted.
 
 **Stale rows persist.** The clear is prospective: a vLLM application created
 between part 1 and part 2 keeps its stored `true` until its next save, when the
@@ -329,12 +333,13 @@ type is derived by `Omit`, so **the field must be optional there** or the
 Three things make this harder than a checkbox:
 
 - **The two surfaces learn capability from different inputs.** The application
-  form knows `type` directly. The spec form's only signal is a read-only echo of
-  the *loaded* spec's effective type, which is undefined on create and stale the
-  moment the binary field is edited — the detection itself is Go-only, from a
-  binary basename. The spec form therefore cannot mirror the application form's
-  gating and must either ask the backend or accept being permissive and letting
-  the documented 400 answer.
+  form knows `type` directly. The spec form has a **writable type select**, and
+  the backend resolves the effective kind from that explicit type first, falling
+  back to detection from the binary basename only when it is empty. So the spec
+  form can mirror the application form's gating whenever a type is chosen, and
+  needs a fallback only for the empty-type case, where the read-only echo of the
+  loaded spec is its sole signal — undefined on create and stale once the binary
+  is edited. Be permissive there and let the documented 400 answer.
 - **The create default is on, so a plain `useState(false)` is wrong.** A
   checkbox that always sends `false` silently disagrees with the API's
   documented default and would turn the feature off for every application
@@ -375,12 +380,15 @@ model rewrite.
 comments): that the Responses partials carry no usage at all, and that a
 mid-stream rate exists only when the client asked. D4 makes both false.
 
-**Set 4 — the "nothing reads the resolved flag" family**, six members written
+**Set 4 — the "nothing reads the resolved flag" family**, eight members written
 by part 1: three in `internal/routing` (the target field's doc comment, the
 precedence test's "this test is the whole of the field's current contract", and
 the capable-kind predicate's "nothing about it belongs to the request path"),
-falsified by the gate; and three in the canonical documents, falsified by the
-injection. Every one of the latter three also says "and nothing retries without
+falsified by the gate; and **five sentences across three canonical documents**,
+falsified by the injection. One of the five carries no claim of its own — it
+says "for the same reason as the column above" — so it inherits its falsity by
+reference, and reads as still-true prose if the sentence it points at is
+corrected and it is not. Every one of the latter three also says "and nothing retries without
 it", which D3 keeps **true** — so those sentences are edited, not deleted.
 
 Note that Set 3's per-flavor table cell carries a second false clause beside the
