@@ -526,6 +526,76 @@ func rewriteModelField(raw []byte, providerModel string) []byte {
 	return out
 }
 
+// timingsPerTokenKey is llama.cpp's per-token timings request flag. With it set,
+// the server attaches a top-level `timings` object to PARTIAL frames; without it
+// only the terminal frame carries one. That object is the only thing that can put
+// an upstream-reported tokens/sec on a running /v1/responses passthrough row.
+// Measured for /v1/responses on ONE llama.cpp build, not a general guarantee: the
+// frame counts and the without-flag replay are in §8.4.3 of
+// docs/architecture/cross-cutting/telemetry-usage-observability.md.
+const timingsPerTokenKey = "timings_per_token"
+
+// injectTimingsPerToken returns the body with a top-level "timings_per_token": true
+// added, and whether it actually added it. It is a pure function of its argument:
+// the input slice is never written to, and an injected body is always a FRESH slice
+// from json.Marshal. That matters at the call site — proxyNative hands the outgoing
+// bytes to the transport, but reads the CLIENT's bytes again after the copy loop to
+// build the payload capture, and rewriteModelField returns those same client bytes
+// unchanged from its no-op branches. So an in-place edit here would reach the
+// capture, which would then record a key the client never sent.
+//
+// The body is returned unchanged, with false, in three cases:
+//
+//   - It is not a JSON object, so the decode into map[string]any fails.
+//   - It decodes to a nil map, which is what a bare `null` body does WITHOUT
+//     reporting an error; assigning into that map would panic with "assignment to
+//     entry in nil map". Nothing on this path can deliver such a body today —
+//     sniffRoutingModel reads no model out of `null`, and handleOpenAIResponses
+//     only reaches tryProxyNative for a non-empty model — but that guard lives in
+//     inference_handlers.go, so this helper does not assume it. (rewriteModelField
+//     has the same shape and relies on the same distant guard; changing it is not
+//     part of this feature.)
+//   - The key is ALREADY PRESENT at the top level, whatever its value. Presence,
+//     not value: llama.cpp treats an explicit false exactly as it treats an absent
+//     key, so a client that sent false has made a choice, and overwriting it would
+//     be the silent rewriting of a client request that this path refuses to do.
+//
+// A json.Marshal failure returns the body unchanged as well — a fourth `return raw,
+// false`, left out of the list above because no value a JSON decode can put into
+// the map is one json.Marshal rejects. rewriteModelField carries the same fallback.
+//
+// Deliberately NOT folded into rewriteModelField, which returns the original slice
+// from three no-op branches — an empty providerModel, a body that is not a JSON
+// object, and a provider model that already equals the body's model. The last is an
+// ordinary configuration (the portal's model reconciliation writes the gateway and
+// provider model names to the same string), so an injection placed below it would
+// never fire for those mappings.
+//
+// Re-serialization costs what rewriteModelField's doc already concedes: key order
+// changes and <>& are HTML-escaped. That is value-lossless to any JSON parser, and
+// UseNumber keeps it lossless for numbers too — without it a literal such as
+// 9007199254740993 would come back as 9007199254740992.
+func injectTimingsPerToken(raw []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil {
+		return raw, false
+	}
+	if obj == nil {
+		return raw, false
+	}
+	if _, present := obj[timingsPerTokenKey]; present {
+		return raw, false
+	}
+	obj[timingsPerTokenKey] = true
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
 // parsePassthroughUsage best-effort extracts token counts (and, for the
 // Responses shape, llama.cpp's own reported rate) from a proxied upstream
 // response (stream or buffered) so the Activity view still shows tokens. It
