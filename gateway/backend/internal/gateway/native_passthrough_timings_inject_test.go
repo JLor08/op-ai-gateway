@@ -53,9 +53,12 @@ func TestInjectTimingsPerTokenAddsTheFlag(t *testing.T) {
 	}
 }
 
-// The caller keeps reading the client's own bytes (the payload capture) while the
-// HTTP transport is sending the returned ones, so the two must not share a backing
-// array. Scribbling over every byte of the result must leave the input intact.
+// The caller reads the client's own bytes again AFTER the relay, to build the
+// payload capture, and rewriteModelField hands those same bytes back from its
+// no-op branches — so the injected body must not share a backing array with the
+// input, or the capture would record a key the client never sent. Aliasing, not a
+// race: the relay, the copy loop and the capture read run in that order on one
+// goroutine. Scribbling over every byte of the result must leave the input intact.
 func TestInjectTimingsPerTokenReturnsUnaliasedBytes(t *testing.T) {
 	const body = `{"model":"gw","stream":true,"input":"hi"}`
 	in := []byte(body)

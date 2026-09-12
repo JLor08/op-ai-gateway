@@ -565,11 +565,13 @@ const timingsPerTokenKey = "timings_per_token"
 // the map is one json.Marshal rejects. rewriteModelField carries the same fallback.
 //
 // Deliberately NOT folded into rewriteModelField, which returns the original slice
-// from three no-op branches — an empty providerModel, a body that is not a JSON
-// object, and a provider model that already equals the body's model. The last is an
-// ordinary configuration (the portal's model reconciliation writes the gateway and
-// provider model names to the same string), so an injection placed below it would
-// never fire for those mappings.
+// from three no-op branches — an empty providerModel, a body whose decode into
+// map[string]any FAILS, and a provider model that already equals the body's model.
+// The last is an ordinary configuration (the portal's model reconciliation writes
+// the gateway and provider model names to the same string), so an injection placed
+// below it would never fire for those mappings. A bare `null` is NOT one of the
+// three: it decodes without error into a nil map, which is why rewriteModelField
+// panics on it, exactly as the nil-map case above describes.
 //
 // Re-serialization costs what rewriteModelField's doc already concedes: key order
 // changes and <>& are HTML-escaped. That is value-lossless to any JSON parser, and
