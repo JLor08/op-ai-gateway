@@ -372,6 +372,18 @@ const de = {
   applicationFlavors: 'API-Varianten',
   applicationNativeNote:
     'Für jeden Coding-Agent-Endpunkt lässt sich der Modus wählen: Deaktiviert, Umwandlung ins interne Format (/v1/chat/completions) oder Durchreichen im Originalformat. Der Endpunkt wird nur bedient, wenn die passende API-Variante (openai bzw. anthropic) aktiviert ist.',
+  // Der Live-Timings-Schalter im gemeinsamen API-Varianten-Block. Beide
+  // Formulare rendern denselben Block, deshalb tragen alle vier Texte --
+  // wie applicationFlavors/applicationNativeNote daneben -- das
+  // application*-Präfix, auch wenn der Auto-Hinweis nur auf der
+  // Startvorgaben-Seite erscheint.
+  applicationLiveTimings: 'Live-Timings vom Upstream anfordern',
+  applicationLiveTimingsNote:
+    'Setzt bei gestreamten Codex-Anfragen (/v1/responses) den llama.cpp-Parameter „timings_per_token“, damit die Laufenden Verbindungen eine vom Upstream gemeldete Tokens/s für die gesamte Anfrage zeigen statt einer hier abgeleiteten. Solange dies aktiv ist, ist der aufgezeichnete Anfragetext nicht mehr exakt der gesendete.',
+  applicationLiveTimingsUnsupportedNote:
+    'Live-Timings sind nur für llama.cpp verfügbar. Für diesen Typ wird der Parameter nicht gesetzt, und ein noch gespeichertes Ja wird beim nächsten Speichern gelöscht.',
+  applicationLiveTimingsAutoNote:
+    'Der Typ steht auf „Automatisch“: welche Art Server der Programmpfad startet, erkennt erst das Gateway. Ohne Häkchen entscheidet es selbst — eine neu angelegte llama.cpp-Startvorgabe bekommt Live-Timings, jede andere nicht, und eine bestehende Startvorgabe behält ihren gespeicherten Wert. Ein Häkchen auf einer Startvorgabe, die nicht llama.cpp ist, wird beim Speichern abgelehnt.',
   applicationResponsesMode: 'Codex (Responses-API)',
   applicationMessagesMode: 'Claude Code (Anthropic Messages)',
   applicationModeDisabled: 'Deaktiviert',
@@ -1236,6 +1248,12 @@ const de = {
     'Diese Variable ist bereits von Hand gesetzt. „GPU-Zuweisung erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
     'Runtime-Spezifikationen erfordern eine Server-Agent-Anwendung',
+  errorApplicationResponsesLiveTimingsUnsupported:
+    'Live-Timings sind für diesen Anwendungstyp nicht verfügbar; nur llama.cpp kann sie liefern. Die Meldung nennt den gesendeten Typ.',
+  errorApplicationResponsesLiveTimingsConflict:
+    'Diese Anwendung hat einen Typ, der keine Live-Timings liefern kann. Ändern Sie zuerst den Typ, oder lassen Sie die Einstellung aus.',
+  errorRuntimeSpecResponsesLiveTimingsUnsupported:
+    'Live-Timings sind für die Art dieses Servers nicht verfügbar; nur llama.cpp kann sie liefern. Die Meldung nennt die erkannte Art.',
   errorRuntimeCoresidencyPairInvalid: 'Ungültiges Koresidenz-Paar',
   errorServerGpuBudgetInvalid: 'Ungültiges GPU-Budget',
   errorServerRuntimeLimitInvalid: 'Ungültiges Prozess-Limit',
@@ -2678,6 +2696,17 @@ const en: PortalMessages = {
   applicationFlavors: 'API flavors',
   applicationNativeNote:
     'Each coding-agent endpoint can be set to Disabled, Translate into the internal format (/v1/chat/completions), or Pass-through in its native format. The endpoint is only served when the matching API flavor (openai resp. anthropic) is enabled.',
+  // The live-timings switch on the shared API-variant block. Both forms
+  // render that block, so all four strings carry the application* prefix its
+  // neighbours already use, even though the Auto hint only ever shows on the
+  // launch-spec side.
+  applicationLiveTimings: 'Ask the upstream for live timings',
+  applicationLiveTimingsNote:
+    'Sets llama.cpp\'s "timings_per_token" on streamed Codex requests (/v1/responses), so Running connections show a tokens/sec the upstream reports for the whole request instead of one derived here. While this is on, the recorded request body is no longer exactly the body that was sent.',
+  applicationLiveTimingsUnsupportedNote:
+    'Live timings are available for llama.cpp only. For this type the parameter is not set, and a stored yes is cleared on the next save.',
+  applicationLiveTimingsAutoNote:
+    'Type is set to "Auto", so which kind of server the binary launches is only detected by the gateway. Left unticked, the gateway decides — a newly created llama.cpp launch spec gets live timings, any other kind does not, and an existing spec keeps its stored value. Ticking it on a spec that is not llama.cpp is refused on save.',
   applicationResponsesMode: 'Codex (Responses API)',
   applicationMessagesMode: 'Claude Code (Anthropic Messages)',
   applicationModeDisabled: 'Disabled',
@@ -3470,6 +3499,12 @@ const en: PortalMessages = {
   errorRuntimeSpecVisibleDevicesConflict:
     'This variable is already set by hand. Enforcing GPU assignment and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
+  errorApplicationResponsesLiveTimingsUnsupported:
+    'Live timings are not available for this application type; only llama.cpp can report them. The message names the type that was sent.',
+  errorApplicationResponsesLiveTimingsConflict:
+    'This application has a type that cannot report live timings. Change the type first, or leave the setting off.',
+  errorRuntimeSpecResponsesLiveTimingsUnsupported:
+    'Live timings are not available for this runtime kind; only llama.cpp can report them. The message names the detected kind.',
   errorRuntimeCoresidencyPairInvalid: 'Invalid co-residency pair',
   errorServerGpuBudgetInvalid: 'Invalid GPU budget',
   errorServerRuntimeLimitInvalid: 'Invalid process limit',

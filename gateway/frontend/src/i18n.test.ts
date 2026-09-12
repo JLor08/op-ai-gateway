@@ -2690,3 +2690,40 @@ describe('mapping capability i18n keys', () => {
     expect(messages.de.mappingIsMtpUnknownHint).toMatch(/nicht neu erkannt/);
   });
 });
+
+// Responses live-timings (issue #81 part 2, design D10): the shared
+// API-variant block's own checkbox strings plus the three backend refusals
+// part 1 introduced. The codes are read verbatim from the Go errRow tables in
+// gateway/portal_application_endpoints.go and portal_runtime_endpoints.go;
+// see format.test.ts for the map side.
+describe('responses live-timings i18n keys', () => {
+  it('defines the control + error-code keys in de and en', () => {
+    const keys = [
+      'applicationLiveTimings',
+      'applicationLiveTimingsNote',
+      'applicationLiveTimingsUnsupportedNote',
+      'applicationLiveTimingsAutoNote',
+      'errorApplicationResponsesLiveTimingsUnsupported',
+      'errorApplicationResponsesLiveTimingsConflict',
+      'errorRuntimeSpecResponsesLiveTimingsUnsupported',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The two application refusals answer DIFFERENT questions -- the 400 says
+  // the body you just sent is contradictory, the 409 says this application's
+  // STORED type cannot honour it -- so one shared sentence would tell half
+  // the operators the wrong remedy.
+  it('gives the 400 and the 409 application refusals different sentences', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].errorApplicationResponsesLiveTimingsUnsupported).not.toBe(
+        messages[locale].errorApplicationResponsesLiveTimingsConflict,
+      );
+    }
+  });
+});
