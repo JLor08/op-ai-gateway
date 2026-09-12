@@ -81,8 +81,13 @@ type Target struct {
 	// otherwise -- the same precedence ResponsesMode/MessagesMode use above,
 	// and deliberately NOT OpportunisticMetrics' app-only shape, because this
 	// flag qualifies a decision (ResponsesMode == passthrough) that comes from
-	// the spec for a server_agent child. Nothing reads it yet; the gate, the
-	// injection and the retry are part 2 of issue #81.
+	// the spec for a server_agent child. Its reader on the request path is
+	// gateway.wantsResponsesLiveTimings, the part-2 gate of issue #81, which
+	// ANDs this flag with the effective upstream kind, the Responses flavor
+	// and the stream flag and lets a recorded live-progress rejection veto the
+	// lot. No retry accompanies it: llama.cpp was measured accepting the
+	// injected key on this endpoint, so a retry's trigger could not be
+	// exercised against any upstream this repository can point at.
 	ResponsesLiveTimingsEnabled bool
 	// LiveProgressSupport is the mapping's PERSISTED verdict about whether this
 	// upstream tolerates the live-progress parameters: "", "supported",

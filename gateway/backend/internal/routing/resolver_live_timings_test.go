@@ -82,9 +82,11 @@ func seedLiveTimingsStore(t *testing.T, now time.Time, appType string, appLiveTi
 // spec leaves the application's value in place, which is why it expects true
 // against an app that says true.
 //
-// No production code reads this field in part 1 of issue #81; the gate, the
-// timings_per_token injection and the retry are part 2. This test is the whole
-// of the field's current contract.
+// This test is the field's PRECEDENCE contract -- which row's value wins -- and
+// nothing else. What the request path then does with the resolved value is the
+// part-2 gate's contract, pinned separately by TestWantsResponsesLiveTimings in
+// internal/gateway. Neither test can fail for the other's regression, which is
+// why both exist.
 func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	cases := []struct {

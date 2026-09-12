@@ -70,9 +70,13 @@ var liveTimingsCapableKinds = map[string]struct{}{
 
 // LiveTimingsCapableKind reports whether kind -- an Application.Type or the
 // string form of an EffectiveRuntimeSpecType -- is one of the kinds above.
-// Exported because the portal's create paths are its callers and they live in
-// another package; it is a statement about a KIND, not a read of any stored
-// flag, so nothing about it belongs to the request path.
+// Exported because its callers live in other packages: the portal's create
+// paths, which use it to pick the stored default, and the request path's own
+// gate, gateway.wantsResponsesLiveTimings, which re-asks it about the
+// EFFECTIVE kind of an already-resolved target. It is still a statement about a
+// KIND and reads no stored flag -- the request-path caller supplies the kind
+// and ANDs the answer with the stored opt-in itself, which is exactly what lets
+// the store stay policy-free about which kinds may hold a true.
 //
 // The argument must already be normalized: the lookup is a plain map hit, so it
 // is case-sensitive AND whitespace-sensitive. Nothing untrimmed can reach a
