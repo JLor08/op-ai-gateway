@@ -6680,3 +6680,81 @@ describe('RuntimeAdminSection responses live timings', () => {
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
   });
 });
+
+describe('RuntimeAdminSection responses live timings body', () => {
+  it('omits the key on an untouched Auto create, so the backend applies the detected kind default', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    // Sending `false` here would be the defect: the backend's first-write
+    // default for a llama-server binary is ON, and this form cannot detect
+    // that basename itself.
+    expect('responses_live_timings_enabled' in putSpecs[0].body).toBe(false);
+  });
+
+  it('sends an explicit value once the operator states one under Auto', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.responses_live_timings_enabled).toBe(true);
+  });
+
+  it('sends the value for an explicit llama_cpp Type', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings })); // untick
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.responses_live_timings_enabled).toBe(false);
+  });
+
+  // THE BLOCKER THIS FORM MUST NOT BE ABLE TO BUILD, and it is the same one
+  // the application form has: buildSpecBody is a FULL-DOCUMENT upsert that
+  // restates `type` on every save, and putRuntimeSpec refuses an explicit
+  // true against an incapable effective kind with 400
+  // runtime_spec.responses_live_timings_unsupported BEFORE any store write --
+  // so the whole save fails. Omitting is what the backend normalises: it
+  // clears a stored true whose document can no longer honour it.
+  it('omits the key when the operator retypes a live-timings spec to an incapable kind', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          type: 'llama_cpp',
+          binary: '/usr/bin/llama-server',
+          responses_live_timings_enabled: true,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeOllama }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('ollama');
+    expect('responses_live_timings_enabled' in putSpecs[0].body).toBe(false);
+  });
+});

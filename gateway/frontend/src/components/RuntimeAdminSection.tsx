@@ -2648,6 +2648,23 @@ export function RuntimeAdminSection({
       api_flavors: specApiFlavors,
       responses_mode: specResponsesMode,
       messages_mode: specMessagesMode,
+      // Two independent reasons to omit, and both must hold before the key is
+      // sent.
+      //
+      // Kind: this is a FULL-DOCUMENT upsert that restates `type` on every
+      // save, and putRuntimeSpec refuses an explicit true against an
+      // incapable effective kind with 400 BEFORE any store write -- so the
+      // whole save would fail, on a retype the operator made for another
+      // reason entirely. Omitting is what the backend normalises: it clears a
+      // stored true whose document can no longer honour it, deliberately and
+      // silently, because the caller said nothing about the flag.
+      //
+      // Value: undefined is "no opinion", which IS the absent key. Under Type
+      // "Auto" that is the only honest thing to send, since the kind is
+      // detected from the binary's basename by Go and not by this form.
+      ...(specLiveTimingsKind !== 'incapable' && specLiveTimings !== undefined
+        ? { responses_live_timings_enabled: specLiveTimings }
+        : {}),
       type: specType,
       metrics_path: metricsPath.trim(),
       context_probe_path: contextProbePath.trim(),
