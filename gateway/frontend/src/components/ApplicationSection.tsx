@@ -417,6 +417,20 @@ export function ApplicationSection({
       health_check_interval_seconds: healthIntervalMode === 'custom' ? healthIntervalSeconds : 0,
       responses_mode: responsesMode,
       messages_mode: messagesMode,
+      // Sent ONLY for a type that can honour it. buildBody restates `type` on
+      // every save, and the backend selects the 400 arm
+      // (application.responses_live_timings_unsupported) over the 409
+      // precisely when the request carries a type -- so an unconditional true
+      // on an incapable type would not merely fail to apply, it would REFUSE
+      // THE WHOLE SAVE, and on an unrelated edit at that. Omitting is what
+      // the API asks for instead: absent on a create takes the type's own
+      // default, and absent on an update is what CLEARS a stored true whose
+      // resulting type cannot honour it.
+      //
+      // Unlike proxy_excluded next door, no seed-diff is needed: this key is
+      // only ever sent for a capable type, which accepts both values, so
+      // restating it on an unrelated save changes nothing.
+      ...(liveTimingsKind === 'capable' ? { responses_live_timings_enabled: liveTimings } : {}),
       // A server_agent application's model discovery/loaded-state/context
       // probing all run on the agent side (the runtime spec's own Type +
       // metrics/context-probe overrides, RuntimeAdminSection) -- these three

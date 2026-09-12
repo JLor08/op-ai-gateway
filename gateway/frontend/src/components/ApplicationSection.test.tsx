@@ -1707,3 +1707,67 @@ describe('ApplicationSection responses live timings', () => {
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
   });
 });
+
+describe('ApplicationSection responses live timings body', () => {
+  it('sends the create default for a capable type without the operator touching the box', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('llama_cpp');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].responses_live_timings_enabled).toBe(true);
+  });
+
+  it('sends an explicit false when the operator unticks it', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('llama_cpp');
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings }));
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].responses_live_timings_enabled).toBe(false);
+  });
+
+  it('restates the stored value on an unrelated save of a capable application', async () => {
+    const { updated } = renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    fireEvent.change(screen.getByLabelText(t.applicationWeight), { target: { value: '7' } });
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    // Safe to restate, unlike proxy_excluded: a capable type accepts BOTH
+    // values, so a save made for an unrelated reason cannot change anything.
+    expect(updated[0].body.responses_live_timings_enabled).toBe(true);
+    expect(updated[0].body.weight).toBe(7);
+  });
+
+  // THE BLOCKER THIS FORM MUST NOT BE ABLE TO BUILD. buildBody restates
+  // `type` on every save, and the backend picks the 400 arm over the 409
+  // precisely when the request carries a type -- so an unconditional true on
+  // an incapable type does not merely fail to apply, it refuses the whole
+  // save. Omitting is also what the backend WANTS: the create takes the
+  // type's default and the update clears a stale true.
+  it('omits the key entirely for an incapable type, on create and on save', async () => {
+    const { created } = renderSection();
+    openCreate();
+    // ollama, the form's own create default, is incapable.
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect('responses_live_timings_enabled' in created[0]).toBe(false);
+    cleanup();
+
+    const { updated } = renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'vllm', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    // A vLLM row can still hold a stale true from before design D6 dropped
+    // vLLM from the capable set. Omitting is what clears it, prospectively,
+    // on the row's next save -- the clear D6 promises and refuses to do in SQL.
+    expect('responses_live_timings_enabled' in updated[0].body).toBe(false);
+  });
+});
