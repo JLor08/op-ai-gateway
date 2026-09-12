@@ -28,6 +28,7 @@ import (
 // place, and a reader of this function is not invited to think it lives in
 // two.
 func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
+	liveTimings := dto.ResponsesLiveTimingsEnabled
 	return PutRuntimeSpecRequest{
 		Enabled:                     dto.Enabled,
 		Binary:                      dto.Binary,
@@ -49,6 +50,35 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		// A *bool on the request against a bool on the DTO, so this is a
+		// conversion rather than a copy -- the one line in this spread that is
+		// not a straight assignment. A loaded document always HAS an opinion,
+		// so an explicit pointer is the honest spread of it; a nil would be
+		// this mapper inventing a non-mention the document does not contain.
+		//
+		// In the ORDINARY case the pointer changes nothing, and this says so
+		// rather than claiming a danger it averts: this mapper's only
+		// PRODUCTION caller resolved the spec by id before calling it
+		// (SetBenchmarkRuntimeSpecAdminState, which returns
+		// ErrRuntimeSpecNotFound when there is no such row), so putRuntimeSpec
+		// always finds an existing spec and a nil would take the PRESERVE
+		// branch -- putting back exactly what was read. The create-time default
+		// is unreachable from here. "Production" is load-bearing: four test
+		// call sites also spread a document through this mapper, and a SECOND
+		// production caller that did not resolve the spec first would put the
+		// create default back in reach.
+		//
+		// What the pointer changes is the ONE pathological case: a stored true
+		// on a kind that cannot honour it. A nil would let the clear arm wipe
+		// it silently; the explicit pointer re-ASSERTS it and earns the 400
+		// instead -- a failure worth hearing about rather than papering over.
+		// Re-asserting is safe because the spread restates Type and Binary
+		// from the same document (SetBenchmarkRuntimeSpecAdminState re-reads
+		// the whole document through this spread and then replaces AdminState
+		// alone), so the kind the value was stored under is the kind it is
+		// re-asserted against, and a 400 out of the restore means the STORED
+		// row already violated the invariant.
+		ResponsesLiveTimingsEnabled: &liveTimings,
 		APITokenMode:                dto.APITokenMode,
 		APITokenHeaderSource:        dto.APITokenHeaderSource,
 		APITokenHeader:              dto.APITokenHeader,

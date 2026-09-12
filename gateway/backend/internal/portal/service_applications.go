@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
@@ -74,6 +75,41 @@ var (
 	// gateway flips it to https itself once the agent's TLS listener is
 	// confirmed.
 	ErrApplicationProxyEntryScheme = errors.New("application.proxy_entry_scheme")
+	// ErrApplicationResponsesLiveTimingsUnsupported rejects an EXPLICIT
+	// responses_live_timings_enabled:true whose RESULTING application type is
+	// not a live-timings-capable kind (routing.LiveTimingsCapableKind), in the
+	// case where the REQUEST ITSELF supplied that type: every create (whose
+	// "type" is always the request's own) and any PATCH that sends "type"
+	// alongside the flag. HTTP 400 -- such a body is internally contradictory
+	// and can be judged without reading the stored row at all.
+	//
+	// The message names the offending type: the caller asserted something
+	// about this row that its kind cannot carry, and storing false while
+	// answering 200 would be a write that lies about its result. That is
+	// ErrApplicationProxyExcludedPortConflict's argument above, applied to a
+	// second field: "silently zeroing what the caller asked for in the same
+	// breath would be a lie."
+	//
+	// An ABSENT field is never this error. It is the kind-dependent default on
+	// create, and on update it is a CLEAR when the resulting type cannot
+	// honour the flag -- clearing overrides nothing the operator said, because
+	// a request that does not mention the field says nothing about it.
+	ErrApplicationResponsesLiveTimingsUnsupported = errors.New("application.responses_live_timings_unsupported")
+	// ErrApplicationResponsesLiveTimingsConflict rejects the SAME explicit
+	// true when the incapable type is the one already STORED and the request
+	// does not send "type" at all. HTTP 409, not 400: the request is
+	// well-formed -- it would be accepted verbatim against a capable
+	// application -- and it collides with this application's own state, which
+	// is exactly the line ErrServerManagedRuntimeOnly and the three proxy
+	// sentinels above already draw ("the request SHAPE is fine, it conflicts
+	// with the target's own state", gateway/portal_application_endpoints.go:220-221).
+	//
+	// The distinction is drawn on req.Type != nil, NOT on whether the type
+	// changed: a PATCH restating the same incapable type still supplied the
+	// type it is judged against, so that is the 400 above. It reaches exactly
+	// this one shape -- there is no create path to it, since a create always
+	// carries its own type.
+	ErrApplicationResponsesLiveTimingsConflict = errors.New("application.responses_live_timings_conflict")
 
 	// CodeMappingNotFound is ErrMappingNotFound's API error code, exported for
 	// the same reason as CodeApplicationNotFound above (portal_mapping_endpoints.go).
@@ -203,6 +239,14 @@ type ApplicationDTO struct {
 	BenchmarkScheduleEnabled         bool `json:"benchmark_schedule_enabled"`
 	BenchmarkScheduleIntervalSeconds int  `json:"benchmark_schedule_interval_seconds"`
 	OpportunisticMetricsEnabled      bool `json:"opportunistic_metrics_enabled"`
+	// ResponsesLiveTimingsEnabled is the operator's opt-in to asking a capable
+	// upstream for mid-stream timings on a passthrough /v1/responses stream
+	// (migration 80). Set from the RAW column and always the STORED value --
+	// which, given the write paths' refusal rule, is also always a value this
+	// application's TYPE can honour: a create/update that asks for true on a
+	// kind that cannot is refused -- 400 when the request supplied that kind,
+	// 409 when it is the stored one -- and never stored as false.
+	ResponsesLiveTimingsEnabled bool `json:"responses_live_timings_enabled"`
 	// ProxyListenPort is the gateway-managed TLS port the agent's local proxy
 	// listens on for this application (P4 HTTPS-switch); 0 = not yet assigned
 	// (the gateway auto-assigns it once the app needs one). Not user-editable
@@ -253,6 +297,21 @@ type CreateApplicationRequest struct {
 	BenchmarkScheduleEnabled         bool     `json:"benchmark_schedule_enabled"`
 	BenchmarkScheduleIntervalSeconds int      `json:"benchmark_schedule_interval_seconds"`
 	OpportunisticMetricsEnabled      bool     `json:"opportunistic_metrics_enabled"`
+	// ResponsesLiveTimingsEnabled opts this application in to the
+	// live-timings request parameter on its passthrough /v1/responses streams.
+	//
+	// A POINTER, like ProxyExcluded below, and for both of that field's
+	// reasons at once. First, absent must be distinguishable from an explicit
+	// false, because absent is what gets the kind-dependent default (ON for
+	// llama_cpp and vllm) and false is a deliberate off; with a plain bool the
+	// default could never fire for any client that sends the key -- which
+	// includes every portal form, since they send one whole body for create
+	// and update alike. Second, absent is what distinguishes a NON-MENTION
+	// from an ASSERTION: an explicit true on a kind that cannot honour it is
+	// refused (ErrApplicationResponsesLiveTimingsUnsupported), while an absent
+	// field on such a kind simply takes the default. A plain bool collapses
+	// those into one request and neither rule can be written.
+	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// ProxyListenPort: 0 = auto-assign (default; gateway-managed). A caller may
 	// set it explicitly, validated unique per server + in the TCP port range.
 	ProxyListenPort int `json:"proxy_listen_port"`
@@ -295,6 +354,12 @@ type UpdateApplicationRequest struct {
 	BenchmarkScheduleEnabled         *bool   `json:"benchmark_schedule_enabled,omitempty"`
 	BenchmarkScheduleIntervalSeconds *int    `json:"benchmark_schedule_interval_seconds,omitempty"`
 	OpportunisticMetricsEnabled      *bool   `json:"opportunistic_metrics_enabled,omitempty"`
+	// ResponsesLiveTimingsEnabled: nil = keep the stored value, the house
+	// sentinel -- except that a nil against a resulting type that cannot
+	// honour the flag CLEARS it, and a non-nil true against such a type is
+	// refused. Whether the request ALSO sends Type above decides which of the
+	// two refusal sentinels comes back (400 vs 409). See UpdateApplication.
+	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// ProxyListenPort: nil = keep the stored value (gateway-managed; the portal
 	// UI never sends this). 0 resets to auto-assign; a positive value sets it
 	// explicitly, validated unique per server + in the TCP port range.
@@ -479,6 +544,72 @@ func (s *Service) CreateApplication(ctx context.Context, principal auth.Token, s
 	if err := applyProxyExclusion(&app, req.ProxyExcluded, req.ProxyListenPort); err != nil {
 		return ApplicationDTO{}, err
 	}
+	// Decision (d): a newly created application on an upstream kind whose
+	// request schema tolerates the parameter starts with the opt-in ON; every
+	// other kind gets the DDL default. A server_agent application is NOT such a
+	// kind at this point and cannot be: it has no binary, no spec type and no
+	// mappings yet -- runtime specs are per-mapping and are created later by
+	// PutRuntimeSpec, which applies the per-kind default from the spec's own
+	// resolved type.
+	//
+	// Decision (e), create half: an EXPLICIT true on a kind that cannot honour
+	// it is REFUSED, not stored as false. Nothing has been persisted at this
+	// point -- the first store write is s.routes.CreateApplication below -- so
+	// a refused create leaves nothing behind. An explicit false is honoured on
+	// every kind (it asks for nothing the kind cannot do), and an ABSENT field
+	// is never refused: that is what the pointer buys, and it is why a caller
+	// who says nothing gets the default rather than an error.
+	//
+	// POSITION, deliberately: after EVERY check on this path that can refuse
+	// the body -- the managed-runtime gate, type, scheme, port, flavors, the
+	// two endpoint modes, status, tuning, the health-check fields and
+	// interval, the benchmark interval, the app-path suffix, the token header,
+	// the proxy-port 400 and 409, the one-server_agent-per-server 409, the
+	// token seal (capture.ErrKeyRequired) and applyProxyExclusion's own two
+	// 409s -- and immediately before the single store write. Each of those
+	// returns rather than falling through, so this brand-new refusal cannot
+	// rewrite the answer to a body that was already invalid for a SHIPPED
+	// reason. The only refusal left downstream is CreateApplication's own
+	// conflict classification, which by definition cannot precede the write it
+	// classifies. No residue remains on this path.
+	//
+	// That last position is what the trailing assignment buys, and the reason
+	// to keep it. liveTimings used to be a FIELD in the routing.Application
+	// literal above, which pinned this block above applyProxyExclusion and
+	// reported two shipped 409s -- application.proxy_excluded_port_conflict
+	// and application.proxy_entry_scheme -- as this 400 instead. A literal
+	// field is not an immovable consumer: written as a statement after the
+	// call, it frees the block to sit below it. Assigning AFTER
+	// applyProxyExclusion cannot bypass the invariant that function's own
+	// "LAST" comment protects, because it reads and writes only
+	// ProxyExcluded, ProxyListenPort and Scheme and never looks at this field.
+	// Keep it that way: the moment this block needs a field
+	// applyProxyExclusion does read, the field goes back in the literal and
+	// the ordering question reopens.
+	//
+	// ALWAYS the 400 sentinel here, never the 409 one. req.Type is a plain
+	// string on this request, so the type this refusal names is always the
+	// caller's own, and there is no prior state for anything to conflict with:
+	// a create body that pairs an incapable type with true is contradictory on
+	// its own terms. The stored-state shape exists only on UpdateApplication.
+	//
+	// appType has already been through normalizeApplicationType, so the %q can
+	// only ever print one of its six accepted values. Keep the message a
+	// statement about the type the caller sent; do NOT grow it into a list of
+	// capable-versus-incapable kinds, because such a list would have to mention
+	// "mock", which is a routing provider constant but NOT an accepted
+	// application type -- a body with "type":"mock" is already dead on
+	// ErrApplicationTypeInvalid above.
+	liveTimingsCapable := routing.LiveTimingsCapableKind(appType)
+	liveTimings := liveTimingsCapable
+	if req.ResponsesLiveTimingsEnabled != nil {
+		if *req.ResponsesLiveTimingsEnabled && !liveTimingsCapable {
+			return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
+				ErrApplicationResponsesLiveTimingsUnsupported, appType)
+		}
+		liveTimings = *req.ResponsesLiveTimingsEnabled
+	}
+	app.ResponsesLiveTimingsEnabled = liveTimings
 	if err := s.routes.CreateApplication(ctx, app); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return ApplicationDTO{}, s.classifyApplicationWriteConflict(ctx, app, "")
@@ -732,6 +863,63 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	if req.OpportunisticMetricsEnabled != nil {
 		app.OpportunisticMetricsEnabled = *req.OpportunisticMetricsEnabled
 	}
+	// Decision (e), update half. The pointer separates an ASSERTION from a
+	// NON-MENTION and the two get opposite treatment:
+	//
+	//   - non-nil: the caller's value, STAGED here and validated BELOW. The
+	//     refusal that rejects an impossible true runs after
+	//     applyProxyExclusion now, so at this line a true has NOT been
+	//     checked yet and this arm may legitimately stage one an incapable
+	//     type cannot honour. That is safe only because nothing between here
+	//     and the refusal persists anything.
+	//
+	//     This arm's position is NOT load bearing on its own, and neither is
+	//     the refusal's read. The four combinations are symmetric, and each
+	//     single change was measured on the FULL internal/portal and
+	//     internal/gateway packages: with the refusal reading
+	//     req.ResponsesLiveTimingsEnabled, swapping these two arms leaves
+	//     both packages ok (fix round 4); with the arms in this order,
+	//     rewriting the refusal to read the STAGED flag also leaves both
+	//     packages ok (fix round 5). Only the two changes TOGETHER break, and
+	//     then they break loudly (fix round 3's (H2)). The arms can disagree
+	//     only on an incapable resulting type, where this arm stages the
+	//     caller's value and a swapped incapable arm stages false -- and the
+	//     caller's value is then either false (same row) or the true a
+	//     request-reading refusal below rejects (no row at all).
+	//
+	//     So the order and the read are ALTERNATIVE guards, not two halves of
+	//     one, and "keep the order and the read is free" is exactly as true
+	//     as "keep the read and the order is free". This file picks the read,
+	//     and that is a PREFERENCE among symmetric alternatives rather than a
+	//     measured asymmetry. The reason is reach, not correctness: reading
+	//     the request keeps the refusal independent of ANY later edit to this
+	//     switch -- a third arm, a different predicate, the clear moved
+	//     somewhere else -- while keeping the arm order guards only the one
+	//     edit that swaps these two. Change the read and this arm's position
+	//     becomes load bearing for real, which is what the refusal's HAZARD
+	//     note says and why it says it conditionally;
+	//   - nil with an incapable resulting type: the stored value is CLEARED,
+	//     so a retype away from llama_cpp/vllm cannot leave a stale true
+	//     behind for a kind that can never honour it (LiteLLM, for one,
+	//     forwards unknown body keys downstream and OpenAI/Azure answer 400).
+	//     This overrides nothing the operator said in THIS request -- they
+	//     said nothing about the flag -- which is exactly why a clear is
+	//     legitimate here while a silent rewrite of an explicit true is not.
+	//
+	// It reads app.Type, the POST-mutation type (assigned in the mutation block
+	// above), for the same reason normalizeApplicationTimeoutMS reads it. That
+	// also makes the condition a property of the RESULTING ROW rather than of
+	// the request's shape -- the distinction applyProxyExclusion's RULE 4
+	// spells out, where a request-shape-only check turned out to be the hole
+	// the bad state arrived through. A retype TO a capable kind deliberately
+	// does NOT switch it on: decision (d) scopes the kind-dependent 1 to
+	// create.
+	switch {
+	case req.ResponsesLiveTimingsEnabled != nil:
+		app.ResponsesLiveTimingsEnabled = *req.ResponsesLiveTimingsEnabled
+	case !routing.LiveTimingsCapableKind(app.Type):
+		app.ResponsesLiveTimingsEnabled = false
+	}
 	if req.ProxyListenPort != nil {
 		app.ProxyListenPort = proxyListenPort
 	}
@@ -758,6 +946,126 @@ func (s *Service) UpdateApplication(ctx context.Context, principal auth.Token, a
 	}
 	if err := applyProxyExclusion(&app, req.ProxyExcluded, explicitProxyListenPort); err != nil {
 		return ApplicationDTO{}, err
+	}
+	// The live-timings opt-in's refusal, judged over the RESULTING type. By
+	// this point app.Type IS the resulting type -- the mutation block above
+	// assigned it from appType when this PATCH sends one and left the stored
+	// value otherwise -- so the rule reads app.Type directly and needs no
+	// resultingType of its own. The type is the authority on whether the flag
+	// can be honest, so a body that retypes AND asserts true in one breath is
+	// refused on the NEW type rather than accepted against the old one.
+	//
+	// POSITION, deliberately: after EVERY check on this path that can refuse
+	// the body -- the pre-mutation normalizers and validators (type, scheme,
+	// port, flavors, status, the five tuning bounds, the health-check path,
+	// mode and interval, the two endpoint modes, the benchmark interval and
+	// the proxy-port 400), the proxy-port 409, the
+	// one-server_agent-per-server 409 and, inside the mutation block,
+	// checkPathSuffix, checkHeaderName, the token seal and
+	// applyProxyExclusion's own two 409s -- and immediately before the store
+	// write. Downstream there is only warnProxyExclusionOwnTLS (which logs and
+	// returns nothing), the UpdatedAt stamp, and UpdateApplication's conflict
+	// classification, which cannot precede the write it classifies. No residue
+	// remains on this path, and the create half says the same of its own: the
+	// two are symmetric again.
+	//
+	// It took four positions to get here, which is the useful part of the
+	// history. It started MIDWAY through the pre-mutation block, immediately
+	// after the two endpoint modes, where it masked the NINE checks below it:
+	// the benchmark interval, the proxy-port 400 and 409, the
+	// one-server_agent-per-server 409, checkPathSuffix, checkHeaderName, the
+	// seal and applyProxyExclusion's two 409s. (Not the whole list -- type,
+	// scheme, port, flavors, status, the tuning bounds, the health-check
+	// fields and the endpoint modes already ran above it.)
+	//
+	// At the END of that block it still masked FIVE: checkPathSuffix,
+	// checkHeaderName, the seal and applyProxyExclusion's own two 409s. The
+	// first three because they run from INSIDE the mutation block -- each
+	// validates its own field before staging that field, but only after
+	// earlier fields have been staged -- so a check that stays outside the
+	// mutation block necessarily runs ahead of all three; the two 409s
+	// because applyProxyExclusion runs at the very END of the mutation block,
+	// below its two-arm clear. Moved inside the block but still above that
+	// clear, only applyProxyExclusion's two 409s were left, and that residue
+	// is what made the fourth move necessary. Below applyProxyExclusion it
+	// masks nothing.
+	//
+	// It sits BEFORE warnProxyExclusionOwnTLS deliberately, not incidentally:
+	// that warning tells the operator their application has left the TLS
+	// proxy, and emitting it for a request that is about to be refused would
+	// describe a state this call never reaches.
+	//
+	// Being INSIDE the mutation block -- now past the two-arm clear as well --
+	// costs nothing: the block mutates a LOCAL copy of the application and the
+	// only persistence is s.routes.UpdateApplication below, so a refusal from
+	// here still leaves the stored row untouched, exactly the property
+	// TestUpdateApplicationRetypeAndAssertTrueInOneBodyIsRejected asserts by
+	// reloading after a refused PATCH. checkPathSuffix, checkHeaderName and
+	// the seal already validate from in here for the same reason, so this sets
+	// no new precedent.
+	//
+	// HAZARD the position creates, and the reason the reads below are what
+	// they are: this refusal reads req.ResponsesLiveTimingsEnabled, req.Type
+	// and app.Type, and must NEVER be rewritten to read the STAGED
+	// app.ResponsesLiveTimingsEnabled the clear has just assigned. app.Type is
+	// safe -- nothing after the mutation block's first line writes it, so it
+	// is still the resulting type here (the clear touches only the flag;
+	// applyProxyExclusion only ProxyExcluded, ProxyListenPort and Scheme). The
+	// FLAG is not safe. Reading it happens to be equivalent today, purely
+	// because the clear's value arm comes first and therefore stages an
+	// explicit true unchanged; swap the clear's two arms and the incapable arm
+	// stages false instead, a staged-state refusal sees false, refuses
+	// nothing, and the impossible true answers 200 with a stored false.
+	// Measured -- but measured as the COMPOUND of both changes (fix round 3's
+	// (H2)), and the compound is the only thing the suite catches. Neither
+	// half alone is caught, and the two halves are SYMMETRIC: on the full
+	// internal/portal and internal/gateway packages the staged read alone
+	// leaves both ok (fix round 5), and so does the arm swap alone (fix round
+	// 4). So "never read the staged flag" is a CONVENTION this file adopts,
+	// not an asymmetry the code has -- pinning the arm order instead would be
+	// equally correct today. It is preferred because it reaches further:
+	// reading the REQUEST makes the refusal independent of the clear
+	// altogether, and stays so through any later edit of that switch, while
+	// reading the staged flag couples the two silently and rests the whole
+	// guarantee on the clear's internal order.
+	//
+	// WHETHER to refuse is a property of the resulting ROW; WHICH sentinel to
+	// refuse with is a property of the REQUEST, and the two must not be
+	// conflated:
+	//
+	//   - the request sent "type", so it supplied the incapable type itself
+	//     and the body is contradictory on its own terms -> ...Unsupported,
+	//     400;
+	//   - the request did not, so the incapable type is the stored one and
+	//     this PATCH leaves it exactly as it was -> ...Conflict, 409. The
+	//     request is well-formed; it collides with this application's state.
+	//
+	// Read off req.Type != nil -- nothing in this function reassigns req, so
+	// the mutation block above cannot blur it -- and deliberately NOT off a
+	// comparison of the sent type against the type this row used to have: a
+	// PATCH restating the type it already had still SUPPLIED the type it is
+	// being judged against, so it belongs in the 400 arm. A value comparison
+	// would also drop the portal's own saves into the 409 arm, since
+	// ApplicationSection.tsx's buildBody() restates "type" on every save.
+	//
+	// Note where such a comparison would have to come FROM at this position.
+	// app.Type is the RESULTING type here, so *req.Type != app.Type is no
+	// longer the round-0 slip: normalizeApplicationType only trims, so the two
+	// differ solely for a type padded with whitespace, which leaves the 400
+	// arm all but unreachable and fails four test cases at once -- two test
+	// functions in internal/portal plus two subtests of internal/gateway's
+	// wire refusal test, re-measured in fix round 4. The type this row
+	// used to have survives only in previousType, so *req.Type != previousType
+	// is the shape a future editor would actually reach for -- the same
+	// mistake, respelled. The pointer is the whole test.
+	liveTimingsRefusal := ErrApplicationResponsesLiveTimingsConflict
+	if req.Type != nil {
+		liveTimingsRefusal = ErrApplicationResponsesLiveTimingsUnsupported
+	}
+	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled &&
+		!routing.LiveTimingsCapableKind(app.Type) {
+		return ApplicationDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for an application of type %q",
+			liveTimingsRefusal, app.Type)
 	}
 	warnProxyExclusionOwnTLS(server, app, previousProxyListenPort)
 	app.UpdatedAt = s.clock().UTC()
@@ -860,6 +1168,7 @@ func applicationDTO(server routing.AIServer, app routing.Application) Applicatio
 		BenchmarkScheduleEnabled:         app.BenchmarkScheduleEnabled,
 		BenchmarkScheduleIntervalSeconds: app.BenchmarkScheduleIntervalSeconds,
 		OpportunisticMetricsEnabled:      app.OpportunisticMetricsEnabled,
+		ResponsesLiveTimingsEnabled:      app.ResponsesLiveTimingsEnabled,
 		ProxyListenPort:                  app.ProxyListenPort,
 		ProxyExcluded:                    app.ProxyExcluded,
 		// Default to reachable; enrichReachability overrides it only when the

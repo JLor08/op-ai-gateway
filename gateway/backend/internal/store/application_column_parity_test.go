@@ -15,34 +15,43 @@ import (
 // applicationParityRows is how many applications rows the column-parity
 // fixture seeds, computed the same way (and for the same reason) as
 // aiServerParityRows in ai_server_column_parity_test.go: the applications
-// select lists carry FOUR integer-boolean columns, two same-typed columns are
+// select lists carry FIVE integer-boolean columns, two same-typed columns are
 // only distinguishable by value if they differ in at least one seeded row, so
 // each needs its own DISTINCT pattern across the rows. With r rows there are
-// 2^r patterns, so r must satisfy 2^r >= 4 — three rows (native_responses /
+// 2^r patterns, so r must satisfy 2^r >= 5 — three rows still suffice
+// (2^3 = 8 >= 5), which is why adding responses_live_timings_enabled as the
+// fifth boolean did not need a fourth row. (native_responses /
 // native_messages were replaced by the ResponsesMode / MessagesMode text
-// columns below, which the string fixture already varies per row).
+// columns below, which the string fixture already varies per row.)
 const applicationParityRows = 3
 
 // applicationParityBools is the bit-pattern table, one row per integer-boolean
 // column in SELECT-LIST order (always_reachable, benchmark_schedule_enabled,
-// opportunistic_metrics_enabled, proxy_excluded) and one column per seeded
-// application.
+// opportunistic_metrics_enabled, proxy_excluded,
+// responses_live_timings_enabled) and one column per seeded application.
 //
 // Its two load-bearing properties are asserted by
 // TestApplicationParityFixtureDistinguishesEverySameTypedPair below, so the
 // table cannot silently degrade into an all-true fixture that catches nothing:
 //
 //   - every PAIR of rows differs in at least one column, so swapping any two of
-//     the four bool columns in one reader's select list changes an observable
+//     the five bool columns in one reader's select list changes an observable
 //     value in at least one seeded application;
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows up
 //     as a mismatch somewhere.
-var applicationParityBools = [4][applicationParityRows]bool{
+//
+// The responses_live_timings_enabled row carries one further constraint, which
+// is about MEANING rather than about distinguishability and therefore lives at
+// the seeding site: whichever row it is true in must have a type that
+// routing.LiveTimingsCapableKind calls INCAPABLE. See the guard next to the
+// types fixture in TestConformanceApplicationReadersAgreeOnEveryColumn.
+var applicationParityBools = [5][applicationParityRows]bool{
 	{true, true, false},  // always_reachable
 	{false, true, true},  // benchmark_schedule_enabled
 	{false, true, false}, // opportunistic_metrics_enabled
 	{false, false, true}, // proxy_excluded
+	{true, false, false}, // responses_live_timings_enabled
 }
 
 // TestConformanceApplicationReadersAgreeOnEveryColumn closes a gap that
@@ -72,7 +81,7 @@ var applicationParityBools = [4][applicationParityRows]bool{
 //
 // WHAT THE FIXTURE GUARANTEES, precisely: fields that CAN hold a distinct value
 // per row (strings, ints) do, and each varies per row as well, so a reader
-// returning the wrong ROW is caught too. The four integer-booleans carry the
+// returning the wrong ROW is caught too. The five integer-booleans carry the
 // bit-pattern table above, sized so every pair of them differs in at least one
 // seeded application. Together that makes a swapped pair in any one list
 // observable wherever the two columns are same-typed — the only case that does
@@ -96,7 +105,45 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 		// flavor), so a non-active row could not appear in the third reader at
 		// all and the comparison would have nothing to make. Every other
 		// same-typed column is varied instead.
-		types := [applicationParityRows]string{routing.ProviderVLLM, routing.ProviderOllama, routing.ProviderLlamaCPP}
+		//
+		// The row carrying responses_live_timings_enabled = true is deliberately
+		// an INCAPABLE type (ollama), which is why ollama leads this list. The
+		// store is policy-free about that flag: issue #81 decision (e) puts the
+		// "an incapable kind may not store true" refusal in the portal, as a 400
+		// naming the type, never in SQL -- so every store path has to round-trip
+		// a true for ANY kind, and something has to seed one.
+		//
+		// Nothing did before: every ResponsesLiveTimingsEnabled: true in this
+		// package sat on llama_cpp or vllm, so a store path that "helpfully"
+		// cleared the flag for an incapable kind would have passed the entire
+		// suite.
+		//
+		// This row is the applications half of that fix, and it covers
+		// CreateApplication plus the three applications readers ALONE. The spec
+		// upsert is a different statement in a different file and cannot be
+		// reached from here, so TestRoutingStoreRuntimeSpecs
+		// (routing_store_conformance_test.go) now seeds its own true on an
+		// incapable EFFECTIVE kind and carries the same guard.
+		// TestConformanceApplicationResponsesLiveTimings still seeds llama_cpp,
+		// which costs nothing: it writes through the CreateApplication this row
+		// already covers.
+		types := [applicationParityRows]string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP}
+		// Checked rather than asserted in prose, so the tie to the real
+		// definition of "capable" cannot rot: if routing's capable set ever grew to
+		// include the type of every row that seeds a true (today just ollama),
+		// this fixture would silently stop proving the paragraph above -- it says
+		// so here instead. Stated over the whole table rather than over row 0, so
+		// reordering the patterns or the types keeps the property under guard.
+		capableOnly := true
+		for i, on := range applicationParityBools[4] {
+			if on && !routing.LiveTimingsCapableKind(types[i]) {
+				capableOnly = false
+			}
+		}
+		if capableOnly {
+			t.Fatalf("every row seeding responses_live_timings_enabled true (pattern %v) has a live-timings-capable type (%v): put the true on a row whose type is NOT capable, or this fixture passes even when a store path clears the flag by kind",
+				applicationParityBools[4], types)
+		}
 		schemes := [applicationParityRows]string{"http", "http", "https"}
 		// proxy_listen_port respects the portal's excluded => port 0 invariant
 		// (proxy_excluded is true only in the third row), and still carries two
@@ -145,6 +192,7 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 				OpportunisticMetricsEnabled:      applicationParityBools[2][i],
 				ProxyListenPort:                  proxyPorts[i],
 				ProxyExcluded:                    applicationParityBools[3][i],
+				ResponsesLiveTimingsEnabled:      applicationParityBools[4][i],
 				CreatedAt:                        now.Add(time.Duration(-10-i) * time.Minute),
 				UpdatedAt:                        now.Add(time.Duration(-i) * time.Minute),
 			})
@@ -228,6 +276,14 @@ func TestApplicationParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
 	names := []string{
 		"always_reachable",
 		"benchmark_schedule_enabled", "opportunistic_metrics_enabled", "proxy_excluded",
+		"responses_live_timings_enabled",
+	}
+	// Without this, the guard degrades exactly the way it exists to prevent: a
+	// sixth pattern row with no names entry either reports the wrong column's
+	// name (if it happens to be distinct) or panics with index-out-of-range
+	// instead of printing the duplicate-pattern message below.
+	if len(names) != len(applicationParityBools) {
+		t.Fatalf("names has %d entries for %d bit-pattern rows: widen both together", len(names), len(applicationParityBools))
 	}
 	for i := range applicationParityBools {
 		trueSomewhere := false

@@ -37,11 +37,42 @@ func reinvokeMigration78(ctx context.Context, t *testing.T, s *SQLStore) {
 // seedMigration78Mappings creates one server, one application and one mapping
 // per id, so each id can then be forced into its own pre-78 column shape.
 //
-// It goes through the PUBLIC store API, which no longer writes the eleven
-// columns migration 79 dropped -- they are `not null default` at version 77,
-// so an insert that omits them still lands. Forcing a legacy value is then
-// the caller's own raw `update` (mustExec), which needs a database stopped
-// before 79: see forEachDialectMigratedTo.
+// Its eight callers are SPLIT, and the paragraphs below turn on that split.
+// FOUR hand it a database deliberately stopped at version 77
+// (forEachDialectMigratedTo): TestMigration78BackfillFromLegacyColumns,
+// TestMigration78Idempotent and TestMigration78VisionBackfillResolvesByRank
+// here, plus TestMigration79FreshInstallMatchesUpgradedSchema's upgrade leg.
+// The other FOUR hand it a fully migrated one (forEachDialect), because they
+// test post-79 behaviour rather than the pre-78 shape.
+//
+// The mapping and server rows go through the PUBLIC store API, which no longer
+// writes the eleven columns migration 79 dropped -- they are
+// `not null default` at version 77, so an insert that omits them still lands.
+// Forcing a legacy value afterwards is the caller's own raw `update`
+// (mustExec) and needs a database stopped before 79, so only the v77 four
+// ever do it.
+//
+// The APPLICATION row does NOT, and cannot, go through the public store API:
+// that API always speaks the column set of the CURRENT migration head, and for
+// the v77 four the two agreed only for as long as no migration above 77 added
+// an applications column. Migration 80's responses_live_timings_enabled is the
+// first one that does, and CreateApplication naming it turned this helper into
+// "table applications has no column named ...". So the raw insert below is
+// REQUIRED by those four -- and it is valid for the other four as well, by
+// construction rather than by luck: it names exactly the thirteen applications
+// columns that the frozen-at-v60 baseline declares with no DDL default -- the
+// `create table if not exists applications` statement in
+// baselineCreateStatements, whose primary key, not-null scalars and two
+// timestamps are the thirteen, every other column there carrying `not null
+// default`. That makes it a complete insert at the baseline and a complete
+// insert at every version above it, since every applications column added
+// since, 80's included, arrives `not null default`. Version-independent in
+// both directions, for all eight callers. The application row is therefore
+// what it always was here: an FK parent whose own shape is not the subject of
+// any migration-78 or -79 test, and any future applications column needs no
+// edit here. (ai_servers and model_mappings carry the same latent coupling
+// through CreateAIServer / CreateMapping; the same fix applies to whichever of
+// them a post-77 migration touches first.)
 func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now time.Time, ids ...string) {
 	t.Helper()
 	if err := s.CreateAIServer(ctx, routing.AIServer{
@@ -50,14 +81,12 @@ func seedMigration78Mappings(ctx context.Context, t *testing.T, s *SQLStore, now
 	}); err != nil {
 		t.Fatalf("create server: %v", err)
 	}
-	if err := s.CreateApplication(ctx, routing.Application{
-		ID: "app_m78", ServerID: "srv_m78", Type: routing.ProviderVLLM, Port: 8000, Scheme: "http",
-		APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
-		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
-		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("create application: %v", err)
-	}
+	mustExec(ctx, t, s, `insert into applications (
+		id, server_id, type, port, scheme, api_flavors, priority, weight,
+		timeout_ms, affinity_ttl_seconds, status, created_at, updated_at
+	) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"app_m78", "srv_m78", routing.ProviderVLLM, 8000, "http", `["openai"]`,
+		1, 1, 30000, 300, routing.ServerStatusActive, now, now)
 	for _, id := range ids {
 		if err := s.CreateMapping(ctx, routing.ModelMapping{
 			ID: id, ApplicationID: "app_m78", GatewayModelName: id + "-model",

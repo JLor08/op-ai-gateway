@@ -112,6 +112,7 @@ var migrations = []migration{
 	{version: 77, name: "model_mappings_capabilities", up: migration77Up},
 	{version: 78, name: "model_mapping_capabilities_table", up: migration78Up},
 	{version: 79, name: "model_mappings_drop_capability_columns", up: migration79Up},
+	{version: 80, name: "application_responses_live_timings", up: migration80Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3746,4 +3747,80 @@ func migration79Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration80Up adds applications.responses_live_timings_enabled and
+// agent_runtime_specs.responses_live_timings_enabled -- the operator's
+// per-endpoint opt-in to asking a capable upstream for mid-stream timings on
+// a `passthrough` /v1/responses stream. It is ORTHOGONAL to responses_mode
+// (it qualifies a passthrough stream, it is not a fourth value of the enum),
+// exactly as proxy_excluded is orthogonal to scheme.
+//
+// The column lands on BOTH tables because for a server_agent mapping the
+// resolved runtime spec -- not the parent application -- is the authority for
+// the endpoint behaviour this flag qualifies, the same reason responses_mode
+// and messages_mode live on both (migration72Up).
+//
+// The DDL default of 0 is the whole of the upgrade story (decision (d)): no
+// running deployment's behaviour changes, because every existing row reads
+// back off. The backfill below is therefore provably a NO-OP on any real
+// upgrade -- BOTH columns are new, so there is no non-zero application value
+// anywhere to copy -- and the same argument migration74Up makes about its
+// defaults applies here. It exists so the spec column's provenance is
+// identical to responses_mode's rather than an accident of ordering: the next
+// column added to a spec inherits this shape, and a spec written before its
+// parent application's value existed would otherwise have no story at all.
+//
+// It ABORTS the boot on failure rather than skipping, following migration70Up
+// and unlike migration68Up: this is a deterministic UPDATE with no
+// possibly-dirty pre-check to fail, and migration68Up's skip-rather-than-abort
+// policy is scoped to a CONSTRAINT over data an enforcement layer already
+// guards.
+//
+// Append-only: it does NOT touch baselineCreateStatements, FROZEN as of v60,
+// nor migration65Up's create-table for agent_runtime_specs. A fresh install
+// gets both columns by replaying this duplicate-tolerant migration, and the
+// backfill is a no-op there because both tables are empty.
+//
+// Nothing in this migration's cut READS the column.
+func migration80Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, table := range []string{"applications", "agent_runtime_specs"} {
+		if err := addColumnIfMissing(ctx, tx, dl, table,
+			"responses_live_timings_enabled integer not null default 0"); err != nil {
+			return err
+		}
+	}
+	// Snapshot each spec from its parent application, migration72Up's join:
+	// agent_runtime_specs.mapping_id -> model_mappings.application_id ->
+	// applications. Cross-driver: postgres UPDATE ... FROM a multi-table
+	// join; sqlite correlated subqueries (modernc sqlite supports UPDATE ...
+	// FROM only since 3.33 and not across this join shape reliably).
+	// The `= 0` guard is one-directional, and copying it as a general
+	// idempotency guard is the trap this comment exists to close. Unlike
+	// migration72Up's `''` sentinel, 0 is NOT distinguishable from a
+	// legitimate value here: it means both "never backfilled" and "the
+	// operator's explicit off". So what it protects is a spec the operator
+	// has since turned ON -- a replay never drags that back to its parent's
+	// value, which is what
+	// TestMigration80SnapshotsTheSpecFromItsParentApplication asserts. What
+	// it does NOT protect is a spec the operator has explicitly turned OFF: a
+	// replay would flip that back on whenever the parent application is on.
+	// Harmless here only because the runner applies pending migrations only,
+	// so this body runs exactly once per database -- a future spec column
+	// whose "off" value is also its DDL default needs a real sentinel, or no
+	// backfill at all, not this guard.
+	if dl.name() == "postgres" {
+		return execTx(ctx, tx, dl, `update agent_runtime_specs s
+			set responses_live_timings_enabled = a.responses_live_timings_enabled
+			from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = s.mapping_id
+			  and s.responses_live_timings_enabled = 0`)
+	}
+	return execTx(ctx, tx, dl, `update agent_runtime_specs
+		set responses_live_timings_enabled = coalesce((select a.responses_live_timings_enabled
+			from model_mappings m
+			join applications a on a.id = m.application_id
+			where m.id = agent_runtime_specs.mapping_id), responses_live_timings_enabled)
+		where responses_live_timings_enabled = 0`)
 }

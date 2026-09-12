@@ -75,6 +75,15 @@ type Target struct {
 	// set, a successful real inference EWMA-updates the served mapping's throughput
 	// metrics from the usage event.
 	OpportunisticMetrics bool
+	// ResponsesLiveTimingsEnabled is the EFFECTIVE per-endpoint live-timings
+	// opt-in for this request: the resolved RuntimeSpec's value for a
+	// server_agent mapping that has a spec, the resolved application's
+	// otherwise -- the same precedence ResponsesMode/MessagesMode use above,
+	// and deliberately NOT OpportunisticMetrics' app-only shape, because this
+	// flag qualifies a decision (ResponsesMode == passthrough) that comes from
+	// the spec for a server_agent child. Nothing reads it yet; the gate, the
+	// injection and the retry are part 2 of issue #81.
+	ResponsesLiveTimingsEnabled bool
 	// LiveProgressSupport is the mapping's PERSISTED verdict about whether this
 	// upstream tolerates the live-progress parameters: "", "supported",
 	// "unsupported". See wantsLiveProgress for how it combines with the shape.
@@ -1081,6 +1090,11 @@ func serverSelectable(server AIServer) bool {
 func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor string) (Target, error) {
 	server, app, mapping := c.Server, c.Application, c.Mapping
 	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
+	// Same precedence as the modes on the line above, for the same reason: the
+	// flag qualifies ResponsesMode, so it must be read from whichever row said
+	// what ResponsesMode says. Kept as its own statement so the mode tuple
+	// stays the three values it has always been.
+	liveTimings := app.ResponsesLiveTimingsEnabled
 	var spec RuntimeSpec
 	var liveProgressSpecType string
 	if app.Type == ProviderServerAgent {
@@ -1091,6 +1105,7 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		if ok {
 			spec = loaded
 			flavors, responsesMode, messagesMode = spec.APIFlavors, spec.ResponsesMode, spec.MessagesMode
+			liveTimings = spec.ResponsesLiveTimingsEnabled
 		}
 		// EffectiveRuntimeSpecType is the only shape evidence available for a
 		// server_agent child: its application type says nothing about what
@@ -1119,6 +1134,10 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		ResponsesMode:        responsesMode,
 		MessagesMode:         messagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
+		// ResponsesLiveTimingsEnabled carries the spec-then-app resolution
+		// computed above, NOT app.ResponsesLiveTimingsEnabled -- see the
+		// liveTimings seed and its override in the server_agent branch.
+		ResponsesLiveTimingsEnabled: liveTimings,
 		// LiveProgressSupport reads the candidate's capability verdict
 		// (MappingCandidate.LiveProgressSupport). #49-3 moved every writer
 		// onto a "live_progress" capability row and migration 79 then dropped

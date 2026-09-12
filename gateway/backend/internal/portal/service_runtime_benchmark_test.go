@@ -159,6 +159,7 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APIFlavors:                  []string{routing.APIFlavorOpenAI},
 		ResponsesMode:               string(routing.EndpointModeDisabled),
 		MessagesMode:                string(routing.EndpointModeTranslate),
+		ResponsesLiveTimingsEnabled: true,
 		APITokenMode:                string(routing.RuntimeAPITokenModeSet),
 		APITokenSet:                 true, // read-only; must NOT appear in want below
 		APITokenHeaderSource:        string(routing.RuntimeAPITokenHeaderSourceCustom),
@@ -192,6 +193,7 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
+		ResponsesLiveTimingsEnabled: &dto.ResponsesLiveTimingsEnabled,
 		APITokenMode:                dto.APITokenMode,
 		APITokenHeaderSource:        dto.APITokenHeaderSource,
 		APITokenHeader:              dto.APITokenHeader,

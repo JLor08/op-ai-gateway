@@ -64,8 +64,11 @@ func (s *Server) handlePortalMappingRuntimeSpec(w http.ResponseWriter, r *http.R
 // portalRuntimeSpecErrRows are writePortalRuntimeSpecError's mapper-specific
 // rows (checked before sharedErrorMap); portal.ErrMappingNotFound (the
 // 404-no-leak collapse from authorizeMapping) maps identically elsewhere and
-// lives in sharedErrorMap instead. Every sentinel here is 400 except
-// ErrRuntimeSpecNotFound (404 — nothing to delete).
+// lives in sharedErrorMap instead. Every sentinel here is 400 except two:
+// ErrRuntimeSpecNotFound is 404 (nothing to delete) and
+// ErrRuntimeSpecServerBenchmarking is 409 (well-formed, but a benchmark run
+// holds the server — see that row's own note). Deliberately no count: a
+// number here goes stale the next time a row is added.
 var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotFound, status: http.StatusNotFound, code: portal.CodeRuntimeSpecNotFound, msg: msgRuntimeSpecNotFound},
 	{err: portal.ErrRuntimeSpecBinaryRequired, status: http.StatusBadRequest, code: "runtime_spec.binary_required", msg: "runtime spec binary is required and must be an absolute path"},
@@ -82,6 +85,28 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
 	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, custom (or empty for auto)"},
+	// The one row in this table with a dynamic message. The service wraps the
+	// sentinel with the offending EFFECTIVE kind (fmt.Errorf("%w: ...")), and
+	// naming it is the entire point of refusing the write instead of storing
+	// something else -- doubly so here, where an empty "type" means the kind
+	// was detected from the binary and the caller never typed it. msgFn exists
+	// for exactly this ("a row that must surface the underlying error's own
+	// text", see errRow in error_map.go); the sentinel's own text IS the API
+	// code, per the convention above, so it is trimmed rather than repeated.
+	//
+	// 400 and never 409: the application table splits this refusal in two
+	// (portal_application_endpoints.go) because a PATCH can assert the flag
+	// against a type it never sent, and the request is then well-formed. A
+	// spec PUT always states its own Type and Binary, so the kind named here
+	// always came from this body.
+	{
+		err:    portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported,
+		status: http.StatusBadRequest,
+		code:   "runtime_spec.responses_live_timings_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported.Error()+": ")
+		},
+	},
 	{err: portal.ErrRuntimeSpecMetricsPathInvalid, status: http.StatusBadRequest, code: "runtime_spec.metrics_path_invalid", msg: "metrics_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	{err: portal.ErrRuntimeSpecContextProbePathInvalid, status: http.StatusBadRequest, code: "runtime_spec.context_probe_path_invalid", msg: "context_probe_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken

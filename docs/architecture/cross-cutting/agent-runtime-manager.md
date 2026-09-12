@@ -3742,6 +3742,25 @@ application's own values no longer apply to a mapping that has a spec (full
 semantics, including the effective-served rule and the disabled-endpoint 404:
 [Compatibility & Inference
 §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+`responses_live_timings_enabled` joins that per-spec set (migration 80), and
+for a `server_agent` model it is the resolved spec's copy — not the parent
+application's — that the request path *will* read: the flag qualifies
+`responses_mode`, which for a managed model comes from the spec, so reading the
+application's copy would attach the flag to a decision the application never
+made. **Will, not does:** this cut carries the value as far as
+`routing.Target.ResponsesLiveTimingsEnabled` and stops. **Nothing acts on it
+yet** — no upstream parameter is injected, nothing gates on it and nothing
+retries without it — so setting it `true` through the API changes no request's
+behaviour and produces no mid-stream tokens/sec; the gate, the injection and
+the retry are part 2 of issue #81. Its write rule is already enforced, though,
+and it is the spec's own kind rather than the operator's optimism — a PUT that
+sets it `true` on a spec whose **effective** type (the explicit `type`, else
+detected from `binary`) is not `llama_cpp`/`vllm` is refused with **400**,
+never 409, because the document always carries the type it is judged against;
+a PUT that omits it on such a type clears any stored `true`. **No operator
+control for it ships in this cut either** — the value is reachable through the
+API only, and a visible toggle that did nothing would be worse than the blank
+cell it promises to fix.
 **Snapshot, not inheritance:** opening the **create** form pre-fills the three
 fields from the parent application's *current* values (`openCreate` in
 `RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/

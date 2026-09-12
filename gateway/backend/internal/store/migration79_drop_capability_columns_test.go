@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"op-ai-gateway/internal/routing"
 	"path/filepath"
 	"slices"
@@ -32,41 +33,77 @@ var droppedCapabilityColumns = []string{
 	"live_progress_support", "live_progress_checked_at",
 }
 
-// tableColumnTypes reads a table's column names AND declared types from the
-// database itself, per dialect: sqlite's pragma_table_info exposes both in
-// one row (name, type), postgres' information_schema.columns calls them
-// column_name/data_type. Reading the LIVE schema rather than the migration
-// source is the point -- a migration that silently did nothing, or added a
-// column with the wrong type, would still leave the source looking correct.
+// tableColumnDecls reads a table's column names AND their full declared
+// shape from the database itself, per dialect: sqlite's pragma_table_info
+// exposes name/type/notnull/dflt_value in one row, postgres'
+// information_schema.columns calls the same four
+// column_name/data_type/is_nullable/column_default. Reading the LIVE schema
+// rather than the migration source is the point -- a migration that silently
+// did nothing, or added a column with the wrong shape, would still leave the
+// source looking correct.
+//
+// The shape is the TYPE plus nullability plus default, folded into one string
+// ("integer not null default 0"), because the type alone does not pin what
+// callers actually depend on. That string is NOT dialect-neutral and must not
+// be compared across dialects: SQLite's pragma reports the canonical `INTEGER`
+// for a column declared lowercase, while PostgreSQL's information_schema
+// reports `integer`, so the same real DDL folds to two strings differing only
+// in case. Every caller compares within ONE dialect -- a column against a
+// sibling column, or a fresh install against an upgraded one on the same
+// engine -- which is what makes the fold safe here; a cross-dialect comparison
+// would be exactly the silent case-mismatch this helper exists to catch. A column declared
+// `integer` where the precedent is `integer not null default 0` gives every
+// existing row NULL instead of 0 -- same data_type, and every later Scan of
+// that column behaves differently. The three together are what ADR-005's
+// narrow-vs-wide hazard is really about.
 //
 // Fails loudly (rather than returning a zero value) if a reported type is
-// empty: that would make every type comparison below vacuously "equal"
-// without ever having compared anything.
-func tableColumnTypes(ctx context.Context, t *testing.T, s *SQLStore, table string) map[string]string {
+// empty, or if a nullability flag is a value neither dialect is supposed to
+// produce: either would make the comparisons below vacuously "equal" without
+// ever having compared anything.
+func tableColumnDecls(ctx context.Context, t *testing.T, s *SQLStore, table string) map[string]string {
 	t.Helper()
-	q := `select name, type from pragma_table_info(?)`
+	q := `select name, type, "notnull", dflt_value from pragma_table_info(?)`
 	if s.dl.name() == "postgres" {
-		q = `select column_name, data_type from information_schema.columns
+		q = `select column_name, data_type, is_nullable, column_default from information_schema.columns
 			where table_schema = 'public' and table_name = ?`
 	}
 	rows, err := s.db.QueryContext(ctx, s.dl.rebind(q), table)
 	if err != nil {
-		t.Fatalf("read %s column types: %v", table, err)
+		t.Fatalf("read %s column declarations: %v", table, err)
 	}
 	defer rows.Close()
 	out := make(map[string]string)
 	for rows.Next() {
 		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
-			t.Fatalf("scan %s column type: %v", table, err)
+		// sqlite returns notnull as 0/1 and dflt_value as NULL when there is
+		// no default; postgres returns is_nullable as YES/NO and
+		// column_default as NULL. NullString absorbs both, including the
+		// int64-to-string conversion database/sql does for the sqlite flag.
+		var notNull, dflt sql.NullString
+		if err := rows.Scan(&name, &typ, &notNull, &dflt); err != nil {
+			t.Fatalf("scan %s column declaration: %v", table, err)
 		}
 		if typ == "" {
 			t.Fatalf("%s.%s reported an empty type -- the query is reading the wrong column, or the driver is not returning one", table, name)
 		}
-		out[name] = typ
+		var nullability string
+		switch notNull.String {
+		case "1", "NO":
+			nullability = "not null"
+		case "0", "YES":
+			nullability = "null"
+		default:
+			t.Fatalf("%s.%s reported nullability %q, which is neither sqlite's 0/1 nor postgres' YES/NO -- the query is reading the wrong column", table, name, notNull.String)
+		}
+		def := "(no default)"
+		if dflt.Valid {
+			def = "default " + dflt.String
+		}
+		out[name] = typ + " " + nullability + " " + def
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate %s column types: %v", table, err)
+		t.Fatalf("iterate %s column declarations: %v", table, err)
 	}
 	if len(out) == 0 {
 		t.Fatalf("%s reported no columns at all -- does the table exist?", table)
@@ -74,12 +111,12 @@ func tableColumnTypes(ctx context.Context, t *testing.T, s *SQLStore, table stri
 	return out
 }
 
-// sortedColumnNames is tableColumnTypes' name-only view, sorted -- what most
+// sortedColumnNames is tableColumnDecls' name-only view, sorted -- what most
 // callers below actually want (they only care whether a column is present,
-// not what type it has).
-func sortedColumnNames(types map[string]string) []string {
-	out := make([]string, 0, len(types))
-	for name := range types {
+// not what shape it has).
+func sortedColumnNames(decls map[string]string) []string {
+	out := make([]string, 0, len(decls))
+	for name := range decls {
 		out = append(out, name)
 	}
 	slices.Sort(out)
@@ -87,10 +124,10 @@ func sortedColumnNames(types map[string]string) []string {
 }
 
 // tableColumns reads a table's column names from the database itself, sorted.
-// See tableColumnTypes for how, and for the type-level view of the same read.
+// See tableColumnDecls for how, and for the shape-level view of the same read.
 func tableColumns(ctx context.Context, t *testing.T, s *SQLStore, table string) []string {
 	t.Helper()
-	return sortedColumnNames(tableColumnTypes(ctx, t, s, table))
+	return sortedColumnNames(tableColumnDecls(ctx, t, s, table))
 }
 
 // TestMigration79DropsTheElevenCapabilityColumns is this task's central
@@ -135,13 +172,14 @@ func TestMigration79KeepsTheBenchmarkHistoryColumn(t *testing.T) {
 // between 78 and 79: 78 READS the eleven columns to backfill from them, 79
 // drops them. A fresh install replays both against an empty table; an
 // upgraded database replays them against real rows. Both must land on the
-// same model_mappings SHAPE -- same column names AND same column types, not
-// merely the same names -- and the upgrade must still be carrying the rows
-// 78 backfilled, which is the half a drop could silently undo. The type
-// comparison is what would catch a future migration whose ALTER lands on a
-// different type than the baseline CREATE would have (ADR-005's narrow-vs-
-// wide column type hazard); a name-only comparison passes silently through
-// that class of bug.
+// same model_mappings SHAPE -- same column names AND same declared shape
+// (type, nullability, default), not merely the same names -- and the upgrade
+// must still be carrying the rows 78 backfilled, which is the half a drop
+// could silently undo. The shape comparison is what would catch a future
+// migration whose ALTER lands on a different declaration than the baseline
+// CREATE would have (ADR-005's narrow-vs-wide column type hazard, and the
+// nullable-with-no-default variant of it); a name-only comparison passes
+// silently through that class of bug.
 //
 // FRESH runs FIRST, UPGRADE second, and that order is deliberate rather than
 // incidental: forEachDialect already leaves s freshly migrated end-to-end, so
@@ -160,7 +198,7 @@ func TestMigration79FreshInstallMatchesUpgradedSchema(t *testing.T) {
 
 		// FRESH first, while s is still exactly what forEachDialect left it
 		// as: the full ledger applied to an empty database.
-		freshTypes := tableColumnTypes(ctx, t, s, "model_mappings")
+		freshDecls := tableColumnDecls(ctx, t, s, "model_mappings")
 
 		// UPGRADE second: rebuild a genuine pre-78 shape (the last version
 		// that still has the columns), write a mapping whose legacy columns
@@ -205,22 +243,22 @@ func TestMigration79FreshInstallMatchesUpgradedSchema(t *testing.T) {
 				t.Fatalf("the %s row 78 backfilled did not survive 79: %+v", capability, got)
 			}
 		}
-		upgradedTypes := tableColumnTypes(ctx, t, upgrade, "model_mappings")
+		upgradedDecls := tableColumnDecls(ctx, t, upgrade, "model_mappings")
 
-		fresh := sortedColumnNames(freshTypes)
-		upgraded := sortedColumnNames(upgradedTypes)
+		fresh := sortedColumnNames(freshDecls)
+		upgraded := sortedColumnNames(upgradedDecls)
 		if !slices.Equal(fresh, upgraded) {
 			t.Fatalf("fresh install and upgrade disagree on model_mappings columns:\n fresh    = %v\n upgraded = %v", fresh, upgraded)
 		}
 		// Same names is not the same shape: a column that survived under the
-		// same name but landed on a different declared type (a narrower
-		// integer, a different timestamp precision, ...) would pass the
-		// check above silently. Compare WITHIN this dialect only -- fresh
-		// and upgraded are always the same dialect here, so no cross-dialect
-		// type-name normalisation is needed.
+		// same name but landed on a different declaration (a narrower
+		// integer, a different timestamp precision, a lost NOT NULL or
+		// default, ...) would pass the check above silently. Compare WITHIN
+		// this dialect only -- fresh and upgraded are always the same dialect
+		// here, so no cross-dialect normalisation is needed.
 		for _, name := range upgraded {
-			if freshTypes[name] != upgradedTypes[name] {
-				t.Fatalf("fresh install and upgrade disagree on the type of model_mappings.%s: fresh = %q, upgraded = %q", name, freshTypes[name], upgradedTypes[name])
+			if freshDecls[name] != upgradedDecls[name] {
+				t.Fatalf("fresh install and upgrade disagree on the declaration of model_mappings.%s: fresh = %q, upgraded = %q", name, freshDecls[name], upgradedDecls[name])
 			}
 		}
 	})
