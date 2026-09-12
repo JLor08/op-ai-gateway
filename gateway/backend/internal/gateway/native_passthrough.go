@@ -302,6 +302,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// request is not.
 	upstreamBody := rewriteModelField(raw, target.ProviderModel)
 
+	// The operator's opt-in, applied as a SECOND, separate edit rather than
+	// folded into the rewrite above. rewriteModelField returns the client's own
+	// slice unchanged from three no-op branches, and one of them -- a provider
+	// model that already equals the body's model -- is an ordinary
+	// configuration the portal's application auto-sync produces, so an
+	// injection placed inside that helper would silently never fire for those
+	// mappings.
+	//
+	// The argument order matters: the injection runs over the REWRITTEN body,
+	// so a request that needs both edits gets both. Both helpers return a fresh
+	// slice when they change anything and the original otherwise, so `raw` --
+	// still read further down to build the payload capture, and handed to the
+	// HTTP transport as `upstreamBody` while the request is in flight -- is
+	// never written to.
+	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) {
+		upstreamBody, _ = injectTimingsPerToken(upstreamBody)
+	}
+
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
 	// activity for `idle`), a buffered completion uses a total timeout. Both cancel
 	// the upstream request context.
