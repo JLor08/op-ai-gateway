@@ -316,8 +316,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// still read further down to build the payload capture, and handed to the
 	// HTTP transport as `upstreamBody` while the request is in flight -- is
 	// never written to.
+	// injectedLiveTimings is false for a request the gate refused AND for one
+	// whose client already sent the key -- two different reasons for a panel
+	// cell that stays blank with the switch on, which is why it is recorded
+	// from the helper's own answer rather than inferred from the gate.
+	injectedLiveTimings := false
 	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) {
-		upstreamBody, _ = injectTimingsPerToken(upstreamBody)
+		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
 	}
 
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
@@ -358,7 +363,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: serverName, ServerID: target.ServerID, Model: pfReq.Model, RequestedModel: pfReq.RequestedModel, APIFlavor: pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
-	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID)
+	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID, "timings_per_token_injected", injectedLiveTimings)
 
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	ctx = s.upstreamAuthCtx(ctx, target)

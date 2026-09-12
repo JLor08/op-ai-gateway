@@ -302,3 +302,71 @@ func TestPassthroughResponsesDoesNotInjectTimingsWhenTheGateRefuses(t *testing.T
 		})
 	}
 }
+
+// TestPassthroughNativeDebugLineRecordsTheInjection pins spec D9, whose whole
+// purpose is to close a gap the other deferrals leave open together. The
+// payload capture deliberately keeps recording the CLIENT's bytes, so an
+// operator opening a 400 from a flagged request sees a body that would NOT have
+// earned that 400, with nothing anywhere saying the gateway added a key. The
+// per-request debug line is that "anywhere".
+//
+// The field is asserted in BOTH directions on purpose. A field emitted only when
+// true is indistinguishable, to an operator grepping a log, from a build that
+// never had the field -- and the false cases are the ones they are actually
+// debugging: "the switch is on and the panel is still blank, did the gateway
+// ask?". The client-already-sent-it row is the sharpest of those, because the
+// gate said yes and the key still was not added.
+func TestPassthroughNativeDebugLineRecordsTheInjection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed liveTimingsSeed
+		body string
+		want bool
+	}{
+		{
+			name: "the gate allowed and the key was added",
+			seed: llamaCppOptedIn(),
+			body: liveTimingsStreamBody,
+			want: true,
+		},
+		{
+			name: "the client had already sent the key, so nothing was added",
+			seed: llamaCppOptedIn(),
+			body: `{"model":"gw-model","stream":true,"input":"hi","timings_per_token":false}`,
+			want: false,
+		},
+		{
+			name: "the operator never switched it on",
+			seed: liveTimingsSeed{appType: routing.ProviderLlamaCPP},
+			body: liveTimingsStreamBody,
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			defer restore()
+			prov := &recordingProxyProvider{respBody: terminalOnlyResponsesStream}
+			srv := newLiveTimingsTestServer(t, prov, tc.seed)
+
+			postPassthrough(t, srv, prov, "/v1/responses", tc.body)
+
+			found := false
+			for _, rec := range buf.Snapshot() {
+				if rec.Msg != "inference request (native passthrough)" {
+					continue
+				}
+				found = true
+				got, ok := rec.Attrs["timings_per_token_injected"]
+				if !ok {
+					t.Fatalf("the per-request debug line carries no timings_per_token_injected field: attrs = %+v", rec.Attrs)
+				}
+				if got != tc.want {
+					t.Fatalf("timings_per_token_injected = %#v, want %v", got, tc.want)
+				}
+			}
+			if !found {
+				t.Fatalf("no %q debug record was emitted at all", "inference request (native passthrough)")
+			}
+		})
+	}
+}
