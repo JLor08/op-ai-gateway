@@ -143,7 +143,12 @@ Inject when **all** of:
    `"server_agent"`;
 3. the request is the Responses flavor;
 4. the request is streaming;
-5. and the stored live-progress verdict is **not** an explicit negative.
+5. and the stored live-progress verdict is **not** an explicit negative —
+   spelled `"unsupported"` on the target, which is what the one producer emits;
+   a veto written against the capability row's own `"no"` would never fire.
+
+Condition 3 must take the **fine** flavor as a parameter. `Target.APIFlavor` is
+the coarse one and cannot tell `/v1/responses` from `/v1/chat/completions`.
 
 Point 5 is a veto, not a requirement. Requiring a positive verdict would make
 the switch silently dead wherever the capability probe never ran, which is the
@@ -216,9 +221,24 @@ and the limiter. A separately named field is safe even though the shared merge
 writes it into the accumulator too, because the usage event is assembled
 field-by-field.
 
+**No new wire field.** The live-progress DTO already carries an output-token
+count, populated by the same mechanism for `anthropic_messages`; publishing
+`predicted_n` through the live-progress path fills it by construction. The panel
+column renders that existing field. The carrier constraint above is about the
+scanner's usage struct, which is a different value on a different path.
+
 The panel gains a live output-tokens column, **default-hidden**. Default-visible
-would break six existing frontend assertions by ambiguity; hidden keeps them all
-green and lets an operator opt in.
+would break six existing frontend assertions by ambiguity — they sit in five
+test cases, two sharing one — while hidden keeps them all green.
+
+**Accepted consequence:** giving a Responses row an exact mid-stream count makes
+a `gateway`-labelled mid-stream rate reachable on that flavor for the first
+time, because the upstream rate series opens at `0.0` and only a positive rate
+is stored, so the earliest timings-bearing partials carry a count and no rate.
+This is accepted and pinned by a test rather than suppressed: the structural
+invariant is that a gateway-derived rate is only ever computed over an exact
+upstream count, and `predicted_n` is exactly that. Suppressing it would mean
+inventing a per-flavor exception inside the one derivation this feature has.
 
 ### D5 — An explicit client `false` is honoured
 
@@ -354,6 +374,18 @@ model rewrite.
 **Set 3 — the "no mid-stream source" claim** (three sites, two of them test
 comments): that the Responses partials carry no usage at all, and that a
 mid-stream rate exists only when the client asked. D4 makes both false.
+
+**Set 4 — the "nothing reads the resolved flag" family**, six members written
+by part 1: three in `internal/routing` (the target field's doc comment, the
+precedence test's "this test is the whole of the field's current contract", and
+the capable-kind predicate's "nothing about it belongs to the request path"),
+falsified by the gate; and three in the canonical documents, falsified by the
+injection. Every one of the latter three also says "and nothing retries without
+it", which D3 keeps **true** — so those sentences are edited, not deleted.
+
+Note that Set 3's per-flavor table cell carries a second false clause beside the
+one about mid-stream counts: the same cell says the gateway derives no rate on
+this flavor, which D4's accepted consequence retires.
 
 Also expiring with this cut: part 1's recorded reason for shipping no control —
 *a visible toggle that did nothing would be worse than the blank cell it
