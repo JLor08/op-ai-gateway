@@ -97,6 +97,11 @@ export interface RuntimeSpec {
   api_flavors: string[];
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;
+  // This spec's OWN live-timings opt-in (not inherited from the parent
+  // application, and it is the spec's copy that wins for a server_agent
+  // model). Always present on read; on the request shape below it is optional
+  // and that is load-bearing -- see PutRuntimeSpecRequest.
+  responses_live_timings_enabled: boolean;
   // Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
   // "tgi" | "ollama" | "custom"); "" means auto-detect from `binary` --
   // `effective_type` below is what that resolves to. Mirrors the Go
@@ -140,12 +145,23 @@ export type PutRuntimeSpecRequest = Omit<
   | 'effective_type'
   | 'resolved_metrics_path'
   | 'resolved_context_probe_path'
+  | 'responses_live_timings_enabled'
 > & {
   // Write-only: undefined/absent or null = keep the stored token; '' = clear;
   // a value = replace-and-seal (set mode).
   api_token?: string | null;
   // Force regeneration of the random-mode token on save.
   api_token_rotate?: boolean;
+  // OPTIONAL, and excluded from the Omit above for exactly that reason rather
+  // than as a tidy-up. The Go field is a *bool with omitempty, and nil there
+  // means "no opinion": a FIRST write then takes the effective kind's own
+  // default and a later save keeps the stored value. Inherited through Omit
+  // it would arrive here as RuntimeSpec's REQUIRED boolean, every caller
+  // would have to state an opinion it may not have, and the third state part
+  // 1 built would be gone. An explicit true whose effective kind is not
+  // llama_cpp is refused with 400 runtime_spec.responses_live_timings_unsupported
+  // and fails the whole upsert.
+  responses_live_timings_enabled?: boolean;
 };
 
 // An application's allowed co-residency pairs (its own mappings only), each

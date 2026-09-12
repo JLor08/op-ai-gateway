@@ -214,6 +214,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
     context_probe_path: '',
@@ -534,6 +535,14 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // writable. type/metrics_path/context_probe_path (the writable trio) DO
   // belong in `rest`: an override must preserve them unchanged, exactly like
   // every other field this full-document PUT carries verbatim.
+  //
+  // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
+  // writable, but on the request shape it is OPTIONAL, and absent means "keep
+  // the stored value". Dropping it is therefore exactly what an override
+  // click wants -- and it is also the only safe thing to send, because the
+  // store is policy-free by design and a stored true can outlive a retype to
+  // an incapable kind; restating such a pair would earn a 400 and turn a
+  // Start/Stop/Clear click into a failed write.
   const {
     configured,
     id,
@@ -544,6 +553,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     effective_type,
     resolved_metrics_path,
     resolved_context_probe_path,
+    responses_live_timings_enabled,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
