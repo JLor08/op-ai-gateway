@@ -124,6 +124,7 @@ describe('running-connections (active requests) i18n keys', () => {
       'activityActiveEmpty',
       'activityActiveElapsed',
       'activityActiveSession',
+      'activityColLiveOutputTokens',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ActiveRequestsPanel } from './ActiveRequestsPanel';
 import { messages } from '../i18n';
@@ -376,5 +376,101 @@ describe('ActiveRequestsPanel native-passthrough row shapes', () => {
     // 0. A bare '0' is not — no visible column of this panel renders it in any state —
     // so the two em-dash assertions above are what pin the live cells.
     expect(within(row).queryByRole('cell', { name: '0 ms' })).not.toBeInTheDocument();
+  });
+});
+
+// The live output-tokens column. It renders the DTO field the panel has carried
+// since the passthrough bridge (`output_tokens`, already populated for
+// anthropic_messages) -- there is no new wire field and no new type member here,
+// only a column that shows one.
+describe('ActiveRequestsPanel live output-tokens column', () => {
+  it('stays hidden by default and is offered in the column menu', async () => {
+    render(
+      <ActiveRequestsPanel
+        t={t}
+        active={[makeActive({ output_tokens: 12 })]}
+        effectiveScope="own"
+      />,
+    );
+
+    // Hidden by default, and deliberately so. This panel renders a
+    // never-measured metric as the shared em-dash, and output_tokens is 0 -- "the
+    // upstream reported none" -- on most rows, so a visible count column would put
+    // a SECOND em-dash cell on those rows and make five of this file's existing
+    // cases ambiguous: getByRole('cell', { name: '—' }) and getByText('—') both
+    // throw on more than one match, and the failure ("Found multiple elements")
+    // invites the wrong repair -- loosening the query, which would retire the
+    // invariant that a measured zero never renders as "0".
+    expect(screen.queryByRole('columnheader', { name: t.activityColLiveOutputTokens })).toBeNull();
+
+    // Hidden is not the same as absent: the operator who wants the count must be
+    // able to switch it on, so the column menu has to offer it, unticked.
+    fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
+    const entry = await screen.findByRole('checkbox', {
+      name: t.activityColLiveOutputTokens,
+    });
+    expect(entry).not.toBeChecked();
+  });
+
+  it('shows the upstream count when switched on, and a zero as the shared em-dash', () => {
+    // ListTable persists column visibility at `table.<storageKey>.hidden`,
+    // mirrored to localStorage at `op.pref.` + key; an EMPTY hidden set is the
+    // state of an operator who has switched every optional column on. Seeded
+    // rather than clicked because an open MUI column menu is a Modal that
+    // aria-hides the rest of the page, and getByRole skips an aria-hidden
+    // subtree -- the row queries below would find nothing. vitest.setup.ts
+    // clears localStorage after every test, so this leaks into none of them.
+    window.localStorage.setItem('op.pref.table.op.activeRequests.hidden', JSON.stringify([]));
+    render(
+      <ActiveRequestsPanel
+        t={t}
+        active={[
+          // A mid-stream openai_responses passthrough row: the count is
+          // llama.cpp's own timings.predicted_n off a partial frame, and the rate
+          // is derived over that exact count because the same partial reported no
+          // rate of its own (the measured predicted_per_second series opens at
+          // 0.0). Pinned backend-side by
+          // TestPassthroughResponsesPartialPredictedNDecidesTheMidStreamCount
+          // (passthrough_progress_test.go); asserted here only as a row shape.
+          makeActive({
+            id: 'act_live_count',
+            api_flavor: 'openai_responses',
+            req_path: '/v1/responses',
+            provider_path: '/v1/responses',
+            ttft_ms: 640,
+            output_tokens: 12,
+            tokens_per_second: 24.0,
+            tokens_per_second_source: 'gateway',
+          }),
+          // The same flavor before any timings-bearing partial arrived. 0 means
+          // "the upstream reported none", which is not a measurement of zero
+          // tokens, so the cell must read as the shared em-dash.
+          makeActive({
+            id: 'act_no_count',
+            model: 'live-model-2',
+            api_flavor: 'openai_responses',
+            req_path: '/v1/responses',
+            provider_path: '/v1/responses',
+            ttft_ms: 640,
+            output_tokens: 0,
+          }),
+        ]}
+        effectiveScope="own"
+      />,
+    );
+
+    // Addressed by column index rather than by cell text: with every optional
+    // column on, several cells in these rows are em-dashes, so a text query could
+    // be satisfied by the wrong one. ListTable renders header and body cells from
+    // the same visible-column list, so the index is shared.
+    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+    const countIndex = headers.findIndex((h) => h.includes(t.activityColLiveOutputTokens));
+    expect(countIndex).toBeGreaterThanOrEqual(0);
+
+    const countRow = screen.getByRole('cell', { name: 'live-model' }).closest('tr')!;
+    expect(within(countRow).getAllByRole('cell')[countIndex].textContent).toBe('12');
+
+    const noneRow = screen.getByRole('cell', { name: 'live-model-2' }).closest('tr')!;
+    expect(within(noneRow).getAllByRole('cell')[countIndex].textContent).toBe('—');
   });
 });

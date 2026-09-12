@@ -215,6 +215,25 @@ export function ActiveRequestsPanel({
       numeric: true,
       render: (a) => <span title={liveTpsTitle(t, a)}>{formatLiveTps(a.tokens_per_second)}</span>,
     },
+    // Optional (hidden by default): the upstream's own cumulative count of tokens
+    // GENERATED so far. Hidden because a 0 here means "the upstream reported
+    // none", which this panel renders as the shared never-measured em-dash -- and
+    // a second em-dash column on every unmeasured row makes the row-scoped
+    // em-dash queries in this panel's tests ambiguous rather than wrong, which is
+    // the kind of failure that gets "fixed" by loosening the query.
+    //
+    // formatMetric is what supplies that em-dash, and it doubles as the sort
+    // accessor: '—' is not a number, so ListTable's `numeric` sort sinks an
+    // unreported count in BOTH directions instead of ranking it as the smallest
+    // real value.
+    {
+      id: 'output_tokens',
+      label: t.activityColLiveOutputTokens,
+      value: (a) => formatMetric(a.output_tokens, 0),
+      searchable: false,
+      numeric: true,
+      defaultHidden: true,
+    },
     {
       id: 'ttft',
       label: t.activityColTTFT,
