@@ -1668,7 +1668,9 @@ injected. Nothing calls it yet — the gate and the call site are a later task.
 2. Do not edit the long comment block directly above
    `upstreamBody := rewriteModelField(raw, target.ProviderModel)` (lines 282-302
    today), which still states that the gateway does not add `timings_per_token`.
-   It is one of nine sites rewritten together by the documentation task; editing
+   It is one of nine coupled sites; THIS block belongs to Task 4 (steps 9a/9b),
+   not to the documentation task -- see Task 8's own table, which marks both
+   `proxyNative` comments "Task 4 -- do not touch". Editing
    it here would leave the other eight contradicting it.
 
 **Why a separate function instead of extending `rewriteModelField`.**
