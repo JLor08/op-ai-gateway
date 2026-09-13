@@ -132,8 +132,9 @@ want a chat run to inherit a *specific stored API token's* limits, model
 overrides, project attribution, or server pin instead of the session's
 defaults. `X-OP-Run-As-Token` carries that token's **ID** (not its secret —
 the caller is already a CSRF-protected authenticated session, so this header
-is a capability *selector*, not a credential) on requests to
-`/openai/v1/chat/completions`.
+is a capability *selector*, not a credential) on chat-completions requests —
+those handled by `handleOpenAIChat`, reached via both `/v1/chat/completions`
+(the path the loopback run executor actually posts to) and its `/openai/` alias.
 
 `portal.Service.AuthorizeRunAsToken(ctx, principal, tokenID)` is the sole
 authorization point:

@@ -661,9 +661,9 @@ The persistent chat feature (`gateway/frontend/src/components/chat/ChatStore.tsx
 backend `internal/gateway/chat_runs.go`) does not call `/v1/chat/completions`
 from the browser. Instead:
 
-1. The frontend `POST`s to `/api/portal/chats/{id}` (portal session, cookie +
-   `X-OP-CSRF`) to start/edit a run, then opens an `EventSource` on
-   `/api/portal/chats/{id}/runs/{runId}/events` for live deltas.
+1. The frontend `POST`s to `/api/portal/chats/{id}/runs` (portal session, cookie
+   + `X-OP-CSRF`; handler `chat_run_endpoints.go`) to start a run, then opens an
+   `EventSource` on `/api/portal/chats/{id}/runs/{runId}/events` for live deltas.
 2. The gateway's own background run executor (`executeRun`,
    `internal/gateway/chat_runs.go`) makes a **loopback** `POST` to its own
    `/v1/chat/completions`, authenticating via the internal trusted-loopback
@@ -673,10 +673,14 @@ from the browser. Instead:
    `X-OP-CSRF` header a direct browser call would need.
 3. `/v1/chat/completions` is the one inference endpoint reachable through this
    session-authenticated path at all (`requireWebAnyScope` →
-   `authenticateWeb`) — `/v1/responses` and `/v1/messages` are bearer-only
-   (`requireAnyScope`) precisely because they carry `server_override` and
-   run-as headers that only the gateway's own loopback caller is trusted to
-   set (`applyServerOverride`'s doc comment, `internal/gateway/inference_handlers.go`).
+   `authenticateWeb`); `/v1/responses` and `/v1/messages` authenticate as
+   **bearer-only** (`requireAnyScope` → `authenticate` → `LookupBearer`, which
+   always yields a populated token id). That is a property of their auth wiring,
+   not of the headers they carry: the run-as header (`X-OP-Run-As-Token`) is
+   honoured only in `handleOpenAIChat` — the chat-completions path — so it does
+   not reach those two at all, and `applyServerOverride` runs from
+   `inferencePreflight` (`internal/gateway/inference_handlers.go`), which **all
+   three** flavors call, so `server_override` is not distinctive of them either.
 4. The executor relays the resulting SSE deltas into the chat's own live-run
    state, which the browser's `EventSource` streams to the UI — the browser
    itself never opens a fetch stream.
