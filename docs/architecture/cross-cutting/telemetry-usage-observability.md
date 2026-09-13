@@ -264,7 +264,8 @@ evidence is not stamped on a failed write:
   [Agent-Managed Model Runtime
   §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
   for when each is filled), `metrics_probe`/`context_probe` (each a `string`,
-  exactly one of `ok`/`unreachable`/`na`, or `""` when not reported — the
+  one of `ok`/`unreachable`/`na` (`context_probe` additionally `router` for a
+  llama.cpp multi-model router server, issue #55), or `""` when not reported — the
   reachability of the endpoint each numeric field above came from, so a
   forgotten `--metrics` flag or a genuinely unsupported endpoint is no longer
   indistinguishable from a real, measured `0`; see [Agent-Managed Model

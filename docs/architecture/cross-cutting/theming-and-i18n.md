@@ -214,10 +214,13 @@ compiles, passes type checks, and shows a raw wire string to operators.
 
 Two more surfaces reuse the identical three-class mapping rather than
 inventing a fourth colour: the runtime admin's per-probe "Probes" chips map
-`ok → active/success`, `unreachable → watch`, `na → standby` — `watch` is
-deliberately the only shade available for "configured but currently
-failing", so it must never be reused for "not configured at all" (`na`), or
-a healthy Ollama model with no `/metrics` endpoint would look broken; and
+`ok → active/success`, `unreachable → watch`, and both `na` and `router →
+standby` — `watch` is deliberately the only shade available for "configured
+but currently failing", so it must never be reused for a state that is not a
+fault: neither "not configured at all" (`na`) nor "a llama.cpp router server
+this endpoint cannot answer for" (`router`, issue #55), or a healthy Ollama
+model with no `/metrics` endpoint — and a perfectly good router server — would
+look broken; and
 the Models overview's "Lädt" count chip is a plain `watch` badge, the same
 colour `starting` already carries everywhere else. See [Agent-Managed Model
 Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)

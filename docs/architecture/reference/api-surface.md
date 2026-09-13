@@ -289,8 +289,9 @@ Conventions worth stating, because each is a judgement call a client depends on:
   per-child probe's result (§10 of
   [Agent-Managed Model Runtime](../cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
   and `0`/`""` is their honest pre-probe/unsupported value, not an absence to
-  special-case. `metrics_probe`/`context_probe` are each exactly one of
-  `ok`/`unreachable`/`na`, or `""` when this frame never ran the probe (a
+  special-case. `metrics_probe`/`context_probe` are one of
+  `ok`/`unreachable`/`na` (`context_probe` additionally `router` for a llama.cpp
+  multi-model router server, issue #55), or `""` when this frame never ran the probe (a
   non-running child, or an agent that predates the field) — the
   reachability that says whether the two request-count fields and this
   frame's `context_size` are real measurements or just unprobed zeros. (In

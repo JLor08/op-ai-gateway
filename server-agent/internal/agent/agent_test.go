@@ -1671,6 +1671,52 @@ func TestCollectOnceRuntimeContextCacheInvalidatesOnModelChange(t *testing.T) {
 	}
 }
 
+// TestCollectOnceRuntimeContextRouterModeReported pins issue #55: a llama.cpp
+// server in multi-model ROUTER mode answers GET /props with a dummy carrying
+// "role": "router" and n_ctx 0. Rather than take the non-positive-size exit
+// (recorded as "unreachable", indistinguishable from a broken server), the
+// context probe reports the mode itself as "router", and no size is recorded.
+func TestCollectOnceRuntimeContextRouterModeReported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/props" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"role":"router","model_path":"none","default_generation_settings":{"n_ctx":0}}`))
+	}))
+	defer srv.Close()
+
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:           "rspec_router",
+			Model:            "qwen-coder",
+			State:            runtimectl.StateRunning,
+			PID:              5151,
+			Port:             portFromURL(t, srv.URL),
+			Type:             "llama_cpp",
+			ContextProbePath: "/props",
+		},
+	})
+
+	poster := &capturePoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+
+	a.collectOnce(context.Background())
+	first := poster.first()
+	if first == nil || len(first.Runtimes) != 1 {
+		t.Fatalf("Runtimes = %+v", first)
+	}
+	if got := first.Runtimes[0].ContextProbe; got != "router" {
+		t.Errorf("ContextProbe = %q, want %q (router mode must be distinguishable from unreachable)", got, "router")
+	}
+	if got := first.Runtimes[0].ContextSize; got != 0 {
+		t.Errorf("ContextSize = %d, want 0 (a router dummy's n_ctx is not a measured size)", got)
+	}
+}
+
 // TestCollectOnceRuntimeContextZeroSizeNotCached is FIX 4's proof: a context
 // probe that succeeds but returns a non-positive size (a JSON field present
 // but literally 0) is effectively "unknown" and must NOT be cached as final

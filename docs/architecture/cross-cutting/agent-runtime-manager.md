@@ -800,6 +800,21 @@ invalidation key beside the PID, `Type` and `ContextProbePath`
 at a different model changes which model's context length `/api/show`
 reports, with the same PID throughout.
 
+**`llama_cpp` in multi-model router mode is its own probe state, not a broken
+server (issue #55).** llama.cpp's `llama-server` can run as a multi-model
+router that spawns per-model children; in that shape `GET /props` (no
+`?model=`) answers with a dummy document carrying `"role": "router"` and
+`n_ctx: 0`, and `/metrics` requires `?model=<name>`, answering `400` otherwise.
+The context probe recognizes the `role: "router"` dummy — the same
+discriminator the capability probes already gate on — and reports a distinct
+`context_probe = "router"` (the portal shows its own neutral "Router mode" chip)
+rather than recording that `0` or collapsing it onto `unreachable`. The metrics
+scrape now **rejects any non-2xx reply**: previously it read a `400` body as an
+empty metric set and recorded a plausible idle `active=0/queue=0` with
+`metrics_probe = "ok"`; it now reports `unreachable`, honestly. A router
+server's per-model context and metrics live behind `/v1/models` and
+`/metrics?model=<name>`; probing those per model is separate work (issue #49).
+
 **What the number means did not change, and that was a decision rather than
 an omission.** `/api/show`'s `model_info.<arch>.context_length` is the
 MODEL MAXIMUM and stays the reported figure. Ollama also exposes
@@ -3090,7 +3105,8 @@ misconfigured endpoint) used to fail silently — the scrape errored, the field
 stayed at its zero value, and nothing told the operator the number was fake
 rather than genuinely idle. `probeRuntimeChild` sets `MetricsProbe` and
 `ContextProbe` on the same `RuntimeSample` entry alongside the numeric
-fields, each exactly one of:
+fields, each one of the following (the last, `router`, on the context probe
+only):
 
 - **`na`** — no path is configured for this child at all (`MetricsPath`/
   `ContextProbePath` resolved empty, e.g. Ollama has no Prometheus-style
@@ -3103,6 +3119,13 @@ fields, each exactly one of:
   `ok`: a cached size means a prior probe on this exact process generation
   already succeeded, so it is still an honest "reachable", never a fabricated
   one.
+- **`router`** (context only) — the endpoint answered with a llama.cpp
+  multi-model **router** dummy (`"role": "router"`, `n_ctx` 0), which has no
+  measurable context for the server as a whole. Reported distinctly so a router
+  server is not read as broken (issue #55); its per-model context lives behind
+  `/v1/models`. The metrics probe has no such value — a router server's
+  `/metrics` needs `?model=` and answers `400` to the bare GET, which the scrape
+  now rejects as `unreachable` (previously a false idle `ok`).
 
 Both fields are set only when the numeric fields are — a `StateRunning`
 child with a live port — so a non-running child, or an agent that predates
@@ -3702,11 +3725,12 @@ uses; a probe reported `""` (no running child, or a pre-feature agent)
 renders no chip at all rather than a placeholder, and a row with neither
 chip renders nothing in this column. Colour follows the portal's three-class
 status model exactly — `ok` → the success/green chip, `unreachable` → the
-`watch` chip (the portal's only non-green, non-neutral colour), `na` → the
-neutral `standby` chip — and `na` is deliberately never rendered as a
-warning: an `na` metrics probe means this runtime type genuinely has no
-`/metrics` endpoint (Ollama), and colouring that like `unreachable` would
-make every healthy Ollama model look broken. See [Status
+`watch` chip (the portal's only non-green, non-neutral colour), and both `na`
+and `router` → the neutral `standby` chip — and neither `na` nor `router` is
+ever rendered as a warning: an `na` metrics probe means this runtime type
+genuinely has no `/metrics` endpoint (Ollama), and a `router` context probe
+means a valid llama.cpp multi-model router server (issue #55); colouring
+either like `unreachable` would make a perfectly healthy server look broken. See [Status
 colours](theming-and-i18n.md#9-status-colours-there-are-exactly-three) for
 why `watch`, not a fourth colour, is the only shade available for
 "configured but failing".

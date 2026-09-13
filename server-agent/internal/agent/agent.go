@@ -11,6 +11,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"op-ai-server-agent/internal/certinstall"
@@ -139,7 +140,19 @@ import (
 // to wait for. Note the deliberate asymmetry with
 // runtime_upstream_props' own Since ("0.7.0", unchanged): a Since records
 // the version a feature SHIPPED in, and this bump ships no feature.
-const Version = "0.7.1"
+//
+// 0.7.1 -> 0.7.2 is the single bump for the router-mode probe branch (issue
+// #55): the context probe now reports "router" (a new value on the existing
+// context_probe telemetry field) when a llama.cpp multi-model router answers
+// /props with its role-router dummy, instead of collapsing it onto
+// "unreachable"; and the metrics scrape now rejects a non-2xx reply rather
+// than recording a router server's 400 as an idle active=0/queue=0 "ok".
+// PATCH, and the rule decides it: agent.Features gains no entry. This is a
+// bugfix plus one additional observable value on a field the gateway already
+// passes through untouched -- nothing negotiates on it, and an older agent
+// simply keeps reporting "unreachable" for a router server, the pre-fix
+// behaviour.
+const Version = "0.7.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1147,8 +1160,11 @@ type runtimeCapabilityEntry struct {
 // channel), plus (Task 2) rs.MetricsProbe/rs.ContextProbe: each is exactly
 // one of "ok" (probe succeeded), "unreachable" (a path was configured but
 // the SSRF guard rejected it, the probe errored, or -- context only -- the
-// probe returned a non-positive size), or "na" (no path was configured for
-// this child at all). These make a forgotten runtime flag (e.g. llama.cpp
+// probe returned a non-positive size), "na" (no path was configured for
+// this child at all), or -- context only -- "router" (the endpoint answered
+// with a llama.cpp multi-model router dummy that has no measurable context;
+// issue #55, distinguished so it does not read as a broken server). These
+// make a forgotten runtime flag (e.g. llama.cpp
 // started without --metrics) visible instead of silently reading as an
 // idle 0. client is shared across all children probed this cycle.
 //
@@ -1240,6 +1256,14 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
 	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, st.Model)
 	cancel()
+	if errors.Is(err, collector.ErrRouterMode) {
+		// llama.cpp router mode: /props answered with the router dummy
+		// ("role": "router", n_ctx 0). Report the mode itself rather than
+		// collapse it onto "unreachable", where it would be indistinguishable
+		// from a broken server (issue #55). No size is recorded; the per-model
+		// context lives behind /v1/models with a ?model= selector, not here.
+		return "router"
+	}
 	if err != nil {
 		slog.Debug("runtime context probe failed", "spec_id", st.SpecID, "err", err)
 		return "unreachable"
