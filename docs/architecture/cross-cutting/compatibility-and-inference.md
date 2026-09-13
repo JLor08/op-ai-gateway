@@ -381,8 +381,8 @@ partials carry no usage object, and the terminal `response.completed` frame is
 what finally lands one. With it, those same partials carry llama.cpp's own
 `timings`, and the row gets both an upstream-reported rate and an
 upstream-reported count while the request is still running — the count on a
-column that ships **hidden**, which the operator reveals from that panel's
-column menu. The flag reaches the body either because the **client** set it, in
+column that ships **hidden**, which an operator who has never changed that
+panel's columns reveals from its column menu. The flag reaches the body either because the **client** set it, in
 which case it is relayed untouched, or because the application's (or runtime
 spec's) `responses_live_timings_enabled` opt-in is on and the request is a
 streaming `/v1/responses` passthrough to a `llama_cpp` upstream. A **buffered**

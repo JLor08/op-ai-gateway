@@ -603,16 +603,18 @@ it completes. In the running-connections table `requested_model` and `model` are
 visible by default — matching the completed-requests table — and
 `provider_model` is an opt-in column.
 
-**The live output-token count is the second opt-in column**
-(`Generated (live)`), and it ships **hidden**: on a profile that has never
-changed this panel's columns the count described further down is real, arrives,
-and is invisible until the operator reveals it from the panel's column menu.
-That default binds only a profile with nothing stored for this panel — an
-operator who has ever hidden or shown a column here carries a stored list that
-cannot mention a column added after it, and therefore sees this one already
-visible, appended at the end of the row rather than in catalogue position.
-Column settings are per user profile, so two operators on one gateway can
-legitimately see different panels, and the menu's reset restores both defaults.
+**The live output-token count is an opt-in column too**
+(`Generated (live)`), one of the six this panel ships hidden: on a profile that
+has never changed its columns the count described further down is real, arrives,
+and is invisible until the operator reveals it from the column menu. Two stored
+preferences bypass that default, and they are independent. A stored HIDDEN
+SET — written by hiding or showing any column here — cannot mention a column
+added after it, so such an operator sees this one already **visible**, in its
+catalogue position between the live rate and TTFT. A stored ORDER — written
+only by reordering, or by a reset performed before this column existed — is
+the one that puts a later column at the END of the row. Column settings are
+per user profile, so two operators on one gateway can legitimately see
+different panels, and the menu's reset restores both defaults.
 
 **Live tokens/sec and TTFT.** Two more values ride the same `ActiveRequest`: a
 per-request output-tokens/sec figure and a time-to-first-token (TTFT), both
