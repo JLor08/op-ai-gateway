@@ -309,6 +309,48 @@ func TestUsageScannerFinishRecoversUnterminatedFinalLine(t *testing.T) {
 	}
 }
 
+// TestUsageScannerBufferedBodyUsageSurvivesPrettyPrinting pins issue #78: a
+// buffered (non-streaming) native-passthrough body must yield its usage no
+// matter how the JSON is whitespace-formatted. The pretty-printed body whose
+// last newline falls BEFORE its closing brace is the case that regressed — feed
+// split there, handing jsonPayloads a truncated, unparseable fragment, so ALL
+// of the response's usage was lost (in=0 out=0 total=0). That zeroed both the
+// persisted usage row AND the token budget the request consumed, invisibly,
+// because the request itself still succeeded.
+//
+// The two already-working rows are kept deliberately: a compact body has no
+// newline (feed scans nothing, finish scans the intact body) and a pretty body
+// WITH a trailing newline puts the split point after the closing brace. They
+// are the two shapes the code was designed around, which is what makes the
+// pretty-no-trailing-newline body a gap rather than a design choice — so a fix
+// must keep all three green. All three call finish before reading usage,
+// matching the real caller (nativeCopier.run defers finish before usage()).
+func TestUsageScannerBufferedBodyUsageSurvivesPrettyPrinting(t *testing.T) {
+	const prettyNoNL = `{
+  "id": "resp_1",
+  "usage": {"input_tokens": 5, "output_tokens": 9, "total_tokens": 14}
+}`
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"pretty, no trailing newline", prettyNoNL},
+		{"pretty, with trailing newline", prettyNoNL + "\n"},
+		{"compact, no newline at all", `{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":9,"total_tokens":14}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
+			now := time.Now()
+			s.feed([]byte(tc.body), now)
+			s.finish(now)
+			if u := s.usage(); u.InputTokens != 5 || u.OutputTokens != 9 || u.TotalTokens != 14 {
+				t.Fatalf("usage = %+v, want input=5 output=9 total=14", u)
+			}
+		})
+	}
+}
+
 // TestUsageScannerTotalTokensAcrossSplitFrames proves the deferred-finalize
 // design in mergePassthroughUsage/finalizeTotalTokens: Anthropic reports input
 // tokens on message_start and output tokens on a LATER, separate message_delta

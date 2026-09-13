@@ -365,7 +365,18 @@ counts out of the response's bytes as they are copied to the client, per-flavor
 Anthropic, folded back into the OpenAI-canonical `InputTokens`). That is its own
 incremental scan rather than a single pass over the capture tee's capped buffer,
 which used to drop even the terminal count on a response longer than
-`captureMaxBytes`.
+`captureMaxBytes`. The scan splits a line-delimited SSE stream into frames (so
+counts max-merge across `message_start`/`message_delta` and the live column is
+fed per frame) but treats a **buffered** body as one JSON value — held whole and
+scanned once at end-of-copy — because its interior newlines are formatting, not
+frame boundaries. The two shapes are told apart by the body's first
+non-whitespace byte (`{`/`[` for a buffered value; an SSE frame opens with a
+field name or `:` comment, never a brace). A buffered body's usage is therefore
+recovered regardless of whitespace formatting — compact, or pretty-printed with
+interior newlines, with or without a trailing newline; splitting such a body at
+an interior newline previously handed the parser a truncated fragment and lost
+**all** of its usage, zeroing both the persisted row and the token budget the
+request consumed while the request itself still succeeded.
 
 **The panel's live figures are no longer part of the trade-off — except where
 the wire cannot honestly supply them.** Choosing `passthrough` used to cost the
