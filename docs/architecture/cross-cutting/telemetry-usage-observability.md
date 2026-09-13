@@ -1606,13 +1606,16 @@ stale *positive* would send the parameters to an upstream that answers 400 —
 the dead stream this design exists to eliminate. There is therefore no
 positive entry that could go stale.
 
-**Native passthrough gets neither parameter — and gets the live figures its own
-relayed frames can support, which is not the same statement.** `proxyNative`
-forwards the client's own body unmodified (only the `model` field is ever
-rewritten, and losslessly), so neither parameter is ever added on this path;
-`timings_per_token` is read when the client set it and never injected, which is
-a decision with its own reasons rather than an omission (see "Two rules on this
-path must survive any later change" above). A **buffered** passthrough request
+**Native passthrough gets neither of `CompleteStream`'s parameters — and gets the
+live figures its own relayed frames can support, which is not the same
+statement.** `stream_options.continuous_usage_stats` is never added on this path
+at all, and `timings_per_token` is added only under the operator's per-endpoint
+opt-in and the four other conditions the gate applies (see "Two rules on this
+path must survive any later change" above) — never through `wantsLiveProgress`,
+whose verdict describes the *completion* endpoint's parameter schema and which is
+deliberately not reused here. Everything else `proxyNative` forwards is the
+client's own body, with the `model` field losslessly rewritten and nothing else
+touched. A **buffered** passthrough request
 allocates no `Progress` counter for its `ActiveRequest`, and `liveProgressDTO`
 resolves it to "not measured" exactly as it does a non-streaming translated
 call — nil deliberately, not an allocated permanently-zero struct. A
@@ -1662,17 +1665,18 @@ build on that deployment; not a general guarantee about every llama.cpp build,
 and the emit side is one deployment. The figures below come from SEPARATE
 requests, so each bullet says which run it belongs to.
 
-- **The precondition needed no gateway change.** A client that sets
-  `timings_per_token` itself has the flag relayed untouched (the non-injection
-  rule above). Measured **direct to the runtime router**, with the flag set:
+- **The precondition needed no gateway change at the time this was measured.** A
+  client that sets `timings_per_token` itself has the flag relayed untouched, and
+  that is still true — but it is no longer the only way the flag reaches the
+  upstream, since the operator's opt-in injects it under the gate above. Measured **direct to the runtime router**, with the flag set:
   **39 of one 48-frame Responses stream's frames carried a top-level `timings`
   object** — on `response.reasoning_text.delta` and
   `response.output_text.delta` alike. The **same prompt replayed without the
   flag** produced **exactly one** timings-bearing frame: the terminal
   `response.completed`. (A replay, not the same request — a request either
-  carried the flag or it did not.) So the peak is reachable for any client that
-  asks for mid-stream timings, and this substitution is a measured no-op for
-  traffic that does not.
+  carried the flag or it did not.) So the peak is reachable on any request that
+  carries the flag, whoever put it there, and this substitution is a measured
+  no-op only for traffic that carries none.
 - **The defect, end to end through this gateway.** A **second, separate
   request**, this one relayed **through the gateway**: 41 timings-bearing
   frames, whose terminal frame reported `predicted_per_second = 47.389` while
