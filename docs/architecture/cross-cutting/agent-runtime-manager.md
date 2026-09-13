@@ -3751,11 +3751,13 @@ made. **And the request path reads it now:** on a **streaming** `/v1/responses`
 request this spec serves in `passthrough` mode to a `llama_cpp` upstream, the
 gateway adds `"timings_per_token": true` to the body it forwards, which is what
 makes llama.cpp attach a `timings` object to the partial frames and fills the
-running-connections row's live tokens/sec and live output-token count. Five
-conditions gate it — the opt-in itself, the effective kind, the Responses
-flavor, the stream flag, and a recorded live-progress rejection as a veto — and
-**nothing retries without it**, so an upstream that rejects the key answers the
-client's request with its own 4xx ([Telemetry, Usage & Observability
+running-connections row's live tokens/sec and live output-token count — the
+count on a column that ships **hidden**, which an operator who has never changed
+that panel's columns reveals from its column menu. Five conditions gate it — the
+opt-in itself, the effective kind, the Responses flavor, the stream flag, and a
+recorded live-progress rejection as a veto — and **nothing retries without it**,
+so an upstream that rejects the key answers the client's request with its own
+4xx ([Telemetry, Usage & Observability
 §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
 Its write rule is enforced on the spec's own kind rather than the operator's
 optimism — a PUT that sets it `true` on a spec whose **effective** type (the

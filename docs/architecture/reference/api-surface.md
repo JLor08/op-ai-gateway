@@ -542,11 +542,14 @@ Wire notes a client must know:
     timings-bearing partial carries a positive rate — an upstream-reported
     tokens/sec for the whole request, instead of a blank cell. Until that first
     rate arrives the row carries the exact count with a `gateway`-labelled rate
-    derived over it. The stored value is
-    resolved onto the request's routing target spec-over-application, the same
-    precedence `responses_mode` uses. **Five conditions gate the injection and
-    nothing retries without it** — an upstream that rejects the key answers the
-    client's request with its own 4xx ([Telemetry, Usage & Observability
+    derived over it. **The count's column ships hidden**: an operator who has
+    never changed that panel's columns sees the rate cell fill and no count
+    column at all until they reveal `Generated (live)` from the panel's column
+    menu. The stored value is resolved onto the request's routing target
+    spec-over-application, the same precedence `responses_mode` uses. **Five
+    conditions gate the injection and nothing retries without it** — an upstream
+    that rejects the key answers the client's request with its own 4xx
+    ([Telemetry, Usage & Observability
     §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
     A body that already carries `timings_per_token`, `true` **or** `false`, is
     forwarded unchanged, so a client that sends `false` makes the flag
