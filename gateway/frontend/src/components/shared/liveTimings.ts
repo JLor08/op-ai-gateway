@@ -49,9 +49,13 @@ export type LiveTimingsKind = 'capable' | 'incapable' | 'unknown' | 'delegated';
  *
  * The Go map is keyed on the string BOTH vocabularies share
  * (ProviderLlamaCPP == "llama_cpp" == RuntimeSpecTypeLlamaCpp), which is why
- * one list serves an application `type` and a spec `type` alike.
+ * one lookup serves an application `type` and a spec `type` alike.
+ *
+ * A Set, mirroring the Go side's map: every read below is a membership test and
+ * nothing here is ever ordered or indexed. One member is the measurement, not
+ * the data structure -- see the Go file for why vllm left.
  */
-const liveTimingsCapableKinds: readonly string[] = ['llama_cpp'];
+const liveTimingsCapableKinds: ReadonlySet<string> = new Set(['llama_cpp']);
 
 /**
  * The application form's gate: it always knows its own `type`.
@@ -65,7 +69,7 @@ const liveTimingsCapableKinds: readonly string[] = ['llama_cpp'];
  */
 export function applicationLiveTimingsKind(type: ApplicationType): LiveTimingsKind {
   if (type === 'server_agent') return 'delegated';
-  return liveTimingsCapableKinds.includes(type) ? 'capable' : 'incapable';
+  return liveTimingsCapableKinds.has(type) ? 'capable' : 'incapable';
 }
 
 /**
@@ -78,5 +82,5 @@ export function applicationLiveTimingsKind(type: ApplicationType): LiveTimingsKi
  */
 export function runtimeSpecLiveTimingsKind(specType: RuntimeSpec['type']): LiveTimingsKind {
   if (specType === '') return 'unknown';
-  return liveTimingsCapableKinds.includes(specType) ? 'capable' : 'incapable';
+  return liveTimingsCapableKinds.has(specType) ? 'capable' : 'incapable';
 }
