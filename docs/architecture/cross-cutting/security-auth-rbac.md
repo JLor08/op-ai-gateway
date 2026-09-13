@@ -734,7 +734,18 @@ protocol (e.g. Anthropic-shaped in, Chat-Completions-shaped out) — the
 translated *upstream* request headers are redacted with the exact same list,
 so an upstream API key injected by the gateway itself never leaks into a
 capture either; native passthrough has no separate translated headers to
-redact because the client bytes already equal the upstream bytes.
+redact because **nothing upstream-side is captured on that path at all** —
+neither the per-application upstream credential `upstreamAuthCtx` attaches nor
+the upstream request body. The operative guarantee is therefore stronger than a
+redaction rule, and it is worth being precise about what it is not: a
+native-passthrough capture holds the **client's** bytes, which are not the
+upstream's. They differ whenever the model rewrite fires (it re-serializes the
+object, reordering keys and HTML-escaping `<>&`) and, since the Responses
+live-timings opt-in, whenever the gateway adds `timings_per_token` to a
+streaming `/v1/responses` body. That divergence is recorded in the request log
+rather than closed in the capture
+([Telemetry, Usage & Observability
+§8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
 
 Bodies are independently size-capped: `OP_AI_GATEWAY_CAPTURE_MAX_BYTES`
 (default 1 MiB) truncates each individual captured request/response body
