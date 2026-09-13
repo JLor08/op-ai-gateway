@@ -37,9 +37,10 @@ describe('RowActionsCell', () => {
       />,
     );
     const button = screen.getByRole('button', { name: 'Neu starten' });
-    expect(button).toBeDisabled();
-    // Hover the wrapper: a disabled MUI button is pointer-inert.
-    fireEvent.mouseOver(button.parentElement as HTMLElement);
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    // Hover the button directly: aria-disabled (not the inert `disabled`
+    // attribute) leaves it pointer-interactive, so the tooltip fires on it.
+    fireEvent.mouseOver(button);
     expect(await screen.findByRole('tooltip')).toHaveTextContent('Kein Prozess läuft');
   });
 

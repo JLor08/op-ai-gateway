@@ -160,8 +160,8 @@ describe('ChatSidebar', () => {
     const renameButtons = screen.getAllByRole('button', { name: t.chatRename });
     const deleteButtons = screen.getAllByRole('button', { name: t.chatDelete });
     // Row c1 (running) is locked...
-    expect(renameButtons[0]).toBeDisabled();
-    expect(deleteButtons[0]).toBeDisabled();
+    expect(renameButtons[0]).toHaveAttribute('aria-disabled', 'true');
+    expect(deleteButtons[0]).toHaveAttribute('aria-disabled', 'true');
     // ...while row c2 (idle) is still actionable.
     expect(renameButtons[1]).not.toBeDisabled();
     expect(deleteButtons[1]).not.toBeDisabled();

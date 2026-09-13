@@ -215,8 +215,14 @@ describe('UsersView system_admin row actions', () => {
     renderUsersView({ adminUsers: vi.fn(async () => ({ data: [sysAdmin] })) }, false);
     await screen.findByText(sysAdmin.email);
     // Edit + Deactivate (both route through UpdateUser -> ErrForbiddenRole) are not clickable.
-    expect(screen.getByRole('button', { name: t.userActionEdit })).toBeDisabled();
-    expect(screen.getByRole('button', { name: t.userActionDisable })).toBeDisabled();
+    expect(screen.getByRole('button', { name: t.userActionEdit })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+    expect(screen.getByRole('button', { name: t.userActionDisable })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
     // The allowed support ops stay clickable.
     expect(screen.getByRole('button', { name: t.userActionLimits })).toBeEnabled();
     expect(screen.getByRole('button', { name: t.userActionReinvite })).toBeEnabled();
