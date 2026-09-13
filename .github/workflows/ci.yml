@@ -99,3 +99,58 @@ jobs:
         run: npm run build
       - name: Test
         run: npm test
+
+  e2e-runtime:
+    name: E2E (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The agent-managed model runtime is the newest, least-exercised subsystem
+    # and the ONLY suite that crosses a real process boundary: the gateway hands
+    # a launch spec to a real server-agent binary, which exec()s a real child,
+    # an inference routes to it, and the state returns to the portal. A locator
+    # that no longer matches the shipped DOM is exactly the class of defect only
+    # this layer sees -- e2e:runtime was red for three commits once and no gate
+    # noticed (issue #24). This job runs `e2e:runtime` ONLY; the other 19
+    # Playwright suites stay local-only (development-and-quality.md §6).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Every e2e config's webServer builds a Go binary and sets GOCACHE. The
+      # in-repo default is the macOS-only /private/tmp path; the configs fall
+      # back to $GOCACHE when it is set (playwright.*.config.ts), so point it at
+      # a writable path on the runner (Go creates it). Without this the
+      # webServer's `go build` dies with a filesystem error before any test runs.
+      # Set via $GITHUB_ENV so it reaches every later step, including the Node
+      # process whose process.env the configs read. RUNNER_TEMP is a default env
+      # var; the `runner` context is NOT available in a job-level `env:`.
+      - name: Point GOCACHE at a writable path
+        run: echo "GOCACHE=$RUNNER_TEMP/op-e2e-go-build" >> "$GITHUB_ENV"
+      # The frontend deps are for the suite's own webServer, which runs
+      # `npm run build && npm run preview` to serve the real portal it tests.
+      - name: Install frontend dependencies
+        working-directory: gateway/frontend
+        run: npm ci
+      - name: Install e2e dependencies
+        working-directory: gateway/e2e
+        run: npm ci
+      - name: Install the Playwright browser
+        working-directory: gateway/e2e
+        run: npx playwright install --with-deps chromium
+      # The suite's webServer builds the gateway with a 120s timeout, and the
+      # spec's beforeAll builds the agent and the stub server. Warming GOCACHE
+      # and the module cache here (all three build to /dev/null) keeps those
+      # in-suite builds incremental and well under their timeouts on a cold
+      # runner, and fails early and clearly if any of the three stops compiling.
+      - name: Warm the Go build cache
+        run: |
+          (cd gateway/backend && go build -o /dev/null ./cmd/gateway)
+          (cd server-agent && go build -o /dev/null .)
+          (cd gateway/e2e/e2e-runtime/fixtures/stubserver && go build -o /dev/null .)
+      - name: Run the runtime e2e suite
+        working-directory: gateway/e2e
+        run: npm run e2e:runtime

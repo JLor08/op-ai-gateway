@@ -205,19 +205,22 @@ than no checker.
   expected to require matching spec updates; plan the e2e rewrite as part of
   such a change.
 
-> **No Playwright suite runs in CI.** `.github/workflows/ci.yml` has only the
-> Go job and the frontend job, `make test-e2e` runs the base suite alone, and
-> nothing in the Makefile enumerates the scenario suites — so every one of them,
-> `e2e:runtime` included, is a **local-only gate a pull request can pass without
-> running**. Likewise the three e2e fixture Go modules
+> **Only `e2e:runtime` runs in CI; the other 19 Playwright suites do not.**
+> `.github/workflows/ci.yml` has four jobs — `go`, `docs`, `frontend`, and
+> `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
+> least-exercised subsystem, and the one whose three-commit regression no gate
+> noticed — issue #24). Every **other** suite is still a **local-only gate a
+> pull request can pass without running**: `make test-e2e` runs the base suite
+> alone, and nothing in the Makefile enumerates the scenario suites. Likewise
+> the three e2e fixture Go modules
 > (`e2e-certificates/fakeacme`, `e2e-smtp/mailcatcher`,
 > `e2e-runtime/fixtures/stubserver`) are outside `make lint`/`make fmt`/`make
 > test-go` (which enumerate `gateway/backend` and `server-agent` only) and
 > outside `sonar.sources`, so they are formatted, vetted and linted only by hand
 > in the module directory — which is also why a new fixture module needs no
-> registration anywhere. A reader who sees a rich suite catalogue reasonably
-> assumes CI enforces it; knowing it does not changes both review expectations
-> and any decision to invest in these suites.
+> registration anywhere. A reader who sees a rich suite catalogue should not
+> assume CI enforces all of it: it enforces exactly one suite, which changes both
+> review expectations and any decision to invest in the rest.
 
 ### 6.1 `e2e:runtime` — the one suite with real child processes
 

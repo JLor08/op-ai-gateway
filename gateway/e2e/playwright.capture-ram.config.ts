@@ -53,7 +53,7 @@ export default defineConfig({
         OP_AI_GATEWAY_BOOTSTRAP_ADMIN_NAME: "Capture RAM Admin",
         OP_AI_GATEWAY_BOOTSTRAP_API_TOKEN: BOOTSTRAP_API_TOKEN,
         OP_AI_GATEWAY_BOOTSTRAP_ADMIN_PASSWORD: CAPTURE_RAM_ADMIN_PASSWORD,
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {
