@@ -3747,21 +3747,34 @@ for a `server_agent` model it is the resolved spec's copy — not the parent
 application's — that the request path *will* read: the flag qualifies
 `responses_mode`, which for a managed model comes from the spec, so reading the
 application's copy would attach the flag to a decision the application never
-made. **Will, not does:** this cut carries the value as far as
-`routing.Target.ResponsesLiveTimingsEnabled` and stops. **Nothing acts on it
-yet** — no upstream parameter is injected, nothing gates on it and nothing
-retries without it — so setting it `true` through the API changes no request's
-behaviour and produces no mid-stream tokens/sec; the gate, the injection and
-the retry are part 2 of issue #81. Its write rule is already enforced, though,
-and it is the spec's own kind rather than the operator's optimism — a PUT that
-sets it `true` on a spec whose **effective** type (the explicit `type`, else
-detected from `binary`) is not `llama_cpp` is refused with **400** (`vllm` left
-that set on 2026-09-12, measured inert on `/v1/responses`),
-never 409, because the document always carries the type it is judged against;
-a PUT that omits it on such a type clears any stored `true`. **No operator
-control for it ships in this cut either** — the value is reachable through the
-API only, and a visible toggle that did nothing would be worse than the blank
-cell it promises to fix.
+made. **And the request path reads it now:** on a **streaming** `/v1/responses`
+request this spec serves in `passthrough` mode to a `llama_cpp` upstream, the
+gateway adds `"timings_per_token": true` to the body it forwards, which is what
+makes llama.cpp attach a `timings` object to the partial frames and fills the
+running-connections row's live tokens/sec and live output-token count. Five
+conditions gate it — the opt-in itself, the effective kind, the Responses
+flavor, the stream flag, and a recorded live-progress rejection as a veto — and
+**nothing retries without it**, so an upstream that rejects the key answers the
+client's request with its own 4xx ([Telemetry, Usage & Observability
+§8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+Its write rule is enforced on the spec's own kind rather than the operator's
+optimism — a PUT that sets it `true` on a spec whose **effective** type (the
+explicit `type`, else detected from `binary`) is not `llama_cpp` is refused with
+**400** (`vllm` left that set on 2026-09-12, measured inert on `/v1/responses`),
+never 409, because the document always carries the type it is judged against; a
+PUT that omits it on such a type clears any stored `true`. **The checkbox ships
+on this form too**, on the same shared `ApiVariantControls` block the flavor and
+mode dropdowns live on, so the value is no longer reachable through the API
+alone. It is deliberately **permissive here in a way it is not on the
+application form**: that form always knows its own `type`, while this one gates
+on its own **writable Type select** — exact whenever a type is chosen, since an
+explicit `type` is the first branch of the effective-type rule, but `Auto` leaves
+the kind undecidable in the browser, because detecting it from a binary basename
+is Go-only. Under `Auto` the checkbox is therefore offered, with a note saying
+the gateway decides, and ticking it on a spec whose binary turns out not to be
+llama.cpp is answered by the documented 400 rather than prevented in the form.
+The read-only `effective_type` echo beside it is deliberately **not** that
+signal: it is undefined on create and stale the moment `binary` is edited.
 **Snapshot, not inheritance:** opening the **create** form pre-fills the three
 fields from the parent application's *current* values (`openCreate` in
 `RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/
