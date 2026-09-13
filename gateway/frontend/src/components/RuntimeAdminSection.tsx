@@ -302,6 +302,17 @@ function probeChipInfo(
       tooltip: t.runtimeProbeTooltipUnreachable,
     };
   }
+  if (probeState === 'router') {
+    // A llama.cpp multi-model router server: this endpoint cannot answer for
+    // the server as a whole (issue #55). Neutral, not a warning -- it is a
+    // valid server shape, not a fault -- but its own label and tooltip so the
+    // operator is not left guessing, which was the whole point of the issue.
+    return {
+      status: 'standby',
+      label: `${prefix} ${t.runtimeProbeStateRouter}`,
+      tooltip: t.runtimeProbeTooltipRouter,
+    };
+  }
   // "na", and any future/unrecognised non-empty value: neutral, never a
   // false warning for a probe state this build does not know.
   return {

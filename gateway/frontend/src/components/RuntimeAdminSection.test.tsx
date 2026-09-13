@@ -2197,6 +2197,30 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
     );
     expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeProbeTooltipOk);
   });
+
+  it('shows the router-mode context probe with its own label and tooltip (issue #55)', async () => {
+    const { stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', metrics_probe: '', context_probe: 'router' })],
+    });
+    stream.setStatus('open');
+    await screen.findByText('Alpha');
+
+    // Router mode is its OWN state, not collapsed onto "unreachable" or the
+    // neutral "na": the operator can see why the context is not measured.
+    const chip = screen.getByText(
+      probeLabel(t.runtimeProbeContextPrefix, t.runtimeProbeStateRouter),
+    );
+    // Neutral, never a warning -- a router server is a valid shape, not a fault
+    // (issue #55). Pin the colour, not just the text, so a flip to `watch` fails.
+    expect(chip).toHaveAttribute('data-status', 'standby');
+    expect(chip).not.toHaveAttribute('data-status', 'watch');
+    fireEvent.mouseOver(chip);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeProbeTooltipRouter);
+  });
 });
 
 // #57: task 6 (above) shipped the probe chips into the launch-specs table's

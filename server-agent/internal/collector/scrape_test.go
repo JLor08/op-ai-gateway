@@ -129,3 +129,23 @@ func TestScraperUnknownFormatYieldsZero(t *testing.T) {
 		t.Errorf("active,queue = %d,%d, want 0,0 for an unrecognized metrics format", active, queue)
 	}
 }
+
+func TestScraperRejectsNon2xx(t *testing.T) {
+	// A non-2xx reply must be an ERROR, not a successful zero. llama.cpp's
+	// router mode answers a bare GET /metrics (no ?model=) with 400 "model name
+	// is missing from the request"; that error body parses to no known metric,
+	// so without a status check Scrape would return (0, 0, nil) and the caller
+	// would record active=0 queue=0 state=ok -- a plausible idle server where
+	// there is a configuration error (issue #55). Mirrors ProbeContext's own
+	// non-2xx rejection.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"model name is missing from the request"}}`))
+	}))
+	defer ts.Close()
+
+	active, queue, err := NewScraper(ts.URL, ts.Client()).Scrape(context.Background())
+	if err == nil {
+		t.Fatalf("Scrape on a 400 reply = (%d, %d, nil), want a non-nil error", active, queue)
+	}
+}

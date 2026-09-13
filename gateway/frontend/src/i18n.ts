@@ -606,10 +606,13 @@ const de = {
   runtimeProbeStateOk: 'Erreichbar',
   runtimeProbeStateUnreachable: 'Nicht erreichbar',
   runtimeProbeStateNa: 'Nicht zutreffend',
+  runtimeProbeStateRouter: 'Router-Modus',
   runtimeProbeTooltipOk: 'Der Endpunkt ist erreichbar und wird abgefragt.',
   runtimeProbeTooltipUnreachable:
     'Dieser Endpunkt ist aktuell nicht erreichbar. Prüfen Sie die Serverargumente bzw. den konfigurierten Endpunkt (z. B. --metrics bei llama.cpp).',
   runtimeProbeTooltipNa: 'Dieser Runtime-Typ bietet diesen Endpunkt nicht.',
+  runtimeProbeTooltipRouter:
+    'Dieser Server läuft im Multi-Modell-Router-Modus von llama.cpp; dieser Endpunkt kann für den Server als Ganzes nicht antworten. Pro-Modell-Werte liegen unter /v1/models.',
   runtimeStateStopped: 'Gestoppt',
   runtimeStateStarting: 'Startet…',
   runtimeStateRunning: 'Läuft',
@@ -2916,10 +2919,13 @@ const en: PortalMessages = {
   runtimeProbeStateOk: 'Reachable',
   runtimeProbeStateUnreachable: 'Unreachable',
   runtimeProbeStateNa: 'Not applicable',
+  runtimeProbeStateRouter: 'Router mode',
   runtimeProbeTooltipOk: 'The endpoint is reachable and being queried.',
   runtimeProbeTooltipUnreachable:
     "This endpoint is currently not reachable. Check the server's arguments or configured endpoint (e.g. llama.cpp's --metrics).",
   runtimeProbeTooltipNa: 'This runtime type has no such endpoint.',
+  runtimeProbeTooltipRouter:
+    "This server runs in llama.cpp's multi-model router mode; this endpoint cannot answer for the server as a whole. Per-model values live behind /v1/models.",
   runtimeStateStopped: 'Stopped',
   runtimeStateStarting: 'Starting…',
   runtimeStateRunning: 'Running',

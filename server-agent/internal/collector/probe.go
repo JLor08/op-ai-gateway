@@ -147,6 +147,17 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 		return 0, fmt.Errorf("probe context: parse response: %w", err)
 	}
 
+	// llama.cpp router mode answers /props with a dummy carrying "role":
+	// "router" and n_ctx 0. Report the mode rather than record that 0 as a
+	// measured context size (issue #55). This is the same discriminator
+	// detectCapabilities/detectLiveProgressSupport gate on; it is harmless for
+	// every other body, none of which carries a top-level "role": "router".
+	if obj, ok := v.(map[string]any); ok {
+		if role, ok := obj["role"].(string); ok && role == "router" {
+			return 0, ErrRouterMode
+		}
+	}
+
 	n, ok := extractContext(normalizedType, v)
 	if !ok {
 		return 0, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
@@ -163,6 +174,16 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 // error, a non-2xx status, an unparseable body, a missing context field) can
 // match on it with errors.Is.
 var ErrOllamaModelRequired = errors.New("probe context: ollama requires a model name")
+
+// ErrRouterMode is the distinct error ProbeContext returns when the probed
+// endpoint answers with a llama.cpp multi-model ROUTER document ("role":
+// "router"): a dummy /props whose n_ctx is 0 because the router itself serves no
+// model (get_router_props, tools/server/server-models.cpp). Taking that 0 as a
+// measured context size would record a plausible-looking zero and read as a
+// broken server; callers match this with errors.Is to report the mode itself
+// instead (issue #55). The per-model context lives behind /v1/models with a
+// ?model= selector, not this endpoint.
+var ErrRouterMode = errors.New("probe context: server is in router mode")
 
 // fetchProbeBody issues the GET that /props-, /v1/models-, and /info-shaped
 // probes need. It is a thin wrapper so that every long-standing caller keeps

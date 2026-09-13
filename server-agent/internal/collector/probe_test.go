@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -121,6 +122,23 @@ func TestProbeContext_LlamaCpp(t *testing.T) {
 	}
 	if got != 8192 {
 		t.Errorf("context = %d, want 8192", got)
+	}
+}
+
+func TestProbeContext_LlamaCppRouterMode(t *testing.T) {
+	// llama.cpp's multi-model ROUTER mode answers GET /props (no ?model=) with a
+	// dummy document carrying "role": "router" and n_ctx 0 (get_router_props,
+	// tools/server/server-models.cpp). Taking that 0 at face value would record a
+	// plausible-looking measured context of 0; ProbeContext must instead report
+	// the mode itself so the caller can distinguish it from a broken server
+	// (issue #55). The discriminator is the role field the response already
+	// carries — the same one detectCapabilities/detectLiveProgressSupport gate on.
+	body := `{"role":"router","model_path":"none","default_generation_settings":{"n_ctx":0}}`
+	ts := newProbeServer(t, body)
+
+	got, err := ProbeContext(context.Background(), ts.Client(), ts.URL, "llama_cpp", "/props", "")
+	if !errors.Is(err, ErrRouterMode) {
+		t.Fatalf("ProbeContext on a router-mode /props = (%d, %v), want (_, ErrRouterMode)", got, err)
 	}
 }
 
