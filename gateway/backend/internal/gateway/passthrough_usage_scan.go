@@ -179,6 +179,23 @@ func (s *usageScanner) feed(chunk []byte, at time.Time) {
 	}
 	s.lastAt = at
 	s.carry = append(s.carry, chunk...)
+	// A buffered (non-streaming) body is a single JSON value, and a
+	// pretty-printed one carries newlines that are FORMATTING INSIDE that value,
+	// not frame boundaries. Splitting it at a newline (below) would hand
+	// jsonPayloads a truncated, unparseable fragment and lose ALL of the
+	// response's usage — issue #78, the shape that sits between the compact (no
+	// newline at all) and pretty-with-trailing-newline bodies that already
+	// worked. So do not line-split such a body: hold it whole and let finish
+	// scan the intact value, which jsonPayloads returns unchanged as one payload
+	// because it contains no `data:` line. The remaining line-split path is what
+	// an SSE stream needs, and only an SSE stream reaches it — see
+	// bufferedJSONStart for why the two shapes never cross.
+	if bufferedJSONStart(s.carry) {
+		if len(s.carry) > s.capBytes {
+			s.carry = nil
+		}
+		return
+	}
 	i := bytes.LastIndexByte(s.carry, '\n')
 	if i < 0 {
 		if len(s.carry) > s.capBytes {
@@ -197,6 +214,36 @@ func (s *usageScanner) feed(chunk []byte, at time.Time) {
 	next := make([]byte, len(rest))
 	copy(next, rest)
 	s.carry = next
+}
+
+// bufferedJSONStart reports whether b begins — after any leading JSON-insignificant
+// whitespace — with a JSON object or array, i.e. the shape of a buffered
+// native-passthrough response body. feed uses it to tell a single (possibly
+// pretty-printed, multi-line) JSON value, whose interior newlines must NOT be
+// treated as frame boundaries, from a line-delimited SSE stream, whose frames
+// must. The discriminator is safe because the two shapes never cross: an SSE
+// frame's first line is a field (data:/event:/id:/retry:) or a ':' comment and
+// so never opens with a brace, while a buffered body for every API this path
+// serves is a lone JSON object. It mirrors jsonPayloads' own SSE-vs-buffered
+// split (native_passthrough.go), which keys on the presence of `data:` lines;
+// the two cannot disagree on any body that carries usage, since such a body is
+// either brace-opened JSON or data:-framed SSE.
+//
+// In feed's buffered branch the carry is never consumed, so it always begins at
+// the body's first byte — which makes this decision stable across the several
+// chunks a large buffered body may arrive in.
+func bufferedJSONStart(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '{', '[':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // finish scans whatever is left in the carry as if it were itself a complete
