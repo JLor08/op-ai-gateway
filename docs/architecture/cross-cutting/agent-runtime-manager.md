@@ -3773,10 +3773,18 @@ on its own **writable Type select** — exact whenever a type is chosen, since a
 explicit `type` is the first branch of the effective-type rule, but `Auto` leaves
 the kind undecidable in the browser, because detecting it from a binary basename
 is Go-only. Under `Auto` the checkbox is therefore offered, with a note saying
-the gateway decides, and ticking it on a spec whose binary turns out not to be
+the gateway decides, and a `true` on a spec whose binary turns out not to be
 llama.cpp is answered by the documented 400 rather than prevented in the form.
-The read-only `effective_type` echo beside it is deliberately **not** that
-signal: it is undefined on create and stale the moment `binary` is edited.
+**That `true` need not be a tick the operator made**: the edit form pre-fills
+the box from the stored row, and the first write of a spec whose binary the
+detector read as llama.cpp stored a `true` by the backend's own default. Editing
+`binary` to a wrapper the detector does not recognise (`run-llama.sh`, a
+versioned `llama-srv-…`) therefore refuses the whole save, about a checkbox
+nobody touched and a save that was about the binary path. Recoverable by
+unticking and saving again, and accepted as the price of staying permissive
+under `Auto`. The read-only `effective_type` echo beside it is deliberately
+**not** that signal: it is undefined on create and stale the moment `binary` is
+edited.
 **Snapshot, not inheritance:** opening the **create** form pre-fills the three
 fields from the parent application's *current* values (`openCreate` in
 `RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/

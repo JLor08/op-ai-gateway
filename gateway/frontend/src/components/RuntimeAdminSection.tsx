@@ -2662,6 +2662,18 @@ export function RuntimeAdminSection({
       // Value: undefined is "no opinion", which IS the absent key. Under Type
       // "Auto" that is the only honest thing to send, since the kind is
       // detected from the binary's basename by Go and not by this form.
+      //
+      // But under "Auto" the value is NOT reliably undefined, and that is the
+      // case to be exact about: openEdit seeds this state from the STORED row,
+      // and putRuntimeSpec's own first-write default stored a true for every
+      // binary its detector read as llama.cpp. So the box can arrive ticked
+      // without the operator ever touching it, and an edit to `binary` alone --
+      // to a wrapper the detector does not recognise, run-llama.sh or a
+      // versioned llama-srv-b10448 -- then sends that true beside a document
+      // that now resolves to `custom`, and the 400 takes the WHOLE save, on a
+      // save that was about the binary path. Accepted and recoverable (untick,
+      // save again); what it is not is a consequence of TICKING the box, so do
+      // not describe it as one.
       ...(specLiveTimingsKind !== 'incapable' && specLiveTimings !== undefined
         ? { responses_live_timings_enabled: specLiveTimings }
         : {}),

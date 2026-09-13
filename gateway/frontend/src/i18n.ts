@@ -385,7 +385,7 @@ const de = {
   applicationLiveTimingsDelegatedNote:
     'Bei diesem Typ entscheidet die Startvorgabe des Modells, nicht die Anwendung: Der Schalter steht unter „Runtime-Spezifikationen“ beim jeweiligen Modell. Wirksam wird er nur, wenn diese Startvorgabe tatsächlich einen llama.cpp-Server startet. Ein hier gespeicherter Wert würde beim Ausliefern ohnehin durch den der Startvorgabe ersetzt, deshalb gibt es hier keinen zweiten Schalter.',
   applicationLiveTimingsAutoNote:
-    'Der Typ steht auf „Automatisch“: welche Art Server der Programmpfad startet, erkennt erst das Gateway. Ohne Häkchen entscheidet es selbst — eine neu angelegte llama.cpp-Startvorgabe bekommt Live-Timings, jede andere nicht, und eine bestehende Startvorgabe behält ihren gespeicherten Wert. Ein Häkchen auf einer Startvorgabe, die nicht llama.cpp ist, wird beim Speichern abgelehnt.',
+    'Der Typ steht auf „Automatisch“: welche Art Server der Programmpfad startet, erkennt erst das Gateway. Ohne Häkchen entscheidet es selbst — eine neu angelegte llama.cpp-Startvorgabe bekommt Live-Timings, jede andere nicht, und eine bestehende Startvorgabe behält ihren gespeicherten Wert. Ein gesetztes Häkchen auf einer Startvorgabe, die nicht llama.cpp ist, wird beim Speichern abgelehnt — auch wenn es aus dem gespeicherten Wert stammt und niemand es angeklickt hat. Wird dann ein Speichern abgelehnt, das eigentlich dem Programmpfad galt: Häkchen entfernen und erneut speichern.',
   applicationResponsesMode: 'Codex (Responses-API)',
   applicationMessagesMode: 'Claude Code (Anthropic Messages)',
   applicationModeDisabled: 'Deaktiviert',
@@ -2710,7 +2710,7 @@ const en: PortalMessages = {
   applicationLiveTimingsDelegatedNote:
     'For this type the model\'s launch spec decides, not the application: the switch lives under "Runtime specs" on the individual model. It takes effect only if that spec really launches a llama.cpp server. A value stored here would be replaced by the spec\'s when a request is served, so this form deliberately offers no second switch.',
   applicationLiveTimingsAutoNote:
-    'Type is set to "Auto", so which kind of server the binary launches is only detected by the gateway. Left unticked, the gateway decides — a newly created llama.cpp launch spec gets live timings, any other kind does not, and an existing spec keeps its stored value. Ticking it on a spec that is not llama.cpp is refused on save.',
+    'Type is set to "Auto", so which kind of server the binary launches is only detected by the gateway. Left unticked, the gateway decides — a newly created llama.cpp launch spec gets live timings, any other kind does not, and an existing spec keeps its stored value. A ticked box on a spec that is not llama.cpp is refused on save — including when it arrived ticked from the stored value and nobody clicked it. If a save that was really about the binary path is refused, untick the box and save again.',
   applicationResponsesMode: 'Codex (Responses API)',
   applicationMessagesMode: 'Claude Code (Anthropic Messages)',
   applicationModeDisabled: 'Disabled',
