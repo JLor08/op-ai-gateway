@@ -641,9 +641,12 @@ func TestPassthroughLiveProgressWritesNoRoutingInput(t *testing.T) {
 }
 
 // TestPassthroughResponsesTerminalUsageBecomesVisibleBeforeTheRowLeaves pins the
-// `openai_responses` cell the other two Responses tests leave uncovered: the
-// flavor has no MID-STREAM source for a count, but the TERMINAL
-// response.completed frame carries the upstream's own final
+// `openai_responses` cell the other two Responses tests leave uncovered: this
+// fixture's partials carry no `timings` object — its client sends no
+// `timings_per_token` and its resolved target has the operator's opt-in OFF,
+// so nothing injects one, and without one this fixture has no mid-stream
+// source for a count — while the TERMINAL response.completed frame carries
+// the upstream's own final
 // `response.usage.output_tokens`, isTerminalUsageFrame accepts it, and
 // publishProgress therefore puts it on the row. For the brief window between
 // that frame and proxyNative's deferred Active.Remove, the still-active row
