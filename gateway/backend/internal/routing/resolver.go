@@ -89,9 +89,15 @@ type Target struct {
 	// veto the lot; when all of those hold, the body relayed upstream grows
 	// llama.cpp's `timings_per_token`. So this field has a live consumer
 	// outside its own table test -- a dead-code pass that concludes otherwise
-	// is reading a stale claim. Still ahead in that part: the portal's visible
-	// control for the flag, and the live per-token count the `timings` objects
-	// it buys can feed. No retry accompanies the injection: llama.cpp was
+	// is reading a stale claim. The two things that part still owed when this
+	// sentence was first written have since SHIPPED on the same branch: the
+	// portal renders a visible control for the flag on both surfaces (the
+	// shared ApiVariantControls block, on the application form and the
+	// launch-spec form), and the `timings` objects the injection buys feed a
+	// live per-token count on the running-connections panel -- a column that
+	// ships hidden and is switched on from that panel's own column menu, so an
+	// operator who has never changed that panel's columns sees the rate fill
+	// and no count column at all. No retry accompanies the injection: llama.cpp was
 	// measured accepting the injected key on this endpoint, so a retry's
 	// trigger could not be exercised against any upstream this repository can
 	// point at.
