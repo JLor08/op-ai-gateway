@@ -67,6 +67,12 @@ LOCAL_DIR="$(sonar_local_dir "$ROOT")"
 CREDS_FILE="$LOCAL_DIR/credentials.json"
 FINDINGS_FILE="$LOCAL_DIR/findings.json"
 HOTSPOTS_FILE="$LOCAL_DIR/hotspots.json"
+# Records which analysis the findings export describes (SCM revision + date), so
+# branch-findings.sh can refuse a stale export whose revision is not HEAD (a
+# scan that failed server-side, or another worktree's scan, leaves the server's
+# LAST SUCCESSFUL analysis in place, and exporting it looks identical to a real
+# pass -- issue #22, problem 4).
+ANALYSIS_META_FILE="$LOCAL_DIR/analysis-meta.json"
 
 UP_TIMEOUT="${SONAR_UP_TIMEOUT:-300}"     # seconds to wait for the server to report UP
 CE_TIMEOUT="${SONAR_CE_TIMEOUT:-900}"     # seconds to wait for the compute-engine task
@@ -336,7 +342,22 @@ cmd_scan() {
     fi
   fi
 
-  log "Running sonar-scanner-cli against ${ROOT} ..."
+  # Give every analysis a distinct project version so the PREVIOUS_VERSION
+  # new-code period has something to advance against. Without it every analysis
+  # reports version "not provided", the version never changes, and the period
+  # collapses to the project's FIRST-ever analysis -- so "new code" silently
+  # means everything since the server was bootstrapped (issue #22). This does
+  # NOT make the server gate a real "vs main" comparison -- Community Build
+  # cannot (see branch-findings.sh) -- but it bounds the baseline to the last
+  # scan instead of the first. `describe --tags --always --dirty` yields the
+  # nearest tag or, with no tags, the short HEAD sha, and appends `-dirty` when
+  # the working tree the scanner sees carries uncommitted edits -- so the value
+  # is distinct across commits (the property the period needs) and a dirty
+  # re-scan is still distinct from its clean counterpart.
+  local project_version
+  project_version="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+  log "Running sonar-scanner-cli against ${ROOT} (version ${project_version}) ..."
   local start_ts end_ts
   start_ts="$(date +%s)"
   # The image's default sonar.working.directory lives under /tmp inside the
@@ -352,7 +373,8 @@ cmd_scan() {
     -v "${ROOT}:/usr/src" \
     "${extra_mounts[@]}" \
     -w /usr/src \
-    sonarsource/sonar-scanner-cli
+    sonarsource/sonar-scanner-cli \
+    -Dsonar.projectVersion="${project_version}"
   end_ts="$(date +%s)"
   log "Scanner finished in $((end_ts - start_ts))s."
 
@@ -401,6 +423,15 @@ cmd_scan() {
   '
   echo ""
   echo "Dashboard: ${SONAR_URL}/dashboard?id=${PROJECT_KEY}"
+  echo ""
+  echo "NOTE: this quality gate is ADVISORY. SonarQube Community Build cannot"
+  echo "      compare a branch against main, so 'new code' here is measured"
+  echo "      against the previous analysis on this shared server, NOT main."
+  echo "      The enforcing 'did MY branch introduce this?' gate is:"
+  echo "          make sonar-findings && make sonar-branch-findings"
+  echo "      which computes the comparison from git (see branch-findings.sh)."
+  echo "      This command exits 0 on an ADVISORY FAIL by design; pass --strict"
+  echo "      to make it exit non-zero on the advisory verdict too."
 
   if [ "$strict" -eq 1 ] && [ "$gate_status" != "OK" ]; then
     die "quality gate failed (--strict)"
@@ -475,6 +506,21 @@ cmd_findings() {
     "hotspots"
   chmod 600 "$FINDINGS_FILE" "$HOTSPOTS_FILE"
 
+  # Stamp the export with the analysis it describes (its SCM revision + date),
+  # so branch-findings.sh can tell a fresh export from a stale one. The server's
+  # issue search always returns its LAST SUCCESSFUL analysis, which a failed or
+  # unrelated scan leaves untouched; without this stamp that reads as a pass.
+  local meta_resp
+  meta_resp="$(curl -fsS -u "$(current_token):" "${SONAR_URL}/api/project_analyses/search?project=${PROJECT_KEY}&ps=1" 2>/dev/null || true)"
+  if [ -n "$meta_resp" ] && echo "$meta_resp" | jq -e '.analyses[0].revision' >/dev/null 2>&1; then
+    echo "$meta_resp" | jq --arg exportedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      .analyses[0] | {revision: .revision, analysisKey: .key, analysisDate: .date, exportedAt: $exportedAt}
+    ' >"$ANALYSIS_META_FILE"
+    chmod 600 "$ANALYSIS_META_FILE"
+  else
+    rm -f "$ANALYSIS_META_FILE"
+  fi
+
   local total_issues total_hotspots
   total_issues="$(jq 'length' "$FINDINGS_FILE")"
   total_hotspots="$(jq 'length' "$HOTSPOTS_FILE")"
@@ -515,6 +561,9 @@ cmd_findings() {
 
   echo ""
   echo "Raw JSON: ${FINDINGS_FILE} (${total_issues} issues), ${HOTSPOTS_FILE} (${total_hotspots} hotspots)"
+  if [ -f "$ANALYSIS_META_FILE" ]; then
+    echo "Analysis: revision $(jq -r '.revision // "?"' "$ANALYSIS_META_FILE") at $(jq -r '.analysisDate // "?"' "$ANALYSIS_META_FILE")"
+  fi
 }
 
 # ---------------------------------------------------------------------------

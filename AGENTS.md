@@ -224,12 +224,15 @@ Required sequence for substantial work:
 8. Update the matching `docs/architecture/` documents with everything
    durable (design decisions, behavior, constraints) — in the same branch.
 9. Run the local SonarQube quality gate whenever the environment allows it
-   (`make sonar-up` once, then `make sonar-gate`), and act on the result
-   before the cleanup below: the gate is new-code based, so what it reports
-   is this branch's own work. `make sonar-branch-findings` narrows the
-   export to the lines this branch changed. If Docker or the server is
-   unavailable, say so explicitly in the pull request rather than staying
-   silent about a skipped gate. See
+   (`make sonar-up` once, then `make sonar-gate`). The `sonar-gate` verdict
+   is **advisory**: SonarQube Community Build cannot compare a branch against
+   main, so its "new code" is measured against the previous analysis on the
+   shared server, not this branch (and it never sees blame in a linked
+   worktree). The authoritative "did my branch introduce this?" gate is
+   `make sonar-findings && make sonar-branch-findings`, which computes the
+   comparison from git; act on **that** before the cleanup below. If Docker
+   or the server is unavailable, say so explicitly in the pull request rather
+   than staying silent about a skipped gate. See
    [`development-and-quality.md` §7](docs/architecture/cross-cutting/development-and-quality.md).
 10. **Final step before the pull request:** remove `docs/superpowers/` and
     `docs/implementation-status.md` from the branch (their durable content

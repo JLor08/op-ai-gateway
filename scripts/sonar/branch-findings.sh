@@ -72,6 +72,31 @@ cd "$REPO" || { echo "error: cannot enter $REPO" >&2; exit 2; }
   exit 2
 }
 
+# Refuse a STALE export. sonar.sh records, next to the export, the SCM revision
+# of the analysis it describes (analysis-meta.json). The findings must describe
+# the CURRENT HEAD: a scan that failed server-side, or another worktree's scan,
+# leaves the server's last SUCCESSFUL analysis in place, and exporting THAT is
+# indistinguishable from a real pass (issue #22, problem 4). A revision that is
+# not HEAD means the export predates -- or belongs to a different line of
+# history than -- the tree being checked, so attribution against it is
+# meaningless. Missing metadata only warns, so an older export or a hand-passed
+# --findings file still runs; SONAR_BRANCH_FINDINGS_ALLOW_STALE=1 overrides.
+META="$(dirname "$FINDINGS")/analysis-meta.json"
+if [ "${SONAR_BRANCH_FINDINGS_ALLOW_STALE:-0}" != "1" ] && [ -f "$META" ]; then
+  meta_rev="$(jq -r '.revision // empty' "$META" 2>/dev/null || true)"
+  head_rev="$(git rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$meta_rev" ] && [ -n "$head_rev" ] && [ "$meta_rev" != "$head_rev" ]; then
+    echo "error: findings export is STALE -- it describes revision $meta_rev," >&2
+    echo "       but HEAD is $head_rev. The export does not reflect this tree;" >&2
+    echo "       re-run: sonar.sh scan && sonar.sh findings" >&2
+    echo "       (set SONAR_BRANCH_FINDINGS_ALLOW_STALE=1 to attribute anyway.)" >&2
+    exit 2
+  fi
+elif [ ! -f "$META" ]; then
+  echo "warning: no analysis metadata beside $FINDINGS; cannot verify the export" >&2
+  echo "         describes HEAD -- re-run 'sonar.sh findings' to record it." >&2
+fi
+
 # Default to origin/main, not the local main: in a worktree you typically only
 # fetch origin/main and branch off it, so the local ref can sit far behind --
 # and a stale base makes the merge base ancient, which attributes half the

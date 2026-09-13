@@ -329,17 +329,27 @@ Lifecycle (`scripts/sonar/sonar.sh`, wrapped by make targets):
 | `make sonar-up` | Starts the server (first run: `sonar.sh bootstrap` sets credentials + token) |
 | `make sonar-coverage` | Generates Go coverprofiles (both modules, `-covermode=atomic`) and the frontend lcov report |
 | `make sonar-scan` | Runs the scanner alone (missing coverage reports are tolerated with a WARN, but the gate's coverage condition then reads 0) |
-| `make sonar-gate` | Coverage + scan + waits for the computed **quality-gate verdict** — the meaningful pass/fail entry point |
-| `make sonar-findings` | Exports open issues + hotspots as JSON into `.sonar-local/` for headless triage |
-| `make sonar-branch-findings` | Filters that export down to the findings on lines **this branch** changed (see below); exits non-zero when the branch owns one |
+| `make sonar-gate` | Coverage + scan + waits for the computed quality-gate verdict. The verdict is **advisory**: it exits 0 even on an advisory FAIL (pass `sonar.sh gate --strict` to exit non-zero on it). Community Build cannot compare against main, so this is **not** the branch pass/fail gate — `sonar-branch-findings` is (see §7.1) |
+| `make sonar-findings` | Exports open issues + hotspots as JSON into `.sonar-local/`, and records which analysis the export describes (`analysis-meta.json`: SCM revision + date) so a stale export can be detected |
+| `make sonar-branch-findings` | Filters that export down to the findings on lines **this branch** changed (see below); the **authoritative pre-PR gate** — exits non-zero when the branch owns one, and refuses a stale export whose revision is not `HEAD` |
 | `make sonar-down` | Stops the server (data volume kept) |
 | `sonar.sh purge` | Destroys the server **including** its database — resets credentials **and the new-code baseline** |
 
 Semantics and policy:
 
 - The gate is **new-code based**: pre-existing accepted issues never block;
-  **new** violations and new-code coverage below the threshold do. The first
-  scan after a purge establishes the baseline.
+  **new** violations and new-code coverage below the threshold do. But "new
+  code" here is **not** "changed versus main". Community Build's new-code period
+  is `PREVIOUS_VERSION`, so each scan is compared against the previous *analysis*
+  on this shared, single-branch server — not against main. `sonar.sh scan` sets
+  `sonar.projectVersion` to the short `HEAD` description per analysis so that
+  period has a distinct previous version to advance against; without it every
+  analysis reports version "not provided", the version never changes, and the
+  period collapses to the project's **first-ever** analysis — making "new code"
+  mean everything since the server was bootstrapped. Even with it, the server
+  verdict is only advisory: for the real "did my branch introduce this?"
+  question use `sonar-branch-findings` (§7.1), which computes it from git. The
+  first scan after `sonar.sh purge` re-establishes the baseline.
 - The triage policy is **versioned in `sonar-project.properties`**, never in
   the server database, so it survives purges and is reviewable in diffs.
   Every entry is justified individually in that file's own comment; the whole
@@ -393,9 +403,17 @@ the repository:
 - It is post-processing only and never contacts the server: run
   `make sonar-findings` first. Exit code 1 when the branch owns a finding, so it
   works as a pre-PR check.
-- Its own cases (including the merge-base semantics and the stale-`main` default)
-  are pinned by `scripts/sonar/branch-findings.test.sh`, which runs offline
-  against a throwaway repository: `sh scripts/sonar/branch-findings.test.sh`.
+- It **refuses a stale export**. `sonar.sh findings` records the analysed SCM
+  revision beside the export (`analysis-meta.json`), and the filter exits 2 when
+  that revision is not `HEAD`: a scan that failed server-side, or another
+  worktree's scan, leaves the server's last *successful* analysis in place, and
+  attributing findings against it would otherwise read exactly like a real pass.
+  `SONAR_BRANCH_FINDINGS_ALLOW_STALE=1` overrides the check; a missing metadata
+  file (an older export, or a hand-passed `--findings`) only warns.
+- Its own cases (including the merge-base semantics, the stale-`main` default,
+  and the stale-export guard) are pinned by
+  `scripts/sonar/branch-findings.test.sh`, which runs offline against a
+  throwaway repository: `sh scripts/sonar/branch-findings.test.sh`.
 
 Deliberate limits: attribution is by **line**, so a finding your change causes
 elsewhere without touching that line is not attributed, and coverage is not
@@ -403,10 +421,20 @@ considered — for those, read the quality gate itself.
 
 Operational notes (encoded in `sonar-project.properties` comments):
 
-- **Linked git worktrees**: the scanner's JGit cannot resolve `.git`
-  gitdir-pointer files; `sonar.sh` bind-mounts the main `.git` read-only and
-  `sonar.scm.exclusions.disabled=true` keeps the analysis from silently
-  reporting "0 non excluded files".
+- **Linked git worktrees have no SCM blame.** Run from a `.worktrees/<name>`
+  checkout, the scanner's JGit *does* open the repository and read the HEAD
+  revision — the `.git` gitdir-pointer resolves, and `sonar.sh` bind-mounts the
+  common `.git` read-only so the objects are reachable — but its blame yields
+  **nothing** (measured on SonarQube 26.8: 0 of 1027 files blamed). Without
+  blame, Sonar dates every line by the analysis that first saw it and so treats
+  the whole tree as new code. This inflates the **already-advisory** server gate
+  only (see §7 and above); `sonar-branch-findings` computes its comparison from
+  git on the host and is unaffected, which is why it — not the server gate — is
+  the authoritative pre-PR check. The git CLI blames the same worktree correctly,
+  but SonarQube's git SCM sensor uses JGit with no CLI fallback, so there is no
+  clean in-scanner fix short of scanning a non-worktree checkout.
+  `sonar.scm.exclusions.disabled=true` keeps the analysis from silently reporting
+  "0 non excluded files".
 - **JS/TS bridge memory**: `sonar.javascript.node.maxspace=2048` caps the
   scanner's embedded Node analyzer. Do **not** raise it without raising
   Docker's memory limit — an unbounded bridge balloons into the VM's OOM
