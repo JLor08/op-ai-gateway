@@ -3308,3 +3308,287 @@ func TestSnapshotStatusCopiesProbeConfig(t *testing.T) {
 		t.Errorf("Status.ContextProbePath = %q, want %q (spec.ContextProbePath)", got.ContextProbePath, spec.ContextProbePath)
 	}
 }
+
+// --- issue #63: a changed running spec relaunches with the new launch shape ---
+
+// TestApplyRelaunchesRunningChildOnLaunchChange is the core acceptance case for
+// issue #63: when a launch-affecting field of a RUNNING spec changes, the child
+// must be drained and relaunched with the new shape -- not left running the old
+// one until it restarts for some unrelated reason. The two invocation logs make
+// "relaunched with the NEW args" observable from the child side: the first
+// generation writes to logA, and only a genuine relaunch that consumed the new
+// Args (which now name logB) can make logB appear.
+func TestApplyRelaunchesRunningChildOnLaunchChange(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	logA := filepath.Join(t.TempDir(), "invocations-a.log")
+	logB := filepath.Join(t.TempDir(), "invocations-b.log")
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 0, 0, logA)
+	spec.Pinned = true // so the relaunch is immediate, not deferred to a request
+	m.Apply(Config{ETag: "e1", Specs: []Spec{spec}})
+
+	waitUntil(t, 3*time.Second, "spec-a running from the first launch", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	if n := countInvocations(t, logA); n != 1 {
+		t.Fatalf("first launch invocation count = %d, want 1", n)
+	}
+
+	// A launch-affecting edit: point the child at a different invocation log.
+	changed := baseSpec("spec-a", "model-a")
+	changed.Args = stubArgs(0, 0, 0, logB)
+	changed.Pinned = true
+	m.Apply(Config{ETag: "e2", Specs: []Spec{changed}})
+
+	waitUntil(t, 5*time.Second, "spec-a relaunched and running again", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning && countInvocations(t, logB) == 1
+	})
+
+	if n := countInvocations(t, logB); n != 1 {
+		t.Errorf("relaunch invocation count (new args, logB) = %d, want 1", n)
+	}
+	if n := countInvocations(t, logA); n != 1 {
+		t.Errorf("old-args invocation count (logA) = %d, want 1: the child must not have re-run with the stale args", n)
+	}
+}
+
+// TestApplyDoesNotRelaunchRunningChildOnMetadataChange is the other half of
+// issue #63: a metadata-only edit (here, the idle timeout on a pinned spec)
+// must NOT bounce a healthy child. Because applyConfig runs synchronously under
+// Apply, a relaunch would have moved the spec to draining by the time Apply
+// returns -- so the state staying running is a deterministic assertion, not a
+// race against a restart that might not have happened yet.
+func TestApplyDoesNotRelaunchRunningChildOnMetadataChange(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	invLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 0, 0, invLog)
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", Specs: []Spec{spec}})
+
+	waitUntil(t, 3*time.Second, "spec-a running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	if n := countInvocations(t, invLog); n != 1 {
+		t.Fatalf("first launch invocation count = %d, want 1", n)
+	}
+
+	// Metadata-only edit: idle timeout (pure metadata, and inert on a pinned
+	// spec, which is never idle-unloaded). Same launch shape.
+	changed := baseSpec("spec-a", "model-a")
+	changed.Args = stubArgs(0, 0, 0, invLog)
+	changed.Pinned = true
+	changed.IdleTimeoutSeconds = 300
+	m.Apply(Config{ETag: "e2", Specs: []Spec{changed}})
+
+	// Deterministic: if a relaunch had been triggered, applyConfig would have
+	// drained the child synchronously before Apply returned.
+	if st := statusFor(m, "spec-a"); st == nil || st.State != StateRunning {
+		t.Fatalf("state after metadata-only change = %+v, want still running (no drain)", st)
+	}
+	// And it never relaunches after the fact either.
+	time.Sleep(300 * time.Millisecond)
+	if n := countInvocations(t, invLog); n != 1 {
+		t.Errorf("invocation count after metadata-only change = %d, want 1 (no relaunch)", n)
+	}
+	if st := statusFor(m, "spec-a"); st == nil || st.State != StateRunning {
+		t.Errorf("state = %+v, want still running", st)
+	}
+}
+
+// TestApplyRelaunchDrainsInFlightBeforeRelaunch proves the relaunch respects the
+// drain: while a request is in flight, the changed spec's child moves to
+// draining but is NOT killed or relaunched until the request releases. This is
+// the "in-flight requests drain rather than being killed" clause of issue #63.
+func TestApplyRelaunchDrainsInFlightBeforeRelaunch(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	// A comfortably long drain grace so the "in-flight holds off the kill"
+	// window does not race the grace timer under parallel test load; restored
+	// by shrinkTimings' own cleanup (to the production default).
+	drainGrace = 3 * time.Second
+	m := newTestManager(t, allowlistPolicy())
+
+	invLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 0, 0, invLog)
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	if n := countInvocations(t, invLog); n != 1 {
+		t.Fatalf("first launch invocation count = %d, want 1", n)
+	}
+
+	// A launch-affecting edit (a new env var) while the request is still in
+	// flight -- the child ignores the var, so it stays healthy after relaunch.
+	changed := baseSpec("spec-a", "model-a")
+	changed.Args = stubArgs(0, 0, 0, invLog)
+	changed.Env = map[string]string{"OP_RESPEC": "1"}
+	changed.Pinned = true
+	m.Apply(Config{ETag: "e2", Specs: []Spec{changed}})
+
+	// The child is draining, not killed, and has NOT relaunched while the
+	// request is in flight.
+	if st := statusFor(m, "spec-a"); st == nil || st.State != StateDraining {
+		t.Fatalf("state with a request in flight = %+v, want draining", st)
+	}
+	if n := countInvocations(t, invLog); n != 1 {
+		t.Errorf("invocation count while draining = %d, want 1 (no relaunch until in-flight drains)", n)
+	}
+
+	// Releasing the in-flight request lets the drain finish, and the pinned
+	// spec relaunches with the new shape.
+	release()
+	waitUntil(t, 5*time.Second, "spec-a relaunched after the in-flight request drained", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning && countInvocations(t, invLog) == 2
+	})
+}
+
+// TestSameLaunchShape pins the launch-affecting vs metadata classification that
+// decides whether a changed running spec relaunches (issue #63). Launch-baked
+// fields must read as a DIFFERENT shape (false -> relaunch); live/next-start
+// metadata must read as the SAME shape (true -> no bounce). New Spec fields
+// default to launch-affecting (they are not stripped), so a forgotten field
+// over-relaunches rather than silently going stale.
+func TestSameLaunchShape(t *testing.T) {
+	base := Spec{
+		ID: "s", Model: "m", UpstreamModel: "um", Binary: "/bin/x",
+		Args: []string{"-p", "${PORT}"}, Env: map[string]string{"A": "1"},
+		WorkDir: "/w", ListenPort: 8080,
+		GPUs:               []SpecGPU{{Index: 0, VRAMMB: 8000}},
+		SetVisibleDevices:  true,
+		VisibleDevicesMode: "env",
+		APIToken:           "tok",
+		HealthPath:         "/health", HealthTimeoutSeconds: 2, StartupTimeoutSeconds: 5,
+		IdleTimeoutSeconds: 0, AdmissionWaitTimeoutSeconds: 5,
+		Pinned: false, AdminState: "", Type: "llama_cpp",
+		MetricsPath: "/metrics", ContextProbePath: "/props",
+	}
+	if !sameLaunchShape(base, base) {
+		t.Fatal("a spec must have the same launch shape as itself")
+	}
+
+	// Launch-affecting: any of these must force a relaunch.
+	launch := map[string]func(*Spec){
+		"Binary":             func(s *Spec) { s.Binary = "/bin/y" },
+		"Args":               func(s *Spec) { s.Args = []string{"-p", "${PORT}", "-x"} },
+		"Env value":          func(s *Spec) { s.Env = map[string]string{"A": "2"} },
+		"Env key":            func(s *Spec) { s.Env = map[string]string{"A": "1", "B": "2"} },
+		"WorkDir":            func(s *Spec) { s.WorkDir = "/w2" },
+		"ListenPort":         func(s *Spec) { s.ListenPort = 9090 },
+		"GPU index":          func(s *Spec) { s.GPUs = []SpecGPU{{Index: 1, VRAMMB: 8000}} }, // index feeds the visibility/--device list
+		"SetVisibleDevices":  func(s *Spec) { s.SetVisibleDevices = false },
+		"VisibleDevicesMode": func(s *Spec) { s.VisibleDevicesMode = "args" },
+		"APIToken":           func(s *Spec) { s.APIToken = "tok2" },
+		"UpstreamModel":      func(s *Spec) { s.UpstreamModel = "um2" }, // feeds ${MODEL}
+	}
+	for name, mut := range launch {
+		b := base
+		mut(&b)
+		if sameLaunchShape(base, b) {
+			t.Errorf("changing %s must change the launch shape (relaunch), but sameLaunchShape returned true", name)
+		}
+	}
+
+	// Metadata: none of these may bounce a healthy child.
+	meta := map[string]func(*Spec){
+		"Model":                       func(s *Spec) { s.Model = "m2" },
+		"HealthPath":                  func(s *Spec) { s.HealthPath = "/healthz" },
+		"HealthTimeoutSeconds":        func(s *Spec) { s.HealthTimeoutSeconds = 9 },
+		"StartupTimeoutSeconds":       func(s *Spec) { s.StartupTimeoutSeconds = 99 },
+		"IdleTimeoutSeconds":          func(s *Spec) { s.IdleTimeoutSeconds = 300 },
+		"AdmissionWaitTimeoutSeconds": func(s *Spec) { s.AdmissionWaitTimeoutSeconds = 60 },
+		"Pinned":                      func(s *Spec) { s.Pinned = true },
+		"AdminState":                  func(s *Spec) { s.AdminState = "force_running" },
+		"Type":                        func(s *Spec) { s.Type = "vllm" },
+		"MetricsPath":                 func(s *Spec) { s.MetricsPath = "/m2" },
+		"ContextProbePath":            func(s *Spec) { s.ContextProbePath = "/p2" },
+		// A GPU row's vram_mb is the admission DEMAND, not a launch input; the
+		// gateway churns it via measured-VRAM write-back, so an edit to it alone
+		// must not bounce a running child (issue #63 review finding).
+		"GPU vram_mb": func(s *Spec) { s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 9000}} },
+	}
+	for name, mut := range meta {
+		b := base
+		mut(&b)
+		if !sameLaunchShape(base, b) {
+			t.Errorf("changing %s is metadata and must NOT trigger a relaunch, but sameLaunchShape returned false", name)
+		}
+	}
+}
+
+// TestApplyRelaunchesOnDemandChildOnNextRequest covers the on-demand half of
+// issue #63's relaunch contract: a NON-pinned running child whose launch shape
+// changes is drained now (freeing its slot) but not auto-restarted; the new
+// shape then takes effect on the next request. The two invocation logs prove
+// the next start used the NEW args, and that the old child never re-ran.
+func TestApplyRelaunchesOnDemandChildOnNextRequest(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	logA := filepath.Join(t.TempDir(), "invocations-a.log")
+	logB := filepath.Join(t.TempDir(), "invocations-b.log")
+
+	spec := baseSpec("spec-a", "model-a") // not pinned; IdleTimeoutSeconds 0 = never idle-unload
+	spec.Args = stubArgs(0, 0, 0, logA)
+	m.Apply(Config{ETag: "e1", Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, release, err := m.EnsureRunning(ctx, "model-a")
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	release() // drop in-flight so the respec drain can proceed at once
+	if n := countInvocations(t, logA); n != 1 {
+		t.Fatalf("first launch invocation count = %d, want 1", n)
+	}
+
+	// A launch-affecting edit to the on-demand spec.
+	changed := baseSpec("spec-a", "model-a")
+	changed.Args = stubArgs(0, 0, 0, logB)
+	m.Apply(Config{ETag: "e2", Specs: []Spec{changed}})
+
+	// Drained and NOT auto-restarted (no pending request, not pinned): it rests
+	// at stopped rather than relaunching on its own.
+	waitUntil(t, 3*time.Second, "spec-a drained to stopped without auto-restart", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStopped
+	})
+	if n := countInvocations(t, logB); n != 0 {
+		t.Errorf("on-demand spec must not auto-relaunch: logB count = %d, want 0", n)
+	}
+
+	// The next request starts it with the NEW shape (logB), not the old one.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	_, release2, err := m.EnsureRunning(ctx2, "model-a")
+	if err != nil {
+		t.Fatalf("second EnsureRunning: %v", err)
+	}
+	defer release2()
+	if n := countInvocations(t, logB); n != 1 {
+		t.Errorf("next-request relaunch invocation count (new args, logB) = %d, want 1", n)
+	}
+	if n := countInvocations(t, logA); n != 1 {
+		t.Errorf("old-args invocation count (logA) = %d, want 1: the child must not re-run with stale args", n)
+	}
+}

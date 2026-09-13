@@ -915,8 +915,10 @@ func (o *owner) applyConfig(cfg Config) {
 		// to actually re-check would just be a cosmetic, potentially
 		// misleading flip.
 		changed := !reflect.DeepEqual(st.spec, spec)
+		prevSpec := st.spec
 		st.spec = spec
-		if changed && st.proc == nil {
+		switch {
+		case changed && st.proc == nil:
 			switch st.state {
 			case StateStartFailed, StateCrashed:
 				o.setState(st, StateStopped)
@@ -924,6 +926,24 @@ func (o *owner) applyConfig(cfg Config) {
 				cancelTimer(o.m, &st.backoffTimer)
 				o.setState(st, StateStopped)
 			}
+		case changed && st.proc != nil && spec.AdminState != "force_stopped" && !sameLaunchShape(prevSpec, spec):
+			// I7 fix (issue #63): a LIVE child whose LAUNCH SHAPE changed must
+			// be relaunched with it. Before this, applyConfig stored the new
+			// spec (above) but acted only on a STOPPED child, so a running
+			// child kept the old binary/args/env/GPUs/visible-devices/port
+			// until it restarted for some unrelated reason -- the edit
+			// silently had no effect. Drain it exactly like a removed spec,
+			// but WITHOUT st.removed: onProcExited's clean-stop branch then
+			// re-admits this same spec, so a pinned/force_running child comes
+			// back immediately with the new shape and an on-demand one on its
+			// next request; either way in-flight requests drain rather than
+			// being killed. A metadata-only edit (idle timeout, pinned,
+			// admin_state, health/probe paths, model name) leaves the launch
+			// shape equal, so sameLaunchShape skips it and it takes effect in
+			// place from the stored st.spec. force_stopped is excluded: its
+			// own drain is handled by the force loop below, and it must not
+			// relaunch.
+			o.beginDrain(spec.ID)
 		}
 	}
 
@@ -992,6 +1012,56 @@ func (o *owner) applyConfig(cfg Config) {
 		}
 	}
 	o.wakeAdmissionCandidates()
+}
+
+// sameLaunchShape reports whether two revisions of a spec would exec the
+// IDENTICAL child process, and so whether a running child needs no relaunch
+// when the spec changes (issue #63). It is defined as the COMPLEMENT of the
+// metadata fields: every field the agent consumes live (re-read from the
+// stored spec on the next relevant event) or only at the next start is
+// zeroed, and whatever remains -- the fields ExpandPlaceholders + startProcess
+// bake into the process (binary, args, env, work_dir, the GPU index set, the
+// visible-devices toggle and mode, listen port, the ${API_TOKEN} material,
+// and upstream_model via a ${MODEL} placeholder) -- is compared with
+// reflect.DeepEqual. Anchoring on the metadata set is deliberate: a NEW Spec
+// field therefore defaults to launch-affecting until it is added here, so a
+// forgotten classification over-relaunches (harmless -- a graceful drain and
+// restart) rather than silently ignoring a real launch change, which is the
+// exact failure mode of issue #63.
+func sameLaunchShape(a, b Spec) bool {
+	strip := func(s Spec) Spec {
+		s.Model = ""                      // router display/routing key, read live
+		s.HealthPath = ""                 // startup health probe, next start only
+		s.HealthTimeoutSeconds = 0        // "
+		s.StartupTimeoutSeconds = 0       // "
+		s.IdleTimeoutSeconds = 0          // scanIdle, read live
+		s.AdmissionWaitTimeoutSeconds = 0 // per-request waiter, read live
+		s.Pinned = false                  // admission / scanIdle, read live
+		s.AdminState = ""                 // force loop below, read live
+		s.Type = ""                       // reported for probes, read live
+		s.MetricsPath = ""                // "
+		s.ContextProbePath = ""           // "
+		// GPUs' launch-relevant part is the ordered/deduped INDEX list
+		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
+		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
+		// arithmetic and the measurement snapshot, never baked into the child.
+		// Zero it so a pure vram_mb edit is metadata (binds at the next start,
+		// per the admission-not-retroactive rule) -- crucial because the
+		// gateway writes measured VRAM back into vram_mb, which would otherwise
+		// relaunch every freshly measured healthy child. Index (and any future
+		// SpecGPU subfield) stays in the comparison, so the fail-safe bias
+		// holds.
+		if len(s.GPUs) > 0 {
+			gpus := make([]SpecGPU, len(s.GPUs))
+			for i, g := range s.GPUs {
+				g.VRAMMB = 0
+				gpus[i] = g
+			}
+			s.GPUs = gpus
+		}
+		return s
+	}
+	return reflect.DeepEqual(strip(a), strip(b))
 }
 
 func (o *owner) rebuildUpstreamIndex() {

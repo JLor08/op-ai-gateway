@@ -1900,22 +1900,35 @@ or start, so the router's non-blocking endpoints stay non-blocking.
 
 ### 5.6 What a pushed config applies, and what it does not
 
-Admission is evaluated only when a request arrives for a spec that is **not
-currently running**, plus a re-attempt for queued waiters when a release frees
-resources. Nothing re-evaluates admission for processes already up. So:
+A spec's own **launch definition** is reconciled on every push: if a
+launch-affecting field of a running spec changes, its child is relaunched (see
+below). The **admission arithmetic** (per-GPU budgets, co-residency,
+`runtime_max_processes`) is not: it is evaluated only when a request arrives for
+a spec that is **not currently running**, plus a re-attempt for queued waiters
+when a release frees resources, and nothing re-evaluates it for processes
+already up. So:
 
 | A pushed configuration change | Effect |
 |---|---|
 | Spec removed from the document | **Applied immediately** — the spec drains. |
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
+| A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
+| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **or a GPU row's `vram_mb`** — the admission demand, not a launch input) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` binds at the next start, per the not-retroactive rule below). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed co-residency pair | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
 
-An operator who lowers a budget to reclaim VRAM and sees nothing happen will
+The launch-vs-metadata split is the complement of the fields the agent bakes
+into the child at exec time: a change is launch-affecting unless the field is
+one the agent reads live from the stored spec or only at the next start, so a
+newly added spec field defaults to forcing a relaunch rather than being silently
+ignored (`sameLaunchShape`, `manager.go`).
+
+An operator who lowers a **budget** to reclaim VRAM and sees nothing happen will
 conclude the setting is broken. Operator guidance: to make a tightened limit
 take effect now, force-stop the running spec — which *is* applied on push — or
-accept that it binds when the process next stops for another reason.
+accept that it binds when the process next stops for another reason. (A change
+to the spec's own launch definition, by contrast, relaunches on its own.)
 
 Applying a document resets a spec's terminal or backoff state **only for specs
 whose own spec document actually changed** (compared field-wise), and `Apply`
@@ -2892,9 +2905,11 @@ mirror). Three different cadences share the one collect cycle:
   PID) forces a re-probe, since a new process generation may serve a
   different model or config — short-circuits every cycle after the first
   success. The entry also carries the `Type`, `ContextProbePath` and (since
-  #54) `Model` it was probed with, and a cache hit compares all three: the
-  config reconciliation edits a RUNNING spec in place, same PID, so a
-  spec repointed at a different model must not keep serving the previous
+  #54) `Model` it was probed with, and a cache hit compares all three: a
+  **metadata** edit to a RUNNING spec (model, type, probe path — none of them
+  launch-affecting) is applied in place, same PID (a launch-affecting edit
+  relaunches instead — a new PID, already caught by the key above; see §5.6),
+  so a spec repointed at a different model must not keep serving the previous
   model's size. Nothing about a stale size looks invalid, which is why the
   comparison is the only thing that catches it. A *failed* probe is never
   cached, so a child whose HTTP server is still warming up is retried next
