@@ -791,11 +791,11 @@ by shape, so tests pin both:
   A client that sent `timings_per_token` **itself** — `true` or `false` — has its
   body forwarded unchanged: the injection tests for the key's *presence*, not its
   value, because llama.cpp was measured treating an explicit `false` exactly as
-  it treats an absent key (§ "the flag's effect reproduces" below).
-  Overwriting an explicit client `false` would be the silently rewritten
-  client request this path refuses to be; the accepted cost is that such a client
-  makes the operator's switch ineffective for its own requests, with nothing on
-  the panel explaining why.
+  it treats an absent key (§ "the flag's effect reproduces" below). Overwriting
+  an explicit client `false` would be the silently rewritten client request this
+  path refuses to be; the accepted cost is that such a client makes the
+  operator's switch ineffective for its own requests, with nothing on the panel
+  explaining why.
 
   **Nothing retries without it.** An upstream that rejects the key answers the
   client's request with its own 4xx. That residual is measured-small rather than
