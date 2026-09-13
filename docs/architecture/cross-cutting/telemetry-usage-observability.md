@@ -1787,16 +1787,22 @@ Four properties of the substitution are deliberate, and pinned:
   flavor-agnostic substitution a no-op for `anthropic_messages` by construction
   rather than by assumption.
 
-**The same gate governs both columns.** `usageScanner.publishProgress`
-publishes an output-token count to the live counter only from an authoritative
-frame, for a sharper version of the identical reason: the recorded row can
-tolerate a placeholder because it is presented as a *count*, whereas
-`liveProgressDTO` would divide that `1` by the generation window and DISPLAY the
-quotient as a measured *rate* for the rest of the stream. One predicate, one
-definition per flavor, three consumers — the derived rate, the frame that
-freezes the recorded rate's capture, and the live count — so the predicate's
-Responses branch now has two readers of its own (the live count, and the rate
-capture above) where the Anthropic-only derived rate gives it none.
+**The same gate still governs the frame's own `OutputTokens`, and no longer
+governs the live column alone.** `usageScanner.publishProgress` publishes **this
+frame's** `OutputTokens` to the live counter only from an authoritative frame,
+for a sharper version of the identical reason: the recorded row can tolerate a
+placeholder because it is presented as a *count*, whereas `liveProgressDTO` would
+divide that `1` by the generation window and DISPLAY the quotient as a measured
+*rate* for the rest of the stream. What a **non**-authoritative frame may publish
+is the separate `LiveOutputTokens` — llama.cpp's `timings.predicted_n`, a number
+the upstream reported for **itself** rather than a placeholder the merge cannot
+distinguish. That is the whole reason the two travel in different fields: the
+gate exists to keep a placeholder off the live column, and an upstream's own
+per-frame count is not one. One predicate, one definition per flavor, three
+consumers — the derived rate, the frame that freezes the recorded rate's
+capture, and the live count — so the predicate's Responses branch now has two
+readers of its own (the live count, and the rate capture above) where the
+Anthropic-only derived rate gives it none.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds
