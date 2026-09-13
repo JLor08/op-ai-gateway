@@ -685,6 +685,34 @@ from the browser. Instead:
    state, which the browser's `EventSource` streams to the UI — the browser
    itself never opens a fetch stream.
 
+The executor also derives the turn's display metrics (`consumeRunStream`):
+
+- **TTFT** — request start to the first content delta.
+- **chars/s** — the visible answer's character rate. Counted in **runes, not
+  bytes** (`utf8.RuneCountInString`), over the **content window** (first content
+  delta → completion; reasoning text is not in the answer buffer, so its window
+  excludes the reasoning phase), and floored: a rate is only reported once that
+  window reaches `minGatewayRateWindow` (the same 50 ms floor the passthrough
+  surfaces use), so the first delta's microsecond divisor can no longer
+  fabricate an absurd rate.
+- **tokens/s** — the real output tokens per second. The loopback body sets
+  `stream_options.include_usage`, so `/v1/chat/completions` emits a terminal
+  usage chunk carrying the exact `completion_tokens`; the executor divides that
+  by the **full generation window** (first token of any kind → completion, also
+  floored). The window deliberately differs from chars/s: `completion_tokens`
+  includes reasoning tokens, so anchoring it on the first *content* delta would
+  divide a reasoning-inclusive count by a reasoning-excluding window and inflate
+  the rate on reasoning turns. It exists only once a turn has completed, and is
+  absent (not zero) mid-turn or when the upstream reported no usage.
+
+  These reach the UI two ways, with deliberately different key casing:
+  the live SSE metrics event is snake_case (`ttft_ms`, `reasoning_ms`, `tps`,
+  `tokens_per_second`), while the persisted transcript message is camelCase
+  (`ttftMs`, `reasoningMs`, `tps`, `tokensPerSecond`) so the portal reads it by
+  a direct cast. In **both**, `tps` is the character rate (the key predates the
+  tokens/s metric and is kept so old transcripts still render); the real
+  tokens/s is always the separate `tokens_per_second`/`tokensPerSecond` key.
+
 ## 13. Errors
 
 Every inference error response uses the gateway-wide envelope

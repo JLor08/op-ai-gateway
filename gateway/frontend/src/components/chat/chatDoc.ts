@@ -24,13 +24,22 @@ export type ChatUiMessage = {
   reasoning?: string;
   reasoningMs?: number;
   ttftMs?: number;
+  // tps is the output CHARACTER rate ("chars/s"), kept under the legacy `tps`
+  // name so old transcripts still render. tokensPerSecond is the real output
+  // tokens/sec, present only once a turn has completed (issue #56).
   tps?: number;
+  tokensPerSecond?: number;
   status?: ChatMessageStatus;
 };
 
 // Shape of the named SSE metrics payload (wire keys are snake_case; mapped to
 // the camelCase message fields via metricsOf below).
-export type RunMetricsPayload = { ttft_ms?: number; reasoning_ms?: number; tps?: number };
+export type RunMetricsPayload = {
+  ttft_ms?: number;
+  reasoning_ms?: number;
+  tps?: number;
+  tokens_per_second?: number;
+};
 
 // resolveTokenOverride returns the run-as token's effective override for a
 // requested model: an exact per-model map entry wins, otherwise the catch-all
@@ -53,6 +62,8 @@ export function metricsOf(metrics?: RunMetricsPayload): Partial<ChatUiMessage> {
   if (typeof metrics.reasoning_ms === 'number' && metrics.reasoning_ms > 0)
     out.reasoningMs = metrics.reasoning_ms;
   if (typeof metrics.tps === 'number' && metrics.tps > 0) out.tps = metrics.tps;
+  if (typeof metrics.tokens_per_second === 'number' && metrics.tokens_per_second > 0)
+    out.tokensPerSecond = metrics.tokens_per_second;
   return out;
 }
 

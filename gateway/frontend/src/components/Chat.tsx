@@ -286,6 +286,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   reasoningMs={message.reasoningMs}
                   ttftMs={message.ttftMs}
                   tps={message.tps}
+                  tokensPerSecond={message.tokensPerSecond}
                   streaming={c.streaming && isLast && message.role === 'assistant'}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}

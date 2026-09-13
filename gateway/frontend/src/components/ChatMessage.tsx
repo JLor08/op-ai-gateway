@@ -47,6 +47,7 @@ function ChatMessageComponent({
   streaming,
   ttftMs,
   tps,
+  tokensPerSecond,
   onEdit,
   onRegenerate,
   canRun = true,
@@ -59,6 +60,7 @@ function ChatMessageComponent({
   streaming?: boolean;
   ttftMs?: number;
   tps?: number;
+  tokensPerSecond?: number;
   onEdit?: (text: string) => void;
   onRegenerate?: () => void;
   // Whether a new run may be started. False while the model is unavailable —
@@ -270,14 +272,22 @@ function ChatMessageComponent({
               <CodeIcon fontSize="small" />
             </IconButton>
           </Tooltip>
-          {(ttftMs !== undefined || tps !== undefined) && (
+          {(ttftMs !== undefined || tps !== undefined || tokensPerSecond !== undefined) && (
             <Typography
               component="span"
               sx={{ ml: 1, color: 'var(--muted)', fontSize: 12, whiteSpace: 'nowrap' }}
             >
-              {ttftMs !== undefined ? `${t.chatTtftLabel} ${(ttftMs / 1000).toFixed(1)}s` : ''}
-              {ttftMs !== undefined && tps !== undefined ? ' · ' : ''}
-              {tps !== undefined ? `${Math.round(tps)} ${t.chatCharsPerSecUnit}` : ''}
+              {[
+                ttftMs !== undefined ? `${t.chatTtftLabel} ${(ttftMs / 1000).toFixed(1)}s` : '',
+                tps !== undefined ? `${Math.round(tps)} ${t.chatCharsPerSecUnit}` : '',
+                // tokens/sec appears next to chars/s once the turn completes and
+                // the upstream reported usage (issue #56).
+                tokensPerSecond !== undefined
+                  ? `${Math.round(tokensPerSecond)} ${t.chatTokensPerSecUnit}`
+                  : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             </Typography>
           )}
         </Stack>

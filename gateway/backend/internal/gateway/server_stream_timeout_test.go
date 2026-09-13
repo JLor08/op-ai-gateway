@@ -57,6 +57,79 @@ func (p pacedStreamer) CompleteStream(ctx context.Context, _ routing.Target, _ i
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{InputTokens: 1, OutputTokens: p.n, TotalTokens: 1 + p.n}})
 }
 
+// pacedTextStreamer emits n deltas of a fixed text (which may be multibyte), spaced
+// by gap, then a terminal completion reporting outTokens. Unlike pacedStreamer
+// it decouples the reported output-token count from the delta count, so a run
+// can have a chars/s (from the content's runes) that differs from its
+// tokens/sec (from outTokens) by a known ratio -- letting a test prove chars/s
+// counts runes, not bytes, and that tokens/sec comes from the usage chunk.
+type pacedTextStreamer struct {
+	text      string
+	n         int
+	gap       time.Duration
+	outTokens int
+}
+
+func (pacedTextStreamer) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (s pacedTextStreamer) CompleteStream(ctx context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	for i := 0; i < s.n; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.gap):
+		}
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: s.text}); err != nil {
+			return err
+		}
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{InputTokens: 1, OutputTokens: s.outTokens, TotalTokens: 1 + s.outTokens}})
+}
+
+// reasoningThenTextStreamer emits reasoningN reasoning deltas, then textN content
+// deltas, all spaced by gap, then a terminal completion reporting outTokens
+// (which, like a real upstream, counts reasoning tokens too). It lets a test
+// prove tokens/s is measured over the FULL generation window (reasoning first
+// token -> completion) while chars/s covers only the content window (issue #56).
+type reasoningThenTextStreamer struct {
+	reasoning  string
+	reasoningN int
+	text       string
+	textN      int
+	gap        time.Duration
+	outTokens  int
+}
+
+func (reasoningThenTextStreamer) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (s reasoningThenTextStreamer) CompleteStream(ctx context.Context, _ routing.Target, _ inference.Request, emit provider.StreamEmit) error {
+	for i := 0; i < s.reasoningN; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.gap):
+		}
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Reasoning: s.reasoning}); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < s.textN; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.gap):
+		}
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: s.text}); err != nil {
+			return err
+		}
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{InputTokens: 1, OutputTokens: s.outTokens, TotalTokens: 1 + s.outTokens}})
+}
+
 // trickleReader releases its pieces one Read at a time, sleeping gap before each, so the
 // request body takes len(pieces)*gap to arrive on the wire.
 type trickleReader struct {

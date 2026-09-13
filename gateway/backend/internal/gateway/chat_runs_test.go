@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestLoopbackBaseFromAddr(t *testing.T) {
@@ -49,6 +51,37 @@ func TestParseChatSSELine(t *testing.T) {
 	}
 	if _, kind := parseChatSSELine(`data: {"error":{"code":"x","message":"boom"}}`); kind != sseError {
 		t.Fatalf("want error frame")
+	}
+	// The terminal usage chunk (stream_options.include_usage) has an empty
+	// choices/delta but the exact completion-token count: surface it as sseUsage
+	// carrying that count, not sseIgnore as an empty delta (issue #56).
+	if ev, kind := parseChatSSELine(`data: {"choices":[],"usage":{"completion_tokens":42}}`); kind != sseUsage || ev.OutputTokens != 42 {
+		t.Fatalf("want usage kind with 42 tokens, got %v %+v", kind, ev)
+	}
+	// A usage chunk reporting zero completion tokens carries no rate signal: ignore.
+	if _, kind := parseChatSSELine(`data: {"choices":[],"usage":{"completion_tokens":0}}`); kind != sseIgnore {
+		t.Fatalf("want ignore for zero-token usage chunk")
+	}
+}
+
+func TestFlooredRate(t *testing.T) {
+	// Below the floor the divisor is a microsecond artefact -> 0, no matter the
+	// count. This is the whole point of the floor (issue #56).
+	if got := flooredRate(1000, minGatewayRateWindow-time.Nanosecond); got != 0 {
+		t.Fatalf("flooredRate below floor = %v, want 0", got)
+	}
+	// The floor is inclusive (>=): a window of exactly minGatewayRateWindow
+	// engages rather than returning 0.
+	if got, want := flooredRate(50, minGatewayRateWindow), 50/minGatewayRateWindow.Seconds(); got != want {
+		t.Fatalf("flooredRate at the exact floor = %v, want %v (inclusive boundary)", got, want)
+	}
+	// Above the floor: 100 over 100ms = 1000/s.
+	if got := flooredRate(100, 100*time.Millisecond); got != 1000 {
+		t.Fatalf("flooredRate(100, 100ms) = %v, want 1000", got)
+	}
+	// A non-positive count is 0 even above the floor.
+	if got := flooredRate(0, time.Second); got != 0 {
+		t.Fatalf("flooredRate(0, 1s) = %v, want 0", got)
 	}
 }
 
@@ -293,6 +326,209 @@ func TestExecuteRunCommitsTranscript(t *testing.T) {
 	}
 	if !strings.Contains(string(got.Content), `"status":"complete"`) {
 		t.Fatalf("assistant not committed: %s", got.Content)
+	}
+}
+
+// TestExecuteRunMetricsRunesNotBytesAndTokens pins the two halves of issue #56
+// on the committed transcript:
+//
+//   - chars/s (`tps`) counts RUNES, not bytes. The stream emits multibyte text
+//     whose byte length exceeds its rune length, so a byte-counting bug would
+//     inflate the rate. Because the final chars/s and tokens/sec are computed
+//     over the SAME window, their ratio is exactly runes:tokens regardless of
+//     wall-clock timing -- a deterministic assertion despite real-time rates.
+//   - tokens/sec (`tokens_per_second`) is present and derived from the upstream
+//     usage chunk (requested via stream_options.include_usage), whose token
+//     count is decoupled here from the delta count.
+func TestExecuteRunMetricsRunesNotBytesAndTokens(t *testing.T) {
+	const delta = "aé" // 2 runes, 3 bytes -- runes != bytes
+	const deltas = 15
+	const outTokens = 10
+	runesPerDelta := utf8.RuneCountInString(delta)
+	bytesPerDelta := len(delta)
+	if runesPerDelta == bytesPerDelta {
+		t.Fatal("test delta must be multibyte so runes != bytes")
+	}
+	// 15 deltas * 6ms = ~90ms window, comfortably above minGatewayRateWindow so
+	// both rates engage (a shorter window would floor them both to 0).
+	prov := pacedTextStreamer{text: delta, n: deltas, gap: 6 * time.Millisecond, outTokens: outTokens}
+	srv, owner, chatID := newRunTestServerWithProvider(t, prov)
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("run status = %q, want completed", got)
+	}
+
+	got, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	var doc struct {
+		Messages []struct {
+			Role            string  `json:"role"`
+			Content         string  `json:"content"`
+			TPS             float64 `json:"tps"`
+			TokensPerSecond float64 `json:"tokensPerSecond"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(got.Content, &doc); err != nil {
+		t.Fatalf("unmarshal chat doc: %v (%s)", err, got.Content)
+	}
+	var asst *struct {
+		Role            string  `json:"role"`
+		Content         string  `json:"content"`
+		TPS             float64 `json:"tps"`
+		TokensPerSecond float64 `json:"tokensPerSecond"`
+	}
+	for i := range doc.Messages {
+		if doc.Messages[i].Role == "assistant" {
+			asst = &doc.Messages[i]
+		}
+	}
+	if asst == nil {
+		t.Fatalf("no assistant message: %s", got.Content)
+	}
+	if asst.TPS <= 0 {
+		t.Fatalf("chars/s (tps) = %v, want > 0", asst.TPS)
+	}
+	if asst.TokensPerSecond <= 0 {
+		t.Fatalf("tokens_per_second = %v, want > 0 (from usage chunk)", asst.TokensPerSecond)
+	}
+	// The window cancels in the ratio, leaving content-runes : output-tokens.
+	wantRunes := utf8.RuneCountInString(asst.Content)
+	if wantRunes != deltas*runesPerDelta {
+		t.Fatalf("buffered content = %d runes, want %d", wantRunes, deltas*runesPerDelta)
+	}
+	ratio := asst.TPS / asst.TokensPerSecond
+	runeRatio := float64(wantRunes) / float64(outTokens)
+	byteRatio := float64(deltas*bytesPerDelta) / float64(outTokens)
+	if diff := ratio - runeRatio; diff > 0.01 || diff < -0.01 {
+		t.Fatalf("tps/tokens_per_second = %.4f, want %.4f (runes:tokens); a byte count would give %.4f",
+			ratio, runeRatio, byteRatio)
+	}
+}
+
+// TestExecuteRunTokensPerSecondAbsentWithoutUsage: when the upstream reports no
+// output tokens, tokens/sec is absent (not a spurious 0) while chars/s is still
+// reported. This exercises the completion_tokens==0 -> sseIgnore guard, so the
+// run never receives a usable token count (issue #56).
+func TestExecuteRunTokensPerSecondAbsentWithoutUsage(t *testing.T) {
+	// n content deltas, 8ms apart (~64ms >= floor), but a usage chunk of 0 tokens.
+	prov := pacedTextStreamer{text: "hi", n: 8, gap: 8 * time.Millisecond, outTokens: 0}
+	srv, owner, chatID := newRunTestServerWithProvider(t, prov)
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("run status = %q, want completed", got)
+	}
+
+	got, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	content := string(got.Content)
+	// chars/s present (a rate was measurable), tokens/sec key omitted entirely.
+	if !strings.Contains(content, `"tps":`) {
+		t.Fatalf("chars/s missing despite measurable content: %s", content)
+	}
+	if strings.Contains(content, `"tokensPerSecond":`) {
+		t.Fatalf("tokens/sec must be absent when the upstream reported no usage: %s", content)
+	}
+}
+
+// TestExecuteRunTokensPerSecondSpansReasoning pins the reasoning half of issue
+// #56 part (B): the upstream's completion_tokens count includes reasoning
+// tokens, so tokens/sec must be divided by the FULL generation window
+// (reasoning + content), not just the content window. chars/s stays on the
+// content window. The check is timing-robust: it reconstructs each rate's window
+// from the committed rate and asserts their difference is the recorded reasoning
+// duration. A regression that anchors tokens/sec on the first CONTENT delta
+// would make that difference ~0 and fail here.
+func TestExecuteRunTokensPerSecondSpansReasoning(t *testing.T) {
+	const gap = 8 * time.Millisecond
+	prov := reasoningThenTextStreamer{
+		reasoning:  "rz",
+		reasoningN: 12, // ~96ms of reasoning before any content
+		text:       "ab",
+		textN:      10, // ~80ms content window; content = 20 runes
+		gap:        gap,
+		outTokens:  30, // includes the reasoning tokens, like a real upstream
+	}
+	srv, owner, chatID := newRunTestServerWithProvider(t, prov)
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("run status = %q, want completed", got)
+	}
+
+	got, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	var doc struct {
+		Messages []struct {
+			Role            string  `json:"role"`
+			Content         string  `json:"content"`
+			ReasoningMs     float64 `json:"reasoningMs"`
+			TPS             float64 `json:"tps"`
+			TokensPerSecond float64 `json:"tokensPerSecond"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(got.Content, &doc); err != nil {
+		t.Fatalf("unmarshal chat doc: %v (%s)", err, got.Content)
+	}
+	var m *struct {
+		Role            string  `json:"role"`
+		Content         string  `json:"content"`
+		ReasoningMs     float64 `json:"reasoningMs"`
+		TPS             float64 `json:"tps"`
+		TokensPerSecond float64 `json:"tokensPerSecond"`
+	}
+	for i := range doc.Messages {
+		if doc.Messages[i].Role == "assistant" {
+			m = &doc.Messages[i]
+		}
+	}
+	if m == nil {
+		t.Fatalf("no assistant message: %s", got.Content)
+	}
+	if m.ReasoningMs <= 0 {
+		t.Fatalf("reasoningMs = %v, want > 0 (reasoning happened)", m.ReasoningMs)
+	}
+	if m.TPS <= 0 || m.TokensPerSecond <= 0 {
+		t.Fatalf("rates not both set: tps=%v tokens/s=%v", m.TPS, m.TokensPerSecond)
+	}
+	// Reconstruct each rate's window: chars/s covers the content window, tokens/s
+	// the generation window. Their difference is the reasoning phase, which the
+	// message also records as reasoningMs.
+	contentWindow := float64(utf8.RuneCountInString(m.Content)) / m.TPS
+	genWindow := 30.0 / m.TokensPerSecond
+	gotReasoningSecs := genWindow - contentWindow
+	wantReasoningSecs := m.ReasoningMs / 1000.0
+	if math.Abs(gotReasoningSecs-wantReasoningSecs) > 0.005 {
+		t.Fatalf("tokens/s window excludes the reasoning phase: gen-content window = %.4fs, want ~%.4fs (reasoningMs). "+
+			"A content-anchored tokens/s (the bug) would give ~0.", gotReasoningSecs, wantReasoningSecs)
 	}
 }
 

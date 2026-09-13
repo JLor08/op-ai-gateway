@@ -260,7 +260,7 @@ func TestCheckpointThenCommitAssistant(t *testing.T) {
 		t.Fatalf("checkpoint not written: %s", got.Content)
 	}
 
-	final := AssistantTurn{Reasoning: "think", Content: "full answer", TTFTMs: 5, TPS: 12.5}
+	final := AssistantTurn{Reasoning: "think", Content: "full answer", TTFTMs: 5, CharsPerSecond: 12.5, TokensPerSecond: 4}
 	if err := svc.CommitAssistant(ctx, owner, created.ID, final, "complete"); err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +268,15 @@ func TestCheckpointThenCommitAssistant(t *testing.T) {
 	if !strings.Contains(string(got.Content), `"status":"complete"`) ||
 		!strings.Contains(string(got.Content), `"full answer"`) {
 		t.Fatalf("commit not written: %s", got.Content)
+	}
+	// chars/s persists under the legacy `tps` key; tokens/sec under camelCase
+	// `tokensPerSecond` (matching ttftMs/reasoningMs) so the portal reads it by
+	// direct cast (issue #56).
+	if !strings.Contains(string(got.Content), `"tps":12.5`) {
+		t.Fatalf("chars/s not persisted under tps: %s", got.Content)
+	}
+	if !strings.Contains(string(got.Content), `"tokensPerSecond":4`) {
+		t.Fatalf("tokens/sec not persisted under tokensPerSecond: %s", got.Content)
 	}
 	// Still exactly one assistant message (checkpoint upserts, does not append).
 	if strings.Count(string(got.Content), `"role":"assistant"`) != 1 {
