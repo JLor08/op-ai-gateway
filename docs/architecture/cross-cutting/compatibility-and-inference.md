@@ -382,15 +382,16 @@ what finally lands one. With it, those same partials carry llama.cpp's own
 `timings`, and the row gets both an upstream-reported rate and an
 upstream-reported count while the request is still running — the count on a
 column that ships **hidden**, which an operator who has never changed that
-panel's columns reveals from its column menu. The flag reaches the body either because the **client** set it, in
-which case it is relayed untouched, or because the application's (or runtime
-spec's) `responses_live_timings_enabled` opt-in is on and the request is a
-streaming `/v1/responses` passthrough to a `llama_cpp` upstream. A **buffered**
-response still gets nothing at all, having no frames to time. The per-flavor
-detail, the five conditions that gate the injection, and the two rules that keep
-it honest — a relayed body is augmented only where the operator asked and never
-over a value the client set itself, and no in-flight figure ever becomes a
-routing input — are in [Telemetry, Usage Analytics & Observability
+panel's columns reveals from its column menu. The flag reaches the body either
+because the **client** set it, in which case it is relayed untouched, or because
+the application's (or runtime spec's) `responses_live_timings_enabled` opt-in is
+on and the request is a streaming `/v1/responses` passthrough to a `llama_cpp`
+upstream. A **buffered** response still gets nothing at all, having no frames to
+time. The per-flavor detail, the five conditions that gate the injection, and
+the two rules that keep it honest — a relayed body is augmented only where the
+operator asked and never over a value the client set itself, and no in-flight
+figure ever becomes a routing input — are in [Telemetry, Usage Analytics &
+Observability
 §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests).
 
 ## 7. Streaming lifecycle
