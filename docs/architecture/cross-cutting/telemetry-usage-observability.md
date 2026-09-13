@@ -757,15 +757,55 @@ rather than merely as a number where there should be none.
 **Two rules on this path must survive any later change.** Neither is enforceable
 by shape, so tests pin both:
 
-- **`timings_per_token` is READ when the client set it, and never injected.**
-  Injecting it is what would complete the Responses column mid-stream for every
-  client, which is exactly why the temptation is worth naming at the one place
-  someone would act on it: `rewriteModelField` is the only edit ever made to a
-  relayed body, and adding the flag would change the upstream's *response*
-  shape — frames' worth of fields the client never asked for, flowing through to
-  a client that must parse them — in order to improve a gateway display column.
-  A missing live rate renders as "not measured" and is honest; a silently
-  rewritten client request is not.
+- **`timings_per_token` is added to a relayed body only where the operator asked
+  for it, and never over a value the client set itself.** It is the one request
+  parameter the gateway ever adds on this path, and the second of the only two
+  body edits `proxyNative` makes — the other being the model rewrite.
+  `wantsResponsesLiveTimings` (`responses_live_timings.go`) is the whole of the
+  decision, and it answers true only when **all five** of these hold:
+  1. `Target.ResponsesLiveTimingsEnabled` — the operator's per-endpoint opt-in,
+     resolved spec-over-application, the same precedence `responses_mode` uses
+     ([API Surface](../reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode));
+  2. the effective upstream kind is `llama_cpp`. For a `server_agent` target that
+     is `Target.LiveProgressSpecType`; `Target.Provider` holds the literal
+     `server_agent` there and is the wrong field to read;
+  3. the request is the **Responses** flavor — the *fine* flavor, taken as a
+     parameter, because `Target.APIFlavor` is the coarse `openai`/`anthropic` one
+     and cannot tell `/v1/responses` from `/v1/chat/completions`;
+  4. the request is **streaming** — a buffered body has no partial frames to
+     time, and gets no live counter either;
+  5. the stored live-progress verdict is not an explicit `"unsupported"`.
+
+  Point 5 is a **veto, not a requirement.** Requiring a *positive* verdict would
+  make the switch silently dead wherever the capability probe never ran, which is
+  the worst failure available to a control an operator has deliberately switched
+  ON; and within llama.cpp a positive verdict allows nothing the veto has not
+  already allowed. The verdict's vocabulary is load-bearing:
+  `Target.LiveProgressSupport` speaks `""` / `"supported"` / `"unsupported"`, so
+  a veto written against the capability row's own `"no"` would never fire. Point
+  2 re-checks the **kind** rather than trusting the portal's write rule, because
+  the store is policy-free by design — its parity fixture deliberately seeds a
+  `true` on an incapable row — so a restored dump or a direct write can produce
+  one the request path must not act on.
+
+  A client that sent `timings_per_token` **itself** — `true` or `false` — has its
+  body forwarded unchanged: the injection tests for the key's *presence*, not its
+  value, because llama.cpp was measured treating an explicit `false` exactly as
+  it treats an absent key (§ "the flag's effect reproduces" below).
+  Overwriting an explicit client `false` would be the silently rewritten
+  client request this path refuses to be; the accepted cost is that such a client
+  makes the operator's switch ineffective for its own requests, with nothing on
+  the panel explaining why.
+
+  **Nothing retries without it.** An upstream that rejects the key answers the
+  client's request with its own 4xx. That residual is measured-small rather than
+  overlooked: on the build this was measured against, `/v1/responses` answered a
+  request carrying an entirely fabricated top-level key with an ordinary
+  completion, and llama.cpp's request schema is pull-based, so a key nobody asks
+  for is never inspected. The blast radius is one application, the operator can
+  switch it off through either portal surface, and the failure is immediate and
+  visible rather than silent. What makes it *diagnosable* is the log field in the
+  next paragraph, not the capture.
 - **The in-flight figure is display only.** The END-of-request rate still feeds
   an opted-in mapping's throughput EWMA (`UpdateMappingOpportunisticMetrics`,
   read back by the scorer and by a model group's `MinTokensPerSecond` gate —
@@ -775,6 +815,16 @@ by shape, so tests pin both:
   path, and the test asserts that on the CALL COUNT with the opt-in switched on,
   because an extra write carrying an identical-looking value would otherwise
   hide.
+
+  What the opt-in does change is **which traffic** reaches the end-of-request
+  feed at all. A flagged stream carries per-frame rates where an unflagged one
+  carries none, including the truncated stream that ends cleanly at 200 with no
+  `response.completed` — recorded `status = "success"`, so its last reported rate
+  is a routing input like any complete stream's (see "A response with no
+  authoritative frame records the LAST rate its own frames reported" further
+  down). The operator's switch, not only a client's own body, now selects
+  requests into that population. The recorded figure is still the rate the stream
+  reported rather than the generation's peak, and must stay that way.
 
 **What this surface does and does not distinguish**, since the tooltip's refusal
 to name a cause is easy to mistake for a missing field. `provider_path` **does**
