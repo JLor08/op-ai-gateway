@@ -1666,6 +1666,35 @@ requests, so each bullet says which run it belongs to.
   not corrective.
 - **`draft_n` survives on the terminal frame with the flag set** (28 on the
   measured run), so nothing about `speculation_observed` (§ above) changes.
+- **The flag's effect reproduces, an explicit `false` is honoured upstream, and
+  the wire cost is 2.49×.** A third set, measured **on 2026-09-12** on the same
+  build and deployment: the same prompt run three times, all three terminating
+  at the same `output_tokens: 60`.
+
+  | outgoing body | data frames | frames carrying `timings` | bytes |
+  |---|---|---|---|
+  | `"timings_per_token": true` | 68 | **59** | 28 463 |
+  | key absent | 68 | **1** (terminal only) | 11 412 |
+  | `"timings_per_token": false` | 65 | **1** (terminal only) | 10 614 |
+
+  Two facts the rest of this section leans on come from that table and nowhere
+  else. **llama.cpp treats an explicit `false` exactly as it treats an absent
+  key** — which is why the injection tests for the key's PRESENCE rather than
+  its value, and why a client that sends `false` keeps its own body and defeats
+  the operator's switch for its own requests. And **2.49× is the wire cost of
+  the flag for an identical generation** — fields the client never asked for on
+  frames it must parse, which is the whole reason this is an operator's switch
+  rather than a default, and the size of what a later response-side strip would
+  recover.
+- **An unknown top-level key is not rejected, which is why there is no retry.** A
+  `/v1/responses` request on the same build carrying `"zzq_not_a_real_key": true`
+  answered with an ordinary completion body rather than an error object:
+  llama.cpp's request schema is pull-based, so a key nobody asks for is never
+  inspected. A retry without the flag would therefore be code that no upstream
+  this repository can point at would ever fire — the streaming run in the table
+  above carried the very key that gets injected and was not rejected either. The
+  residual that an OLDER build might reject it is recorded on the risk register
+  ([Risks & Technical Debt §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 Four properties of the substitution are deliberate, and pinned:
 
