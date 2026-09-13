@@ -5,14 +5,31 @@ import { describe, expect, it } from 'vitest';
 import { applicationLiveTimingsKind, runtimeSpecLiveTimingsKind } from './liveTimings';
 import type { ApplicationType, RuntimeSpec } from '../../api';
 
-// Both lists are stated EXHAUSTIVELY and are the whole point of the test: the
-// Go set (routing.liveTimingsCapableKinds, read by
-// routing.LiveTimingsCapableKind) is a map this module hand-copies, and
-// nothing compiles the two together. A kind added to the Go set without a
-// matching edit here is a silent portal that never offers the switch; a kind
-// left here after Go drops it is a portal that offers a switch every save
-// refuses. Naming every member in both directions is what makes either
-// direction fail loudly.
+// Both lists are stated EXHAUSTIVELY, and it is worth being exact about what
+// that does and does not buy, because the obvious reading is too generous.
+//
+// The Go set (routing.liveTimingsCapableKinds, read by
+// routing.LiveTimingsCapableKind) is a map liveTimings.ts hand-copies, and
+// nothing compiles the two together. This test CANNOT see that map. What it
+// pins is the TypeScript half alone: that the hand-copy answers every member
+// of both vocabularies the way it currently claims to, so an edit to the copy
+// reds here in both directions. A kind added to the GO set with no edit here
+// is still a silent portal that never offers the switch -- but nothing in this
+// file notices, and a green frontend suite is not evidence about it.
+//
+// The guard on that seam lives on the Go side:
+// TestLiveTimingsCapableKindsSizeIsPinned in
+// internal/routing/live_timings_test.go pins the set's size, so any addition
+// or removal there fails, and its message enumerates what else to change.
+// That is the test to point an editor at, not this one.
+//
+// The lists are typed against their unions, which guards exactly one
+// direction. REMOVING a member from ApplicationType or from RuntimeSpec['type']
+// is a compile error here, because the dropped literal stops being assignable
+// (measured: dropping 'llama_swap' yields TS2322 on the first list). ADDING one
+// is not -- the array simply omits it, tsc stays quiet and every case still
+// passes, so the list silently stops being exhaustive. A widened union means
+// editing these two lists by hand.
 const allApplicationTypes: ApplicationType[] = [
   'ollama',
   'vllm',
