@@ -1801,16 +1801,22 @@ describe('ApplicationSection responses live timings body', () => {
   // routing.LiveTimingsCapableKind('server_agent') is false and buildBody
   // restates `type` on every save, so the pair is the 400 arm -- and EVERY
   // CREATE would fail, because openCreate seeds the box true. Be exact about
-  // the scope: BOTH backend arms refuse only an explicit TRUE, and a stored
-  // server_agent row can only ever hold false (its create default is the
-  // kind's own, and the update path clears a stale true whenever the
-  // resulting type cannot honour it). So an ordinary edit-and-save of an
-  // existing server_agent row sends false and succeeds. Anyone checking this
-  // warning by opening such a row and saving it will see it pass and conclude
-  // the guard is noise -- it is the CREATE path that breaks, which is why the
-  // case below creates rather than edits. The second door is a retype: ticking
-  // a capable row and changing its type to server_agent before saving sends
-  // true beside the new type, and earns the same 400.
+  // the scope: BOTH backend arms refuse only an explicit TRUE, and the PORTAL
+  // can only ever write false onto a server_agent row (its create default is
+  // the kind's own, and the update path clears a stale true whenever the
+  // resulting type cannot honour it). Not the stored ROW: the store is
+  // policy-free about exactly this by design, and its own conformance and
+  // column-parity tests deliberately write a true on an incapable kind so a
+  // store path that "helpfully" cleared it would fail -- which is why the
+  // request-path gate re-checks the kind instead of trusting the row. What is
+  // claimed here is only about the two portal write paths. So an ordinary
+  // edit-and-save of an existing server_agent row sends false and succeeds.
+  // Anyone checking this warning by opening such a row and saving it will see
+  // it pass and conclude the guard is noise -- it is the CREATE path that
+  // breaks, which is why the case below creates rather than edits. The second
+  // door is a retype: ticking a capable row and changing its type to
+  // server_agent before saving sends true beside the new type, and earns the
+  // same 400.
   //
   // The spec form can send on `!== 'incapable'` only because it never sees
   // 'delegated' at all.
