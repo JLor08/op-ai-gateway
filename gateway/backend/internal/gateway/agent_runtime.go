@@ -114,17 +114,21 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 // difference is what the gateway is allowed to treat as PROOF that it did.
 const runtimeConfigAckFeature = "runtime_config_ack"
 
-// pushRuntimeConfigTimeout bounds the s.Portal.AgentRuntimeConfig store read
-// PushRuntimeConfig performs -- a package-level var (not const), following
-// the established shrink-in-tests pattern (chat_runs.go's
-// runCheckpointInterval) so a test can drive it down to milliseconds without
-// sleeping out a real multi-second deadline. 5s matches capture.go's
-// persistCapture timeout for its SaveCapture call, not model_warmer.go's 60s
-// warmCallTimeout: AgentRuntimeConfig is a bounded local store-read assembly
-// (a handful of RuntimeStore reads), the same shape and cost class as
-// persisting one capture row, not a network round trip to an upstream
-// inference server loading a model (what warmCallTimeout's 60s budgets for).
-var pushRuntimeConfigTimeout = 5 * time.Second
+// defaultPushRuntimeConfigTimeout bounds the s.Portal.AgentRuntimeConfig store
+// read PushRuntimeConfig performs. It is the DEFAULT for the per-instance
+// Server.pushRuntimeConfigTimeout field (set in New, overridable on one Server),
+// not a package-level var: a var shared with the goroutine PushRuntimeConfig
+// spawns was a data race under `go test -race` (issue #53), since a test
+// shrinking it wrote the very memory the push goroutine read. A per-instance
+// field -- the pattern activeRegistry already uses for `now func() time.Time` --
+// lets a test drive its own timeout down to milliseconds without touching shared
+// state. 5s matches capture.go's persistCapture timeout for its SaveCapture
+// call, not model_warmer.go's 60s warmCallTimeout: AgentRuntimeConfig is a
+// bounded local store-read assembly (a handful of RuntimeStore reads), the same
+// shape and cost class as persisting one capture row, not a network round trip
+// to an upstream inference server loading a model (what warmCallTimeout's 60s
+// budgets for).
+const defaultPushRuntimeConfigTimeout = 5 * time.Second
 
 // PushRuntimeConfig is the gateway half of the WS push path (agent-runtime-
 // manager design spec §10, Phase 2 Task 8): a best-effort, feature-gated
@@ -174,7 +178,14 @@ func (s *Server) PushRuntimeConfig(serverID string) {
 		if s.Portal == nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), pushRuntimeConfigTimeout)
+		timeout := s.pushRuntimeConfigTimeout
+		if timeout <= 0 {
+			// A bare &Server{} built without New (a fixture pattern this
+			// package supports) leaves the field zero; fall back to the
+			// default rather than an instantly-expiring 0.
+			timeout = defaultPushRuntimeConfigTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		dto, err := s.Portal.AgentRuntimeConfig(ctx, serverID)
 		if err != nil {

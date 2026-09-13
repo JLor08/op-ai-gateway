@@ -180,21 +180,18 @@ func (f *ctxDoneSignalingPortal) AgentRuntimeConfig(ctx context.Context, _ strin
 // (lock contention, a wedged query) would otherwise accumulate goroutines
 // without bound under sustained write pressure.
 //
-// pushRuntimeConfigTimeout is shrunk to milliseconds for the duration of
-// this test (the established chat_runs.go runCheckpointInterval
-// shrink-in-tests pattern, restored via defer) so this test does not need to
-// sleep out the real 5s production budget: if PushRuntimeConfig is bounding
+// This Server's pushRuntimeConfigTimeout is shrunk to milliseconds so the test
+// does not sleep out the real 5s production budget: if PushRuntimeConfig bounds
 // the call correctly, ctxDoneSignalingPortal's ctx.Done() fires almost
 // immediately; if a regression reintroduced context.Background(), ctx.Done()
-// would never fire and this test would time out waiting for `returned`.
+// would never fire and this test would time out waiting for `returned`. The
+// timeout is set on the instance, not a shared package var the push goroutine
+// also reads, so `go test -race` stays clean (issue #53).
 func TestPushRuntimeConfigBoundsThePortalReadWithATimeout(t *testing.T) {
-	oldTimeout := pushRuntimeConfigTimeout
-	pushRuntimeConfigTimeout = 20 * time.Millisecond
-	defer func() { pushRuntimeConfigTimeout = oldTimeout }()
-
 	const serverID = "mock-host-qwen"
 	fake := &ctxDoneSignalingPortal{returned: make(chan struct{})}
 	srv := NewTestServer()
+	srv.pushRuntimeConfigTimeout = 20 * time.Millisecond
 	srv.Portal = fake
 	srv.AgentFeatures.Set(serverID, []string{"runtime_manager"})
 

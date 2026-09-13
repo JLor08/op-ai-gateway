@@ -334,13 +334,19 @@ type Server struct {
 	SessionMaxAge       time.Duration
 	PublicURL           string
 	streamIdleTimeout   time.Duration
-	selfBaseURL         string
-	Cipher              *capture.Cipher
-	captureMaxBytes     int
-	CaptureEnabled      func() bool
-	CaptureOverride     func() bool
-	Active              *activeRegistry
-	AppHealth           *AppHealthRegistry
+	// pushRuntimeConfigTimeout bounds PushRuntimeConfig's store read. A
+	// per-instance field, not a package var, so a `-race` test can shrink its
+	// own without writing memory the push goroutine reads (issue #53). Defaulted
+	// in New; a bare &Server{} leaves it zero and PushRuntimeConfig falls back to
+	// defaultPushRuntimeConfigTimeout.
+	pushRuntimeConfigTimeout time.Duration
+	selfBaseURL              string
+	Cipher                   *capture.Cipher
+	captureMaxBytes          int
+	CaptureEnabled           func() bool
+	CaptureOverride          func() bool
+	Active                   *activeRegistry
+	AppHealth                *AppHealthRegistry
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -775,6 +781,7 @@ func New(deps ServerDeps) *Server {
 		SessionMaxAge:               deps.SessionMaxAge,
 		PublicURL:                   deps.PublicURL,
 		streamIdleTimeout:           deps.StreamIdleTimeout,
+		pushRuntimeConfigTimeout:    defaultPushRuntimeConfigTimeout,
 		selfBaseURL:                 deps.SelfBaseURL,
 		Cipher:                      deps.Cipher,
 		captureMaxBytes:             captureMaxBytes,

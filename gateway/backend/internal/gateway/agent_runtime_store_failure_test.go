@@ -94,12 +94,12 @@ func TestAgentRuntimeConfigStoreFailureIsA500NotTheEmptyDocument(t *testing.T) {
 // so the agent's status-based discipline never gets a chance: it receives a
 // well-formed document that removes everything.
 func TestPushRuntimeConfigNeverPushesTheEmptyDocumentOnAStoreFailure(t *testing.T) {
-	oldTimeout := pushRuntimeConfigTimeout
-	pushRuntimeConfigTimeout = 20 * time.Millisecond
-	defer func() { pushRuntimeConfigTimeout = oldTimeout }()
-
 	const serverID = "mock-host-qwen"
 	srv := NewTestServer()
+	// Shrink THIS instance's push deadline so the slow store's
+	// DeadlineExceeded fires fast -- set on the Server, not a shared package
+	// var the push goroutine also reads (issue #53's data race).
+	srv.pushRuntimeConfigTimeout = 20 * time.Millisecond
 	srv.Portal = runtimeConfigPortalOver(t, &ctxBoundAIServerByIDStore{Store: routing.NewMemoryStore()})
 	conn := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
 	srv.AgentStreams.add(serverID, conn)
