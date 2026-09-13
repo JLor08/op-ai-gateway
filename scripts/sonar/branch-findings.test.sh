@@ -207,6 +207,66 @@ check "still attributes the branch's own line with the default base" \
 check "names the base it actually used" "origin/main" "$stale_out"
 rm -rf "$STALE"
 
+# --- the stale-export guard (issue #22, problem 4): the findings export must
+# describe HEAD. A scan that failed server-side, or another worktree's scan,
+# leaves the server's last SUCCESSFUL analysis in place; exporting THAT and
+# attributing against it reads exactly like a real pass. sonar.sh records the
+# analysed revision in analysis-meta.json next to the export; the guard refuses
+# when that revision is not HEAD.
+cd "$REPO"
+GUARD="$(mktemp -d)"
+git init -q -b main "$GUARD"
+cd "$GUARD"
+git config user.email test@example.test
+git config user.name "Test"
+mkdir -p src .sonar-local
+ten_lines >src/f.txt
+git add -A
+git commit -qm "base"
+git checkout -qb feature
+sed -i.bak '5s/.*/line 5 CHANGED/' src/f.txt && rm -f src/f.txt.bak
+git commit -qam "branch edit"
+guard_head="$(git rev-parse HEAD)"
+cat >.sonar-local/findings.json <<'JSON'
+[
+  {"key":"a","rule":"go:S1","severity":"CRITICAL","type":"CODE_SMELL",
+   "component":"op-ai-gateway:src/f.txt","line":5,
+   "textRange":{"startLine":5,"endLine":5},"message":"GUARD OWNS THIS"}
+]
+JSON
+
+# (1) fresh export: recorded revision == HEAD -> attributes normally.
+printf '{"revision":"%s","analysisKey":"k","analysisDate":"d"}\n' "$guard_head" \
+  >.sonar-local/analysis-meta.json
+fresh_out="$(sh "$FILTER" --repo "$GUARD" --base main 2>&1)" || true
+check "fresh export (revision==HEAD) is attributed normally" "GUARD OWNS THIS" "$fresh_out"
+check "fresh export is not flagged stale" '!STALE' "$fresh_out"
+
+# (2) stale export: recorded revision != HEAD -> refused, attributes nothing.
+printf '{"revision":"%s","analysisKey":"k","analysisDate":"d"}\n' \
+  "0000000000000000000000000000000000000000" >.sonar-local/analysis-meta.json
+stale_out="$(sh "$FILTER" --repo "$GUARD" --base main 2>&1)" && stale_rc=0 || stale_rc=$?
+check "stale export is refused" "STALE" "$stale_out"
+check "stale export attributes nothing" '!GUARD OWNS THIS' "$stale_out"
+if [ "${stale_rc:-0}" -eq 2 ]; then
+  echo "ok: exit code 2 (could not run) on a stale export"
+else
+  echo "FAIL: exit code ${stale_rc:-0} on a stale export, want 2"
+  fail=1
+fi
+
+# (3) override attributes despite stale metadata.
+override_out="$(SONAR_BRANCH_FINDINGS_ALLOW_STALE=1 sh "$FILTER" --repo "$GUARD" --base main 2>&1)" || true
+check "override attributes despite stale metadata" "GUARD OWNS THIS" "$override_out"
+
+# (4) missing metadata warns but still runs (backward compatible).
+rm -f .sonar-local/analysis-meta.json
+missing_out="$(sh "$FILTER" --repo "$GUARD" --base main 2>&1)" || true
+check "missing metadata warns" "no analysis metadata" "$missing_out"
+check "missing metadata still attributes" "GUARD OWNS THIS" "$missing_out"
+cd "$REPO"
+rm -rf "$GUARD"
+
 if [ "$fail" -eq 0 ]; then
   echo "PASS"
 else
