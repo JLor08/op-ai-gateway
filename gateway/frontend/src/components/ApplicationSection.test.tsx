@@ -1686,6 +1686,27 @@ describe('ApplicationSection responses live timings', () => {
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
   });
 
+  // A server_agent application is NOT told the feature is unavailable. The
+  // resolver overwrites this row's value with the runtime spec's, and the
+  // request-path gate judges the spec's effective kind -- and runtime specs
+  // exist only under server_agent applications, so every managed llama.cpp
+  // runtime is reached through THIS form. The blanket unsupported note would
+  // tell exactly those operators the feature does not apply to them, and on a
+  // managed-runtime-only server the create form opens on this very type.
+  //
+  // Still no checkbox, though: the spec's value wins, so a control here would
+  // be a second switch that does nothing.
+  it('points a server_agent operator at the launch spec instead of calling the feature unavailable', async () => {
+    renderSection();
+    openCreate();
+    await selectType('server_agent');
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsDelegatedNote)).toBeInTheDocument();
+    expect(screen.queryByText(t.applicationLiveTimingsUnsupportedNote)).not.toBeInTheDocument();
+  });
+
   // BOTH directions in one case, deliberately: asserting only the stored
   // `false` would still pass if openEdit stopped seeding at all, because the
   // create default would be left standing -- for `false` that happens to look

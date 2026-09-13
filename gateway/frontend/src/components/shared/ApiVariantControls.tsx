@@ -103,13 +103,21 @@ export function ApiVariantControls({
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
         {t.applicationNativeNote}
       </Typography>
-      {liveTimingsKind === 'incapable' ? (
+      {liveTimingsKind === 'incapable' || liveTimingsKind === 'delegated' ? (
         // Never a blank: the slot the checkbox would occupy still explains why
         // there is nothing to set. Rendering a DISABLED checkbox instead would
         // be worse -- it would show a value (ticked or not) that this form
-        // will not send, since an incapable kind omits the key altogether.
+        // will not send, since neither of these kinds sends the key at all.
+        //
+        // Two kinds, two SENTENCES. `delegated` (server_agent) must not get
+        // the unsupported note: the flag is real for such an application, it
+        // is simply decided on the runtime spec instead -- and since runtime
+        // specs exist only under server_agent, that note would tell precisely
+        // the operators who CAN use this feature that they cannot.
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          {t.applicationLiveTimingsUnsupportedNote}
+          {liveTimingsKind === 'delegated'
+            ? t.applicationLiveTimingsDelegatedNote
+            : t.applicationLiveTimingsUnsupportedNote}
         </Typography>
       ) : (
         <>

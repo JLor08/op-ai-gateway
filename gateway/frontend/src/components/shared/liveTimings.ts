@@ -23,8 +23,19 @@ import type { ApplicationType, RuntimeSpec } from '../../api';
  *                what the backend normalises: a create takes the kind's own
  *                default and an update clears a stale true.
  *   unknown   -- only the launch-spec form, only under Auto.
+ *   delegated -- only the application form, only for server_agent: the flag is
+ *                real for this application but is decided ELSEWHERE. The
+ *                resolver overwrites the application's stored value with the
+ *                runtime spec's, and the request-path gate judges the spec's
+ *                effective kind rather than the application type. Like
+ *                `incapable` it sends no key and shows no checkbox -- a
+ *                control here would be a second switch the spec's value
+ *                overrides -- but it must NOT reuse `incapable`'s sentence,
+ *                which tells the operator the feature is unavailable to them
+ *                when in fact runtime specs exist only under this type, so
+ *                every managed llama.cpp runtime is reached through this form.
  */
-export type LiveTimingsKind = 'capable' | 'incapable' | 'unknown';
+export type LiveTimingsKind = 'capable' | 'incapable' | 'unknown' | 'delegated';
 
 /**
  * The kinds whose request schema is known to tolerate `timings_per_token`.
@@ -40,8 +51,18 @@ export type LiveTimingsKind = 'capable' | 'incapable' | 'unknown';
  */
 const liveTimingsCapableKinds: readonly string[] = ['llama_cpp'];
 
-/** The application form's gate: it always knows its own `type`. */
+/**
+ * The application form's gate: it always knows its own `type`.
+ *
+ * server_agent is answered `delegated`, not `incapable`. Its own type says
+ * nothing about what actually serves -- routing.Resolver.targetFrom replaces
+ * the application's flag with the runtime spec's whenever one exists, and
+ * gateway.wantsResponsesLiveTimings then asks about the spec's
+ * EffectiveRuntimeSpecType. So the answer for this type is "ask the launch
+ * spec", which is a different sentence from "no kind here can do it".
+ */
 export function applicationLiveTimingsKind(type: ApplicationType): LiveTimingsKind {
+  if (type === 'server_agent') return 'delegated';
   return liveTimingsCapableKinds.includes(type) ? 'capable' : 'incapable';
 }
 

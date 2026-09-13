@@ -382,6 +382,8 @@ const de = {
     'Setzt bei gestreamten Codex-Anfragen (/v1/responses) den llama.cpp-Parameter „timings_per_token“, damit die Laufenden Verbindungen eine vom Upstream gemeldete Tokens/s für die gesamte Anfrage zeigen statt einer hier abgeleiteten. Solange dies aktiv ist, ist der aufgezeichnete Anfragetext nicht mehr exakt der gesendete.',
   applicationLiveTimingsUnsupportedNote:
     'Live-Timings sind nur für llama.cpp verfügbar. Für diesen Typ wird der Parameter nicht gesetzt, und ein noch gespeichertes Ja wird beim nächsten Speichern gelöscht.',
+  applicationLiveTimingsDelegatedNote:
+    'Bei diesem Typ entscheidet die Startvorgabe des Modells, nicht die Anwendung: Der Schalter steht unter „Runtime-Spezifikationen“ beim jeweiligen Modell – dort auch nur für llama.cpp. Ein hier gespeicherter Wert würde beim Ausliefern ohnehin durch den der Startvorgabe ersetzt, deshalb gibt es hier keinen zweiten Schalter.',
   applicationLiveTimingsAutoNote:
     'Der Typ steht auf „Automatisch“: welche Art Server der Programmpfad startet, erkennt erst das Gateway. Ohne Häkchen entscheidet es selbst — eine neu angelegte llama.cpp-Startvorgabe bekommt Live-Timings, jede andere nicht, und eine bestehende Startvorgabe behält ihren gespeicherten Wert. Ein Häkchen auf einer Startvorgabe, die nicht llama.cpp ist, wird beim Speichern abgelehnt.',
   applicationResponsesMode: 'Codex (Responses-API)',
@@ -2705,6 +2707,8 @@ const en: PortalMessages = {
     'Sets llama.cpp\'s "timings_per_token" on streamed Codex requests (/v1/responses), so Running connections show a tokens/sec the upstream reports for the whole request instead of one derived here. While this is on, the recorded request body is no longer exactly the body that was sent.',
   applicationLiveTimingsUnsupportedNote:
     'Live timings are available for llama.cpp only. For this type the parameter is not set, and a stored yes is cleared on the next save.',
+  applicationLiveTimingsDelegatedNote:
+    'For this type the model\'s launch spec decides, not the application: the switch lives under "Runtime specs" on the individual model, and there too only for llama.cpp. A value stored here would be replaced by the spec\'s when a request is served, so this form deliberately offers no second switch.',
   applicationLiveTimingsAutoNote:
     'Type is set to "Auto", so which kind of server the binary launches is only detected by the gateway. Left unticked, the gateway decides — a newly created llama.cpp launch spec gets live timings, any other kind does not, and an existing spec keeps its stored value. Ticking it on a spec that is not llama.cpp is refused on save.',
   applicationResponsesMode: 'Codex (Responses API)',

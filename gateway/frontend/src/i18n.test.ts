@@ -2703,6 +2703,7 @@ describe('responses live-timings i18n keys', () => {
       'applicationLiveTimingsNote',
       'applicationLiveTimingsUnsupportedNote',
       'applicationLiveTimingsAutoNote',
+      'applicationLiveTimingsDelegatedNote',
       'errorApplicationResponsesLiveTimingsUnsupported',
       'errorApplicationResponsesLiveTimingsConflict',
       'errorRuntimeSpecResponsesLiveTimingsUnsupported',
