@@ -489,7 +489,11 @@ type AssistantTurn struct {
 	Content     string
 	TTFTMs      int64
 	ReasoningMs int64
-	TPS         float64
+	// CharsPerSecond is the output CHARACTER rate (portal label "chars/s"),
+	// serialized under the legacy `tps` key. TokensPerSecond is the real output
+	// tokens/sec, present only once the turn completed. See issue #56.
+	CharsPerSecond  float64
+	TokensPerSecond float64
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -545,8 +549,14 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 	if turn.ReasoningMs > 0 {
 		msg["reasoningMs"] = turn.ReasoningMs
 	}
-	if turn.TPS > 0 {
-		msg["tps"] = turn.TPS
+	if turn.CharsPerSecond > 0 {
+		msg["tps"] = turn.CharsPerSecond
+	}
+	if turn.TokensPerSecond > 0 {
+		// camelCase to match the transcript's other metric keys (ttftMs,
+		// reasoningMs) so the portal reads it by a direct cast; the SSE metrics
+		// event carries the snake_case tokens_per_second separately (issue #56).
+		msg["tokensPerSecond"] = turn.TokensPerSecond
 	}
 	raw, err := json.Marshal(msg)
 	if err != nil {

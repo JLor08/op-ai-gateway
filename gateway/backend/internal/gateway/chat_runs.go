@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // loopbackBaseFromAddr turns an OP_AI_GATEWAY_ADDR value (host:port) into the
@@ -40,6 +41,7 @@ const (
 	sseDelta
 	sseDone
 	sseError
+	sseUsage
 )
 
 type sseDeltaEvent struct {
@@ -47,6 +49,10 @@ type sseDeltaEvent struct {
 	Reasoning string
 	ErrCode   string
 	ErrMsg    string
+	// OutputTokens carries the completion-token count from the terminal usage
+	// chunk (kind sseUsage). Requested via stream_options.include_usage on the
+	// loopback body; the exact figure the real tokens/sec is computed from.
+	OutputTokens int
 }
 
 // parseChatSSELine mirrors portal-ui/src/components/shared/chatStream.ts:parseLine.
@@ -71,6 +77,9 @@ func parseChatSSELine(line string) (sseDeltaEvent, sseKind) {
 				ReasoningContent string `json:"reasoning_content"`
 			} `json:"delta"`
 		} `json:"choices"`
+		Usage *struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 		return sseDeltaEvent{}, sseIgnore
@@ -88,9 +97,28 @@ func parseChatSSELine(line string) (sseDeltaEvent, sseKind) {
 		}
 	}
 	if ev.Content == "" && ev.Reasoning == "" {
+		// The terminal usage chunk (stream_options.include_usage) carries no
+		// delta content but the exact completion-token count -- surface it as
+		// sseUsage rather than dropping it as an empty delta (issue #56).
+		if chunk.Usage != nil && chunk.Usage.CompletionTokens > 0 {
+			return sseDeltaEvent{OutputTokens: chunk.Usage.CompletionTokens}, sseUsage
+		}
 		return sseDeltaEvent{}, sseIgnore
 	}
 	return ev, sseDelta
+}
+
+// flooredRate returns count/window in per-second units, but only when the window
+// is at least minGatewayRateWindow -- the same floor passthrough_usage_scan.go,
+// benchmark_runner.go and liveProgressDTO apply. Below it (the first content
+// delta of every turn lands microseconds after firstContentAt) the divisor is
+// tiny and the rate is nonsense, so it returns 0 (issue #56). A non-positive
+// count also returns 0.
+func flooredRate(count int, window time.Duration) float64 {
+	if count > 0 && window >= minGatewayRateWindow {
+		return float64(count) / window.Seconds()
+	}
+	return 0
 }
 
 var (
@@ -108,9 +136,20 @@ type runEvent struct {
 }
 
 type runMetrics struct {
-	TTFTMs      int64   `json:"ttft_ms,omitempty"`
-	ReasoningMs int64   `json:"reasoning_ms,omitempty"`
-	TPS         float64 `json:"tps,omitempty"`
+	TTFTMs      int64 `json:"ttft_ms,omitempty"`
+	ReasoningMs int64 `json:"reasoning_ms,omitempty"`
+	// CharsPerSecond is the turn's output rate in CHARACTERS per second (the
+	// portal labels it "chars/s" / "Zeichen/s"). Runes, not bytes -- and
+	// deliberately not named TPS: `tps` collides with the real tokens/sec on the
+	// activity surfaces, and this is a character rate (issue #56). The `tps` wire
+	// key is kept so existing chat history still renders.
+	CharsPerSecond float64 `json:"tps,omitempty"`
+	// TokensPerSecond is the real output tokens/sec, from the upstream's own
+	// terminal usage chunk over the generation window. It exists only once the
+	// turn has completed (the exact count arrives with the usage chunk), so it is
+	// absent -- not zero -- mid-turn, and on turns whose upstream reported no
+	// usage (issue #56).
+	TokensPerSecond float64 `json:"tokens_per_second,omitempty"`
 }
 
 type ChatRun struct {
@@ -512,7 +551,8 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 				reasoning, content := run.buffered()
 				m := run.currentMetrics()
 				_ = s.Portal.CheckpointAssistant(context.Background(), owner, run.ChatID, portal.AssistantTurn{
-					Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs, TPS: m.TPS,
+					Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
+					CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 				})
 			}
 		}
@@ -521,6 +561,7 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 	start := time.Now()
 	var firstContentAt time.Time
 	var reasoningStart time.Time
+	var outputTokens int
 	status, errMsg := "completed", ""
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -549,13 +590,17 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			run.publish(ev)
 			if !firstContentAt.IsZero() {
 				_, content := run.buffered()
-				secs := time.Since(firstContentAt).Seconds()
-				if secs > 0 {
+				// chars/s, live: RUNES (not len's bytes), floored (issue #56).
+				if r := flooredRate(utf8.RuneCountInString(content), time.Since(firstContentAt)); r > 0 {
 					m := run.currentMetrics()
-					m.TPS = float64(len(content)) / secs
+					m.CharsPerSecond = r
 					run.setMetrics(m)
 				}
 			}
+		case sseUsage:
+			// The terminal usage chunk's exact completion-token count, used for
+			// the real tokens/sec computed at finish (issue #56).
+			outputTokens = ev.OutputTokens
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -573,6 +618,30 @@ finish:
 	// commit and leave the trailing assistant message stuck at "pending".
 	close(done)
 	wg.Wait()
+	// Final rates (issue #56), computed after the checkpoint goroutine has
+	// stopped so this is the last metrics write. Both are floored, but over
+	// DIFFERENT windows, because their numerators cover different spans:
+	//   - chars/s: the visible answer's runes over the CONTENT window
+	//     (firstContentAt -> now). `content` excludes reasoning text, so its
+	//     window must too, or the rate understates the answer's real speed.
+	//   - tokens/s: the upstream's completion_tokens over the FULL GENERATION
+	//     window (first token of any kind -> now). completion_tokens includes
+	//     reasoning tokens (see internal/inference/types.go), so anchoring on
+	//     firstContentAt would divide a reasoning-inclusive count by a
+	//     reasoning-excluding window and inflate the rate several-fold on
+	//     reasoning turns. reasoningStart is the first reasoning delta.
+	if !firstContentAt.IsZero() {
+		now := time.Now()
+		_, content := run.buffered()
+		m := run.currentMetrics()
+		m.CharsPerSecond = flooredRate(utf8.RuneCountInString(content), now.Sub(firstContentAt))
+		genStart := firstContentAt
+		if !reasoningStart.IsZero() && reasoningStart.Before(firstContentAt) {
+			genStart = reasoningStart
+		}
+		m.TokensPerSecond = flooredRate(outputTokens, now.Sub(genStart))
+		run.setMetrics(m)
+	}
 	s.finishRun(context.Background(), owner, run, status, errMsg)
 }
 
@@ -597,7 +666,8 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 	// (control flow is unchanged — the run still finishes) so the failure is not
 	// silently swallowed.
 	if err := s.Portal.CommitAssistant(ctx, owner, run.ChatID, portal.AssistantTurn{
-		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs, TPS: m.TPS,
+		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
+		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
 	}
@@ -613,6 +683,11 @@ func buildChatCompletionsBody(prep PrepareRunResult) ([]byte, error) {
 		"model":    prep.Settings.Model,
 		"messages": prep.History,
 		"stream":   true,
+		// Ask our own loopback for the terminal usage chunk so the run can
+		// compute a real tokens/sec (issue #56). This is our body, not anything
+		// the user sent; the client-facing usage chunk is gated on IncludeUsage
+		// (inference_complete.go), which stream_options.include_usage sets.
+		"stream_options": map[string]any{"include_usage": true},
 	}
 	if prep.Settings.Temperature != 0 {
 		payload["temperature"] = prep.Settings.Temperature

@@ -85,6 +85,31 @@ describe('ChatMessage', () => {
     expect(screen.getByText(/17 Zeichen, 2\.0s/)).toBeInTheDocument();
   });
 
+  it('shows chars/s and, once known, tokens/s side by side (issue #56)', () => {
+    render(
+      <ChatMessage
+        t={t}
+        role="assistant"
+        content="answer"
+        ttftMs={500}
+        tps={30}
+        tokensPerSecond={10}
+      />,
+    );
+    const line = screen.getByText(
+      (c) => c.includes('30 Zeichen/s') && c.includes(`10 ${t.chatTokensPerSecUnit}`),
+    );
+    expect(line).toBeInTheDocument();
+    // Rounded, not raw, and ordered chars/s then tokens/s.
+    expect(line.textContent).toContain('30 Zeichen/s · 10 Tokens/s');
+  });
+
+  it('omits tokens/s until it is known, still showing chars/s', () => {
+    render(<ChatMessage t={t} role="assistant" content="answer" ttftMs={500} tps={30} />);
+    expect(screen.getByText((c) => c.includes('30 Zeichen/s'))).toBeInTheDocument();
+    expect(screen.queryByText((c) => c.includes(t.chatTokensPerSecUnit))).not.toBeInTheDocument();
+  });
+
   it('makes the assistant bubble hug its content with a request-width floor, but never the user bubble', () => {
     const assistant = render(<ChatMessage t={t} role="assistant" content="short" />);
     const answer = assistant.container.querySelector('[data-role="assistant"]');
