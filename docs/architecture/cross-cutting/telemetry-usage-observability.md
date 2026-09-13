@@ -850,8 +850,9 @@ to name a cause is easy to mistake for a missing field. `provider_path` **does**
 separate native passthrough from translation: it rides the same DTO and differs
 from `req_path` exactly when translation is happening (`ActiveRequest`,
 `active_requests.go`), and the panel offers it as an opt-in column. What nothing
-on the DTO records is whether the **client** asked for mid-stream timings — and
-on the passthrough Responses path that is precisely the axis an absent rate
+on the DTO records is whether **anyone** asked for mid-stream timings — neither
+the client's own `timings_per_token` nor the operator's opt-in that injects it —
+and on the passthrough Responses path that is precisely the axis an absent rate
 turns on. So the tooltip is not claiming that passthrough and translation are
 indistinguishable here; it is that no flavor-plus-mode combination narrows the
 absence to a single cause.
@@ -1435,7 +1436,8 @@ attaches `timings.draft_n` — the number of tokens a draft model proposed for
 that turn — to the non-streaming chat body, to the final frame of a
 chat-completions stream (the same chunk as the terminal `usage`), and to the
 terminal frame of a Responses-API stream. **Those three are the whole list of
-shapes that carry a `timings` object with `timings_per_token` unset** — measured
+shapes that carry a `timings` object with `timings_per_token` unset — unset by the
+client AND not injected by the operator's Responses live-timings opt-in** — measured
 for the Responses stream: with the flag unset, exactly ONE frame of a 48-frame
 request carried `timings`, the terminal one (§8.4.3's measurement). The flag
 adds one to a chat stream's PARTIAL chunks, which is where the translate path's
