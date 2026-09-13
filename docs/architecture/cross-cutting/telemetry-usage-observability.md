@@ -826,6 +826,25 @@ by shape, so tests pin both:
   requests into that population. The recorded figure is still the rate the stream
   reported rather than the generation's peak, and must stay that way.
 
+**While the switch is on, the recorded request body is not the body that was
+sent.** The payload capture on this path records the **client's** bytes —
+`buildCaptureInput` is handed the raw client body, never the body `proxyNative`
+built — and that has already diverged from the upstream bytes since long before
+this feature, because `rewriteModelField` re-serializes the whole object whenever
+a provider-model override applies. The injected `timings_per_token` widens the
+divergence from cosmetic to semantic. Changing what is captured is deliberately
+out of scope here: it is a behaviour change for **every** passthrough request and
+would put the internal provider model name in front of the tenant. What closes
+the operator's gap instead is the **request log** — `proxyNative`'s per-request
+`inference request (native passthrough)` debug line carries
+`timings_per_token_injected`, so an operator holding an unexplained upstream 4xx
+has one grep that says whether the gateway added a key the capture does not show.
+No wire change, no DTO field, nothing tenant-visible. The panel gains no "we
+asked" state either: when the key is injected, the request succeeds and no
+partial carries `timings`, the row is byte-identical to one where nothing was
+injected — and the panel's job is to report the number and where it came from,
+not who asked for it. Revisit that if the case is ever observed.
+
 **What this surface does and does not distinguish**, since the tooltip's refusal
 to name a cause is easy to mistake for a missing field. `provider_path` **does**
 separate native passthrough from translation: it rides the same DTO and differs
