@@ -152,7 +152,18 @@ import (
 // passes through untouched -- nothing negotiates on it, and an older agent
 // simply keeps reporting "unreachable" for a router server, the pre-fix
 // behaviour.
-const Version = "0.7.2"
+//
+// 0.7.2 -> 0.7.3 is the single bump for the respec-relaunch branch (issue
+// #63): when a RUNNING child's spec changes a launch-affecting field (binary,
+// args, env, work_dir, GPU set, visible-devices toggle/mode, listen port, api
+// token, or upstream_model via ${MODEL}), the agent now drains and relaunches
+// the child with the new shape instead of storing the new spec but leaving the
+// old process running until it restarts for some unrelated reason. In-flight
+// requests drain first; a metadata-only edit (idle timeout, pinned, admin
+// state, health/probe paths, model name) still takes effect in place with no
+// relaunch. PATCH, and the rule decides it: agent.Features gains no entry --
+// this is an observable runtime-behaviour change, not a negotiated capability.
+const Version = "0.7.3"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

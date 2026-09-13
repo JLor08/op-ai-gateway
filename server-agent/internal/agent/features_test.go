@@ -256,13 +256,14 @@ func TestFeaturesDeclareRuntimeUpstreamProps(t *testing.T) {
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
-	// followed. 0.7.2 is the router-mode probe branch's PATCH bump (issue
-	// #55, see the Version constant's own block): the context probe gains a
-	// "router" state and the metrics scrape rejects a non-2xx reply -- both
-	// observable behaviour changes but no new Features entry, so it is PATCH,
-	// which is also why runtime_upstream_props' Since above stays at the 0.7.0
-	// it shipped in rather than following Version.
-	if Version != "0.7.2" {
-		t.Fatalf("Version = %q, want 0.7.2 (one bump per shipped change: 0.7.0 has shipped, and #55 adds no Features entry, so it is PATCH)", Version)
+	// followed. 0.7.3 is the respec-relaunch branch's PATCH bump (issue #63,
+	// see the Version constant's own block): a running child whose spec's
+	// launch shape changes is now drained and relaunched with the new shape
+	// instead of keeping the old launch until an unrelated restart -- an
+	// observable runtime-behaviour change but no new Features entry, so it is
+	// PATCH, which is also why runtime_upstream_props' Since above stays at
+	// the 0.7.0 it shipped in rather than following Version.
+	if Version != "0.7.3" {
+		t.Fatalf("Version = %q, want 0.7.3 (one bump per shipped change: 0.7.0 has shipped, and #63 adds no Features entry, so it is PATCH)", Version)
 	}
 }
