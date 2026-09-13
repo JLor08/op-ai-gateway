@@ -735,9 +735,11 @@ translated *upstream* request headers are redacted with the exact same list,
 so an upstream API key injected by the gateway itself never leaks into a
 capture either; native passthrough has no separate translated headers to
 redact because **nothing upstream-side is captured on that path at all** —
-neither the per-application upstream credential `upstreamAuthCtx` attaches nor
-the upstream request body. The operative guarantee is therefore stronger than a
-redaction rule, and it is worth being precise about what it is not: a
+neither the per-application upstream credential (carried on the request context
+by `upstreamAuthCtx`, and set on the outgoing request by the provider layer's
+`applyUpstreamAuth`) nor the upstream request body. The operative guarantee is
+therefore stronger than a redaction rule, and it is worth being precise about
+what it is not: a
 native-passthrough capture holds the **client's** bytes, which are not the
 upstream's. They differ whenever the model rewrite fires (it re-serializes the
 object, reordering keys and HTML-escaping `<>&`) and, since the Responses

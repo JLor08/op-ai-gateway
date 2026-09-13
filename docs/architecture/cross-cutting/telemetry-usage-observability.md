@@ -802,9 +802,12 @@ by shape, so tests pin both:
   overlooked: on the build this was measured against, `/v1/responses` answered a
   request carrying an entirely fabricated top-level key with an ordinary
   completion, and llama.cpp's request schema is pull-based, so a key nobody asks
-  for is never inspected. The blast radius is one application, the operator can
-  switch it off through either portal surface, and the failure is immediate and
-  visible rather than silent. What makes it *diagnosable* is the log field in the
+  for is never inspected. The blast radius is one application, and the operator
+  switches it off on whichever surface owns the endpoint — the model's **runtime
+  spec** for a `server_agent` model, since the resolver takes the spec's stored
+  value over the parent application's whenever a spec exists and the application
+  form offers no switch for that type; the application itself otherwise. The
+  failure is immediate and visible rather than silent. What makes it *diagnosable* is the log field in the
   next paragraph, not the capture.
 - **The in-flight figure is display only.** The END-of-request rate still feeds
   an opted-in mapping's throughput EWMA (`UpdateMappingOpportunisticMetrics`,

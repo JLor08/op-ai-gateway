@@ -538,8 +538,11 @@ Wire notes a client must know:
     `passthrough` mode to a `llama_cpp` upstream, the gateway adds
     `"timings_per_token": true` to the body it forwards. llama.cpp then attaches
     a `timings` object to the partial frames, and the running-connections panel
-    shows an upstream-reported tokens/sec and an upstream-reported output-token
-    count for the whole request instead of a blank cell. The stored value is
+    shows an upstream-reported output-token count and — once the first
+    timings-bearing partial carries a positive rate — an upstream-reported
+    tokens/sec for the whole request, instead of a blank cell. Until that first
+    rate arrives the row carries the exact count with a `gateway`-labelled rate
+    derived over it. The stored value is
     resolved onto the request's routing target spec-over-application, the same
     precedence `responses_mode` uses. **Five conditions gate the injection and
     nothing retries without it** — an upstream that rejects the key answers the
