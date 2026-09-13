@@ -1798,10 +1798,22 @@ describe('ApplicationSection responses live timings body', () => {
   // buildBody asks `=== 'capable'` while buildSpecBody asks `!== 'incapable'`
   // -- and harmonising them onto the spec form's shape is exactly the tidy-up
   // that looks safe and is not: 'delegated' passes `!== 'incapable'`.
-  // routing.LiveTimingsCapableKind('server_agent') is false, and buildBody
-  // restates `type` on every save, so the pair would be the 400 arm and every
-  // save of a server_agent application would fail. The spec form can send on
-  // `!== 'incapable'` only because it never sees 'delegated' at all.
+  // routing.LiveTimingsCapableKind('server_agent') is false and buildBody
+  // restates `type` on every save, so the pair is the 400 arm -- and EVERY
+  // CREATE would fail, because openCreate seeds the box true. Be exact about
+  // the scope: BOTH backend arms refuse only an explicit TRUE, and a stored
+  // server_agent row can only ever hold false (its create default is the
+  // kind's own, and the update path clears a stale true whenever the
+  // resulting type cannot honour it). So an ordinary edit-and-save of an
+  // existing server_agent row sends false and succeeds. Anyone checking this
+  // warning by opening such a row and saving it will see it pass and conclude
+  // the guard is noise -- it is the CREATE path that breaks, which is why the
+  // case below creates rather than edits. The second door is a retype: ticking
+  // a capable row and changing its type to server_agent before saving sends
+  // true beside the new type, and earns the same 400.
+  //
+  // The spec form can send on `!== 'incapable'` only because it never sees
+  // 'delegated' at all.
   it('omits the key for server_agent, whose state is delegated rather than incapable', async () => {
     const { created } = renderSection();
     openCreate();

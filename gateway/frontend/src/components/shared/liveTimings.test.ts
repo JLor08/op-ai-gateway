@@ -102,8 +102,11 @@ describe('runtimeSpecLiveTimingsKind', () => {
 
   // 'delegated' is the APPLICATION form's answer for server_agent and has no
   // meaning here: a runtime spec has nothing further to delegate to, and its
-  // own Type select is already the signal. Pinned so a later edit cannot
-  // quietly hand this side a state it has no rendering for.
+  // own Type select is already the signal. The hazard is not a blank -- the
+  // shared control renders this state perfectly well -- it is that the
+  // sentence it renders tells the operator the switch lives on the launch
+  // spec, which on the launch-spec form itself points them back at the form
+  // they are already looking at.
   it('never answers delegated, for any spec type', () => {
     for (const specType of allSpecTypes) {
       expect(runtimeSpecLiveTimingsKind(specType), specType).not.toBe('delegated');

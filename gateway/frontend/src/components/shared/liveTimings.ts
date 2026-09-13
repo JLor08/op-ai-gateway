@@ -7,12 +7,14 @@ import type { ApplicationType, RuntimeSpec } from '../../api';
  * What a form knows about whether its upstream can honour
  * `responses_live_timings_enabled`.
  *
- * Three states, not two, because the launch-spec form genuinely has a third:
- * with Type on "Auto" the effective kind is detected from the binary's
- * basename, and that detection (routing.DetectRuntimeSpecType) is Go-only.
- * Mirroring it here would be a second, uncompiled copy of a matching rule --
- * exactly the drift this file's own list is already at risk of -- so Auto
- * stays UNKNOWN and the form sends no opinion rather than a guess.
+ * Deliberately NOT a yes/no: each state below exists because some form has a
+ * question the other two answers would misreport. Keep this list and the union
+ * in step, and do not state a COUNT here -- an earlier version of this
+ * docblock said "three states, not two", the shared control's suppression was
+ * written to match that reading by testing a single value, and a fourth state
+ * then fell silently into the checkbox branch. Nothing typechecks the
+ * branches: all three consumers use plain comparisons, not an exhaustive
+ * switch, so a missed state is a rendering bug rather than a compile error.
  *
  *   capable   -- the form may send either value
  *   incapable -- the form must send NO key at all. An explicit true here is
