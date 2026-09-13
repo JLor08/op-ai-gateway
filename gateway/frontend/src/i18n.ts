@@ -379,7 +379,7 @@ const de = {
   // Startvorgaben-Seite erscheint.
   applicationLiveTimings: 'Live-Timings vom Upstream anfordern',
   applicationLiveTimingsNote:
-    'Setzt bei gestreamten Codex-Anfragen (/v1/responses) den llama.cpp-Parameter „timings_per_token“, damit die Laufenden Verbindungen eine vom Upstream gemeldete Tokens/s für die gesamte Anfrage zeigen statt einer hier abgeleiteten. Solange dies aktiv ist, ist der aufgezeichnete Anfragetext nicht mehr exakt der gesendete.',
+    'Setzt bei gestreamten Codex-Anfragen (/v1/responses) den llama.cpp-Parameter „timings_per_token“, damit die Laufenden Verbindungen eine vom Upstream gemeldete Tokens/s für die gesamte Anfrage zeigen statt einer hier abgeleiteten, sobald der Upstream erstmals eine Rate meldet. Solange dies aktiv ist, ist der aufgezeichnete Anfragetext nicht mehr exakt der gesendete.',
   applicationLiveTimingsUnsupportedNote:
     'Live-Timings sind nur für llama.cpp verfügbar. Für diesen Typ wird der Parameter nicht gesetzt, und ein noch gespeichertes Ja wird beim nächsten Speichern gelöscht.',
   applicationLiveTimingsDelegatedNote:
@@ -2704,7 +2704,7 @@ const en: PortalMessages = {
   // launch-spec side.
   applicationLiveTimings: 'Ask the upstream for live timings',
   applicationLiveTimingsNote:
-    'Sets llama.cpp\'s "timings_per_token" on streamed Codex requests (/v1/responses), so Running connections show a tokens/sec the upstream reports for the whole request instead of one derived here. While this is on, the recorded request body is no longer exactly the body that was sent.',
+    'Sets llama.cpp\'s "timings_per_token" on streamed Codex requests (/v1/responses), so Running connections show a tokens/sec the upstream reports for the whole request instead of one derived here, once the upstream first reports a rate. While this is on, the recorded request body is no longer exactly the body that was sent.',
   applicationLiveTimingsUnsupportedNote:
     'Live timings are available for llama.cpp only. For this type the parameter is not set, and a stored yes is cleared on the next save.',
   applicationLiveTimingsDelegatedNote:
