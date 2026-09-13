@@ -143,6 +143,34 @@ func TestResolveTargetSwallowsWriterErrorAndKeepsTarget(t *testing.T) {
 	}
 }
 
+// TestResolveTargetSkipsLastUsedModelForTokenlessPrincipal pins issue #27: a
+// token-less session principal — sessionPrincipal (auth.go) leaves
+// auth.Token.ID == "" — resolving a target must NOT attempt a last-used-model
+// write. `last_used_model` is an api_tokens column, and a session principal has
+// no such row, so the write is not merely doomed ("store: not found") but has no
+// addressee at all; it fired once per portal-chat turn. The guard sits on the
+// id, NOT the model, deliberately: a populated id that no longer resolves (a
+// token deleted or expired between auth and the write) is a real signal and must
+// still be reported.
+func TestResolveTargetSkipsLastUsedModelForTokenlessPrincipal(t *testing.T) {
+	var writes []string
+	s := newTestServer(t)
+	s.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+		writes = append(writes, tokenID+"="+model)
+		return nil
+	}
+	// The shape sessionPrincipal produces: a user, but no token id and no
+	// last-used marker.
+	token := auth.Token{UserID: "usr_1"}
+
+	if _, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "qwen3-32b"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(writes) != 0 {
+		t.Fatalf("token-less principal wrote %v, want no write (issue #27)", writes)
+	}
+}
+
 func TestResolveTargetDoesNotRecordOnFailure(t *testing.T) {
 	// "Last used" means last SUCCESSFULLY routed — a typo or a dead model must
 	// never become the redirect target for every later request.

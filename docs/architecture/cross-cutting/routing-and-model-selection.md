@@ -287,17 +287,25 @@ such a fallback is not refused anywhere: it is silently never taken. Rejecting
 it on write is the only moment an operator can still notice. An empty allowlist
 narrows nothing.
 
-**The last-used-model marker.** Every token records the gateway model or group
+**The last-used-model marker.** An API token records the gateway model or group
 name of its last **successfully routed** request (`api_tokens.last_used_model`).
 `Server.resolveTarget` (`internal/gateway/inference_resolve.go`) is the single
 seam all three inference paths (`complete`, `tryProxyNative`, `beginStream`)
 resolve through, so the marker is written in exactly one place. It is written
-**only when the value changes** (the token row is already written on every
-authentication; a second unconditional write per request would double that
-load for no gain), **never on a failed resolve** (a typo or a dead model must
-not become a token's redirect target), and a write error is logged and
-swallowed — the marker is a convenience, never a reason to fail a request that
-already has a live target. Over the portal API the marker is **read-only**: it
+**only for a principal that owns an `api_tokens` row** — one with a non-empty
+token id: a token-less **session** principal (a portal chat run with no run-as
+token; `sessionPrincipal`, `internal/gateway/auth.go`) has no such row, so the
+write is skipped rather than aimed at `where id = ''`, which would match nothing
+and log a spurious "store: not found" once per chat turn (issue #27). Among
+principals that do own a row it is written **only when the value changes** (a
+bearer token's row is already written when `LookupBearer` authenticates it, so a
+second unconditional write per request would double that load for no gain),
+**never on a failed resolve** (a typo or a dead model must not become a token's
+redirect target), and a write error is logged and swallowed — the marker is a
+convenience, never a reason to fail a request that already has a live target. A
+write error that survives the id guard therefore means a **populated** id that
+no longer resolves (a token deleted or expired since authentication), which is a
+real signal worth an operator's attention. Over the portal API the marker is **read-only**: it
 appears on token DTOs and on no request body, because a writable marker would
 hand a client control over where its own unknown requests go.
 
