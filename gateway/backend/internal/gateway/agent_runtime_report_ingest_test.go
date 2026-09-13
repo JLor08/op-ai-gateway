@@ -508,3 +508,62 @@ func TestAgentRuntimeReportGateOnRejectsPublicServesAgent(t *testing.T) {
 		t.Fatalf("agent listener (netbird_only on) = %d, want 200; body=%s", agentOKRec.Code, agentOKRec.Body.String())
 	}
 }
+
+// reportBodyWithProbeAndVDM is a file-mode report whose single spec exercises
+// the fields the mirror struct used to silently drop (issue #64):
+// visible_devices_mode (the reported bug) plus the resolved type/metrics_path/
+// context_probe_path. It also carries a PLAINTEXT api_token to prove the mirror
+// still drops that secret by omission (defense in depth), even though a
+// well-behaved agent would have masked it already.
+const reportBodyWithProbeAndVDM = `{"source":"file","collected_at":"2026-08-20T09:00:00Z","config":{"router_listen":8081,"max_processes":2,"gpu_budgets":[],"specs":[{"id":"local-spec-1","model":"qwen-coder","upstream_model":"qwen2.5-coder-32b","binary":"/usr/bin/llama-server","args":["--port","9001"],"env":{},"listen_port":9001,"health_path":"/health","health_timeout_seconds":5,"startup_timeout_seconds":180,"idle_timeout_seconds":900,"admission_wait_timeout_seconds":0,"pinned":false,"set_visible_devices":true,"visible_devices_mode":"args","admin_state":"","api_token":"plaintext-token-DO-NOT-STORE","type":"llama_cpp","metrics_path":"/metrics","context_probe_path":"/props","gpus":[{"index":0,"vram_mb":24000}]}],"coresident":[]}}`
+
+// TestIngestRuntimeReportPreservesMirrorFields is the issue #64 round-trip: the
+// report mirror must carry every non-secret AgentRuntimeSpecDTO field it claims
+// to mirror. visible_devices_mode was dropped (a spec running in args mode
+// showed as env in the report view); type/metrics_path/context_probe_path were
+// dropped the same way. api_token, the one secret, must still be absent.
+// Revert-verified: removing any of the new struct fields fails this test.
+func TestIngestRuntimeReportPreservesMirrorFields(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", json.RawMessage(reportBodyWithProbeAndVDM)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("ServerRuntimeReportByServer ok=%v err=%v", ok, err)
+	}
+
+	// The secret must never survive the mirror, plaintext or key.
+	if strings.Contains(report.ReportJSON, "plaintext-token-DO-NOT-STORE") {
+		t.Fatalf("stored blob leaked the plaintext api_token: %s", report.ReportJSON)
+	}
+	if strings.Contains(report.ReportJSON, "api_token") {
+		t.Fatalf("mirror must not carry the api_token field at all: %s", report.ReportJSON)
+	}
+
+	var got agentRuntimeReport
+	if err := json.Unmarshal([]byte(report.ReportJSON), &got); err != nil {
+		t.Fatalf("canonical json not parseable: %v", err)
+	}
+	var cfg agentRuntimeReportConfig
+	if err := json.Unmarshal(got.Config, &cfg); err != nil {
+		t.Fatalf("config not parseable: %v", err)
+	}
+	if len(cfg.Specs) != 1 {
+		t.Fatalf("want 1 spec, got %d", len(cfg.Specs))
+	}
+	s := cfg.Specs[0]
+	if s.VisibleDevicesMode != "args" {
+		t.Errorf("visible_devices_mode = %q, want \"args\" (the reported bug: an args-mode spec must not show as env)", s.VisibleDevicesMode)
+	}
+	if s.Type != "llama_cpp" {
+		t.Errorf("type = %q, want \"llama_cpp\" (silently dropped before #64)", s.Type)
+	}
+	if s.MetricsPath != "/metrics" {
+		t.Errorf("metrics_path = %q, want \"/metrics\" (silently dropped before #64)", s.MetricsPath)
+	}
+	if s.ContextProbePath != "/props" {
+		t.Errorf("context_probe_path = %q, want \"/props\" (silently dropped before #64)", s.ContextProbePath)
+	}
+}

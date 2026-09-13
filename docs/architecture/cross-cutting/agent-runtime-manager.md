@@ -2590,6 +2590,15 @@ carries no `api_token` field at all, so even an unmasked value arriving on
 the wire would be dropped by the unmarshal before it reached storage — but
 the agent-side mask is what keeps that from being the *only* protection.
 
+`api_token` is the **only** `AgentRuntimeSpecDTO` field the mirror omits;
+every other non-secret field must be present on `agentRuntimeReportSpec`, or
+the same unmarshal-then-remarshal that drops the token silently drops it too.
+That is not hypothetical: `visible_devices_mode`, `type`, and the probe paths
+were each lost this way, so a spec genuinely running in args mode was shown as
+`env` in the report view (issue #64). A round-trip test
+(`TestIngestRuntimeReportPreservesMirrorFields`) pins the non-secret fields
+through the sanitizer and asserts the token still does not survive.
+
 > **Limitation — `args` are not masked *in this report*.** The report's wire
 > contract scopes redaction to `env` values, and `args` are deliberately outside
 > it, so **a literal secret typed into an argument of a local `runtime.json`
