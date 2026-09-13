@@ -2615,11 +2615,14 @@ describe('RuntimeAdminSection restart sequence', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(1));
 
     const busyButton = screen.getByRole('button', { name: t.runtimeRestart });
-    expect(busyButton).toBeDisabled();
+    expect(busyButton).toHaveAttribute('aria-disabled', 'true');
     fireEvent.click(busyButton);
     // Every other override write is locked too: any admin_state change
     // during the sequence would fight it.
-    expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeDisabled();
+    expect(screen.getByRole('button', { name: t.runtimeForceStart })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
     expect(putSpecs).toHaveLength(1);
 
     stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
@@ -3105,7 +3108,10 @@ describe('RuntimeAdminSection restart-state gate (fix round 1, I1)', () => {
     // disabled, so the sequence can never be started from here.
     for (const model of ['up-stop', 'up-vram', 'up-perm']) {
       const row = inRowWith(model);
-      expect(row.getByRole('button', { name: t.runtimeRestart })).toBeDisabled();
+      expect(row.getByRole('button', { name: t.runtimeRestart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
       // "Force start" is the action that does something on all three.
       expect(row.getByRole('button', { name: t.runtimeForceStart })).toBeEnabled();
     }
@@ -3291,7 +3297,10 @@ describe('RuntimeAdminSection bounded override writes (fix round 1, M4)', () => 
       await act(async () => {
         await Promise.resolve();
       });
-      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toBeDisabled();
+      expect(screen.getByRole('button', { name: t.runtimeForceStart })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
 
       await act(async () => {
         vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
@@ -3430,7 +3439,10 @@ describe('RuntimeAdminSection restart state gate is re-asserted on click (fix ro
     // Nothing was written and no sequence is running.
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
     expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: t.runtimeRestart })).toBeDisabled();
+    expect(screen.getByRole('button', { name: t.runtimeRestart })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
   });
 
   // A greyed-out Restart with no explanation is the RESTING state of a healthy
@@ -3445,10 +3457,10 @@ describe('RuntimeAdminSection restart state gate is re-asserted on click (fix ro
     stream.setStatus('open');
     await openStatusTab();
     const restartButton = await screen.findByRole('button', { name: t.runtimeRestart });
-    expect(restartButton).toBeDisabled();
-    // The wrapper span, not the button: a disabled MUI button is pointer-inert
-    // and a Tooltip anchored on it never fires.
-    fireEvent.mouseOver(restartButton.parentElement as HTMLElement);
+    expect(restartButton).toHaveAttribute('aria-disabled', 'true');
+    // The button directly: aria-disabled (not the inert `disabled` attribute)
+    // leaves it pointer-interactive, so the Tooltip fires on it.
+    fireEvent.mouseOver(restartButton);
     expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeRestartUnavailable);
   });
 });
@@ -4844,8 +4856,8 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     // How that is achieved: the action is still offered, but locked -- and it
     // says why, because a greyed-out control with no account of itself is its
     // own defect (RowAction.title, forwarded on the inline path).
-    expect(del).toBeDisabled();
-    fireEvent.mouseOver(del.parentElement as HTMLElement);
+    expect(del).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.mouseOver(del);
     expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeSpecDeleteStateLoading);
 
     // And it resolves itself the moment the read answers.
@@ -4975,11 +4987,11 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
     expect(fakeApi.deleteMapping).not.toHaveBeenCalled();
     expect(deletedMappingIds).toEqual([]);
     expect(deletedSpecIds).toEqual([]);
-    expect(del).toBeDisabled();
+    expect(del).toHaveAttribute('aria-disabled', 'true');
     // A different sentence from the still-loading one: this state does not
     // resolve itself, so the tooltip names the way out instead of asking for
     // patience.
-    fireEvent.mouseOver(del.parentElement as HTMLElement);
+    fireEvent.mouseOver(del);
     expect(await screen.findByRole('tooltip')).toHaveTextContent(t.runtimeSpecDeleteStateUnknown);
 
     // Take that way out. The Edit GET answers the question, so the control is

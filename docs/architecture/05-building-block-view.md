@@ -179,17 +179,30 @@ Two additions worth knowing when looking for code on this side:
   `components/shared/ResourceFallback.tsx` (`resourceState()` +
   `<ResourceFallback>`) was extracted there as the canonical
   loading/error/stale-error/ready rendering for `useResource` call sites.
-- `RowAction.title` — the "why is this disabled" reason — is now honoured on
-  **both** rendering paths. `RowActionsCell` previously dropped it on the inline
-  icon path, and `IconAction` spent its only tooltip on the action's label
-  anchored directly on the `IconButton`, which meant a **disabled** inline action
-  showed no tooltip at all, not even its own label (MUI warns about exactly this:
-  a disabled element fires no events, so a Tooltip needs a wrapper element).
-  `IconAction` now takes an optional `title`, wraps only the disabled button in a
-  `span`, and prefers `title` over `label` when both are set — the reason is
-  strictly more informative than the name, which the icon and the `aria-label`
-  already carry. The enabled path's DOM is unchanged, so no other screen's
-  markup, layout or queries move.
+- `RowAction.title` — the "why is this disabled" reason — is honoured on
+  **both** rendering paths and is reachable by keyboard and screen readers, not
+  only on pointer hover. `RowActionsCell` previously dropped it on the inline
+  icon path, and `IconAction` spent its only tooltip on the action's label. It
+  now takes an optional `title` and prefers it over `label` when both are set —
+  the reason is strictly more informative than the name, which the icon and the
+  `aria-label` already carry. Crucially, a **disabled** action uses
+  `aria-disabled`, **not** the `disabled` attribute: a real `disabled` attribute
+  is unfocusable and pointer-inert, so the tooltip explaining the refusal reached
+  only mouse users — the one place the UI says *why* an action is refused was
+  announced to nobody using a keyboard or screen reader (issue #26). With
+  `aria-disabled` the control stays focusable, and the reason rides a
+  **persistent**, visually-hidden element wired through `aria-describedby` — in
+  the accessibility tree at all times, so a screen reader reads it the instant
+  the control takes focus, rather than ~100ms later when the Tooltip's hover
+  delay would elapse (a `describeChild` Tooltip alone associates its text only
+  while open, too late for the focus announcement). The Tooltip carries the same
+  text for sighted users on hover and focus, with `describeChild` so it never
+  competes with the accessible **name**, which stays the `label`. Because the
+  control is no longer inert, `IconAction` drops `onClick` when disabled (the DOM
+  no longer swallows the click) and reapplies the disabled look itself (greyed,
+  no ripple, no hover affordance). Seven direct call sites plus `RowActionsCell`'s
+  inline path go through `IconAction`, so this is one component, not a sweep; the
+  enabled path's behaviour is unchanged.
 
 ## 5.4 Level 2 — Server-Agent components
 
