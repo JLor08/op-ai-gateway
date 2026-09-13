@@ -124,6 +124,7 @@ describe('running-connections (active requests) i18n keys', () => {
       'activityActiveEmpty',
       'activityActiveElapsed',
       'activityActiveSession',
+      'activityColLiveOutputTokens',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -149,12 +150,13 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // Deliberately broader than the old literal: pinning the full phrase would let a
     // reworded "the upstream does not report a count mid-stream" reintroduce the same
     // false cause and still pass. The demonstrative is what does the blaming, so it is
-    // what is banned — the honest string names the server as one of two dependency
-    // axes ("the upstream" in en, "vom Inferenzserver" in de, which uses that one term
-    // throughout the sentence rather than mixing it with the anglicism), never "this
-    // upstream" / "dieser Inferenzserver" as the reason. The German term is banned in
-    // any declension, and the anglicism's ban stays so the guard does not go quiet if
-    // the wording is ever swapped back to "Upstream".
+    // what is banned — the honest string names the server as one of THREE dependency
+    // axes, beside what the client requested and the operator's Responses live-timings
+    // switch ("the upstream" in en, "vom Inferenzserver" in de, which uses that one
+    // term throughout the sentence rather than mixing it with the anglicism), never
+    // "this upstream" / "dieser Inferenzserver" as the reason. The German term is
+    // banned in any declension, and the anglicism's ban stays so the guard does not go
+    // quiet if the wording is ever swapped back to "Upstream".
     expect(messages.en.activityLiveTpsNone).not.toMatch(/this upstream/i);
     expect(messages.de.activityLiveTpsNone).not.toMatch(/dieser Upstream/i);
     expect(messages.de.activityLiveTpsNone).not.toMatch(/dies\w* Inferenzserver/i);
@@ -166,8 +168,9 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
     // deliberately about the derivation and not about the count's existence — a row
     // whose exact count has arrived inside the gateway's 50ms derivation floor
     // reaches this same string with a positive count, so "no count to derive one
-    // from" would be false there. The client is named as one of the two dependency
-    // axes, which is what stops the sentence reading as an upstream limitation.
+    // from" would be false there. The client is named as one of the three dependency
+    // axes — beside the upstream and the operator's Responses live-timings switch —
+    // which is what stops the sentence reading as an upstream limitation.
     expect(messages.en.activityLiveTpsNone).toMatch(/not measured/i);
     expect(messages.en.activityLiveTpsNone).toMatch(/client/i);
     expect(messages.de.activityLiveTpsNone).toMatch(/nicht gemessen/i);
@@ -187,17 +190,33 @@ describe('live tokens/sec provenance strings claim only what the row can know', 
   });
 
   it('leaves the upstream-reported string free of any token claim', () => {
-    // A native-passthrough openai_responses stream WITH timings_per_token produces
-    // the row shape "rate present, token count 0": the upstream's own rate arrives
-    // on the partial frames while those partials carry no usage. This is the string
-    // shown there, so interpolating a count into it (as activityLiveTpsGateway
-    // legitimately does) would make it claim "computed from 0 tokens".
+    // A native-passthrough openai_responses stream WITH timings_per_token can
+    // produce the row shape "rate present, token count 0": the mid-stream count
+    // is `timings.predicted_n` and nothing else, so a partial whose `timings`
+    // object carries a rate and no predicted_n puts a rate on the row and no
+    // count. This is the string shown there, so interpolating a count into it (as
+    // activityLiveTpsGateway legitimately does) would make it claim "computed
+    // from 0 tokens".
     expect(messages.en.activityLiveTpsUpstream).not.toMatch(/token/i);
     expect(messages.de.activityLiveTpsUpstream).not.toMatch(/token/i);
     for (const m of [messages.de, messages.en]) {
       expect(m.activityLiveTpsUpstream).not.toContain('{n}');
       expect(m.activityLiveTpsGateway).toContain('{n}');
     }
+  });
+
+  it('names the operator switch beside the client as a third dependency axis', () => {
+    // The string ends by naming what the absence depends on, and it named two
+    // things: the upstream, and what the client requested. Part 2 of issue #81
+    // adds a third -- the operator's switch, which makes the gateway ask
+    // llama.cpp for timings_per_token on a streaming /v1/responses passthrough.
+    // So a row can be empty because the SWITCH is off while the client asked for
+    // nothing, and can carry a rate no client ever asked for. A two-item list
+    // presented as the whole list is the same class of defect as the wrong cause
+    // the first case in this describe bans: the sentence has to be complete, not
+    // merely free of false blame.
+    expect(messages.en.activityLiveTpsNone).toMatch(/switch/i);
+    expect(messages.de.activityLiveTpsNone).toMatch(/Schalter/i);
   });
 });
 
@@ -2669,5 +2688,43 @@ describe('mapping capability i18n keys', () => {
     expect(messages.de.mappingVisionCapableUnknownHint).toMatch(/llama\.cpp/);
     expect(messages.en.mappingIsMtpUnknownHint).toMatch(/never re-detected/);
     expect(messages.de.mappingIsMtpUnknownHint).toMatch(/nicht neu erkannt/);
+  });
+});
+
+// Responses live-timings (issue #81 part 2, design D10): the shared
+// API-variant block's own checkbox strings plus the three backend refusals
+// part 1 introduced. The codes are read verbatim from the Go errRow tables in
+// gateway/portal_application_endpoints.go and portal_runtime_endpoints.go;
+// see format.test.ts for the map side.
+describe('responses live-timings i18n keys', () => {
+  it('defines the control + error-code keys in de and en', () => {
+    const keys = [
+      'applicationLiveTimings',
+      'applicationLiveTimingsNote',
+      'applicationLiveTimingsUnsupportedNote',
+      'applicationLiveTimingsAutoNote',
+      'applicationLiveTimingsDelegatedNote',
+      'errorApplicationResponsesLiveTimingsUnsupported',
+      'errorApplicationResponsesLiveTimingsConflict',
+      'errorRuntimeSpecResponsesLiveTimingsUnsupported',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // The two application refusals answer DIFFERENT questions -- the 400 says
+  // the body you just sent is contradictory, the 409 says this application's
+  // STORED type cannot honour it -- so one shared sentence would tell half
+  // the operators the wrong remedy.
+  it('gives the 400 and the 409 application refusals different sentences', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].errorApplicationResponsesLiveTimingsUnsupported).not.toBe(
+        messages[locale].errorApplicationResponsesLiveTimingsConflict,
+      );
+    }
   });
 });

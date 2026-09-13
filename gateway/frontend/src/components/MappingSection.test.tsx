@@ -85,6 +85,7 @@ const application: PortalApplication = {
   health_check_interval_seconds: 0,
   responses_mode: 'passthrough',
   messages_mode: 'passthrough',
+  responses_live_timings_enabled: false,
   loaded_models_path: '',
   loaded_models_format: '',
   context_probe_path: '',

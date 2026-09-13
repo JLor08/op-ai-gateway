@@ -63,6 +63,18 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.visible_devices_no_gpus': 'errorRuntimeSpecVisibleDevicesNoGpus',
   'runtime_spec.visible_devices_conflict': 'errorRuntimeSpecVisibleDevicesConflict',
   'runtime_spec.application_not_server_agent': 'errorRuntimeSpecApplicationNotServerAgent',
+  // Issue #81 part 2 (design D10): the three refusals part 1 introduced. THREE
+  // distinct labels on purpose -- the whole-map "reuses a label for two codes
+  // only where that is deliberate" invariant below fails on a shared one, and
+  // it would be right to: the 400 tells the operator their own body is
+  // contradictory, the 409 tells them this application's stored type is, and
+  // the runtime_spec one names a kind that may have been DETECTED rather than
+  // typed. Read verbatim from the Go errRow tables, not guessed.
+  'application.responses_live_timings_unsupported':
+    'errorApplicationResponsesLiveTimingsUnsupported',
+  'application.responses_live_timings_conflict': 'errorApplicationResponsesLiveTimingsConflict',
+  'runtime_spec.responses_live_timings_unsupported':
+    'errorRuntimeSpecResponsesLiveTimingsUnsupported',
   'runtime_coresidency.pair_invalid': 'errorRuntimeCoresidencyPairInvalid',
   'server.gpu_budget_invalid': 'errorServerGpuBudgetInvalid',
   'server.runtime_limit_invalid': 'errorServerRuntimeLimitInvalid',

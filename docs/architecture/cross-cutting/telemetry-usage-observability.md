@@ -603,6 +603,19 @@ it completes. In the running-connections table `requested_model` and `model` are
 visible by default — matching the completed-requests table — and
 `provider_model` is an opt-in column.
 
+**The live output-token count is an opt-in column too**
+(`Generated (live)`), one of the six this panel ships hidden: on a profile that
+has never changed its columns the count described further down is real, arrives,
+and is invisible until the operator reveals it from the column menu. Two stored
+preferences bypass that default, and they are independent. A stored HIDDEN
+SET — written by hiding or showing any column here — cannot mention a column
+added after it, so such an operator sees this one already **visible**, in its
+catalogue position between the live rate and TTFT. A stored ORDER — written
+only by reordering, or by a reset performed before this column existed — is
+the one that puts a later column at the END of the row. Column settings are
+per user profile, so two operators on one gateway can legitimately see
+different panels, and the menu's reset restores both defaults.
+
 **Live tokens/sec and TTFT.** Two more values ride the same `ActiveRequest`: a
 per-request output-tokens/sec figure and a time-to-first-token (TTFT), both
 resolved from a `requestProgress` (`request_progress.go`) — a small struct of
@@ -715,8 +728,8 @@ feature:
 | | `anthropic_messages` | `openai_responses` |
 |---|---|---|
 | TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.function_call_arguments.delta` stamps it |
-| output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **no mid-stream source** — the `*.delta` partials carry no usage object at all, and counting deltas as tokens is the option this feature already rejected above |
-| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream only when the **client** set `timings_per_token`, and then labelled `upstream`. There is no mid-stream count on this flavor, so the gateway derives nothing here: a `timings` object attached by the upstream to a PARTIAL frame is the only possible source, and the gateway reads one off whatever partial carries it. That llama.cpp's Responses implementation does attach one is now MEASURED, not carried over from its chat streams: on the operator's deployment (build `b10448-ad1de39e0`, § "the bias … are measured" below) a flagged request measured DIRECT to the runtime router had 39 of its 48 frames carry a top-level `timings` object, on `response.reasoning_text.delta` and `response.output_text.delta` alike — one build on one deployment, not a general guarantee. Either way the flag is the only thing that can put a rate on this cell mid-stream: **the same prompt replayed WITHOUT the flag produced exactly one timings-bearing frame** — the terminal one, which is the next paragraph's subject, not this cell's. (A replay, not the same request: a request either carried the flag or it did not.) |
+| output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **yes, once the outgoing body carries `timings_per_token`** — those partials then carry llama.cpp's own `timings.predicted_n`, and that is the count. The column that renders it ships **hidden** and is revealed from the panel's column menu (the column inventory at the top of this section). Without the flag there is no mid-stream source at all: the `*.delta` partials carry no usage object, and counting deltas as tokens is the option this feature already rejected above. **It is an UPSTREAM count, not a count of what the client has received.** It advances only on the partials that happen to carry a `timings` object, so the series is monotone but **not contiguous** (a measured run ran 1…27 on the reasoning deltas, then 30, 31, 32 — two tokens generated across frames that carry no `timings`), and mid-stream it can trail the terminal `response.usage.output_tokens` by a token or two. That is why it travels in a field of its own (`inference.Usage.LiveOutputTokens`, never `OutputTokens`) and reaches the live counter only: the recorded row, `usage_events`, the Activity totals, the usage timeseries and the rate limiter are all built from the accumulator and never see it. **No test may assert equality between the last partial count and the recorded total** — such a test passes on cap-truncated data, where both numbers are the cap, and fails on a naturally ending generation. |
+| rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream when the outgoing body carries `timings_per_token` — the **client's own**, or the one the **operator's** per-endpoint opt-in injects — and then labelled `upstream`: a `timings` object attached by the upstream to a PARTIAL frame is the only upstream source, and the gateway reads one off whatever partial carries it. A `gateway`-labelled rate is reachable here too since this flavor gained a mid-stream count, in the narrow window where a timings-bearing partial carries a `predicted_n` but a `predicted_per_second` of `0.0` — the measured series opens at exactly that, and only a positive rate is stored, so the earliest flagged partials give the row an exact count and no rate, and the feature's one derivation runs over that count. That is accepted and pinned rather than suppressed: the structural invariant is that a gateway-derived rate is only ever computed over an **exact upstream count**, and `predicted_n` is exactly that, so suppressing it would mean inventing a per-flavor exception inside the single derivation this feature has. That llama.cpp's Responses implementation does attach one is now MEASURED, not carried over from its chat streams: on the operator's deployment (build `b10448-ad1de39e0`, § "the bias … are measured" below) a flagged request measured DIRECT to the runtime router had 39 of its 48 frames carry a top-level `timings` object, on `response.reasoning_text.delta` and `response.output_text.delta` alike — one build on one deployment, not a general guarantee. Either way the flag is the only thing that can put an UPSTREAM-reported rate on this cell mid-stream: **the same prompt replayed WITHOUT the flag produced exactly one timings-bearing frame** — the terminal one, which is the next paragraph's subject, not this cell's. (A replay, not the same request: a request either carried the flag or it did not.) |
 
 **The Responses column's terminal frame is a different answer from its
 mid-stream one, and it is not suppressed for arriving late.**
@@ -726,8 +739,10 @@ branch of `isTerminalUsageFrame` is load-bearing for the live column, not only
 for the recorded row — so the count, and a rate alongside it, appear on the
 still-active row for the short window between that frame and `proxyNative`'s
 deferred `Active.Remove`. The honest one-line reading of the column is
-therefore "nothing to show mid-stream unless the client asked for it", not
-"nothing to show". **Which label that rate carries is the upstream's choice,
+therefore "nothing to show mid-stream unless the body carried
+`timings_per_token`", not "nothing to show" — and since the Responses
+live-timings opt-in, the operator is the second of the two parties who can put
+it there. **Which label that rate carries is the upstream's choice,
 and on llama.cpp it is `upstream`, not `gateway`.** The terminal
 `response.completed` frame is one of the three shapes llama.cpp bolts a
 `timings` object onto, with no dependence on `timings_per_token` — that flag's
@@ -755,15 +770,58 @@ rather than merely as a number where there should be none.
 **Two rules on this path must survive any later change.** Neither is enforceable
 by shape, so tests pin both:
 
-- **`timings_per_token` is READ when the client set it, and never injected.**
-  Injecting it is what would complete the Responses column mid-stream for every
-  client, which is exactly why the temptation is worth naming at the one place
-  someone would act on it: `rewriteModelField` is the only edit ever made to a
-  relayed body, and adding the flag would change the upstream's *response*
-  shape — frames' worth of fields the client never asked for, flowing through to
-  a client that must parse them — in order to improve a gateway display column.
-  A missing live rate renders as "not measured" and is honest; a silently
-  rewritten client request is not.
+- **`timings_per_token` is added to a relayed body only where the operator asked
+  for it, and never over a value the client set itself.** It is the one request
+  parameter the gateway ever adds on this path, and the second of the only two
+  body edits `proxyNative` makes — the other being the model rewrite.
+  `wantsResponsesLiveTimings` (`responses_live_timings.go`) is the whole of the
+  decision, and it answers true only when **all five** of these hold:
+  1. `Target.ResponsesLiveTimingsEnabled` — the operator's per-endpoint opt-in,
+     resolved spec-over-application, the same precedence `responses_mode` uses
+     ([API Surface](../reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode));
+  2. the effective upstream kind is `llama_cpp`. For a `server_agent` target that
+     is `Target.LiveProgressSpecType`; `Target.Provider` holds the literal
+     `server_agent` there and is the wrong field to read;
+  3. the request is the **Responses** flavor — the *fine* flavor, taken as a
+     parameter, because `Target.APIFlavor` is the coarse `openai`/`anthropic` one
+     and cannot tell `/v1/responses` from `/v1/chat/completions`;
+  4. the request is **streaming** — a buffered body has no partial frames to
+     time, and gets no live counter either;
+  5. the stored live-progress verdict is not an explicit `"unsupported"`.
+
+  Point 5 is a **veto, not a requirement.** Requiring a *positive* verdict would
+  make the switch silently dead wherever the capability probe never ran, which is
+  the worst failure available to a control an operator has deliberately switched
+  ON; and within llama.cpp a positive verdict allows nothing the veto has not
+  already allowed. The verdict's vocabulary is load-bearing:
+  `Target.LiveProgressSupport` speaks `""` / `"supported"` / `"unsupported"`, so
+  a veto written against the capability row's own `"no"` would never fire. Point
+  2 re-checks the **kind** rather than trusting the portal's write rule, because
+  the store is policy-free by design — its parity fixture deliberately seeds a
+  `true` on an incapable row — so a restored dump or a direct write can produce
+  one the request path must not act on.
+
+  A client that sent `timings_per_token` **itself** — `true` or `false` — has its
+  body forwarded unchanged: the injection tests for the key's *presence*, not its
+  value, because llama.cpp was measured treating an explicit `false` exactly as
+  it treats an absent key (§ "the flag's effect reproduces" below). Overwriting
+  an explicit client `false` would be the silently rewritten client request this
+  path refuses to be; the accepted cost is that such a client makes the
+  operator's switch ineffective for its own requests, with nothing on the panel
+  explaining why.
+
+  **Nothing retries without it.** An upstream that rejects the key answers the
+  client's request with its own 4xx. That residual is measured-small rather than
+  overlooked: on the build this was measured against, `/v1/responses` answered a
+  request carrying an entirely fabricated top-level key with an ordinary
+  completion, and llama.cpp's request schema is pull-based, so a key nobody asks
+  for is never inspected. The blast radius is one application, and the operator
+  switches it off on whichever surface owns the endpoint — the model's **runtime
+  spec** for a `server_agent` model, since the resolver takes the spec's stored
+  value over the parent application's whenever a spec exists and the application
+  form offers no switch for that type; the application itself otherwise. The
+  failure is immediate and visible rather than silent. What makes it *diagnosable* is the log field in the
+  next paragraph, not the capture.
 - **The in-flight figure is display only.** The END-of-request rate still feeds
   an opted-in mapping's throughput EWMA (`UpdateMappingOpportunisticMetrics`,
   read back by the scorer and by a model group's `MinTokensPerSecond` gate —
@@ -774,13 +832,43 @@ by shape, so tests pin both:
   because an extra write carrying an identical-looking value would otherwise
   hide.
 
+  What the opt-in does change is **which traffic** reaches the end-of-request
+  feed at all. A flagged stream carries per-frame rates where an unflagged one
+  carries none, including the truncated stream that ends cleanly at 200 with no
+  `response.completed` — recorded `status = "success"`, so its last reported rate
+  is a routing input like any complete stream's (see "A response with no
+  authoritative frame records the LAST rate its own frames reported" further
+  down). The operator's switch, not only a client's own body, now selects
+  requests into that population. The recorded figure is still the rate the stream
+  reported rather than the generation's peak, and must stay that way.
+
+**While the switch is on, the recorded request body is not the body that was
+sent.** The payload capture on this path records the **client's** bytes —
+`buildCaptureInput` is handed the raw client body, never the body `proxyNative`
+built — and that has already diverged from the upstream bytes since long before
+this feature, because `rewriteModelField` re-serializes the whole object whenever
+a provider-model override applies. The injected `timings_per_token` widens the
+divergence from cosmetic to semantic. Changing what is captured is deliberately
+out of scope here: it is a behaviour change for **every** passthrough request and
+would put the internal provider model name in front of the tenant. What closes
+the operator's gap instead is the **request log** — `proxyNative`'s per-request
+`inference request (native passthrough)` debug line carries
+`timings_per_token_injected`, so an operator holding an unexplained upstream 4xx
+has one grep that says whether the gateway added a key the capture does not show.
+No wire change, no DTO field, nothing tenant-visible. The panel gains no "we
+asked" state either: when the key is injected, the request succeeds and no
+partial carries `timings`, the row is byte-identical to one where nothing was
+injected — and the panel's job is to report the number and where it came from,
+not who asked for it. Revisit that if the case is ever observed.
+
 **What this surface does and does not distinguish**, since the tooltip's refusal
 to name a cause is easy to mistake for a missing field. `provider_path` **does**
 separate native passthrough from translation: it rides the same DTO and differs
 from `req_path` exactly when translation is happening (`ActiveRequest`,
 `active_requests.go`), and the panel offers it as an opt-in column. What nothing
-on the DTO records is whether the **client** asked for mid-stream timings — and
-on the passthrough Responses path that is precisely the axis an absent rate
+on the DTO records is whether **anyone** asked for mid-stream timings — neither
+the client's own `timings_per_token` nor the operator's opt-in that injects it —
+and on the passthrough Responses path that is precisely the axis an absent rate
 turns on. So the tooltip is not claiming that passthrough and translation are
 indistinguishable here; it is that no flavor-plus-mode combination narrows the
 absence to a single cause.
@@ -1364,7 +1452,8 @@ attaches `timings.draft_n` — the number of tokens a draft model proposed for
 that turn — to the non-streaming chat body, to the final frame of a
 chat-completions stream (the same chunk as the terminal `usage`), and to the
 terminal frame of a Responses-API stream. **Those three are the whole list of
-shapes that carry a `timings` object with `timings_per_token` unset** — measured
+shapes that carry a `timings` object with `timings_per_token` unset — unset by the
+client AND not injected by the operator's Responses live-timings opt-in** — measured
 for the Responses stream: with the flag unset, exactly ONE frame of a 48-frame
 request carried `timings`, the terminal one (§8.4.3's measurement). The flag
 adds one to a chat stream's PARTIAL chunks, which is where the translate path's
@@ -1533,13 +1622,16 @@ stale *positive* would send the parameters to an upstream that answers 400 —
 the dead stream this design exists to eliminate. There is therefore no
 positive entry that could go stale.
 
-**Native passthrough gets neither parameter — and gets the live figures its own
-relayed frames can support, which is not the same statement.** `proxyNative`
-forwards the client's own body unmodified (only the `model` field is ever
-rewritten, and losslessly), so neither parameter is ever added on this path;
-`timings_per_token` is read when the client set it and never injected, which is
-a decision with its own reasons rather than an omission (see "Two rules on this
-path must survive any later change" above). A **buffered** passthrough request
+**Native passthrough gets neither of `CompleteStream`'s parameters — and gets the
+live figures its own relayed frames can support, which is not the same
+statement.** `stream_options.continuous_usage_stats` is never added on this path
+at all, and `timings_per_token` is added only under the operator's per-endpoint
+opt-in and the four other conditions the gate applies (see "Two rules on this
+path must survive any later change" above) — never through `wantsLiveProgress`,
+whose verdict describes the *completion* endpoint's parameter schema and which is
+deliberately not reused here. Everything else `proxyNative` forwards is the
+client's own body, with the `model` field losslessly rewritten and nothing else
+touched. A **buffered** passthrough request
 allocates no `Progress` counter for its `ActiveRequest`, and `liveProgressDTO`
 resolves it to "not measured" exactly as it does a non-streaming translated
 call — nil deliberately, not an allocated permanently-zero struct. A
@@ -1589,17 +1681,18 @@ build on that deployment; not a general guarantee about every llama.cpp build,
 and the emit side is one deployment. The figures below come from SEPARATE
 requests, so each bullet says which run it belongs to.
 
-- **The precondition needed no gateway change.** A client that sets
-  `timings_per_token` itself has the flag relayed untouched (the non-injection
-  rule above). Measured **direct to the runtime router**, with the flag set:
+- **The precondition needed no gateway change at the time this was measured.** A
+  client that sets `timings_per_token` itself has the flag relayed untouched, and
+  that is still true — but it is no longer the only way the flag reaches the
+  upstream, since the operator's opt-in injects it under the gate above. Measured **direct to the runtime router**, with the flag set:
   **39 of one 48-frame Responses stream's frames carried a top-level `timings`
   object** — on `response.reasoning_text.delta` and
   `response.output_text.delta` alike. The **same prompt replayed without the
   flag** produced **exactly one** timings-bearing frame: the terminal
   `response.completed`. (A replay, not the same request — a request either
-  carried the flag or it did not.) So the peak is reachable for any client that
-  asks for mid-stream timings, and this substitution is a measured no-op for
-  traffic that does not.
+  carried the flag or it did not.) So the peak is reachable on any request that
+  carries the flag, whoever put it there, and this substitution is a measured
+  no-op only for traffic that carries none.
 - **The defect, end to end through this gateway.** A **second, separate
   request**, this one relayed **through the gateway**: 41 timings-bearing
   frames, whose terminal frame reported `predicted_per_second = 47.389` while
@@ -1614,6 +1707,35 @@ requests, so each bullet says which run it belongs to.
   not corrective.
 - **`draft_n` survives on the terminal frame with the flag set** (28 on the
   measured run), so nothing about `speculation_observed` (§ above) changes.
+- **The flag's effect reproduces, an explicit `false` is honoured upstream, and
+  the wire cost is 2.49×.** A third set, measured **on 2026-09-12** on the same
+  build and deployment: the same prompt run three times, all three terminating
+  at the same `output_tokens: 60`.
+
+  | outgoing body | data frames | frames carrying `timings` | bytes |
+  |---|---|---|---|
+  | `"timings_per_token": true` | 68 | **59** | 28 463 |
+  | key absent | 68 | **1** (terminal only) | 11 412 |
+  | `"timings_per_token": false` | 65 | **1** (terminal only) | 10 614 |
+
+  Two facts the rest of this section leans on come from that table and nowhere
+  else. **llama.cpp treats an explicit `false` exactly as it treats an absent
+  key** — which is why the injection tests for the key's PRESENCE rather than
+  its value, and why a client that sends `false` keeps its own body and defeats
+  the operator's switch for its own requests. And **2.49× is the wire cost of
+  the flag for an identical generation** — fields the client never asked for on
+  frames it must parse, which is the whole reason this is an operator's switch
+  rather than a default, and the size of what a later response-side strip would
+  recover.
+- **An unknown top-level key is not rejected, which is why there is no retry.** A
+  `/v1/responses` request on the same build carrying `"zzq_not_a_real_key": true`
+  answered with an ordinary completion body rather than an error object:
+  llama.cpp's request schema is pull-based, so a key nobody asks for is never
+  inspected. A retry without the flag would therefore be code that no upstream
+  this repository can point at would ever fire — the streaming run in the table
+  above carried the very key that gets injected and was not rejected either. The
+  residual that an OLDER build might reject it is recorded on the risk register
+  ([Risks & Technical Debt §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 Four properties of the substitution are deliberate, and pinned:
 
@@ -1681,16 +1803,22 @@ Four properties of the substitution are deliberate, and pinned:
   flavor-agnostic substitution a no-op for `anthropic_messages` by construction
   rather than by assumption.
 
-**The same gate governs both columns.** `usageScanner.publishProgress`
-publishes an output-token count to the live counter only from an authoritative
-frame, for a sharper version of the identical reason: the recorded row can
-tolerate a placeholder because it is presented as a *count*, whereas
-`liveProgressDTO` would divide that `1` by the generation window and DISPLAY the
-quotient as a measured *rate* for the rest of the stream. One predicate, one
-definition per flavor, three consumers — the derived rate, the frame that
-freezes the recorded rate's capture, and the live count — so the predicate's
-Responses branch now has two readers of its own (the live count, and the rate
-capture above) where the Anthropic-only derived rate gives it none.
+**The same gate still governs the frame's own `OutputTokens`, and no longer
+governs the live column alone.** `usageScanner.publishProgress` publishes **this
+frame's** `OutputTokens` to the live counter only from an authoritative frame,
+for a sharper version of the identical reason: the recorded row can tolerate a
+placeholder because it is presented as a *count*, whereas `liveProgressDTO` would
+divide that `1` by the generation window and DISPLAY the quotient as a measured
+*rate* for the rest of the stream. What a **non**-authoritative frame may publish
+is the separate `LiveOutputTokens` — llama.cpp's `timings.predicted_n`, a number
+the upstream reported for **itself** rather than a placeholder the merge cannot
+distinguish. That is the whole reason the two travel in different fields: the
+gate exists to keep a placeholder off the live column, and an upstream's own
+per-frame count is not one. One predicate, one definition per flavor, three
+consumers — the derived rate, the frame that freezes the recorded rate's
+capture, and the live count — so the predicate's Responses branch now has two
+readers of its own (the live count, and the rate capture above) where the
+Anthropic-only derived rate gives it none.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiVariantControls } from './ApiVariantControls';
 import { messages } from '../../i18n';
 import type { EndpointMode } from '../../api';
+import type { LiveTimingsKind } from './liveTimings';
 
 const t = messages.de;
 
@@ -18,23 +19,34 @@ function Harness({
   flavors = ['openai', 'anthropic'],
   responses = 'passthrough',
   msgs = 'passthrough',
+  // NO default value here, deliberately: a default would fire for an
+  // EXPLICIT `timings={undefined}` too, and `undefined` is the value one of
+  // the cases below is about.
+  timings,
+  timingsKind = 'capable',
 }: {
   flavors?: string[];
   responses?: EndpointMode;
   msgs?: EndpointMode;
+  timings?: boolean;
+  timingsKind?: LiveTimingsKind;
 }) {
   const [apiFlavors, setApiFlavors] = useState<string[]>(flavors);
   const [responsesMode, setResponsesMode] = useState<EndpointMode>(responses);
   const [messagesMode, setMessagesMode] = useState<EndpointMode>(msgs);
+  const [liveTimings, setLiveTimings] = useState<boolean | undefined>(timings);
   return (
     <ApiVariantControls
       t={t}
       apiFlavors={apiFlavors}
       responsesMode={responsesMode}
       messagesMode={messagesMode}
+      liveTimings={liveTimings}
+      liveTimingsKind={timingsKind}
       onFlavorsChange={setApiFlavors}
       onResponsesModeChange={setResponsesMode}
       onMessagesModeChange={setMessagesMode}
+      onLiveTimingsChange={setLiveTimings}
     />
   );
 }
@@ -91,6 +103,9 @@ describe('ApiVariantControls', () => {
         apiFlavors={['openai', 'anthropic']}
         responsesMode="passthrough"
         messagesMode="passthrough"
+        liveTimings={false}
+        liveTimingsKind="capable"
+        onLiveTimingsChange={() => {}}
         onFlavorsChange={onFlavorsChange}
         onResponsesModeChange={() => {}}
         onMessagesModeChange={() => {}}
@@ -98,5 +113,37 @@ describe('ApiVariantControls', () => {
     );
     fireEvent.click(screen.getByRole('checkbox', { name: 'anthropic' }));
     expect(onFlavorsChange).toHaveBeenCalledWith(['openai']);
+  });
+
+  const liveTimingsBox = () => screen.getByRole('checkbox', { name: t.applicationLiveTimings });
+
+  it('renders the live-timings checkbox for a capable kind and reports a toggle', () => {
+    render(<Harness timings={false} timingsKind="capable" />);
+    expect(liveTimingsBox()).not.toBeChecked();
+    expect(screen.getByText(t.applicationLiveTimingsNote)).toBeInTheDocument();
+    fireEvent.click(liveTimingsBox());
+    expect(liveTimingsBox()).toBeChecked();
+  });
+
+  it('offers no checkbox at all for an incapable kind, and says why instead', () => {
+    render(<Harness timings={false} timingsKind="incapable" />);
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsUnsupportedNote)).toBeInTheDocument();
+  });
+
+  // "No opinion" (undefined) is not a third rendering -- it is the value the
+  // BACKEND will pick, shown honestly. On a kind the form knows is capable
+  // that value is ON (the documented create default), so the box shows
+  // ticked; on an unknown kind nothing can be promised, so the box shows
+  // unticked and the Auto caption is what states the rule.
+  it('shows no-opinion as the default the backend will apply, per kind', () => {
+    render(<Harness timings={undefined} timingsKind="capable" />);
+    expect(liveTimingsBox()).toBeChecked();
+    cleanup();
+    render(<Harness timings={undefined} timingsKind="unknown" />);
+    expect(liveTimingsBox()).not.toBeChecked();
+    expect(screen.getByText(t.applicationLiveTimingsAutoNote)).toBeInTheDocument();
   });
 });

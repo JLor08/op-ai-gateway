@@ -46,11 +46,16 @@ function formatLiveTps(value: number): string {
 // DOES distinguish native passthrough from translation — it differs from `req_path`
 // exactly when translation is happening — but that is not the axis this absence
 // turns on: nothing on this DTO records whether the client set `timings_per_token`,
-// and no flavor-plus-mode combination narrows the absence to a single cause. The
+// nothing on it records the operator's Responses live-timings switch either (that
+// one is recorded on the gateway's per-request debug line, deliberately not on this
+// wire shape — so do not go looking for a field here, and do not reach for
+// `provider_path` or `api_flavor` as a stand-in for one), and no flavor-plus-mode
+// combination narrows the absence to a single cause. The
 // same empty source arises from a translated stream whose provider reports neither
-// an exact count nor a rate; from a native-passthrough openai_responses stream whose
-// CLIENT did not ask for timings, where the very same llama.cpp upstream would have
-// attached its own `timings` to the partial frames had it been asked (the per-flavor
+// an exact count nor a rate; from a native-passthrough openai_responses stream that
+// NOBODY asked for timings on — neither the CLIENT nor the operator's Responses
+// live-timings switch — where the very same llama.cpp upstream would have attached
+// its own `timings` to the partial frames had it been asked (the per-flavor
 // table in docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3,
 // under "Native passthrough is on this panel too", spells this out); from a row that
 // is merely EARLY, the first content frame having landed (so there is a TTFT) with no
@@ -66,10 +71,11 @@ function formatLiveTps(value: number): string {
 // would drift.
 //
 // So activityLiveTpsNone claims only what holds across all of them — no rate
-// reported, none derivable yet — and names both dependency axes without asserting
-// which applies. Note the second clause is about the DERIVATION, not about the
-// count: on that last row an exact count exists, so a sentence denying one would be
-// false there.
+// reported, none derivable yet — and names all three dependency axes (the upstream,
+// what the client requested, and the operator's Responses live-timings switch)
+// without asserting which applies. Note the second clause is about the DERIVATION,
+// not about the count: on that last row an exact count exists, so a sentence denying
+// one would be false there.
 function liveTpsTitle(t: Translation, a: ActiveRequest): string {
   if (a.tokens_per_second_source === 'upstream') return t.activityLiveTpsUpstream;
   if (a.tokens_per_second_source === 'gateway') {
@@ -214,6 +220,35 @@ export function ActiveRequestsPanel({
       searchable: false,
       numeric: true,
       render: (a) => <span title={liveTpsTitle(t, a)}>{formatLiveTps(a.tokens_per_second)}</span>,
+    },
+    // Optional (hidden by default): the upstream's own cumulative count of tokens
+    // GENERATED so far. Hidden because a 0 here means "the upstream reported
+    // none", which this panel renders as the shared never-measured em-dash -- and
+    // a second em-dash column on every unmeasured row makes the row-scoped
+    // em-dash queries in this panel's tests ambiguous rather than wrong, which is
+    // the kind of failure that gets "fixed" by loosening the query.
+    //
+    // formatMetric is what supplies that em-dash, and it doubles as the sort
+    // accessor: '—' is not a number, so ListTable's `numeric` sort sinks an
+    // unreported count in BOTH directions instead of ranking it as the smallest
+    // real value.
+    //
+    // "By default" and "between live_tps and ttft" both mean: for a profile with
+    // nothing stored. reconcileHiddenIds applies defaultHidden ONLY when the
+    // persisted hidden value is not an array, so an operator who has ever toggled a
+    // column on this panel carries a stored array that cannot mention a column
+    // added after it, and sees this one VISIBLE. Independently, reconcileOrder
+    // appends a catalogue id missing from a stored order at the END — after
+    // `elapsed` — for an operator who has ever reordered or reset. Both are
+    // inherited by every optional column in this codebase rather than anything this
+    // one does, and the column menu's reset restores both to the values here.
+    {
+      id: 'output_tokens',
+      label: t.activityColLiveOutputTokens,
+      value: (a) => formatMetric(a.output_tokens, 0),
+      searchable: false,
+      numeric: true,
+      defaultHidden: true,
     },
     {
       id: 'ttft',

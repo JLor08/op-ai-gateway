@@ -247,8 +247,11 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 // streams the raw response back byte-for-byte, so protocol-specific content (Codex
 // tool calls, reasoning items, Claude Code content blocks) is preserved exactly. It
 // mirrors completeStream's idle-watchdog / write-deadline / capture / usage-record
-// machinery. The only body edit is rewriting the `model` field to the upstream's
-// mapped name (lossless; all other fields untouched).
+// machinery. Exactly two body edits are possible, both value-lossless and both
+// described at the body-building step below: the `model` field is rewritten to
+// the upstream's mapped name, and -- only where the operator switched it on for
+// a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
+// field reaches the upstream as the client wrote it.
 func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, path string, raw []byte, pfReq inference.Request) {
 	start := time.Now()
 	id := nextRequestID()
@@ -279,28 +282,72 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		return
 	}
 
-	// The ONLY edit made to a relayed body, ever. Passthrough means the client's
-	// bytes reach the upstream as the client wrote them, apart from the mapped
-	// model name.
+	// The only two edits ever made to a relayed body. Passthrough still means
+	// the client's bytes reach the upstream as the client wrote them, apart
+	// from the mapped model name and -- under the operator's opt-in below --
+	// llama.cpp's `timings_per_token`.
 	//
-	// In particular the gateway does NOT add llama.cpp's `timings_per_token`,
-	// however tempting that looks: a `timings` object on a PARTIAL frame is the
-	// only thing that can put a live tokens/sec figure on an /v1/responses
-	// passthrough row while generation is still running, and that flag is what
-	// makes llama.cpp attach one to a chat stream's partials. Whether its
-	// Responses implementation does the same on partials is not something this
-	// repo has captured — the gateway simply reads a `timings` object wherever
-	// one appears. Note "while still running": the terminal `response.completed`
-	// frame carries its own `timings`, so a rate does arrive at the end without
-	// any flag (see the per-flavor table under "Native passthrough is on this
-	// panel too" in docs/architecture/cross-cutting/telemetry-usage-observability.md
-	// §8.4.3). The flag is READ when the client set it and never set here.
-	// Injecting it would change the upstream's response shape — new frames' worth
-	// of fields the client never asked for, flowing through to a client that must
-	// parse them — to improve a gateway display column. A missing live rate is
-	// rendered as "not measured" and is honest; a silently rewritten client
-	// request is not.
+	// That flag is what makes llama.cpp attach a top-level `timings` object to
+	// PARTIAL frames, and such an object is the only thing that can put a live
+	// tokens/sec figure on an /v1/responses passthrough row while generation is
+	// still running. That its Responses implementation does attach one is
+	// MEASURED rather than carried over from its chat streams: one flagged
+	// 48-frame stream carried `timings` on 39 of its frames while the same
+	// prompt replayed WITHOUT the flag carried exactly one, the terminal
+	// `response.completed` (usageScanner's doc comment in
+	// passthrough_usage_scan.go records the measurement and its scope caveat).
+	// Note "while still running": that terminal frame carries its own `timings`
+	// with or without the flag, so a rate does arrive at the END regardless --
+	// the flag buys the mid-stream figure and nothing else (see the per-flavor
+	// table under "Native passthrough is on this panel too" in
+	// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.3).
+	//
+	// Adding it is not the silent rewriting of a client request that this path
+	// refuses to do, because every part of it is the operator's own decision and
+	// none of it overrides the client's. wantsResponsesLiveTimings requires the
+	// per-endpoint opt-in, a llama.cpp upstream, the Responses flavor and a
+	// streaming request, and lets a recorded live-progress rejection veto the
+	// lot; injectTimingsPerToken then tests for the key's PRESENCE rather than
+	// its value, so a client that sent `timings_per_token: false` keeps it --
+	// llama.cpp treats an explicit false exactly as it treats an absent key.
+	// What the client does pay is fields it did not ask for on frames it has to
+	// parse, and that cost is measured rather than guessed: in a separate
+	// flagged/unflagged pair of the same prompt, both terminating at the same
+	// `output_tokens`, the flagged run carried 2.49x the wire bytes. The
+	// operator accepted that by switching this on, which is the whole reason
+	// this is an operator's switch and not a default. No retry accompanies the
+	// injection: the endpoint was measured accepting unknown top-level keys, so
+	// a retry's trigger could not be exercised against any upstream this
+	// repository can point at (issue #81).
+	//
+	// The payload capture keeps recording the CLIENT's bytes, so the debug line
+	// below is where an operator debugging a 400 learns that the gateway added
+	// a key at all.
 	upstreamBody := rewriteModelField(raw, target.ProviderModel)
+
+	// The operator's opt-in, applied as a SECOND, separate edit rather than
+	// folded into the rewrite above. rewriteModelField returns the client's own
+	// slice unchanged from three no-op branches, and one of them -- a provider
+	// model that already equals the body's model -- is an ordinary
+	// configuration the portal's application auto-sync produces, so an
+	// injection placed inside that helper would silently never fire for those
+	// mappings.
+	//
+	// The argument order matters: the injection runs over the REWRITTEN body,
+	// so a request that needs both edits gets both. Both helpers return a fresh
+	// slice when they change anything and the original otherwise, so `raw` --
+	// still read further down to build the payload capture, and handed to the
+	// HTTP transport as `upstreamBody` while the request is in flight -- is
+	// never written to.
+	//
+	// injectedLiveTimings is false for a request the gate refused AND for one
+	// whose client already sent the key -- two different reasons for a panel
+	// cell that stays blank with the switch on, which is why it is recorded
+	// from the helper's own answer rather than inferred from the gate.
+	injectedLiveTimings := false
+	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) {
+		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
+	}
 
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
 	// activity for `idle`), a buffered completion uses a total timeout. Both cancel
@@ -340,7 +387,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: serverName, ServerID: target.ServerID, Model: pfReq.Model, RequestedModel: pfReq.RequestedModel, APIFlavor: pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
-	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID)
+	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID, "timings_per_token_injected", injectedLiveTimings)
 
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	ctx = s.upstreamAuthCtx(ctx, target)
@@ -526,6 +573,78 @@ func rewriteModelField(raw []byte, providerModel string) []byte {
 	return out
 }
 
+// timingsPerTokenKey is llama.cpp's per-token timings request flag. With it set,
+// the server attaches a top-level `timings` object to PARTIAL frames; without it
+// only the terminal frame carries one. That object is the only thing that can put
+// an upstream-reported tokens/sec on a running /v1/responses passthrough row.
+// Measured for /v1/responses on ONE llama.cpp build, not a general guarantee: the
+// frame counts and the without-flag replay are in §8.4.3 of
+// docs/architecture/cross-cutting/telemetry-usage-observability.md.
+const timingsPerTokenKey = "timings_per_token"
+
+// injectTimingsPerToken returns the body with a top-level "timings_per_token": true
+// added, and whether it actually added it. It is a pure function of its argument:
+// the input slice is never written to, and an injected body is always a FRESH slice
+// from json.Marshal. That matters at the call site — proxyNative hands the outgoing
+// bytes to the transport, but reads the CLIENT's bytes again after the copy loop to
+// build the payload capture, and rewriteModelField returns those same client bytes
+// unchanged from its no-op branches. So an in-place edit here would reach the
+// capture, which would then record a key the client never sent.
+//
+// The body is returned unchanged, with false, in three cases:
+//
+//   - It is not a JSON object, so the decode into map[string]any fails.
+//   - It decodes to a nil map, which is what a bare `null` body does WITHOUT
+//     reporting an error; assigning into that map would panic with "assignment to
+//     entry in nil map". Nothing on this path can deliver such a body today —
+//     sniffRoutingModel reads no model out of `null`, and handleOpenAIResponses
+//     only reaches tryProxyNative for a non-empty model — but that guard lives in
+//     inference_handlers.go, so this helper does not assume it. (rewriteModelField
+//     has the same shape and relies on the same distant guard; changing it is not
+//     part of this feature.)
+//   - The key is ALREADY PRESENT at the top level, whatever its value. Presence,
+//     not value: llama.cpp treats an explicit false exactly as it treats an absent
+//     key, so a client that sent false has made a choice, and overwriting it would
+//     be the silent rewriting of a client request that this path refuses to do.
+//
+// A json.Marshal failure returns the body unchanged as well — a fourth `return raw,
+// false`, left out of the list above because no value a JSON decode can put into
+// the map is one json.Marshal rejects. rewriteModelField carries the same fallback.
+//
+// Deliberately NOT folded into rewriteModelField, which returns the original slice
+// from three no-op branches — an empty providerModel, a body whose decode into
+// map[string]any FAILS, and a provider model that already equals the body's model.
+// The last is an ordinary configuration (the portal's model reconciliation writes
+// the gateway and provider model names to the same string), so an injection placed
+// below it would never fire for those mappings. A bare `null` is NOT one of the
+// three: it decodes without error into a nil map, which is why rewriteModelField
+// panics on it, exactly as the nil-map case above describes.
+//
+// Re-serialization costs what rewriteModelField's doc already concedes: key order
+// changes and <>& are HTML-escaped. That is value-lossless to any JSON parser, and
+// UseNumber keeps it lossless for numbers too — without it a literal such as
+// 9007199254740993 would come back as 9007199254740992.
+func injectTimingsPerToken(raw []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil {
+		return raw, false
+	}
+	if obj == nil {
+		return raw, false
+	}
+	if _, present := obj[timingsPerTokenKey]; present {
+		return raw, false
+	}
+	obj[timingsPerTokenKey] = true
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
 // parsePassthroughUsage best-effort extracts token counts (and, for the
 // Responses shape, llama.cpp's own reported rate) from a proxied upstream
 // response (stream or buffered) so the Activity view still shows tokens. It
@@ -588,6 +707,7 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 		Timings *struct {
 			PromptPerSecond    float64 `json:"prompt_per_second"`
 			PredictedPerSecond float64 `json:"predicted_per_second"`
+			PredictedN         int     `json:"predicted_n"`
 			DraftN             int     `json:"draft_n"`
 		} `json:"timings"`
 	}
@@ -609,6 +729,16 @@ func mergeResponsesUsage(dst *inference.Usage, payload []byte) {
 	if m.Timings != nil {
 		takeMaxF(&dst.PromptPerSecond, m.Timings.PromptPerSecond)
 		takeMaxF(&dst.TokensPerSecond, m.Timings.PredictedPerSecond)
+		// predicted_n lands in its OWN field and never in OutputTokens or
+		// TotalTokens. This function writes to TWO destinations -- scan's
+		// per-frame scratch Usage, which the live column reads, and the
+		// scanner's accumulator, which usage() hands recordUsage -- so whatever
+		// is written here reaches the accumulator by construction. A separate
+		// field is what makes that harmless: recordUsage assembles usage.Event
+		// field by field and has no member for this one. See
+		// inference.Usage.LiveOutputTokens for what would be rewritten
+		// otherwise.
+		takeMax(&dst.LiveOutputTokens, m.Timings.PredictedN)
 		takeMax(&dst.DraftTokens, m.Timings.DraftN)
 	}
 }

@@ -75,6 +75,7 @@ function makeApp(overrides: Partial<PortalApplication> = {}): PortalApplication 
     health_check_interval_seconds: 0,
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    responses_live_timings_enabled: false,
     loaded_models_path: '',
     loaded_models_format: '',
     context_probe_path: '',
@@ -154,6 +155,7 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
     context_probe_path: '',
@@ -1660,5 +1662,171 @@ describe('ApplicationSection managed_runtime_only create button reason', () => {
     const blocked = screen.getByText(t.runtimeManagedOnlyCreateBlocked);
     expect(banner).not.toContainElement(blocked);
     expect(banner.parentElement).toBe(blocked.parentElement);
+  });
+});
+
+// Responses live timings (issue #81 part 2, design D10). The control is
+// rendered by the shared ApiVariantControls block; what is pinned HERE is the
+// part this form owns -- which kind it reports, what it seeds, and (next
+// describe) what it puts in the body.
+describe('ApplicationSection responses live timings', () => {
+  it('hides the control for an incapable type and shows it TICKED once a capable type is chosen', async () => {
+    renderSection();
+    openCreate();
+    // The create form opens on ollama.
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsUnsupportedNote)).toBeInTheDocument();
+
+    await selectType('llama_cpp');
+    // Ticked without the operator touching anything: the API's create default
+    // for a capable type is ON, and a control that opened unticked would turn
+    // the feature off for every application created through this portal.
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+  });
+
+  // A server_agent application is NOT told the feature is unavailable. The
+  // resolver overwrites this row's value with the runtime spec's, and the
+  // request-path gate judges the spec's effective kind -- and runtime specs
+  // exist only under server_agent applications, so every managed llama.cpp
+  // runtime is reached through THIS form. The blanket unsupported note would
+  // tell exactly those operators the feature does not apply to them, and on a
+  // managed-runtime-only server the create form opens on this very type.
+  //
+  // Still no checkbox, though: the spec's value wins, so a control here would
+  // be a second switch that does nothing.
+  it('points a server_agent operator at the launch spec instead of calling the feature unavailable', async () => {
+    renderSection();
+    openCreate();
+    await selectType('server_agent');
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsDelegatedNote)).toBeInTheDocument();
+    expect(screen.queryByText(t.applicationLiveTimingsUnsupportedNote)).not.toBeInTheDocument();
+  });
+
+  // BOTH directions in one case, deliberately: asserting only the stored
+  // `false` would still pass if openEdit stopped seeding at all, because the
+  // create default would be left standing -- for `false` that happens to look
+  // right. The stored `true` half is what fails then.
+  it('seeds the control from the loaded application on edit, not from the create default', async () => {
+    renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+    cleanup();
+
+    renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: false })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+  });
+});
+
+describe('ApplicationSection responses live timings body', () => {
+  it('sends the create default for a capable type without the operator touching the box', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('llama_cpp');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].responses_live_timings_enabled).toBe(true);
+  });
+
+  it('sends an explicit false when the operator unticks it', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('llama_cpp');
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings }));
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].responses_live_timings_enabled).toBe(false);
+  });
+
+  it('restates the stored value on an unrelated save of a capable application', async () => {
+    const { updated } = renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'llama_cpp', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    fireEvent.change(screen.getByLabelText(t.applicationWeight), { target: { value: '7' } });
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    // Safe to restate, unlike proxy_excluded: a capable type accepts BOTH
+    // values, so a save made for an unrelated reason cannot change anything.
+    expect(updated[0].body.responses_live_timings_enabled).toBe(true);
+    expect(updated[0].body.weight).toBe(7);
+  });
+
+  // THE BLOCKER THIS FORM MUST NOT BE ABLE TO BUILD. buildBody restates
+  // `type` on every save, and the backend picks the 400 arm over the 409
+  // precisely when the request carries a type -- so an unconditional true on
+  // an incapable type does not merely fail to apply, it refuses the whole
+  // save. Omitting is also what the backend WANTS: the create takes the
+  // type's default and the update clears a stale true.
+  it('omits the key entirely for an incapable type, on create and on save', async () => {
+    const { created } = renderSection();
+    openCreate();
+    // ollama, the form's own create default, is incapable.
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect('responses_live_timings_enabled' in created[0]).toBe(false);
+    cleanup();
+
+    const { updated } = renderSection({
+      apps: [makeApp({ id: 'app_1', type: 'vllm', responses_live_timings_enabled: true })],
+    });
+    await screen.findByText('https://s1.example.test:8000');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+    fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+    await waitFor(() => expect(updated).toHaveLength(1));
+    // A vLLM row can still hold a stale true from before design D6 dropped
+    // vLLM from the capable set. Omitting is what clears it, prospectively,
+    // on the row's next save -- the clear D6 promises and refuses to do in SQL.
+    expect('responses_live_timings_enabled' in updated[0].body).toBe(false);
+  });
+
+  // server_agent omits it too, and this is NOT covered by the incapable case
+  // above: the form reports 'delegated' for this type, which is a DIFFERENT
+  // state. The two forms' body gates read almost alike but not quite --
+  // buildBody asks `=== 'capable'` while buildSpecBody asks `!== 'incapable'`
+  // -- and harmonising them onto the spec form's shape is exactly the tidy-up
+  // that looks safe and is not: 'delegated' passes `!== 'incapable'`.
+  // routing.LiveTimingsCapableKind('server_agent') is false and buildBody
+  // restates `type` on every save, so the pair is the 400 arm -- and EVERY
+  // CREATE would fail, because openCreate seeds the box true. Be exact about
+  // the scope: BOTH backend arms refuse only an explicit TRUE, and the PORTAL
+  // can only ever write false onto a server_agent row (its create default is
+  // the kind's own, and the update path clears a stale true whenever the
+  // resulting type cannot honour it). Not the stored ROW: the store is
+  // policy-free about exactly this by design, and its own conformance and
+  // column-parity tests deliberately write a true on an incapable kind so a
+  // store path that "helpfully" cleared it would fail -- which is why the
+  // request-path gate re-checks the kind instead of trusting the row. What is
+  // claimed here is only about the two portal write paths. So an ordinary
+  // edit-and-save of an existing server_agent row sends false and succeeds.
+  // Anyone checking this warning by opening such a row and saving it will see
+  // it pass and conclude the guard is noise -- it is the CREATE path that
+  // breaks, which is why the case below creates rather than edits. The second
+  // door is a retype: ticking a capable row and changing its type to
+  // server_agent before saving sends true beside the new type, and earns the
+  // same 400.
+  //
+  // The spec form can send on `!== 'incapable'` only because it never sees
+  // 'delegated' at all.
+  it('omits the key for server_agent, whose state is delegated rather than incapable', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('server_agent');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].type).toBe('server_agent');
+    expect('responses_live_timings_enabled' in created[0]).toBe(false);
   });
 });

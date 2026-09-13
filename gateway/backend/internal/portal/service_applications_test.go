@@ -2964,8 +2964,9 @@ func assertNoRawToken(t *testing.T, dto ApplicationDTO, rawToken string) {
 // TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind pins
 // decision (d)'s create-path default for EVERY type normalizeApplicationType
 // accepts, with the key ABSENT: a newly created application on an upstream
-// kind whose request schema tolerates the live-progress parameter starts with
-// the opt-in ON, and every other kind gets the DDL default (off).
+// kind whose /v1/responses implementation actually ANSWERS the live-progress
+// parameter starts with the opt-in ON, and every other kind gets the DDL
+// default (off).
 //
 // Six rows, not seven: normalizeApplicationType's set is closed at
 // ollama/vllm/llama_cpp/llama_swap/litellm/server_agent (its switch has one
@@ -2976,7 +2977,7 @@ func assertNoRawToken(t *testing.T, dto ApplicationDTO, rawToken string) {
 // routing.ProviderMock's false is pinned where it is reachable, in routing's
 // own TestLiveTimingsCapableKind.
 //
-// The rows deliberately DISAGREE: two want true, four want false. A table
+// The rows deliberately DISAGREE: one wants true, five want false. A table
 // where every row expects the same value passes against an implementation
 // that ignores the kind entirely.
 //
@@ -2996,7 +2997,13 @@ func TestCreateApplicationResponsesLiveTimingsDefaultsByUpstreamKind(t *testing.
 		want    bool
 	}{
 		{routing.ProviderLlamaCPP, 8200, true},
-		{routing.ProviderVLLM, 8201, true},
+		// vllm was true here until 2026-09-12, when a streamed vLLM
+		// /v1/responses request carrying timings_per_token was measured to
+		// produce 48 frames and zero timings objects: the key is accepted and
+		// inert, so defaulting the opt-in on promised a number that never
+		// arrives. internal/provider's GATE still lists vllm, for the pair it
+		// sends on /v1/chat/completions.
+		{routing.ProviderVLLM, 8201, false},
 		{routing.ProviderOllama, 8202, false},
 		{routing.ProviderLlamaSwap, 8203, false},
 		{routing.ProviderLiteLLM, 8204, false},

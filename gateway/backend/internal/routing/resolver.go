@@ -81,8 +81,26 @@ type Target struct {
 	// otherwise -- the same precedence ResponsesMode/MessagesMode use above,
 	// and deliberately NOT OpportunisticMetrics' app-only shape, because this
 	// flag qualifies a decision (ResponsesMode == passthrough) that comes from
-	// the spec for a server_agent child. Nothing reads it yet; the gate, the
-	// injection and the retry are part 2 of issue #81.
+	// the spec for a server_agent child. THE REQUEST PATH READS IT, on every
+	// native passthrough request: gateway.proxyNative passes the resolved
+	// target to issue #81's part-2 gate, gateway.wantsResponsesLiveTimings,
+	// which ANDs this flag with the effective upstream kind, the Responses
+	// flavor and the stream flag and lets a recorded live-progress rejection
+	// veto the lot; when all of those hold, the body relayed upstream grows
+	// llama.cpp's `timings_per_token`. So this field has a live consumer
+	// outside its own table test -- a dead-code pass that concludes otherwise
+	// is reading a stale claim. The two things that part still owed when this
+	// sentence was first written have since SHIPPED on the same branch: the
+	// portal renders a visible control for the flag on both surfaces (the
+	// shared ApiVariantControls block, on the application form and the
+	// launch-spec form), and the `timings` objects the injection buys feed a
+	// live per-token count on the running-connections panel -- a column that
+	// ships hidden and is switched on from that panel's own column menu, so an
+	// operator who has never changed that panel's columns sees the rate fill
+	// and no count column at all. No retry accompanies the injection: llama.cpp was
+	// measured accepting the injected key on this endpoint, so a retry's
+	// trigger could not be exercised against any upstream this repository can
+	// point at.
 	ResponsesLiveTimingsEnabled bool
 	// LiveProgressSupport is the mapping's PERSISTED verdict about whether this
 	// upstream tolerates the live-progress parameters: "", "supported",

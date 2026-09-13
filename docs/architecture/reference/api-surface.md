@@ -533,26 +533,60 @@ Wire notes a client must know:
   `UpdateApplicationRequest` and `PutRuntimeSpecRequest`. It is **orthogonal
   to `responses_mode`**, not a fourth value of it, and it is offered on the
   Responses side only — there is no `/v1/messages` equivalent.
-  - **Nothing acts on the value in this cut, so setting it changes no
-    inference request's behaviour.** What ships here are the WRITE rules below — the capable-only
-    default, the refusal, the clear, absent-preserves — plus the resolution of
-    the stored value onto the request's routing target (spec over application,
-    the same precedence `responses_mode` uses). There it stops: the upstream
-    parameter is **not injected**, nothing gates on it and nothing retries
-    without it. So an application or spec with the flag `true` produces no
-    mid-stream tokens/sec **of its own**: a client that sets
-    `timings_per_token` on the request still gets them exactly as before, and
-    a client that does not gets nothing extra from the flag being on — the
-    injection, the gate and the retry are part 2 of issue #81. This is
-    consistent with, and does not weaken, the standing rule that
-    `timings_per_token` is read when the client set it and never injected
+  - **What the value does.** On a **streaming** `/v1/responses` request that this
+    application — or, for a `server_agent` model, its runtime spec — serves in
+    `passthrough` mode to a `llama_cpp` upstream, the gateway adds
+    `"timings_per_token": true` to the body it forwards. llama.cpp then attaches
+    a `timings` object to the partial frames, and the running-connections panel
+    shows an upstream-reported output-token count and — once the first
+    timings-bearing partial carries a positive rate — an upstream-reported
+    tokens/sec for the whole request, instead of a blank cell. Until that first
+    rate arrives the row carries the exact count with a `gateway`-labelled rate
+    derived over it. **The count's column ships hidden**: an operator who has
+    never changed that panel's columns sees the rate cell fill and no count
+    column at all until they reveal `Generated (live)` from the panel's column
+    menu. The stored value is resolved onto the request's routing target
+    spec-over-application, the same precedence `responses_mode` uses. **Five
+    conditions gate the injection and nothing retries without it** — an upstream
+    that rejects the key answers the client's request with its own 4xx
     ([Telemetry, Usage & Observability
     §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
+    A body that already carries `timings_per_token`, `true` **or** `false`, is
+    forwarded unchanged, so a client that sends `false` makes the flag
+    ineffective for its own requests. Nothing else about the request changes,
+    and no response field the client sees is removed or rewritten — the client
+    receives llama.cpp's frames as llama.cpp emits them, extra `timings` objects
+    included. **While the flag is on, an encrypted payload capture for such a
+    request shows the body the CLIENT sent, not the body that was sent
+    upstream**; the injection is recorded on the gateway's per-request debug log
+    line instead.
   - On all three request shapes **absent is not the same as `false`**. Absent
     on a create — or on a **first** spec write, which is what a full-document
     upsert means by "create" — takes the kind-dependent default: `true` for
-    `llama_cpp`/`vllm`, `false` for every other kind. An explicit `false` is a
-    deliberate off, honoured on any kind.
+    `llama_cpp`, `false` for every other kind. An explicit `false` is a
+    deliberate off, honoured on any kind. `vllm` was on that list until
+    2026-09-12, when a streamed vLLM `/v1/responses` request carrying
+    `timings_per_token` was measured to produce 48 frames and **no** `timings`
+    object at all: vLLM accepts the key and does nothing with it, so the
+    default promised a figure that never arrives — and, for the same reason,
+    an explicit `true` on a `vllm` application or on a spec whose effective
+    type is `vllm` is now **refused** by the same three error codes below.
+    Nothing pins that refusal on `vllm` by name, deliberately: it is two
+    already-pinned facts composed. The predicate answers `false` for `vllm`
+    (`TestLiveTimingsCapableKind`, with `TestLiveTimingsCapableKindsSizeIsPinned`
+    on the set's size), and each refusal arm is a kind-generic read of that one
+    predicate, pinned per code on another incapable kind —
+    `TestCreateApplicationResponsesLiveTimingsRejectsTrueOnAnIncapableKind`
+    (400),
+    `TestUpdateApplicationResponsesLiveTimingsRejectsTrueOnAStoredIncapableKind`
+    (409) and
+    `TestPutRuntimeSpecResponsesLiveTimingsRejectsTrueOnAnIncapableKind` (400).
+    A `vllm` copy of any of them would be a third instance of one rule. What
+    that composition cannot survive is a **kind-specific** arm added to any of
+    those three paths: every test named here would stay green while this
+    sentence quietly stopped being true. The gateway's own shape clause for the
+    `/v1/chat/completions` live-progress parameters still lists `vllm`; the two
+    lists are no longer one list.
   - Absent on an update keeps the stored value, **except** that it is
     **cleared** whenever the *resulting* type cannot honour the flag. That is
     a property of the row the write leaves behind, not of a retype: an

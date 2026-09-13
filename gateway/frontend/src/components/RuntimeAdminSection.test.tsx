@@ -90,6 +90,7 @@ const application: PortalApplication = {
   health_check_interval_seconds: 0,
   responses_mode: 'passthrough',
   messages_mode: 'passthrough',
+  responses_live_timings_enabled: false,
   loaded_models_path: '/running',
   loaded_models_format: 'llama_swap',
   context_probe_path: '',
@@ -162,6 +163,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
     context_probe_path: '',
@@ -6609,5 +6611,150 @@ describe('RuntimeAdminSection API-token backend hints', () => {
     expect(screen.queryByText(t.runtimeSpecApiTokenRowVllmEnv)).not.toBeInTheDocument();
     expect(screen.queryByText(t.runtimeSpecApiTokenArgsLeakWarning)).not.toBeInTheDocument();
     expect(screen.queryByText(t.runtimeSpecApiTokenBackendBanner)).not.toBeInTheDocument();
+  });
+});
+
+// Responses live timings on the launch-spec surface (issue #81 part 2, design
+// D10). This form's capability signal is the WRITABLE Type select, which is
+// the first branch of routing.EffectiveRuntimeSpecType; only "Auto" falls
+// through to the binary-basename detection, which is Go-only and is the one
+// case this form answers "unknown".
+describe('RuntimeAdminSection responses live timings', () => {
+  it('shows the Auto caption on create and no tick, because the kind is not known yet', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+    expect(screen.getByText(t.applicationLiveTimingsAutoNote)).toBeInTheDocument();
+  });
+
+  it('ticks the box once Type is set to llama_cpp, and hides it for an incapable Type', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    // Nothing was ticked by hand: with a known-capable kind and no opinion,
+    // what the backend will apply on a first write is ON, so the box says so.
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeOllama }));
+    expect(
+      screen.queryByRole('checkbox', { name: t.applicationLiveTimings }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(t.applicationLiveTimingsUnsupportedNote)).toBeInTheDocument();
+  });
+
+  it('hydrates the box from a CONFIGURED spec, and treats an unconfigured one as no opinion', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          type: 'llama_cpp',
+          binary: '/usr/bin/llama-server',
+          responses_live_timings_enabled: false,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).not.toBeChecked();
+    cleanup();
+
+    // Edit is deliberately ungated and is reachable on a mapping with NO spec
+    // row. That document's `false` is a ZERO VALUE, not an operator decision:
+    // hydrating it would make this form's FIRST write send an explicit false
+    // and lose the llama.cpp create default.
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ mapping_id: 'map_1', type: 'llama_cpp' }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+  });
+});
+
+describe('RuntimeAdminSection responses live timings body', () => {
+  it('omits the key on an untouched Auto create, so the backend applies the detected kind default', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    // Sending `false` here would be the defect: the backend's first-write
+    // default for a llama-server binary is ON, and this form cannot detect
+    // that basename itself.
+    expect('responses_live_timings_enabled' in putSpecs[0].body).toBe(false);
+  });
+
+  it('sends an explicit value once the operator states one under Auto', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.responses_live_timings_enabled).toBe(true);
+  });
+
+  it('sends the value for an explicit llama_cpp Type', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationLiveTimings })); // untick
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.responses_live_timings_enabled).toBe(false);
+  });
+
+  // THE BLOCKER THIS FORM MUST NOT BE ABLE TO BUILD, and it is the same one
+  // the application form has: buildSpecBody is a FULL-DOCUMENT upsert that
+  // restates `type` on every save, and putRuntimeSpec refuses an explicit
+  // true against an incapable effective kind with 400
+  // runtime_spec.responses_live_timings_unsupported BEFORE any store write --
+  // so the whole save fails. Omitting is what the backend normalises: it
+  // clears a stored true whose document can no longer honour it.
+  it('omits the key when the operator retypes a live-timings spec to an incapable kind', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          type: 'llama_cpp',
+          binary: '/usr/bin/llama-server',
+          responses_live_timings_enabled: true,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeOllama }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('ollama');
+    expect('responses_live_timings_enabled' in putSpecs[0].body).toBe(false);
   });
 });

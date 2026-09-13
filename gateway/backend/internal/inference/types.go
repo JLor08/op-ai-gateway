@@ -115,6 +115,47 @@ type Usage struct {
 	// acceptance RATE is a performance measure, not a capability signal, and
 	// belongs with metrics rather than this field.
 	DraftTokens int `json:"draft_tokens,omitempty"`
+	// LiveOutputTokens is llama.cpp's own `timings.predicted_n`: the number of
+	// tokens the upstream reports having GENERATED so far. It exists for the
+	// running-connections panel's live CELLS and for nothing else.
+	//
+	// Cells, plural: it is the mid-stream count the active-requests DTO reports
+	// for this flavor, and on a row where no upstream rate has arrived it also
+	// decides the live RATE cell. liveProgressDTO derives a rate only over an
+	// exact upstream count, labels such a row `gateway`, and the panel's tooltip
+	// for that label interpolates this very number ("computed by the gateway from
+	// N tokens the server reported"). So a wrong value here is not confined to
+	// one cell.
+	//
+	// It is deliberately NOT OutputTokens and NOT TotalTokens. Those two are what
+	// usageScanner.usage hands recordUsage, and thence usage_events, the Activity
+	// totals, the usage timeseries and the principal rate limiter's input.
+	// Measured on llama.cpp build b10448-ad1de39e0: on a NATURALLY ENDING
+	// generation the TERMINAL predicted_n equals that response's
+	// usage.output_tokens exactly, reasoning tokens included. So the live count
+	// CONVERGES on the recorded total rather than competing with it -- which is
+	// precisely why it must not also be written there: it would rewrite every one
+	// of those surfaces with a number carrying no information they do not already
+	// have.
+	//
+	// Mid-stream it is neither contiguous nor equal to that total. llama.cpp
+	// attaches `timings` to most partials but not all -- the measured stream
+	// skipped 28 and 29 across the output_item.added/content_part.added pair,
+	// which carry none -- and the highest value any PARTIAL carried was short of
+	// the terminal total. This is therefore an upstream count of what has been
+	// generated, never a count of what the client has received, and nothing may
+	// assert equality between the last partial's value and the recorded total:
+	// such an assertion passes on a cap-truncated generation, where both numbers
+	// are just the cap, and fails on a naturally ending one.
+	//
+	// Written only by mergeResponsesUsage (native_passthrough.go); read only by
+	// usageScanner.publishProgress (passthrough_usage_scan.go). Anthropic's merge
+	// writes it never, which is what keeps message_start's placeholder count off
+	// the live row through this door. `json:"-"` because it belongs to no
+	// recorded and no wire representation of usage: recordUsage assembles
+	// usage.Event field by field and has no member for it, and the client-facing
+	// bodies compat builds carry usage structs of their own.
+	LiveOutputTokens int `json:"-"`
 }
 
 type Error struct {

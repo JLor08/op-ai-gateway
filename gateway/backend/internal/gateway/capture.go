@@ -37,8 +37,18 @@ type captureInput struct {
 	// Translated* hold the TRANSLATED upstream exchange (the request the gateway
 	// actually sent to the Chat-Completions upstream + the raw upstream response),
 	// populated only on the translate path when capturing. Empty on native
-	// passthrough (its client bytes already equal the upstream bytes) and on plain
-	// same-protocol requests. Request headers are redacted like the client ones.
+	// passthrough and on plain same-protocol requests. Request headers are
+	// redacted like the client ones.
+	//
+	// Empty on native passthrough because that path attaches no sink, NOT because
+	// its captured bytes are the upstream's. They are not, and have not been since
+	// the model rewrite: rewriteModelField re-serializes the whole object whenever
+	// a provider-model override applies, which reorders keys and HTML-escapes
+	// <>&, and proxyNative may additionally add `timings_per_token` when the
+	// operator's Responses live-timings opt-in is on. So a capture on this path
+	// shows what the CLIENT sent, which is the right thing to show a tenant and
+	// the wrong thing to debug an upstream 400 with — the per-request debug log
+	// is what covers the second case.
 	TranslatedReqHeaders  http.Header
 	TranslatedReqBody     []byte
 	TranslatedRespHeaders http.Header
@@ -47,8 +57,9 @@ type captureInput struct {
 
 // attachTranslatedCapture copies the sink's collected upstream (translated)
 // request+response onto ci, for the translate path. Nil-safe: a nil ci or a nil
-// sink leaves ci unchanged. Native passthrough passes no sink because the bytes it
-// already captures ARE the upstream bytes.
+// sink leaves ci unchanged. Native passthrough passes no sink at all, so nothing
+// upstream-side is captured on that path — see the Translated* field doc for why
+// that is not the same as the two byte streams being equal.
 func attachTranslatedCapture(ci *captureInput, sink *provider.CaptureSink) {
 	if ci == nil || sink == nil {
 		return

@@ -152,7 +152,14 @@ export type ActiveRequest = {
   stream: boolean;
   started_at: string;
   // Live per-request progress. `output_tokens` is the upstream's own cumulative
-  // count (0 = none reported). `tokens_per_second` is 0 when not measured, and
+  // count of tokens GENERATED so far (0 = none reported) — never a count of what
+  // this client has received and never a gateway estimate. For anthropic_messages
+  // it is message_delta's usage.output_tokens; for openai_responses it is
+  // llama.cpp's `timings.predicted_n` off whatever partial carries a `timings`
+  // object, and then the terminal frame's own response.usage.output_tokens — so
+  // the Responses figure climbs in jumps (partials without a `timings` object
+  // skip values) and can sit a token or two below what the finished request
+  // records. `tokens_per_second` is 0 when not measured, and
   // `tokens_per_second_source` says how it was obtained: 'upstream' (reported by
   // the inference server), 'gateway' (computed here from the upstream's exact
   // count), or '' (not measured). `ttft_ms` is 0 when not measured.

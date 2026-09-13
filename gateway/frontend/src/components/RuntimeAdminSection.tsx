@@ -64,6 +64,7 @@ import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
+import { runtimeSpecLiveTimingsKind } from './shared/liveTimings';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -214,6 +215,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     api_flavors: [],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
+    responses_live_timings_enabled: false,
     type: '',
     metrics_path: '',
     context_probe_path: '',
@@ -534,6 +536,14 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // writable. type/metrics_path/context_probe_path (the writable trio) DO
   // belong in `rest`: an override must preserve them unchanged, exactly like
   // every other field this full-document PUT carries verbatim.
+  //
+  // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
+  // writable, but on the request shape it is OPTIONAL, and absent means "keep
+  // the stored value". Dropping it is therefore exactly what an override
+  // click wants -- and it is also the only safe thing to send, because the
+  // store is policy-free by design and a stored true can outlive a retype to
+  // an incapable kind; restating such a pair would earn a 400 and turn a
+  // Start/Stop/Clear click into a failed write.
   const {
     configured,
     id,
@@ -544,6 +554,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     effective_type,
     resolved_metrics_path,
     resolved_context_probe_path,
+    responses_live_timings_enabled,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -2206,6 +2217,15 @@ export function RuntimeAdminSection({
   const [specType, setSpecType] = useState<RuntimeSpec['type']>('');
   const [metricsPath, setMetricsPath] = useState('');
   const [contextProbePath, setContextProbePath] = useState('');
+  // undefined = "no opinion", and the request field is optional so this form
+  // can say it. It genuinely has to: with Type on "Auto" the effective kind
+  // is detected from the binary's basename, and that detection is Go-only --
+  // so a `true` here might be refused and a `false` would silently disagree
+  // with the llama.cpp create default. The only correct thing to send is
+  // nothing, and the backend then applies the kind's own default on a first
+  // write or keeps the stored value on a later one.
+  const [specLiveTimings, setSpecLiveTimings] = useState<boolean | undefined>(undefined);
+  const specLiveTimingsKind = runtimeSpecLiveTimingsKind(specType);
 
   /**
    * The newest VRAM measurement this mapping has, for the per-GPU APPLY
@@ -2289,6 +2309,7 @@ export function RuntimeAdminSection({
     setApiTokenRotate(false);
     setGpuRows([]);
     setSpecType('');
+    setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
   }
@@ -2330,6 +2351,11 @@ export function RuntimeAdminSection({
     setSpecResponsesMode(spec.responses_mode);
     setSpecMessagesMode(spec.messages_mode);
     setSpecType(spec.type);
+    // `configured: false` means the mapping has no spec row and every other
+    // field is a zero value -- so that `false` is not an operator decision
+    // and must not become one. Edit is ungated and reaches exactly that
+    // document, and the write it leads to is a FIRST write.
+    setSpecLiveTimings(spec.configured ? spec.responses_live_timings_enabled : undefined);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
   }
@@ -2622,6 +2648,35 @@ export function RuntimeAdminSection({
       api_flavors: specApiFlavors,
       responses_mode: specResponsesMode,
       messages_mode: specMessagesMode,
+      // Two independent reasons to omit, and both must hold before the key is
+      // sent.
+      //
+      // Kind: this is a FULL-DOCUMENT upsert that restates `type` on every
+      // save, and putRuntimeSpec refuses an explicit true against an
+      // incapable effective kind with 400 BEFORE any store write -- so the
+      // whole save would fail, on a retype the operator made for another
+      // reason entirely. Omitting is what the backend normalises: it clears a
+      // stored true whose document can no longer honour it, deliberately and
+      // silently, because the caller said nothing about the flag.
+      //
+      // Value: undefined is "no opinion", which IS the absent key. Under Type
+      // "Auto" that is the only honest thing to send, since the kind is
+      // detected from the binary's basename by Go and not by this form.
+      //
+      // But under "Auto" the value is NOT reliably undefined, and that is the
+      // case to be exact about: openEdit seeds this state from the STORED row,
+      // and putRuntimeSpec's own first-write default stored a true for every
+      // binary its detector read as llama.cpp. So the box can arrive ticked
+      // without the operator ever touching it, and an edit to `binary` alone --
+      // to a wrapper the detector does not recognise, run-llama.sh or a
+      // versioned llama-srv-b10448 -- then sends that true beside a document
+      // that now resolves to `custom`, and the 400 takes the WHOLE save, on a
+      // save that was about the binary path. Accepted and recoverable (untick,
+      // save again); what it is not is a consequence of TICKING the box, so do
+      // not describe it as one.
+      ...(specLiveTimingsKind !== 'incapable' && specLiveTimings !== undefined
+        ? { responses_live_timings_enabled: specLiveTimings }
+        : {}),
       type: specType,
       metrics_path: metricsPath.trim(),
       context_probe_path: contextProbePath.trim(),
@@ -3761,9 +3816,12 @@ export function RuntimeAdminSection({
               apiFlavors={specApiFlavors}
               responsesMode={specResponsesMode}
               messagesMode={specMessagesMode}
+              liveTimings={specLiveTimings}
+              liveTimingsKind={specLiveTimingsKind}
               onFlavorsChange={setSpecApiFlavors}
               onResponsesModeChange={setSpecResponsesMode}
               onMessagesModeChange={setSpecMessagesMode}
+              onLiveTimingsChange={setSpecLiveTimings}
             />
             <FormControlLabel
               control={

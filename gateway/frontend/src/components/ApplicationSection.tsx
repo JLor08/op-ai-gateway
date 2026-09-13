@@ -34,6 +34,7 @@ import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { applicationTypeDefaults, migrateTypeFields } from './shared/applicationTypeDefaults';
+import { applicationLiveTimingsKind } from './shared/liveTimings';
 import { MappingSection } from './MappingSection';
 import { RuntimeAdminSection } from './RuntimeAdminSection';
 
@@ -239,6 +240,15 @@ export function ApplicationSection({
   // reasoning at length.
   const [proxyExcluded, setProxyExcluded] = useState(false);
   const [proxyExcludedSeed, setProxyExcludedSeed] = useState(false);
+  // The operator's opt-in to asking a capable upstream for live per-token
+  // timings on /v1/responses. Seeded TRUE on create -- deliberately, and not
+  // a guess: this value is only ever SENT for a capable type (buildBody), and
+  // the API's create default is ON for every capable type, so an untouched
+  // portal create now agrees with the documented default instead of silently
+  // switching the feature off. On edit it is seeded from the stored row, so a
+  // retype TO a capable kind does NOT switch it on -- matching the API, whose
+  // kind-dependent default is scoped to create.
+  const [liveTimings, setLiveTimings] = useState(true);
   const [benchmarkScheduleEnabled, setBenchmarkScheduleEnabled] = useState(false);
   const [opportunisticMetricsEnabled, setOpportunisticMetricsEnabled] = useState(false);
   // What the gateway's TLS proxy is doing on THIS server. The `?? 'unknown'`
@@ -256,6 +266,7 @@ export function ApplicationSection({
   // control in every state, out_of_scope included. An operator must always be
   // able to see and undo their own setting.
   const showProxyControls = serverProxyState !== 'out_of_scope' || proxyExcluded;
+  const liveTimingsKind = applicationLiveTimingsKind(type);
   const [benchmarkIntervalSeconds, setBenchmarkIntervalSeconds] = useState(
     defaultBenchmarkIntervalSeconds,
   );
@@ -310,6 +321,7 @@ export function ApplicationSection({
     setTokenCleared(false);
     setProxyExcluded(false);
     setProxyExcludedSeed(false);
+    setLiveTimings(true);
     setBenchmarkScheduleEnabled(false);
     setOpportunisticMetricsEnabled(false);
     setBenchmarkIntervalSeconds(defaultBenchmarkIntervalSeconds);
@@ -368,6 +380,7 @@ export function ApplicationSection({
     setTokenCleared(false);
     setProxyExcluded(app.proxy_excluded);
     setProxyExcludedSeed(app.proxy_excluded);
+    setLiveTimings(app.responses_live_timings_enabled);
     setBenchmarkScheduleEnabled(app.benchmark_schedule_enabled);
     setOpportunisticMetricsEnabled(app.opportunistic_metrics_enabled);
     setBenchmarkIntervalSeconds(
@@ -404,6 +417,20 @@ export function ApplicationSection({
       health_check_interval_seconds: healthIntervalMode === 'custom' ? healthIntervalSeconds : 0,
       responses_mode: responsesMode,
       messages_mode: messagesMode,
+      // Sent ONLY for a type that can honour it. buildBody restates `type` on
+      // every save, and the backend selects the 400 arm
+      // (application.responses_live_timings_unsupported) over the 409
+      // precisely when the request carries a type -- so an unconditional true
+      // on an incapable type would not merely fail to apply, it would REFUSE
+      // THE WHOLE SAVE, and on an unrelated edit at that. Omitting is what
+      // the API asks for instead: absent on a create takes the type's own
+      // default, and absent on an update is what CLEARS a stored true whose
+      // resulting type cannot honour it.
+      //
+      // Unlike proxy_excluded next door, no seed-diff is needed: this key is
+      // only ever sent for a capable type, which accepts both values, so
+      // restating it on an unrelated save changes nothing.
+      ...(liveTimingsKind === 'capable' ? { responses_live_timings_enabled: liveTimings } : {}),
       // A server_agent application's model discovery/loaded-state/context
       // probing all run on the agent side (the runtime spec's own Type +
       // metrics/context-probe overrides, RuntimeAdminSection) -- these three
@@ -841,9 +868,12 @@ export function ApplicationSection({
               apiFlavors={flavors}
               responsesMode={responsesMode}
               messagesMode={messagesMode}
+              liveTimings={liveTimings}
+              liveTimingsKind={liveTimingsKind}
               onFlavorsChange={setFlavors}
               onResponsesModeChange={setResponsesMode}
               onMessagesModeChange={setMessagesMode}
+              onLiveTimingsChange={setLiveTimings}
             />
             <Box
               component="fieldset"

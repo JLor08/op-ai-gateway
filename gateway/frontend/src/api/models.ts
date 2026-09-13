@@ -43,6 +43,11 @@ export type PortalApplication = {
   // native_* booleans).
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;
+  // The operator's opt-in to asking a capable upstream (llama.cpp only) for
+  // live per-token timings on streamed /v1/responses. Always present on read;
+  // the two request shapes below make it optional, because absent there means
+  // something a `false` cannot say.
+  responses_live_timings_enabled: boolean;
   // Optional upstream status path the gateway polls to learn which models are
   // loaded (empty disables it); format selects the parser (auto/openai/
   // llama_swap/llama_cpp).
@@ -86,6 +91,15 @@ export type CreateApplicationRequest = {
   health_check_interval_seconds?: number;
   responses_mode?: EndpointMode;
   messages_mode?: EndpointMode;
+  // Absent is NOT the same as false. Absent on a create takes the type's own
+  // default (true for llama_cpp, false otherwise); absent on an update keeps
+  // the stored value, except that the backend CLEARS a stored true whenever
+  // the resulting type cannot honour it. An explicit true against an
+  // incapable type is refused outright -- 400 when the body also carries
+  // `type` (which this form's buildBody always does), 409 when it does not --
+  // and that refusal fails the WHOLE save, so the form omits the key rather
+  // than ever sending an impossible pair. See ApplicationSection's buildBody.
+  responses_live_timings_enabled?: boolean;
   loaded_models_path?: string;
   loaded_models_format?: string;
   context_probe_path?: string;
@@ -122,6 +136,15 @@ export type UpdateApplicationRequest = {
   health_check_interval_seconds?: number;
   responses_mode?: EndpointMode;
   messages_mode?: EndpointMode;
+  // Absent is NOT the same as false. Absent on a create takes the type's own
+  // default (true for llama_cpp, false otherwise); absent on an update keeps
+  // the stored value, except that the backend CLEARS a stored true whenever
+  // the resulting type cannot honour it. An explicit true against an
+  // incapable type is refused outright -- 400 when the body also carries
+  // `type` (which this form's buildBody always does), 409 when it does not --
+  // and that refusal fails the WHOLE save, so the form omits the key rather
+  // than ever sending an impossible pair. See ApplicationSection's buildBody.
+  responses_live_timings_enabled?: boolean;
   loaded_models_path?: string;
   loaded_models_format?: string;
   context_probe_path?: string;

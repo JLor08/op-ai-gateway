@@ -823,6 +823,7 @@ beforeEach(() => {
           health_check_interval_seconds?: number;
           responses_mode?: PortalApplication['responses_mode'];
           messages_mode?: PortalApplication['messages_mode'];
+          responses_live_timings_enabled?: boolean;
           loaded_models_path?: string;
           loaded_models_format?: string;
           context_probe_path?: string;
@@ -855,6 +856,7 @@ beforeEach(() => {
           health_check_interval_seconds: body.health_check_interval_seconds ?? 0,
           responses_mode: body.responses_mode ?? 'passthrough',
           messages_mode: body.messages_mode ?? 'passthrough',
+          responses_live_timings_enabled: body.responses_live_timings_enabled ?? false,
           loaded_models_path: body.loaded_models_path ?? '',
           loaded_models_format: body.loaded_models_format ?? '',
           context_probe_path: body.context_probe_path ?? '',
@@ -2012,6 +2014,7 @@ describe('App', () => {
         health_check_interval_seconds: 0,
         responses_mode: 'passthrough',
         messages_mode: 'passthrough',
+        responses_live_timings_enabled: false,
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2085,6 +2088,7 @@ describe('App', () => {
         health_check_interval_seconds: 0,
         responses_mode: 'passthrough',
         messages_mode: 'passthrough',
+        responses_live_timings_enabled: false,
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2150,6 +2154,7 @@ describe('App', () => {
         health_check_interval_seconds: 0,
         responses_mode: 'passthrough',
         messages_mode: 'passthrough',
+        responses_live_timings_enabled: false,
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2185,6 +2190,7 @@ describe('App', () => {
         health_check_interval_seconds: 0,
         responses_mode: 'passthrough',
         messages_mode: 'passthrough',
+        responses_live_timings_enabled: false,
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',
@@ -2250,6 +2256,7 @@ describe('App', () => {
         health_check_interval_seconds: 0,
         responses_mode: 'passthrough',
         messages_mode: 'passthrough',
+        responses_live_timings_enabled: false,
         loaded_models_path: '',
         loaded_models_format: '',
         context_probe_path: '',

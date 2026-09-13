@@ -90,16 +90,23 @@ type usageScanner struct {
 	// defensive rather than corrective. Those are figures from THAT build on
 	// THAT deployment, not a guarantee about every llama.cpp build.
 	//
-	// The precondition is a client's own `timings_per_token`, RELAYED UNTOUCHED
-	// (a rule this path pins deliberately — see
-	// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate). The
-	// flag is what puts `timings` on the partials at all: the SAME PROMPT
-	// REPLAYED WITHOUT the flag produced exactly ONE timings-bearing frame, the
-	// terminal response.completed. A replay, not the same request — a request
-	// either carried the flag or it did not. So the peak is reachable whenever a
-	// client asks for mid-stream timings, and this capture is a measured no-op
-	// for traffic that does not. A recorded rate is a ROUTING input — recordUsage
-	// feeds it into the mapping's throughput EWMA
+	// The precondition is a `timings_per_token` on the outgoing request, and it
+	// now has TWO sources: the client's own, RELAYED UNTOUCHED (a rule this path
+	// pins deliberately — see
+	// TestPassthroughResponsesStreamWithClientTimingsShowsTheUpstreamRate), or
+	// one proxyNative added at its body-building step because the operator
+	// switched the per-endpoint opt-in on for a capable upstream (issue #81
+	// part 2). The flag is what puts `timings` on the partials at all: the SAME
+	// PROMPT REPLAYED WITHOUT the flag produced exactly ONE timings-bearing
+	// frame, the terminal response.completed. A replay, not the same request — a
+	// request either carried the flag or it did not. So the peak is reachable
+	// whenever mid-stream timings were asked for by EITHER party, and this
+	// capture is a measured no-op only for traffic where neither did — which
+	// matters below, because the operator's switch, not only a client, now
+	// decides which requests reach the EWMA with an upstream-reported rate.
+	//
+	// A recorded rate is a ROUTING input — recordUsage feeds it into the
+	// mapping's throughput EWMA
 	// (UpdateMappingOpportunisticMetrics, inference_complete.go), which the
 	// scorer and a model group's MinTokensPerSecond gate read back — so a peak
 	// recorded as the end-of-request figure does not merely misreport one row,
@@ -372,14 +379,25 @@ func takeLastNonZeroF(dst *float64, v float64) {
 //     TTFT; publishing an earlier bookkeeping frame (Anthropic's message_start)
 //     would stamp it before any content existed.
 //
-//   - The output-token count is published only from an AUTHORITATIVE usage frame
-//     (isTerminalUsageFrame), never from any frame that merely carries a usage
-//     object. This is usage()'s placeholder gate applied to the live column, for
-//     a sharper reason: message_start's `output_tokens: 1` is indistinguishable
-//     from a real total, and liveProgressDTO would divide that 1 by the
-//     generation window and DISPLAY the result as a measured rate for the rest
-//     of the stream. The recorded row tolerates the placeholder count because it
-//     is presented as a count; a live rate derived from it would not be.
+//   - The output-token count comes from exactly two sources and never from a
+//     frame that merely carries a usage object. An AUTHORITATIVE usage frame
+//     (isTerminalUsageFrame) publishes its own OutputTokens; every other frame
+//     publishes LiveOutputTokens, which only mergeResponsesUsage writes and only
+//     out of llama.cpp's `timings.predicted_n`. The SEPARATE FIELD is what makes
+//     that safe to open up. The old gate was "authoritative frames only", and its
+//     reason was Anthropic's message_start: it carries `output_tokens: 1` as a
+//     PLACEHOLDER that the merge cannot tell from a real total, and liveProgressDTO
+//     would divide that 1 by the generation window and DISPLAY the result as a
+//     measured rate for the rest of the stream. mergeAnthropicUsage writes no
+//     LiveOutputTokens at all, so the placeholder cannot reach the row through the
+//     new door either -- the gate is now "an authoritative frame, or a field that
+//     only the Responses `timings` object fills".
+//
+//     On the terminal Responses frame BOTH are present and they report the same
+//     quantity (measured: a naturally ending generation's terminal predicted_n
+//     equals that response's usage.output_tokens). The authoritative count wins
+//     by the explicit branch above rather than by observeDelta's last write, so
+//     which of the two lands on the row is a rule and not an ordering accident.
 //
 //   - The rate is read from THIS frame, not from the max-merged accumulator.
 //     llama.cpp's `predicted_per_second` is a cumulative average over the
@@ -398,6 +416,8 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 	prog := inference.StreamProgress{TokensPerSecond: frame.TokensPerSecond}
 	if authoritativeUsage {
 		prog.OutputTokens = frame.OutputTokens
+	} else {
+		prog.OutputTokens = frame.LiveOutputTokens
 	}
 	s.progress.observeDelta(s.firstContentAt, &prog)
 }
