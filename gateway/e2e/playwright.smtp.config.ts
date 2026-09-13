@@ -41,7 +41,7 @@ export default defineConfig({
       env: {
         MAILCATCHER_SMTP_ADDR: `${SMTP_HOST}:${SMTP_PORT}`,
         MAILCATCHER_HTTP_ADDR: "127.0.0.1:8092",
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {
@@ -53,7 +53,7 @@ export default defineConfig({
       env: {
         OP_AI_GATEWAY_ADDR: "127.0.0.1:8091",
         OP_AI_GATEWAY_PUBLIC_URL: "http://127.0.0.1:4173/portal",
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {

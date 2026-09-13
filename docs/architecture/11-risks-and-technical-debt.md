@@ -66,9 +66,10 @@ hidden.
   guards — `append([]T(nil), src...)` when there is nothing to append, and
   `json.Unmarshal([]byte("null"), &m)` — and a conformance assertion must test
   `x == nil` explicitly, not merely `len(x) == 0`, or it cannot see either.
-- **No Playwright scenario suite runs in CI**, so a pull request can pass without
-  any of them; the e2e fixture Go modules are likewise outside `make lint`,
-  `make test-go` and Sonar's sources. See
+- **Only `e2e:runtime` runs in CI; every other Playwright scenario suite is
+  local-only**, so a pull request can still pass without them; the e2e fixture
+  Go modules are likewise outside `make lint`, `make test-go` and Sonar's
+  sources. See
   [Development Tooling & Quality Gates §6](cross-cutting/development-and-quality.md).
 - **No gate in this repository can see a browser-engine-specific layout defect.**
   The frontend Vitest suite runs in `jsdom` (`gateway/frontend/vite.config.ts`,

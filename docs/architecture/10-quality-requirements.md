@@ -32,7 +32,11 @@ refine the quality goals in [1.3](01-introduction-and-goals.md#13-quality-goals)
 - **Frontend unit tests** (Vitest) and a **type-checked build**.
 - **Playwright end-to-end suites** driving the real built portal against the real
   gateway (auth, invites, chat, capture, telemetry/agent, certificates, TOTP,
-  SMTP, groups/projects/services/resource-groups, logs, and more).
+  SMTP, groups/projects/services/resource-groups, logs, and more). Only the
+  `e2e:runtime` suite is **enforced in CI**; the other suites are local-only
+  gates a pull request can pass without running — see
+  [Development Tooling & Quality Gates](cross-cutting/development-and-quality.md)
+  §6.
 - **Server-Agent** build + tests across target OSes (build-tagged, CGO-free).
 - **Architecture tests** (dependency rules in both Go modules and the frontend)
   run inside the normal test suites — see

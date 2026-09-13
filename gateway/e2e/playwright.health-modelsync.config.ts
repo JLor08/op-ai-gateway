@@ -35,7 +35,7 @@ export default defineConfig({
         OP_AI_GATEWAY_PUBLIC_URL: "http://127.0.0.1:4173/portal",
         OP_AI_GATEWAY_MOCK_UNREACHABLE: "true",
         OP_AI_GATEWAY_SEED_APP_HEALTH_MODE: "model_sync",
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {

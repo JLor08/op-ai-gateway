@@ -98,7 +98,7 @@ export default defineConfig({
       env: {
         FAKEACME_ADDR,
         FAKEACME_CHALLENGE_BASE: "http://127.0.0.1:8091",
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {
@@ -161,7 +161,7 @@ export default defineConfig({
         // is unaffected -- and scenarios 1-3 never touch cert_edge_require_https,
         // so this override is a no-op for them (the gate stays disarmed).
         OP_AI_GATEWAY_CERT_EDGE_GATE_TEST_REMOTE_ADDR: "203.0.113.90:1",
-        GOCACHE: "/private/tmp/op-ai-gateway-go-build-cache"
+        GOCACHE: process.env.GOCACHE ?? "/private/tmp/op-ai-gateway-go-build-cache"
       }
     },
     {
