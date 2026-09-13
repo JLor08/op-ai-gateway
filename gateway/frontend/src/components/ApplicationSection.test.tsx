@@ -1791,4 +1791,24 @@ describe('ApplicationSection responses live timings body', () => {
     // on the row's next save -- the clear D6 promises and refuses to do in SQL.
     expect('responses_live_timings_enabled' in updated[0].body).toBe(false);
   });
+
+  // server_agent omits it too, and this is NOT covered by the incapable case
+  // above: the form reports 'delegated' for this type, which is a DIFFERENT
+  // state. The two forms' body gates read almost alike but not quite --
+  // buildBody asks `=== 'capable'` while buildSpecBody asks `!== 'incapable'`
+  // -- and harmonising them onto the spec form's shape is exactly the tidy-up
+  // that looks safe and is not: 'delegated' passes `!== 'incapable'`.
+  // routing.LiveTimingsCapableKind('server_agent') is false, and buildBody
+  // restates `type` on every save, so the pair would be the 400 arm and every
+  // save of a server_agent application would fail. The spec form can send on
+  // `!== 'incapable'` only because it never sees 'delegated' at all.
+  it('omits the key for server_agent, whose state is delegated rather than incapable', async () => {
+    const { created } = renderSection();
+    openCreate();
+    await selectType('server_agent');
+    fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].type).toBe('server_agent');
+    expect('responses_live_timings_enabled' in created[0]).toBe(false);
+  });
 });
