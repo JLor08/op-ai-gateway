@@ -115,8 +115,12 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 // asserts the SIZE of the set and nothing about its contents, so that changing
 // the size cannot happen without an edit right here -- at a site whose failure
 // message names the OTHER hand-written list and says how far the two still have
-// to agree: every kind HERE is in the gate, and the gate deliberately holds one
-// kind this set does not.
+// to agree (every kind HERE is in the gate, and the gate deliberately holds one
+// kind this set does not), and then enumerates every OTHER site that restates
+// this membership in prose or in TypeScript: five architecture documents, the
+// portal's hand-copy of the set, and the portal strings that name llama.cpp.
+// That enumeration is the message's whole value, so it has to stay complete --
+// an undercount is worse than no list, because a reader follows it and stops.
 //
 // Why a size pin is needed on top of everything else. internal/provider's
 // TestLiveProgressUpstreamsCoverEveryRoutingCapableKind no longer checks
@@ -145,7 +149,7 @@ func TestLiveTimingsCapableKindsSizeIsPinned(t *testing.T) {
 	// before you do.
 	const pinnedSize = 1
 	if len(liveTimingsCapableKinds) != pinnedSize {
-		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here. Do NOT go and make internal/provider's liveProgressUpstreams match -- that is the wrong half to follow: the two sets stopped being one set on 2026-09-12 and the gate deliberately holds vllm, which this set does not. The rule is only that every kind HERE is also in the gate; read the divergence note on liveTimingsCapableKinds first. And note that the provider-side parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet. Two architecture documents also state this set's membership, in prose that no test and no link check can see: docs/architecture/reference/api-surface.md (the responses_live_timings_enabled default and the refusal that shares this predicate) and docs/architecture/cross-cutting/agent-runtime-manager.md (the runtime-spec refusal in 11.5). Change them in the same edit",
+		t.Fatalf("liveTimingsCapableKinds has %d kinds, pinned at %d: a kind was added or removed here. Do NOT go and make internal/provider's liveProgressUpstreams match -- that is the wrong half to follow: the two sets stopped being one set on 2026-09-12 and the gate deliberately holds vllm, which this set does not. The rule is only that every kind HERE is also in the gate; read the divergence note on liveTimingsCapableKinds first. And note that the provider-side parity test cannot see this set and enumerates kind strings by hand, so it stays SILENT about a kind neither list mentions yet. FIVE architecture documents also state this set's membership, in prose that no test and no link check can see, and all five change in the same edit: docs/architecture/reference/api-surface.md (the kind-dependent responses_live_timings_enabled default and the refusal that shares this predicate), docs/architecture/cross-cutting/agent-runtime-manager.md (the runtime-spec refusal in 11.5), docs/architecture/cross-cutting/telemetry-usage-observability.md (gate condition 2 in 8.4.3, which is the canonical statement of it), docs/architecture/cross-cutting/compatibility-and-inference.md (what passthrough costs on the Responses shape, in section 6) and docs/architecture/reference/data-model.md, TWICE: the applications row of the schema table and migration 80's row in the migration history. docs/architecture/11-risks-and-technical-debt.md states no set but frames its accepted-risk row as a llama.cpp build's, so re-read that one too. The PORTAL is the other half, and no Go test can see any of it: gateway/frontend/src/components/shared/liveTimings.ts HAND-COPIES this set (its own exhaustive test pins that copy against the TypeScript unions alone and points back HERE for this seam), and gateway/frontend/src/i18n.ts names llama.cpp in six live-timings strings per locale -- twelve across de and en: applicationLiveTimingsNote, applicationLiveTimingsUnsupportedNote, applicationLiveTimingsDelegatedNote, applicationLiveTimingsAutoNote, errorApplicationResponsesLiveTimingsUnsupported and errorRuntimeSpecResponsesLiveTimingsUnsupported. Skip the portal and the added kind gets no checkbox at all, while its operator is told in both locales that live timings are llama.cpp-only",
 			len(liveTimingsCapableKinds), pinnedSize)
 	}
 }
