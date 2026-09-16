@@ -2201,8 +2201,23 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// capability row carries its OWN provenance -- see
 	// manualCapabilityRow below), and metrics_source/metrics_updated_at
 	// describe the numeric metrics' provenance, not a capability's.
-	metricValueChanged := req.GenTokensPerSecond != nil || req.PromptTokensPerSecond != nil || req.LoadTimeMS != nil || req.ContextSize != nil || req.MaxConcurrency != nil || req.RecommendedConcurrency != nil || req.GenTokensPerSecondAtCapacity != nil || req.EnergyWhPerToken != nil
-	if metricValueChanged {
+	// The mask names exactly the metric columns this request supplied, so the
+	// store write leaves every other metric column to its probe/benchmark writer
+	// rather than round-tripping the loaded (possibly stale) value (issue #65).
+	// A present pointer means "the operator supplied this value" -- for a metric
+	// that is an authoritative manual entry, unlike the legacy capability
+	// booleans where a present pointer only means "the form was submitted".
+	metricsMask := routing.MappingMetricsMask{
+		GenTokensPerSecond:           req.GenTokensPerSecond != nil,
+		PromptTokensPerSecond:        req.PromptTokensPerSecond != nil,
+		LoadTimeMS:                   req.LoadTimeMS != nil,
+		ContextSize:                  req.ContextSize != nil,
+		EnergyWhPerToken:             req.EnergyWhPerToken != nil,
+		MaxConcurrency:               req.MaxConcurrency != nil,
+		RecommendedConcurrency:       req.RecommendedConcurrency != nil,
+		GenTokensPerSecondAtCapacity: req.GenTokensPerSecondAtCapacity != nil,
+	}
+	if metricsMask.Any() {
 		now2 := s.clock().UTC()
 		mapping.MetricsSource = "manual"
 		mapping.MetricsUpdatedAt = &now2
@@ -2252,7 +2267,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	statedRows, resetCaps := operatorCapabilityWrites(capIntents, capsByName, capChangedAt)
 	capRows = append(capRows, statedRows...)
 	mapping.UpdatedAt = s.clock().UTC()
-	if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
+	if err := s.routes.UpdateMappingEditable(ctx, mapping, metricsMask); err != nil {
 		return ModelMappingDTO{}, err
 	}
 	// The RESET is not best-effort, and the asymmetry with the upsert two
@@ -2486,7 +2501,10 @@ func (s *Service) reconcileApplicationModels(ctx context.Context, server routing
 		}
 		mapping.Status = routing.ServerStatusDisabled
 		mapping.UpdatedAt = now
-		if err := s.routes.UpdateMapping(ctx, mapping); err != nil {
+		// Config-only edit: an empty metric mask leaves every metric column to
+		// its probe/benchmark writer, so disabling a mapping whose upstream went
+		// away cannot revert a concurrently probed metric (issue #65).
+		if err := s.routes.UpdateMappingEditable(ctx, mapping, routing.MappingMetricsMask{}); err != nil {
 			return SyncResultDTO{}, err
 		}
 		result.Disabled++

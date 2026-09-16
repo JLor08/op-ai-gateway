@@ -1014,6 +1014,63 @@ func (m *MemoryStore) UpdateMapping(_ context.Context, mapping ModelMapping) err
 	return nil
 }
 
+// UpdateMappingEditable mirrors the SQLite CASE-per-column writer: it starts
+// from the STORED row (so unsupplied metric columns keep their probed values),
+// overlays the operator-editable columns, and overlays only the metric columns
+// the mask marks supplied plus the provenance stamp when any is (issue #65).
+func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapping, metrics MappingMetricsMask) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.mappings[mapping.ID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	if _, ok := m.applications[mapping.ApplicationID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	existing.ApplicationID = mapping.ApplicationID
+	existing.GatewayModelName = mapping.GatewayModelName
+	existing.AppModelName = mapping.AppModelName
+	existing.Status = mapping.Status
+	existing.MetricsLocked = mapping.MetricsLocked
+	existing.UpdatedAt = mapping.UpdatedAt
+	if metrics.GenTokensPerSecond {
+		existing.GenTokensPerSecond = mapping.GenTokensPerSecond
+	}
+	if metrics.PromptTokensPerSecond {
+		existing.PromptTokensPerSecond = mapping.PromptTokensPerSecond
+	}
+	if metrics.LoadTimeMS {
+		existing.LoadTimeMS = mapping.LoadTimeMS
+	}
+	if metrics.ContextSize {
+		existing.ContextSize = mapping.ContextSize
+	}
+	if metrics.EnergyWhPerToken {
+		existing.EnergyWhPerToken = mapping.EnergyWhPerToken
+	}
+	if metrics.MaxConcurrency {
+		existing.MaxConcurrency = mapping.MaxConcurrency
+	}
+	if metrics.RecommendedConcurrency {
+		existing.RecommendedConcurrency = mapping.RecommendedConcurrency
+	}
+	if metrics.GenTokensPerSecondAtCapacity {
+		existing.GenTokensPerSecondAtCapacity = mapping.GenTokensPerSecondAtCapacity
+	}
+	if metrics.Any() {
+		existing.MetricsSource = mapping.MetricsSource
+		// Mirror the SQL COALESCE(?, metrics_updated_at): a nil stamp keeps the
+		// stored one rather than nulling it, so the two stores never diverge on
+		// the (caller-unreachable) supply-a-metric-with-no-stamp corner.
+		if mapping.MetricsUpdatedAt != nil {
+			existing.MetricsUpdatedAt = mapping.MetricsUpdatedAt
+		}
+	}
+	m.mappings[mapping.ID] = existing
+	return nil
+}
+
 // UpdateMappingContextProbe sets a mapping's context_size + provenance from a
 // context probe, only while it is unlocked. A missing or locked mapping is a
 // benign no-op (mirrors the SQL metrics_locked = 0 guard).

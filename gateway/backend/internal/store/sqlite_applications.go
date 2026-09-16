@@ -264,6 +264,81 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 	return requireAffected(result)
 }
 
+// ptrWhen returns &v when cond, else nil -- the "supply this value or leave it
+// alone" argument shape UpdateMappingEditable's COALESCE columns take.
+func ptrWhen[T any](cond bool, v T) *T {
+	if cond {
+		return &v
+	}
+	return nil
+}
+
+// UpdateMappingEditable writes a mapping's operator-editable columns and only
+// the metric columns metrics marks supplied, via a per-column COALESCE -- an
+// unsupplied metric column keeps its stored value, so this write cannot revert
+// a concurrently probed metric even from a stale struct (issue #65).
+// metrics_source/metrics_updated_at are (re)stamped only when at least one
+// metric is supplied; otherwise they too keep the probe's provenance. Unlike
+// the narrow probe writers there is NO metrics_locked guard: the operator owns
+// these columns (a manual value on a locked mapping is exactly what the supplied
+// metrics express).
+func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing.ModelMapping, metrics routing.MappingMetricsMask) error {
+	// A per-column COALESCE(?, col): a NULL arg keeps the stored value, a
+	// non-NULL one writes it. Passing a nil pointer for an unsupplied metric is
+	// what keeps a config edit from touching a probe-owned column -- and it
+	// avoids feeding a bool into a `case when ?`, which pgx cannot type in the
+	// binary protocol. metrics_source/metrics_updated_at ride the same rule,
+	// stamped only when at least one metric is supplied.
+	var src *string
+	var srcAt *time.Time
+	if metrics.Any() {
+		src = &mapping.MetricsSource
+		srcAt = mapping.MetricsUpdatedAt
+	}
+	result, err := s.exec(ctx, `
+		update model_mappings
+		set application_id = ?, gateway_model_name = ?, app_model_name = ?, status = ?,
+			metrics_locked = ?, updated_at = ?,
+			gen_tokens_per_second = coalesce(?, gen_tokens_per_second),
+			prompt_tokens_per_second = coalesce(?, prompt_tokens_per_second),
+			load_time_ms = coalesce(?, load_time_ms),
+			context_size = coalesce(?, context_size),
+			energy_wh_per_token = coalesce(?, energy_wh_per_token),
+			max_concurrency = coalesce(?, max_concurrency),
+			recommended_concurrency = coalesce(?, recommended_concurrency),
+			gen_tokens_per_second_at_capacity = coalesce(?, gen_tokens_per_second_at_capacity),
+			metrics_source = coalesce(?, metrics_source),
+			metrics_updated_at = coalesce(?, metrics_updated_at)
+		where id = ?`,
+		mapping.ApplicationID,
+		mapping.GatewayModelName,
+		mapping.AppModelName,
+		mapping.Status,
+		mapping.MetricsLocked,
+		mapping.UpdatedAt,
+		ptrWhen(metrics.GenTokensPerSecond, mapping.GenTokensPerSecond),
+		ptrWhen(metrics.PromptTokensPerSecond, mapping.PromptTokensPerSecond),
+		ptrWhen(metrics.LoadTimeMS, mapping.LoadTimeMS),
+		ptrWhen(metrics.ContextSize, mapping.ContextSize),
+		ptrWhen(metrics.EnergyWhPerToken, mapping.EnergyWhPerToken),
+		ptrWhen(metrics.MaxConcurrency, mapping.MaxConcurrency),
+		ptrWhen(metrics.RecommendedConcurrency, mapping.RecommendedConcurrency),
+		ptrWhen(metrics.GenTokensPerSecondAtCapacity, mapping.GenTokensPerSecondAtCapacity),
+		src, srcAt,
+		mapping.ID,
+	)
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("update mapping editable: %w", err)
+	}
+	return requireAffected(result)
+}
+
 // UpdateMappingContextProbe sets a mapping's context_size + provenance from a
 // context probe. The metrics_locked = 0 guard makes the lock atomic in SQL: a
 // locked (or missing) row matches 0 rows and is left untouched, which is a benign

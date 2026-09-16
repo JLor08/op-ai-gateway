@@ -303,3 +303,42 @@ describe('MappingForm ownership boundary', () => {
     expect(submitted[0].app_model_name).toBe('app-model');
   });
 });
+
+describe('MappingForm metric diffing (issue #65)', () => {
+  const machineMetricKeys = [
+    'context_size',
+    'gen_tokens_per_second',
+    'prompt_tokens_per_second',
+    'load_time_ms',
+    'energy_wh_per_token',
+    'max_concurrency',
+    'recommended_concurrency',
+    'gen_tokens_per_second_at_capacity',
+  ] as const;
+
+  it('omits every unchanged metric so a concurrently probed value is not reverted', async () => {
+    const { submitted } = renderForm({
+      row: makeMapping({ context_size: 8192, gen_tokens_per_second: 40 }),
+    });
+    await save();
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    for (const key of machineMetricKeys) {
+      expect(submitted[0]).not.toHaveProperty(key);
+    }
+    // The operator-owned fields are still always sent.
+    expect(submitted[0]).toHaveProperty('status');
+    expect(submitted[0]).toHaveProperty('metrics_locked');
+  });
+
+  it('sends ONLY the metric the operator actually changed', async () => {
+    const { submitted } = renderForm({ row: makeMapping({ context_size: 8192 }) });
+    fireEvent.change(screen.getByLabelText(t.mappingContextSize), { target: { value: '4096' } });
+    await save();
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0].context_size).toBe(4096);
+    for (const key of machineMetricKeys) {
+      if (key === 'context_size') continue;
+      expect(submitted[0]).not.toHaveProperty(key);
+    }
+  });
+});

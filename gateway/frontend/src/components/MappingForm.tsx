@@ -31,16 +31,22 @@ export type MappingFormValues = {
   gateway_model_name: string;
   app_model_name: string;
   status: ApplicationStatus;
-  gen_tokens_per_second: number;
-  prompt_tokens_per_second: number;
-  load_time_ms: number;
-  context_size: number;
-  energy_wh_per_token: number;
+  // The eight metric fields are emitted ONLY when the operator changed them
+  // from the value the form opened with -- like capability_verdicts below, and
+  // for the same reason: these columns are machine-owned (probes, benchmarks,
+  // the EWMA writers), so re-stating a value this form merely READ would revert
+  // a metric a background probe wrote while the form was open (issue #65). An
+  // unchanged metric contributes no key, and the backend leaves that column
+  // exactly as stored. A changed one is an authoritative manual entry.
+  gen_tokens_per_second?: number;
+  prompt_tokens_per_second?: number;
+  load_time_ms?: number;
+  context_size?: number;
+  energy_wh_per_token?: number;
   /**
    * The capability verdicts the operator actually STATED: one entry per
-   * control they moved -- unlike every other key here, which is always
-   * emitted -- carrying the value they moved it to ('yes', 'no', or '' for
-   * unknown, which DELETES the row).
+   * control they moved, carrying the value they moved it to ('yes', 'no', or
+   * '' for unknown, which DELETES the row).
    *
    * An untouched control contributes no entry at all. A capability row whose
    * source is `manual` outranks every probe and the vision benchmark for as
@@ -58,9 +64,9 @@ export type MappingFormValues = {
    */
   capability_verdicts?: Record<string, CapabilityVerdictInput>;
   metrics_locked: boolean;
-  max_concurrency: number;
-  recommended_concurrency: number;
-  gen_tokens_per_second_at_capacity: number;
+  max_concurrency?: number;
+  recommended_concurrency?: number;
+  gen_tokens_per_second_at_capacity?: number;
 };
 
 // Parse a free-text numeric input into a non-negative number; blank/invalid → 0
@@ -203,6 +209,22 @@ export function MappingForm({
   const [genTpsAtCapacity, setGenTpsAtCapacity] = useState(() =>
     text(row?.gen_tokens_per_second_at_capacity),
   );
+  // The eight metric fields are diffed against the value the form opened with,
+  // exactly like the capability controls above and for the same reason: these
+  // columns are machine-owned, so an unchanged metric must be OMITTED from the
+  // submit rather than re-stated, or a full-row save would revert a value a
+  // probe wrote while the form was open (issue #65). Lazy from `row`, never
+  // re-synced. The seed strings mirror each metric state's own initializer.
+  const [metricSeeds] = useState(() => ({
+    context_size: text(row?.context_size),
+    energy_wh_per_token: text(row?.energy_wh_per_token),
+    gen_tokens_per_second: text(row?.gen_tokens_per_second),
+    prompt_tokens_per_second: text(row?.prompt_tokens_per_second),
+    load_time_ms: text(row?.load_time_ms),
+    max_concurrency: text(row?.max_concurrency),
+    recommended_concurrency: text(row?.recommended_concurrency),
+    gen_tokens_per_second_at_capacity: text(row?.gen_tokens_per_second_at_capacity),
+  }));
 
   // Manual context-size probe: running state + whether this server is busy with
   // a benchmark/probe run (polled while editing so the button disables).
@@ -305,20 +327,29 @@ export function MappingForm({
     }
     const capabilities: Pick<MappingFormValues, 'capability_verdicts'> =
       Object.keys(verdicts).length > 0 ? { capability_verdicts: verdicts } : {};
+    // Emit a metric key only when the operator changed it from the seed, so an
+    // untouched (machine-owned) metric is left to its probe writer (issue #65).
+    const metrics: Partial<MappingFormValues> = {};
+    for (const m of [
+      { key: 'context_size', value: contextSize },
+      { key: 'energy_wh_per_token', value: energyWhPerToken },
+      { key: 'gen_tokens_per_second', value: genTps },
+      { key: 'prompt_tokens_per_second', value: promptTps },
+      { key: 'load_time_ms', value: loadTimeMs },
+      { key: 'max_concurrency', value: maxConcurrency },
+      { key: 'recommended_concurrency', value: recommendedConcurrency },
+      { key: 'gen_tokens_per_second_at_capacity', value: genTpsAtCapacity },
+    ] as const) {
+      if (m.value.trim() === metricSeeds[m.key].trim()) continue;
+      metrics[m.key] = num(m.value);
+    }
     onSubmit({
       gateway_model_name: gatewayName,
       app_model_name: appName,
       status,
-      gen_tokens_per_second: num(genTps),
-      prompt_tokens_per_second: num(promptTps),
-      load_time_ms: num(loadTimeMs),
-      context_size: num(contextSize),
-      energy_wh_per_token: num(energyWhPerToken),
+      ...metrics,
       ...capabilities,
       metrics_locked: metricsLocked,
-      max_concurrency: num(maxConcurrency),
-      recommended_concurrency: num(recommendedConcurrency),
-      gen_tokens_per_second_at_capacity: num(genTpsAtCapacity),
     });
   }
 

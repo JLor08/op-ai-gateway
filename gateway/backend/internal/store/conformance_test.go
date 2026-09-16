@@ -8268,3 +8268,122 @@ func TestConformanceApplicationProxyExcluded(t *testing.T) {
 		}
 	})
 }
+
+// TestConformanceUpdateMappingEditable pins the partial-write fix for issue #65:
+// the operator-editable columns always land, but a metric column is written ONLY
+// when the mask supplies it. A config-only edit carrying a STALE metric value
+// (the portal's loaded struct) therefore cannot revert a concurrently probed
+// metric, while a supplied metric still writes with 'manual' provenance.
+func TestConformanceUpdateMappingEditable(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+
+		srv := routing.AIServer{
+			ID: "srv1", Name: "Server 1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateAIServer(ctx, srv); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		app := routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		mapping := routing.ModelMapping{
+			ID: "map1", ApplicationID: "app1", GatewayModelName: "g", AppModelName: "up",
+			Status: routing.ServerStatusActive, ContextSize: 0, MetricsLocked: false,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateMapping(ctx, mapping); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		// A probe stamps context_size + 'probe' provenance on the live row.
+		probeAt := time.Date(2026, 7, 23, 13, 0, 0, 0, time.UTC)
+		if err := s.UpdateMappingContextProbe(ctx, "map1", 131072, probeAt); err != nil {
+			t.Fatalf("context probe: %v", err)
+		}
+
+		// The operator edits UNRELATED fields from a STALE struct (loaded before
+		// the probe: ContextSize 0, MetricsSource ""). An EMPTY metric mask must
+		// leave context_size AND its provenance exactly as the probe set them,
+		// while applying the operator columns.
+		stale := routing.ModelMapping{
+			ID: "map1", ApplicationID: "app1", GatewayModelName: "g2", AppModelName: "up",
+			Status: routing.ServerStatusDisabled, ContextSize: 0, MetricsSource: "",
+			MetricsUpdatedAt: nil, UpdatedAt: now.Add(time.Minute),
+		}
+		if err := s.UpdateMappingEditable(ctx, stale, routing.MappingMetricsMask{}); err != nil {
+			t.Fatalf("UpdateMappingEditable (config-only): %v", err)
+		}
+		got, err := s.MappingByID(ctx, "map1")
+		if err != nil {
+			t.Fatalf("mapping by id: %v", err)
+		}
+		if got.ContextSize != 131072 {
+			t.Fatalf("context_size = %d, want 131072 (a config-only edit must not revert a probed metric)", got.ContextSize)
+		}
+		if got.MetricsSource != "probe" {
+			t.Fatalf("metrics_source = %q, want probe (a config-only edit must not restamp it)", got.MetricsSource)
+		}
+		if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(probeAt) {
+			t.Fatalf("metrics_updated_at = %v, want %v (unchanged)", got.MetricsUpdatedAt, probeAt)
+		}
+		if got.GatewayModelName != "g2" || got.Status != routing.ServerStatusDisabled {
+			t.Fatalf("operator columns not applied: name=%q status=%q", got.GatewayModelName, got.Status)
+		}
+
+		// A SUPPLIED metric IS written, with the caller's 'manual' provenance.
+		manualAt := time.Date(2026, 7, 23, 15, 0, 0, 0, time.UTC)
+		manual := got
+		manual.ContextSize = 4096
+		manual.MetricsSource = "manual"
+		manual.MetricsUpdatedAt = &manualAt
+		manual.UpdatedAt = now.Add(2 * time.Minute)
+		if err := s.UpdateMappingEditable(ctx, manual, routing.MappingMetricsMask{ContextSize: true}); err != nil {
+			t.Fatalf("UpdateMappingEditable (context_size supplied): %v", err)
+		}
+		got2, err := s.MappingByID(ctx, "map1")
+		if err != nil {
+			t.Fatalf("mapping by id (2): %v", err)
+		}
+		if got2.ContextSize != 4096 {
+			t.Fatalf("supplied context_size = %d, want 4096", got2.ContextSize)
+		}
+		if got2.MetricsSource != "manual" || got2.MetricsUpdatedAt == nil || !got2.MetricsUpdatedAt.Equal(manualAt) {
+			t.Fatalf("supplied metric provenance = %q@%v, want manual@%v", got2.MetricsSource, got2.MetricsUpdatedAt, manualAt)
+		}
+
+		// On a LOCKED mapping, a supplied metric is STILL written -- unlike the
+		// five narrow probe writers, UpdateMappingEditable has no metrics_locked
+		// guard, because a supplied value is the operator's own manual entry.
+		locked := got2
+		locked.MetricsLocked = true
+		locked.ContextSize = 2048
+		locked.UpdatedAt = now.Add(3 * time.Minute)
+		if err := s.UpdateMappingEditable(ctx, locked, routing.MappingMetricsMask{ContextSize: true}); err != nil {
+			t.Fatalf("UpdateMappingEditable (locked, supplied): %v", err)
+		}
+		got3, err := s.MappingByID(ctx, "map1")
+		if err != nil {
+			t.Fatalf("mapping by id (3): %v", err)
+		}
+		if !got3.MetricsLocked || got3.ContextSize != 2048 {
+			t.Fatalf("locked+supplied = locked %v ctx %d, want true/2048 (no metrics_locked guard)", got3.MetricsLocked, got3.ContextSize)
+		}
+
+		// A missing row is ErrNotFound (same as UpdateMapping).
+		missing := got3
+		missing.ID = "does-not-exist"
+		if err := s.UpdateMappingEditable(ctx, missing, routing.MappingMetricsMask{}); err != ErrNotFound {
+			t.Fatalf("missing-row err = %v, want ErrNotFound", err)
+		}
+	})
+}
