@@ -2,8 +2,27 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { applicationLiveTimingsKind, runtimeSpecLiveTimingsKind } from './liveTimings';
+import {
+  applicationLiveTimingsKind,
+  applicationSendsLiveTimings,
+  liveTimingsControlLayout,
+  runtimeSpecLiveTimingsKind,
+  runtimeSpecSendsLiveTimings,
+  type LiveTimingsKind,
+} from './liveTimings';
 import type { ApplicationType, RuntimeSpec } from '../../api';
+
+// The full LiveTimingsKind union, so the tests below fail to COMPILE if a state
+// is added -- the same never-arm exhaustiveness the helpers themselves carry
+// (issue #88). Adding a member here without a case in these tables is a type
+// error; forgetting it entirely drops coverage but the helpers' own assertNever
+// arms still fail the build.
+const allLiveTimingsKinds: readonly LiveTimingsKind[] = [
+  'capable',
+  'incapable',
+  'unknown',
+  'delegated',
+];
 
 // Both lists are stated EXHAUSTIVELY, and it is worth being exact about what
 // that does and does not buy, because the obvious reading is too generous.
@@ -114,5 +133,61 @@ describe('runtimeSpecLiveTimingsKind', () => {
     for (const specType of allSpecTypes) {
       expect(runtimeSpecLiveTimingsKind(specType), specType).not.toBe('delegated');
     }
+  });
+});
+
+describe('applicationSendsLiveTimings', () => {
+  // Only a capable kind sends the key; every other kind omits it. Preserves the
+  // previous `=== 'capable'` exactly, exhaustively (issue #88).
+  const expected: Record<LiveTimingsKind, boolean> = {
+    capable: true,
+    incapable: false,
+    delegated: false,
+    unknown: false,
+  };
+  for (const kind of allLiveTimingsKinds) {
+    it(`${kind} -> ${expected[kind]}`, () => {
+      expect(applicationSendsLiveTimings(kind)).toBe(expected[kind]);
+    });
+  }
+});
+
+describe('runtimeSpecSendsLiveTimings', () => {
+  // Everything but incapable sends (the caller still gates on value !== undefined).
+  // Preserves the previous `!== 'incapable'` exactly, exhaustively (issue #88).
+  const expected: Record<LiveTimingsKind, boolean> = {
+    capable: true,
+    unknown: true,
+    delegated: true,
+    incapable: false,
+  };
+  for (const kind of allLiveTimingsKinds) {
+    it(`${kind} -> ${expected[kind]}`, () => {
+      expect(runtimeSpecSendsLiveTimings(kind)).toBe(expected[kind]);
+    });
+  }
+});
+
+describe('liveTimingsControlLayout', () => {
+  // The shared control's rendering per kind: the checkbox (with its no-opinion
+  // default and caption) for a settable kind, or a suppressed note otherwise.
+  // Pins the mapping the plain-comparison suppression got wrong (issue #88).
+  const expected: Record<LiveTimingsKind, ReturnType<typeof liveTimingsControlLayout>> = {
+    capable: { checkbox: true, defaultChecked: true, note: 'default' },
+    unknown: { checkbox: true, defaultChecked: false, note: 'auto' },
+    incapable: { checkbox: false, note: 'unsupported' },
+    delegated: { checkbox: false, note: 'delegated' },
+  };
+  for (const kind of allLiveTimingsKinds) {
+    it(`${kind} -> ${JSON.stringify(expected[kind])}`, () => {
+      expect(liveTimingsControlLayout(kind)).toEqual(expected[kind]);
+    });
+  }
+
+  it('never shows the delegated note for a suppressed incapable kind (the #88 bug direction)', () => {
+    const incapable = liveTimingsControlLayout('incapable');
+    expect(incapable.checkbox).toBe(false);
+    expect(incapable).not.toHaveProperty('defaultChecked');
+    if (!incapable.checkbox) expect(incapable.note).toBe('unsupported');
   });
 });

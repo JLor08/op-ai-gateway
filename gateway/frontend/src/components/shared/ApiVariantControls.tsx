@@ -5,7 +5,7 @@ import { Checkbox, FormControlLabel, Typography } from '@mui/material';
 import { CheckboxGroup } from './CheckboxGroup';
 import { SelectField } from './SelectField';
 import type { EndpointMode } from '../../api';
-import type { LiveTimingsKind } from './liveTimings';
+import { liveTimingsControlLayout, type LiveTimingsKind } from './liveTimings';
 import type { Translation } from './types';
 
 // The two base API-Varianten capability checkboxes. openai gates /v1/responses
@@ -66,6 +66,9 @@ export function ApiVariantControls({
 }>) {
   const openaiEnabled = apiFlavors.includes('openai');
   const anthropicEnabled = apiFlavors.includes('anthropic');
+  // The exhaustive replacement for the plain-comparison suppression that once
+  // let a fourth kind fall through to a working, do-nothing checkbox (issue #88).
+  const liveTimingsLayout = liveTimingsControlLayout(liveTimingsKind);
   return (
     <>
       <CheckboxGroup
@@ -103,46 +106,46 @@ export function ApiVariantControls({
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
         {t.applicationNativeNote}
       </Typography>
-      {liveTimingsKind === 'incapable' || liveTimingsKind === 'delegated' ? (
-        // Never a blank: the slot the checkbox would occupy still explains why
-        // there is nothing to set. Rendering a DISABLED checkbox instead would
-        // be worse -- it would show a value (ticked or not) that this form
-        // will not send, since neither of these kinds sends the key at all.
-        //
-        // Two kinds, two SENTENCES. `delegated` (server_agent) must not get
-        // the unsupported note: the flag is real for such an application, it
-        // is simply decided on the runtime spec instead -- and since runtime
-        // specs exist only under server_agent, that note would tell precisely
-        // the operators who CAN use this feature that they cannot.
-        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          {liveTimingsKind === 'delegated'
-            ? t.applicationLiveTimingsDelegatedNote
-            : t.applicationLiveTimingsUnsupportedNote}
-        </Typography>
-      ) : (
+      {liveTimingsLayout.checkbox ? (
         <>
           <FormControlLabel
             control={
               <Checkbox
-                // `?? liveTimingsKind === 'capable'` is the honest rendering of
-                // "no opinion", not a default: what the backend will apply for
-                // a capable kind on a first write is ON, so the box says ON.
-                // For an unknown kind nothing can be promised and the caption
-                // below is what states the rule. Clicking either way leaves a
-                // DEFINITE value, and there is deliberately no way back to "no
+                // `?? liveTimingsLayout.defaultChecked` is the honest rendering of
+                // "no opinion", not a default: what the backend will apply for a
+                // capable kind on a first write is ON, so the box says ON; for an
+                // unknown kind nothing can be promised (defaultChecked is false)
+                // and the caption below states the rule. Clicking either way
+                // leaves a DEFINITE value, with deliberately no way back to "no
                 // opinion" once the operator has said something.
-                checked={liveTimings ?? liveTimingsKind === 'capable'}
+                checked={liveTimings ?? liveTimingsLayout.defaultChecked}
                 onChange={(e) => onLiveTimingsChange(e.target.checked)}
               />
             }
             label={t.applicationLiveTimings}
           />
           <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-            {liveTimingsKind === 'unknown'
+            {liveTimingsLayout.note === 'auto'
               ? t.applicationLiveTimingsAutoNote
               : t.applicationLiveTimingsNote}
           </Typography>
         </>
+      ) : (
+        // Never a blank: the slot the checkbox would occupy still explains why
+        // there is nothing to set. Rendering a DISABLED checkbox instead would be
+        // worse -- it would show a value (ticked or not) that this form will not
+        // send, since neither suppressed kind sends the key at all.
+        //
+        // Two kinds, two SENTENCES. `delegated` (server_agent) must not get the
+        // unsupported note: the flag is real for such an application, it is simply
+        // decided on the runtime spec instead -- and since runtime specs exist
+        // only under server_agent, that note would tell precisely the operators
+        // who CAN use this feature that they cannot.
+        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+          {liveTimingsLayout.note === 'delegated'
+            ? t.applicationLiveTimingsDelegatedNote
+            : t.applicationLiveTimingsUnsupportedNote}
+        </Typography>
       )}
     </>
   );

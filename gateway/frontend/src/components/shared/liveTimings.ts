@@ -16,6 +16,14 @@ import type { ApplicationType, RuntimeSpec } from '../../api';
  * branches: all three consumers use plain comparisons, not an exhaustive
  * switch, so a missed state is a rendering bug rather than a compile error.
  *
+ * Since issue #88, no consumer branches on this union with a plain comparison:
+ * each decision runs through an exhaustive switch with a never-typed arm
+ * (applicationSendsLiveTimings, runtimeSpecSendsLiveTimings and
+ * liveTimingsControlLayout below), so a state added here with no matching arm is
+ * a COMPILE error -- which is how the fourth state ('delegated') should have been
+ * caught, instead of the mutation that found the working, do-nothing checkbox it
+ * had rendered for server_agent.
+ *
  *   capable   -- the form may send either value
  *   incapable -- the form must send NO key at all. An explicit true here is
  *                refused (application.responses_live_timings_unsupported /
@@ -87,4 +95,88 @@ export function applicationLiveTimingsKind(type: ApplicationType): LiveTimingsKi
 export function runtimeSpecLiveTimingsKind(specType: RuntimeSpec['type']): LiveTimingsKind {
   if (specType === '') return 'unknown';
   return liveTimingsCapableKinds.has(specType) ? 'capable' : 'incapable';
+}
+
+/**
+ * assertNever turns a forgotten union member into a COMPILE error: a switch that
+ * misses a case leaves that member's type un-narrowed instead of `never`, so
+ * this call fails to typecheck. It is the never-typed arm issue #88 adds to every
+ * LiveTimingsKind decision below. It also throws at runtime, but the point is the
+ * build failure -- the fourth state was caught by a mutation only because nothing
+ * here type-checked the branches.
+ */
+function assertNever(value: never): never {
+  throw new Error(`unhandled LiveTimingsKind: ${String(value)}`);
+}
+
+/**
+ * Whether the APPLICATION form sends `responses_live_timings_enabled` for a
+ * kind. Only `capable` does; `incapable` and `delegated` send no key (and
+ * `unknown` is the launch-spec form's state, which applicationLiveTimingsKind
+ * never yields -- the switch answers for the whole union regardless). Preserves
+ * the previous `=== 'capable'` exactly, now exhaustively.
+ */
+export function applicationSendsLiveTimings(kind: LiveTimingsKind): boolean {
+  switch (kind) {
+    case 'capable':
+      return true;
+    case 'incapable':
+    case 'delegated':
+    case 'unknown':
+      return false;
+    default:
+      return assertNever(kind);
+  }
+}
+
+/**
+ * Whether the LAUNCH-SPEC form sends `responses_live_timings_enabled` for a kind
+ * (before the separate `value !== undefined` gate the caller keeps). Everything
+ * but `incapable` sends; `delegated` is the application form's server_agent
+ * state, which runtimeSpecLiveTimingsKind never yields -- the switch answers for
+ * the whole union regardless. Preserves the previous `!== 'incapable'` exactly,
+ * now exhaustively.
+ */
+export function runtimeSpecSendsLiveTimings(kind: LiveTimingsKind): boolean {
+  switch (kind) {
+    case 'incapable':
+      return false;
+    case 'capable':
+    case 'unknown':
+    case 'delegated':
+      return true;
+    default:
+      return assertNever(kind);
+  }
+}
+
+/**
+ * How the shared ApiVariantControls block renders the live-timings row for a
+ * kind: `checkbox` for a kind the form may set (with its no-opinion default and
+ * which caption to show), or a suppressed note for a kind that sends no key. The
+ * `note` is a semantic tag the control maps to a translation, so this file stays
+ * free of i18n. This is the exhaustive replacement for the plain-comparison
+ * suppression condition that shipped the do-nothing checkbox (issue #88).
+ */
+export type LiveTimingsControlLayout =
+  | { readonly checkbox: true; readonly defaultChecked: boolean; readonly note: 'default' | 'auto' }
+  | { readonly checkbox: false; readonly note: 'unsupported' | 'delegated' };
+
+export function liveTimingsControlLayout(kind: LiveTimingsKind): LiveTimingsControlLayout {
+  switch (kind) {
+    case 'capable':
+      return { checkbox: true, defaultChecked: true, note: 'default' };
+    case 'unknown':
+      // No opinion can be promised under Auto, so the box shows OFF and the
+      // caption states the rule.
+      return { checkbox: true, defaultChecked: false, note: 'auto' };
+    case 'incapable':
+      return { checkbox: false, note: 'unsupported' };
+    case 'delegated':
+      // NOT the unsupported note: the flag is real for a server_agent
+      // application, it is just decided on the runtime spec instead.
+      return { checkbox: false, note: 'delegated' };
+    default:
+      return assertNever(kind);
+  }
 }
