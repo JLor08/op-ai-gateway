@@ -355,6 +355,12 @@ not fail against the thing it named, so they are worth stating as rules:
    interchangeable by value, so swapping a same-typed pair in one reader's select
    list stayed green. Booleans cannot all be pairwise distinct, so covering
    non-adjacent swaps needs a second row seeded with the complementary pattern.
+   And the set of columns the fixture covers must be **derived from the live
+   schema, not a list kept beside it** (`tableColumns` + `assertColumnCoverage`):
+   a bit-pattern table and a `names` list checked only against each other cannot
+   see a column a later migration adds, so that column reaches the readers while
+   no fixture row seeds it — green, because the suite never learned it exists
+   (issue #84).
 3. **A cascade test cannot establish completeness**, because it can only
    enumerate the maps it actually reads — "the run reports exactly these and
    nothing else" proves nothing about a map nobody looked at. And a deletion line
@@ -434,9 +440,15 @@ ignores the column: an opt-out that works in the UI and is ignored the moment
 traffic is actually routed. `forEachDialect` is the right harness for this (not
 `forEachRoutingStore`, which would run the memory driver that cannot see the
 defect), and `TestConformanceApplicationReadersAgreeOnEveryColumn` plus
-`application_column_parity_test.go` are the only guards. Before migration 70 no
-`*_test.go` in the store package so much as mentioned `proxy_listen_port`, so
-migration 59's column had never been read back through SQL by any suite at all.
+`application_column_parity_test.go` guard it. `TestApplicationsSchemaColumnsAllCovered`
+now derives the fixture's covered-column set from the live migrated schema, so a
+column a later migration adds with no fixture entry fails the suite instead of
+being silently ignored (issue #84). `agent_runtime_specs` — which had no parity
+fixture at all, only a one-column round-trip in `TestRoutingStoreRuntimeSpecs` —
+and `ai_servers` now carry the same reader-agreement plus schema-coverage guards.
+Before migration 70 no `*_test.go` in the store package so much as mentioned
+`proxy_listen_port`, so migration 59's column had never been read back through SQL
+by any suite at all.
 
 **Store reads must return non-nil empty slices**, because a nil slice marshals to
 JSON `null` instead of `[]` and breaks API clients. Two shapes produce nil where
