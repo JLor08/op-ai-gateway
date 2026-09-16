@@ -624,9 +624,11 @@ plausible-looking validation rule would break the normal case:
   immunity. `legacy` marks a verdict migration 78 inherited from a column
   whose real origin is unknowable, and it ranks alongside a probe deliberately
   — treating a guess as authoritative would freeze it in forever. The rule
-  lives in `WritableCapabilityRows`, applied by each writer rather than by the
-  store, because only a writer knows what rank its own evidence carries
-  ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+  lives in `WritableCapabilityRows`, applied by each writer as the primary
+  check because only a writer knows what rank its own evidence carries; the
+  store repeats the same `rank(incoming) >= rank(current)` inside its upsert as
+  a backstop for the check-then-act interleaving the writer cannot see (issue
+  #79, [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
   The two PROBE sources are `llama_cpp_props` (a `GET` of llama.cpp's
   `/props`) and, since #54, `ollama_api_show` (a `POST` of Ollama's
   `/api/show`); the probing agent REPORTS which one produced a verdict set

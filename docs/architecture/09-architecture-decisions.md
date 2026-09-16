@@ -965,9 +965,17 @@ plausible-looking but unpopulated verdict — anything holding only a mapping
 has to ask for the rows. **(b) The precedence rule is a RANK,** not a
 probe/not-probe split: `manual` 3 > `vision_benchmark` 2 >
 `llama_cpp_props`/`ollama_api_show`/`legacy`/**any unrecognised source** 1 >
-no row 0, and a write is permitted **iff `rank(incoming) >= rank(current)`**
-(`WritableCapabilityRows` — pure, no I/O, applied by each writer rather than
-by the store, because only a writer knows what rank its own evidence carries).
+no row 0, and a write is permitted **iff `rank(incoming) >= rank(current)`**.
+`WritableCapabilityRows` (pure, no I/O) applies it in each writer, because only
+a writer knows what rank its own evidence carries and it also decides what is
+worth writing at all (an unchanged verdict is skipped). But that check and the
+write are two store calls, so a rank-3 `manual` committed in between would be
+overwritten by a probe that read "no row"; the SQL upsert therefore repeats the
+same `rank(incoming) >= rank(current)` inside its `on conflict` as a **backstop**
+(`capabilityRankCase`, mirrored in `MemoryStore`, issue #79), and the two
+orderings are pinned equal by a test. The Go check is still the primary and the
+only one that skips an unchanged write; the SQL guard closes only the
+interleaving the Go check cannot see.
 Four consequences are load-bearing: an operator's verdict is permanent against
 both the benchmark and every probe, with **no `metrics_locked` involved** —
 the lock does not guard capabilities at all any more; the benchmark still

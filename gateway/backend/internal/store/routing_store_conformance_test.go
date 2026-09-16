@@ -1848,3 +1848,133 @@ func TestRoutingStoreBenchmarkRunVRAMJSON(t *testing.T) {
 		}
 	})
 }
+
+// upsertPrecedenceFixture creates a server/app/mapping and returns the mapping id.
+func upsertPrecedenceFixture(t *testing.T, ctx context.Context, s routing.Store, now time.Time) string {
+	t.Helper()
+	if err := s.CreateAIServer(ctx, routing.AIServer{
+		ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderOllama,
+		Endpoint: "http://srv1.local:11434", Status: routing.ServerStatusActive,
+		HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := s.CreateApplication(ctx, routing.Application{
+		ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	if err := s.CreateMapping(ctx, routing.ModelMapping{
+		ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
+		AppModelName: "up", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	return "m1"
+}
+
+// TestUpsertMappingCapabilitiesRespectsSourcePrecedence pins issue #79: the
+// upsert itself refuses to let a lower-rank source overwrite a higher-rank one,
+// closing the check-then-act window in which a rank-3 manual verdict, written
+// between a probe's read and its write, was silently overwritten by the probe.
+// Runs on MemoryStore, sqlite and postgres. It fails with the SQL WHERE guard
+// (and the MemoryStore rank check) removed.
+func TestUpsertMappingCapabilitiesRespectsSourcePrecedence(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+		mID := upsertPrecedenceFixture(t, ctx, s, now)
+
+		upsert := func(verdict, source string, at time.Time) {
+			t.Helper()
+			if err := s.UpsertMappingCapabilities(ctx, mID, []routing.CapabilityRow{{
+				Capability: routing.CapabilityVision, Verdict: verdict, Source: source, CheckedAt: at,
+			}}); err != nil {
+				t.Fatalf("upsert %s/%s: %v", source, verdict, err)
+			}
+		}
+		vision := func() routing.CapabilityRow {
+			t.Helper()
+			caps, err := s.MappingCapabilities(ctx, mID)
+			if err != nil {
+				t.Fatalf("mapping capabilities: %v", err)
+			}
+			return routing.CapabilityRowsByName(caps)[routing.CapabilityVision]
+		}
+
+		// An operator's rank-3 manual verdict, then a concurrent rank-1 probe that
+		// read "no row" and now writes the OPPOSITE verdict. The manual must stand.
+		manualAt := now.Add(time.Hour)
+		upsert(routing.CapabilityYes, routing.CapabilitySourceManual, manualAt)
+		upsert(routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps, now.Add(2*time.Hour))
+		if got := vision(); got.Verdict != routing.CapabilityYes || got.Source != routing.CapabilitySourceManual || !got.CheckedAt.Equal(manualAt) {
+			t.Fatalf("rank-1 probe overwrote a rank-3 manual verdict: %+v, want yes/manual@%v (issue #79)", got, manualAt)
+		}
+		// A rank-2 vision benchmark is also outranked by the standing manual.
+		upsert(routing.CapabilityNo, routing.CapabilitySourceVisionBenchmark, now.Add(3*time.Hour))
+		if got := vision(); got.Source != routing.CapabilitySourceManual {
+			t.Fatalf("rank-2 benchmark overwrote a rank-3 manual: %+v", got)
+		}
+
+		// The reverse holds: a manual (rank 3) DOES overwrite a lower-rank row.
+		manual2At := now.Add(4 * time.Hour)
+		upsert(routing.CapabilityNo, routing.CapabilitySourceManual, manual2At)
+		if got := vision(); got.Verdict != routing.CapabilityNo || got.Source != routing.CapabilitySourceManual || !got.CheckedAt.Equal(manual2At) {
+			t.Fatalf("a manual verdict failed to update its own row: %+v", got)
+		}
+
+		// EQUAL rank still writes: a newer probe replaces an older probe. Reset to
+		// a probe row first (manual -> probe is allowed only from a probe; use a
+		// fresh capability to avoid the standing manual).
+		upsert2 := func(cap, verdict, source string, at time.Time) {
+			t.Helper()
+			if err := s.UpsertMappingCapabilities(ctx, mID, []routing.CapabilityRow{{
+				Capability: cap, Verdict: verdict, Source: source, CheckedAt: at,
+			}}); err != nil {
+				t.Fatalf("upsert %s: %v", cap, err)
+			}
+		}
+		upsert2(routing.CapabilityMTP, routing.CapabilityYes, routing.CapabilitySourceLlamaCppProps, now.Add(5*time.Hour))
+		newProbeAt := now.Add(6 * time.Hour)
+		upsert2(routing.CapabilityMTP, routing.CapabilityNo, routing.CapabilitySourceLlamaCppTimings, newProbeAt)
+		caps, err := s.MappingCapabilities(ctx, mID)
+		if err != nil {
+			t.Fatalf("mapping capabilities: %v", err)
+		}
+		mtp := routing.CapabilityRowsByName(caps)[routing.CapabilityMTP]
+		if mtp.Verdict != routing.CapabilityNo || !mtp.CheckedAt.Equal(newProbeAt) {
+			t.Fatalf("equal-rank probe did not replace the older probe: %+v, want no@%v", mtp, newProbeAt)
+		}
+	})
+}
+
+// TestCapabilityRankCaseMatchesGoRank pins the SQL precedence CASE against the
+// Go ordering it mirrors: for every source constant (and the empty and an
+// unknown source), the SQL rank must equal routing.CapabilitySourceRank, or the
+// upsert guard and WritableCapabilityRows would enforce different orderings.
+func TestCapabilityRankCaseMatchesGoRank(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		for _, src := range []string{
+			routing.CapabilitySourceManual,
+			routing.CapabilitySourceVisionBenchmark,
+			routing.CapabilitySourceLlamaCppProps,
+			routing.CapabilitySourceLegacy,
+			routing.CapabilitySourceOllamaAPIShow,
+			routing.CapabilitySourceLlamaCppTimings,
+			"",
+			"some-future-unknown-source",
+		} {
+			var rank int
+			if err := s.db.QueryRowContext(ctx, s.dl.rebind(`select `+capabilityRankCase("?")), src).Scan(&rank); err != nil {
+				t.Fatalf("query SQL rank for %q: %v", src, err)
+			}
+			if want := routing.CapabilitySourceRank(src); rank != want {
+				t.Fatalf("SQL capabilityRankCase(%q) = %d, want %d (routing.CapabilitySourceRank) -- the SQL guard and the Go ordering have drifted", src, rank, want)
+			}
+		}
+	})
+}

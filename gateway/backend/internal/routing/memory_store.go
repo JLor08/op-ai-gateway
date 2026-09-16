@@ -1127,14 +1127,17 @@ func (m *MemoryStore) MappingCapabilitiesForMappings(_ context.Context, mappingI
 	return out, nil
 }
 
-// UpsertMappingCapabilities writes rows, REPLACING any row for the same
-// (mapping, capability) — the map key is the capability, so a re-write is a
-// natural replacement, matching the SQL on-conflict-do-update. It applies no
-// precedence rule (the caller does — see WritableCapabilityRows) and,
-// unlike every metric writer here, carries no metrics_locked guard: see the
-// Store interface's own UpsertMappingCapabilities doc for the full argument,
-// which is what this table has instead of the lock the pre-78 capability
-// columns had to argue their way out of.
+// UpsertMappingCapabilities writes rows, replacing any row for the same
+// (mapping, capability) — the map key is the capability, matching the SQL
+// on-conflict-do-update. It mirrors that upsert's precedence BACKSTOP (issue
+// #79): a lower-rank source may not overwrite a higher-rank stored row, so a
+// rank-3 manual verdict is not clobbered by a probe that raced the caller's
+// check; equal ranks still write. WritableCapabilityRows stays the primary
+// check and the only one that skips an unchanged write. Unlike every metric
+// writer here it carries no metrics_locked guard: see the Store interface's
+// own UpsertMappingCapabilities doc for the full argument, which is what this
+// table has instead of the lock the pre-78 capability columns had to argue
+// their way out of.
 //
 // Every row is validated (ValidateCapabilityRow) before anything is written
 // — the same check SQLiteStore's UpsertMappingCapabilities makes, so the two
@@ -1173,6 +1176,15 @@ func (m *MemoryStore) UpsertMappingCapabilities(_ context.Context, mappingID str
 		m.mappingCapabilities[mappingID] = byCapability
 	}
 	for _, row := range rows {
+		// Mirror the SQL upsert's precedence guard (issue #79): a lower-rank
+		// source may not overwrite a higher-rank one, even if a check-then-act
+		// caller decided it could before a rank-3 manual verdict landed in
+		// between. Equal ranks still write (a newer probe replacing an older
+		// one, an operator restating a manual), matching the SQL `>=`.
+		if existing, ok := byCapability[row.Capability]; ok &&
+			capabilitySourceRank(row.Source) < capabilitySourceRank(existing.Source) {
+			continue
+		}
 		byCapability[row.Capability] = row
 	}
 	return nil

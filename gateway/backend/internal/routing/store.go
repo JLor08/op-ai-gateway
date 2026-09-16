@@ -1202,8 +1202,11 @@ const (
 //	                                   needs a case of its own below.
 //	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
 //
-// WritableCapabilityRows is the only caller: a write is permitted iff
-// rank(incoming) >= rank(current).
+// WritableCapabilityRows is the primary caller -- a write is permitted iff
+// rank(incoming) >= rank(current) -- but no longer the only one: since issue
+// #79 MemoryStore.UpsertMappingCapabilities mirrors this ordering as its
+// backstop, and the exported CapabilitySourceRank wrapper (just below) hands
+// the same numbers to the SQL guard and the test that pins the two equal.
 func capabilitySourceRank(source string) int {
 	switch source {
 	case CapabilitySourceManual:
@@ -1218,6 +1221,13 @@ func capabilitySourceRank(source string) int {
 		return 1
 	}
 }
+
+// CapabilitySourceRank is the exported view of capabilitySourceRank, for the
+// store's SQL upsert precedence guard (issue #79) and the test that pins the
+// SQL CASE against this ordering. It is the SAME ordering
+// WritableCapabilityRows enforces in Go; the SQL guard is the backstop for the
+// interleaving that check-then-act cannot see.
+func CapabilitySourceRank(source string) int { return capabilitySourceRank(source) }
 
 // LiveProgressCapabilityVerdict maps the live-progress verdict vocabulary
 // ("supported" / "unsupported", what provider.detectLiveProgressSupport
@@ -1260,8 +1270,14 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // WritableCapabilityRows answers the one question every capability writer --
 // a probe, or the vision benchmark -- has to ask -- which of the verdicts I
 // just determined may I actually write, given what is already on file -- and
-// is the single place that answer lives. Pure: no I/O, no store access,
-// table-testable on its own.
+// is the primary place that answer lives: it also decides what is worth writing
+// at all (an unchanged verdict is skipped, so the write is not even issued).
+// Pure: no I/O, no store access, table-testable on its own. Because its read
+// and the write are separate store calls, the SQL upsert repeats the SAME
+// rank(incoming) >= rank(current) guard inside its on-conflict as a backstop for
+// the interleaving this check cannot see -- see capabilityRankCase and
+// UpsertMappingCapabilities (issue #79). The Go rule and the SQL rule are pinned
+// to the same ordering (CapabilitySourceRank) by a test.
 //
 // Three rules, in order:
 //
@@ -1488,11 +1504,13 @@ type MappingStore interface {
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
 	// UpsertMappingCapabilities writes rows, replacing any row for the same
 	// (mapping, capability), atomically as one set -- a caller passing several
-	// verdicts must never observe some of them applied and others not. It does
-	// NOT apply the precedence rule -- callers do, because only they know what
-	// rank their own write is (see capabilitySourceRank, and
-	// WritableCapabilityRows for the answer every writer shares -- a probe
-	// and the vision benchmark alike). It rejects (ValidateCapabilityRow),
+	// verdicts must never observe some of them applied and others not. The
+	// caller (WritableCapabilityRows) is the PRIMARY precedence check and the
+	// only one that skips an unchanged write; the store then repeats the same
+	// rank(incoming) >= rank(current) guard as a BACKSTOP (see
+	// capabilitySourceRank), so a rank-3 manual verdict committed between a
+	// probe's read and its write is not overwritten by that probe (issue #79).
+	// It rejects (ValidateCapabilityRow),
 	// without writing anything, a row whose Verdict is neither CapabilityYes
 	// nor CapabilityNo or whose Capability or Source is empty.
 	//
