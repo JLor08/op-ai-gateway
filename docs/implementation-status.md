@@ -65,12 +65,46 @@ shipped the Responses live-timings opt-in:
 ## Progress
 
 - [x] Worktree + Understand pass (6 parallel readers, change sites pinned)
-- [ ] Task 1: provider seam (exported interface + Multiplexer dispatch + exported rejection class)
-- [ ] Task 2: gateway wiring (call-site AND, Warn line, memo record)
-- [ ] Task 3: portal reserved-name refusal (SET refused, RESET kept)
-- [ ] Task 4: the missing end-to-end tests (residuals 3 + 5)
-- [ ] Task 5: docs (six "five conditions" restatements, three false claims, ADR-039, api-surface)
-- [ ] Gates: build, gofumpt, golangci-lint, full packages, Postgres leg, -race, check-docs, frontend
+- [x] Task 1: provider seam (exported interface + Multiplexer dispatch + exported rejection class)
+- [x] Task 2: gateway wiring (call-site AND, Warn line, memo record)
+- [x] Task 3: portal reserved-name refusal (SET refused, RESET kept)
+- [x] Task 4: the missing end-to-end tests (residuals 3 + 5)
+- [x] Task 5: docs (five condition-count restatements, three false claims, ADR-039, api-surface)
+- [x] Committed as 8e64886
+- [ ] Gates (in progress; see below)
 - [ ] Adversarial review + fixes
 - [ ] Sonar branch-findings
 - [ ] Remove this file, push, open PR
+
+## Gate results
+
+| Gate | Result |
+|---|---|
+| `go build ./...` (backend) | clean |
+| `golangci-lint fmt --diff` | silent, both modules |
+| `golangci-lint run` | **0 issues**, both modules |
+| backend `go test ./...` | **23 packages ok**, 0 FAIL |
+| PostgreSQL leg (`OP_AI_GATEWAY_TEST_POSTGRES_DSN` set) | **137 postgres-dialect subtests**; exactly 3 skips, all documented dialect skips, none missing-DSN |
+| `-race` (gateway, provider, portal, routing, store) | **0 data races**, exit 0 (gateway 840s — hence `-timeout=25m`) |
+| `scripts/check-docs.sh` | OK (44 md files, 582 anchors, 641 links, 29/29 reachable, 260 $refs) |
+| frontend `format:check` | clean |
+| frontend `lint` | 0 errors, 13 warnings — byte-identical to `main`, none on a changed file |
+| frontend `build` | clean |
+| frontend `npm test` | **113 files / 2976 tests** passed |
+
+Note: the worktree needed its own `npm ci` — symlinking the main checkout's
+`node_modules` passes prettier/eslint/build but breaks vitest's `/@fs` module
+resolution (all 113 files fail to import `@testing-library/jest-dom`).
+
+## Mutation proofs (each caught by exactly the test that claims it)
+
+| Mutation | Caught by |
+|---|---|
+| `Multiplexer.liveProgressMemoFor` ignores the provider key (fallback only) | `TestMultiplexerDispatchesRejectionMemoToTheResolvedClient` |
+| gate drops `routing.LiveTimingsCapableKind` | both new refusal-table rows |
+| call site drops the memo conjunct | `TestRecordedRejectionSuppressesTheNextInjection` |
+| rejection logged but not recorded | `…IsRecordedForBothEndpoints`, `TestNonSchemaRejectionIsNotRecorded`, `…SuppressesTheNextInjection` |
+| the new line drops from Warn to Debug | `TestInjectedTimingsRejectionIsVisibleAtTheDefaultLogLevel` |
+| reservation also blocks the RESET | `TestMappingCapabilityVerdictReservedNamesStayResettable` |
+| reservation removed | `TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet` |
+| reservation moved BEFORE the value check | that test's ordering row |
