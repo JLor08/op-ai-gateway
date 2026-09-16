@@ -313,7 +313,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// What the client does pay is fields it did not ask for on frames it has to
 	// parse, and that cost is measured rather than guessed: in a separate
 	// flagged/unflagged pair of the same prompt, both terminating at the same
-	// `output_tokens`, the flagged run carried 2.49x the wire bytes. The
+	// `output_tokens`, the flagged run carried 2.49x the wire bytes -- the pair
+	// is recorded in §8.4.3 of
+	// docs/architecture/cross-cutting/telemetry-usage-observability.md. The
 	// operator accepted that by switching this on, which is the whole reason
 	// this is an operator's switch and not a default. No retry accompanies the
 	// injection: the endpoint was measured accepting unknown top-level keys, so
@@ -604,7 +606,9 @@ const timingsPerTokenKey = "timings_per_token"
 //     part of this feature.)
 //   - The key is ALREADY PRESENT at the top level, whatever its value. Presence,
 //     not value: llama.cpp treats an explicit false exactly as it treats an absent
-//     key, so a client that sent false has made a choice, and overwriting it would
+//     key -- measured, in §8.4.3 of
+//     docs/architecture/cross-cutting/telemetry-usage-observability.md -- so a
+//     client that sent false has made a choice, and overwriting it would
 //     be the silent rewriting of a client request that this path refuses to do.
 //
 // A json.Marshal failure returns the body unchanged as well — a fourth `return raw,
