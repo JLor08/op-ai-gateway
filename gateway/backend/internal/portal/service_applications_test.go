@@ -1864,8 +1864,9 @@ func TestCreateMappingVisionCapableRoundTrip(t *testing.T) {
 // so the operator's verdict survives unchanged. This exercises the exact
 // call sequence every real probe writer uses (routing.WritableCapabilityRows
 // then, only if it returns rows, UpsertMappingCapabilities) rather than
-// calling UpsertMappingCapabilities directly, which enforces no precedence
-// of its own -- callers do (see its own doc-comment).
+// calling UpsertMappingCapabilities directly: the caller is the primary
+// precedence check, and since issue #79 the store also enforces the same rank
+// order as a backstop against a racing write (see its own doc-comment).
 func TestUpdateMappingVisionCapableSurvivesSubsequentProbe(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newServerTestService(t, now)

@@ -111,10 +111,13 @@ func scanCapabilityRowsInto(rows *sql.Rows, out map[string][]routing.CapabilityR
 }
 
 // UpsertMappingCapabilities writes one row per verdict, replacing any row for
-// the same (mapping, capability). It applies NO precedence rule — the caller
-// decides whether its source may overwrite what is there (see
-// routing.WritableCapabilityRows for the shared answer) — and carries no
-// metrics_locked guard, never touching metrics_source/metrics_updated_at: a
+// the same (mapping, capability) — but only when the incoming source's rank is
+// at least the stored one's. The caller (routing.WritableCapabilityRows) is the
+// primary precedence check and the only one that skips an unchanged write; this
+// on-conflict WHERE (capabilityRankCase) is the BACKSTOP for the interleaving
+// that check-then-act cannot see, so a rank-3 manual verdict committed between a
+// probe's read and its write is not overwritten by that probe (issue #79). It
+// carries no metrics_locked guard, never touching metrics_source/metrics_updated_at: a
 // capability is not a number an operator pins against automation. That
 // argument used to live on UpdateMappingCapabilities beside it; with the
 // columns' writers gone it lives on routing.MappingStore's own
@@ -157,13 +160,30 @@ func (s *SQLiteStore) UpsertMappingCapabilities(ctx context.Context, mappingID s
 			on conflict(mapping_id, capability) do update set
 				verdict = excluded.verdict,
 				source = excluded.source,
-				checked_at = excluded.checked_at`),
+				checked_at = excluded.checked_at
+			where `+capabilityRankCase("excluded.source")+` >= `+capabilityRankCase("model_mapping_capabilities.source")),
 			mappingID, r.Capability, r.Verdict, r.Source, r.CheckedAt,
 		); err != nil {
 			return fmt.Errorf("upsert mapping capability %q: %w", r.Capability, err)
 		}
 	}
 	return tx.Commit()
+}
+
+// capabilityRankCase renders the source-precedence ordering
+// (routing.CapabilitySourceRank) as a SQL CASE over a source-column
+// expression, so UpsertMappingCapabilities' on-conflict WHERE can compare an
+// incoming source's rank to the stored one INSIDE the write -- the guard the
+// Go-side routing.WritableCapabilityRows check cannot enforce across the
+// interleaving between its read and this write (issue #79). The source strings
+// are the routing constants (the persisted values), and the rank numbers are
+// pinned against the Go ordering by TestCapabilityRankCaseMatchesGoRank. A
+// non-empty source outside the two named ones ranks 1, matching the Go default.
+func capabilityRankCase(col string) string {
+	return fmt.Sprintf(
+		`(case %s when '%s' then 3 when '%s' then 2 when '' then 0 else 1 end)`,
+		col, routing.CapabilitySourceManual, routing.CapabilitySourceVisionBenchmark,
+	)
 }
 
 // DeleteMappingCapability returns one capability to UNKNOWN by removing its
