@@ -1410,9 +1410,40 @@ func ValidateCapabilityRow(r CapabilityRow) error {
 // UpsertMappingCapabilities carries the full argument, and it is the one this
 // table's capability columns and migrations 76/77/78 all cite. See
 // CapabilityRow.
+// MappingMetricsMask names which of a mapping's machine-owned metric columns a
+// partial edit actually supplies. UpdateMappingEditable writes each column only
+// when its flag is set, leaving the rest to their narrow probe/benchmark
+// writers — so an operator config edit cannot revert a concurrently probed
+// metric (issue #65). Any() reports whether any metric is supplied, which also
+// gates whether metrics_source/metrics_updated_at are (re)stamped.
+type MappingMetricsMask struct {
+	GenTokensPerSecond           bool
+	PromptTokensPerSecond        bool
+	LoadTimeMS                   bool
+	ContextSize                  bool
+	EnergyWhPerToken             bool
+	MaxConcurrency               bool
+	RecommendedConcurrency       bool
+	GenTokensPerSecondAtCapacity bool
+}
+
+// Any reports whether the mask supplies at least one metric column.
+func (m MappingMetricsMask) Any() bool {
+	return m.GenTokensPerSecond || m.PromptTokensPerSecond || m.LoadTimeMS || m.ContextSize ||
+		m.EnergyWhPerToken || m.MaxConcurrency || m.RecommendedConcurrency || m.GenTokensPerSecondAtCapacity
+}
+
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
+	// UpdateMappingEditable writes a mapping's operator-editable columns
+	// (application_id, gateway_model_name, app_model_name, status,
+	// metrics_locked, updated_at) and only the machine-owned metric columns the
+	// caller supplies in metrics — plus metrics_source/metrics_updated_at when
+	// metrics.Any(). Every unsupplied metric column is left exactly as stored,
+	// so a portal edit that carries a stale metric value can no longer revert a
+	// concurrently probed one (issue #65). ErrNotFound on a missing row.
+	UpdateMappingEditable(ctx context.Context, mapping ModelMapping, metrics MappingMetricsMask) error
 	// UpdateMappingContextProbe sets a mapping's context_size + provenance from a
 	// context probe, atomically and ONLY when metrics_locked is false (a no-op,
 	// non-error, when the mapping is missing or locked). It touches only the three

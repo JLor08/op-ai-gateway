@@ -3789,3 +3789,71 @@ func TestUpdateApplicationLiveTimingsClearIsAPropertyOfTheStoredRowNotTheRequest
 		t.Errorf("stored value = true after a PATCH that touched only the port, on incapable type %q", reloaded.Type)
 	}
 }
+
+// probeAfterLoadStore lands a context-probe write on a target mapping the FIRST
+// time it is read, reproducing issue #65's lost-update window: the portal
+// handler's authorizeMapping load returns the PRE-probe struct, and the probe
+// then commits before the handler writes -- so the handler holds a stale metric
+// value at write time. Armed by setting mappingID after the mapping exists so
+// the create-time reads do not trip it.
+type probeAfterLoadStore struct {
+	*routing.MemoryStore
+	mappingID   string
+	contextSize int
+	at          time.Time
+	fired       bool
+}
+
+func (p *probeAfterLoadStore) MappingByID(ctx context.Context, id string) (routing.ModelMapping, error) {
+	m, err := p.MemoryStore.MappingByID(ctx, id)
+	if err == nil && !p.fired && id != "" && id == p.mappingID {
+		p.fired = true
+		_ = p.MemoryStore.UpdateMappingContextProbe(ctx, id, p.contextSize, p.at)
+	}
+	return m, err
+}
+
+// TestUpdateMappingConfigEditDoesNotRevertAConcurrentProbe is the issue #65
+// regression at the service boundary: an operator's config-only save (here, a
+// status change) must not revert a context probe that lands after the handler
+// loaded the mapping. Pre-fix the wide UpdateMapping rewrote context_size from
+// the stale struct (0) and the probe's 8192 was lost; the partial write leaves
+// the unsupplied metric untouched.
+func TestUpdateMappingConfigEditDoesNotRevertAConcurrentProbe(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	injector := &probeAfterLoadStore{MemoryStore: routing.NewMemoryStore(), contextSize: 8192, at: now.Add(time.Hour)}
+	svc := newServerTestServiceWithRoutes(t, now, injector)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{Type: routing.ProviderVLLM, Port: 8000, Scheme: "https"})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "g", AppModelName: "a"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	injector.mappingID = mapping.ID // arm only now, so create-time reads don't fire it
+
+	disabled := routing.ServerStatusDisabled
+	if _, err := svc.UpdateMapping(ctx, ownerToken(), mapping.ID, UpdateMappingRequest{Status: &disabled}); err != nil {
+		t.Fatalf("UpdateMapping (status only): %v", err)
+	}
+	if !injector.fired {
+		t.Fatal("test bug: the concurrent probe never fired, so the race was not exercised")
+	}
+
+	got, err := injector.MemoryStore.MappingByID(ctx, mapping.ID)
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if got.ContextSize != 8192 {
+		t.Fatalf("context_size = %d, want 8192 (a config-only edit must not revert a concurrently probed metric)", got.ContextSize)
+	}
+	if got.MetricsSource != "probe" {
+		t.Fatalf("metrics_source = %q, want probe (the probe's provenance must survive)", got.MetricsSource)
+	}
+	if got.Status != routing.ServerStatusDisabled {
+		t.Fatalf("status = %q, want disabled (the operator's edit must land)", got.Status)
+	}
+}

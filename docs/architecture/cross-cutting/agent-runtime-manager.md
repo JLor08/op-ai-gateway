@@ -3682,15 +3682,18 @@ numeric metrics, which ADR-039 is explicit does not guard the capability table
 any more.
 
 **Omission removes the clobber, not the race, and this split is the first thing
-that makes two simultaneous mapping writers a designed workflow.**
-`Service.UpdateMapping` loads the row, applies the pointer fields and writes the
-**whole struct** back with no compare-and-set, so two PATCHes in flight at once
-still lose an update — the later writer reverts the earlier writer's field even
-though it never sent that key. The split shrinks the fields both screens send
-from three to zero, which is what stops the overwrite happening on *every*
-submit; it does not close the window. That is a **backend contract gap** (the
-endpoint has no `If-Match` and the row has no version column), recorded as its
-own entry in [§11.1 Operational
+that makes two simultaneous mapping writers a designed workflow.** Since issue
+#65 `Service.UpdateMapping` no longer writes the whole struct: `UpdateMappingEditable`
+writes the operator columns plus only the metric columns the request actually
+supplied, so a writer can no longer revert a field it never sent — the
+machine-owned metric class (a background probe reverted by an unrelated operator
+save) is closed on both channels, the backend write and the form's always-submit
+body. What is NOT closed is two PATCHes naming the **same** column: with no
+compare-and-set the later writer still wins. The split shrinks the fields both
+screens send from three to zero, which is what stops the overwrite happening on
+*every* submit; it does not close that same-column window. That remaining window
+is a **backend contract gap** (the endpoint has no `If-Match` and the row has no
+version column), recorded as its own entry in [§11.1 Operational
 risks](../11-risks-and-technical-debt.md#111-operational-risks) rather than
 worked around here. Nothing below should be read as saying the two screens
 cannot race.

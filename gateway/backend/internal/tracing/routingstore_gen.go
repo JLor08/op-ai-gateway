@@ -1276,6 +1276,18 @@ func (_d *RoutingStoreWithTracing) UpdateMappingContextProbe(ctx context.Context
 	return _d.Store.UpdateMappingContextProbe(ctx, id, contextSize, at)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateMappingEditable(ctx context.Context, mapping _sourceRouting.ModelMapping, metrics _sourceRouting.MappingMetricsMask) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateMappingEditable")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateMappingEditable(ctx, mapping, metrics)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateMappingEnergyEWMA(ctx context.Context, id string, sampleWhPerToken float64, alpha float64, at time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateMappingEnergyEWMA")
 	defer span.End()

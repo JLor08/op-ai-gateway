@@ -283,7 +283,7 @@ describe('MappingSection performance metrics', () => {
     expect(created[0].body).not.toHaveProperty('vision_capable');
   });
 
-  it('populates every metric field on edit and resubmits them unchanged', async () => {
+  it('populates every metric field on edit and OMITS the unchanged ones on resubmit', async () => {
     const { updated } = renderSection({
       mappings: [
         makeMapping({
@@ -338,22 +338,26 @@ describe('MappingSection performance metrics', () => {
 
     await waitFor(() => expect(updated).toHaveLength(1));
     expect(updated[0].id).toBe('map_1');
-    expect(updated[0].body).toMatchObject({
-      context_size: 8192,
-      gen_tokens_per_second: 40.5,
-      prompt_tokens_per_second: 200.25,
-      load_time_ms: 1500,
-      metrics_locked: true,
-      max_concurrency: 16,
-      recommended_concurrency: 8,
-      gen_tokens_per_second_at_capacity: 640.5,
-    });
-    // The capability controls are the ONE exception to "resubmits them
-    // unchanged", and it is deliberate: a `manual` capability row outranks
-    // every probe and the vision benchmark for as long as it stands, so an
-    // untouched control must not be restated as an operator verdict.
-    // Unchanged means ABSENT -- no entry in the authoritative field, and never
-    // the legacy booleans either.
+    // Since issue #65 an UNCHANGED metric is omitted, exactly like the
+    // capability controls and for the same reason: these columns are
+    // machine-owned (probes, benchmarks, the EWMA writers), so re-stating a
+    // value this form merely READ would revert a metric a background probe
+    // wrote while the form was open. The operator-owned policy flag is still
+    // always sent.
+    expect(updated[0].body).toMatchObject({ metrics_locked: true });
+    for (const key of [
+      'context_size',
+      'gen_tokens_per_second',
+      'prompt_tokens_per_second',
+      'load_time_ms',
+      'energy_wh_per_token',
+      'max_concurrency',
+      'recommended_concurrency',
+      'gen_tokens_per_second_at_capacity',
+    ]) {
+      expect(updated[0].body).not.toHaveProperty(key);
+    }
+    // Capabilities were already omitted when unchanged; still are.
     expect(updated[0].body).not.toHaveProperty('capability_verdicts');
     expect(updated[0].body).not.toHaveProperty('is_mtp');
     expect(updated[0].body).not.toHaveProperty('vision_capable');
