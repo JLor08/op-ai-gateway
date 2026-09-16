@@ -5,11 +5,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { TimeSeries, UsagePage, UsageStats } from '../api';
 import type { PortalApi } from './shared/types';
-
-const t = messages.de;
 
 // Fresh, inspectable localStorage per test so the persisted window/bucket prefs
 // are deterministic and assertable (mirrors the other Activity test suites).
@@ -119,97 +117,101 @@ function makeApi(over: Over = {}) {
   return { api, unsubscribe };
 }
 
-function renderActivity(over: Over = {}, role = 'user') {
-  const { api } = makeApi(over);
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  return { api };
-}
-
-function tsCalls(api: Pick<PortalApi, 'usageTimeSeries'>) {
-  return (api.usageTimeSeries as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-}
-function lastTsArg(api: Pick<PortalApi, 'usageTimeSeries'>) {
-  return tsCalls(api).at(-1)![0] as { window: string; bucket: number; scope: string };
-}
-
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
-describe('Activity time-series charts', () => {
-  it('renders the three line charts from api.usageTimeSeries with the persisted defaults', async () => {
-    installStorage();
-    const { api } = renderActivity();
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    expect(await screen.findByText(t.activityTsConnections)).toBeInTheDocument();
-    expect(screen.getByText(t.activityTsPromptThroughput)).toBeInTheDocument();
-    expect(screen.getByText(t.activityTsCompletionThroughput)).toBeInTheDocument();
-    // Chart 1 is a two-series chart: its legend carries both series labels.
-    expect(screen.getByText(t.activityTsConnectionsThroughput)).toBeInTheDocument();
-    expect(screen.getByText(t.activityTsConcurrency)).toBeInTheDocument();
+  function renderActivity(over: Over = {}, role = 'user') {
+    const { api } = makeApi(over);
+    render(
+      <ToastProvider>
+        <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
+      </ToastProvider>,
+    );
+    return { api };
+  }
 
-    await waitFor(() => expect(api.usageTimeSeries).toHaveBeenCalled());
-    expect(lastTsArg(api)).toMatchObject({ window: '5m', bucket: 5, scope: 'own' });
+  function tsCalls(api: Pick<PortalApi, 'usageTimeSeries'>) {
+    return (api.usageTimeSeries as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+  }
+  function lastTsArg(api: Pick<PortalApi, 'usageTimeSeries'>) {
+    return tsCalls(api).at(-1)![0] as { window: string; bucket: number; scope: string };
+  }
+
+  describe(`Activity time-series charts [${locale}]`, () => {
+    it('renders the three line charts from api.usageTimeSeries with the persisted defaults', async () => {
+      installStorage();
+      const { api } = renderActivity();
+
+      expect(await screen.findByText(t.activityTsConnections)).toBeInTheDocument();
+      expect(screen.getByText(t.activityTsPromptThroughput)).toBeInTheDocument();
+      expect(screen.getByText(t.activityTsCompletionThroughput)).toBeInTheDocument();
+      // Chart 1 is a two-series chart: its legend carries both series labels.
+      expect(screen.getByText(t.activityTsConnectionsThroughput)).toBeInTheDocument();
+      expect(screen.getByText(t.activityTsConcurrency)).toBeInTheDocument();
+
+      await waitFor(() => expect(api.usageTimeSeries).toHaveBeenCalled());
+      expect(lastTsArg(api)).toMatchObject({ window: '5m', bucket: 5, scope: 'own' });
+    });
+
+    it('switches + persists the window and refetches', async () => {
+      const store = installStorage();
+      const { api } = renderActivity();
+      await screen.findByText(t.activityTsConnections);
+
+      // Window is a MUI Select now: open it, then pick the "15 Min" option (label
+      // formatted from the 900s window duration).
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityTsWindowLabel }));
+      fireEvent.click(await screen.findByRole('option', { name: `15 ${t.tsUnitMin}` }));
+
+      await waitFor(() => expect(lastTsArg(api).window).toBe('15m'));
+      expect(store.get('op.activity.tsWindow')).toBe('15m');
+    });
+
+    it('switches + persists the resolution (bucket) and refetches', async () => {
+      const store = installStorage();
+      const { api } = renderActivity();
+      await screen.findByText(t.activityTsConnections);
+
+      // Resolution is a MUI Select now: open it, then pick the "10s" option.
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityTsBucketLabel }));
+      fireEvent.click(await screen.findByRole('option', { name: '10s' }));
+
+      await waitFor(() => expect(lastTsArg(api).bucket).toBe(10));
+      expect(store.get('op.activity.tsBucket')).toBe('10');
+    });
+
+    it('is scope-aware: an admin switching to all refetches the series with scope=all', async () => {
+      installStorage();
+      const { api } = renderActivity({}, 'admin');
+      await screen.findByText(t.activityTsConnections);
+      expect(lastTsArg(api).scope).toBe('own');
+
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
+      fireEvent.click(await screen.findByRole('option', { name: t.activityScopeAll }));
+
+      await waitFor(() => expect(lastTsArg(api).scope).toBe('all'));
+    });
+
+    it('refetches the time-series on an SSE signal', async () => {
+      installStorage();
+      let signal: () => void = () => {};
+      const subscribeActivity = vi.fn((cb: () => void) => {
+        signal = cb;
+        return vi.fn();
+      }) as unknown as PortalApi['subscribeActivity'];
+      const { api } = renderActivity({ subscribeActivity });
+
+      await screen.findByText(t.activityTsConnections);
+      const before = tsCalls(api).length;
+
+      act(() => signal());
+
+      await waitFor(() => expect(tsCalls(api).length).toBeGreaterThan(before));
+    });
   });
-
-  it('switches + persists the window and refetches', async () => {
-    const store = installStorage();
-    const { api } = renderActivity();
-    await screen.findByText(t.activityTsConnections);
-
-    // Window is a MUI Select now: open it, then pick the "15 Min" option (label
-    // formatted from the 900s window duration).
-    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityTsWindowLabel }));
-    fireEvent.click(await screen.findByRole('option', { name: `15 ${t.tsUnitMin}` }));
-
-    await waitFor(() => expect(lastTsArg(api).window).toBe('15m'));
-    expect(store.get('op.activity.tsWindow')).toBe('15m');
-  });
-
-  it('switches + persists the resolution (bucket) and refetches', async () => {
-    const store = installStorage();
-    const { api } = renderActivity();
-    await screen.findByText(t.activityTsConnections);
-
-    // Resolution is a MUI Select now: open it, then pick the "10s" option.
-    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityTsBucketLabel }));
-    fireEvent.click(await screen.findByRole('option', { name: '10s' }));
-
-    await waitFor(() => expect(lastTsArg(api).bucket).toBe(10));
-    expect(store.get('op.activity.tsBucket')).toBe('10');
-  });
-
-  it('is scope-aware: an admin switching to all refetches the series with scope=all', async () => {
-    installStorage();
-    const { api } = renderActivity({}, 'admin');
-    await screen.findByText(t.activityTsConnections);
-    expect(lastTsArg(api).scope).toBe('own');
-
-    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
-    fireEvent.click(await screen.findByRole('option', { name: t.activityScopeAll }));
-
-    await waitFor(() => expect(lastTsArg(api).scope).toBe('all'));
-  });
-
-  it('refetches the time-series on an SSE signal', async () => {
-    installStorage();
-    let signal: () => void = () => {};
-    const subscribeActivity = vi.fn((cb: () => void) => {
-      signal = cb;
-      return vi.fn();
-    }) as unknown as PortalApi['subscribeActivity'];
-    const { api } = renderActivity({ subscribeActivity });
-
-    await screen.findByText(t.activityTsConnections);
-    const before = tsCalls(api).length;
-
-    act(() => signal());
-
-    await waitFor(() => expect(tsCalls(api).length).toBeGreaterThan(before));
-  });
-});
+}

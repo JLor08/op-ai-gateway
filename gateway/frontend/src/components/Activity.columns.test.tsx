@@ -5,10 +5,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { UsageEvent, UsagePage, UsageStats } from '../api';
-
-const t = messages.de;
 
 function installStorage() {
   const store = new Map<string, string>();
@@ -106,189 +104,200 @@ function makeApi() {
   };
 }
 
-// The scope switch is now a non-native MUI Select (SelectField): open the
-// combobox then click the option, rather than firing a native change event.
-async function selectScope(optionName: string) {
-  fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
-  fireEvent.click(await screen.findByRole('option', { name: optionName }));
-}
-
-function renderActivity(role: string) {
-  const api = makeApi();
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  return api;
-}
-
 beforeEach(() => installStorage());
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
-describe('Activity admin scope + columns', () => {
-  it('hides the scope switch and owner column for a plain user', async () => {
-    renderActivity('user');
-    await screen.findByRole('cell', { name: 'qwen-coder' });
-    expect(screen.queryByLabelText(t.activityScopeLabel)).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole('columnheader', { name: t.activityColOwner }),
-    ).not.toBeInTheDocument();
-  });
+// Both locales, not just German (issue #89): run the whole suite once per locale
+// so the table's English headers and labels are rendered and asserted too.
+// Everything that references `t` lives inside the loop.
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-  it('renders the scope switch at the top of the view, above the stat tiles', async () => {
-    renderActivity('admin');
-    await screen.findByRole('cell', { name: 'qwen-coder' });
-    const scope = screen.getByLabelText(t.activityScopeLabel);
-    const stats = screen.getByLabelText(t.activityStatsLabel);
-    // The single toggle governs the whole view, so it must PRECEDE the stat tiles.
-    expect(stats.compareDocumentPosition(scope) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
-  });
+  // The scope switch is now a non-native MUI Select (SelectField): open the
+  // combobox then click the option, rather than firing a native change event.
+  async function selectScope(optionName: string) {
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
+    fireEvent.click(await screen.findByRole('option', { name: optionName }));
+  }
 
-  it('reveals the owner column for a plain admin who switches to all-scope', async () => {
-    const api = renderActivity('admin');
-    // Scope to the COMPLETED table (the running panel also owns an all-scope owner
-    // column now, so an unscoped columnheader query would match two).
-    const completed = (await screen.findByRole('cell', { name: 'qwen-coder' })).closest('table')!;
-    expect(
-      within(completed).queryByRole('columnheader', { name: t.activityColOwner }),
-    ).not.toBeInTheDocument();
-
-    await selectScope(t.activityScopeAll);
-
-    await waitFor(() =>
-      expect(
-        within(completed).getByRole('columnheader', { name: t.activityColOwner }),
-      ).toBeInTheDocument(),
-    );
-    expect(within(completed).getByRole('cell', { name: 'Alice Admin' })).toBeInTheDocument();
-    await waitFor(() => {
-      const last = (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)!;
-      expect(last[0]).toMatchObject({ scope: 'all' });
-    });
-  });
-
-  it('reveals the owner column for a system-admin who switches to all-scope', async () => {
-    const api = renderActivity('system_admin');
-    const completed = (await screen.findByRole('cell', { name: 'qwen-coder' })).closest('table')!;
-    expect(
-      within(completed).queryByRole('columnheader', { name: t.activityColOwner }),
-    ).not.toBeInTheDocument();
-
-    await selectScope(t.activityScopeAll);
-
-    await waitFor(() =>
-      expect(
-        within(completed).getByRole('columnheader', { name: t.activityColOwner }),
-      ).toBeInTheDocument(),
-    );
-    expect(within(completed).getByRole('cell', { name: 'Alice Admin' })).toBeInTheDocument();
-    await waitFor(() => {
-      const last = (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)!;
-      expect(last[0]).toMatchObject({ scope: 'all' });
-    });
-  });
-
-  it('persists a hidden column to the user profile and drops it from the table', async () => {
-    const store = installStorage();
-    renderActivity('user');
-    // Scope queries to the usage table region: the running-connections panel is
-    // its own table with its own "Spalten" button and its own "Modell" column,
-    // so unscoped queries would match both.
-    const usage = screen.getByRole('region', { name: t.usageTableTitle });
-    await within(usage).findByRole('cell', { name: 'qwen-coder' });
-
-    // Open the column menu (its button now lives inside the table toolbar) and
-    // hide the Model column.
-    fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
-    fireEvent.click(await screen.findByRole('checkbox', { name: t.tableModel }));
-
-    await waitFor(() =>
-      expect(
-        within(usage).queryByRole('columnheader', { name: t.tableModel }),
-      ).not.toBeInTheDocument(),
-    );
-    // Column visibility now persists at the user profile via usePreference; with
-    // no PreferencesProvider mounted it falls back to the localStorage mirror
-    // (key "op.pref." + "table.activity.hidden"), a JSON array of hidden ids.
-    await waitFor(() => {
-      const raw = store.get('op.pref.table.activity.hidden');
-      expect(raw).toBeTruthy();
-      expect(JSON.parse(raw!)).toContain('model');
-    });
-  });
-
-  it('shows the service column when enabled via the column menu (Phase 1 service accounts)', async () => {
-    const api = makeApi();
-    (api.activity as unknown as { mockResolvedValue: (v: UsagePage) => void }).mockResolvedValue({
-      data: [makeRow({ service_name: 'Nightly Batch' })],
-      page: 1,
-      limit: 25,
-      total: 1,
-      total_pages: 1,
-    });
-    render(
-      <ToastProvider>
-        <Activity t={t} api={api} role="user" onUnauthorized={vi.fn()} />
-      </ToastProvider>,
-    );
-    const usage = screen.getByRole('region', { name: t.usageTableTitle });
-    await within(usage).findByRole('cell', { name: 'qwen-coder' });
-    // Hidden by default: no "Dienst" column/cell yet.
-    expect(
-      within(usage).queryByRole('columnheader', { name: new RegExp(t.activityColService) }),
-    ).not.toBeInTheDocument();
-
-    fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
-    const serviceCheckbox = await screen.findByRole('checkbox', { name: t.activityColService });
-    fireEvent.click(serviceCheckbox);
-    // Close the column menu (Escape dispatched on a node inside the Menu's
-    // portal so it bubbles to the Modal's keydown handler; the rest of the
-    // page is aria-hidden while the Modal is open, so a later getByRole on
-    // "usage" would otherwise find nothing — mirrors Activity.test.tsx's
-    // cost-column-toggle test).
-    fireEvent.keyDown(serviceCheckbox, { key: 'Escape' });
-
-    await waitFor(() =>
-      expect(
-        within(usage).getByRole('columnheader', { name: new RegExp(t.activityColService) }),
-      ).toBeInTheDocument(),
-    );
-    expect(within(usage).getByRole('cell', { name: 'Nightly Batch' })).toBeInTheDocument();
-  });
-
-  it('persists the owner display choice to the user profile', async () => {
-    const store = installStorage();
+  function renderActivity(role: string) {
     const api = makeApi();
     render(
       <ToastProvider>
-        <Activity t={t} api={api} role="system_admin" onUnauthorized={vi.fn()} />
+        <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
       </ToastProvider>,
     );
-    const usage = screen.getByRole('region', { name: t.usageTableTitle });
-    const completed = (await within(usage).findByRole('cell', { name: 'qwen-coder' })).closest(
-      'table',
-    )!;
-    await selectScope(t.activityScopeAll);
-    await waitFor(() =>
+    return api;
+  }
+
+  describe(`Activity admin scope + columns [${locale}]`, () => {
+    it('hides the scope switch and owner column for a plain user', async () => {
+      renderActivity('user');
+      await screen.findByRole('cell', { name: 'qwen-coder' });
+      expect(screen.queryByLabelText(t.activityScopeLabel)).not.toBeInTheDocument();
       expect(
-        within(completed).getByRole('columnheader', { name: t.activityColOwner }),
-      ).toBeInTheDocument(),
-    );
+        screen.queryByRole('columnheader', { name: t.activityColOwner }),
+      ).not.toBeInTheDocument();
+    });
 
-    fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
-    fireEvent.click(await screen.findByRole('radio', { name: t.activityOwnerId }));
+    it('renders the scope switch at the top of the view, above the stat tiles', async () => {
+      renderActivity('admin');
+      await screen.findByRole('cell', { name: 'qwen-coder' });
+      const scope = screen.getByLabelText(t.activityScopeLabel);
+      const stats = screen.getByLabelText(t.activityStatsLabel);
+      // The single toggle governs the whole view, so it must PRECEDE the stat tiles.
+      expect(stats.compareDocumentPosition(scope) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    });
 
-    await waitFor(() =>
-      expect(within(completed).getByRole('cell', { name: 'usr_42' })).toBeInTheDocument(),
-    );
-    // ownerDisplay persists via usePreference; the localStorage mirror stores the
-    // JSON-encoded value under "op.pref." + "table.activity.ownerDisplay".
-    await waitFor(() =>
-      expect(JSON.parse(store.get('op.pref.table.activity.ownerDisplay')!)).toBe('id'),
-    );
+    it('reveals the owner column for a plain admin who switches to all-scope', async () => {
+      const api = renderActivity('admin');
+      // Scope to the COMPLETED table (the running panel also owns an all-scope owner
+      // column now, so an unscoped columnheader query would match two).
+      const completed = (await screen.findByRole('cell', { name: 'qwen-coder' })).closest('table')!;
+      expect(
+        within(completed).queryByRole('columnheader', { name: t.activityColOwner }),
+      ).not.toBeInTheDocument();
+
+      await selectScope(t.activityScopeAll);
+
+      await waitFor(() =>
+        expect(
+          within(completed).getByRole('columnheader', { name: t.activityColOwner }),
+        ).toBeInTheDocument(),
+      );
+      expect(within(completed).getByRole('cell', { name: 'Alice Admin' })).toBeInTheDocument();
+      await waitFor(() => {
+        const last = (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(
+          -1,
+        )!;
+        expect(last[0]).toMatchObject({ scope: 'all' });
+      });
+    });
+
+    it('reveals the owner column for a system-admin who switches to all-scope', async () => {
+      const api = renderActivity('system_admin');
+      const completed = (await screen.findByRole('cell', { name: 'qwen-coder' })).closest('table')!;
+      expect(
+        within(completed).queryByRole('columnheader', { name: t.activityColOwner }),
+      ).not.toBeInTheDocument();
+
+      await selectScope(t.activityScopeAll);
+
+      await waitFor(() =>
+        expect(
+          within(completed).getByRole('columnheader', { name: t.activityColOwner }),
+        ).toBeInTheDocument(),
+      );
+      expect(within(completed).getByRole('cell', { name: 'Alice Admin' })).toBeInTheDocument();
+      await waitFor(() => {
+        const last = (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(
+          -1,
+        )!;
+        expect(last[0]).toMatchObject({ scope: 'all' });
+      });
+    });
+
+    it('persists a hidden column to the user profile and drops it from the table', async () => {
+      const store = installStorage();
+      renderActivity('user');
+      // Scope queries to the usage table region: the running-connections panel is
+      // its own table with its own "Spalten" button and its own "Modell" column,
+      // so unscoped queries would match both.
+      const usage = screen.getByRole('region', { name: t.usageTableTitle });
+      await within(usage).findByRole('cell', { name: 'qwen-coder' });
+
+      // Open the column menu (its button now lives inside the table toolbar) and
+      // hide the Model column.
+      fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
+      fireEvent.click(await screen.findByRole('checkbox', { name: t.tableModel }));
+
+      await waitFor(() =>
+        expect(
+          within(usage).queryByRole('columnheader', { name: t.tableModel }),
+        ).not.toBeInTheDocument(),
+      );
+      // Column visibility now persists at the user profile via usePreference; with
+      // no PreferencesProvider mounted it falls back to the localStorage mirror
+      // (key "op.pref." + "table.activity.hidden"), a JSON array of hidden ids.
+      await waitFor(() => {
+        const raw = store.get('op.pref.table.activity.hidden');
+        expect(raw).toBeTruthy();
+        expect(JSON.parse(raw!)).toContain('model');
+      });
+    });
+
+    it('shows the service column when enabled via the column menu (Phase 1 service accounts)', async () => {
+      const api = makeApi();
+      (api.activity as unknown as { mockResolvedValue: (v: UsagePage) => void }).mockResolvedValue({
+        data: [makeRow({ service_name: 'Nightly Batch' })],
+        page: 1,
+        limit: 25,
+        total: 1,
+        total_pages: 1,
+      });
+      render(
+        <ToastProvider>
+          <Activity t={t} api={api} role="user" onUnauthorized={vi.fn()} />
+        </ToastProvider>,
+      );
+      const usage = screen.getByRole('region', { name: t.usageTableTitle });
+      await within(usage).findByRole('cell', { name: 'qwen-coder' });
+      // Hidden by default: no "Dienst" column/cell yet.
+      expect(
+        within(usage).queryByRole('columnheader', { name: new RegExp(t.activityColService) }),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
+      const serviceCheckbox = await screen.findByRole('checkbox', { name: t.activityColService });
+      fireEvent.click(serviceCheckbox);
+      // Close the column menu (Escape dispatched on a node inside the Menu's
+      // portal so it bubbles to the Modal's keydown handler; the rest of the
+      // page is aria-hidden while the Modal is open, so a later getByRole on
+      // "usage" would otherwise find nothing — mirrors Activity.test.tsx's
+      // cost-column-toggle test).
+      fireEvent.keyDown(serviceCheckbox, { key: 'Escape' });
+
+      await waitFor(() =>
+        expect(
+          within(usage).getByRole('columnheader', { name: new RegExp(t.activityColService) }),
+        ).toBeInTheDocument(),
+      );
+      expect(within(usage).getByRole('cell', { name: 'Nightly Batch' })).toBeInTheDocument();
+    });
+
+    it('persists the owner display choice to the user profile', async () => {
+      const store = installStorage();
+      const api = makeApi();
+      render(
+        <ToastProvider>
+          <Activity t={t} api={api} role="system_admin" onUnauthorized={vi.fn()} />
+        </ToastProvider>,
+      );
+      const usage = screen.getByRole('region', { name: t.usageTableTitle });
+      const completed = (await within(usage).findByRole('cell', { name: 'qwen-coder' })).closest(
+        'table',
+      )!;
+      await selectScope(t.activityScopeAll);
+      await waitFor(() =>
+        expect(
+          within(completed).getByRole('columnheader', { name: t.activityColOwner }),
+        ).toBeInTheDocument(),
+      );
+
+      fireEvent.click(within(usage).getByRole('button', { name: t.listColumns }));
+      fireEvent.click(await screen.findByRole('radio', { name: t.activityOwnerId }));
+
+      await waitFor(() =>
+        expect(within(completed).getByRole('cell', { name: 'usr_42' })).toBeInTheDocument(),
+      );
+      // ownerDisplay persists via usePreference; the localStorage mirror stores the
+      // JSON-encoded value under "op.pref." + "table.activity.ownerDisplay".
+      await waitFor(() =>
+        expect(JSON.parse(store.get('op.pref.table.activity.ownerDisplay')!)).toBe('id'),
+      );
+    });
   });
-});
+}

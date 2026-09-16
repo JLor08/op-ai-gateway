@@ -13,10 +13,8 @@ import {
   THROUGHPUT_POLL_MS,
 } from './PerformanceSection';
 import { chartColor } from './chartPalette';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { PerfGPU, PerfHistory, PerfPoint, PortalServer, TimeSeries } from '../api';
-
-const t = messages.de;
 
 function makeGpu(over: Partial<PerfGPU> = {}): PerfGPU {
   return {
@@ -243,132 +241,136 @@ describe('PerformanceSection helpers', () => {
   });
 });
 
-describe('PerformanceSection', () => {
-  it('renders the GPU utilization chart from the fetched history', async () => {
-    const { api } = makeApi();
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    expect(await screen.findByRole('img', { name: t.serverPerfGpuUtil })).toBeInTheDocument();
-  });
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-  it('renders the VRAM-MB chart alongside the VRAM-% chart', async () => {
-    const { api } = makeApi();
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    expect(await screen.findByRole('img', { name: t.serverPerfGpuVram })).toBeInTheDocument();
-    expect(screen.getByRole('img', { name: t.serverPerfGpuVramMb })).toBeInTheDocument();
-  });
-
-  it('renders the per-core CPU chart when the samples carry cpu_cores', async () => {
-    const { api } = makeApi({
-      history: makeHistory([
-        makePoint('2026-07-19T12:00:00Z', { cpu_cores: [10, 20, 30, 40] }),
-        makePoint('2026-07-19T12:00:05Z', { cpu_cores: [11, 21, 31, 41] }),
-      ]),
-    });
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    expect(await screen.findByRole('img', { name: t.serverPerfCpuCores })).toBeInTheDocument();
-  });
-
-  it('appends a live sample from the SSE callback', async () => {
-    const { api, captured } = makeApi();
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    // history loads 3 points.
-    await screen.findByRole('img', { name: t.serverPerfGpuUtil });
-    expect(screen.getByTestId('perf-point-count')).toHaveTextContent('3');
-
-    act(() => captured.onSample!(makePoint('2026-07-19T12:00:15Z')));
-    expect(screen.getByTestId('perf-point-count')).toHaveTextContent('4');
-  });
-
-  it('shows the no-agent empty state when there is no history and the server never reported', async () => {
-    const { api } = makeApi({ history: makeHistory([]) });
-    render(<PerformanceSection t={t} api={api} server={makeServer({ last_seen_at: null })} />);
-    expect(await screen.findByText(t.serverPerfNoAgent)).toBeInTheDocument();
-  });
-
-  it('unsubscribes from the SSE on unmount', async () => {
-    const { api, unsubscribe } = makeApi();
-    const { unmount } = render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    await screen.findByRole('img', { name: t.serverPerfGpuUtil });
-    unmount();
-    expect(unsubscribe).toHaveBeenCalled();
-  });
-
-  it('polls usageTimeSeries on an interval while live and clears it on unmount', async () => {
-    vi.useFakeTimers();
-    try {
+  describe(`PerformanceSection [${locale}]`, () => {
+    it('renders the GPU utilization chart from the fetched history', async () => {
       const { api } = makeApi();
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      expect(await screen.findByRole('img', { name: t.serverPerfGpuUtil })).toBeInTheDocument();
+    });
+
+    it('renders the VRAM-MB chart alongside the VRAM-% chart', async () => {
+      const { api } = makeApi();
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      expect(await screen.findByRole('img', { name: t.serverPerfGpuVram })).toBeInTheDocument();
+      expect(screen.getByRole('img', { name: t.serverPerfGpuVramMb })).toBeInTheDocument();
+    });
+
+    it('renders the per-core CPU chart when the samples carry cpu_cores', async () => {
+      const { api } = makeApi({
+        history: makeHistory([
+          makePoint('2026-07-19T12:00:00Z', { cpu_cores: [10, 20, 30, 40] }),
+          makePoint('2026-07-19T12:00:05Z', { cpu_cores: [11, 21, 31, 41] }),
+        ]),
+      });
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      expect(await screen.findByRole('img', { name: t.serverPerfCpuCores })).toBeInTheDocument();
+    });
+
+    it('appends a live sample from the SSE callback', async () => {
+      const { api, captured } = makeApi();
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      // history loads 3 points.
+      await screen.findByRole('img', { name: t.serverPerfGpuUtil });
+      expect(screen.getByTestId('perf-point-count')).toHaveTextContent('3');
+
+      act(() => captured.onSample!(makePoint('2026-07-19T12:00:15Z')));
+      expect(screen.getByTestId('perf-point-count')).toHaveTextContent('4');
+    });
+
+    it('shows the no-agent empty state when there is no history and the server never reported', async () => {
+      const { api } = makeApi({ history: makeHistory([]) });
+      render(<PerformanceSection t={t} api={api} server={makeServer({ last_seen_at: null })} />);
+      expect(await screen.findByText(t.serverPerfNoAgent)).toBeInTheDocument();
+    });
+
+    it('unsubscribes from the SSE on unmount', async () => {
+      const { api, unsubscribe } = makeApi();
       const { unmount } = render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-      const calls = () =>
-        (api.usageTimeSeries as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
-      // Flush the mount fetches (history + the initial throughput fetch).
-      await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-      const initial = calls();
-      expect(initial).toBeGreaterThanOrEqual(1);
-
-      // One poll interval -> one more usageTimeSeries call.
-      await act(async () => {
-        vi.advanceTimersByTime(THROUGHPUT_POLL_MS);
-        await Promise.resolve();
-      });
-      expect(calls()).toBe(initial + 1);
-
-      // Unmount clears the interval: no further polls.
+      await screen.findByRole('img', { name: t.serverPerfGpuUtil });
       unmount();
-      const afterUnmount = calls();
-      await act(async () => {
-        vi.advanceTimersByTime(THROUGHPUT_POLL_MS * 3);
-        await Promise.resolve();
+      expect(unsubscribe).toHaveBeenCalled();
+    });
+
+    it('polls usageTimeSeries on an interval while live and clears it on unmount', async () => {
+      vi.useFakeTimers();
+      try {
+        const { api } = makeApi();
+        const { unmount } = render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+        const calls = () =>
+          (api.usageTimeSeries as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+        // Flush the mount fetches (history + the initial throughput fetch).
+        await act(async () => {
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        const initial = calls();
+        expect(initial).toBeGreaterThanOrEqual(1);
+
+        // One poll interval -> one more usageTimeSeries call.
+        await act(async () => {
+          vi.advanceTimersByTime(THROUGHPUT_POLL_MS);
+          await Promise.resolve();
+        });
+        expect(calls()).toBe(initial + 1);
+
+        // Unmount clears the interval: no further polls.
+        unmount();
+        const afterUnmount = calls();
+        await act(async () => {
+          vi.advanceTimersByTime(THROUGHPUT_POLL_MS * 3);
+          await Promise.resolve();
+        });
+        expect(calls()).toBe(afterUnmount);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('renders the CPU-power and System-power charts when the latest point carries them', async () => {
+      const { api } = makeApi({
+        history: makeHistory([
+          makePoint('2026-07-19T12:00:00Z', { cpu_power_w: 60, system_power_w: 150 }),
+          makePoint('2026-07-19T12:00:05Z', { cpu_power_w: 62, system_power_w: 155 }),
+        ]),
       });
-      expect(calls()).toBe(afterUnmount);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('renders the CPU-power and System-power charts when the latest point carries them', async () => {
-    const { api } = makeApi({
-      history: makeHistory([
-        makePoint('2026-07-19T12:00:00Z', { cpu_power_w: 60, system_power_w: 150 }),
-        makePoint('2026-07-19T12:00:05Z', { cpu_power_w: 62, system_power_w: 155 }),
-      ]),
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      expect(await screen.findByRole('img', { name: t.serverPerfCpuPower })).toBeInTheDocument();
+      expect(screen.getByRole('img', { name: t.serverPerfSystemPower })).toBeInTheDocument();
     });
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    expect(await screen.findByRole('img', { name: t.serverPerfCpuPower })).toBeInTheDocument();
-    expect(screen.getByRole('img', { name: t.serverPerfSystemPower })).toBeInTheDocument();
-  });
 
-  it("omits the power charts when the latest point's power is null", async () => {
-    const { api } = makeApi({
-      history: makeHistory([
-        makePoint('2026-07-19T12:00:00Z', { cpu_power_w: null, system_power_w: null }),
-      ]),
+    it("omits the power charts when the latest point's power is null", async () => {
+      const { api } = makeApi({
+        history: makeHistory([
+          makePoint('2026-07-19T12:00:00Z', { cpu_power_w: null, system_power_w: null }),
+        ]),
+      });
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      await screen.findByRole('img', { name: t.serverPerfGpuUtil });
+      expect(screen.queryByRole('img', { name: t.serverPerfCpuPower })).not.toBeInTheDocument();
+      expect(screen.queryByRole('img', { name: t.serverPerfSystemPower })).not.toBeInTheDocument();
     });
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    await screen.findByRole('img', { name: t.serverPerfGpuUtil });
-    expect(screen.queryByRole('img', { name: t.serverPerfCpuPower })).not.toBeInTheDocument();
-    expect(screen.queryByRole('img', { name: t.serverPerfSystemPower })).not.toBeInTheDocument();
-  });
 
-  it('renders the CPU-temperature chart when the latest point carries cpu_temp_c', async () => {
-    const { api } = makeApi({
-      history: makeHistory([
-        makePoint('2026-07-19T12:00:00Z', { cpu_temp_c: 55 }),
-        makePoint('2026-07-19T12:00:05Z', { cpu_temp_c: 58.5 }),
-      ]),
+    it('renders the CPU-temperature chart when the latest point carries cpu_temp_c', async () => {
+      const { api } = makeApi({
+        history: makeHistory([
+          makePoint('2026-07-19T12:00:00Z', { cpu_temp_c: 55 }),
+          makePoint('2026-07-19T12:00:05Z', { cpu_temp_c: 58.5 }),
+        ]),
+      });
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      expect(await screen.findByRole('img', { name: t.serverPerfCpuTemp })).toBeInTheDocument();
     });
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    expect(await screen.findByRole('img', { name: t.serverPerfCpuTemp })).toBeInTheDocument();
-  });
 
-  it("omits the CPU-temperature chart when the latest point's cpu_temp_c is null or absent", async () => {
-    const { api } = makeApi({
-      history: makeHistory([makePoint('2026-07-19T12:00:00Z', { cpu_temp_c: null })]),
+    it("omits the CPU-temperature chart when the latest point's cpu_temp_c is null or absent", async () => {
+      const { api } = makeApi({
+        history: makeHistory([makePoint('2026-07-19T12:00:00Z', { cpu_temp_c: null })]),
+      });
+      render(<PerformanceSection t={t} api={api} server={makeServer()} />);
+      await screen.findByRole('img', { name: t.serverPerfGpuUtil });
+      expect(screen.queryByRole('img', { name: t.serverPerfCpuTemp })).not.toBeInTheDocument();
     });
-    render(<PerformanceSection t={t} api={api} server={makeServer()} />);
-    await screen.findByRole('img', { name: t.serverPerfGpuUtil });
-    expect(screen.queryByRole('img', { name: t.serverPerfCpuTemp })).not.toBeInTheDocument();
   });
-});
+}

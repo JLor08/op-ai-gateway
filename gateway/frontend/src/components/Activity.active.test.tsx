@@ -5,11 +5,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { ActiveRequest, UsagePage, UsageStats } from '../api';
 import type { PortalApi } from './shared/types';
-
-const t = messages.de;
 
 // Fresh localStorage per test so the persisted scope (op.activity.scope) is
 // deterministic. The running panel shows `user_name || user_id` directly (no
@@ -120,270 +118,284 @@ function makeApi(over: ApiOverrides = {}) {
   return { api, unsubscribe };
 }
 
-function renderActivity(over: ApiOverrides = {}, role = 'user') {
-  const { api } = makeApi(over);
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  return { api };
-}
+// Both locales, not just German (issue #89): run the whole suite once per locale
+// so the panel's English strings are rendered and asserted too. Everything that
+// references `t` lives inside the loop.
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-// The scope control is now a non-native MUI Select (SelectField): open it, then
-// click the option. Options render in a portal on document.body.
-async function selectScope(optionText: string) {
-  fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
-  fireEvent.click(await screen.findByRole('option', { name: optionText }));
-}
-
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
-
-describe('Activity running-connections panel', () => {
-  it('renders a row from api.activeRequests with model, token, path, server and elapsed', async () => {
-    renderActivity({ activeRequests: vi.fn(async () => ({ data: [makeActive()] })) });
-
-    const modelCell = await screen.findByRole('cell', { name: 'live-model' });
-    const row = modelCell.closest('tr')!;
-    expect(within(row).getByText('Live Token')).toBeInTheDocument();
-    // The path is now its own column (the api_flavor suffix was dropped in the
-    // list-view refactor) and the server name is a separate column.
-    expect(within(row).getByText('/v1/chat/completions')).toBeInTheDocument();
-    expect(within(row).getByText('live-server')).toBeInTheDocument();
-    // The last cell is the live elapsed value ("Xs" or "m:ss").
-    const cells = within(row).getAllByRole('cell');
-    expect(cells[cells.length - 1].textContent).toMatch(/^\d+s$|^\d+:\d{2}$/);
-    // The panel carries its own heading (the same label also leads the stat tiles).
-    expect(
-      screen.getByRole('heading', { level: 2, name: t.activityActiveTitle }),
-    ).toBeInTheDocument();
-  });
-
-  it('shows the pre-override requested model of a running request by default', async () => {
-    // A token override is in play: the request routes to "live-model" while the
-    // client asked for "client-model". Seeing that second name without waiting
-    // for the request to finish is the reason this column exists, so it must be
-    // visible without touching the column menu.
-    renderActivity({ activeRequests: vi.fn(async () => ({ data: [makeActive()] })) });
-
-    const modelCell = await screen.findByRole('cell', { name: 'live-model' });
-    const row = modelCell.closest('tr')!;
-    expect(within(row).getByRole('cell', { name: 'client-model' })).toBeInTheDocument();
-    // Scoped to THIS table: the completed-requests table on the same page also
-    // carries a requested-model header.
-    const table = modelCell.closest('table')!;
-    expect(
-      within(table).getByRole('columnheader', { name: new RegExp(t.tableRequestedModel) }),
-    ).toBeInTheDocument();
-  });
-
-  it('renders a dash when a running request carries no requested model', async () => {
-    renderActivity({
-      activeRequests: vi.fn(async () => ({ data: [makeActive({ requested_model: '' })] })),
-    });
-
-    const row = (await screen.findByRole('cell', { name: 'live-model' })).closest('tr')!;
-    expect(within(row).getByRole('cell', { name: '-' })).toBeInTheDocument();
-  });
-
-  it('shows the session label when a running request has no token', async () => {
-    // Token-less session chat: token_id is empty (it still carries the user's
-    // display name as token_name) -> the panel shows the session label.
-    renderActivity({
-      activeRequests: vi.fn(async () => ({
-        data: [makeActive({ token_id: '', token_name: 'Dev User' })],
-      })),
-    });
-    expect(await screen.findByText(t.activityActiveSession)).toBeInTheDocument();
-  });
-
-  it('shows the empty label when there are no running connections', async () => {
-    renderActivity({ activeRequests: vi.fn(async () => ({ data: [] })) });
-    expect(await screen.findByText(t.activityActiveEmpty)).toBeInTheDocument();
-  });
-
-  it('keeps the page alive (no alert) when api.activeRequests rejects', async () => {
-    renderActivity({ activeRequests: vi.fn(async () => Promise.reject(new Error('boom'))) });
-    // The completed-list empty state still renders; the active fetch failure is swallowed.
-    expect(await screen.findByText(t.activityEmpty)).toBeInTheDocument();
-    expect(screen.getByText(t.activityActiveEmpty)).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-  });
-
-  it('refetches the running connections on an SSE signal', async () => {
-    let signal: () => void = () => {};
-    const subscribeActivity = vi.fn((cb: () => void) => {
-      signal = cb;
-      return vi.fn();
-    }) as unknown as PortalApi['subscribeActivity'];
-    const activeRequests = vi.fn(async () => ({ data: [makeActive()] }));
-    renderActivity({ subscribeActivity, activeRequests });
-
-    await screen.findByRole('cell', { name: 'live-model' });
-    const before = (activeRequests as unknown as { mock: { calls: unknown[][] } }).mock.calls
-      .length;
-
-    act(() => signal());
-
-    await waitFor(() =>
-      expect(
-        (activeRequests as unknown as { mock: { calls: unknown[][] } }).mock.calls,
-      ).toHaveLength(before + 1),
+  function renderActivity(over: ApiOverrides = {}, role = 'user') {
+    const { api } = makeApi(over);
+    render(
+      <ToastProvider>
+        <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
+      </ToastProvider>,
     );
-  });
+    return { api };
+  }
 
-  it('requests scope=all when an admin switches to the all-users scope', async () => {
-    const activeRequests = vi.fn(async () => ({ data: [makeActive()] }));
-    renderActivity({ activeRequests }, 'admin');
+  // The scope control is now a non-native MUI Select (SelectField): open it, then
+  // click the option. Options render in a portal on document.body.
+  async function selectScope(optionText: string) {
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.activityScopeLabel }));
+    fireEvent.click(await screen.findByRole('option', { name: optionText }));
+  }
 
-    await screen.findByRole('cell', { name: 'live-model' });
-    expect(activeRequests).toHaveBeenCalledWith('own', { user_id: undefined, token_id: undefined });
-
-    await selectScope(t.activityScopeAll);
-
-    await waitFor(() =>
-      expect(activeRequests).toHaveBeenCalledWith('all', {
-        user_id: undefined,
-        token_id: undefined,
-      }),
-    );
-  });
-
-  it('persists the scope to localStorage on change and restores it on a fresh remount', async () => {
-    installStorage(); // fresh storage, default scope = own
-    const first = renderActivity(
-      { activeRequests: vi.fn(async () => ({ data: [makeActive()] })) },
-      'admin',
-    );
-
-    await screen.findByRole('cell', { name: 'live-model' });
-    expect(first.api.activeRequests).toHaveBeenCalledWith('own', {
-      user_id: undefined,
-      token_id: undefined,
-    });
-
-    await selectScope(t.activityScopeAll);
-    await waitFor(() =>
-      expect(first.api.activeRequests).toHaveBeenCalledWith('all', {
-        user_id: undefined,
-        token_id: undefined,
-      }),
-    );
-    // The change effect persisted the scope (writeScope).
-    expect(localStorage.getItem('op.activity.scope')).toBe('all');
-
-    // A fresh mount (navigate away and back) reads scope=all from localStorage.
+  afterEach(() => {
     cleanup();
-    const second = renderActivity(
-      { activeRequests: vi.fn(async () => ({ data: [makeActive()] })) },
-      'admin',
-    );
+    vi.unstubAllGlobals();
+  });
 
-    await waitFor(() =>
-      expect(second.api.activeRequests).toHaveBeenCalledWith('all', {
+  describe(`Activity running-connections panel [${locale}]`, () => {
+    it('renders a row from api.activeRequests with model, token, path, server and elapsed', async () => {
+      renderActivity({ activeRequests: vi.fn(async () => ({ data: [makeActive()] })) });
+
+      const modelCell = await screen.findByRole('cell', { name: 'live-model' });
+      const row = modelCell.closest('tr')!;
+      expect(within(row).getByText('Live Token')).toBeInTheDocument();
+      // The path is now its own column (the api_flavor suffix was dropped in the
+      // list-view refactor) and the server name is a separate column.
+      expect(within(row).getByText('/v1/chat/completions')).toBeInTheDocument();
+      expect(within(row).getByText('live-server')).toBeInTheDocument();
+      // The last cell is the live elapsed value ("Xs" or "m:ss").
+      const cells = within(row).getAllByRole('cell');
+      expect(cells[cells.length - 1].textContent).toMatch(/^\d+s$|^\d+:\d{2}$/);
+      // The panel carries its own heading (the same label also leads the stat tiles).
+      expect(
+        screen.getByRole('heading', { level: 2, name: t.activityActiveTitle }),
+      ).toBeInTheDocument();
+    });
+
+    it('shows the pre-override requested model of a running request by default', async () => {
+      // A token override is in play: the request routes to "live-model" while the
+      // client asked for "client-model". Seeing that second name without waiting
+      // for the request to finish is the reason this column exists, so it must be
+      // visible without touching the column menu.
+      renderActivity({ activeRequests: vi.fn(async () => ({ data: [makeActive()] })) });
+
+      const modelCell = await screen.findByRole('cell', { name: 'live-model' });
+      const row = modelCell.closest('tr')!;
+      expect(within(row).getByRole('cell', { name: 'client-model' })).toBeInTheDocument();
+      // Scoped to THIS table: the completed-requests table on the same page also
+      // carries a requested-model header.
+      const table = modelCell.closest('table')!;
+      expect(
+        within(table).getByRole('columnheader', { name: new RegExp(t.tableRequestedModel) }),
+      ).toBeInTheDocument();
+    });
+
+    it('renders a dash when a running request carries no requested model', async () => {
+      renderActivity({
+        activeRequests: vi.fn(async () => ({ data: [makeActive({ requested_model: '' })] })),
+      });
+
+      const row = (await screen.findByRole('cell', { name: 'live-model' })).closest('tr')!;
+      expect(within(row).getByRole('cell', { name: '-' })).toBeInTheDocument();
+    });
+
+    it('shows the session label when a running request has no token', async () => {
+      // Token-less session chat: token_id is empty (it still carries the user's
+      // display name as token_name) -> the panel shows the session label.
+      renderActivity({
+        activeRequests: vi.fn(async () => ({
+          data: [makeActive({ token_id: '', token_name: 'Dev User' })],
+        })),
+      });
+      expect(await screen.findByText(t.activityActiveSession)).toBeInTheDocument();
+    });
+
+    it('shows the empty label when there are no running connections', async () => {
+      renderActivity({ activeRequests: vi.fn(async () => ({ data: [] })) });
+      expect(await screen.findByText(t.activityActiveEmpty)).toBeInTheDocument();
+    });
+
+    it('keeps the page alive (no alert) when api.activeRequests rejects', async () => {
+      renderActivity({ activeRequests: vi.fn(async () => Promise.reject(new Error('boom'))) });
+      // The completed-list empty state still renders; the active fetch failure is swallowed.
+      expect(await screen.findByText(t.activityEmpty)).toBeInTheDocument();
+      expect(screen.getByText(t.activityActiveEmpty)).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('refetches the running connections on an SSE signal', async () => {
+      let signal: () => void = () => {};
+      const subscribeActivity = vi.fn((cb: () => void) => {
+        signal = cb;
+        return vi.fn();
+      }) as unknown as PortalApi['subscribeActivity'];
+      const activeRequests = vi.fn(async () => ({ data: [makeActive()] }));
+      renderActivity({ subscribeActivity, activeRequests });
+
+      await screen.findByRole('cell', { name: 'live-model' });
+      const before = (activeRequests as unknown as { mock: { calls: unknown[][] } }).mock.calls
+        .length;
+
+      act(() => signal());
+
+      await waitFor(() =>
+        expect(
+          (activeRequests as unknown as { mock: { calls: unknown[][] } }).mock.calls,
+        ).toHaveLength(before + 1),
+      );
+    });
+
+    it('requests scope=all when an admin switches to the all-users scope', async () => {
+      const activeRequests = vi.fn(async () => ({ data: [makeActive()] }));
+      renderActivity({ activeRequests }, 'admin');
+
+      await screen.findByRole('cell', { name: 'live-model' });
+      expect(activeRequests).toHaveBeenCalledWith('own', {
         user_id: undefined,
         token_id: undefined,
-      }),
-    );
-    // The non-native Select shows the selected option's text (not an input .value).
-    expect(screen.getByRole('combobox', { name: t.activityScopeLabel }).textContent).toBe(
-      t.activityScopeAll,
-    );
-  });
+      });
 
-  it('adds a Benutzer column showing the display name in the all-scope view', async () => {
-    installStorage();
-    const activeRequests = vi.fn(async () => ({
-      data: [makeActive({ user_id: 'usr_99', user_name: 'Alice Active' })],
-    }));
-    renderActivity({ activeRequests }, 'admin');
+      await selectScope(t.activityScopeAll);
 
-    await screen.findByRole('cell', { name: 'live-model' });
-    await selectScope(t.activityScopeAll);
+      await waitFor(() =>
+        expect(activeRequests).toHaveBeenCalledWith('all', {
+          user_id: undefined,
+          token_id: undefined,
+        }),
+      );
+    });
 
-    // The running panel gains its own owner/Benutzer column header (scoped to the
-    // running table so it never matches the completed table's owner column).
-    const activeTable = (await screen.findByRole('cell', { name: 'live-model' })).closest('table')!;
-    await waitFor(() =>
-      expect(
-        within(activeTable).getByRole('columnheader', { name: t.activityColOwner }),
-      ).toBeInTheDocument(),
-    );
-    // The row shows the display name (preferred over the id).
-    const row = within(activeTable).getByRole('cell', { name: 'live-model' }).closest('tr')!;
-    expect(within(row).getByText('Alice Active')).toBeInTheDocument();
-    expect(within(row).queryByText('usr_99')).not.toBeInTheDocument();
-  });
-
-  it('falls back to the user id in the Benutzer column when the name is empty', async () => {
-    installStorage();
-    const activeRequests = vi.fn(async () => ({
-      data: [makeActive({ user_id: 'usr_99', user_name: '' })],
-    }));
-    renderActivity({ activeRequests }, 'admin');
-
-    await screen.findByRole('cell', { name: 'live-model' });
-    await selectScope(t.activityScopeAll);
-
-    const activeTable = (await screen.findByRole('cell', { name: 'live-model' })).closest('table')!;
-    const row = within(activeTable).getByRole('cell', { name: 'live-model' }).closest('tr')!;
-    await waitFor(() => expect(within(row).getByText('usr_99')).toBeInTheDocument());
-  });
-
-  it('has no Benutzer column in the own-scope view', async () => {
-    installStorage();
-    const activeRequests = vi.fn(async () => ({
-      data: [makeActive({ user_id: 'usr_99', user_name: 'Alice Active' })],
-    }));
-    renderActivity({ activeRequests }, 'admin'); // default scope = own
-
-    const modelCell = await screen.findByRole('cell', { name: 'live-model' });
-    const activeTable = modelCell.closest('table')!;
-    expect(
-      within(activeTable).queryByRole('columnheader', { name: t.activityColOwner }),
-    ).not.toBeInTheDocument();
-    // No owner cell -> neither the name nor the id shows in the running row.
-    const row = modelCell.closest('tr')!;
-    expect(within(row).queryByText('Alice Active')).not.toBeInTheDocument();
-    expect(within(row).queryByText('usr_99')).not.toBeInTheDocument();
-  });
-
-  it('ticks the elapsed label every second while requests are running', async () => {
-    vi.useFakeTimers();
-    try {
-      const base = new Date('2026-07-16T12:00:00.000Z');
-      vi.setSystemTime(base);
-      const activeRequests = vi.fn(async () => ({
-        data: [makeActive({ started_at: base.toISOString() })],
-      }));
-      render(
-        <ToastProvider>
-          <Activity
-            t={t}
-            api={makeApi({ activeRequests }).api}
-            role="user"
-            onUnauthorized={vi.fn()}
-          />
-        </ToastProvider>,
+    it('persists the scope to localStorage on change and restores it on a fresh remount', async () => {
+      installStorage(); // fresh storage, default scope = own
+      const first = renderActivity(
+        { activeRequests: vi.fn(async () => ({ data: [makeActive()] })) },
+        'admin',
       );
 
-      // Flush the mount load (promises resolve as microtasks under fake timers).
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
+      await screen.findByRole('cell', { name: 'live-model' });
+      expect(first.api.activeRequests).toHaveBeenCalledWith('own', {
+        user_id: undefined,
+        token_id: undefined,
       });
-      expect(screen.getByText('0s')).toBeInTheDocument();
 
-      // The 1s ticker advances the elapsed label.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(3000);
-      });
-      expect(screen.getByText('3s')).toBeInTheDocument();
-      expect(screen.queryByText('0s')).not.toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
+      await selectScope(t.activityScopeAll);
+      await waitFor(() =>
+        expect(first.api.activeRequests).toHaveBeenCalledWith('all', {
+          user_id: undefined,
+          token_id: undefined,
+        }),
+      );
+      // The change effect persisted the scope (writeScope).
+      expect(localStorage.getItem('op.activity.scope')).toBe('all');
+
+      // A fresh mount (navigate away and back) reads scope=all from localStorage.
+      cleanup();
+      const second = renderActivity(
+        { activeRequests: vi.fn(async () => ({ data: [makeActive()] })) },
+        'admin',
+      );
+
+      await waitFor(() =>
+        expect(second.api.activeRequests).toHaveBeenCalledWith('all', {
+          user_id: undefined,
+          token_id: undefined,
+        }),
+      );
+      // The non-native Select shows the selected option's text (not an input .value).
+      expect(screen.getByRole('combobox', { name: t.activityScopeLabel }).textContent).toBe(
+        t.activityScopeAll,
+      );
+    });
+
+    it('adds a Benutzer column showing the display name in the all-scope view', async () => {
+      installStorage();
+      const activeRequests = vi.fn(async () => ({
+        data: [makeActive({ user_id: 'usr_99', user_name: 'Alice Active' })],
+      }));
+      renderActivity({ activeRequests }, 'admin');
+
+      await screen.findByRole('cell', { name: 'live-model' });
+      await selectScope(t.activityScopeAll);
+
+      // The running panel gains its own owner/Benutzer column header (scoped to the
+      // running table so it never matches the completed table's owner column).
+      const activeTable = (await screen.findByRole('cell', { name: 'live-model' })).closest(
+        'table',
+      )!;
+      await waitFor(() =>
+        expect(
+          within(activeTable).getByRole('columnheader', { name: t.activityColOwner }),
+        ).toBeInTheDocument(),
+      );
+      // The row shows the display name (preferred over the id).
+      const row = within(activeTable).getByRole('cell', { name: 'live-model' }).closest('tr')!;
+      expect(within(row).getByText('Alice Active')).toBeInTheDocument();
+      expect(within(row).queryByText('usr_99')).not.toBeInTheDocument();
+    });
+
+    it('falls back to the user id in the Benutzer column when the name is empty', async () => {
+      installStorage();
+      const activeRequests = vi.fn(async () => ({
+        data: [makeActive({ user_id: 'usr_99', user_name: '' })],
+      }));
+      renderActivity({ activeRequests }, 'admin');
+
+      await screen.findByRole('cell', { name: 'live-model' });
+      await selectScope(t.activityScopeAll);
+
+      const activeTable = (await screen.findByRole('cell', { name: 'live-model' })).closest(
+        'table',
+      )!;
+      const row = within(activeTable).getByRole('cell', { name: 'live-model' }).closest('tr')!;
+      await waitFor(() => expect(within(row).getByText('usr_99')).toBeInTheDocument());
+    });
+
+    it('has no Benutzer column in the own-scope view', async () => {
+      installStorage();
+      const activeRequests = vi.fn(async () => ({
+        data: [makeActive({ user_id: 'usr_99', user_name: 'Alice Active' })],
+      }));
+      renderActivity({ activeRequests }, 'admin'); // default scope = own
+
+      const modelCell = await screen.findByRole('cell', { name: 'live-model' });
+      const activeTable = modelCell.closest('table')!;
+      expect(
+        within(activeTable).queryByRole('columnheader', { name: t.activityColOwner }),
+      ).not.toBeInTheDocument();
+      // No owner cell -> neither the name nor the id shows in the running row.
+      const row = modelCell.closest('tr')!;
+      expect(within(row).queryByText('Alice Active')).not.toBeInTheDocument();
+      expect(within(row).queryByText('usr_99')).not.toBeInTheDocument();
+    });
+
+    it('ticks the elapsed label every second while requests are running', async () => {
+      vi.useFakeTimers();
+      try {
+        const base = new Date('2026-07-16T12:00:00.000Z');
+        vi.setSystemTime(base);
+        const activeRequests = vi.fn(async () => ({
+          data: [makeActive({ started_at: base.toISOString() })],
+        }));
+        render(
+          <ToastProvider>
+            <Activity
+              t={t}
+              api={makeApi({ activeRequests }).api}
+              role="user"
+              onUnauthorized={vi.fn()}
+            />
+          </ToastProvider>,
+        );
+
+        // Flush the mount load (promises resolve as microtasks under fake timers).
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(screen.getByText('0s')).toBeInTheDocument();
+
+        // The 1s ticker advances the elapsed label.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(3000);
+        });
+        expect(screen.getByText('3s')).toBeInTheDocument();
+        expect(screen.queryByText('0s')).not.toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
-});
+}

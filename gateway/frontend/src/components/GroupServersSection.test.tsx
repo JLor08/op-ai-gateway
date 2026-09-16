@@ -4,11 +4,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, within } from '@testing-library/react';
 import { GroupServersSection } from './GroupServersSection';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { GroupModelServerRow, ModelOption } from '../api';
 import type { PortalApi } from './shared/types';
-
-const t = messages.de;
 
 afterEach(() => cleanup());
 
@@ -104,100 +102,104 @@ function rowFor(serverName: string): HTMLElement {
   return screen.getByText(serverName).closest('tr')!;
 }
 
-describe('GroupServersSection', () => {
-  it('renders the Prio, Model, and Server columns for every offering row', async () => {
-    const api = makeApi();
-    render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    expect(await screen.findByText('GPU-Box-A')).toBeInTheDocument();
-    expect(screen.getByText('GPU-Box-B')).toBeInTheDocument();
-    expect(screen.getByText('qwen-coder')).toBeInTheDocument();
-    expect(screen.getByText('llama3')).toBeInTheDocument();
+  describe(`GroupServersSection [${locale}]`, () => {
+    it('renders the Prio, Model, and Server columns for every offering row', async () => {
+      const api = makeApi();
+      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
 
-    // Column headers.
-    expect(screen.getByText(t.modelServerColPrio)).toBeInTheDocument();
-    expect(screen.getByText(t.modelServerColModel)).toBeInTheDocument();
-    expect(screen.getByText(t.modelServerColServer)).toBeInTheDocument();
+      expect(await screen.findByText('GPU-Box-A')).toBeInTheDocument();
+      expect(screen.getByText('GPU-Box-B')).toBeInTheDocument();
+      expect(screen.getByText('qwen-coder')).toBeInTheDocument();
+      expect(screen.getByText('llama3')).toBeInTheDocument();
 
-    // Live Prio rank per row.
-    expect(within(rowFor('GPU-Box-A')).getByText('1')).toBeInTheDocument();
-    expect(within(rowFor('GPU-Box-B')).getByText('2')).toBeInTheDocument();
+      // Column headers.
+      expect(screen.getByText(t.modelServerColPrio)).toBeInTheDocument();
+      expect(screen.getByText(t.modelServerColModel)).toBeInTheDocument();
+      expect(screen.getByText(t.modelServerColServer)).toBeInTheDocument();
 
-    // The group-detail intro subtitle is shown.
-    expect(screen.getByText(t.groupServersIntro)).toBeInTheDocument();
-  });
-
-  it("fetches by the group's id and re-polls the list live", async () => {
-    // Fake timers own the clock here: the pre-poll assertions below are only
-    // meaningful BEFORE the interval fires, and under real timers that window is
-    // just `pollIntervalMs` of wall clock (a full-suite run under load overshoots
-    // it and the poll lands first).
-    vi.useFakeTimers();
-    try {
-      const rows = makeRows();
-      const reranked = rows.map((r) =>
-        r.mapping_id === 'map-b' ? { ...r, priority: 1 } : { ...r, priority: 2 },
-      );
-      const modelGroupServers = vi.fn().mockResolvedValueOnce(rows).mockResolvedValue(reranked);
-      const api = makeApi({ modelGroupServers });
-      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={50} />);
-
-      // Flush ONLY the mount fetch's promise chain (.then/.catch/.finally) — no
-      // clock advance, so the 50ms poll tick cannot fire yet. NOTE: do not use
-      // findBy*/waitFor under fake timers here; RTL's async utilities advance fake
-      // timers themselves and would fire the poll, re-introducing the race.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(modelGroupServers).toHaveBeenCalledWith('fast-group');
-      expect(modelGroupServers).toHaveBeenCalledTimes(1);
-
-      // Initial mount fetch: rowA=1, rowB=2 — now deterministically observable.
+      // Live Prio rank per row.
       expect(within(rowFor('GPU-Box-A')).getByText('1')).toBeInTheDocument();
       expect(within(rowFor('GPU-Box-B')).getByText('2')).toBeInTheDocument();
 
-      // Exactly one poll tick re-fetches and re-renders the new ranking: the
-      // interval IS the cause of the re-poll, not an incidental second fetch.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(50);
-      });
-      expect(modelGroupServers).toHaveBeenCalledTimes(2);
-      expect(within(rowFor('GPU-Box-B')).getByText('1')).toBeInTheDocument();
-      expect(within(rowFor('GPU-Box-A')).getByText('2')).toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+      // The group-detail intro subtitle is shown.
+      expect(screen.getByText(t.groupServersIntro)).toBeInTheDocument();
+    });
 
-  it('stops re-polling after unmount', async () => {
-    vi.useFakeTimers();
-    try {
-      const modelGroupServers = vi.fn().mockResolvedValue(makeRows());
-      const api = makeApi({ modelGroupServers });
-      const { unmount } = render(
-        <GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={50} />,
-      );
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(modelGroupServers).toHaveBeenCalledTimes(1);
+    it("fetches by the group's id and re-polls the list live", async () => {
+      // Fake timers own the clock here: the pre-poll assertions below are only
+      // meaningful BEFORE the interval fires, and under real timers that window is
+      // just `pollIntervalMs` of wall clock (a full-suite run under load overshoots
+      // it and the poll lands first).
+      vi.useFakeTimers();
+      try {
+        const rows = makeRows();
+        const reranked = rows.map((r) =>
+          r.mapping_id === 'map-b' ? { ...r, priority: 1 } : { ...r, priority: 2 },
+        );
+        const modelGroupServers = vi.fn().mockResolvedValueOnce(rows).mockResolvedValue(reranked);
+        const api = makeApi({ modelGroupServers });
+        render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={50} />);
 
-      unmount();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(50 * 5);
-      });
-      // clearInterval on unmount: the mount fetch stays the only call.
-      expect(modelGroupServers).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+        // Flush ONLY the mount fetch's promise chain (.then/.catch/.finally) — no
+        // clock advance, so the 50ms poll tick cannot fire yet. NOTE: do not use
+        // findBy*/waitFor under fake timers here; RTL's async utilities advance fake
+        // timers themselves and would fire the poll, re-introducing the race.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(modelGroupServers).toHaveBeenCalledWith('fast-group');
+        expect(modelGroupServers).toHaveBeenCalledTimes(1);
 
-  it("has no 'Laden' action (read-only view)", async () => {
-    const api = makeApi();
-    render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
-    await screen.findByText('GPU-Box-A');
-    expect(screen.queryByText(t.modelServerLoad)).toBeNull();
-    expect(screen.queryByRole('button', { name: t.listRowMenu })).toBeNull();
+        // Initial mount fetch: rowA=1, rowB=2 — now deterministically observable.
+        expect(within(rowFor('GPU-Box-A')).getByText('1')).toBeInTheDocument();
+        expect(within(rowFor('GPU-Box-B')).getByText('2')).toBeInTheDocument();
+
+        // Exactly one poll tick re-fetches and re-renders the new ranking: the
+        // interval IS the cause of the re-poll, not an incidental second fetch.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(50);
+        });
+        expect(modelGroupServers).toHaveBeenCalledTimes(2);
+        expect(within(rowFor('GPU-Box-B')).getByText('1')).toBeInTheDocument();
+        expect(within(rowFor('GPU-Box-A')).getByText('2')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops re-polling after unmount', async () => {
+      vi.useFakeTimers();
+      try {
+        const modelGroupServers = vi.fn().mockResolvedValue(makeRows());
+        const api = makeApi({ modelGroupServers });
+        const { unmount } = render(
+          <GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={50} />,
+        );
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(modelGroupServers).toHaveBeenCalledTimes(1);
+
+        unmount();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(50 * 5);
+        });
+        // clearInterval on unmount: the mount fetch stays the only call.
+        expect(modelGroupServers).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("has no 'Laden' action (read-only view)", async () => {
+      const api = makeApi();
+      render(<GroupServersSection t={t} api={api} group={group} isAdmin pollIntervalMs={200} />);
+      await screen.findByText('GPU-Box-A');
+      expect(screen.queryByText(t.modelServerLoad)).toBeNull();
+      expect(screen.queryByRole('button', { name: t.listRowMenu })).toBeNull();
+    });
   });
-});
+}
