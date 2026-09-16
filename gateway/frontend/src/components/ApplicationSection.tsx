@@ -34,7 +34,7 @@ import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
 import { applicationTypeDefaults, migrateTypeFields } from './shared/applicationTypeDefaults';
-import { applicationLiveTimingsKind } from './shared/liveTimings';
+import { applicationLiveTimingsKind, applicationSendsLiveTimings } from './shared/liveTimings';
 import { MappingSection } from './MappingSection';
 import { RuntimeAdminSection } from './RuntimeAdminSection';
 
@@ -430,7 +430,9 @@ export function ApplicationSection({
       // Unlike proxy_excluded next door, no seed-diff is needed: this key is
       // only ever sent for a capable type, which accepts both values, so
       // restating it on an unrelated save changes nothing.
-      ...(liveTimingsKind === 'capable' ? { responses_live_timings_enabled: liveTimings } : {}),
+      ...(applicationSendsLiveTimings(liveTimingsKind)
+        ? { responses_live_timings_enabled: liveTimings }
+        : {}),
       // A server_agent application's model discovery/loaded-state/context
       // probing all run on the agent side (the runtime spec's own Type +
       // metrics/context-probe overrides, RuntimeAdminSection) -- these three

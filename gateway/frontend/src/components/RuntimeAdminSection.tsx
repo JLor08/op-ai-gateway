@@ -64,7 +64,7 @@ import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
-import { runtimeSpecLiveTimingsKind } from './shared/liveTimings';
+import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -2685,7 +2685,7 @@ export function RuntimeAdminSection({
       // save that was about the binary path. Accepted and recoverable (untick,
       // save again); what it is not is a consequence of TICKING the box, so do
       // not describe it as one.
-      ...(specLiveTimingsKind !== 'incapable' && specLiveTimings !== undefined
+      ...(runtimeSpecSendsLiveTimings(specLiveTimingsKind) && specLiveTimings !== undefined
         ? { responses_live_timings_enabled: specLiveTimings }
         : {}),
       type: specType,
