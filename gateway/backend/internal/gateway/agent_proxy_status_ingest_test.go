@@ -84,3 +84,39 @@ func TestNewDefaultsAgentProxyStatusRegistry(t *testing.T) {
 		t.Fatal("Server.AgentProxyStatus is nil -- New must default it")
 	}
 }
+
+// TestTelemetryIngestPokesCertReconcileOnTLSActiveEdge pins issue #104's gateway
+// side: when an agent first reports a TLS-active proxy route, ingest pokes an
+// immediate cert + https-switch reconcile so the public flip lands now instead
+// of up to a full cert_reconcile_interval later. A steady or inactive report is
+// not an edge and must not poke. (Nil-safety of the hook is already covered by
+// the other ingest tests, which post tls_active routes with the hook unset.)
+func TestTelemetryIngestPokesCertReconcileOnTLSActiveEdge(t *testing.T) {
+	srv := NewTestServer()
+	pokes := 0
+	srv.triggerCertReconcile = func() { pokes++ }
+
+	post := func(body string) {
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+
+	post(`{"host":{"cpu_util_pct":10},"proxy_routes":[{"listen":8600,"tls_active":true}]}`)
+	if pokes != 1 {
+		t.Fatalf("pokes after the first tls_active report = %d, want 1", pokes)
+	}
+	post(`{"host":{"cpu_util_pct":10},"proxy_routes":[{"listen":8600,"tls_active":true}]}`)
+	if pokes != 1 {
+		t.Fatalf("pokes after a steady tls_active report = %d, want 1 (no edge)", pokes)
+	}
+	post(`{"host":{"cpu_util_pct":10},"proxy_routes":[{"listen":8600,"tls_active":false}]}`)
+	if pokes != 1 {
+		t.Fatalf("pokes after going inactive = %d, want 1 (no edge)", pokes)
+	}
+	post(`{"host":{"cpu_util_pct":10},"proxy_routes":[{"listen":8600,"tls_active":true}]}`)
+	if pokes != 2 {
+		t.Fatalf("pokes after re-activation = %d, want 2", pokes)
+	}
+}

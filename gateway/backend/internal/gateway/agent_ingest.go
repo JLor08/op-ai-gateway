@@ -1622,7 +1622,13 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// for (agent_proxy_routes.go). Unconditional, mirroring SetAgentReport above:
 	// each sample is a full snapshot, and an agent that never sends proxy_routes
 	// (cert_mode != proxy) reports nil here, which Report treats as "no routes".
-	s.AgentProxyStatus.Report(serverID, proxyRouteStatusesFromSamples(req.ProxyRoutes))
+	if s.AgentProxyStatus.Report(serverID, proxyRouteStatusesFromSamples(req.ProxyRoutes)) && s.triggerCertReconcile != nil {
+		// A listener just became TLS-active: poke an immediate https-switch
+		// reconcile so the public flip lands now rather than up to a full
+		// cert_reconcile_interval later. Non-blocking + coalescing at the hook,
+		// so this stays safe on the telemetry ingest hot path (issue #104).
+		s.triggerCertReconcile()
+	}
 	// Record the agent's declared feature set (design spec §9, feature
 	// negotiation), so a later portal runtime-spec write's PushRuntimeConfig
 	// knows whether this connected agent understands a runtime_config frame

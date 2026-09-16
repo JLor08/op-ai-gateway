@@ -114,3 +114,62 @@ func TestAgentProxyStatusRegistry(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+// TestAgentProxyStatusReportTLSActiveEdge pins the upward-edge signal Report
+// returns for issue #104: a listener becoming TLS-active (that was not before)
+// returns true so the ingest path can poke an immediate https-switch reconcile;
+// a steady TLS-active listener, or one going inactive, returns false so the poke
+// fires at most once per activation, not on every telemetry sample.
+func TestAgentProxyStatusReportTLSActiveEdge(t *testing.T) {
+	cases := []struct {
+		name string
+		prev []ProxyRouteStatus // nil = never reported
+		next []ProxyRouteStatus
+		want bool
+	}{
+		{"first report, active", nil, []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, true},
+		{"first report, inactive", nil, []ProxyRouteStatus{{Listen: 8600, TLSActive: false}}, false},
+		{"first report, no routes", nil, nil, false},
+		{"inactive -> active", []ProxyRouteStatus{{Listen: 8600, TLSActive: false}}, []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, true},
+		{"absent -> active", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, []ProxyRouteStatus{{Listen: 8600, TLSActive: true}, {Listen: 8601, TLSActive: true}}, true},
+		{"steady active", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, false},
+		{"active -> inactive", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, []ProxyRouteStatus{{Listen: 8600, TLSActive: false}}, false},
+		{"active -> gone", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, nil, false},
+		{"replaces one active with a different active port", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}, []ProxyRouteStatus{{Listen: 8601, TLSActive: true}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewAgentProxyStatusRegistry()
+			if tc.prev != nil {
+				r.Report("s1", tc.prev) // seed prior snapshot; its edge is not under test
+			}
+			if got := r.Report("s1", tc.next); got != tc.want {
+				t.Fatalf("becameTLSActive = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("re-activation after dropping fires the edge again", func(t *testing.T) {
+		r := NewAgentProxyStatusRegistry()
+		if got := r.Report("s1", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}); !got {
+			t.Fatal("first activation must be an edge")
+		}
+		if got := r.Report("s1", []ProxyRouteStatus{{Listen: 8600, TLSActive: false}}); got {
+			t.Fatal("going inactive must not be an edge")
+		}
+		if got := r.Report("s1", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}); !got {
+			t.Fatal("re-activation must be an edge again")
+		}
+	})
+
+	t.Run("nil registry and empty id return false", func(t *testing.T) {
+		var r *AgentProxyStatusRegistry
+		if r.Report("s1", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}) {
+			t.Fatal("nil registry must return false")
+		}
+		live := NewAgentProxyStatusRegistry()
+		if live.Report("", []ProxyRouteStatus{{Listen: 8600, TLSActive: true}}) {
+			t.Fatal("empty id must return false")
+		}
+	})
+}

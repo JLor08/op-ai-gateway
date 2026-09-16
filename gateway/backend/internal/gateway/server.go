@@ -238,6 +238,15 @@ type ServerDeps struct {
 	// non-blocking (wrap its work in a goroutine). nil = no trigger (the periodic
 	// NetBird + app-health loops are the backstop). Wired in cmd/gateway/main.go.
 	OnAgentReactivated func(serverID string)
+	// TriggerCertReconcile, when set, requests an immediate extra certificate +
+	// https-switch reconcile pass (the same pass the periodic loop runs). The
+	// gateway fires it from the telemetry ingest hot path when an agent's proxy
+	// route newly becomes TLS-active, so the https-auto-switch flips seconds
+	// after the agent is TLS-ready instead of on the next timed pass (issue
+	// #104). MUST be non-blocking (a coalescing send that drops when a pass is
+	// already pending). nil = no trigger (the periodic loop is the backstop).
+	// Wired in cmd/gateway/main.go to certReconcileTriggerFunc.
+	TriggerCertReconcile func()
 	// Benchmarks is the in-memory per-server benchmark-run registry
 	// (benchmark.go). gateway.New defaults a nil value to a fresh registry and
 	// wires it as the resolver's ServerBusyChecker so a running benchmark
@@ -449,6 +458,9 @@ type Server struct {
 	// onAgentReactivated fires on an inactive->active ServerAgent edge; see
 	// ServerDeps.OnAgentReactivated. nil-safe (unset -> no trigger).
 	onAgentReactivated func(serverID string)
+	// triggerCertReconcile pokes an immediate cert + https-switch reconcile
+	// pass on a tls_active edge; see ServerDeps.TriggerCertReconcile. nil-safe.
+	triggerCertReconcile func()
 	// agentPresenceDefault memoizes the system-wide agent-presence-timeout default
 	// (a system_settings read) for agentPresenceDefaultTTL (settingCache, TTL-only
 	// mode -- ttlcache.go) so the per-telemetry-ingest reactivation-edge check does
@@ -810,6 +822,7 @@ func New(deps ServerDeps) *Server {
 		RuntimeStatus:               runtimeStatus,
 		RuntimeLogs:                 runtimeLogs,
 		onAgentReactivated:          deps.OnAgentReactivated,
+		triggerCertReconcile:        deps.TriggerCertReconcile,
 		Benchmarks:                  benchmarks,
 		Groups:                      groups,
 		newMailer:                   deps.NewMailer,
