@@ -1853,7 +1853,15 @@ tee buffer (bounded at `captureMaxBytes`, ~1 MiB) onto its own incremental scan
 fed directly from every chunk as it is copied to the client
 (`passthrough_usage_scan.go`), because the capture cap was silently dropping
 even the FINAL token count on any passthrough response that ran long — a
-correctness bug independent of throughput, not merely a live-progress gap.
+correctness bug independent of throughput, not merely a live-progress gap. The
+**streaming** path gets that for free: every frame is scanned as it passes, so a
+terminal usage frame beyond the cap is still seen. A **buffered** body has no
+frames to scan incrementally, so the scanner must hold the whole value and read
+it once at `finish`; it stays within a bounded trailing window (a small multiple
+of `capBytes`) by keeping only the value's tail once the body overflows the cap,
+then recovering the `usage` object from that fragment — these APIs place it at
+the END of the object — rather than dropping the carry, which had lost the count
+and the request's whole token budget together (issue #91).
 
 **Refresh cadence: a 2s poll, not an SSE push.** The rest of Activity refreshes
 off the `usage.Broker`'s payload-free doorbell (§8.4.2): a write calls
