@@ -347,6 +347,7 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
+| `application.api_token_key_required` | 400 — the application-surface twin of `runtime_spec.api_token_key_required` above: `capture.SealSecret` returned `capture.ErrKeyRequired` sealing a non-empty `api_token` on a disk-backed store with no encryption key. Mapped from the shared `capture.ErrKeyRequired`; before #85 it had no row here (nor in `sharedErrorMap`) and fell through to the 500 `application.request_failed` fallback below |
 | `application.proxy_listen_port_invalid` | 400 |
 | `application.proxy_excluded_port_conflict`, `application.proxy_entry_scheme`, `application.proxy_listen_port_conflict` | **409** — the request shape is valid, it conflicts with the target's own state |
 | unmapped | 500 `runtime_spec.request_failed` |
@@ -362,6 +363,11 @@ sends `proxy_listen_port` therefore sees 400/409 where it used to see 500; the
 portal form never sends the field, so no first-party consumer changes.
 `proxy_excluded_port_conflict` and `proxy_entry_scheme` are new with the
 per-application proxy opt-out ([certificates-tls §7](../cross-cutting/certificates-tls.md#7-automatic-https-switch-of-applications)).
+`application.api_token_key_required` is the same class fixed again by #85:
+`capture.ErrKeyRequired` had a row on the runtime-spec table but none here, so an
+`api_token` write on a keyless disk store fell through to that 500 while the
+runtime-spec surface already answered 400 — a consumer that sets `api_token` now
+sees the same 400 on both surfaces.
 
 `application.server_agent_exists` (message `server already has a server_agent
 application`) is returned by both the application **create** (POST) and
