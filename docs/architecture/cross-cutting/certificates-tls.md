@@ -58,7 +58,11 @@ an operator identity.
 
 `ReconcileCertificates` (`cmd/gateway/cert_reconcile.go` drives it on
 `cert_reconcile_interval_seconds`, floored at 60s, plus an immediate extra
-pass whenever certificate settings change) places at most **5** new ACME
+pass on any of three events: a certificate-settings change, a ServerAgent
+inactive→active edge — so a newly connected server has its leaf minted at once
+rather than waiting up to a full interval — and an agent proxy route becoming
+TLS-active — so the https-auto-switch below flips seconds after the agent is
+TLS-ready; all three reuse one coalescing trigger, §7) places at most **5** new ACME
 orders per pass — a hard code constant, not a setting, so a misconfiguration
 can never burn Let's Encrypt's weekly duplicate-certificate limit in one
 tick — under a 10-minute pass deadline (capped, never below 2 minutes, so a
@@ -283,8 +287,10 @@ stateDiagram-v2
 ```
 
 `ReconcileHTTPSSwitch` (`internal/portal/service_https_switch.go`, riding the
-same cadence as the certificate pass, own short deadline) implements this
-per server:
+same cadence and the same event trigger as the certificate pass — a route's
+`tls_active` upward edge in a telemetry sample pokes an immediate pass, so the
+flip does not wait for the next interval tick — own short deadline) implements
+this per server:
 
 - **In scope**: forward `http → https` only on an **explicit** reported
   `tls_active:true` for the app's exact `ProxyListenPort`. An explicit

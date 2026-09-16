@@ -49,9 +49,18 @@ func NewAgentProxyStatusRegistry() *AgentProxyStatusRegistry {
 // than as a distinguishable empty report. Otherwise routes is defensively
 // copied so a caller's later mutation of its backing slice can never
 // retroactively change what was stored.
-func (r *AgentProxyStatusRegistry) Report(serverID string, routes []ProxyRouteStatus) {
+//
+// It returns becameTLSActive: true when a listener terminates TLS now that did
+// NOT in the previous snapshot (an UPWARD tls_active edge). That edge is what
+// unblocks the https-auto-switch — ReconcileHTTPSSwitch gates the public flip
+// on this registry — so the ingest caller pokes an immediate switch reconcile
+// on a true return, landing the flip seconds after the agent is TLS-ready
+// instead of on the next timed pass (issue #104). A steady TLS-active listener,
+// or one going inactive, is not an edge and returns false, so the poke fires at
+// most once per activation rather than on every telemetry sample.
+func (r *AgentProxyStatusRegistry) Report(serverID string, routes []ProxyRouteStatus) (becameTLSActive bool) {
 	if r == nil || serverID == "" {
-		return
+		return false
 	}
 	var cp []ProxyRouteStatus
 	if len(routes) > 0 {
@@ -60,7 +69,31 @@ func (r *AgentProxyStatusRegistry) Report(serverID string, routes []ProxyRouteSt
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	prevActive := tlsActiveListenPorts(r.status[serverID])
+	for _, rt := range cp {
+		if rt.TLSActive && !prevActive[rt.Listen] {
+			becameTLSActive = true
+			break
+		}
+	}
 	r.status[serverID] = cp
+	return becameTLSActive
+}
+
+// tlsActiveListenPorts returns the set of Listen ports whose route currently
+// terminates TLS. nil for no such ports, so a lookup on the result is always
+// safe (a nil-map read is false).
+func tlsActiveListenPorts(routes []ProxyRouteStatus) map[int]bool {
+	if len(routes) == 0 {
+		return nil
+	}
+	set := make(map[int]bool, len(routes))
+	for _, rt := range routes {
+		if rt.TLSActive {
+			set[rt.Listen] = true
+		}
+	}
+	return set
 }
 
 // Status returns the last reported route statuses for serverID, or nil when

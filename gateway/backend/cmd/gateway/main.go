@@ -1015,14 +1015,17 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// gateway.ServerDeps.OnAgentReactivated) by immediately syncing+
 	// reconciling that server's NetBird peer (if any) and, once online (or
 	// peer-less), poking appHealthServerTrigger for an out-of-band scoped
-	// health pass -- instead of waiting for the periodic NetBird/health
-	// loops. Run in a goroutine: the gateway fires this from the
-	// telemetry-ingest hot path, so it must never block.
+	// health pass AND certReconcileTrigger for an immediate certificate +
+	// https-switch pass -- instead of waiting for the periodic loops, so a
+	// newly connected server gets its leaf issued at once rather than up to a
+	// full cert_reconcile_interval later (issue #104). Run in a goroutine: the
+	// gateway fires this from the telemetry-ingest hot path, so it must never
+	// block.
 	onAgentReactivated := func(serverID string) {
 		go handleAgentReactivation(context.Background(), serverID, reactivationDeps{
 			store: b.Routes, settings: portalService, reconciler: portalService,
 			syncOne: syncServerNetbirdOnce, timeout: netbirdCallTimeout,
-		}, appHealthServerTrigger)
+		}, appHealthServerTrigger, certReconcileTrigger)
 	}
 	// Certificate reconcile loop: drives portal.Service.ReconcileCertificates
 	// on its own cadence (a no-op while the module is disabled, so this costs
@@ -1091,6 +1094,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		Groups:                          groups,
 		Users:                           b.Users,
 		OnAgentReactivated:              onAgentReactivated,
+		TriggerCertReconcile:            certReconcileTriggerFunc(certReconcileTrigger),
 		Limiter:                         principalLimiter,
 	}, cleanup, nil
 }

@@ -42,10 +42,15 @@ type reactivationDeps struct {
 // server WITHOUT waiting for the periodic loops: if the server has a NetBird peer
 // (module configured, NetbirdEnabled, a peer or tracking group), it syncs the peer
 // (name/domain/connected) and reconciles its group/policy, then triggers an app
-// health check only if the peer is online; a server with no NetBird peer triggers
-// the health check directly. Best-effort: every failure is Debug-logged and never
-// surfaced; a full trigger channel is dropped (the periodic loops are the backstop).
-func handleAgentReactivation(ctx context.Context, serverID string, deps reactivationDeps, healthTrigger chan<- string) {
+// health check AND an immediate certificate reconcile pass only if the peer is
+// online; a server with no NetBird peer triggers both directly. The certificate
+// poke is what gives a NEWLY connected server its leaf now rather than up to a
+// full cert_reconcile_interval later (issue #104): a self_signed leaf is minted
+// on the spot and an ACME order needs the peer online anyway, which is why the
+// poke sits behind the same online gate as the health check. Best-effort: every
+// failure is Debug-logged and never surfaced; a full trigger channel is dropped
+// (the periodic loops are the backstop).
+func handleAgentReactivation(ctx context.Context, serverID string, deps reactivationDeps, healthTrigger chan<- string, certTrigger chan<- struct{}) {
 	server, err := deps.store.AIServerByID(ctx, serverID)
 	if err != nil {
 		slog.Debug("agent reactivation: server lookup failed", "server_id", serverID, "error", err)
@@ -60,6 +65,12 @@ func handleAgentReactivation(ctx context.Context, serverID string, deps reactiva
 		if !connected {
 			return // offline -> the periodic NetBird + health loops are the backstop
 		}
+	}
+	// Coalescing, non-blocking: a full buffer means an extra pass is already
+	// pending, which covers this server too (the ticker is the ultimate backstop).
+	select {
+	case certTrigger <- struct{}{}:
+	default:
 	}
 	select {
 	case healthTrigger <- serverID:

@@ -96,17 +96,24 @@ func TestHandleAgentReactivation(t *testing.T) {
 			store := &fakeReactStore{servers: map[string]routing.AIServer{tc.server.ID: tc.server}}
 			rec := &fakeServerReconciler{}
 			trigger := make(chan string, 4)
+			certTrigger := make(chan struct{}, 4)
 			syncOne := func(context.Context, netbird.Config, time.Duration, netbirdStateStore, routing.AIServer, onlineEventFunc) (bool, bool) {
 				return tc.syncConnected, true
 			}
 			handleAgentReactivation(ctx, tc.server.ID, reactivationDeps{
 				store: store, settings: &fakeNetbirdCfg{ok: tc.nbOK, err: tc.nbErr}, reconciler: rec,
 				syncOne: syncOne, timeout: time.Second,
-			}, trigger)
+			}, trigger, certTrigger)
 
 			gotTrigger := drain(trigger)
 			if tc.wantTrigger != (len(gotTrigger) == 1 && gotTrigger[0] == tc.server.ID) {
 				t.Fatalf("trigger: want fired=%v, got %v", tc.wantTrigger, gotTrigger)
+			}
+			// The certificate poke (issue #104) fires behind the same online
+			// gate as the health check, so it fires exactly when the health
+			// trigger does.
+			if gotCert := len(certTrigger) == 1; gotCert != tc.wantTrigger {
+				t.Fatalf("cert trigger: want fired=%v, got %v", tc.wantTrigger, gotCert)
 			}
 			if tc.wantReconcile != (len(rec.called) == 1) {
 				t.Fatalf("reconcile: want=%v, got %v", tc.wantReconcile, rec.called)
@@ -119,6 +126,8 @@ func TestHandleAgentReactivationFullChannelDoesNotBlock(t *testing.T) {
 	store := &fakeReactStore{servers: map[string]routing.AIServer{"n": {ID: "n"}}}
 	trigger := make(chan string, 1)
 	trigger <- "prefill" // full
+	certTrigger := make(chan struct{}, 1)
+	certTrigger <- struct{}{} // full: neither poke may block
 	done := make(chan struct{})
 	go func() {
 		handleAgentReactivation(context.Background(), "n", reactivationDeps{
@@ -127,7 +136,7 @@ func TestHandleAgentReactivationFullChannelDoesNotBlock(t *testing.T) {
 				return false, false
 			},
 			timeout: time.Second,
-		}, trigger)
+		}, trigger, certTrigger)
 		close(done)
 	}()
 	select {
@@ -140,14 +149,18 @@ func TestHandleAgentReactivationFullChannelDoesNotBlock(t *testing.T) {
 func TestHandleAgentReactivationLookupErrorIsNoop(t *testing.T) {
 	store := &fakeReactStore{err: context.DeadlineExceeded}
 	trigger := make(chan string, 1)
+	certTrigger := make(chan struct{}, 1)
 	handleAgentReactivation(context.Background(), "x", reactivationDeps{
 		store: store, settings: &fakeNetbirdCfg{ok: true}, reconciler: &fakeServerReconciler{},
 		syncOne: func(context.Context, netbird.Config, time.Duration, netbirdStateStore, routing.AIServer, onlineEventFunc) (bool, bool) {
 			return true, true
 		},
 		timeout: time.Second,
-	}, trigger)
+	}, trigger, certTrigger)
 	if len(drain(trigger)) != 0 {
 		t.Fatal("a lookup error must fire nothing")
+	}
+	if len(certTrigger) != 0 {
+		t.Fatal("a lookup error must fire no cert reconcile")
 	}
 }
