@@ -41,6 +41,18 @@ type usageScanner struct {
 	// instead of feed.
 	carry []byte
 
+	// bufferedTruncated marks that this response is a BUFFERED (non-streaming)
+	// JSON body whose bytes ran far enough past capBytes that feed trimmed the
+	// carry to a trailing sliding window instead of holding the whole value. It
+	// is STICKY: once set, feed keeps the buffered branch for every later chunk,
+	// because the trimmed tail no longer begins with the value's opening brace,
+	// so bufferedJSONStart can no longer recognise it. finish reads it to recover
+	// the usage object from that fragment rather than json.Unmarshaling a value
+	// whose front bytes are gone (see feed and finish). Left false for a buffered
+	// body small enough to be retained whole (finish scans it directly), and for
+	// every streaming response.
+	bufferedTruncated bool
+
 	acc inference.Usage
 
 	haveFirstContent bool
@@ -153,15 +165,25 @@ func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) 
 // hands every COMPLETE '\n'-terminated line in it to the usage/content-frame
 // scan, and keeps only the trailing, still-incomplete line as the new carry.
 //
-// The carry is bounded by capBytes: if it grows past that without ever seeing a
-// newline — one pathologically long line, or an upstream that never terminates
-// a frame — it is dropped rather than grown further. This is a deliberate,
-// advisory trade: an ordinary SSE upstream never gets near this (every frame
-// this codebase, and a real llama.cpp/OpenAI/Anthropic-compatible server,
-// emits ends in "\n\n"), but nothing here may let a misbehaving or hostile
-// upstream make the gateway allocate without limit just because it happens to
-// be scanning for usage. Losing an over-long line's numbers is an acceptable
-// trade; unbounded memory growth on an advisory accounting path is not.
+// The carry is bounded by capBytes: if a STREAMING line grows past that without
+// ever seeing a newline — one pathologically long line, or an upstream that
+// never terminates a frame — it is dropped rather than grown further. This is a
+// deliberate, advisory trade: an ordinary SSE upstream never gets near this
+// (every frame this codebase, and a real llama.cpp/OpenAI/Anthropic-compatible
+// server, emits ends in "\n\n"), but nothing here may let a misbehaving or
+// hostile upstream make the gateway allocate without limit just because it
+// happens to be scanning for usage. Losing an over-long line's numbers is an
+// acceptable trade; unbounded memory growth on an advisory accounting path is
+// not.
+//
+// A BUFFERED body over the cap is bounded but NOT dropped: its usage object sits
+// at the end of the value, so feed retains a trailing sliding window and finish
+// recovers the usage from that fragment (issue #91). Dropping it outright zeroed
+// the persisted usage row and the request's whole token budget on exactly the
+// long turns most likely to overflow the cap. That window is bounded by
+// 2×capBytes rather than capBytes — the headroom is what lets the per-chunk
+// append amortize instead of re-copying the tail every feed (see the buffered
+// branch below) — still a hard bound on the same feature's budget.
 //
 // A line is scanned exactly once here (it leaves the carry as soon as it's
 // complete), but correctness never actually depends on that: mergePassthroughUsage's
@@ -190,9 +212,32 @@ func (s *usageScanner) feed(chunk []byte, at time.Time) {
 	// because it contains no `data:` line. The remaining line-split path is what
 	// an SSE stream needs, and only an SSE stream reaches it — see
 	// bufferedJSONStart for why the two shapes never cross.
-	if bufferedJSONStart(s.carry) {
-		if len(s.carry) > s.capBytes {
-			s.carry = nil
+	//
+	// bufferedTruncated keeps this branch STICKY once the tail has been trimmed:
+	// the retained fragment no longer opens with the value's brace, so
+	// bufferedJSONStart would no longer route it here on the next chunk. Without
+	// the flag, later chunks of an over-cap buffered body would fall through to
+	// the SSE line-split path below and be mis-scanned.
+	if s.bufferedTruncated || bufferedJSONStart(s.carry) {
+		// Retain the trailing window rather than dropping the carry: a buffered
+		// body's `usage` object sits at the END of the value for every API this
+		// path serves, so a bounded tail still carries it, where the old outright
+		// drop lost it along with the request's whole token budget (issue #91).
+		// finish extracts the usage from this fragment; see there.
+		//
+		// Trim LAZILY — only once the carry has grown a full capBytes PAST the
+		// window — and keepTail copies the survivors into a buffer with headroom,
+		// so the ordinary per-chunk append reuses spare capacity instead of
+		// reallocating and re-copying the whole tail on EVERY feed. Trimming
+		// eagerly (every feed, back to exactly capBytes) would cost O(capBytes)
+		// per chunk — O(body × capBytes) against an upstream that trickles bytes
+		// one read at a time. This way each capBytes-sized trim amortizes over a
+		// capBytes of input, i.e. O(1) per byte. The retained carry is therefore
+		// bounded by 2×capBytes, not capBytes; still a hard bound, and the tail is
+		// the same feature's memory budget either way.
+		if len(s.carry) > 2*s.capBytes {
+			s.carry = keepTail(s.carry, s.capBytes)
+			s.bufferedTruncated = true
 		}
 		return
 	}
@@ -229,9 +274,12 @@ func (s *usageScanner) feed(chunk []byte, at time.Time) {
 // the two cannot disagree on any body that carries usage, since such a body is
 // either brace-opened JSON or data:-framed SSE.
 //
-// In feed's buffered branch the carry is never consumed, so it always begins at
-// the body's first byte — which makes this decision stable across the several
-// chunks a large buffered body may arrive in.
+// While the carry stays under the cap it is never consumed, so it always begins
+// at the body's first byte — which makes this decision stable across the several
+// chunks a large buffered body may arrive in. Once the body overflows the cap
+// feed trims the carry to its trailing window, which no longer opens with the
+// brace; feed's bufferedTruncated flag, not this function, keeps the branch from
+// then on.
 func bufferedJSONStart(b []byte) bool {
 	for _, c := range b {
 		switch c {
@@ -246,6 +294,30 @@ func bufferedJSONStart(b []byte) bool {
 	return false
 }
 
+// keepTail returns a FRESH copy of the last n bytes of b (all of b when it is
+// already <= n bytes; an empty slice when n <= 0), allocated with headroom
+// (capacity 2n) so the caller's subsequent appends reuse spare capacity instead
+// of reallocating. feed's buffered branch uses it to keep a bounded trailing
+// window of an over-cap body.
+//
+// The copy is load-bearing, not incidental: slicing alone (b[len(b)-n:]) would
+// leave the whole grown backing array — the body accumulated so far, which can
+// be far larger than n — reachable through the small tail and so unfreed. The
+// fresh allocation lets that array be collected, which is the entire reason the
+// retained carry costs O(n) and not O(body length). Pinned by
+// TestKeepTailCopiesIntoABoundedBuffer.
+func keepTail(b []byte, n int) []byte {
+	if n < 0 {
+		n = 0
+	}
+	if len(b) > n {
+		b = b[len(b)-n:]
+	}
+	out := make([]byte, len(b), 2*n)
+	copy(out, b)
+	return out
+}
+
 // finish scans whatever is left in the carry as if it were itself a complete
 // line, and must be called exactly once after the last feed() — nativeCopier.run
 // does this via a defer. Without it, a stream whose final frame is never itself
@@ -254,6 +326,16 @@ func bufferedJSONStart(b []byte) bool {
 // the entire JSON body is typically emitted as one line with no embedded
 // newline at all. finish is what lets one scanner serve both the streaming and
 // the buffered native-passthrough shape.
+//
+// A buffered body that overran the cap left only its trailing bytes in the carry
+// (feed's buffered branch), so it is no longer a parseable JSON value: recover
+// the trailing usage object from the fragment and scan a synthetic
+// {"usage":<obj>} instead, which the normal per-flavor merge reads exactly as it
+// would the whole body's top-level usage — no fourth copy of the usage switch.
+// The counts are what issue #91 restores; the buffered shapes carry no `timings`
+// object and derive no rate (see usage and isTerminalUsageFrame), so nothing
+// else is lost by scanning the reconstructed object rather than the original
+// value.
 func (s *usageScanner) finish(at time.Time) {
 	if s == nil {
 		return
@@ -262,8 +344,159 @@ func (s *usageScanner) finish(at time.Time) {
 	if len(s.carry) == 0 {
 		return
 	}
+	if s.bufferedTruncated {
+		if synth := bufferedTailUsage(s.carry); synth != nil {
+			s.scan(synth, at)
+		}
+		s.carry = nil
+		return
+	}
 	s.scan(s.carry, at)
 	s.carry = nil
+}
+
+// maxBufferedUsageObjectBytes bounds how far balancedObject scans for a usage
+// object's closing brace, and maxBufferedUsageKeyProbes bounds how many trailing
+// `usage` occurrences trailingJSONObject tries before giving up. Both exist to
+// keep the tail recovery cheap against a HOSTILE body (issue #91 review): the
+// pre-#91 path did O(1) work (it dropped the carry), so an unbounded scan here
+// would be a new CPU-amplification vector — a tail packed with `"usage":{` tokens
+// that never close would otherwise make finish do work quadratic in the tail
+// length. A real usage object for either API is well under 1 KiB and is the LAST
+// occurrence in any well-formed body, so both budgets are ample; a client that
+// stuffs more only zeroes its OWN usage row (exactly as the pre-#91 drop did),
+// never spends unbounded gateway CPU.
+const (
+	maxBufferedUsageObjectBytes = 1 << 14 // 16 KiB
+	maxBufferedUsageKeyProbes   = 32
+)
+
+// bufferedTailUsage rebuilds a minimal, parseable {"usage":<obj>} payload from
+// the trailing fragment of a buffered body that overran capBytes (feed's
+// buffered branch). It returns nil when no complete `usage` object is present in
+// the retained tail — the same "recovered nothing" outcome the pre-#91 drop
+// always produced, now the rare fallback instead of the rule. A buffered body
+// for every API this path serves places its authoritative usage as a top-level
+// field at the END of the value, so the LAST `usage` object in the tail is that
+// field; mergeResponsesUsage/mergeAnthropicUsage then read it from the synthetic
+// exactly as they read the top-level usage of a whole body.
+func bufferedTailUsage(tail []byte) []byte {
+	obj := trailingJSONObject(tail, "usage")
+	if obj == nil {
+		return nil
+	}
+	synth := make([]byte, 0, len(obj)+len(`{"usage":}`))
+	synth = append(synth, `{"usage":`...)
+	synth = append(synth, obj...)
+	synth = append(synth, '}')
+	return synth
+}
+
+// trailingJSONObject returns the JSON object value ({...}) of the LAST real
+// occurrence of the object key "<key>" in b, or nil if the key is absent or its
+// value is not a brace-balanced object that closes within b. "Real key" means
+// the bytes "<key>" followed by optional JSON whitespace and a ':' — this rejects
+// a same-named string VALUE (e.g. `"type":"usage"`), the only other way the raw
+// bytes "usage" can appear, since a string value's own quotes are escaped. The
+// retained tail feed hands it may begin partway through the buffered value, but
+// the trailing usage object it targets is intact at the end, so scanning forward
+// from the key to its matching close brace recovers it.
+//
+// The backward search is bounded to maxBufferedUsageKeyProbes occurrences so a
+// hostile tail of decoy `usage` keys cannot make this quadratic in the tail
+// length (issue #91 review); the authoritative usage is the LAST occurrence, so
+// the budget is only ever spent skipping decoys, which a well-formed body has
+// none of.
+func trailingJSONObject(b []byte, key string) []byte {
+	needle := append(append([]byte{'"'}, key...), '"')
+	end := len(b)
+	for probes := 0; probes < maxBufferedUsageKeyProbes; probes++ {
+		i := bytes.LastIndex(b[:end], needle)
+		if i < 0 {
+			return nil
+		}
+		if obj := objectAfterKey(b, i+len(needle)); obj != nil {
+			return obj
+		}
+		// Not a usable key/object here — look for an earlier occurrence.
+		end = i
+	}
+	return nil
+}
+
+// objectAfterKey returns the brace-balanced object that is the value of a key
+// whose closing quote ended at keyEnd in b (b[:keyEnd] ended in the quoted key),
+// or nil when keyEnd is not followed by ':' and a '{' object — i.e. the match was
+// a same-named string VALUE, not a key. JSON whitespace between the key, its
+// colon, and its value is skipped.
+func objectAfterKey(b []byte, keyEnd int) []byte {
+	j := skipJSONSpace(b, keyEnd)
+	if j >= len(b) || b[j] != ':' {
+		return nil
+	}
+	j = skipJSONSpace(b, j+1)
+	if j >= len(b) || b[j] != '{' {
+		return nil
+	}
+	return balancedObject(b, j)
+}
+
+// skipJSONSpace returns the first index at or after i in b that is not JSON
+// whitespace (len(b) if the rest is all whitespace).
+func skipJSONSpace(b []byte, i int) int {
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	return i
+}
+
+// balancedObject returns b[start:end+1] where b[start] == '{' and end is its
+// matching close brace, tracking string literals and escapes so a brace inside a
+// JSON string never miscounts. It returns nil if the object does not close within
+// maxBufferedUsageObjectBytes of start — because it was cut off by the tail bound,
+// or because a hostile run of unbalanced '{' never closes (issue #91 review). A
+// real usage object closes well inside that window, so bounding the scan costs
+// legitimate recovery nothing while capping a hostile one's cost per probe.
+func balancedObject(b []byte, start int) []byte {
+	depth := 0
+	inStr := false
+	esc := false
+	limit := start + maxBufferedUsageObjectBytes
+	if limit > len(b) {
+		limit = len(b)
+	}
+	for i := start; i < limit; i++ {
+		c := b[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return b[start : i+1]
+			}
+		}
+	}
+	return nil
+}
+
+// isJSONSpace reports whether c is one of JSON's insignificant whitespace bytes,
+// the set trailingJSONObject skips between a key, its colon, and its value.
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
 // scan stamps the first-content-frame timestamp and the

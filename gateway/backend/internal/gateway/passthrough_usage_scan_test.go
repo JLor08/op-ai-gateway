@@ -351,6 +351,178 @@ func TestUsageScannerBufferedBodyUsageSurvivesPrettyPrinting(t *testing.T) {
 	}
 }
 
+// TestUsageScannerBufferedBodyOverCapStillYieldsUsage pins issue #91: a buffered
+// (non-streaming) body LARGER than capBytes must still yield its usage. #78
+// fixed a buffered body whose newline placement lost the usage; this is its size
+// sibling — a buffered body that simply runs past the capture cap. The old feed
+// dropped the WHOLE carry the moment it crossed capBytes (`s.carry = nil`),
+// taking the trailing `usage` object — and with it the persisted usage row and
+// the request's entire token budget — down with it, and silently, because the
+// request itself still returned 200. The fix keeps a bounded trailing window of
+// the body instead of dropping it, so finish still recovers the usage object
+// that every API this path serves places at the END of the value.
+//
+// The body is fed in small chunks on purpose: that is what a large buffered
+// response does through nativeCopier.run (32 KB reads), and it exercises the
+// sliding-window trim across feeds, not just a single over-cap append. The carry
+// is asserted bounded (<= 2*capBytes, the retained window plus the amortization
+// headroom) after EVERY feed, and bufferedTruncated is asserted set before
+// finish, so the recovery is proven to run through the truncated path and cannot
+// be bought with unbounded memory — the guarantee #91 says the fix must keep.
+//
+// The pretty-printed row also covers whitespace around the trailing usage key's
+// colon and inside its object, since the retained fragment is scanned by hand
+// (trailingJSONObject/balancedObject) rather than json.Unmarshaled.
+func TestUsageScannerBufferedBodyOverCapStillYieldsUsage(t *testing.T) {
+	const capBytes = 256
+	// Padding that clears 2*capBytes by a wide margin, so the body forces several
+	// trim cycles however the chunk boundaries fall; kept free of the substring
+	// "usage" so the tail scan can only find the real trailing key.
+	pad := strings.Repeat("A", 10*capBytes)
+	prettyUsage := "\n  \"usage\" : {\n    \"input_tokens\": 13,\n    \"output_tokens\": 21,\n    \"total_tokens\": 34\n  }\n"
+	cases := []struct {
+		name                       string
+		apiFlavor                  string
+		body                       string
+		wantIn, wantOut, wantTotal int
+	}{
+		{
+			name:      "openai_responses",
+			apiFlavor: "openai_responses",
+			body:      `{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","content":"` + pad + `"}],"usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}`,
+			wantIn:    11, wantOut: 22, wantTotal: 33,
+		},
+		{
+			name:      "anthropic_messages",
+			apiFlavor: "anthropic_messages",
+			body:      `{"id":"msg_1","type":"message","content":[{"type":"text","text":"` + pad + `"}],"usage":{"input_tokens":7,"output_tokens":40}}`,
+			wantIn:    7, wantOut: 40, wantTotal: 47,
+		},
+		{
+			name:      "openai_responses, pretty-printed usage tail",
+			apiFlavor: "openai_responses",
+			body:      `{"id":"resp_2","object":"response","output":[{"type":"message","content":"` + pad + `"}],` + prettyUsage + `}`,
+			wantIn:    13, wantOut: 21, wantTotal: 34,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
+			if len(body) <= 2*capBytes {
+				t.Fatalf("test body is %d bytes, must exceed 2*cap=%d to exercise the truncated path", len(body), 2*capBytes)
+			}
+			s := newUsageScanner(tc.apiFlavor, capBytes, nil)
+			now := time.Now()
+			for off := 0; off < len(body); off += 40 {
+				end := off + 40
+				if end > len(body) {
+					end = len(body)
+				}
+				s.feed(body[off:end], now)
+				if len(s.carry) > 2*capBytes {
+					t.Fatalf("carry = %d bytes after feeding %d/%d, want <= 2*cap=%d (memory must stay bounded)", len(s.carry), end, len(body), 2*capBytes)
+				}
+			}
+			if !s.bufferedTruncated {
+				t.Fatalf("bufferedTruncated = false, want true (the over-cap body must have been trimmed, so finish exercises the tail recovery)")
+			}
+			s.finish(now)
+			if u := s.usage(); u.InputTokens != tc.wantIn || u.OutputTokens != tc.wantOut || u.TotalTokens != tc.wantTotal {
+				t.Fatalf("usage = %+v, want input=%d output=%d total=%d", u, tc.wantIn, tc.wantOut, tc.wantTotal)
+			}
+		})
+	}
+}
+
+// TestKeepTailCopiesIntoABoundedBuffer pins the load-bearing property of keepTail
+// that the len-based memory assertions above cannot see (issue #91 review):
+// keepTail must COPY the last n bytes into a fresh, bounded buffer, not re-slice
+// the (arbitrarily large) input. A re-slice would keep len == n while the whole
+// grown backing array stayed reachable and unfreed, defeating the bound feed's
+// buffered branch relies on. Asserting on cap() and on independence from the
+// source is what distinguishes the two: a re-slice inherits the input's capacity
+// and shares its bytes; a copy does neither.
+func TestKeepTailCopiesIntoABoundedBuffer(t *testing.T) {
+	const n = 256
+	// A large input with even larger spare capacity — exactly what feed's append
+	// produces just before a trim. A re-slice of this keeps cap in the thousands.
+	big := make([]byte, 8*n, 32*n)
+	for i := range big {
+		big[i] = byte('a' + i%26)
+	}
+	got := keepTail(big, n)
+	if len(got) != n {
+		t.Fatalf("len(keepTail) = %d, want %d (the last n bytes)", len(got), n)
+	}
+	if cap(got) > 2*n {
+		t.Fatalf("cap(keepTail) = %d, want <= %d — keepTail must copy into a bounded buffer, not re-slice the grown input (which keeps its whole backing array alive)", cap(got), 2*n)
+	}
+	if string(got) != string(big[len(big)-n:]) {
+		t.Fatalf("keepTail returned the wrong bytes; want the last %d of the input", n)
+	}
+	// Mutating the copy must not touch the source: proves a genuine copy, i.e. the
+	// source's backing array is no longer aliased and can be freed.
+	got[0] ^= 0xff
+	if got[0] == big[len(big)-n] {
+		t.Fatalf("keepTail aliases the input's backing array; it must return an independent copy")
+	}
+}
+
+// TestBufferedTailUsageBoundsHostileInput pins the recovery-cost bounds added in
+// the #91 review: a hostile buffered tail must be handled in bounded work rather
+// than scanned quadratically (the pre-#91 drop did O(1) work, so an unbounded
+// scan here would be a new CPU-amplification vector). Each bound is pinned by an
+// input where removing it changes the RESULT, not just the work — the only way a
+// cost bound can be observed from a black-box test: the per-object byte bound by
+// an object that closes just past it, and the probe cap by a real object placed
+// just beyond it.
+func TestBufferedTailUsageBoundsHostileInput(t *testing.T) {
+	// balancedObject gives up once an object fails to close within
+	// maxBufferedUsageObjectBytes: an object whose closing brace sits one byte
+	// past the bound is treated as unclosed (the assertion that distinguishes a
+	// bounded scan from an unbounded one — without the bound this recovers it).
+	justPast := []byte("{" + strings.Repeat("a", maxBufferedUsageObjectBytes) + "}")
+	if obj := balancedObject(justPast, 0); obj != nil {
+		t.Fatalf("balancedObject recovered an object closing past the %d-byte bound; want nil", maxBufferedUsageObjectBytes)
+	}
+	// A well-sized object is still recovered whole.
+	small := []byte(`{"input_tokens":1}`)
+	if obj := balancedObject(small, 0); string(obj) != string(small) {
+		t.Fatalf("balancedObject(%q) = %q, want the whole object", small, obj)
+	}
+	// A tail of nothing but unclosed `"usage":{` decoys must terminate and recover
+	// nothing (no hang, no panic, no false recovery).
+	hostile := []byte(strings.Repeat(`"usage":{`, 50000))
+	if obj := trailingJSONObject(hostile, "usage"); obj != nil {
+		t.Fatalf("trailingJSONObject recovered a usage object from an all-unclosed tail; want nil")
+	}
+	if synth := bufferedTailUsage(hostile); synth != nil {
+		t.Fatalf("bufferedTailUsage returned %q for a hostile tail; want nil (recover nothing)", synth)
+	}
+
+	// The probe cap itself — observable only through an input where it changes the
+	// RESULT, not just the work: a genuine, closeable usage object placed FARTHER
+	// back than maxBufferedUsageKeyProbes occurrences from the end, behind that
+	// many unclosed decoys nearer the end. trailingJSONObject scans occurrences
+	// from the end backward, so with the cap it exhausts its budget on the decoys
+	// and gives up (nil) before reaching the real object; WITHOUT the cap it walks
+	// all the way back and recovers it (non-nil). Asserting nil therefore fails iff
+	// the cap is removed — the all-decoy case above cannot pin that, since it is
+	// nil either way. A client that stuffs this many decoys only zeroes its own
+	// usage row, exactly as the pre-#91 drop did.
+	validBody := `{"usage":{"input_tokens":1,"output_tokens":9}}`
+	beyondCap := []byte(validBody + strings.Repeat(`"usage":{`, maxBufferedUsageKeyProbes+8))
+	if obj := trailingJSONObject(beyondCap, "usage"); obj != nil {
+		t.Fatalf("trailingJSONObject recovered a usage object past the %d-probe cap = %q; want nil (the cap must give up before reaching it)", maxBufferedUsageKeyProbes, obj)
+	}
+	// The same object WITHIN the cap is recovered, so the cap is a reachability
+	// limit, not a blanket failure.
+	withinCap := []byte(validBody + strings.Repeat(`"usage":{`, maxBufferedUsageKeyProbes-8))
+	if obj := trailingJSONObject(withinCap, "usage"); string(obj) != `{"input_tokens":1,"output_tokens":9}` {
+		t.Fatalf("trailingJSONObject within the probe cap = %q, want the real usage object", obj)
+	}
+}
+
 // TestUsageScannerTotalTokensAcrossSplitFrames proves the deferred-finalize
 // design in mergePassthroughUsage/finalizeTotalTokens: Anthropic reports input
 // tokens on message_start and output tokens on a LATER, separate message_delta
