@@ -604,3 +604,38 @@ otherwise configured. Any dev or test setup that wants a specific server managed
 must mint a fresh agent token for it. Otherwise the agent connects, negotiates
 and reports healthy while managing a different server's (empty) document: a
 silent no-op that is very hard to attribute to the token.
+
+**A struct assembled by hand at more than one site needs a reflective
+completeness guard, because a Go literal has no `...rest` spread.** A field added
+to such a struct and wired at only one construction site compiles, passes, and
+carries a silent zero value everywhere else; nothing in the compiler or a
+value-only test flags the omission. The pattern that removes the remembering is a
+reflective test that walks the struct's fields and fails when the wiring falls
+behind the shape — so *growing the struct* forces the author to touch every site.
+Three of these guard the two shapes that have paid for it:
+
+- `routing.Target` is built at `resolver.go`'s `targetFrom` (the canonical full
+  builder) and again on the benchmark path.
+  `TestTargetFromPopulatesEveryField` (`internal/routing`) resolves a Target from
+  a fully-populated `server_agent` candidate and fails on any field left zero;
+  `TestBenchmarkTargetReqSetsEveryFieldOrDocumentsOmission` (`internal/gateway`)
+  does the same for `benchmarkTargetReq` with a named `benchmarkOmits` allow-list
+  for the dispatch fields a benchmark stream legitimately never carries. `Target`
+  has no json tags, so both walk field *names* + `reflect.Value.IsZero()`. The
+  routing guard's failure message names the field *and* points at every other
+  construction site the same new field must be taught -- the benchmark builder
+  and the deliberately partial probe targets; the benchmark guard's names the
+  field and its sibling builder. `ResponsesLiveTimingsEnabled` (#81) was the
+  field that had to be threaded
+  in by hand across these sites; the guards make the next one fail loudly instead.
+- `ApplicationDTO` and its write request (`CreateApplicationRequest` /
+  `UpdateApplicationRequest`) are two hand-maintained field lists with no compiler
+  tie. `TestApplicationRequestCoversEveryWritableField` (`internal/portal`) asserts
+  DTO↔request set-parity with the deliberate asymmetries named (identity/derived
+  read-only DTO fields; the write-only token), and
+  `TestCreateAndUpdateApplicationRequestsCarryTheSameFields` pins create and update
+  to one writable surface. This mirrors the older
+  `TestPutRequestFromDTOCoversEveryWritableField` (`RuntimeSpecDTO` ↔
+  `PutRuntimeSpecRequest`), which additionally round-trips values through the pure
+  `putRequestFromDTO` mapper — a half applications lack (a request is applied
+  inline in `Create`/`UpdateApplication`, with no pure mapper to exercise).
