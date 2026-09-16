@@ -54,6 +54,21 @@ var applicationParityBools = [5][applicationParityRows]bool{
 	{true, false, false}, // responses_live_timings_enabled
 }
 
+// applicationParityBoolNames names the applicationParityBools rows in the SAME
+// select-list order. It is the ONE list of the applications integer-boolean
+// columns: TestApplicationParityFixtureDistinguishesEverySameTypedPair reads it
+// to report which column a degenerate pattern belongs to, and
+// TestApplicationsSchemaColumnsAllCovered reads it as the `bools` bucket of the
+// schema-coverage check, so the bit-pattern's bool set and the schema-coverage's
+// bool set cannot drift apart.
+var applicationParityBoolNames = []string{
+	"always_reachable",
+	"benchmark_schedule_enabled",
+	"opportunistic_metrics_enabled",
+	"proxy_excluded",
+	"responses_live_timings_enabled",
+}
+
 // TestConformanceApplicationReadersAgreeOnEveryColumn closes a gap that
 // PREDATES the proxy_excluded column: the applications column list is
 // hand-maintained in THREE separate queries feeding TWO different scan
@@ -273,11 +288,7 @@ func TestConformanceApplicationReadersAgreeOnEveryColumn(t *testing.T) {
 // close, and every test would stay green — which, per its ai_servers sibling's
 // own history, is how that hole got there the first time.
 func TestApplicationParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
-	names := []string{
-		"always_reachable",
-		"benchmark_schedule_enabled", "opportunistic_metrics_enabled", "proxy_excluded",
-		"responses_live_timings_enabled",
-	}
+	names := applicationParityBoolNames
 	// Without this, the guard degrades exactly the way it exists to prevent: a
 	// sixth pattern row with no names entry either reports the wrong column's
 	// name (if it happens to be distinct) or panics with index-out-of-range
@@ -328,4 +339,37 @@ func normalizeApplicationForCompare(in routing.Application) routing.Application 
 	out.CreatedAt = in.CreatedAt.UTC()
 	out.UpdatedAt = in.UpdatedAt.UTC()
 	return out
+}
+
+// TestApplicationsSchemaColumnsAllCovered ties the applications parity fixture to
+// the LIVE migrated schema (issue #84). applicationParityBools + the reader-
+// agreement fixture above pin column parity by hand; nothing tied either to the
+// real column list, so a new integer-boolean column could be added to
+// `applications`, reach every reader, and never appear in a fixture row -- green,
+// because the suite did not know the column existed. This fails the moment the
+// schema grows a column no bucket below covers. See assertColumnCoverage.
+func TestApplicationsSchemaColumnsAllCovered(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		assertColumnCoverage(context.Background(), t, s, "applications", columnCoverage{
+			bools: applicationParityBoolNames,
+			seeded: []string{
+				"admission_queue_timeout_seconds", "affinity_ttl_seconds", "api_flavors",
+				"api_token", "api_token_header", "app_path_suffix",
+				"benchmark_schedule_interval_seconds", "capacity_probe_path", "context_probe_path",
+				"created_at", "health_check_interval_seconds", "health_check_mode", "health_check_path",
+				"id", "loaded_models_format", "loaded_models_path", "messages_mode", "port", "priority",
+				"proxy_listen_port", "responses_mode", "scheme", "server_id", "status", "timeout_ms",
+				"type", "updated_at", "weight",
+			},
+			ignored: map[string]string{
+				// migration 72 replaced these two with the responses_mode / messages_mode
+				// text columns and only BACKFILLS from them; they are never dropped and
+				// no reader reads them (scanApplication / scanMappingCandidate omit them),
+				// so no fixture row needs to seed them. If a reader ever starts reading
+				// one, move it to bools (it is an integer-boolean) and seed it.
+				"native_responses": "inert orphan: replaced by responses_mode (migration 72), never read",
+				"native_messages":  "inert orphan: replaced by messages_mode (migration 72), never read",
+			},
+		})
+	})
 }

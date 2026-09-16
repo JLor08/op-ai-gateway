@@ -64,6 +64,15 @@ var aiServerParityOverrides = [3][aiServerParityRows]string{
 	{"exclude", "include", "include"}, // https_switch_override
 }
 
+// aiServerParityBoolNames names the aiServerParityBools rows in select-list
+// order -- the ONE list of the ai_servers integer-boolean columns, shared by
+// TestAIServerParityFixtureDistinguishesEverySameTypedPair and the schema-
+// coverage guard TestAIServersSchemaColumnsAllCovered so they cannot drift.
+var aiServerParityBoolNames = []string{
+	"netbird_enabled", "netbird_connected", "netbird_peer_managed",
+	"netbird_allow_ping", "netbird_ping_exclude", "managed_runtime_only",
+}
+
 // TestConformanceAIServerReadersAgreeOnEveryColumn closes a PRE-EXISTING
 // systemic gap in the conformance suite: the ai_servers column list is
 // hand-maintained in FOUR separate queries (AIServerByID, AIServers,
@@ -229,10 +238,7 @@ func TestConformanceAIServerReadersAgreeOnEveryColumn(t *testing.T) {
 // was rebuilt to close, and every test would stay green — which is how the
 // hole got there the first time.
 func TestAIServerParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
-	boolNames := []string{
-		"netbird_enabled", "netbird_connected", "netbird_peer_managed",
-		"netbird_allow_ping", "netbird_ping_exclude", "managed_runtime_only",
-	}
+	boolNames := aiServerParityBoolNames
 	for i := range aiServerParityBools {
 		trueSomewhere := false
 		for _, v := range aiServerParityBools[i] {
@@ -296,4 +302,27 @@ func normalizeServerForCompare(in routing.AIServer) routing.AIServer {
 		out.LastSeenAt = &utc
 	}
 	return out
+}
+
+// TestAIServersSchemaColumnsAllCovered ties the ai_servers parity fixture to the
+// LIVE migrated schema (issue #84): the same hand-list hazard the applications
+// and agent_runtime_specs guards close applies here too -- a new integer-boolean
+// column added to ai_servers, wired into scanAIServer and every reader but not
+// into aiServerParityBools, would seed false everywhere and stay green. This
+// fails the moment the schema grows a column no bucket below covers.
+func TestAIServersSchemaColumnsAllCovered(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		assertColumnCoverage(context.Background(), t, s, "ai_servers", columnCoverage{
+			bools: aiServerParityBoolNames,
+			seeded: []string{
+				"agent_presence_timeout_seconds", "certificate_override", "created_at", "domain",
+				"endpoint", "estimated_watts", "health_status", "https_switch_override", "id",
+				"idle_watts", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
+				"netbird_peer_id", "netbird_policy_override", "netbird_setup_key_id", "price_per_kwh",
+				"price_unit", "provider", "pue", "runtime_max_processes", "server_path_suffix",
+				"status", "system_group_id", "updated_at",
+			},
+			ignored: map[string]string{},
+		})
+	})
 }
