@@ -33,16 +33,35 @@ import (
 // failed resolve records nothing — "last used" means last SUCCESSFULLY routed,
 // so a typo or a dead model never becomes a token's redirect target.
 //
+// token is a POINTER so a successful write can refresh the caller's own
+// token.LastUsedModel in place. That refresh is what keeps the marker written
+// once per REQUEST rather than once per RESOLVE on the /v1/responses and
+// /v1/messages non-native path, where tryProxyNative resolves (and writes) then
+// declines to the translate path, which resolves again: token.LastUsedModel is
+// an auth-time snapshot, so without the refresh the change-guard below would see
+// the stale value on the second resolve and write the identical marker a second
+// time (issue #96). The write itself is idempotent — the row ends at the same
+// value — so this only avoids the redundant token-table write, never a wrong
+// one. The refresh is a no-op for the single-resolve paths (chat completions,
+// native passthrough): nothing resolves again to observe it.
+//
 // A write error is logged and swallowed: the marker is a convenience, never a
 // reason to fail a request that already has a live target.
-func (s *Server) resolveTarget(ctx context.Context, token auth.Token, req inference.Request) (routing.Target, error) {
-	target, err := s.Resolver.Resolve(ctx, token, req)
+func (s *Server) resolveTarget(ctx context.Context, token *auth.Token, req inference.Request) (routing.Target, error) {
+	target, err := s.Resolver.Resolve(ctx, *token, req)
 	if err != nil {
 		return target, err
 	}
 	if token.ID != "" && req.Model != "" && req.Model != token.LastUsedModel && s.LastUsedModelWriter != nil {
 		if wErr := s.LastUsedModelWriter(ctx, token.ID, req.Model); wErr != nil {
 			slog.Warn("last-used-model write failed", "token_id", token.ID, "user_id", token.UserID, "model", req.Model, "err", wErr)
+		} else {
+			// Refresh the caller's snapshot ONLY on a successful write, so a later
+			// resolve of the SAME request (the non-native passthrough → translate
+			// fallthrough) sees the value just persisted and suppresses the
+			// redundant write via the guard above. On a failed write the snapshot
+			// is left stale on purpose, so that second resolve still retries.
+			token.LastUsedModel = req.Model
 		}
 	}
 	return target, nil

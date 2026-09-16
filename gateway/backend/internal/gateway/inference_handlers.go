@@ -123,7 +123,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		// Native passthrough: if the resolved application supports Codex natively,
 		// proxy the raw body to the upstream /v1/responses instead of translating.
-		if s.tryProxyNative(w, r, token, raw, "openai_responses", pf) {
+		if s.tryProxyNative(w, r, &token, raw, "openai_responses", pf) {
 			return
 		}
 	}
@@ -185,7 +185,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// proxy the raw body to the upstream /v1/messages instead of translating (this
 		// is also the only way Anthropic streaming works, since the translate path
 		// rejects it).
-		if s.tryProxyNative(w, r, token, raw, "anthropic_messages", pf) {
+		if s.tryProxyNative(w, r, &token, raw, "anthropic_messages", pf) {
 			return
 		}
 	}
