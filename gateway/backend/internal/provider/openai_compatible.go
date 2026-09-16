@@ -420,14 +420,38 @@ func streamRequestBody(target routing.Target, req inference.Request, withLivePro
 	return raw, nil
 }
 
-// schemaRejectionStatus reports whether status is one an upstream uses to refuse a
+// SchemaRejectionStatus reports whether status is one an upstream uses to refuse a
 // body it could not accept: 400 Bad Request or 422 Unprocessable Entity, and
 // nothing else. 503 is excluded ON PURPOSE -- unavailableStatus maps it to
 // ErrUpstreamStarting, which the load runner consumes as "still warming up", and
 // re-issuing the request would both destroy that signal and hit an upstream that
 // is not ready. Every other status keeps its existing meaning too.
-func schemaRejectionStatus(status int) bool {
+//
+// Exported so the native-passthrough path in internal/gateway decides with the
+// SAME class, by construction rather than by comment: it injects
+// `timings_per_token` under the operator's opt-in and, having no retry, reacts
+// to a refusal by recording it through LiveProgressRejectionMemo. Widening this
+// set there would be the expensive mistake -- an auth failure (401/403) or a
+// wrong path (404) would poison the memo for the whole TTL on an upstream that
+// never objected to the key at all.
+func SchemaRejectionStatus(status int) bool {
 	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+var _ LiveProgressRejectionMemo = (*OpenAICompatibleClient)(nil)
+
+// LiveProgressRejected implements LiveProgressRejectionMemo over the client's own
+// memo -- the same object CompleteStream's guard consults, which is the whole
+// point of the seam.
+func (c *OpenAICompatibleClient) LiveProgressRejected(target routing.Target) bool {
+	return c.liveProgress.rejects(target.RouteID)
+}
+
+// RecordLiveProgressRejection implements LiveProgressRejectionMemo. Both memo
+// methods are nil-receiver-safe and take the lock themselves, so a zero-value
+// client (liveProgress == nil) and concurrent requests are both fine here.
+func (c *OpenAICompatibleClient) RecordLiveProgressRejection(target routing.Target) {
+	c.liveProgress.recordRejection(target.RouteID)
 }
 
 // CompleteStream streams a chat completion, translating the upstream's SSE into
@@ -443,7 +467,7 @@ func schemaRejectionStatus(status int) bool {
 //  1. the parameters were actually sent (liveProgress). A request that never
 //     carried them is never retried, so an ordinary 400 keeps its meaning.
 //  2. the failure is of the schema-rejection class: a 400/422 status
-//     (schemaRejectionStatus) or an in-stream error frame. Never 503, never any
+//     (SchemaRejectionStatus) or an in-stream error frame. Never 503, never any
 //     other status.
 //  3. nothing has been emitted yet -- an explicit boolean set on the first
 //     SUCCESSFUL emit, so the invariant is CHECKED rather than inferred from where
@@ -551,7 +575,7 @@ func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, targ
 //
 // Its second result mirrors completeStreamAttempt's own retry signal: true
 // when the response status is in the schema-rejection class
-// (schemaRejectionStatus). A non-nil *http.Response is returned only on a 2xx
+// (SchemaRejectionStatus). A non-nil *http.Response is returned only on a 2xx
 // status, and only then -- the caller owns closing its Body, exactly as
 // completeStreamAttempt's own `defer httpResp.Body.Close()` did before this
 // was split out: on every other path (a request/transport error, or a
@@ -576,7 +600,7 @@ func (c *OpenAICompatibleClient) startStreamRequest(ctx context.Context, target 
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		httpResp.Body.Close()
-		return nil, schemaRejectionStatus(httpResp.StatusCode), unavailableStatus(httpResp.StatusCode)
+		return nil, SchemaRejectionStatus(httpResp.StatusCode), unavailableStatus(httpResp.StatusCode)
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 	return httpResp, false, nil

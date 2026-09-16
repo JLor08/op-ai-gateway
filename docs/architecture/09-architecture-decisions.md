@@ -943,18 +943,30 @@ against a mapping with no row must stay inert, while a PRESENT map key can only
 be an explicit statement. Collapsing the two rules into one would either
 re-open the minting defect or re-close the third state. The map accepts ANY
 capability name — the vocabulary is open below — and rejects a blank one, a
-value outside the three, stating a capability whose legacy boolean the same
-request also sends, and two keys that name one capability once trimmed. Its
+value outside the three, a STATED verdict on one of the two reserved internal
+names, stating a capability whose legacy boolean the same request also sends,
+and two keys that name one capability once trimmed. Its
 store error is PROPAGATED, unlike the accompanying upsert's best-effort write:
 relinquishing the verdict is the whole effect of the action, so swallowing the
 failure would report success for nothing. What is NOT closed is minting one by
 accident from a form gone stale mid-edit
 ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open
-is the *vocabulary*, not the validation: no check compares a name against a
-known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
-`mtp`, `live_progress` and `speculation_observed` while an unrecognised
-upstream name is accepted, stored and shown verbatim — which is why the open
-vocabulary needs no escape hatch. Two verdicts reached the request path
+is the *vocabulary*, not the validation, with exactly one narrowing added after
+the fact: the code reasons about `vision`, `video`, `audio`, `tools`, `mtp`,
+`live_progress` and `speculation_observed` while an unrecognised upstream name is
+accepted, stored and shown verbatim — which is why the open vocabulary needs no
+escape hatch. The narrowing (issue #81) compares a name against a two-entry list
+for a SET only: `live_progress` and `speculation_observed` may not receive a
+`manual` verdict, because a `manual` row is rank 3, nothing re-derives it, and
+for `live_progress` the row is read by the Responses passthrough gate as a veto —
+so an operator could permanently and silently disable their own live-timings
+switch with a request that looks entirely reasonable. `mtp` is NOT on that list,
+and the asymmetry is the rule rather than an omission: it is the one internal
+name with an operator control on the mapping form, whose rank-3 permanence is
+precisely how that control is meant to work. The RESET stays open for every name
+including the two, which is what keeps this compatible with the paragraph above:
+a row a pre-narrowing build stored is still relinquishable, so no row is made
+uncorrectable. Two verdicts reached the request path
 through the candidate query's own **filtered** LEFT JOINs when this decision
 was taken; `mtp` and its join went with the scorer's flat bonus, so today
 there is one

@@ -228,7 +228,12 @@ export type CreateMappingRequest = {
   // A capability's verdict, stated outright and keyed by capability name.
   // 'yes'/'no' writes a `manual` row, '' writes none. A capability named here
   // wins over the legacy boolean above and over the backend's MTP name
-  // heuristic. The vocabulary is open (any capability name is accepted).
+  // heuristic. The vocabulary is open (any capability name is accepted), with
+  // one narrowing: stating a verdict for 'live_progress' or
+  // 'speculation_observed' is a 400, because only an internal writer may
+  // establish those and a `manual` row would outrank it permanently. '' still
+  // resets them. MappingForm sends 'mtp' and 'vision' only, so no form can
+  // produce that refusal.
   capability_verdicts?: Record<string, CapabilityVerdictInput>;
 };
 
@@ -273,7 +278,13 @@ export type UpdateMappingRequest = {
   // a reset applied by a separate request would be undone by the operator's
   // next unrelated edit. Naming a capability here AND sending its legacy
   // boolean is a 400 (two statements about one row, read by two different
-  // rules), as is a value outside the three above.
+  // rules), as is a value outside the three above, and as is STATING a verdict
+  // for 'live_progress' or 'speculation_observed' -- capabilities only an
+  // internal writer may establish, since a `manual` row would outrank it
+  // permanently (for 'live_progress' that silently disables the application's
+  // own responses-live-timings switch). '' still resets those two, so a row an
+  // older build stored stays correctable. MappingForm sends 'mtp' and 'vision'
+  // only, so no form can produce that refusal.
   //
   // A `null` on the booleans could not have carried the third state:
   // is_mtp/vision_capable are optional, so `{vision_capable: null}` is

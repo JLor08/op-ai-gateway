@@ -775,8 +775,9 @@ by shape, so tests pin both:
   for it, and never over a value the client set itself.** It is the one request
   parameter the gateway ever adds on this path, and the second of the only two
   body edits `proxyNative` makes — the other being the model rewrite.
-  `wantsResponsesLiveTimings` (`responses_live_timings.go`) is the whole of the
-  decision, and it answers true only when **all five** of these hold:
+  `wantsResponsesLiveTimings` (`responses_live_timings.go`) is the whole of what
+  the operator's CONFIGURATION permits, and it answers true only when **all
+  five** of these hold:
   1. `Target.ResponsesLiveTimingsEnabled` — the operator's per-endpoint opt-in,
      resolved spec-over-application, the same precedence `responses_mode` uses
      ([API Surface](../reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode));
@@ -802,6 +803,24 @@ by shape, so tests pin both:
   `true` on an incapable row — so a restored dump or a direct write can produce
   one the request path must not act on.
 
+  A **sixth** condition is ANDed at `proxyNative`'s call site rather than folded
+  into those five: `liveProgressRejectedFor` must say that THIS process has not
+  already seen the upstream refuse the parameters. The split is deliberate and
+  load-bearing in both directions. The predicate stays a pure function of
+  target + flavor + stream — no clock, no store, no memo — which is what makes
+  its table test (`TestWantsResponsesLiveTimings`) a statement about the whole of
+  the configuration rule instead of most of it; and an observation belongs in the
+  memo rather than in the predicate because it EXPIRES (5 minutes) where a stored
+  verdict does not, so an upstream replaced behind the same mapping starts being
+  asked again without a gateway restart. Read together: the five are what the
+  operator permits, the sixth is what this process has learned. The construction
+  is copied from `internal/provider`'s own guard, `wantsLiveProgress(target) &&
+  !c.liveProgress.rejects(target.RouteID)` — whose fourth check this path
+  silently dropped for two releases, exactly as the gate's own doc comment
+  predicted a caller would — and the memo is the very same object, reached
+  through the exported `provider.LiveProgressRejectionMemo` seam, which is what
+  makes the two endpoints agree (below).
+
   A client that sent `timings_per_token` **itself** — `true` or `false` — has its
   body forwarded unchanged: the injection tests for the key's *presence*, not its
   value, because llama.cpp was measured treating an explicit `false` exactly as
@@ -811,8 +830,41 @@ by shape, so tests pin both:
   operator's switch ineffective for its own requests, with nothing on the panel
   explaining why.
 
-  **Nothing retries without it.** An upstream that rejects the key answers the
-  client's request with its own 4xx. That residual is measured-small rather than
+  **Nothing retries without it, and the refusal is now learned once rather than
+  re-earned every request.** An upstream that rejects the key answers the
+  client's request with its own 4xx — that request is not retried, and this
+  design still declines to build a retry. What changed is what happens NEXT:
+  when the gateway INJECTED the key and the upstream answered
+  `provider.SchemaRejectionStatus` (400 or 422 — the same class the translate
+  path's retry uses, and nothing wider, because a 401, 404 or 429 would blame the
+  key for a refusal it had no part in and this path has no retry to discover the
+  mistake), `proxyNative` records the rejection through the shared memo and says
+  so at **Warn**, which is on at the default log level. So both endpoints stop
+  asking this mapping until the memo's TTL expires, and the residual narrows from
+  "a 4xx for every request on that application" to "the first request per serving
+  mapping per TTL". Recording is guarded on the gateway having actually injected:
+  a refusal a client's own `timings_per_token` earned says nothing about the
+  gateway's key, and attributing it would cost an uninvolved mapping its live
+  figure.
+
+  **One memo, two endpoints.** The record lands in the same `liveProgressMemo`
+  `CompleteStream` consults, so a refusal learned on `/v1/responses` also stops
+  `/v1/chat/completions` sending its parameter PAIR, and one learned by
+  `CompleteStream`'s retry stops this path injecting. In production that sharing
+  is automatic rather than arranged: one `OpenAICompatibleClient` is registered
+  under every OpenAI-compatible provider key inside one `Multiplexer`, and
+  `dispatchProxyNative` and `dispatchCompleteStream` resolve the same
+  `clients[target.Provider]` entry. It is sound for the same reason the memo is
+  safe at all — it records NEGATIVES only, a stale negative costs at most the
+  "never measured" em-dash, and the TTL undoes it. The two paths do not send the
+  same parameters (translate sends `timings_per_token` **and**
+  `stream_options.continuous_usage_stats`, passthrough only the former), so a
+  translate-learned rejection is slightly over-broad here; that direction is
+  deliberate, because it loses a display figure and never a request. Two cases
+  neither suppress nor heal: a target with an empty `RouteID` is never memoized
+  (the probe- and benchmark-built targets), and a provider whose client lacks the
+  optional seam reads as "nothing recorded" — which is the behaviour this gate
+  had before the seam existed, never an unexplainable refusal. That residual is measured-small rather than
   overlooked: on the build this was measured against, `/v1/responses` answered a
   request carrying an entirely fabricated top-level key with an ordinary
   completion, and llama.cpp's request schema is pull-based, so a key nobody asks
@@ -852,15 +904,35 @@ a provider-model override applies. The injected `timings_per_token` widens the
 divergence from cosmetic to semantic. Changing what is captured is deliberately
 out of scope here: it is a behaviour change for **every** passthrough request and
 would put the internal provider model name in front of the tenant. What closes
-the operator's gap instead is the **request log** — `proxyNative`'s per-request
-`inference request (native passthrough)` debug line carries
-`timings_per_token_injected`, so an operator holding an unexplained upstream 4xx
-has one grep that says whether the gateway added a key the capture does not show.
+the operator's gap instead is the **request log**, at two levels, and the
+distinction between them matters because the first one alone was not enough:
+
+- `proxyNative`'s per-request `inference request (native passthrough)` **debug**
+  line carries `timings_per_token_injected` in both directions, for every
+  request. It answers "did the gateway add a key on this request?" — including
+  the false cases, which are what an operator debugging "the switch is on and
+  the panel is still blank" actually needs. But it is DEBUG, and
+  `OP_AI_GATEWAY_LOG_LEVEL` defaults to `info`, so in a default deployment it
+  says nothing until the level is raised (the portal's Logs view can do that
+  live).
+- The refusal itself is a **Warn** line, on at that default level, emitted only
+  when the gateway injected the key and the upstream answered 400/422. It names
+  the `route_id` and the `status`, and says that nothing was retried and that the
+  mapping is suppressed until the memo expires. So the operator holding an
+  unexplained upstream 4xx has one grep that works out of the box, rather than
+  one that first requires knowing to turn Debug on. Warn is this package's level
+  for a refusal with a nameable cause, and it is a SEPARATE conditional line
+  rather than a promotion of the per-request one, which would be per-request
+  spam. It is also distinct from `nativeTerminalStatus`'s own upstream-error
+  Warn: that one reports the status, this one reports the cause and the remedy.
+
 No wire change, no DTO field, nothing tenant-visible. The panel gains no "we
 asked" state either: when the key is injected, the request succeeds and no
 partial carries `timings`, the row is byte-identical to one where nothing was
 injected — and the panel's job is to report the number and where it came from,
-not who asked for it. Revisit that if the case is ever observed.
+not who asked for it. That decision stands; the case #81 said to revisit it on
+is the 4xx, and what it got is the Warn line and the memo entry above rather
+than a panel state.
 
 **What this surface does and does not distinguish**, since the tooltip's refusal
 to name a cause is easy to mistake for a missing field. `provider_path` **does**
@@ -1424,9 +1496,37 @@ does `probedCapabilityRows`).
 
 Their *differences* are what a rule has to be placed against. The
 reserved-name refusal — `mtp`, `live_progress` and `speculation_observed` may
-not arrive from a probe — lives on the **agent-ingest path only**,
-deliberately: that is the boundary where an agent's bytes arrive, and it is
-the only path with an open vocabulary to police. The gateway path's
+not arrive from a probe — lives on the **agent-ingest path only** among the
+PROBE writers, deliberately: that is the boundary where an agent's bytes
+arrive, and it is the only probe path with an open vocabulary to police.
+
+A **second** reservation, with a different motivation and a deliberately
+different shape, guards the OPERATOR's own write
+(`portal.reservedManualCapabilityNames`). There the danger is not untrusted
+bytes but an entirely reasonable-looking admin request: a `manual` row is rank 3
+and nothing re-derives it, so a manual `live_progress: "no"` reaches
+`Target.LiveProgressSupport` as `"unsupported"` and permanently, silently vetoes
+the operator's own live-timings switch — the switch's own condition 5 — with no
+probe able to outrank it and no control on the mapping form able to clear it
+(that form submits `mtp` and `vision` only). `speculation_observed` is reserved
+on the structural half of the same argument: its one writer is the gateway's
+observation of relayed traffic, at rank 1 and at most once per mapping per
+process lifetime, so a manual row survives even a restart, and a `"no"` states
+something its vocabulary cannot mean. The portal's list therefore carries two
+names where the ingest list carries three: **`mtp` is deliberately absent**,
+because it is the one internal name that HAS an operator control, whose rank-3
+permanence is exactly how that control is meant to work.
+
+The portal refusal is **SET-only**: a `"yes"`/`"no"` on a reserved name is a
+`400` (`mapping.capability_reserved`), while the empty verdict still DELETES the
+row. Without that asymmetry a row minted before the reservation existed would be
+permanently uncorrectable — the objection `normalizeCapabilityVerdicts`' own doc
+comment raises against name-whitelisting, and the reason
+[§11.1](../11-risks-and-technical-debt.md#111-operational-risks) can keep
+recording "a manual verdict has no way back" as closed. The two lists are
+separate copies by construction, not by oversight: `internal/portal` may not
+import `internal/gateway` (a frozen forbidden edge), so both are keyed on the
+same `routing.Capability*` constants instead. The gateway path's
 `caps.Extra` is empty by construction (its `detectCapabilities` writes only
 the four structured fields), so no unvetted name can reach
 `probedCapabilityRows` today. The day the gateway grows a detector that fills
@@ -1623,11 +1723,23 @@ stale *positive* would send the parameters to an upstream that answers 400 —
 the dead stream this design exists to eliminate. There is therefore no
 positive entry that could go stale.
 
+The memo now has **two writers and two readers, on two endpoints**, reached from
+outside `internal/provider` through the exported
+`provider.LiveProgressRejectionMemo` seam: `CompleteStream`'s retry and its own
+guard, plus `proxyNative`'s 400/422-after-injection branch and the sixth
+condition on the Responses injection. The shared object is the OBSERVATION, not
+the predicate — `wantsLiveProgress` is still never consulted on the passthrough
+path, and `continuous_usage_stats` is still never sent there. What makes sharing
+one memo across two endpoints that send different parameter sets acceptable is
+the negative-only asymmetry above: the over-broad direction (a translate-learned
+refusal suppressing a passthrough injection that might have been tolerated)
+costs a display figure for at most one TTL.
+
 **Native passthrough gets neither of `CompleteStream`'s parameters — and gets the
 live figures its own relayed frames can support, which is not the same
 statement.** `stream_options.continuous_usage_stats` is never added on this path
 at all, and `timings_per_token` is added only under the operator's per-endpoint
-opt-in and the four other conditions the gate applies (see "Two rules on this
+opt-in and the five other conditions the gate applies (see "Two rules on this
 path must survive any later change" above) — never through `wantsLiveProgress`,
 whose verdict describes the *completion* endpoint's parameter schema and which is
 deliberately not reused here. Everything else `proxyNative` forwards is the

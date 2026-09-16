@@ -352,8 +352,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// whose client already sent the key -- two different reasons for a panel
 	// cell that stays blank with the switch on, which is why it is recorded
 	// from the helper's own answer rather than inferred from the gate.
+	//
+	// The memo check is the SIXTH condition and lives here, not in the
+	// predicate: the predicate answers what the operator's configuration
+	// permits and stays pure so its table test covers the whole of that, while
+	// liveProgressRejectedFor answers what this process has already observed.
+	// Same construction as internal/provider's own guard,
+	// `wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)`.
 	injectedLiveTimings := false
-	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) {
+	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) && !liveProgressRejectedFor(s.Provider, target) {
 		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
 	}
 
@@ -410,6 +417,40 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		return
 	}
 	defer resp.Body.Close()
+
+	// A body carrying the key WE added was refused the way an upstream refuses a
+	// body it cannot accept. Two things happen, and both are the whole of issue
+	// #81's rejection residual:
+	//
+	//  1. It is SAID OUT LOUD, at Warn. The per-request line above carries
+	//     `timings_per_token_injected` too, but it is Debug and
+	//     OP_AI_GATEWAY_LOG_LEVEL defaults to "info", so in a default deployment
+	//     the operator's "one grep" for an unexplained upstream 4xx found
+	//     nothing. Warn is this package's level for a refusal with a nameable
+	//     cause, and a separate CONDITIONAL line rather than a promotion of the
+	//     per-request one, which would be per-request spam. It is distinct from
+	//     nativeTerminalStatus's own upstream-error Warn because that one reports
+	//     the status; this one reports the cause and the remedy.
+	//  2. It is REMEMBERED, in the same memo internal/provider's CompleteStream
+	//     consults, so neither endpoint asks this mapping again until the memo's
+	//     TTL expires. There is still no retry -- this request keeps the
+	//     upstream's own status and body, relayed verbatim below -- so the
+	//     residual narrows from "every request on that application" to "the
+	//     first request per serving mapping per TTL".
+	//
+	// Both are guarded on injectedLiveTimings, which is false when the CLIENT
+	// sent the key itself: a refusal that body earned says nothing about the
+	// gateway's key, and recording it would cost an uninvolved mapping its live
+	// figure. provider.SchemaRejectionStatus is the same 400/422 class the
+	// translate path's retry uses; anything wider (401, 404, 429) would blame the
+	// key for a refusal it had no part in, and this path has no retry to discover
+	// the mistake.
+	if injectedLiveTimings && provider.SchemaRejectionStatus(resp.StatusCode) {
+		slog.Warn("upstream refused the injected live timings parameter (not retried; suppressed for this mapping until the memo expires)",
+			"path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName,
+			"route_id", target.RouteID, "status", resp.StatusCode)
+		recordLiveProgressRejection(s.Provider, target)
+	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {

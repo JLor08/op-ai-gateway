@@ -107,6 +107,51 @@ func (m *Multiplexer) ProxyNative(ctx context.Context, target routing.Target, pa
 	return res, err
 }
 
+var _ LiveProgressRejectionMemo = (*Multiplexer)(nil)
+
+// liveProgressMemoFor resolves target to its client and reports the memo
+// capability if that client has it. Resolution is the SAME expression
+// dispatchProxyNative and dispatchCompleteStream use -- m.clients[target.Provider],
+// falling back to m.fallback -- which is precisely why a rejection recorded on
+// one of those two endpoints is seen by the other: in production both resolve to
+// the one OpenAICompatibleClient registered under every OpenAI-compatible key.
+//
+// Unlike those two dispatchers this one never errors. The capability is OPTIONAL
+// (LiveProgressRejectionMemo), so a client without it, an unresolvable provider
+// key and a nil Multiplexer all read as "nothing recorded" -- the state that
+// means "send them", i.e. exactly the behaviour every caller had before this
+// seam existed.
+func (m *Multiplexer) liveProgressMemoFor(target routing.Target) (LiveProgressRejectionMemo, bool) {
+	if m == nil {
+		return nil, false
+	}
+	client := m.clients[strings.TrimSpace(target.Provider)]
+	if client == nil {
+		client = m.fallback
+	}
+	memo, ok := client.(LiveProgressRejectionMemo)
+	return memo, ok
+}
+
+// LiveProgressRejected implements LiveProgressRejectionMemo by delegating to the
+// resolved client. A provider that cannot remember never refuses.
+func (m *Multiplexer) LiveProgressRejected(target routing.Target) bool {
+	memo, ok := m.liveProgressMemoFor(target)
+	if !ok {
+		return false
+	}
+	return memo.LiveProgressRejected(target)
+}
+
+// RecordLiveProgressRejection implements LiveProgressRejectionMemo by delegating
+// to the resolved client. A provider that cannot remember drops the record, which
+// only restores the pre-memo cost of one wasted round trip on that mapping.
+func (m *Multiplexer) RecordLiveProgressRejection(target routing.Target) {
+	if memo, ok := m.liveProgressMemoFor(target); ok {
+		memo.RecordLiveProgressRejection(target)
+	}
+}
+
 func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
 	if m == nil {
 		return nil, ErrUnavailable

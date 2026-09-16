@@ -211,3 +211,48 @@ func (m *liveProgressMemo) recordRejection(routeID string) {
 	}
 	m.rejectedAt[routeID] = now
 }
+
+// LiveProgressRejectionMemo is the optional capability of remembering, per
+// serving model mapping, that an upstream REFUSED the live-progress request
+// parameters -- the exported seam onto the memo above. Optional in the same
+// sense as NativeProxyClient (proxy.go): a caller type-asserts for it and
+// carries on unchanged when the resolved client does not have it, which is why
+// it is a second interface rather than a method on NativeProxyClient -- that
+// one has eight implementations, six of them test fakes.
+//
+// It exists because the memo has TWO writers and TWO readers across a package
+// boundary, and before the seam only one pair could reach it. CompleteStream
+// (translate, /v1/chat/completions) records its own retry-confirmed rejection
+// and consults the memo at its guard; internal/gateway's native passthrough
+// (/v1/responses) injects llama.cpp's `timings_per_token` under the operator's
+// opt-in, has NO retry to absorb a wrong guess, and so both needs to stop
+// asking after a refusal and to be told when another endpoint already learned
+// one. Since Multiplexer.dispatchProxyNative and dispatchCompleteStream resolve
+// the SAME m.clients[target.Provider] entry, and production registers one
+// OpenAICompatibleClient under every OpenAI-compatible provider key, a record
+// made through either path is seen by both.
+//
+// Both methods take a routing.Target rather than a bare route id so *Multiplexer
+// can implement them: it has to resolve target.Provider to a client exactly as
+// its other dispatchers do. The memo itself still keys on target.RouteID alone.
+//
+// The asymmetry that makes sharing one memo across two endpoints safe is the
+// memo's own: it records NEGATIVES only, and a stale negative costs at most a
+// missing advisory number that the portal already renders as its "never
+// measured" em-dash, healing by itself when the TTL expires. The two paths do
+// not send the same parameter SET -- translate sends `timings_per_token` AND
+// `stream_options.continuous_usage_stats`, passthrough only the former -- so a
+// translate-learned rejection is very slightly over-broad for the passthrough
+// path (the refusal may have been earned by the other key). That direction is
+// deliberate: it loses a display figure, never a request, and the TTL undoes it.
+type LiveProgressRejectionMemo interface {
+	// LiveProgressRejected reports whether target's upstream has an un-expired
+	// rejection on record. False for an empty RouteID and for an empty memo,
+	// which is what makes "nothing recorded" mean "send them".
+	LiveProgressRejected(target routing.Target) bool
+	// RecordLiveProgressRejection notes that target's upstream refused the
+	// parameters. A no-op for an empty RouteID: a hand-built target (probe,
+	// benchmark, test) has no mapping id, and treating "" as one shared key
+	// would let one upstream's refusal suppress the figure everywhere.
+	RecordLiveProgressRejection(target routing.Target)
+}

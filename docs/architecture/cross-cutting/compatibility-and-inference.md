@@ -398,7 +398,7 @@ because the **client** set it, in which case it is relayed untouched, or because
 the application's (or runtime spec's) `responses_live_timings_enabled` opt-in is
 on and the request is a streaming `/v1/responses` passthrough to a `llama_cpp`
 upstream. A **buffered** response still gets nothing at all, having no frames to
-time. The per-flavor detail, the five conditions that gate the injection, and
+time. The per-flavor detail, the five conditions that gate the injection plus the sixth ANDed at its call site, and
 the two rules that keep it honest — a relayed body is augmented only where the
 operator asked and never over a value the client set itself, and no in-flight
 figure ever becomes a routing input — are in [Telemetry, Usage Analytics &

@@ -155,7 +155,7 @@ func TestPortalMappingCreateStatesACapabilityVerdict(t *testing.T) {
 	}
 }
 
-// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the four
+// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the five
 // sentinels reach the HTTP layer as 400s with their own codes rather than a
 // default 500 -- the same guard TestPortalMappingCreateNegativeMetricReturns400
 // provides for ErrMappingMetricInvalid, and equally easy to lose: a sentinel
@@ -188,6 +188,14 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 			body:     `{"capability_verdicts":{"vision":"no"," vision":"yes"}}`,
 			wantCode: "mapping.capability_duplicate",
 		},
+		{
+			// Issue #81's reserved internal name: a manual rank-3 row on
+			// live_progress permanently vetoes the operator's own
+			// responses-live-timings switch, and no probe outranks it.
+			name:     "a verdict stated for a reserved internal capability",
+			body:     `{"capability_verdicts":{"live_progress":"no"}}`,
+			wantCode: "mapping.capability_reserved",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := patchMapping(t, srv, created.ID, tc.body)
@@ -206,5 +214,22 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 				t.Fatalf("error code = %q, want %q (body = %s)", body.Error.Code, tc.wantCode, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestPortalMappingReservedCapabilityResetReturns200 is the other half of the
+// reservation at the HTTP layer, and the one that keeps it safe: a stored row an
+// older build allowed must still be clearable through the same endpoint. The
+// refusal above is SET-only, so an empty verdict answers 200 rather than the
+// 400 a name-based whitelist would have returned -- which is what makes §11.1's
+// "a manual verdict has no way back" risk stay closed.
+func TestPortalMappingReservedCapabilityResetReturns200(t *testing.T) {
+	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
+	appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8033,"scheme":"https"}`)
+	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reset","app_model_name":"cap-reset-up"}`)
+
+	rec := patchMapping(t, srv, created.ID, `{"capability_verdicts":{"live_progress":""}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s -- resetting a reserved name must stay allowed", rec.Code, rec.Body.String())
 	}
 }
