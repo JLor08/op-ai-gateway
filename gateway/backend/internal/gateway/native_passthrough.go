@@ -164,7 +164,7 @@ func sniffRoutingModel(raw []byte) (model string, stream bool) {
 // application it returns false, leaving the caller's existing translate path
 // to handle (and properly error-record) the request, reusing the SAME pf
 // rather than re-running the gate a second time.
-func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, apiFlavor string, pf preflight) bool {
+func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, pf preflight) bool {
 	start := time.Now()
 	req := pf.Req
 	model := req.Model
@@ -174,6 +174,12 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 	// resolve on the /v1/responses + /v1/messages non-native path only (chat
 	// completions is untouched). We accept that over threading a pre-resolved target
 	// through the battle-tested complete/completeStream* functions.
+	//
+	// token is the caller's own snapshot (a pointer), so resolveTarget's
+	// last-used-model refresh on this first resolve lands on the handler's token;
+	// the translate path then copies that refreshed value and its second resolve
+	// suppresses the redundant marker write (issue #96). Only the marker write is
+	// deduped this way — the resolve itself still runs twice, as documented above.
 	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
 		// An admission-queue rejection (CP4: timeout or full) is TERMINAL for the request —
@@ -183,11 +189,11 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 		// consistent. Mark the request handled (true).
 		if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
 			id := nextRequestID()
-			capturing := s.capturingEnabled(token)
+			capturing := s.capturingEnabled(*token)
 			ireq := req
 			slog.Warn("native passthrough admission rejected", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "code", completionErrorCode(err), "status", completionHTTPStatus(err))
 			body := writeCompletionErrorCaptured(w, err)
-			s.recordUsage(start, token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor))
+			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor))
 			return true
 		}
 		// Routing failed (no route for the model, or the application is currently
@@ -210,7 +216,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 	}
 	switch mode {
 	case routing.EndpointModePassthrough:
-		s.proxyNative(w, r, token, target, path, raw, req)
+		s.proxyNative(w, r, *token, target, path, raw, req)
 		return true
 	case routing.EndpointModeDisabled:
 		// The resolved application (or, for a server_agent app, the resolved runtime
@@ -223,13 +229,13 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token au
 		// event against the resolved target so the rejection is visible in
 		// Activity/Logs, mirroring the admission-timeout terminal branch above.
 		id := nextRequestID()
-		capturing := s.capturingEnabled(token)
+		capturing := s.capturingEnabled(*token)
 		code, status := endpointDisabledError(apiFlavor)
 		slog.Debug("native passthrough rejected: endpoint disabled",
 			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
 			"server", s.serverName(target.ServerID), "code", code, "status", status)
 		body := writeJSONCaptured(w, status, apierror.Response(code, msgEndpointDisabled, ""))
-		s.recordUsage(start, token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor))
+		s.recordUsage(start, *token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor))
 		return true
 	default:
 		// translate (or an unpopulated "" mode — treated as translate, the safe

@@ -843,3 +843,63 @@ func TestResponsesEndpointModeTable(t *testing.T) {
 		})
 	}
 }
+
+// TestResponsesMessagesLastUsedModelWrittenOncePerRequest pins issue #96: on a
+// NON-native /v1/responses or /v1/messages request the routing target resolves
+// TWICE — tryProxyNative resolves and declines, then the translate path
+// (complete for a buffered body, beginStream for a stream) resolves again — and
+// the last-used-model marker must be written EXACTLY ONCE, not once per resolve.
+// It was written twice because token.LastUsedModel is an auth-time snapshot the
+// first write did not refresh, so the change-guard (req.Model != LastUsedModel)
+// saw the stale value on both resolves. The double write is silent (the row ends
+// at the right value) but doubles the token-table write load the guard exists to
+// avoid, on exactly the two passthrough-capable endpoints.
+//
+// The three translate rows cover both second-resolve sites (complete and
+// beginStream) and both flavors; the native row is the regression guard that a
+// request actually served natively still writes its marker once (it resolves
+// once and never reaches the translate path). All are driven end-to-end through
+// ServeHTTP, which the sibling unit test TestTryProxyNativeRecordsLastUsedModel
+// cannot do — it stops at tryProxyNative and never runs the follow-on resolve
+// that produced the second write.
+func TestResponsesMessagesLastUsedModelWrittenOncePerRequest(t *testing.T) {
+	cases := []struct {
+		name          string
+		path          string
+		body          string
+		responsesMode routing.EndpointMode
+		messagesMode  routing.EndpointMode
+		wantProxy     int // 0 => the translate path (the double-resolve) handled it; 1 => native passthrough
+	}{
+		{"responses non-native buffered", "/v1/responses", `{"model":"gw-model","input":"hi"}`, routing.EndpointModeTranslate, routing.EndpointModeTranslate, 0},
+		{"responses non-native stream", "/v1/responses", `{"model":"gw-model","input":"hi","stream":true}`, routing.EndpointModeTranslate, routing.EndpointModeTranslate, 0},
+		{"messages non-native buffered", "/v1/messages", `{"model":"gw-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, routing.EndpointModeTranslate, routing.EndpointModeTranslate, 0},
+		{"responses native passthrough", "/v1/responses", `{"model":"gw-model","input":"hi"}`, routing.EndpointModePassthrough, routing.EndpointModeTranslate, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"}
+			srv := newNativeModeTestServer(prov, tc.responsesMode, tc.messagesMode)
+			var writes []string
+			srv.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+				writes = append(writes, tokenID+"="+model)
+				return nil
+			}
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer dev-secret")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+			}
+			if prov.proxyCalls != tc.wantProxy {
+				t.Fatalf("proxyCalls = %d, want %d (0 = translate/double-resolve path, 1 = native)", prov.proxyCalls, tc.wantProxy)
+			}
+			if len(writes) != 1 || writes[0] != "tok_dev=gw-model" {
+				t.Fatalf("last-used-model writes = %v, want exactly [tok_dev=gw-model] (written once per request, not once per resolve)", writes)
+			}
+		})
+	}
+}

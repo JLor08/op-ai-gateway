@@ -105,14 +105,14 @@ func TestResolveTargetRecordsLastUsedModelOnlyOnChange(t *testing.T) {
 	}
 	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
 
-	if _, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "qwen3-32b"}); err != nil {
+	if _, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "qwen3-32b"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if len(writes) != 0 {
 		t.Fatalf("unchanged model wrote %v, want no write", writes)
 	}
 
-	if _, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "llama-70b"}); err != nil {
+	if _, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "llama-70b"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if len(writes) != 1 || writes[0] != "tok_1=llama-70b" {
@@ -134,12 +134,63 @@ func TestResolveTargetSwallowsWriterErrorAndKeepsTarget(t *testing.T) {
 	}
 	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
 
-	target, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "llama-70b"})
+	target, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "llama-70b"})
 	if err != nil {
 		t.Fatalf("resolveTarget returned %v, want nil (writer error must be swallowed)", err)
 	}
 	if target.ServerID == "" {
 		t.Fatalf("target = %#v, want the live target resolved before the writer ran", target)
+	}
+	// A FAILED write must not refresh the in-memory snapshot (issue #96): the
+	// refresh sits in the write's success branch precisely so that a same-request
+	// second resolve still retries. Refreshing here would suppress that retry and
+	// silently drop the update.
+	if token.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("token.LastUsedModel = %q after a failed write, want %q unchanged (a failed write must not refresh the snapshot)", token.LastUsedModel, "qwen3-32b")
+	}
+}
+
+// TestResolveTargetRetriesWriteAfterFailedWrite pins the retry-on-failure
+// semantics of the #96 snapshot refresh: token.LastUsedModel is refreshed ONLY
+// after a successful write (inference_resolve.go's else-branch), so when the
+// FIRST resolve's marker write fails the snapshot stays stale and the SAME
+// request's second resolve (the non-native passthrough -> translate fallthrough)
+// still attempts the write. A refactor that refreshed the snapshot
+// unconditionally would suppress that retry and silently drop the update — and
+// every other last-used-model test would still pass, because they all use an
+// always-succeeding writer that never exercises this branch.
+func TestResolveTargetRetriesWriteAfterFailedWrite(t *testing.T) {
+	s := newTestServer(t)
+	var attempts []string
+	failNext := true
+	s.LastUsedModelWriter = func(_ context.Context, tokenID, model string) error {
+		attempts = append(attempts, tokenID+"="+model)
+		if failNext {
+			failNext = false
+			return errors.New("transient write failure")
+		}
+		return nil
+	}
+	token := auth.Token{ID: "tok_1", LastUsedModel: "qwen3-32b"}
+
+	// First resolve: the write fails, so the snapshot must stay stale.
+	if _, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "llama-70b"}); err != nil {
+		t.Fatalf("resolve #1: %v", err)
+	}
+	if token.LastUsedModel != "qwen3-32b" {
+		t.Fatalf("after the failed write token.LastUsedModel = %q, want %q unchanged", token.LastUsedModel, "qwen3-32b")
+	}
+
+	// Second resolve on the SAME token: the guard is still true (stale snapshot),
+	// so the write is retried — this time it succeeds and refreshes the snapshot.
+	if _, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "llama-70b"}); err != nil {
+		t.Fatalf("resolve #2: %v", err)
+	}
+	if len(attempts) != 2 || attempts[0] != "tok_1=llama-70b" || attempts[1] != "tok_1=llama-70b" {
+		t.Fatalf("write attempts = %v, want two [tok_1=llama-70b] (the failed first write must be retried by the second resolve)", attempts)
+	}
+	if token.LastUsedModel != "llama-70b" {
+		t.Fatalf("after the successful retry token.LastUsedModel = %q, want %q (refresh only on success)", token.LastUsedModel, "llama-70b")
 	}
 }
 
@@ -163,7 +214,7 @@ func TestResolveTargetSkipsLastUsedModelForTokenlessPrincipal(t *testing.T) {
 	// last-used marker.
 	token := auth.Token{UserID: "usr_1"}
 
-	if _, err := s.resolveTarget(context.Background(), token, inference.Request{Model: "qwen3-32b"}); err != nil {
+	if _, err := s.resolveTarget(context.Background(), &token, inference.Request{Model: "qwen3-32b"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if len(writes) != 0 {
@@ -182,7 +233,7 @@ func TestResolveTargetDoesNotRecordOnFailure(t *testing.T) {
 	}
 	s.Resolver = failingResolver(routing.ErrNoModelRoute)
 
-	if _, err := s.resolveTarget(context.Background(), auth.Token{ID: "tok_1"},
+	if _, err := s.resolveTarget(context.Background(), &auth.Token{ID: "tok_1"},
 		inference.Request{Model: "nope"}); err == nil {
 		t.Fatal("expected the resolver error to surface")
 	}
@@ -247,7 +298,7 @@ func TestTryProxyNativeRecordsLastUsedModel(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	w := httptest.NewRecorder()
 
-	if handled := s.tryProxyNative(w, r, token, []byte("{}"), "", pf); handled {
+	if handled := s.tryProxyNative(w, r, &token, []byte("{}"), "", pf); handled {
 		t.Fatalf("tryProxyNative returned true, want false (seeded application has no native flags)")
 	}
 	if len(writes) != 1 || writes[0] != "tok_1=llama-70b" {
