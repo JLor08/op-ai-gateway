@@ -510,6 +510,62 @@ func testTokenDefaultsUnchanged(t *testing.T, s *SQLStore) {
 	}
 }
 
+// TestConformanceSetTokenLastUsedModel runs SetTokenLastUsedModel against BOTH
+// dialects (issue #97). Its only direct tests were sqlite-only
+// (sqlite_token_test.go), so the setter had never executed under this suite's
+// PostgreSQL leg — the dialect suite touched last_used_model only as a
+// CreatePlainToken/TokenByID column round-trip (the two tests above), never via
+// the setter. Here a populated hit persists the model and reads back through
+// TokenByID; a populated miss and an EMPTY id both resolve to 0 rows affected and
+// so return ErrNotFound on each dialect (the empty-id case had no test at all
+// before this — see the portal conformance suite for the memory-vs-SQL half).
+func TestConformanceSetTokenLastUsedModel(t *testing.T) {
+	forEachDialect(t, testSetTokenLastUsedModel)
+}
+
+func testSetTokenLastUsedModel(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_lum", "lum@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	rec := TokenRecord{ID: "tok_lum", UserID: "usr_lum", Name: "lum", LastUsedModel: "qwen3-32b", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, rec, "lum-secret-value"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	before, err := s.TokenByID(ctx, "tok_lum")
+	if err != nil {
+		t.Fatalf("TokenByID(before): %v", err)
+	}
+
+	// populated-hit: the setter OVERWRITES the prior value (seeded non-empty),
+	// persists it readably via TokenByID, and disturbs no sibling column — on each
+	// dialect, so postgres gets the narrow-write coverage the sqlite-only per-driver
+	// test could not give it.
+	if err := s.SetTokenLastUsedModel(ctx, "tok_lum", "llama-70b"); err != nil {
+		t.Fatalf("SetTokenLastUsedModel(hit) = %v, want nil", err)
+	}
+	got, err := s.TokenByID(ctx, "tok_lum")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.LastUsedModel != "llama-70b" {
+		t.Fatalf("LastUsedModel = %q, want %q (overwrite of %q)", got.LastUsedModel, "llama-70b", before.LastUsedModel)
+	}
+	if got.Name != before.Name || got.Status != before.Status || got.UserID != before.UserID {
+		t.Fatalf("setter disturbed a sibling column: before=%+v after=%+v", before, got)
+	}
+
+	// populated-miss and empty-id both match no row (0 rows affected) -> ErrNotFound.
+	if err := s.SetTokenLastUsedModel(ctx, "tok_missing", "m"); err != ErrNotFound {
+		t.Fatalf("SetTokenLastUsedModel(missing) = %v, want ErrNotFound", err)
+	}
+	if err := s.SetTokenLastUsedModel(ctx, "", "m"); err != ErrNotFound {
+		t.Fatalf("SetTokenLastUsedModel(empty id) = %v, want ErrNotFound", err)
+	}
+}
+
 // --- 4. Sessions + set-password tokens -------------------------------------
 
 func TestConformanceSessionsAndSetPasswordTokens(t *testing.T) {

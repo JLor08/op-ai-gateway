@@ -136,6 +136,14 @@ type TokenRepository interface {
 	UpdateTokenMetadata(ctx context.Context, token store.TokenRecord) error
 	DeleteToken(ctx context.Context, id string) error
 	RotateTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, updatedAt time.Time) error
+	// SetTokenLastUsedModel records the gateway model or group name of a token's
+	// last SUCCESSFULLY routed request (the api_tokens.last_used_model column),
+	// or returns store.ErrNotFound when no token has that id — including the empty
+	// id. Satisfied by *store.SQLiteStore (both sqlite and postgres drivers) and
+	// *MemoryDirectory. It is a member of this interface so the memory-vs-SQL
+	// conformance suite exercises it across drivers, not only at the two live
+	// call sites (issue #97).
+	SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error
 }
 
 // SystemSettingsStore persists portal-wide system settings as key/value pairs.

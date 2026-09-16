@@ -4787,6 +4787,10 @@ func (f failingTokens) RotateTokenSecret(ctx context.Context, id, secretHash, se
 	return f.err
 }
 
+func (f failingTokens) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
+	return f.err
+}
+
 func createEditableToken(t *testing.T, srv *Server, name string) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
