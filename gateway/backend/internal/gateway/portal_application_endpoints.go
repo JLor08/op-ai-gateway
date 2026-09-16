@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
 	"strings"
@@ -199,6 +200,16 @@ var portalApplicationErrRows = []errRow{
 	{err: portal.ErrApplicationHealthIntervalInvalid, status: http.StatusBadRequest, code: "application.health_interval_invalid", msg: "application health check interval is invalid"},
 	{err: portal.ErrApplicationBenchmarkIntervalInvalid, status: http.StatusBadRequest, code: "application.benchmark_interval_invalid", msg: "application benchmark schedule interval is invalid"},
 	{err: portal.ErrApplicationTokenHeaderInvalid, status: http.StatusBadRequest, code: "application.token_header_invalid", msg: "token header name is invalid"},
+	// The application-surface twin of runtime_spec.api_token_key_required
+	// (portal_runtime_endpoints.go): capture.SealSecret returns
+	// capture.ErrKeyRequired when a non-empty api_token is sealed on a
+	// disk-backed store with no encryption key, and CreateApplication /
+	// UpdateApplication return it unwrapped. It had a row on the runtime-spec
+	// table but none here (nor in sharedErrorMap), so an operator's own keyless
+	// misconfiguration fell through to the 500 "application.request_failed"
+	// fallback -- the same server-fault-for-a-client-error class the two proxy
+	// rows below (:218-219) record having been fixed before (issue #85).
+	{err: capture.ErrKeyRequired, status: http.StatusBadRequest, code: "application.api_token_key_required", msg: "an encryption key is required to store an application api token on a disk-backed store"},
 	{err: portal.ErrCoResidencyPairInvalid, status: http.StatusBadRequest, code: "runtime_coresidency.pair_invalid", msg: "co-residency pair is invalid"},
 	// ErrServerManagedRuntimeOnly is a 409 (a conflict with the target
 	// server's own configuration), not a 400 -- the request shape is fine,
