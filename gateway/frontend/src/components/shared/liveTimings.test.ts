@@ -17,11 +17,14 @@ import type { ApplicationType, RuntimeSpec } from '../../api';
 // is still a silent portal that never offers the switch -- but nothing in this
 // file notices, and a green frontend suite is not evidence about it.
 //
-// The guard on that seam lives on the Go side:
-// TestLiveTimingsCapableKindsSizeIsPinned in
-// internal/routing/live_timings_test.go pins the set's size, so any addition
-// or removal there fails, and its message enumerates what else to change.
-// That is the test to point an editor at, not this one.
+// The guard on that seam lives on the Go side, and since issue #87 it reads
+// THIS file: internal/routing.TestLiveTimingsCapableKindsMatchPortalHandCopy
+// parses the liveTimingsCapableKinds Set in liveTimings.ts and asserts it is
+// exactly the Go map, so a kind added to (or removed from) either set with no
+// matching edit fails there. Its companion size pin,
+// TestLiveTimingsCapableKindsSizeIsPinned, additionally breadcrumbs the docs,
+// i18n strings and type comments that state the membership in prose only. Those
+// are the tests to point an editor at, not this one.
 //
 // The lists are typed against their unions, which guards exactly one
 // direction. REMOVING a member from ApplicationType or from RuntimeSpec['type']

@@ -44,8 +44,12 @@ export type LiveTimingsKind = 'capable' | 'incapable' | 'unknown' | 'delegated';
  *
  * A HAND-COPY of `liveTimingsCapableKinds` in
  * `gateway/backend/internal/routing/live_timings.go`, which is the authority.
- * Nothing compiles the two together, so the exhaustive both-directions test in
- * liveTimings.test.ts is the only guard -- edit the two together.
+ * Nothing compiles the two together, but a Go test now reads THIS file:
+ * routing.TestLiveTimingsCapableKindsMatchPortalHandCopy parses the Set below
+ * and asserts it is exactly the Go map, so a kind added on either side with no
+ * matching edit here fails in the Go suite (issue #87). The exhaustive
+ * both-directions test in liveTimings.test.ts still pins this copy against the
+ * TypeScript unions -- edit all of them together.
  *
  * The Go map is keyed on the string BOTH vocabularies share
  * (ProviderLlamaCPP == "llama_cpp" == RuntimeSpecTypeLlamaCpp), which is why
