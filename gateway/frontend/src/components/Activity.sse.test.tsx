@@ -5,10 +5,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { UsageEvent, UsagePage, UsageStats } from '../api';
-
-const t = messages.de;
 
 function makeRow(overrides: Partial<UsageEvent> = {}): UsageEvent {
   return {
@@ -61,157 +59,164 @@ function makePage(): UsagePage {
   return { data: [makeRow()], page: 1, limit: 25, total: 60, total_pages: 3 };
 }
 
-function setup() {
-  let signal: () => void = () => {};
-  let reconnect: () => void = () => {};
-  const unsubscribe = vi.fn();
-  const api = {
-    activity: vi.fn(async () => makePage()),
-    activityStats: vi.fn(async () => makeStats()),
-    activeRequests: vi.fn(async () => ({ data: [] })),
-    usageTimeSeries: vi.fn(async () => ({ points: [], bucket_seconds: 5, from: '', to: '' })),
-    subscribeActivity: vi.fn((cb: () => void, onReconnect?: () => void) => {
-      signal = cb;
-      if (onReconnect) reconnect = onReconnect;
-      return unsubscribe;
-    }),
-    tokens: vi.fn(async () => ({ data: [] })),
-    adminUsers: vi.fn(async () => ({ data: [] })),
-    userTokens: vi.fn(async () => ({ data: [] })),
-    // Not exercised by this suite (SSE reconnect/backoff only).
-    getCurrency: vi.fn(async () => ({ usd_per_eur: 0 })),
-    usageGroups: vi.fn(async () => ({ data: [], group_by: 'server' })),
-    captureDetail: vi.fn(async () => ({
-      id: '',
-      api_flavor: '',
-      http_status: 0,
-      created_at: '',
-      req_headers: {},
-      req_body: '',
-      resp_headers: {},
-      resp_body: '',
-      truncated: false,
-      secret: false,
-      can_toggle_secret: false,
-    })),
-    deleteCapture: vi.fn(async () => ({ ok: true })),
-    setCaptureSecret: vi.fn(async () => ({ ok: true })),
-  };
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role="user" onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  const activityCalls = () =>
-    (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
-  const statsCalls = () =>
-    (api.activityStats as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
-  // fireReconnect delivers the wrapper's onReconnect callback, i.e. what the
-  // EventSource wrapper invokes on a re-open after an onerror -> onopen (a
-  // dropped stream that comes back), the reconnect-resync seam.
-  return {
-    api,
-    fireSignal: () => act(() => signal()),
-    fireReconnect: () => act(() => reconnect()),
-    activityCalls,
-    statsCalls,
-  };
-}
-
 afterEach(cleanup);
 
-describe('Activity SSE behavior', () => {
-  it('on the newest view a signal refetches both stats and the list, with no pill', async () => {
-    const { fireSignal, activityCalls, statsCalls } = setup();
-    await screen.findByRole('cell', { name: 'qwen-coder' });
-    const listBefore = activityCalls();
-    const statsBefore = statsCalls();
+// Both locales, not just German (issue #89): run the whole suite once per locale
+// so the SSE pill's English label (activityNewRequests) is rendered and asserted
+// too. Everything that references `t` lives inside the loop.
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    fireSignal();
-
-    await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
-    await waitFor(() => expect(activityCalls()).toBe(listBefore + 1));
-    expect(
-      screen.queryByRole('button', { name: t.activityNewRequests(1) }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("off the newest view a signal refetches stats only and shows the 'N neue' pill", async () => {
-    const { fireSignal, activityCalls, statsCalls } = setup();
-    await screen.findByRole('cell', { name: 'qwen-coder' });
-
-    // Leave the newest view: sort by a different column (created_at desc -> latency asc).
-    fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
-    await waitFor(() =>
-      expect(
-        screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
-      ).toHaveAttribute('aria-sort', 'ascending'),
+  function setup() {
+    let signal: () => void = () => {};
+    let reconnect: () => void = () => {};
+    const unsubscribe = vi.fn();
+    const api = {
+      activity: vi.fn(async () => makePage()),
+      activityStats: vi.fn(async () => makeStats()),
+      activeRequests: vi.fn(async () => ({ data: [] })),
+      usageTimeSeries: vi.fn(async () => ({ points: [], bucket_seconds: 5, from: '', to: '' })),
+      subscribeActivity: vi.fn((cb: () => void, onReconnect?: () => void) => {
+        signal = cb;
+        if (onReconnect) reconnect = onReconnect;
+        return unsubscribe;
+      }),
+      tokens: vi.fn(async () => ({ data: [] })),
+      adminUsers: vi.fn(async () => ({ data: [] })),
+      userTokens: vi.fn(async () => ({ data: [] })),
+      // Not exercised by this suite (SSE reconnect/backoff only).
+      getCurrency: vi.fn(async () => ({ usd_per_eur: 0 })),
+      usageGroups: vi.fn(async () => ({ data: [], group_by: 'server' })),
+      captureDetail: vi.fn(async () => ({
+        id: '',
+        api_flavor: '',
+        http_status: 0,
+        created_at: '',
+        req_headers: {},
+        req_body: '',
+        resp_headers: {},
+        resp_body: '',
+        truncated: false,
+        secret: false,
+        can_toggle_secret: false,
+      })),
+      deleteCapture: vi.fn(async () => ({ ok: true })),
+      setCaptureSecret: vi.fn(async () => ({ ok: true })),
+    };
+    render(
+      <ToastProvider>
+        <Activity t={t} api={api} role="user" onUnauthorized={vi.fn()} />
+      </ToastProvider>,
     );
-    const listBefore = activityCalls();
-    const statsBefore = statsCalls();
+    const activityCalls = () =>
+      (api.activity as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
+    const statsCalls = () =>
+      (api.activityStats as unknown as { mock: { calls: unknown[][] } }).mock.calls.length;
+    // fireReconnect delivers the wrapper's onReconnect callback, i.e. what the
+    // EventSource wrapper invokes on a re-open after an onerror -> onopen (a
+    // dropped stream that comes back), the reconnect-resync seam.
+    return {
+      api,
+      fireSignal: () => act(() => signal()),
+      fireReconnect: () => act(() => reconnect()),
+      activityCalls,
+      statsCalls,
+    };
+  }
 
-    fireSignal();
-    fireSignal();
+  describe(`Activity SSE behavior [${locale}]`, () => {
+    it('on the newest view a signal refetches both stats and the list, with no pill', async () => {
+      const { fireSignal, activityCalls, statsCalls } = setup();
+      await screen.findByRole('cell', { name: 'qwen-coder' });
+      const listBefore = activityCalls();
+      const statsBefore = statsCalls();
 
-    // stats stayed live (leading-edge fired once); list untouched.
-    await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
-    expect(activityCalls()).toBe(listBefore);
-    expect(screen.getByRole('button', { name: t.activityNewRequests(2) })).toBeInTheDocument();
-  });
+      fireSignal();
 
-  it('clicking the pill refetches the list and clears the counter (resync)', async () => {
-    const { fireSignal, activityCalls } = setup();
-    await screen.findByRole('cell', { name: 'qwen-coder' });
-    fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
-    await waitFor(() =>
-      expect(
-        screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
-      ).toHaveAttribute('aria-sort', 'ascending'),
-    );
-    fireSignal();
-    const pill = await screen.findByRole('button', { name: t.activityNewRequests(1) });
-    const before = activityCalls();
-
-    fireEvent.click(pill);
-
-    await waitFor(() => expect(activityCalls()).toBe(before + 1));
-    await waitFor(() =>
+      await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
+      await waitFor(() => expect(activityCalls()).toBe(listBefore + 1));
       expect(
         screen.queryByRole('button', { name: t.activityNewRequests(1) }),
-      ).not.toBeInTheDocument(),
-    );
-  });
+      ).not.toBeInTheDocument();
+    });
 
-  it('resyncs stats and resets the pill on reconnect (onerror -> onopen)', async () => {
-    const { fireSignal, fireReconnect, activityCalls, statsCalls } = setup();
-    await screen.findByRole('cell', { name: 'qwen-coder' });
+    it("off the newest view a signal refetches stats only and shows the 'N neue' pill", async () => {
+      const { fireSignal, activityCalls, statsCalls } = setup();
+      await screen.findByRole('cell', { name: 'qwen-coder' });
 
-    // Leave the newest view so signals build the pill instead of refetching the list.
-    fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
-    await waitFor(() =>
+      // Leave the newest view: sort by a different column (created_at desc -> latency asc).
+      fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
+      await waitFor(() =>
+        expect(
+          screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
+        ).toHaveAttribute('aria-sort', 'ascending'),
+      );
+      const listBefore = activityCalls();
+      const statsBefore = statsCalls();
+
+      fireSignal();
+      fireSignal();
+
+      // stats stayed live (leading-edge fired once); list untouched.
+      await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
+      expect(activityCalls()).toBe(listBefore);
+      expect(screen.getByRole('button', { name: t.activityNewRequests(2) })).toBeInTheDocument();
+    });
+
+    it('clicking the pill refetches the list and clears the counter (resync)', async () => {
+      const { fireSignal, activityCalls } = setup();
+      await screen.findByRole('cell', { name: 'qwen-coder' });
+      fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
+      await waitFor(() =>
+        expect(
+          screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
+        ).toHaveAttribute('aria-sort', 'ascending'),
+      );
+      fireSignal();
+      const pill = await screen.findByRole('button', { name: t.activityNewRequests(1) });
+      const before = activityCalls();
+
+      fireEvent.click(pill);
+
+      await waitFor(() => expect(activityCalls()).toBe(before + 1));
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('button', { name: t.activityNewRequests(1) }),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    it('resyncs stats and resets the pill on reconnect (onerror -> onopen)', async () => {
+      const { fireSignal, fireReconnect, activityCalls, statsCalls } = setup();
+      await screen.findByRole('cell', { name: 'qwen-coder' });
+
+      // Leave the newest view so signals build the pill instead of refetching the list.
+      fireEvent.click(screen.getByRole('button', { name: t.activityColTime }));
+      await waitFor(() =>
+        expect(
+          screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
+        ).toHaveAttribute('aria-sort', 'ascending'),
+      );
+      fireSignal();
+      fireSignal();
       expect(
-        screen.getByRole('columnheader', { name: new RegExp(t.activityColTime) }),
-      ).toHaveAttribute('aria-sort', 'ascending'),
-    );
-    fireSignal();
-    fireSignal();
-    expect(
-      await screen.findByRole('button', { name: t.activityNewRequests(2) }),
-    ).toBeInTheDocument();
-    const listBefore = activityCalls();
-    const statsBefore = statsCalls();
+        await screen.findByRole('button', { name: t.activityNewRequests(2) }),
+      ).toBeInTheDocument();
+      const listBefore = activityCalls();
+      const statsBefore = statsCalls();
 
-    // The stream drops and re-opens: the wrapper delivers onReconnect.
-    fireReconnect();
+      // The stream drops and re-opens: the wrapper delivers onReconnect.
+      fireReconnect();
 
-    // Stats refetch fires (window-wide) and the pill counter is reset to 0; off the
-    // newest view the list is left untouched (no increment, no list refetch).
-    await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
-    expect(activityCalls()).toBe(listBefore);
-    await waitFor(() =>
-      expect(
-        screen.queryByRole('button', { name: t.activityNewRequests(2) }),
-      ).not.toBeInTheDocument(),
-    );
+      // Stats refetch fires (window-wide) and the pill counter is reset to 0; off the
+      // newest view the list is left untouched (no increment, no list refetch).
+      await waitFor(() => expect(statsCalls()).toBe(statsBefore + 1));
+      expect(activityCalls()).toBe(listBefore);
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('button', { name: t.activityNewRequests(2) }),
+        ).not.toBeInTheDocument(),
+      );
+    });
   });
-});
+}

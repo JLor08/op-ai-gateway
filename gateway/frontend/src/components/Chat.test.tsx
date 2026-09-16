@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
 import { ChatStoreProvider } from './chat/ChatStore';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type {
   ActiveChatRun,
   ModelOption,
@@ -16,8 +16,6 @@ import type {
   ServerModelOption,
   StartChatRunBody,
 } from '../api';
-
-const t = messages.de;
 
 // vision: true so the pre-existing image-retention/attach tests below (which
 // predate the vision-capability gate) keep exercising attach + send unchanged;
@@ -180,13 +178,6 @@ function seedUnavailableModelChat() {
   });
 }
 
-// Wait for the provider's initial list-load to finish and open the fresh chat:
-// the sidebar renders its (untitled) row only after chatsLoading flips false and
-// the chat is activated, so this doubles as a readiness gate before interacting.
-async function waitForChatReady() {
-  await screen.findByText(t.chatUntitled);
-}
-
 function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
   return {
     id: 'tok_plain',
@@ -270,48 +261,6 @@ async function pickOption(comboLabel: string, optionText: string) {
   fireEvent.click(await screen.findByRole('option', { name: optionText }));
 }
 
-function renderChat(
-  initialTokens: PortalToken[] = tokens,
-  modelsOverride: ModelOption[] = models,
-  serversOverride: PortalServer[] = [],
-) {
-  const onRefresh = vi.fn(async () => {});
-  const view = render(
-    <ToastProvider>
-      <ChatStoreProvider
-        api={chatApi.api}
-        models={modelsOverride}
-        tokens={initialTokens}
-        servers={serversOverride}
-        onRefresh={onRefresh}
-        t={t}
-      >
-        <Chat t={t} />
-      </ChatStoreProvider>
-    </ToastProvider>,
-  );
-  const rerenderWith = (nextTokens: PortalToken[], nextServers: PortalServer[] = serversOverride) =>
-    view.rerender(
-      <ToastProvider>
-        <ChatStoreProvider
-          api={chatApi.api}
-          models={modelsOverride}
-          tokens={nextTokens}
-          servers={nextServers}
-          onRefresh={onRefresh}
-          t={t}
-        >
-          <Chat t={t} />
-        </ChatStoreProvider>
-      </ToastProvider>,
-    );
-  return { onRefresh, rerenderWith, unmount: view.unmount };
-}
-
-function openSettings() {
-  fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
-}
-
 beforeEach(() => {
   imageDecodeFails = false;
   FakeEventSource.instances = [];
@@ -325,464 +274,530 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('Chat run-as token selector', () => {
-  it("sends the run-as token id in the started run's settings for a plain (no-override) token", async () => {
-    renderChat();
-    await waitForChatReady();
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    await pickOption(t.chatModel, models[0].display_name);
-    await pickOption(t.chatRunAsTokenLabel, plainToken.name);
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hello there' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
+  // Wait for the provider's initial list-load to finish and open the fresh chat:
+  // the sidebar renders its (untitled) row only after chatsLoading flips false and
+  // the chat is activated, so this doubles as a readiness gate before interacting.
+  async function waitForChatReady() {
+    await screen.findByText(t.chatUntitled);
+  }
 
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
-    expect(body.settings.run_as_token_id).toBe(plainToken.id);
-  });
+  function renderChat(
+    initialTokens: PortalToken[] = tokens,
+    modelsOverride: ModelOption[] = models,
+    serversOverride: PortalServer[] = [],
+  ) {
+    const onRefresh = vi.fn(async () => {});
+    const view = render(
+      <ToastProvider>
+        <ChatStoreProvider
+          api={chatApi.api}
+          models={modelsOverride}
+          tokens={initialTokens}
+          servers={serversOverride}
+          onRefresh={onRefresh}
+          t={t}
+        >
+          <Chat t={t} />
+        </ChatStoreProvider>
+      </ToastProvider>,
+    );
+    const rerenderWith = (
+      nextTokens: PortalToken[],
+      nextServers: PortalServer[] = serversOverride,
+    ) =>
+      view.rerender(
+        <ToastProvider>
+          <ChatStoreProvider
+            api={chatApi.api}
+            models={modelsOverride}
+            tokens={nextTokens}
+            servers={nextServers}
+            onRefresh={onRefresh}
+            t={t}
+          >
+            <Chat t={t} />
+          </ChatStoreProvider>
+        </ToastProvider>,
+      );
+    return { onRefresh, rerenderWith, unmount: view.unmount };
+  }
 
-  it('disables the model select and shows the override hint when a model-override token is selected', async () => {
-    renderChat();
-    await waitForChatReady();
+  function openSettings() {
+    fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+  }
 
-    const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
-    expect(modelSelect).not.toBeDisabled();
+  describe(`Chat run-as token selector [${locale}]`, () => {
+    it("sends the run-as token id in the started run's settings for a plain (no-override) token", async () => {
+      renderChat();
+      await waitForChatReady();
 
-    await pickOption(t.chatRunAsTokenLabel, overrideToken.name);
+      await pickOption(t.chatModel, models[0].display_name);
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+      fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hello there' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
 
-    expect(modelSelect).toBeDisabled();
-    expect(screen.getByText(`${t.chatModelFromToken}: qwen-coder`)).toBeInTheDocument();
-  });
-
-  it('defaults to no token and starts a run with an empty run_as_token_id', async () => {
-    renderChat();
-    await waitForChatReady();
-
-    await pickOption(t.chatModel, models[0].display_name);
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
-    expect(body.settings.run_as_token_id ?? '').toBe('');
-  });
-
-  it('resets a stale selection when the chosen token is no longer usable', async () => {
-    const { rerenderWith } = renderChat();
-    await waitForChatReady();
-    await pickOption(t.chatModel, models[0].display_name);
-
-    // The Autocomplete input reflects the selected option's LABEL (not its id).
-    const tokenSelect = screen.getByLabelText(t.chatRunAsTokenLabel) as HTMLInputElement;
-    await pickOption(t.chatRunAsTokenLabel, plainToken.name);
-    expect(tokenSelect.value).toBe(plainToken.name);
-
-    // Simulate onRefresh reloading tokens without the previously-selected one
-    // (deleted / disabled / expired / lost gateway:use).
-    rerenderWith([overrideToken]);
-
-    // Selection resets to the empty value, whose option label is chatRunAsNone.
-    await waitFor(() => expect(tokenSelect.value).toBe(t.chatRunAsNone));
-
-    // A subsequent send must carry no run-as target.
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
-    expect(body.settings.run_as_token_id ?? '').toBe('');
-  });
-});
-
-describe('Chat image retention', () => {
-  it('persists a sent image to the server and restores it on reload', async () => {
-    const { unmount } = renderChat();
-    await waitForChatReady();
-    await pickOption(t.chatModel, models[0].display_name);
-
-    // Attach an image; the compose strip shows the preview.
-    const fileInput = screen.getByLabelText(t.chatAttachImage);
-    const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
-    fireEvent.change(fileInput, { target: { files: [goodFile] } });
-    await screen.findByAltText(t.chatAttachedImage);
-
-    // Send it with some text; start a server run, then finish it with an empty
-    // reply so the run-end flush round-trips the transcript to the server.
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'look at this' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    // The sent user message carries the image (compose strip cleared on send).
-    await waitFor(() => expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1));
-    // "look at this" also becomes the auto-title in the sidebar, so scope the
-    // transcript assertion to the message log.
-    expect(within(screen.getByRole('log')).getByText('look at this')).toBeInTheDocument();
-
-    // Finish the run (empty reply): the dangling empty assistant is pruned and
-    // the run-end flush persists the user turn (with the image) to the server.
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    await act(async () => {
-      FakeEventSource.instances[0].emit('done', { content: '', status: 'completed' });
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.run_as_token_id).toBe(plainToken.id);
     });
 
-    // The run-end flush must round-trip the transcript (with the image) to the
-    // server before we reload.
-    await waitFor(() => {
-      const stored = chatApi.rows[0]?.content as { messages?: unknown[] } | undefined;
-      expect(stored?.messages?.length ?? 0).toBeGreaterThan(0);
+    it('disables the model select and shows the override hint when a model-override token is selected', async () => {
+      renderChat();
+      await waitForChatReady();
+
+      const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
+      expect(modelSelect).not.toBeDisabled();
+
+      await pickOption(t.chatRunAsTokenLabel, overrideToken.name);
+
+      expect(modelSelect).toBeDisabled();
+      expect(screen.getByText(`${t.chatModelFromToken}: qwen-coder`)).toBeInTheDocument();
     });
 
-    // Remounting a FRESH provider (same backend) reloads the newest chat and
-    // restores the image + text from server content, not localStorage.
-    unmount();
-    renderChat();
-    await waitFor(() => expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1));
-    expect(within(screen.getByRole('log')).getByText('look at this')).toBeInTheDocument();
+    it('defaults to no token and starts a run with an empty run_as_token_id', async () => {
+      renderChat();
+      await waitForChatReady();
+
+      await pickOption(t.chatModel, models[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.run_as_token_id ?? '').toBe('');
+    });
+
+    it('resets a stale selection when the chosen token is no longer usable', async () => {
+      const { rerenderWith } = renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      // The Autocomplete input reflects the selected option's LABEL (not its id).
+      const tokenSelect = screen.getByLabelText(t.chatRunAsTokenLabel) as HTMLInputElement;
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+      expect(tokenSelect.value).toBe(plainToken.name);
+
+      // Simulate onRefresh reloading tokens without the previously-selected one
+      // (deleted / disabled / expired / lost gateway:use).
+      rerenderWith([overrideToken]);
+
+      // Selection resets to the empty value, whose option label is chatRunAsNone.
+      await waitFor(() => expect(tokenSelect.value).toBe(t.chatRunAsNone));
+
+      // A subsequent send must carry no run-as target.
+      fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.run_as_token_id ?? '').toBe('');
+    });
   });
 
-  it('maps an image decode failure to the generic image error', async () => {
-    imageDecodeFails = true;
-    renderChat();
-    await waitForChatReady();
+  describe(`Chat image retention [${locale}]`, () => {
+    it('persists a sent image to the server and restores it on reload', async () => {
+      const { unmount } = renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
 
-    const fileInput = screen.getByLabelText(t.chatAttachImage);
-    const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
-    fireEvent.change(fileInput, { target: { files: [goodFile] } });
+      // Attach an image; the compose strip shows the preview.
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
+      fireEvent.change(fileInput, { target: { files: [goodFile] } });
+      await screen.findByAltText(t.chatAttachedImage);
 
-    const banner = await screen.findByRole('alert');
-    expect(banner).toHaveTextContent(t.chatImageError);
-    // not the type/size branch text, and no image attached
-    expect(banner).not.toHaveTextContent(t.chatImageErrorSize);
-    expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+      // Send it with some text; start a server run, then finish it with an empty
+      // reply so the run-end flush round-trips the transcript to the server.
+      fireEvent.change(screen.getByLabelText(t.messageLabel), {
+        target: { value: 'look at this' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      // The sent user message carries the image (compose strip cleared on send).
+      await waitFor(() => expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1));
+      // "look at this" also becomes the auto-title in the sidebar, so scope the
+      // transcript assertion to the message log.
+      expect(within(screen.getByRole('log')).getByText('look at this')).toBeInTheDocument();
+
+      // Finish the run (empty reply): the dangling empty assistant is pruned and
+      // the run-end flush persists the user turn (with the image) to the server.
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      await act(async () => {
+        FakeEventSource.instances[0].emit('done', { content: '', status: 'completed' });
+      });
+
+      // The run-end flush must round-trip the transcript (with the image) to the
+      // server before we reload.
+      await waitFor(() => {
+        const stored = chatApi.rows[0]?.content as { messages?: unknown[] } | undefined;
+        expect(stored?.messages?.length ?? 0).toBeGreaterThan(0);
+      });
+
+      // Remounting a FRESH provider (same backend) reloads the newest chat and
+      // restores the image + text from server content, not localStorage.
+      unmount();
+      renderChat();
+      await waitFor(() => expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1));
+      expect(within(screen.getByRole('log')).getByText('look at this')).toBeInTheDocument();
+    });
+
+    it('maps an image decode failure to the generic image error', async () => {
+      imageDecodeFails = true;
+      renderChat();
+      await waitForChatReady();
+
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
+      fireEvent.change(fileInput, { target: { files: [goodFile] } });
+
+      const banner = await screen.findByRole('alert');
+      expect(banner).toHaveTextContent(t.chatImageError);
+      // not the type/size branch text, and no image attached
+      expect(banner).not.toHaveTextContent(t.chatImageErrorSize);
+      expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+    });
   });
-});
 
-describe('Chat: remembers an unavailable model', () => {
-  it("keeps the saved-but-unavailable model as the dropdown's selected value and shows the red indicator", async () => {
-    seedUnavailableModelChat();
-    renderChat();
-    await waitForChatReady();
+  describe(`Chat: remembers an unavailable model [${locale}]`, () => {
+    it("keeps the saved-but-unavailable model as the dropdown's selected value and shows the red indicator", async () => {
+      seedUnavailableModelChat();
+      renderChat();
+      await waitForChatReady();
 
-    const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
-    expect(modelSelect.value).toBe('unavailable-model');
-    expect(screen.getByTestId('searchable-select-unavailable')).toBeInTheDocument();
+      const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
+      expect(modelSelect.value).toBe('unavailable-model');
+      expect(screen.getByTestId('searchable-select-unavailable')).toBeInTheDocument();
+    });
+
+    it('disables Send while the model is unavailable', async () => {
+      seedUnavailableModelChat();
+      renderChat();
+      await waitForChatReady();
+
+      expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+    });
+
+    it('shows no red indicator once an available model is picked and enables Send', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.send })).not.toBeDisabled();
+    });
+
+    it('does not auto-select a model: a fresh chat starts empty with Send disabled and no red indicator', async () => {
+      renderChat();
+      await waitForChatReady();
+
+      const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
+      expect(modelSelect.value).toBe('');
+      expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+    });
   });
 
-  it('disables Send while the model is unavailable', async () => {
-    seedUnavailableModelChat();
-    renderChat();
-    await waitForChatReady();
+  describe(`Chat: loaded-state of the selected model [${locale}]`, () => {
+    it('shows a green loaded dot BEFORE the name once a loaded model is selected', async () => {
+      const loaded: ModelOption[] = [
+        {
+          id: 'gpt-oss-20b',
+          display_name: 'gpt-oss-20b',
+          flavors: ['openai'],
+          loading_on_count: 0,
+          loaded: true,
+          loaded_on: ['GPU-1'],
+        },
+      ];
+      renderChat(tokens, loaded);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'gpt-oss-20b');
 
-    expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+      expect(screen.getByTestId('searchable-select-loaded-dot')).toBeInTheDocument();
+    });
+
+    it('shows no loaded dot when the selected model is not loaded', async () => {
+      renderChat(); // default model fixture is not loaded
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
+    });
   });
 
-  it('shows no red indicator once an available model is picked and enables Send', async () => {
-    renderChat();
-    await waitForChatReady();
-    await pickOption(t.chatModel, models[0].display_name);
-
-    expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: t.send })).not.toBeDisabled();
-  });
-
-  it('does not auto-select a model: a fresh chat starts empty with Send disabled and no red indicator', async () => {
-    renderChat();
-    await waitForChatReady();
-
-    const modelSelect = screen.getByLabelText(t.chatModel) as HTMLInputElement;
-    expect(modelSelect.value).toBe('');
-    expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
-  });
-});
-
-describe('Chat: loaded-state of the selected model', () => {
-  it('shows a green loaded dot BEFORE the name once a loaded model is selected', async () => {
-    const loaded: ModelOption[] = [
+  describe(`Chat: image attachment gated on model vision capability [${locale}]`, () => {
+    const nonVisionModels: ModelOption[] = [
       {
-        id: 'gpt-oss-20b',
-        display_name: 'gpt-oss-20b',
+        id: 'text-only',
+        display_name: 'text-only',
         flavors: ['openai'],
         loading_on_count: 0,
-        loaded: true,
-        loaded_on: ['GPU-1'],
+        vision: false,
       },
     ];
-    renderChat(tokens, loaded);
-    await waitForChatReady();
-    await pickOption(t.chatModel, 'gpt-oss-20b');
+    const mixedModels: ModelOption[] = [
+      {
+        id: 'vision-model',
+        display_name: 'vision-model',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        vision: true,
+      },
+      {
+        id: 'text-model',
+        display_name: 'text-model',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        vision: false,
+      },
+    ];
 
-    expect(screen.getByTestId('searchable-select-loaded-dot')).toBeInTheDocument();
+    it('disables the attach button when the selected model is not vision-capable', async () => {
+      renderChat(tokens, nonVisionModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'text-only');
+
+      const attachButton = screen.getByRole('button', { name: t.chatAttachImage });
+      expect(attachButton).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('keeps the attach button enabled for a vision-capable model', async () => {
+      renderChat(); // default fixture is vision: true
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      const attachButton = screen.getByRole('button', { name: t.chatAttachImage });
+      expect(attachButton).not.toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('blocks send() with an attached image on a non-vision-capable model and starts no run', async () => {
+      renderChat(tokens, nonVisionModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'text-only');
+
+      // The attach button is disabled but the underlying <input> is not (jsdom
+      // does not block a programmatic change event on it), matching how the
+      // other attach tests in this file drive the composer.
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
+      fireEvent.change(fileInput, { target: { files: [goodFile] } });
+      await screen.findByAltText(t.chatAttachedImage);
+
+      fireEvent.change(screen.getByLabelText(t.messageLabel), {
+        target: { value: 'look at this' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      const banner = await screen.findByRole('alert');
+      expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // the composer is left untouched (not sent, not silently dropped)
+      expect(screen.getByAltText(t.chatAttachedImage)).toBeInTheDocument();
+    });
+
+    it('clears an attached image and warns when switching from a vision-capable to a non-capable model', async () => {
+      renderChat(tokens, mixedModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'vision-model');
+
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
+      fireEvent.change(fileInput, { target: { files: [goodFile] } });
+      await screen.findByAltText(t.chatAttachedImage);
+
+      await pickOption(t.chatModel, 'text-model');
+
+      await waitFor(() =>
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument(),
+      );
+      const banner = await screen.findByRole('alert');
+      expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
+    });
   });
 
-  it('shows no loaded dot when the selected model is not loaded', async () => {
-    renderChat(); // default model fixture is not loaded
-    await waitForChatReady();
-    await pickOption(t.chatModel, models[0].display_name);
+  describe(`Chat: server override picker (Task 6) [${locale}]`, () => {
+    it('hides the whole control when the caller manages zero servers', async () => {
+      renderChat(tokens, models, []);
+      await waitForChatReady();
+      openSettings();
 
-    expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
-  });
-});
-
-describe('Chat: image attachment gated on model vision capability', () => {
-  const nonVisionModels: ModelOption[] = [
-    {
-      id: 'text-only',
-      display_name: 'text-only',
-      flavors: ['openai'],
-      loading_on_count: 0,
-      vision: false,
-    },
-  ];
-  const mixedModels: ModelOption[] = [
-    {
-      id: 'vision-model',
-      display_name: 'vision-model',
-      flavors: ['openai'],
-      loading_on_count: 0,
-      vision: true,
-    },
-    {
-      id: 'text-model',
-      display_name: 'text-model',
-      flavors: ['openai'],
-      loading_on_count: 0,
-      vision: false,
-    },
-  ];
-
-  it('disables the attach button when the selected model is not vision-capable', async () => {
-    renderChat(tokens, nonVisionModels);
-    await waitForChatReady();
-    await pickOption(t.chatModel, 'text-only');
-
-    const attachButton = screen.getByRole('button', { name: t.chatAttachImage });
-    expect(attachButton).toHaveAttribute('aria-disabled', 'true');
-  });
-
-  it('keeps the attach button enabled for a vision-capable model', async () => {
-    renderChat(); // default fixture is vision: true
-    await waitForChatReady();
-    await pickOption(t.chatModel, models[0].display_name);
-
-    const attachButton = screen.getByRole('button', { name: t.chatAttachImage });
-    expect(attachButton).not.toHaveAttribute('aria-disabled', 'true');
-  });
-
-  it('blocks send() with an attached image on a non-vision-capable model and starts no run', async () => {
-    renderChat(tokens, nonVisionModels);
-    await waitForChatReady();
-    await pickOption(t.chatModel, 'text-only');
-
-    // The attach button is disabled but the underlying <input> is not (jsdom
-    // does not block a programmatic change event on it), matching how the
-    // other attach tests in this file drive the composer.
-    const fileInput = screen.getByLabelText(t.chatAttachImage);
-    const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
-    fireEvent.change(fileInput, { target: { files: [goodFile] } });
-    await screen.findByAltText(t.chatAttachedImage);
-
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'look at this' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    const banner = await screen.findByRole('alert');
-    expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
-    expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
-    // the composer is left untouched (not sent, not silently dropped)
-    expect(screen.getByAltText(t.chatAttachedImage)).toBeInTheDocument();
-  });
-
-  it('clears an attached image and warns when switching from a vision-capable to a non-capable model', async () => {
-    renderChat(tokens, mixedModels);
-    await waitForChatReady();
-    await pickOption(t.chatModel, 'vision-model');
-
-    const fileInput = screen.getByLabelText(t.chatAttachImage);
-    const goodFile = new File(['x'], 'a.jpg', { type: 'image/jpeg' });
-    fireEvent.change(fileInput, { target: { files: [goodFile] } });
-    await screen.findByAltText(t.chatAttachedImage);
-
-    await pickOption(t.chatModel, 'text-model');
-
-    await waitFor(() => expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument());
-    const banner = await screen.findByRole('alert');
-    expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
-  });
-});
-
-describe('Chat: server override picker (Task 6)', () => {
-  it('hides the whole control when the caller manages zero servers', async () => {
-    renderChat(tokens, models, []);
-    await waitForChatReady();
-    openSettings();
-
-    expect(screen.queryByRole('combobox', { name: t.serverOverrideLabel })).not.toBeInTheDocument();
-  });
-
-  it('shows the picker (and no force checkbox yet) when the caller manages at least one server', async () => {
-    renderChat(tokens, models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
-    await waitForChatReady();
-    openSettings();
-
-    expect(screen.getByRole('combobox', { name: t.serverOverrideLabel })).toBeInTheDocument();
-    expect(screen.queryByLabelText(t.serverOverrideForceLabel)).not.toBeInTheDocument();
-  });
-
-  // Both fixture models are part of the general (reachable) catalog, mirroring
-  // production where api.models() already aggregates every server's offerings
-  // -- so picking either keeps modelAvailable true; only the DROPDOWN's option
-  // set narrows once a server override is picked.
-  const twoModelCatalog: ModelOption[] = [
-    { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
-    {
-      id: 'server-only-model',
-      display_name: 'server-only-model',
-      flavors: ['openai'],
-      loading_on_count: 0,
-    },
-  ];
-
-  it("filters the model dropdown to the picked server's offered models and starts a run with both fields set", async () => {
-    serverModelsByServer.srv_a = [{ id: 'server-only-model', display_name: 'server-only-model' }];
-    renderChat(tokens, twoModelCatalog, [makeServer({ id: 'srv_a', name: 'Server A' })]);
-    await waitForChatReady();
-    openSettings();
-
-    await pickOption(t.serverOverrideLabel, 'Server A');
-    await waitFor(() => expect(chatApi.spies.serverModels).toHaveBeenCalledWith('srv_a'));
-
-    // The force checkbox now renders (an override is set).
-    expect(screen.getByLabelText(t.serverOverrideForceLabel)).toBeInTheDocument();
-
-    // The main model dropdown now offers ONLY the override server's model, not
-    // the full two-model catalog.
-    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
-    expect(await screen.findByRole('option', { name: 'server-only-model' })).toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: 'gpt-oss-20b' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('option', { name: 'server-only-model' }));
-
-    fireEvent.click(screen.getByLabelText(t.serverOverrideForceLabel));
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
-    expect(body.settings.server_override).toBe('srv_a');
-    expect(body.settings.server_override_force_unreachable).toBe(true);
-  });
-
-  it('resets a stale override when the picked server drops out of the manageable set', async () => {
-    serverModelsByServer.srv_a = [{ id: 'server-only-model', display_name: 'server-only-model' }];
-    const { rerenderWith } = renderChat(tokens, twoModelCatalog, [
-      makeServer({ id: 'srv_a', name: 'Server A' }),
-    ]);
-    await waitForChatReady();
-    openSettings();
-
-    const serverSelect = screen.getByLabelText(t.serverOverrideLabel) as HTMLInputElement;
-    await pickOption(t.serverOverrideLabel, 'Server A');
-    expect(serverSelect.value).toBe('Server A');
-    expect(screen.getByLabelText(t.serverOverrideForceLabel)).toBeInTheDocument();
-
-    // Simulate `servers` reloading (App's onRefresh path) without the
-    // previously-picked server (deleted / management revoked).
-    rerenderWith(tokens, []);
-
-    // Selection resets to the empty value; the whole control (including the
-    // force checkbox) disappears since the caller now manages zero servers.
-    await waitFor(() =>
       expect(
         screen.queryByRole('combobox', { name: t.serverOverrideLabel }),
-      ).not.toBeInTheDocument(),
-    );
-    expect(screen.queryByLabelText(t.serverOverrideForceLabel)).not.toBeInTheDocument();
-
-    // The model dropdown is back to the full catalog; pick one and send -- the
-    // run must carry no server override.
-    await pickOption(t.chatModel, 'gpt-oss-20b');
-    fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
-    fireEvent.click(screen.getByRole('button', { name: t.send }));
-
-    await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
-    expect(body.settings.server_override ?? '').toBe('');
-    expect(body.settings.server_override_force_unreachable ?? false).toBe(false);
-  });
-});
-
-describe('Chat: run-as token locks the server-override control (T2)', () => {
-  it("keeps the chat's own server-override control editable for a run-as token without a server override", async () => {
-    renderChat(tokens, models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
-    await waitForChatReady();
-    openSettings();
-
-    await pickOption(t.chatRunAsTokenLabel, plainToken.name);
-
-    const serverSelect = screen.getByRole('combobox', {
-      name: t.serverOverrideLabel,
-    }) as HTMLInputElement;
-    expect(serverSelect).not.toBeDisabled();
-  });
-
-  it("locks the server-override control to the run-as token's server + force, and filters the model dropdown to it", async () => {
-    const lockedToken = makeToken({
-      id: 'tok_server_override',
-      name: 'Locked Token',
-      server_override: 'srv_token',
-      server_override_force_unreachable: true,
+      ).not.toBeInTheDocument();
     });
-    serverModelsByServer.srv_token = [
-      { id: 'token-server-model', display_name: 'token-server-model' },
-    ];
-    renderChat([...tokens, lockedToken], models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
-    await waitForChatReady();
-    openSettings();
 
-    await pickOption(t.chatRunAsTokenLabel, lockedToken.name);
+    it('shows the picker (and no force checkbox yet) when the caller manages at least one server', async () => {
+      renderChat(tokens, models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
+      await waitForChatReady();
+      openSettings();
 
-    // The model dropdown's option fetch is keyed on the EFFECTIVE (token-locked)
-    // server, not the chat's own (empty) picked server.
-    await waitFor(() => expect(chatApi.spies.serverModels).toHaveBeenCalledWith('srv_token'));
-
-    const serverSelect = screen.getByRole('combobox', {
-      name: t.serverOverrideLabel,
-    }) as HTMLInputElement;
-    expect(serverSelect).toBeDisabled();
-    // srv_token is not among the caller's manageable servers -- the synthetic
-    // fallback option keeps the id visible instead of rendering blank.
-    expect(serverSelect.value).toBe('srv_token');
-    expect(screen.getByText(t.serverOverrideLockedHint)).toBeInTheDocument();
-
-    const forceCheckbox = screen.getByLabelText(t.serverOverrideForceLabel) as HTMLInputElement;
-    expect(forceCheckbox).toBeDisabled();
-    expect(forceCheckbox.checked).toBe(true);
-
-    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
-    expect(await screen.findByRole('option', { name: 'token-server-model' })).toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: models[0].display_name })).not.toBeInTheDocument();
-  });
-
-  it("unlocks the chat's own server-override control again when the run-as token is cleared", async () => {
-    const lockedToken = makeToken({
-      id: 'tok_server_override',
-      name: 'Locked Token',
-      server_override: 'srv_token',
-      server_override_force_unreachable: true,
+      expect(screen.getByRole('combobox', { name: t.serverOverrideLabel })).toBeInTheDocument();
+      expect(screen.queryByLabelText(t.serverOverrideForceLabel)).not.toBeInTheDocument();
     });
-    serverModelsByServer.srv_token = [
-      { id: 'token-server-model', display_name: 'token-server-model' },
+
+    // Both fixture models are part of the general (reachable) catalog, mirroring
+    // production where api.models() already aggregates every server's offerings
+    // -- so picking either keeps modelAvailable true; only the DROPDOWN's option
+    // set narrows once a server override is picked.
+    const twoModelCatalog: ModelOption[] = [
+      { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+      {
+        id: 'server-only-model',
+        display_name: 'server-only-model',
+        flavors: ['openai'],
+        loading_on_count: 0,
+      },
     ];
-    renderChat([...tokens, lockedToken], models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
-    await waitForChatReady();
-    openSettings();
 
-    await pickOption(t.chatRunAsTokenLabel, lockedToken.name);
-    const serverSelect = screen.getByRole('combobox', {
-      name: t.serverOverrideLabel,
-    }) as HTMLInputElement;
-    expect(serverSelect).toBeDisabled();
+    it("filters the model dropdown to the picked server's offered models and starts a run with both fields set", async () => {
+      serverModelsByServer.srv_a = [{ id: 'server-only-model', display_name: 'server-only-model' }];
+      renderChat(tokens, twoModelCatalog, [makeServer({ id: 'srv_a', name: 'Server A' })]);
+      await waitForChatReady();
+      openSettings();
 
-    await pickOption(t.chatRunAsTokenLabel, t.chatRunAsNone);
+      await pickOption(t.serverOverrideLabel, 'Server A');
+      await waitFor(() => expect(chatApi.spies.serverModels).toHaveBeenCalledWith('srv_a'));
 
-    await waitFor(() => expect(serverSelect).not.toBeDisabled());
+      // The force checkbox now renders (an override is set).
+      expect(screen.getByLabelText(t.serverOverrideForceLabel)).toBeInTheDocument();
+
+      // The main model dropdown now offers ONLY the override server's model, not
+      // the full two-model catalog.
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
+      expect(await screen.findByRole('option', { name: 'server-only-model' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: 'gpt-oss-20b' })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('option', { name: 'server-only-model' }));
+
+      fireEvent.click(screen.getByLabelText(t.serverOverrideForceLabel));
+      fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.server_override).toBe('srv_a');
+      expect(body.settings.server_override_force_unreachable).toBe(true);
+    });
+
+    it('resets a stale override when the picked server drops out of the manageable set', async () => {
+      serverModelsByServer.srv_a = [{ id: 'server-only-model', display_name: 'server-only-model' }];
+      const { rerenderWith } = renderChat(tokens, twoModelCatalog, [
+        makeServer({ id: 'srv_a', name: 'Server A' }),
+      ]);
+      await waitForChatReady();
+      openSettings();
+
+      const serverSelect = screen.getByLabelText(t.serverOverrideLabel) as HTMLInputElement;
+      await pickOption(t.serverOverrideLabel, 'Server A');
+      expect(serverSelect.value).toBe('Server A');
+      expect(screen.getByLabelText(t.serverOverrideForceLabel)).toBeInTheDocument();
+
+      // Simulate `servers` reloading (App's onRefresh path) without the
+      // previously-picked server (deleted / management revoked).
+      rerenderWith(tokens, []);
+
+      // Selection resets to the empty value; the whole control (including the
+      // force checkbox) disappears since the caller now manages zero servers.
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('combobox', { name: t.serverOverrideLabel }),
+        ).not.toBeInTheDocument(),
+      );
+      expect(screen.queryByLabelText(t.serverOverrideForceLabel)).not.toBeInTheDocument();
+
+      // The model dropdown is back to the full catalog; pick one and send -- the
+      // run must carry no server override.
+      await pickOption(t.chatModel, 'gpt-oss-20b');
+      fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.server_override ?? '').toBe('');
+      expect(body.settings.server_override_force_unreachable ?? false).toBe(false);
+    });
   });
-});
+
+  describe(`Chat: run-as token locks the server-override control (T2) [${locale}]`, () => {
+    it("keeps the chat's own server-override control editable for a run-as token without a server override", async () => {
+      renderChat(tokens, models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
+      await waitForChatReady();
+      openSettings();
+
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+
+      const serverSelect = screen.getByRole('combobox', {
+        name: t.serverOverrideLabel,
+      }) as HTMLInputElement;
+      expect(serverSelect).not.toBeDisabled();
+    });
+
+    it("locks the server-override control to the run-as token's server + force, and filters the model dropdown to it", async () => {
+      const lockedToken = makeToken({
+        id: 'tok_server_override',
+        name: 'Locked Token',
+        server_override: 'srv_token',
+        server_override_force_unreachable: true,
+      });
+      serverModelsByServer.srv_token = [
+        { id: 'token-server-model', display_name: 'token-server-model' },
+      ];
+      renderChat([...tokens, lockedToken], models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
+      await waitForChatReady();
+      openSettings();
+
+      await pickOption(t.chatRunAsTokenLabel, lockedToken.name);
+
+      // The model dropdown's option fetch is keyed on the EFFECTIVE (token-locked)
+      // server, not the chat's own (empty) picked server.
+      await waitFor(() => expect(chatApi.spies.serverModels).toHaveBeenCalledWith('srv_token'));
+
+      const serverSelect = screen.getByRole('combobox', {
+        name: t.serverOverrideLabel,
+      }) as HTMLInputElement;
+      expect(serverSelect).toBeDisabled();
+      // srv_token is not among the caller's manageable servers -- the synthetic
+      // fallback option keeps the id visible instead of rendering blank.
+      expect(serverSelect.value).toBe('srv_token');
+      expect(screen.getByText(t.serverOverrideLockedHint)).toBeInTheDocument();
+
+      const forceCheckbox = screen.getByLabelText(t.serverOverrideForceLabel) as HTMLInputElement;
+      expect(forceCheckbox).toBeDisabled();
+      expect(forceCheckbox.checked).toBe(true);
+
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
+      expect(await screen.findByRole('option', { name: 'token-server-model' })).toBeInTheDocument();
+      expect(
+        screen.queryByRole('option', { name: models[0].display_name }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("unlocks the chat's own server-override control again when the run-as token is cleared", async () => {
+      const lockedToken = makeToken({
+        id: 'tok_server_override',
+        name: 'Locked Token',
+        server_override: 'srv_token',
+        server_override_force_unreachable: true,
+      });
+      serverModelsByServer.srv_token = [
+        { id: 'token-server-model', display_name: 'token-server-model' },
+      ];
+      renderChat([...tokens, lockedToken], models, [makeServer({ id: 'srv_a', name: 'Server A' })]);
+      await waitForChatReady();
+      openSettings();
+
+      await pickOption(t.chatRunAsTokenLabel, lockedToken.name);
+      const serverSelect = screen.getByRole('combobox', {
+        name: t.serverOverrideLabel,
+      }) as HTMLInputElement;
+      expect(serverSelect).toBeDisabled();
+
+      await pickOption(t.chatRunAsTokenLabel, t.chatRunAsNone);
+
+      await waitFor(() => expect(serverSelect).not.toBeDisabled());
+    });
+  });
+}

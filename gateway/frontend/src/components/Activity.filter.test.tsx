@@ -5,10 +5,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { AdminUser, PortalToken, UsagePage, UsageStats } from '../api';
-
-const t = messages.de;
 
 function installStorage() {
   const store = new Map<string, string>();
@@ -117,120 +115,132 @@ function makeApi() {
   return { api };
 }
 
-function renderActivity(role = 'user') {
-  const { api } = makeApi();
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  return { api };
-}
-
-// SelectField + SearchableSelect are both MUI comboboxes: open by mouseDown on the
-// combobox (scoped by label), then click the option (rendered in a portal).
-async function pick(comboLabel: string, optionText: string) {
-  fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
-  fireEvent.click(await screen.findByRole('option', { name: optionText }));
-}
-function lastArg(fn: unknown) {
-  return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0] as Record<string, unknown>;
-}
-function lastActiveArgs(fn: unknown) {
-  return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)! as unknown[];
-}
-
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
-describe('Activity user/token filter', () => {
-  it('shows only the token dropdown for a non-admin and fetches own tokens', async () => {
-    installStorage();
-    const { api } = renderActivity('user');
+// Both locales, not just German (issue #89): run the whole suite once per locale
+// so the filter dropdowns' English labels are rendered and asserted too.
+// Everything that references `t` lives inside the loop.
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    expect(
-      await screen.findByRole('combobox', { name: t.activityTokenFilterLabel }),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole('combobox', { name: t.activityScopeLabel })).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole('combobox', { name: t.activityUserFilterLabel }),
-    ).not.toBeInTheDocument();
-    await waitFor(() => expect(api.tokens).toHaveBeenCalled());
-    expect(api.userTokens).not.toHaveBeenCalled();
+  function renderActivity(role = 'user') {
+    const { api } = makeApi();
+    render(
+      <ToastProvider>
+        <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
+      </ToastProvider>,
+    );
+    return { api };
+  }
+
+  // SelectField + SearchableSelect are both MUI comboboxes: open by mouseDown on the
+  // combobox (scoped by label), then click the option (rendered in a portal).
+  async function pick(comboLabel: string, optionText: string) {
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
+    fireEvent.click(await screen.findByRole('option', { name: optionText }));
+  }
+  function lastArg(fn: unknown) {
+    return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0] as Record<
+      string,
+      unknown
+    >;
+  }
+  function lastActiveArgs(fn: unknown) {
+    return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)! as unknown[];
+  }
+
+  describe(`Activity user/token filter [${locale}]`, () => {
+    it('shows only the token dropdown for a non-admin and fetches own tokens', async () => {
+      installStorage();
+      const { api } = renderActivity('user');
+
+      expect(
+        await screen.findByRole('combobox', { name: t.activityTokenFilterLabel }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('combobox', { name: t.activityScopeLabel }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('combobox', { name: t.activityUserFilterLabel }),
+      ).not.toBeInTheDocument();
+      await waitFor(() => expect(api.tokens).toHaveBeenCalled());
+      expect(api.userTokens).not.toHaveBeenCalled();
+    });
+
+    it('offers own/specific/all and reveals the user dropdown only for a specific user', async () => {
+      installStorage();
+      renderActivity('admin');
+      await screen.findByRole('combobox', { name: t.activityScopeLabel });
+
+      await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
+      expect(
+        await screen.findByRole('combobox', { name: t.activityUserFilterLabel }),
+      ).toBeInTheDocument();
+      // No token dropdown until a user is chosen.
+      expect(
+        screen.queryByRole('combobox', { name: t.activityTokenFilterLabel }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("loads the selected user's tokens and threads user_id into all four fetches", async () => {
+      installStorage();
+      const { api } = renderActivity('admin');
+      await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
+      await pick(t.activityUserFilterLabel, 'Alice Admin');
+
+      await waitFor(() => expect(api.userTokens).toHaveBeenCalledWith('usr_42'));
+      expect(
+        await screen.findByRole('combobox', { name: t.activityTokenFilterLabel }),
+      ).toBeInTheDocument();
+
+      await waitFor(() => expect(lastArg(api.activity).user_id).toBe('usr_42'));
+      expect(lastArg(api.activityStats).user_id).toBe('usr_42');
+      expect(lastArg(api.usageTimeSeries).user_id).toBe('usr_42');
+      expect(lastActiveArgs(api.activeRequests)[1]).toMatchObject({ user_id: 'usr_42' });
+    });
+
+    it('maps the chat-session option to token_id=__none__ across all four fetches', async () => {
+      installStorage();
+      const { api } = renderActivity('user');
+      await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
+
+      await pick(t.activityTokenFilterLabel, t.activityActiveSession);
+
+      await waitFor(() => expect(lastArg(api.activity).token_id).toBe('__none__'));
+      expect(lastArg(api.activityStats).token_id).toBe('__none__');
+      expect(lastArg(api.usageTimeSeries).token_id).toBe('__none__');
+      expect(lastActiveArgs(api.activeRequests)[1]).toMatchObject({ token_id: '__none__' });
+    });
+
+    it('sends the raw token id for a real token', async () => {
+      installStorage();
+      const { api } = renderActivity('user');
+      await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
+
+      await pick(t.activityTokenFilterLabel, 'My Token');
+
+      await waitFor(() => expect(lastArg(api.activity).token_id).toBe('tok_own'));
+    });
+
+    it('clears a stale user/token selection on scope change so no foreign token leaks into the fetch', async () => {
+      installStorage();
+      const { api } = renderActivity('admin');
+      // Specific user U1, then U1's token -> threaded into the fetch.
+      await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
+      await pick(t.activityUserFilterLabel, 'Alice Admin');
+      await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
+      await pick(t.activityTokenFilterLabel, 'Target Token');
+      await waitFor(() => expect(lastArg(api.activity).token_id).toBe('tok_target'));
+
+      // Switch scope back to own: the U1 token (tok_target) must NOT survive —
+      // otherwise the backend pins the admin's user_id + a foreign token_id and
+      // every section silently renders empty.
+      await pick(t.activityScopeLabel, t.activityScopeOwn);
+      await waitFor(() => expect(lastArg(api.activity).token_id).toBeUndefined());
+      expect(lastArg(api.activity).user_id).toBeUndefined();
+    });
   });
-
-  it('offers own/specific/all and reveals the user dropdown only for a specific user', async () => {
-    installStorage();
-    renderActivity('admin');
-    await screen.findByRole('combobox', { name: t.activityScopeLabel });
-
-    await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
-    expect(
-      await screen.findByRole('combobox', { name: t.activityUserFilterLabel }),
-    ).toBeInTheDocument();
-    // No token dropdown until a user is chosen.
-    expect(
-      screen.queryByRole('combobox', { name: t.activityTokenFilterLabel }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("loads the selected user's tokens and threads user_id into all four fetches", async () => {
-    installStorage();
-    const { api } = renderActivity('admin');
-    await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
-    await pick(t.activityUserFilterLabel, 'Alice Admin');
-
-    await waitFor(() => expect(api.userTokens).toHaveBeenCalledWith('usr_42'));
-    expect(
-      await screen.findByRole('combobox', { name: t.activityTokenFilterLabel }),
-    ).toBeInTheDocument();
-
-    await waitFor(() => expect(lastArg(api.activity).user_id).toBe('usr_42'));
-    expect(lastArg(api.activityStats).user_id).toBe('usr_42');
-    expect(lastArg(api.usageTimeSeries).user_id).toBe('usr_42');
-    expect(lastActiveArgs(api.activeRequests)[1]).toMatchObject({ user_id: 'usr_42' });
-  });
-
-  it('maps the chat-session option to token_id=__none__ across all four fetches', async () => {
-    installStorage();
-    const { api } = renderActivity('user');
-    await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
-
-    await pick(t.activityTokenFilterLabel, t.activityActiveSession);
-
-    await waitFor(() => expect(lastArg(api.activity).token_id).toBe('__none__'));
-    expect(lastArg(api.activityStats).token_id).toBe('__none__');
-    expect(lastArg(api.usageTimeSeries).token_id).toBe('__none__');
-    expect(lastActiveArgs(api.activeRequests)[1]).toMatchObject({ token_id: '__none__' });
-  });
-
-  it('sends the raw token id for a real token', async () => {
-    installStorage();
-    const { api } = renderActivity('user');
-    await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
-
-    await pick(t.activityTokenFilterLabel, 'My Token');
-
-    await waitFor(() => expect(lastArg(api.activity).token_id).toBe('tok_own'));
-  });
-
-  it('clears a stale user/token selection on scope change so no foreign token leaks into the fetch', async () => {
-    installStorage();
-    const { api } = renderActivity('admin');
-    // Specific user U1, then U1's token -> threaded into the fetch.
-    await pick(t.activityScopeLabel, t.activityScopeSpecificUser);
-    await pick(t.activityUserFilterLabel, 'Alice Admin');
-    await screen.findByRole('combobox', { name: t.activityTokenFilterLabel });
-    await pick(t.activityTokenFilterLabel, 'Target Token');
-    await waitFor(() => expect(lastArg(api.activity).token_id).toBe('tok_target'));
-
-    // Switch scope back to own: the U1 token (tok_target) must NOT survive —
-    // otherwise the backend pins the admin's user_id + a foreign token_id and
-    // every section silently renders empty.
-    await pick(t.activityScopeLabel, t.activityScopeOwn);
-    await waitFor(() => expect(lastArg(api.activity).token_id).toBeUndefined());
-    expect(lastArg(api.activity).user_id).toBeUndefined();
-  });
-});
+}

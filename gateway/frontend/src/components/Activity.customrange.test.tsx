@@ -5,10 +5,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Activity } from './Activity';
 import { ToastProvider } from './shared/ToastProvider';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { PortalToken, UsagePage, UsageStats } from '../api';
-
-const t = messages.de;
 
 function installStorage() {
   const store = new Map<string, string>();
@@ -96,68 +94,78 @@ function makeApi() {
   return { api };
 }
 
-function renderActivity(role = 'user') {
-  const { api } = makeApi();
-  render(
-    <ToastProvider>
-      <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
-    </ToastProvider>,
-  );
-  return { api };
-}
-
-async function pick(comboLabel: string, optionText: string) {
-  fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
-  fireEvent.click(await screen.findByRole('option', { name: optionText }));
-}
-function lastArg(fn: unknown) {
-  return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0] as Record<string, unknown>;
-}
-
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
-describe('Activity custom absolute time range', () => {
-  it('sends range=all + the absolute from/to bounds (not range=custom) when custom is chosen', async () => {
-    installStorage();
-    const { api } = renderActivity('user');
-    await screen.findByRole('combobox', { name: t.activityRangeLabel });
+// Both locales, not just German (issue #89): run the whole suite once per locale
+// so the range picker's English labels are rendered and asserted too.
+// Everything that references `t` lives inside the loop.
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
 
-    await pick(t.activityRangeLabel, t.activityRangeCustom);
-    // The two datetime inputs appear only in custom mode.
-    fireEvent.change(screen.getByLabelText(t.activityRangeFrom), {
-      target: { value: '2026-01-01T00:00' },
-    });
-    fireEvent.change(screen.getByLabelText(t.activityRangeTo), {
-      target: { value: '2026-02-01T00:00' },
+  function renderActivity(role = 'user') {
+    const { api } = makeApi();
+    render(
+      <ToastProvider>
+        <Activity t={t} api={api} role={role} onUnauthorized={vi.fn()} />
+      </ToastProvider>,
+    );
+    return { api };
+  }
+
+  async function pick(comboLabel: string, optionText: string) {
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
+    fireEvent.click(await screen.findByRole('option', { name: optionText }));
+  }
+  function lastArg(fn: unknown) {
+    return (fn as { mock: { calls: unknown[][] } }).mock.calls.at(-1)![0] as Record<
+      string,
+      unknown
+    >;
+  }
+
+  describe(`Activity custom absolute time range [${locale}]`, () => {
+    it('sends range=all + the absolute from/to bounds (not range=custom) when custom is chosen', async () => {
+      installStorage();
+      const { api } = renderActivity('user');
+      await screen.findByRole('combobox', { name: t.activityRangeLabel });
+
+      await pick(t.activityRangeLabel, t.activityRangeCustom);
+      // The two datetime inputs appear only in custom mode.
+      fireEvent.change(screen.getByLabelText(t.activityRangeFrom), {
+        target: { value: '2026-01-01T00:00' },
+      });
+      fireEvent.change(screen.getByLabelText(t.activityRangeTo), {
+        target: { value: '2026-02-01T00:00' },
+      });
+
+      await waitFor(() => expect(lastArg(api.activity).time_from).toBe('2026-01-01T00:00'));
+      const q = lastArg(api.activity);
+      expect(q.time_to).toBe('2026-02-01T00:00');
+      // range is coerced to "all" so the preset lower bound doesn't also clip; the
+      // client never sends the "custom" pseudo-value to the backend.
+      expect(q.range).toBe('all');
     });
 
-    await waitFor(() => expect(lastArg(api.activity).time_from).toBe('2026-01-01T00:00'));
-    const q = lastArg(api.activity);
-    expect(q.time_to).toBe('2026-02-01T00:00');
-    // range is coerced to "all" so the preset lower bound doesn't also clip; the
-    // client never sends the "custom" pseudo-value to the backend.
-    expect(q.range).toBe('all');
+    it('drops the custom bounds when switching back to a preset (range=7d, no custom from/to)', async () => {
+      installStorage();
+      const { api } = renderActivity('user');
+      await screen.findByRole('combobox', { name: t.activityRangeLabel });
+
+      await pick(t.activityRangeLabel, t.activityRangeCustom);
+      fireEvent.change(screen.getByLabelText(t.activityRangeFrom), {
+        target: { value: '2026-01-01T00:00' },
+      });
+      await waitFor(() => expect(lastArg(api.activity).time_from).toBe('2026-01-01T00:00'));
+
+      // Back to a preset: the query must carry range=7d and no longer the custom bound.
+      await pick(t.activityRangeLabel, t.activityRange7d);
+      await waitFor(() => expect(lastArg(api.activity).range).toBe('7d'));
+      expect(lastArg(api.activity).time_from).not.toBe('2026-01-01T00:00');
+      // The datetime inputs are gone (custom-only).
+      expect(screen.queryByLabelText(t.activityRangeFrom)).not.toBeInTheDocument();
+    });
   });
-
-  it('drops the custom bounds when switching back to a preset (range=7d, no custom from/to)', async () => {
-    installStorage();
-    const { api } = renderActivity('user');
-    await screen.findByRole('combobox', { name: t.activityRangeLabel });
-
-    await pick(t.activityRangeLabel, t.activityRangeCustom);
-    fireEvent.change(screen.getByLabelText(t.activityRangeFrom), {
-      target: { value: '2026-01-01T00:00' },
-    });
-    await waitFor(() => expect(lastArg(api.activity).time_from).toBe('2026-01-01T00:00'));
-
-    // Back to a preset: the query must carry range=7d and no longer the custom bound.
-    await pick(t.activityRangeLabel, t.activityRange7d);
-    await waitFor(() => expect(lastArg(api.activity).range).toBe('7d'));
-    expect(lastArg(api.activity).time_from).not.toBe('2026-01-01T00:00');
-    // The datetime inputs are gone (custom-only).
-    expect(screen.queryByLabelText(t.activityRangeFrom)).not.toBeInTheDocument();
-  });
-});
+}

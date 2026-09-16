@@ -4,11 +4,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { AvailabilitySection, buildSegments, bucketUptime } from './AvailabilitySection';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { AvailabilityPoint } from '../api';
 import type { TimelineState } from './UptimeTimeline';
-
-const t = messages.de;
 
 // This file's config doesn't enable vitest `globals`, so @testing-library/react's
 // auto-cleanup (which checks for a global `afterEach`) never registers; without an
@@ -359,97 +357,175 @@ describe('availability derivations', () => {
   });
 });
 
-describe('AvailabilitySection', () => {
-  it('renders timelines + charts from fetched data', async () => {
-    const api = {
-      serverAvailability: vi.fn().mockResolvedValue({
+for (const locale of ['de', 'en'] as readonly Locale[]) {
+  const t = messages[locale];
+
+  describe(`AvailabilitySection [${locale}]`, () => {
+    it('renders timelines + charts from fetched data', async () => {
+      const api = {
+        serverAvailability: vi.fn().mockResolvedValue({
+          points: [
+            {
+              t: '2026-01-01T00:00:00Z',
+              health: 'healthy',
+              reachable_count: 1,
+              active_count: 1,
+              agent_reporting: true,
+            },
+            {
+              t: '2026-01-01T00:30:00Z',
+              health: 'unhealthy',
+              reachable_count: 0,
+              active_count: 1,
+              agent_reporting: false,
+            },
+          ],
+          from: '2026-01-01T00:00:00Z',
+          to: '2026-01-01T01:00:00Z',
+        }),
+      } as any;
+      const server = { id: 's1', name: 'srv', last_seen_at: '2026-01-01T00:59:00Z' } as any;
+      render(<AvailabilitySection t={t} api={api} server={server} />);
+      await waitFor(() =>
+        expect(api.serverAvailability).toHaveBeenCalledWith('s1', expect.any(String)),
+      );
+      expect(await screen.findByText(t.availabilityHealthTimeline)).toBeInTheDocument();
+      expect(screen.getByText(t.availabilityAgentTimeline)).toBeInTheDocument();
+      expect(screen.getByText(t.availabilityUptimeChart)).toBeInTheDocument();
+      expect(screen.getByText(t.availabilityAgentChart)).toBeInTheDocument();
+    });
+
+    it('shows the empty state when no points are returned', async () => {
+      const api = {
+        serverAvailability: vi.fn().mockResolvedValue({
+          points: [],
+          from: '2026-01-01T00:00:00Z',
+          to: '2026-01-01T01:00:00Z',
+        }),
+      } as any;
+      const server = { id: 's2', name: 'srv2', last_seen_at: null } as any;
+      render(<AvailabilitySection t={t} api={api} server={server} />);
+      expect(await screen.findByText(t.availabilityNoData)).toBeInTheDocument();
+    });
+
+    // TestAvailabilitySectionDegradedUnhealthyAbsentSegments (naming mirrors the
+    // Go convention used elsewhere in this repo's test suites): proves the
+    // degraded/unhealthy/absent color+label mappings actually reach the
+    // rendered timeline, not just the healthy/unknown paths the two tests
+    // above exercise. The window here is deliberately tight (from == the
+    // first point, to == the last point, no point more than GAP_THRESHOLD_MS
+    // stale) so every interior segment holds its point's real state instead
+    // of collapsing to "unknown" — the earlier "renders timelines..." test's
+    // sole unhealthy point falls OUTSIDE that threshold and so is painted
+    // "unknown" for its trailing segment, never actually reaching colorHealth/
+    // labelHealth('unhealthy').
+    it('colors and labels degraded/unhealthy health and absent agent segments', async () => {
+      const history = {
         points: [
           {
-            t: '2026-01-01T00:00:00Z',
+            t: '2026-02-01T00:00:00Z',
             health: 'healthy',
             reachable_count: 1,
             active_count: 1,
             agent_reporting: true,
+            netbird_connected: false,
+            gap_before: false,
           },
           {
-            t: '2026-01-01T00:30:00Z',
+            t: '2026-02-01T00:10:00Z',
+            health: 'degraded',
+            reachable_count: 1,
+            active_count: 1,
+            agent_reporting: false,
+            netbird_connected: false,
+            gap_before: false,
+          },
+          {
+            t: '2026-02-01T00:20:00Z',
             health: 'unhealthy',
             reachable_count: 0,
             active_count: 1,
-            agent_reporting: false,
+            agent_reporting: true,
+            netbird_connected: false,
+            gap_before: false,
+          },
+          {
+            t: '2026-02-01T00:30:00Z',
+            health: 'healthy',
+            reachable_count: 1,
+            active_count: 1,
+            agent_reporting: true,
+            netbird_connected: false,
+            gap_before: false,
           },
         ],
-        from: '2026-01-01T00:00:00Z',
-        to: '2026-01-01T01:00:00Z',
-      }),
-    } as any;
-    const server = { id: 's1', name: 'srv', last_seen_at: '2026-01-01T00:59:00Z' } as any;
-    render(<AvailabilitySection t={t} api={api} server={server} />);
-    await waitFor(() =>
-      expect(api.serverAvailability).toHaveBeenCalledWith('s1', expect.any(String)),
-    );
-    expect(await screen.findByText(t.availabilityHealthTimeline)).toBeInTheDocument();
-    expect(screen.getByText(t.availabilityAgentTimeline)).toBeInTheDocument();
-    expect(screen.getByText(t.availabilityUptimeChart)).toBeInTheDocument();
-    expect(screen.getByText(t.availabilityAgentChart)).toBeInTheDocument();
+        from: '2026-02-01T00:00:00Z',
+        to: '2026-02-01T00:30:00Z',
+      };
+      const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
+      const server = { id: 's3', name: 'srv3', netbird_peer_id: '', last_seen_at: null } as any;
+      render(<AvailabilitySection t={t} api={api} server={server} />);
+
+      // Each UptimeTimeline instance's title Typography and its <svg> are
+      // direct siblings inside the SAME wrapper Box, so locating the svg via
+      // the title text (rather than a brittle document-wide positional index,
+      // which an unrelated icon <svg> elsewhere in the panel could shift) is
+      // robust regardless of what else the panel renders.
+      const svgNear = (title: string): SVGElement => {
+        const el = screen.getByText(title).parentElement?.querySelector('svg');
+        if (!el) throw new Error(`no <svg> found next to title ${title}`);
+        return el;
+      };
+      const healthSvg = await waitFor(() => svgNear(t.availabilityHealthTimeline));
+      const agentSvg = svgNear(t.availabilityAgentTimeline);
+
+      const healthFills = Array.from(healthSvg.querySelectorAll('[data-segment]')).map((el) =>
+        el.getAttribute('fill'),
+      );
+      expect(healthFills).toContain('var(--watch-bg, #ed6c02)'); // degraded
+      expect(healthFills).toContain('#d32f2f'); // unhealthy
+
+      const agentFills = Array.from(agentSvg.querySelectorAll('[data-segment]')).map((el) =>
+        el.getAttribute('fill'),
+      );
+      expect(agentFills).toContain('#d32f2f'); // absent
+
+      // Hovering each colored segment surfaces its label text in the tooltip —
+      // proving colorForState and labelForState agree on which segment is which.
+      const degradedRect = healthSvg.querySelector('[fill="var(--watch-bg, #ed6c02)"]');
+      expect(degradedRect).not.toBeNull();
+      fireEvent.mouseEnter(degradedRect as Element);
+      expect(await screen.findByText(new RegExp(t.availabilityStateDegraded))).toBeInTheDocument();
+      fireEvent.mouseLeave(degradedRect as Element);
+
+      const unhealthyRect = healthSvg.querySelector('[fill="#d32f2f"]');
+      expect(unhealthyRect).not.toBeNull();
+      fireEvent.mouseEnter(unhealthyRect as Element);
+      expect(await screen.findByText(new RegExp(t.availabilityStateUnhealthy))).toBeInTheDocument();
+      fireEvent.mouseLeave(unhealthyRect as Element);
+
+      const absentRect = agentSvg.querySelector('[fill="#d32f2f"]');
+      expect(absentRect).not.toBeNull();
+      fireEvent.mouseEnter(absentRect as Element);
+      expect(await screen.findByText(new RegExp(t.availabilityStateAbsent))).toBeInTheDocument();
+      fireEvent.mouseLeave(absentRect as Element);
+    });
   });
 
-  it('shows the empty state when no points are returned', async () => {
-    const api = {
-      serverAvailability: vi.fn().mockResolvedValue({
-        points: [],
-        from: '2026-01-01T00:00:00Z',
-        to: '2026-01-01T01:00:00Z',
-      }),
-    } as any;
-    const server = { id: 's2', name: 'srv2', last_seen_at: null } as any;
-    render(<AvailabilitySection t={t} api={api} server={server} />);
-    expect(await screen.findByText(t.availabilityNoData)).toBeInTheDocument();
-  });
-
-  // TestAvailabilitySectionDegradedUnhealthyAbsentSegments (naming mirrors the
-  // Go convention used elsewhere in this repo's test suites): proves the
-  // degraded/unhealthy/absent color+label mappings actually reach the
-  // rendered timeline, not just the healthy/unknown paths the two tests
-  // above exercise. The window here is deliberately tight (from == the
-  // first point, to == the last point, no point more than GAP_THRESHOLD_MS
-  // stale) so every interior segment holds its point's real state instead
-  // of collapsing to "unknown" — the earlier "renders timelines..." test's
-  // sole unhealthy point falls OUTSIDE that threshold and so is painted
-  // "unknown" for its trailing segment, never actually reaching colorHealth/
-  // labelHealth('unhealthy').
-  it('colors and labels degraded/unhealthy health and absent agent segments', async () => {
+  describe(`AvailabilitySection NetBird gate [${locale}]`, () => {
     const history = {
       points: [
         {
-          t: '2026-02-01T00:00:00Z',
+          t: '2026-01-01T00:00:00Z',
           health: 'healthy',
           reachable_count: 1,
           active_count: 1,
           agent_reporting: true,
-          netbird_connected: false,
+          netbird_connected: true,
           gap_before: false,
         },
         {
-          t: '2026-02-01T00:10:00Z',
-          health: 'degraded',
-          reachable_count: 1,
-          active_count: 1,
-          agent_reporting: false,
-          netbird_connected: false,
-          gap_before: false,
-        },
-        {
-          t: '2026-02-01T00:20:00Z',
-          health: 'unhealthy',
-          reachable_count: 0,
-          active_count: 1,
-          agent_reporting: true,
-          netbird_connected: false,
-          gap_before: false,
-        },
-        {
-          t: '2026-02-01T00:30:00Z',
+          t: '2026-01-01T00:30:00Z',
           health: 'healthy',
           reachable_count: 1,
           active_count: 1,
@@ -458,100 +534,31 @@ describe('AvailabilitySection', () => {
           gap_before: false,
         },
       ],
-      from: '2026-02-01T00:00:00Z',
-      to: '2026-02-01T00:30:00Z',
+      from: '2026-01-01T00:00:00Z',
+      to: '2026-01-01T01:00:00Z',
     };
-    const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
-    const server = { id: 's3', name: 'srv3', netbird_peer_id: '', last_seen_at: null } as any;
-    render(<AvailabilitySection t={t} api={api} server={server} />);
 
-    // Each UptimeTimeline instance's title Typography and its <svg> are
-    // direct siblings inside the SAME wrapper Box, so locating the svg via
-    // the title text (rather than a brittle document-wide positional index,
-    // which an unrelated icon <svg> elsewhere in the panel could shift) is
-    // robust regardless of what else the panel renders.
-    const svgNear = (title: string): SVGElement => {
-      const el = screen.getByText(title).parentElement?.querySelector('svg');
-      if (!el) throw new Error(`no <svg> found next to title ${title}`);
-      return el;
-    };
-    const healthSvg = await waitFor(() => svgNear(t.availabilityHealthTimeline));
-    const agentSvg = svgNear(t.availabilityAgentTimeline);
+    it('shows the NetBird timeline + chart when the server has a linked peer', async () => {
+      const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
+      const server = {
+        id: 's1',
+        name: 'srv',
+        netbird_peer_id: 'peer-1',
+        last_seen_at: null,
+      } as any;
+      render(<AvailabilitySection t={t} api={api} server={server} />);
+      expect(await screen.findByText(t.availabilityNetbirdTimeline)).toBeInTheDocument();
+      expect(screen.getAllByText(t.availabilityNetbirdChart).length).toBeGreaterThan(0);
+    });
 
-    const healthFills = Array.from(healthSvg.querySelectorAll('[data-segment]')).map((el) =>
-      el.getAttribute('fill'),
-    );
-    expect(healthFills).toContain('var(--watch-bg, #ed6c02)'); // degraded
-    expect(healthFills).toContain('#d32f2f'); // unhealthy
-
-    const agentFills = Array.from(agentSvg.querySelectorAll('[data-segment]')).map((el) =>
-      el.getAttribute('fill'),
-    );
-    expect(agentFills).toContain('#d32f2f'); // absent
-
-    // Hovering each colored segment surfaces its label text in the tooltip —
-    // proving colorForState and labelForState agree on which segment is which.
-    const degradedRect = healthSvg.querySelector('[fill="var(--watch-bg, #ed6c02)"]');
-    expect(degradedRect).not.toBeNull();
-    fireEvent.mouseEnter(degradedRect as Element);
-    expect(await screen.findByText(new RegExp(t.availabilityStateDegraded))).toBeInTheDocument();
-    fireEvent.mouseLeave(degradedRect as Element);
-
-    const unhealthyRect = healthSvg.querySelector('[fill="#d32f2f"]');
-    expect(unhealthyRect).not.toBeNull();
-    fireEvent.mouseEnter(unhealthyRect as Element);
-    expect(await screen.findByText(new RegExp(t.availabilityStateUnhealthy))).toBeInTheDocument();
-    fireEvent.mouseLeave(unhealthyRect as Element);
-
-    const absentRect = agentSvg.querySelector('[fill="#d32f2f"]');
-    expect(absentRect).not.toBeNull();
-    fireEvent.mouseEnter(absentRect as Element);
-    expect(await screen.findByText(new RegExp(t.availabilityStateAbsent))).toBeInTheDocument();
-    fireEvent.mouseLeave(absentRect as Element);
+    it('hides the NetBird graphs when the server has no linked peer', async () => {
+      const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
+      const server = { id: 's2', name: 'srv2', netbird_peer_id: '', last_seen_at: null } as any;
+      render(<AvailabilitySection t={t} api={api} server={server} />);
+      // Wait for data to load (health timeline always renders) before asserting absence.
+      expect(await screen.findByText(t.availabilityHealthTimeline)).toBeInTheDocument();
+      expect(screen.queryByText(t.availabilityNetbirdTimeline)).toBeNull();
+      expect(screen.queryAllByText(t.availabilityNetbirdChart)).toHaveLength(0);
+    });
   });
-});
-
-describe('AvailabilitySection NetBird gate', () => {
-  const history = {
-    points: [
-      {
-        t: '2026-01-01T00:00:00Z',
-        health: 'healthy',
-        reachable_count: 1,
-        active_count: 1,
-        agent_reporting: true,
-        netbird_connected: true,
-        gap_before: false,
-      },
-      {
-        t: '2026-01-01T00:30:00Z',
-        health: 'healthy',
-        reachable_count: 1,
-        active_count: 1,
-        agent_reporting: true,
-        netbird_connected: false,
-        gap_before: false,
-      },
-    ],
-    from: '2026-01-01T00:00:00Z',
-    to: '2026-01-01T01:00:00Z',
-  };
-
-  it('shows the NetBird timeline + chart when the server has a linked peer', async () => {
-    const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
-    const server = { id: 's1', name: 'srv', netbird_peer_id: 'peer-1', last_seen_at: null } as any;
-    render(<AvailabilitySection t={t} api={api} server={server} />);
-    expect(await screen.findByText(t.availabilityNetbirdTimeline)).toBeInTheDocument();
-    expect(screen.getAllByText(t.availabilityNetbirdChart).length).toBeGreaterThan(0);
-  });
-
-  it('hides the NetBird graphs when the server has no linked peer', async () => {
-    const api = { serverAvailability: vi.fn().mockResolvedValue(history) } as any;
-    const server = { id: 's2', name: 'srv2', netbird_peer_id: '', last_seen_at: null } as any;
-    render(<AvailabilitySection t={t} api={api} server={server} />);
-    // Wait for data to load (health timeline always renders) before asserting absence.
-    expect(await screen.findByText(t.availabilityHealthTimeline)).toBeInTheDocument();
-    expect(screen.queryByText(t.availabilityNetbirdTimeline)).toBeNull();
-    expect(screen.queryAllByText(t.availabilityNetbirdChart)).toHaveLength(0);
-  });
-});
+}
