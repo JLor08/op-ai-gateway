@@ -906,6 +906,72 @@ func TestTokenRepositoryConformance(t *testing.T) {
 	})
 }
 
+// TestTokenRepositorySetLastUsedModelConformance pins that SetTokenLastUsedModel
+// behaves identically across the memory and SQL drivers (issue #97). The setter
+// was NOT on the TokenRepository interface, so this suite could not reach it, and
+// the two drivers' agreement — especially on the empty-id case — was accidental:
+// it rests on two DIFFERENT mechanisms (the memory driver's map miss vs the SQL
+// driver's 0-rows-affected) that happen to converge on store.ErrNotFound. A
+// populated hit persists the model and reads back through TokenByID; a populated
+// miss and an EMPTY id both return ErrNotFound. The empty-id case had no test in
+// either package before this; the PostgreSQL leg is exercised by the sibling
+// dialect test TestConformanceSetTokenLastUsedModel (internal/store), since this
+// suite's SQL driver is sqlite-only.
+func TestTokenRepositorySetLastUsedModelConformance(t *testing.T) {
+	seedSQL := func(t *testing.T, s *store.SQLStore) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+		if err := s.CreateUser(ctx, store.User{
+			ID: "usr_lum1", Email: "usr_lum1@x.test", DisplayName: "usr_lum1", Role: "user",
+			Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+
+	forEachTokenStore(t, seedSQL, func(t *testing.T, tr TokenRepository) {
+		ctx := context.Background()
+		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+		// populated-hit: the setter OVERWRITES a prior value (seeded non-empty on
+		// purpose), persists it readably via TokenByID, and disturbs no sibling
+		// column — the narrow-write property that must hold identically on both
+		// drivers, not only the SQL one (sqlite_token_test.go pins it for SQL).
+		tok := store.TokenRecord{ID: "tok_lum", UserID: "usr_lum1", Name: "lum", LastUsedModel: "qwen3-32b", CreatedAt: now, UpdatedAt: now}
+		if err := tr.CreatePlainToken(ctx, tok, "lum-secret-value"); err != nil {
+			t.Fatalf("CreatePlainToken: %v", err)
+		}
+		before, err := tr.TokenByID(ctx, "tok_lum")
+		if err != nil {
+			t.Fatalf("TokenByID(before): %v", err)
+		}
+		if err := tr.SetTokenLastUsedModel(ctx, "tok_lum", "llama-70b"); err != nil {
+			t.Fatalf("SetTokenLastUsedModel(hit) = %v, want nil", err)
+		}
+		got, err := tr.TokenByID(ctx, "tok_lum")
+		if err != nil {
+			t.Fatalf("TokenByID: %v", err)
+		}
+		if got.LastUsedModel != "llama-70b" {
+			t.Fatalf("LastUsedModel = %q, want %q (overwrite of %q)", got.LastUsedModel, "llama-70b", before.LastUsedModel)
+		}
+		if got.Name != before.Name || got.Status != before.Status || got.UserID != before.UserID {
+			t.Fatalf("setter disturbed a sibling column: before=%+v after=%+v", before, got)
+		}
+
+		// populated-miss: a non-existent but non-empty id returns ErrNotFound.
+		if err := tr.SetTokenLastUsedModel(ctx, "tok_missing", "m"); err != store.ErrNotFound {
+			t.Fatalf("SetTokenLastUsedModel(missing) = %v, want ErrNotFound", err)
+		}
+
+		// empty-id: the case no existing test covered — both drivers must return
+		// ErrNotFound, pinning the previously-accidental agreement.
+		if err := tr.SetTokenLastUsedModel(ctx, "", "m"); err != store.ErrNotFound {
+			t.Fatalf("SetTokenLastUsedModel(empty id) = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // TestTokenRepositoryCreatePlainTokenUniqueness is the ST-3 DIVERGENCE
 // DISCOVERY test.
 //

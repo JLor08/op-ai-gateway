@@ -1270,6 +1270,16 @@ func (f *fakeTokens) DeleteToken(ctx context.Context, id string) error {
 	return store.ErrNotFound
 }
 
+func (f *fakeTokens) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
+	for i, record := range f.records {
+		if record.ID == tokenID {
+			f.records[i].LastUsedModel = model
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
 type fakeUsage struct {
 	events []usage.Event
 }
