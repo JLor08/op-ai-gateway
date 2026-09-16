@@ -5,10 +5,12 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strings"
@@ -82,6 +84,39 @@ var (
 	_ provider.LiveProgressRejectionMemo = (*rejectingProxyProvider)(nil)
 )
 
+// liveTimingsRefusalMsg is the substring every assertion in this file matches
+// the refusal Warn on. It lives in one place so the positive and the three
+// negatives cannot drift apart -- the failure mode that matters is a build whose
+// warning fires on requests it should not, and a negative matching a different
+// substring than the positive would never see it.
+//
+// It is deliberately a substring of the message rather than the whole of it: the
+// wording carries the remedy for an operator reading a log, so it will change,
+// and coupling four assertions to its exact prose would make every rewording a
+// test edit. "live timings" plus the level is specific enough -- nothing else in
+// this package logs those two words at Warn.
+const liveTimingsRefusalMsg = "live timings"
+
+// assertNoLiveTimingsRefusalWarning is the negative half of the refusal
+// diagnostic, and it exists because the Warn and the memo write share ONE
+// condition at proxyNative. Splitting that condition -- so the line fires on
+// every injected request rather than only on a refused one -- is a one-character
+// edit that the memo assertions alone would not notice, and the whole point of
+// residual 4 is that this line is TRUSTWORTHY at the default level. A diagnostic
+// that cries wolf is worse than the silence it replaced.
+//
+// The package already demands exactly this discipline for the per-request debug
+// FIELD (TestPassthroughNativeDebugLineRecordsTheInjection: "a field emitted only
+// when true is indistinguishable, to an operator grepping a log, from a build
+// that never had the field"). This is the same rule for the line.
+func assertNoLiveTimingsRefusalWarning(t *testing.T, buf *logbuffer.Buffer, why string) {
+	t.Helper()
+	recs := buf.Snapshot()
+	if findLogRecord(recs, "WARN", liveTimingsRefusalMsg) {
+		t.Fatalf("a live-timings refusal WARN was emitted although %s; records = %+v", why, recs)
+	}
+}
+
 // postRejecting drives one request and returns the recorder. Unlike
 // postPassthrough it asserts NOTHING about the status -- that is the subject
 // here -- but it keeps the same "the request reached proxyNative" discipline.
@@ -126,14 +161,14 @@ func TestInjectedTimingsRejectionIsVisibleAtTheDefaultLogLevel(t *testing.T) {
 	}
 
 	recs := buf.Snapshot()
-	if !findLogRecord(recs, "WARN", "live timings") {
-		t.Fatalf("no WARN record naming the live-timings rejection at the default level; records = %+v", recs)
+	if !findLogRecord(recs, "WARN", liveTimingsRefusalMsg) {
+		t.Fatalf("no WARN record naming the live-timings refusal at the default level; records = %+v", recs)
 	}
 	// The record must carry the fields an operator needs to act: which mapping,
 	// and what the upstream answered.
 	var found bool
 	for _, r := range recs {
-		if r.Level != "WARN" || !strings.Contains(r.Msg, "live timings") {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, liveTimingsRefusalMsg) {
 			continue
 		}
 		found = true
@@ -180,6 +215,7 @@ func TestInjectedTimingsRejectionIsRecordedForBothEndpoints(t *testing.T) {
 // timings_per_token itself, so injectTimingsPerToken leaves the body untouched
 // and injectedLiveTimings is false even though the gate said yes.
 func TestUninjectedRejectionIsNotRecorded(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	prov := newRejectingProxyProvider(http.StatusBadRequest, `{"error":"bad input"}`)
 	srv := newLiveTimingsTestServer(t, prov, llamaCppOptedIn())
 
@@ -191,6 +227,7 @@ func TestUninjectedRejectionIsNotRecorded(t *testing.T) {
 	if prov.recordCalls != 0 {
 		t.Fatalf("RecordLiveProgressRejection calls = %d, want 0: the client set the key, so the gateway injected nothing to blame", prov.recordCalls)
 	}
+	assertNoLiveTimingsRefusalWarning(t, buf, "the client's own key earned this 400")
 }
 
 // TestNonSchemaRejectionIsNotRecorded pins the STATUS class. The native path has
@@ -202,6 +239,7 @@ func TestNonSchemaRejectionIsNotRecorded(t *testing.T) {
 		http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
 		http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable,
 	} {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
 		prov := newRejectingProxyProvider(status, `{"error":"nope"}`)
 		srv := newLiveTimingsTestServer(t, prov, llamaCppOptedIn())
 
@@ -213,6 +251,7 @@ func TestNonSchemaRejectionIsNotRecorded(t *testing.T) {
 		if prov.recordCalls != 0 {
 			t.Errorf("status %d: RecordLiveProgressRejection calls = %d, want 0 (only 400/422 are a schema refusal)", status, prov.recordCalls)
 		}
+		assertNoLiveTimingsRefusalWarning(t, buf, fmt.Sprintf("status %d is not a schema refusal", status))
 	}
 	// ...and the second member of the class IS recorded, so the test above is
 	// not passing because nothing is ever recorded.
@@ -264,6 +303,7 @@ func TestRecordedRejectionSuppressesTheNextInjection(t *testing.T) {
 // the memo must stay empty for the happy path, or every opted-in mapping would
 // veto itself after one request.
 func TestASuccessfulInjectionRecordsNothing(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	prov := newRejectingProxyProvider(http.StatusOK, terminalOnlyResponsesStream)
 	srv := newLiveTimingsTestServer(t, prov, llamaCppOptedIn())
 
@@ -278,4 +318,7 @@ func TestASuccessfulInjectionRecordsNothing(t *testing.T) {
 	if prov.recordCalls != 0 {
 		t.Fatalf("RecordLiveProgressRejection calls = %d, want 0 for a 200", prov.recordCalls)
 	}
+	// The sharpest of the three negatives: this is the feature's HAPPY path, so a
+	// warning here would fire on every flagged request an operator ever serves.
+	assertNoLiveTimingsRefusalWarning(t, buf, "the upstream answered 200")
 }

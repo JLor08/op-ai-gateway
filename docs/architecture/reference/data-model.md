@@ -578,7 +578,8 @@ plausible-looking validation rule would break the normal case:
   in
   [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
   A capability NAME
-  is not validated at all: the vocabulary is open on purpose (`vision`,
+  is validated in exactly one narrow place and otherwise not at all: the
+  vocabulary is open on purpose (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress` and
   `speculation_observed` are the names the code itself reasons about, while an
   upstream may report others — since #54 the agent's Ollama probe actually
@@ -586,9 +587,9 @@ plausible-looking validation rule would break the normal case:
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
-  silently drop the very verdicts the open shape exists to keep. The two
-  rules that DO constrain names are about one producer instead of the
-  vocabulary, and they sit at two DIFFERENT layers — neither of them the
+  silently drop the very verdicts the open shape exists to keep. The three
+  rules that DO constrain names are each about one producer instead of the
+  vocabulary, and they sit at three DIFFERENT layers — none of them the
   store, and only one of them the gateway:
   - The COUNT and LENGTH clamp is in the **agent's own detector**
     (`server-agent/internal/collector/probe.go`,
@@ -605,6 +606,23 @@ plausible-looking validation rule would break the normal case:
     in depth; the gateway's list is the load-bearing one, because a buggy or
     hostile agent puts a name straight into the verdicts it sends and no
     agent-side filter is in that path.
+  - The RESERVED-VERDICT refusal is at the **portal's own write path**
+    (`internal/portal.reservedManualVerdicts`, issue #81): an operator may not
+    STATE `live_progress: "no"`, nor either verdict on
+    `speculation_observed` — `mapping.capability_reserved`, a `400`. It is
+    keyed on the (name, verdict) PAIR rather than the name, and the two
+    asymmetries are the rule rather than exceptions to it. `live_progress:
+    "yes"` stays allowed because `internal/provider`'s `wantsLiveProgress`
+    reads that verdict in BOTH directions and no probe writes this row for
+    `llama_swap`/`litellm`/`tgi`/`custom`, so a manual `yes` is the only
+    opt-in those kinds ever had for an exact mid-stream count on
+    `/v1/chat/completions`; and the RESET (`""`) is never refused, which is
+    what keeps a row an older build stored correctable and is the only reason
+    a name check is admissible here at all
+    ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+    Unlike the ingest rule above it is about an ordinary, reasonable-looking
+    admin request rather than untrusted bytes, which is why it narrows a
+    verdict instead of banning a name.
 
   Where each rule is NOT matters as much: the ingest enforces **no** count or
   length bound of its own, so what bounds an arriving pass is the honest

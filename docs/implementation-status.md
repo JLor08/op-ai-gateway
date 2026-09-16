@@ -73,7 +73,7 @@ shipped the Responses live-timings opt-in:
 - [x] Committed as 8e64886
 - [ ] Gates (in progress; see below)
 - [ ] Adversarial review + fixes
-- [ ] Sonar branch-findings
+- [x] Sonar: **0 findings attributed to lines this branch changed** (246 open project-wide, all pre-existing; analysis revision `743bf65` = HEAD, base merge-base `3b8aa88`)
 - [ ] Remove this file, push, open PR
 
 ## Gate results

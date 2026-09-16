@@ -123,10 +123,19 @@ const liveProgressRejectionTTL = 5 * time.Minute
 const maxLiveProgressRejections = 1024
 
 // liveProgressMemo remembers, per serving model mapping (routing.Target.RouteID),
-// that an upstream REJECTED the two live-progress parameters. Consulted before the
-// parameters are added and written only from CompleteStream's retry path, it turns
-// a genuinely incompatible upstream's cost from one wasted round trip per REQUEST
+// that an upstream REJECTED the live-progress request parameters. It turns a
+// genuinely incompatible upstream's cost from one wasted round trip per REQUEST
 // into one per mapping per TTL.
+//
+// TWO writers and TWO readers, on two endpoints, and the second pair reaches it
+// from another package through LiveProgressRejectionMemo below -- read that
+// doc comment for why the sharing is sound and what it is slightly over-broad
+// about. In this package: CompleteStream's retry writes it and CompleteStream's
+// own guard reads it. Outside it: internal/gateway's proxyNative writes it when a
+// body carrying the `timings_per_token` IT injected earns a 400/422, and reads it
+// as the sixth condition on that injection. Do not "simplify" this back to one
+// writer -- a passthrough refusal that only the passthrough path remembered is
+// exactly the split issue #81 was reopened to close.
 //
 // It records ONLY the negative verdict, and that asymmetry is the property that
 // makes it safe. A stale NEGATIVE costs at most a missing advisory number -- the
@@ -218,7 +227,10 @@ func (m *liveProgressMemo) recordRejection(routeID string) {
 // sense as NativeProxyClient (proxy.go): a caller type-asserts for it and
 // carries on unchanged when the resolved client does not have it, which is why
 // it is a second interface rather than a method on NativeProxyClient -- that
-// one has eight implementations, six of them test fakes.
+// one is implemented by three production types and by a test fake per behaviour
+// internal/gateway needs to drive, so widening it would make every one of those
+// fakes carry a method it has no use for. The count is deliberately not written
+// here: it grew by one in the very commit that first cited it.
 //
 // It exists because the memo has TWO writers and TWO readers across a package
 // boundary, and before the seam only one pair could reach it. CompleteStream

@@ -842,7 +842,17 @@ by shape, so tests pin both:
   so at **Warn**, which is on at the default log level. So both endpoints stop
   asking this mapping until the memo's TTL expires, and the residual narrows from
   "a 4xx for every request on that application" to "the first request per serving
-  mapping per TTL". Recording is guarded on the gateway having actually injected:
+  mapping per TTL" — plus any requests already IN FLIGHT when that refusal is
+  recorded, since the record is written only once the upstream response arrives,
+  and again after a gateway restart, the memo being in-process and holding at
+  most 1024 entries. The Warn line reports what was OBSERVED (a 400/422 answered
+  to a body that carried the key) and deliberately does not assert that the key
+  CAUSED it: every other field of a passthrough body is the client's, so an
+  over-length prompt earns a 400 that satisfies both guards, and a diagnostic
+  that names a false cause is worse than the silence it replaced. Suppressing on
+  that evidence is still right, because the memo records a self-healing NEGATIVE
+  whose worst case is a missing advisory number for one TTL. Recording is guarded
+  on the gateway having actually injected:
   a refusal a client's own `timings_per_token` earned says nothing about the
   gateway's key, and attributing it would cost an uninvolved mapping its live
   figure.
@@ -1502,31 +1512,62 @@ arrive, and it is the only probe path with an open vocabulary to police.
 
 A **second** reservation, with a different motivation and a deliberately
 different shape, guards the OPERATOR's own write
-(`portal.reservedManualCapabilityNames`). There the danger is not untrusted
-bytes but an entirely reasonable-looking admin request: a `manual` row is rank 3
-and nothing re-derives it, so a manual `live_progress: "no"` reaches
+(`portal.reservedManualVerdicts`). There the danger is not untrusted bytes but an
+entirely reasonable-looking admin request: a `manual` row is rank 3 and nothing
+re-derives it, so a manual `live_progress: "no"` reaches
 `Target.LiveProgressSupport` as `"unsupported"` and permanently, silently vetoes
-the operator's own live-timings switch — the switch's own condition 5 — with no
-probe able to outrank it and no control on the mapping form able to clear it
-(that form submits `mtp` and `vision` only). `speculation_observed` is reserved
-on the structural half of the same argument: its one writer is the gateway's
-observation of relayed traffic, at rank 1 and at most once per mapping per
-process lifetime, so a manual row survives even a restart, and a `"no"` states
-something its vocabulary cannot mean. The portal's list therefore carries two
-names where the ingest list carries three: **`mtp` is deliberately absent**,
-because it is the one internal name that HAS an operator control, whose rank-3
-permanence is exactly how that control is meant to work.
+the operator's own live-timings switch — the switch's own condition 5 — on an
+endpoint they were not thinking about, with no probe able to outrank it and no
+control on the mapping form able to clear it (that form submits `mtp` and
+`vision` only). `speculation_observed` is reserved in both directions on the
+structural half of the same argument: its one writer is the gateway's observation
+of relayed traffic, at rank 1 and at most once per mapping per process lifetime,
+so a manual row survives even a restart, and a `"no"` states something its
+vocabulary cannot mean. **`mtp` is on neither list**, because it is the one
+internal name that HAS an operator control, whose rank-3 permanence is exactly
+how that control is meant to work.
 
-The portal refusal is **SET-only**: a `"yes"`/`"no"` on a reserved name is a
-`400` (`mapping.capability_reserved`), while the empty verdict still DELETES the
-row. Without that asymmetry a row minted before the reservation existed would be
-permanently uncorrectable — the objection `normalizeCapabilityVerdicts`' own doc
-comment raises against name-whitelisting, and the reason
-[§11.1](../11-risks-and-technical-debt.md#111-operational-risks) can keep
-recording "a manual verdict has no way back" as closed. The two lists are
-separate copies by construction, not by oversight: `internal/portal` may not
-import `internal/gateway` (a frozen forbidden edge), so both are keyed on the
-same `routing.Capability*` constants instead. The gateway path's
+The portal refusal is keyed on the **(name, verdict) pair**, not on the name,
+and it never refuses the RESET. Both narrowings are load-bearing.
+
+`live_progress: "yes"` stays **allowed**, because this row has two consumers that
+read it with OPPOSITE semantics and only one of them is what #81 was about. The
+Responses gate's condition 5 is a veto, so a positive verdict permits nothing
+there; but `internal/provider`'s `wantsLiveProgress` decides on it in BOTH
+directions — `"supported"` returns true *ahead of* its shape clause, which covers
+only `llama_cpp` and `vllm` — and **no probe ever writes this row for
+`llama_swap`, `litellm`, `tgi` or `custom`** (the `/props` detector needs a
+llama.cpp document). So a manual `"yes"` is the only mechanism that ever existed
+to opt a tolerant-but-unlisted upstream into an exact mid-stream token count on
+`/v1/chat/completions`. A name-keyed refusal would have removed that capability
+to prevent nothing.
+
+The RESET (`""`) is never refused either, because a row minted before the
+reservation existed would otherwise be permanently uncorrectable — the objection
+`normalizeCapabilityVerdicts`' own doc comment raises against name-whitelisting,
+and the reason [§11.1](../11-risks-and-technical-debt.md#111-operational-risks)
+can keep recording "a manual verdict has no way back" as closed.
+
+**What the refusal does cost, stated because nothing else records it.** On the
+TRANSLATE path a manual `live_progress: "no"` was the only DURABLE way to stop
+the gateway paying one wasted round trip per mapping per memo TTL against an
+upstream known to refuse the parameter pair: neither rejection path persists
+anything — `CompleteStream`'s retry and `proxyNative` both write only the
+in-process memo — so that cost now recurs every TTL and after every restart, with
+no operator remedy on `/v1/chat/completions`, which has no
+`responses_live_timings_enabled` switch of its own. The trade is deliberate: a
+silent, permanent, CROSS-ENDPOINT veto on a control the operator explicitly
+switched on is worse than a bounded, self-healing round trip. `/v1/responses`
+keeps its own remedy, the switch itself.
+
+`speculation_observed` is refused in both directions because it costs nothing:
+nothing routes, scores or filters on it, so no control is taken away.
+
+The two lists are separate copies by construction, not by oversight:
+`internal/portal` may not import `internal/gateway` (a frozen forbidden edge), so
+both are keyed on the same `routing.Capability*` constants instead — and they are
+keyed differently on purpose, a NAME at the ingest boundary where the threat is
+untrusted bytes, a PAIR at the portal where it is a reasonable-looking request. The gateway path's
 `caps.Extra` is empty by construction (its `detectCapabilities` writes only
 the four structured fields), so no unvetted name can reach
 `probedCapabilityRows` today. The day the gateway grows a detector that fills

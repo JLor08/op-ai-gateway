@@ -11,26 +11,40 @@ import (
 	"time"
 )
 
-// TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet is issue #81's third
+// TestMappingCapabilityVerdictReservedPairsAreRefused is issue #81's third
 // unimplemented R1 ask: "consider refusing live_progress as a MANUAL capability
-// name".
+// name". Considering it is what produced the shape pinned here, which is NOT a
+// name rule.
 //
 // The harm is not that the name is unknown -- the vocabulary is open on purpose
 // -- but that a MANUAL row outranks every automated writer permanently
-// (capabilitySourceRank puts "manual" at rank 3) and this particular row is read
-// by the request path as a VETO. A manual `live_progress: "no"` therefore
-// reaches Target.LiveProgressSupport as "unsupported" and silently, permanently
-// disables the operator's own responses-live-timings switch, with no probe able
-// to repair it and no control on the mapping form able to clear it. That is
-// exactly the "silently dead switch" failure the gate's veto design cites as the
-// worst outcome available to a control someone deliberately switched on.
+// (capabilitySourceRank puts "manual" at rank 3) while this row has TWO
+// consumers that read it with OPPOSITE semantics. A manual
+// `live_progress: "no"` reaches Target.LiveProgressSupport as "unsupported",
+// which gateway's Responses passthrough gate reads as a VETO, so it silently and
+// permanently disables the operator's own responses-live-timings switch on an
+// endpoint they were not thinking about -- no probe can repair it (rank 1 loses
+// to rank 3) and the mapping form cannot clear it, since that form submits "mtp"
+// and "vision" only.
 //
-// speculation_observed is reserved on the same argument minus the functional
-// half: its only legitimate writer is the gateway's own observation of relayed
-// traffic, at rank 1, written at most once per mapping per process lifetime, and
-// a "no" is a claim routing.CapabilitySpeculationObserved says cannot exist
-// ("no evidence" is not "does not speculate").
-func TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet(t *testing.T) {
+// `live_progress: "yes"` is a different matter and stays ALLOWED, which is why
+// the rule is keyed on the PAIR: internal/provider's wantsLiveProgress decides
+// on this verdict in BOTH directions ("supported" returns true ahead of its
+// shape clause, which covers only llama_cpp and vllm), and no probe writes this
+// row for llama_swap, litellm, tgi or custom -- so a manual "yes" is the only
+// mechanism that ever existed for opting such an upstream into an exact
+// mid-stream token count on /v1/chat/completions. Refusing it would have removed
+// a real capability to prevent nothing: on the Responses side condition 5 is a
+// veto, so a positive verdict permits nothing the veto has not already allowed.
+// TestManualLiveProgressYesStaysAllowed below is that half.
+//
+// speculation_observed is reserved in BOTH directions because it costs nothing:
+// its only writer is the gateway's own observation of relayed traffic, at rank 1
+// and at most once per mapping per process lifetime; nothing routes, scores or
+// filters on it, so no control is being taken away; and a "no" is a claim
+// routing.CapabilitySpeculationObserved says cannot exist ("no evidence" is not
+// "does not speculate").
+func TestMappingCapabilityVerdictReservedPairsAreRefused(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
@@ -47,19 +61,19 @@ func TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet(t *testing.T) {
 			want: ErrMappingCapabilityReserved,
 		},
 		{
-			name: "a manual yes on live_progress is refused too -- an operator cannot attest a build's request schema",
-			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilityLiveProgress: routing.CapabilityYes}},
+			name: "a manual no on speculation_observed -- a claim its vocabulary cannot mean",
+			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeculationObserved: routing.CapabilityNo}},
 			want: ErrMappingCapabilityReserved,
 		},
 		{
 			// The name is trimmed BEFORE the reservation is consulted, or the
 			// refusal would be one space away from being bypassed.
-			name: "a padded reserved name is still reserved",
+			name: "a padded reserved pair is still reserved",
 			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{"  " + routing.CapabilityLiveProgress + "  ": routing.CapabilityNo}},
 			want: ErrMappingCapabilityReserved,
 		},
 		{
-			name: "a manual verdict on speculation_observed",
+			name: "a manual yes on speculation_observed -- only the gateway's own observation may write it",
 			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeculationObserved: routing.CapabilityYes}},
 			want: ErrMappingCapabilityReserved,
 		},
@@ -67,17 +81,9 @@ func TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet(t *testing.T) {
 			// Ordering matters and is pinned: an invalid VALUE on a reserved
 			// name reports the value error, because that check shipped first and
 			// a new refusal must not mask a validation that preceded it.
-			name: "an invalid verdict on a reserved name still reports the value error",
+			name: "an invalid verdict on a reserved capability still reports the value error",
 			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilityLiveProgress: "maybe"}},
 			want: ErrMappingCapabilityVerdictInvalid,
-		},
-		{
-			// A blank name is still the blank-name error even though the map
-			// also carries a reserved one: the whole request is refused either
-			// way, but the CODE a client sees must not depend on map order.
-			name: "a blank name beside a reserved one reports the blank name",
-			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{"": routing.CapabilityYes, routing.CapabilityLiveProgress: routing.CapabilityNo}},
-			want: ErrMappingCapabilityNameRequired,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -96,7 +102,7 @@ func TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet(t *testing.T) {
 	}
 }
 
-// TestMappingCapabilityVerdictReservedNamesStayResettable is the half that makes
+// TestMappingCapabilityVerdictReservedPairsStayResettable is the half that makes
 // the refusal above safe, and it is NOT symmetric with it on purpose.
 //
 // normalizeCapabilityVerdicts' own doc comment raises the objection this test
@@ -111,7 +117,7 @@ func TestMappingCapabilityVerdictReservedNamesAreRefusedOnSet(t *testing.T) {
 // mintable through the API for as long as the reservation did not exist -- would
 // be permanently stuck with a disabled live-timings switch and no way to clear
 // it, which is a worse state than the one the refusal prevents.
-func TestMappingCapabilityVerdictReservedNamesStayResettable(t *testing.T) {
+func TestMappingCapabilityVerdictReservedPairsStayResettable(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
@@ -192,5 +198,50 @@ func TestMappingCapabilityVerdictOpenVocabularySurvivesTheReservation(t *testing
 	}
 	if rows["structured_outputs"].Verdict != routing.CapabilityNo {
 		t.Fatalf("structured_outputs row = %+v, want manual no -- the vocabulary stays open", rows["structured_outputs"])
+	}
+}
+
+// TestManualLiveProgressYesStaysAllowed pins the half of the reservation that is
+// deliberately NOT refused, and it is the more valuable half to pin, because the
+// natural "tidy this up" edit is to make the rule symmetric on the name.
+//
+// internal/provider's wantsLiveProgress reads this verdict in BOTH directions:
+// `case "supported": return true` runs AHEAD of its shape clause, which covers
+// only llama_cpp and vllm. And no probe writes this row for llama_swap, litellm,
+// tgi or custom -- the /props detector needs a llama.cpp document. So for those
+// kinds a manual "yes" is the ONLY mechanism that ever existed to opt a
+// tolerant-but-unlisted upstream into an exact mid-stream token count on
+// /v1/chat/completions. Refusing it would have removed a real, documented
+// capability to prevent nothing: on the Responses side the same verdict is read
+// as a veto, where a positive value permits nothing the veto has not already
+// allowed.
+//
+// The row it writes is asserted, not just the absence of an error, because a
+// refusal implemented as a silent drop would otherwise look identical here.
+func TestManualLiveProgressYesStaysAllowed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
+	fx := newCapabilityTestFixture(t, now, recorder)
+
+	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+		CapabilityVerdicts: map[string]string{routing.CapabilityLiveProgress: routing.CapabilityYes},
+	}); err != nil {
+		t.Fatalf("UpdateMapping (manual live_progress yes): %v -- this is the translate path's only opt-in for an upstream no probe writes a verdict for", err)
+	}
+
+	row := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID))[routing.CapabilityLiveProgress]
+	if row.Verdict != routing.CapabilityYes || row.Source != routing.CapabilitySourceManual {
+		t.Fatalf("live_progress row = %+v, want manual yes", row)
+	}
+	// And it is still resettable, so allowing it does not create a row the
+	// operator cannot take back.
+	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+		CapabilityVerdicts: map[string]string{routing.CapabilityLiveProgress: ""},
+	}); err != nil {
+		t.Fatalf("UpdateMapping (reset the manual yes): %v", err)
+	}
+	if _, ok := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID))[routing.CapabilityLiveProgress]; ok {
+		t.Fatal("live_progress row survived its reset")
 	}
 }

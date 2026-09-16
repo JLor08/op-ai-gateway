@@ -161,16 +161,23 @@ func TestTranslateModeApplicationWithTheOptInInjectsNothing(t *testing.T) {
 	if len(prov.gotBody) != 0 {
 		t.Fatalf("a raw body reached the provider on a translate-mode endpoint: %s", prov.gotBody)
 	}
-	// The opt-in really was on for this target, so the zero injections above are
-	// the MODE's doing and not a mis-seeded fixture. Asserted through the
-	// predicate, which answers true here -- the point being that the predicate is
-	// not what protects this case.
-	target := routing.Target{
-		ResponsesLiveTimingsEnabled: true,
-		Provider:                    routing.ProviderServerAgent,
-		LiveProgressSpecType:        string(routing.RuntimeSpecTypeLlamaCpp),
-	}
-	if !wantsResponsesLiveTimings(target, "openai_responses", true) {
-		t.Fatal("the gate refuses this shape, so this test is not exercising the structural protection it claims to")
+	// ANTI-VACUITY CONTROL, and it has to be built this way. Asserting the
+	// predicate against a hand-built routing.Target literal would prove nothing:
+	// the literal would satisfy the gate even if the SEED's opt-in were false, so
+	// `spec.ResponsesLiveTimingsEnabled = false` would leave this test green
+	// while it silently stopped testing the mode at all.
+	//
+	// Instead the same seed runs again with the ONE field under test flipped
+	// back. If the seed is genuinely opted in, that run injects; if it is not,
+	// this control fails and says so. So the zero injections above are
+	// attributable to the MODE and to nothing else.
+	control := serverAgentSpecOptedIn()
+	control.spec.ResponsesMode = routing.EndpointModePassthrough
+	controlProv := &recordingProxyProvider{respBody: terminalOnlyResponsesStream}
+	controlSrv := newLiveTimingsTestServer(t, controlProv, control)
+
+	got := postPassthrough(t, controlSrv, controlProv, "/v1/responses", liveTimingsStreamBody)
+	if !strings.Contains(got, `"timings_per_token":true`) {
+		t.Fatalf("the control run did NOT inject (%s), so the seed is not opted in and the translate assertions above prove nothing about the mode", got)
 	}
 }

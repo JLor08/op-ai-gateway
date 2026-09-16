@@ -445,8 +445,19 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// translate path's retry uses; anything wider (401, 404, 429) would blame the
 	// key for a refusal it had no part in, and this path has no retry to discover
 	// the mistake.
+	//
+	// What the two guards do NOT establish is that the key CAUSED the refusal.
+	// Every other field of a passthrough body is the client's, so an over-length
+	// prompt earns a 400 that satisfies both conjuncts. The message therefore
+	// reports the observation -- a 400/422 answered to a body that carried the
+	// key -- and never asserts the cause, because residual 4 exists to make one
+	// grep TRUSTWORTHY at the default level, and a line naming a false cause for
+	// an ordinary client 400 is worse than the silence it replaced. Suppressing
+	// on that evidence is still right: the memo records a self-healing NEGATIVE
+	// whose worst case is a missing advisory number for one TTL, which is the
+	// same standard the translate path's retry has always applied.
 	if injectedLiveTimings && provider.SchemaRejectionStatus(resp.StatusCode) {
-		slog.Warn("upstream refused the injected live timings parameter (not retried; suppressed for this mapping until the memo expires)",
+		slog.Warn("upstream answered 400/422 to a body carrying the injected live timings parameter; suppressing it for this mapping until the memo expires (not retried)",
 			"path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName,
 			"route_id", target.RouteID, "status", resp.StatusCode)
 		recordLiveProgressRejection(s.Provider, target)

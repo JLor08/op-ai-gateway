@@ -22,11 +22,14 @@ const maxToolArgumentsBytes = 1 << 20 // 1 MiB
 
 type OpenAICompatibleClient struct {
 	http *http.Client
-	// liveProgress memoizes the upstreams that REJECTED the two advisory
-	// live-progress request parameters -- negative verdicts only, see
-	// liveProgressMemo (live_progress.go). Held per client rather than as a package
-	// global so its lifetime is the client's: one process-wide client in
-	// production, an isolated one per test.
+	// liveProgress memoizes the upstreams that REJECTED the advisory
+	// live-progress request parameters as the recording path sends them -- both
+	// of them on this client's own translate path, `timings_per_token` alone when
+	// internal/gateway's native passthrough records one. Negative verdicts only,
+	// see liveProgressMemo (live_progress.go). Held per client rather than as a
+	// package global so its lifetime is the client's: one process-wide client in
+	// production, an isolated one per test -- which is also what makes the two
+	// endpoints share one memo, since the Multiplexer resolves both to it.
 	liveProgress *liveProgressMemo
 }
 
