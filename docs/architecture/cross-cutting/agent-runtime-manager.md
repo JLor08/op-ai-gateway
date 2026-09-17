@@ -859,6 +859,152 @@ capacity benchmark, [Routing & Model Selection
 and was never surfaced in the application editor at all, for any application
 type.
 
+#### A worked `sd-server` launch under `custom`
+
+stable-diffusion.cpp's `sd-server` (`leejet/stable-diffusion.cpp`) is the
+agent-managed runtime behind `POST /v1/images/generations` (see [API
+Compatibility & Inference](compatibility-and-inference.md)), and it is the
+first one this chapter documents that is not shaped like a chat/completions
+server. `RuntimeSpec` — `Binary` plus an opaque `Args` array, `Env`,
+`WorkDir`, `ListenPort` and the timeout fields above — expresses its launch,
+multi-file model weights included, with **no schema change**. This
+subsection is documentation only; it changes no code.
+
+**`Type: "custom"`, not a new `sd_cpp` kind.** `DeriveProbePaths`'s `custom`
+case (`routing/runtime_spec_type.go:91-92`) resolves both the metrics and the
+context-probe path to `""`, and that is exactly right here: `sd-server` has
+no Prometheus `/metrics` and no context-window axis to probe — an image
+model has neither. A dedicated `sd_cpp` kind would buy auto-detection from
+the binary name and a friendlier dropdown label, at the cost of a real edit
+surface — confirmed against this branch, not assumed: the constant and a
+`DetectRuntimeSpecType`/`DeriveProbePaths` case in `runtime_spec_type.go`
+itself; a `validRuntimeSpecType` case and its error string
+(`portal/service_runtime.go`, `gateway/portal_runtime_endpoints.go`); and a
+review of every other place that keys behavior off the resolved kind while
+assuming an LLM-shaped provider — the live-timings-capable set
+(`routing/live_timings.go`), the two live-progress kind resolutions
+(`routing/resolver.go`, `gateway/responses_live_timings.go`), the live-progress
+shape gate (`provider/live_progress.go`), the benchmark runner's live-progress
+lookup (`gateway/benchmark_runner.go`), and the agent's own capability probes
+(`server-agent/internal/collector/probe.go`) — nine backend files, before
+the frontend's type dropdown and its labels (`RuntimeAdminSection.tsx`,
+`i18n.ts`), the mirrored live-timings set (`components/shared/liveTimings.ts`)
+and the DTO's type union (`api/runtime.ts`) add four more. Thirteen files for
+auto-detection and a label, against none of that machinery having any use
+for an image backend today — `custom` with explicit paths is the shape that
+costs nothing, and the plan's "eight-plus files" estimate was, if anything,
+conservative.
+
+A representative spec:
+
+```json
+{
+  "type": "custom",
+  "binary": "/opt/sd-server/sd-server",
+  "args": [
+    "--listen-port", "${PORT}",
+    "--diffusion-model", "/srv/models/sdxl/unet.safetensors",
+    "--vae", "/srv/models/sdxl/vae.safetensors",
+    "--clip_l", "/srv/models/sdxl/clip_l.safetensors",
+    "--clip_g", "/srv/models/sdxl/clip_g.safetensors"
+  ],
+  "health_path": "/",
+  "startup_timeout_seconds": 300
+}
+```
+
+What each obligation is, and why:
+
+- **`health_path` must be set explicitly — `pollHealth` defaults it to
+  `/health`, which `sd-server` does not serve.**
+  `server-agent/internal/runtime/manager.go:1875-1877`:
+  `healthPath := spec.HealthPath; if healthPath == "" { healthPath =
+  "/health" }`. Leaving the field empty is not "auto-detect" for a `custom`
+  spec — the agent probes `/health`, gets a 404 from `sd-server` on every
+  cycle, and kills the process as unhealthy once
+  `startup_timeout_seconds` elapses.
+
+  This plan's earlier reconnaissance could not confirm `sd-server`'s actual
+  liveness route from upstream source and named `/` and `/v1/models` as
+  unverified candidates (issue #71's own reading). Verified now, directly
+  against `leejet/stable-diffusion.cpp` at commit `cc515a0` (2026-09-16, the
+  current `master`): `examples/server/main.cpp` constructs the model context
+  and only calls `svr.listen()` afterward — the listen port never opens
+  until the model has loaded — and `examples/server/routes_index.cpp`
+  registers `svr.Get("/", ...)` unconditionally, with no auth check, which
+  returns the bundled or placeholder page with an implicit `200` (the one
+  exception is an operator who also passes `--serve-html-path` pointing at a
+  file that cannot be read, which 500s — avoid that flag, or point it at a
+  file that exists). The server's own `README.md` says the same thing in its
+  own words: "After the server starts successfully: the web UI is available
+  at `http://127.0.0.1:1234/`." `GET /v1/models`
+  (`examples/server/routes_openai.cpp:250`) is an equally unconditional
+  `200` and has no file-path dependency at all, and it is part of the
+  documented OpenAI-compatible surface (`examples/server/api.md`) rather
+  than the index page — the more future-proof choice if a later release
+  changes how `/` decides what to serve. Either is a valid `health_path`;
+  the example above uses `/`.
+
+- **The weights path is written literally in `Args`; `${MODEL}` is not
+  used.** `${MODEL}` resolves to `spec.UpstreamModel`
+  (`server-agent/internal/runtime/policy_local.go:885-890`) — the
+  application-side model **name** the owning mapping carries — while
+  `sd-server`'s `-m`/`--model`, and the standalone `--diffusion-model`/
+  `--vae`/`--clip_l`/`--clip_g`/`--t5xxl` flags, all take filesystem
+  **paths** (`leejet/stable-diffusion.cpp`
+  `examples/common/common.cpp:381-462`). A name is not a path, so every
+  weights file an `sd-server` spec needs is a literal string in `Args`
+  instead. `${PORT}` (same file, lines 877-879) has no such mismatch and is
+  used exactly as documented in
+  [§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway) above — the
+  agent's chosen listen port substitutes directly into `--listen-port`.
+
+- **The timeout budget needs headroom well past the general 30 s
+  default.** `defaultApplicationTimeoutMS = 30000`
+  (`gateway/backend/internal/portal/service_applications.go:308`) is the
+  application-level default for every type except `server_agent`, which
+  already defaults to `defaultServerAgentTimeoutMS = 600000` (same file,
+  line 320) for exactly this reason — see
+  [§12](#12-the-timeout-budget) for the full timeout table. That default
+  covers the *parent application*; an operator who lowers it, or who leaves
+  a `startup_timeout_seconds` too tight for a multi-gigabyte checkpoint to
+  load, reintroduces the 30 s failure mode the parent default exists to
+  avoid. A real text-to-image request is seconds to low minutes of
+  inference on top of a cold model load that can itself take minutes.
+
+- **No authentication, wide-open CORS — run this behind the agent or a
+  network boundary, never exposed directly.** Verified directly:
+  `examples/server/main.cpp`'s `set_pre_routing_handler` echoes the
+  request's `Origin` header (or `"*"` when absent) back as
+  `Access-Control-Allow-Origin`, sets `Access-Control-Allow-Credentials:
+  true`, and allows every method and header; no handler under
+  `examples/server/` reads an `Authorization` header or any bearer/key
+  equivalent, and `SDSvrParams` (`examples/server/runtime.h:20-30`) has no
+  such field to configure one. The `${API_TOKEN}` placeholder therefore has
+  nothing to bind to for this runtime: setting `api_token_mode` on the spec
+  produces a value `sd-server` never inspects. Its own default `listen_ip`
+  is `127.0.0.1` — loopback-only — which already matches the one address
+  this agent's own health probe ever dials
+  (`endpointFor`, `server-agent/internal/runtime/manager.go:487-489`, always
+  `http://127.0.0.1:<port>`); leave `--listen-ip` unset rather than binding
+  it to a routable address.
+
+- **Live progress is legitimately empty for this runtime.** Verified
+  directly: the library declares a progress callback
+  (`sd_progress_cb_t`/`sd_set_progress_callback`,
+  `include/stable-diffusion.h:450,455`), but nothing under
+  `examples/server/` ever calls `sd_set_progress_callback` —
+  `examples/server/main.cpp` wires only `sd_set_log_callback`. The native
+  `sdcpp` API's own async job states
+  (`queued`/`generating`/`completed`/`failed`/`cancelled`,
+  `examples/server/api.md`) carry no percentage or step field either. There
+  is nothing for this gateway's live-progress machinery to read from this
+  runtime — that is a fact about `sd-server` as shipped, not a gap here.
+
+The obligations above were checked against `leejet/stable-diffusion.cpp` at
+commit `cc515a0` (`master`, 2026-09-16); a later `sd-server` release could in
+principle change any of them.
+
 ## 4. One router port per AI server
 
 The agent listens on a single HTTP port, reads the `model` field out of each
