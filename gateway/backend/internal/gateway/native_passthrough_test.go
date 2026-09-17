@@ -664,6 +664,98 @@ func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 	}
 }
 
+// plainTextErrorProxyProvider returns a non-2xx upstream response with a
+// Content-Type that is NOT application/json, and a body that must reach the
+// client byte-for-byte. It exists for
+// TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim /
+// TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim below, which pin
+// the OTHER side of images_handler.go's error-normalisation branch in
+// proxyNative (native_passthrough.go): that branch is gated on
+// pfReq.APIFlavor == apiFlavorImages specifically so that responses/messages
+// passthrough keeps relaying a non-2xx body untouched. Every existing
+// non-2xx fake (rejectingProxyProvider in passthrough_timings_rejection_test.go
+// included) is only ever asserted against by status/log/call-count, never
+// rec.Body, so nothing previously would have caught that gate being widened
+// or removed.
+type plainTextErrorProxyProvider struct {
+	status      int
+	contentType string
+	body        string
+}
+
+func (plainTextErrorProxyProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (plainTextErrorProxyProvider) CompleteStream(context.Context, routing.Target, inference.Request, provider.StreamEmit) error {
+	return nil
+}
+
+func (p plainTextErrorProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+	return &provider.ProxyResponse{
+		StatusCode: p.status,
+		Header:     http.Header{"Content-Type": []string{p.contentType}},
+		Body:       io.NopCloser(strings.NewReader(p.body)),
+	}, nil
+}
+
+// TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim guards
+// images_handler.go's error-normalisation branch (wired into proxyNative in
+// native_passthrough.go) from ever being widened past apiFlavorImages by
+// accident: a /v1/responses non-2xx passthrough must keep reaching the client
+// with the upstream's own body AND the upstream's own Content-Type, neither
+// rewritten to the OpenAI object shape nor overwritten as JSON. See
+// TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks above for the
+// sibling guard on upstreamPath's own images branch.
+func TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim(t *testing.T) {
+	const upstreamBody = `{"error":"nope"}`
+	const upstreamContentType = "text/plain; charset=utf-8"
+	prov := plainTextErrorProxyProvider{status: http.StatusInternalServerError, contentType: upstreamContentType, body: upstreamBody}
+	srv := newNativeProxyTestServer(prov, true, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status, unchanged); body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("client body = %q, want the upstream body byte-for-byte unchanged: %q", rec.Body.String(), upstreamBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != upstreamContentType {
+		t.Fatalf("content-type = %q, want the upstream's own %q preserved, not overwritten as JSON", ct, upstreamContentType)
+	}
+}
+
+// TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim is the /v1/messages
+// twin of TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim above --
+// cheap to add given newNativeProxyTestServer's existing (nativeResponses,
+// nativeMessages) bool pair, so both flavors the images branch must not touch
+// are covered rather than just one.
+func TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim(t *testing.T) {
+	const upstreamBody = `{"error":"nope"}`
+	const upstreamContentType = "text/plain; charset=utf-8"
+	prov := plainTextErrorProxyProvider{status: http.StatusInternalServerError, contentType: upstreamContentType, body: upstreamBody}
+	srv := newNativeProxyTestServer(prov, false, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status, unchanged); body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("client body = %q, want the upstream body byte-for-byte unchanged: %q", rec.Body.String(), upstreamBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != upstreamContentType {
+		t.Fatalf("content-type = %q, want the upstream's own %q preserved, not overwritten as JSON", ct, upstreamContentType)
+	}
+}
+
 // TestOpenAIResponsesDisabledEndpointRejects proves a resolved target whose
 // EFFECTIVE ResponsesMode is disabled is REJECTED with the stable code + 4xx and
 // is NOT translated: the simple body used here WOULD translate+succeed (200) if it

@@ -35,3 +35,23 @@ func TestResponseJSONOmitsEmptyRequestID(t *testing.T) {
 		t.Fatalf("json = %s, want %s", string(data), want)
 	}
 }
+
+// TestErrorBodyJSONIncludesType pins Type's wire encoding. Response() itself
+// never sets it (see its own doc comment), so this constructs ErrorBody
+// directly -- the shape a caller like images' upstream-error normalisation
+// uses. Nothing above exercises Type at all, so this is the one place a
+// renamed/reordered/misspelled "type" key, or a value that leaked in from
+// somewhere other than the caller's own literal, would be caught.
+func TestErrorBodyJSONIncludesType(t *testing.T) {
+	body := Body{Error: ErrorBody{Code: "images.upstream_error", Message: "out of memory", Type: "upstream_error"}}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("Marshal returned %v", err)
+	}
+
+	want := `{"error":{"code":"images.upstream_error","message":"out of memory","type":"upstream_error"}}`
+	if string(data) != want {
+		t.Fatalf("json = %s, want %s", string(data), want)
+	}
+}
