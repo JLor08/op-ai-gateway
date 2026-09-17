@@ -212,8 +212,8 @@ func TestOpenAIChatStreamResolveErrorRecordsJSONContentType(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	events := srv.Usage.All()
 	if len(events) != 1 {
@@ -237,8 +237,8 @@ func TestOpenAIChatReturnsNoModelRoute(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
 		Error struct {
@@ -699,8 +699,8 @@ func TestOpenAIChatStreamResolveErrorIsJSON(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -991,8 +991,8 @@ func TestOpenAIResponsesStreamResolveErrorReturnsJSON(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	// A pre-stream resolve failure has no stream yet, so it returns a JSON error.
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -1572,8 +1572,8 @@ func TestAnthropicMessagesStreamResolveErrorReturnsJSON(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	// A pre-stream resolve failure has no stream yet, so it returns a JSON error.
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -4914,7 +4914,7 @@ func TestPortalTokenItemDeleteRemovesTokenAndRevokesBearer(t *testing.T) {
 // "ovr-secret". Completion tests send a body model of "gpt-oss-20b", which is
 // unroutable — so a 200 + a usage event with Model "qwen-coder" proves the
 // override (not the request body) drove routing; without the override the
-// resolver would return 502 routing.no_model_route.
+// resolver would return 404 routing.no_model_route.
 func newModelOverrideTestServer(t *testing.T) (*Server, *usage.Recorder) {
 	t.Helper()
 	tokens := auth.NewTokenStore()

@@ -67,8 +67,8 @@ func TestProviderPathEmptyOnResolveFailure(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	events := srv.Usage.ByUser("usr_dev")
 	if len(events) != 1 {

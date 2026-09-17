@@ -126,6 +126,60 @@ func TestFilterCapableRefusesOnStoreError(t *testing.T) {
 	}
 }
 
+// The default single-model path's sentinel has exactly one producer
+// (Resolve's `if len(candidates) == 0 && len(req.RequiredCapabilities) > 0`
+// check, immediately after filterCapable). Nothing else in the suite pins
+// it: deleting that check leaves every other test in this package green
+// (verified by hand -- see task-3-report.md's Finding 3 mutation log) while
+// silently turning a capability refusal back into an indistinguishable
+// "unknown model". This test exists so that regression is caught.
+func TestResolveReturnsModelNotCapableForIncapableSoleCandidate(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seededGroupStore(t, now) // coder-a (map_a) has no image row at all
+	r := NewResolver(store, func() time.Time { return now }, nil)
+
+	_, err := r.Resolve(context.Background(), auth.Token{}, imagesReq("coder-a"))
+	if !errors.Is(err, ErrModelNotCapable) {
+		t.Fatalf("err = %v, want ErrModelNotCapable", err)
+	}
+	if errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v also matches ErrNoModelRoute -- the two facts must stay distinguishable", err)
+	}
+}
+
+// The group path's capability gate must stay a per-member SOFT filter (drop
+// the member, keep walking) and never a hard error that aborts
+// firstAvailable before it reaches a later, capable member. This is the
+// exact regression brief Step 5 would have caused if applied literally to
+// eligibleCandidates (return ErrModelNotCapable there instead of the
+// existing `nil, false, nil`): coder-a (priority 0) has no image row at
+// all, coder-b (priority 1) is image-capable, and this test requires the
+// walk to reach coder-b rather than failing the whole group resolve on
+// coder-a's refusal. See task-3-report.md's Finding 3 mutation log for the
+// verified failure under that exact mutation.
+func TestGroupCapabilityGateSkipsIncapableFirstMemberForCapableSecond(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	mem := seededGroupStore(t, now) // coder-a (prio 0, map_a), coder-b (prio 1, map_b)
+	if err := mem.UpsertMappingCapabilities(ctx, "map_b", []CapabilityRow{
+		{Capability: CapabilityImage, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("seed map_b: %v", err)
+	}
+	// map_a deliberately gets NO image row: the first-priority member is
+	// image-incapable.
+	r := NewResolver(mem, func() time.Time { return now }, nil)
+	r.SetGroupResolver(twoMemberGroup("sticky"))
+
+	target, err := r.Resolve(ctx, auth.Token{}, imagesReq("coder-group"))
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the capable second member served, not a group-wide failure", err)
+	}
+	if target.ServerID != "srv_b" || target.Model != "coder-b" {
+		t.Fatalf("target = {%q,%q}, want {srv_b, coder-b} (coder-a is image-incapable, coder-b is the only capable member)", target.ServerID, target.Model)
+	}
+}
+
 // The load-bearing constraint: chat routing must be unchanged. Asserted across
 // all three capability states, because "the filter early-returns" is a claim
 // about code while this is a claim about behaviour.

@@ -26,6 +26,12 @@ import (
 var (
 	ErrNoModelRoute  = errors.New("routing.no_model_route")
 	ErrNoHealthyHost = errors.New("routing.no_healthy_host")
+	// ErrModelNotCapable reports that candidates existed for the requested model
+	// but none carries a "yes" verdict for a capability the endpoint requires.
+	// It is deliberately NOT ErrNoModelRoute: "this model cannot do that" and
+	// "there is no such model" are different facts, and a client that cannot
+	// tell them apart cannot act on either.
+	ErrModelNotCapable = errors.New("routing.model_not_capable")
 	// ErrAdmissionQueueTimeout: an unpinned request waited for a free concurrency slot up
 	// to the per-app admission_queue_timeout_seconds without one freeing. Maps to HTTP 503.
 	ErrAdmissionQueueTimeout = errors.New("routing.admission_queue_timeout")
@@ -509,6 +515,14 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
 	if err != nil {
 		return Target{}, err
+	}
+	// Checked BEFORE the general empty-candidates case below, so the more
+	// specific fact wins: candidates existed for this model but none carried
+	// the required capability, which is not the same fact as "no such
+	// model". Conditioned on RequiredCapabilities so a chat request (nil)
+	// falls through to the existing check unchanged.
+	if len(candidates) == 0 && len(req.RequiredCapabilities) > 0 {
+		return Target{}, ErrModelNotCapable
 	}
 	if len(candidates) == 0 {
 		return Target{}, ErrNoModelRoute

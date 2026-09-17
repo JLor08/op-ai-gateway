@@ -1035,7 +1035,7 @@ test.describe("Resource Groups Phase 2 — provisioning enforcement (opt-in + de
     // for her), so Resolve() returns routing.ErrNoModelRoute straight from
     // `if len(candidates) == 0 { return Target{}, ErrNoModelRoute }` --
     // BEFORE any provider dial is attempted (see internal/routing/resolver.go).
-    // This is a deterministic 502, never a real upstream connection attempt,
+    // This is a deterministic 404, never a real upstream connection attempt,
     // so it carries none of a live-inference test's network flakiness. A
     // request from an ALLOWED principal (which WOULD attempt to dial the
     // fake server domain) is deliberately not exercised here for that exact
@@ -1046,7 +1046,7 @@ test.describe("Resource Groups Phase 2 — provisioning enforcement (opt-in + de
       headers: CSRF,
       data: { model: P_MODEL_RESTRICTED, messages: [{ role: "user", content: "hello" }], stream: false }
     });
-    expect(vDenied.status(), `expected 502 no-route, got ${vDenied.status()}: ${await vDenied.text()}`).toBe(502);
+    expect(vDenied.status(), `expected 404 no-route, got ${vDenied.status()}: ${await vDenied.text()}`).toBe(404);
     expect((await vDenied.json() as ApiErrorBody).error?.code).toBe("routing.no_model_route");
 
     // === UI smoke: the provisioning editor shows the four targets just set ==
@@ -1155,13 +1155,13 @@ test.describe("Server override — provisioning bypass (Task 8, spec: 2026-08-12
     // plain (non-override) token U mints for herself. This is the exact
     // contrast the override token in (2) must NOT hit. ========================
     const uSessionBaseline = await chatCompletionSession(uPage, SVO_MODEL);
-    expect(uSessionBaseline.status(), `expected 502, got ${uSessionBaseline.status()}: ${await uSessionBaseline.text()}`).toBe(502);
+    expect(uSessionBaseline.status(), `expected 404, got ${uSessionBaseline.status()}: ${await uSessionBaseline.text()}`).toBe(404);
     expect((await uSessionBaseline.json() as ApiErrorBody).error?.code).toBe("routing.no_model_route");
 
     const plainToken = await createTokenRaw(uPage, { name: "e2e-svo-plain" });
     expect(plainToken.token.server_override, "a token created with no override must persist none").toBeFalsy();
     const plainDenied = await chatCompletionBearer(request, plainToken.secret, SVO_MODEL);
-    expect(plainDenied.status(), `expected 502, got ${plainDenied.status()}: ${await plainDenied.text()}`).toBe(502);
+    expect(plainDenied.status(), `expected 404, got ${plainDenied.status()}: ${await plainDenied.text()}`).toBe(404);
     expect((await plainDenied.json() as ApiErrorBody).error?.code).toBe("routing.no_model_route");
 
     // === (2) THE bypass (the core of this task): a token with
@@ -1258,7 +1258,7 @@ test.describe("Server override — provisioning bypass (Task 8, spec: 2026-08-12
     // the identical deny-mode wall the plain token hit in (1) -- proof the
     // clear took effect at RUNTIME, not merely in the returned DTO.
     const afterHeal = await chatCompletionBearer(request, overrideToken.secret, SVO_MODEL);
-    expect(afterHeal.status(), `expected 502, got ${afterHeal.status()}: ${await afterHeal.text()}`).toBe(502);
+    expect(afterHeal.status(), `expected 404, got ${afterHeal.status()}: ${await afterHeal.text()}`).toBe(404);
     expect((await afterHeal.json() as ApiErrorBody).error?.code).toBe("routing.no_model_route");
 
     // === UI smoke, part 2: now that U's ownership of X has actually been
