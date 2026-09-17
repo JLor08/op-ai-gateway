@@ -473,7 +473,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		}
 	}
 	if token.ID != "" {
-		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, now)
+		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
 		if err != nil {
 			return Target{}, err
 		}
@@ -567,7 +567,24 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		if err != nil {
 			return Target{}, err
 		}
-		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 {
+		// The two PIN-CREATING writes -- this one and upsertGroupPin's -- are guarded
+		// on the capability list rather than on a flavor string, so the speech and
+		// multipart endpoints (#68/#69) inherit the guard. AffinityKey.APIFlavor is
+		// COARSE (NormalizeAPIFlavor above), so an unguarded image resolve would
+		// write its pin under the same key a chat client uses and repoint that
+		// client at an image server. The read-side gate (resolveAffinity) does not
+		// help here -- it is the WRITE that does the damage.
+		//
+		// This guard does NOT make every UpsertAffinity call site unreachable for a
+		// capability-carrying request: resolveAffinity's own in-place refresh (the
+		// LastUsedAt/UpdatedAt touch-up on a pin that already satisfies its
+		// capability gate) still runs -- it is not guarded, and it does not need to
+		// be. It rewrites the SAME row it just read, advancing only
+		// LastUsedAt/UpdatedAt; ApplicationID/ServerID/ExpiresAt are unchanged, and
+		// LastUsedAt is never read for a routing decision anywhere in this backend,
+		// so that refresh cannot repoint anything. It just is not "guarded" the way
+		// these two pin-creating writes are.
+		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 && len(req.RequiredCapabilities) == 0 {
 			if err := r.store.UpsertAffinity(ctx, RouteAffinity{
 				ID:            affinityID(key),
 				APITokenID:    token.ID,
@@ -764,7 +781,7 @@ func (r *Resolver) affinityApplicationStale(app Application, affinity RouteAffin
 		(r.checker != nil && !r.checker.Reachable(app.ID))
 }
 
-func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, now time.Time) (Target, bool, error) {
+func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, required []string, now time.Time) (Target, bool, error) {
 	affinity, ok, err := r.store.Affinity(ctx, key)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("lookup affinity: %w", err)
@@ -812,30 +829,61 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
-	affinity.LastUsedAt = now
-	affinity.UpdatedAt = now
-	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
-		return Target{}, false, fmt.Errorf("update affinity: %w", err)
-	}
 	// resolveAffinity's mapping comes from activeMappingForApplication
 	// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
 	// model_mapping_capabilities, so unlike every other targetFrom call site
 	// this one has to fetch the verdict itself with a dedicated keyed read.
-	// That read is on a path that already makes five store calls just to
+	// That read is on a path that already makes four store calls just to
 	// reach this point (Affinity, ApplicationByID, AIServerByID,
-	// activeMappingForApplication's MappingsByApplication, UpsertAffinity);
-	// one more keyed lookup is the cost of the pin no longer serving a stale
-	// verdict for its entire TTL. Best-effort: a read failure degrades to ""
+	// activeMappingForApplication's MappingsByApplication); one more keyed
+	// lookup is the cost of the pin no longer serving a stale verdict for its
+	// entire TTL. Best-effort for LIVE PROGRESS: a read failure degrades to ""
 	// (never-determined) -- the same reading an absent capability row would
 	// produce -- rather than failing an otherwise-servable affinity hit; the
 	// cost is that a transient store error can make one pinned request look
 	// like the verdict was never determined, which is strictly better than
 	// serving the wrong (frozen, possibly stale) column value.
 	liveProgressSupport := ""
-	if caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID); capErr == nil {
+	caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID)
+	if capErr == nil {
 		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
 			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
 		}
+	}
+	// The capability gate on the pinned mapping -- this is the one Resolve branch
+	// with no candidate filter at all (its mapping comes from MappingsByApplication,
+	// which never joins model_mapping_capabilities), so it gates off the very read
+	// fetched above for live progress: no extra store call. Two things differ from
+	// that live-progress read, both deliberate:
+	//
+	//  1. A read ERROR is not-satisfied here, where live progress degrades to ""
+	//     (advisory). Live progress failing open costs one annotation; this
+	//     failing open would route an image request to a chat model for the
+	//     whole AffinityTTLSeconds.
+	//  2. The refusal is NON-DESTRUCTIVE -- it returns (Target{}, false, nil) and
+	//     lets the caller fall through to the fresh-candidate path. Every other
+	//     rejection in this function deletes the affinity row, and that would be
+	//     wrong here: AffinityKey.APIFlavor is COARSE, so an image request
+	//     declaring the pin stale would delete the chat client's pin. For the
+	//     same reason the gate is not in affinityApplicationStale.
+	//
+	// Placed BEFORE the LastUsedAt/UpdatedAt refresh below so a REFUSED request
+	// never touches the affinity row at all. This ordering does NOT make the
+	// refresh below unreachable in general: for a capability-carrying request
+	// whose pin already satisfies the gate, the refusal above is skipped and the
+	// refresh runs exactly as it would for a chat request. That is safe -- it
+	// rewrites the SAME row it just read, advancing only LastUsedAt/UpdatedAt
+	// (ApplicationID/ServerID/ExpiresAt untouched, and LastUsedAt is never read
+	// for a routing decision anywhere in this backend) -- so unlike the two
+	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
+	// on the capability list, and does not need to be.
+	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(caps, required)) {
+		return Target{}, false, nil
+	}
+	affinity.LastUsedAt = now
+	affinity.UpdatedAt = now
+	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
+		return Target{}, false, fmt.Errorf("update affinity: %w", err)
 	}
 	target, err := r.targetFrom(ctx, MappingCandidate{
 		Server:              server,
@@ -1516,8 +1564,13 @@ func (r *Resolver) groupPin(ctx context.Context, key AffinityKey, members []Grou
 // serving application enables affinity. Mirrors the main Resolve pin: on an UpsertAffinity
 // failure it returns the error (a pin that could not be stored is a hard failure, exactly
 // as the single-model path treats it).
-func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key AffinityKey, name string, sel MappingCandidate, now time.Time) error {
-	if token.ID == "" || name == "" || sel.Application.AffinityTTLSeconds <= 0 {
+//
+// It also mirrors the main pin's capability guard: a capability-carrying request
+// (required non-empty) never writes a pin here either, for the same reason -- key
+// is COARSE, so a group image resolve would repoint a chat client sharing that key
+// at an image server. See the guard in Resolve for the full rationale.
+func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key AffinityKey, name string, sel MappingCandidate, required []string, now time.Time) error {
+	if token.ID == "" || name == "" || sel.Application.AffinityTTLSeconds <= 0 || len(required) > 0 {
 		return nil
 	}
 	id := affinityID(key)
@@ -1649,7 +1702,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 
 	// serve builds the target for a selected member and (re)pins the group affinity to it.
 	serve := func(name string, sel MappingCandidate) (Target, error) {
-		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
+		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.req.RequiredCapabilities, g.now); err != nil {
 			return Target{}, err
 		}
 		return r.targetFrom(ctx, sel, g.apiFlavor)
