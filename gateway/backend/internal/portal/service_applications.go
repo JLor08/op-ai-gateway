@@ -178,7 +178,9 @@ var (
 // reservedManualVerdicts are the (capability, verdict) pairs an operator may not
 // state, because a `manual` row is rank 3 -- above every automated source -- and
 // nothing re-derives one, so each of these would permanently override the only
-// writer entitled to establish it.
+// writer entitled to establish it. For most entries that writer exists; for
+// (image, no) it does not yet, which is why this is the first entry added before
+// its writer.
 //
 // It is keyed on the PAIR, not on the name, and that is the whole design. A
 // name-keyed list was the first cut and it was wrong: this row has TWO consumers
@@ -279,6 +281,17 @@ var reservedManualVerdicts = map[string]map[string]bool{
 		routing.CapabilityYes: true,
 		routing.CapabilityNo:  true,
 	},
+	// routing.CapabilityImage + CapabilityNo is reserved BEFORE its writer
+	// exists, which is unusual for this list and is bought at zero cost. Under
+	// ADR-042 an absent row already refuses, so an operator loses no
+	// expressiveness: "cannot generate images" is saying nothing. What it
+	// prevents is a permanent veto -- a manual row is rank 3, outranks every
+	// automated source, and nothing re-derives it, so a `no` written before the
+	// sd-server capability writer lands would outrank that writer forever
+	// against a genuinely capable model. Reserving now is cheaper than a later
+	// migration that has to find and clear such rows. (image, yes) stays
+	// writable: it is the operator's only enablement path until the writer ships.
+	routing.CapabilityImage: {routing.CapabilityNo: true},
 }
 
 // reservedManualVerdict reports whether stating verdict for capability is

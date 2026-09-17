@@ -3858,3 +3858,24 @@ func TestUpdateMappingConfigEditDoesNotRevertAConcurrentProbe(t *testing.T) {
 		t.Fatalf("status = %q, want disabled (the operator's edit must land)", got.Status)
 	}
 }
+
+// (image, no) is reserved once `image` is a routing veto. The argument is
+// asymmetric: it costs the operator nothing, because an ABSENT row already
+// refuses (ADR-042), so "this model cannot generate images" is fully expressed
+// by not writing a yes. And it prevents a permanent veto: a manual row is rank 3,
+// outranks every automated source and nothing re-derives it, so a `no` written
+// before the sd-server capability writer lands would outrank it forever against
+// a genuinely capable model.
+func TestImageNoIsAReservedManualVerdict(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilityImage, routing.CapabilityNo) {
+		t.Error("(image, no) must be reserved")
+	}
+	// yes stays writable -- it is the operator's day-one enablement path.
+	if reservedManualVerdict(routing.CapabilityImage, routing.CapabilityYes) {
+		t.Error("(image, yes) must stay writable: it is the only enablement path until the writer lands")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilityImage, "") {
+		t.Error("the reset must never be refused")
+	}
+}
