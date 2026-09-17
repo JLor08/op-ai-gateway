@@ -3607,6 +3607,170 @@ func TestConformanceUsageGroupsProjectDimension(t *testing.T) {
 	})
 }
 
+// seedMixedUnitEvents returns a MIXED-unit population: one token-metered row
+// and one non-token (image) row on the same user/token/model/host. The token
+// sums must exclude the non-token row, and NonTokenRequests must disclose it.
+// Without the count, a non-token row's "0 tokens" is indistinguishable from a
+// token-metered request whose upstream reported no usage object. This is the
+// SQL-store twin of the memory scenario in usage/recorder_test.go's
+// seedMixedUnitEvents -- there is no automated memory-vs-SQL conformance
+// suite for usage.Store, so the scenario is hand-mirrored in both packages.
+func seedMixedUnitEvents(now time.Time) []usage.Event {
+	return []usage.Event{
+		{
+			ID: "ev_tok", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+			InputTokens: 10, OutputTokens: 20, TotalTokens: 30,
+			CachedTokens: 5, CacheWriteTokens: 2,
+			PromptPerSecond: 50, TokensPerSecond: 25,
+			EnergyWh: 4, LatencyMS: 1000, Status: "success", HTTPStatus: 200,
+			CreatedAt: now.Add(-2 * time.Minute),
+		},
+		{
+			ID: "ev_img", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+			BillingUnit: usage.BillingUnitImage, BillingQuantity: 3,
+			// All seven token-denominated columns stay 0, per the XOR. The two
+			// per-second columns are set EXPLICITLY to 0 to pin the contract
+			// rather than rely on the zero value.
+			PromptPerSecond: 0, TokensPerSecond: 0,
+			EnergyWh: 6, LatencyMS: 3000, Status: "success", HTTPStatus: 200,
+			CreatedAt: now.Add(-1 * time.Minute),
+		},
+	}
+}
+
+// totalHistogramCount sums a Histogram's per-bin counts.
+func totalHistogramCount(h usage.Histogram) int {
+	total := 0
+	for _, bin := range h.Bins {
+		total += bin.Count
+	}
+	return total
+}
+
+// TestConformanceUsageMixedUnitAggregatesDiscloseNonTokenRequests proves both
+// SQL dialects handle a mixed-unit population identically to the memory
+// Recorder twin (usage.TestRecorderUsageMixedUnitAggregatesDiscloseNonTokenRequests):
+// token sums exclude the non-token row, but request counts, error counts,
+// concurrency, and energy sums correctly include it -- and NonTokenRequests
+// discloses which rows those are. An all-"" seed would pass either
+// implementation silently, which is why this seed is mixed.
+func TestConformanceUsageMixedUnitAggregatesDiscloseNonTokenRequests(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		now := time.Now().UTC().Truncate(time.Second)
+		for _, e := range seedMixedUnitEvents(now) {
+			if err := s.Record(e); err != nil {
+				t.Fatalf("record %s: %v", e.ID, err)
+			}
+		}
+
+		stats, err := s.Stats(usage.Query{ScopeAll: true, From: now.Add(-time.Hour), To: now})
+		if err != nil {
+			t.Fatalf("stats: %v", err)
+		}
+		if stats.Totals.TotalRequests != 2 {
+			t.Errorf("TotalRequests = %d, want 2 (a non-token request is a real request)", stats.Totals.TotalRequests)
+		}
+		if stats.Totals.NonTokenRequests != 1 {
+			t.Errorf("NonTokenRequests = %d, want 1", stats.Totals.NonTokenRequests)
+		}
+		if stats.Totals.InputTokens != 10 || stats.Totals.OutputTokens != 20 ||
+			stats.Totals.CachedTokens != 5 || stats.Totals.CacheWriteTokens != 2 {
+			t.Errorf("token sums polluted by the non-token row: %+v", stats.Totals)
+		}
+		if stats.Totals.TotalEnergyWh != 10 {
+			t.Errorf("TotalEnergyWh = %v, want 10 (a non-token row's energy IS real)", stats.Totals.TotalEnergyWh)
+		}
+		// ComputeHistogram drops zeros by design, so the non-token row contributes
+		// no bin. Assert it explicitly rather than relying on that behaviour silently.
+		if got := totalHistogramCount(stats.TokensPerSecond); got != 1 {
+			t.Errorf("tokens/s histogram counted %d values, want 1 (the non-token row's 0 must not bin)", got)
+		}
+
+		buckets, err := s.UsageGroups(context.Background(), usage.Query{ScopeAll: true, From: now.Add(-time.Hour), To: now}, "model")
+		if err != nil {
+			t.Fatalf("usage groups: %v", err)
+		}
+		var count, nonToken, input int
+		for _, b := range buckets {
+			count += b.Count
+			nonToken += b.NonTokenRequests
+			input += b.InputTokens
+		}
+		if count != 2 || nonToken != 1 || input != 10 {
+			t.Errorf("groups: count=%d nonToken=%d input=%d, want 2/1/10", count, nonToken, input)
+		}
+
+		// The time series is the SECOND token-per-second aggregate, and it is safe
+		// for a different reason than the histogram: the divisor is bucket
+		// seconds, not a row count. A non-token row is genuinely IN its input set
+		// -- it bumps Connections, Concurrency and EnergyWh -- and contributes
+		// nothing to the rate numerators. Assert that, rather than trusting it.
+		series, err := s.TimeSeries(usage.Query{ScopeAll: true, From: now.Add(-time.Hour), To: now}, 3600)
+		if err != nil {
+			t.Fatalf("time series: %v", err)
+		}
+		var conns int
+		var energy float64
+		for _, pt := range series.Points {
+			conns += pt.Connections
+			energy += pt.EnergyWh
+		}
+		if conns != 2 {
+			t.Errorf("Connections total = %d, want 2 (a non-token request is a real connection)", conns)
+		}
+		if energy != 10 {
+			t.Errorf("EnergyWh total = %v, want 10 (a non-token row's energy IS real)", energy)
+		}
+	})
+}
+
+// TestUsageAggregateSinceCountsANonTokenRequestWithZeroTokens proves the quota
+// source of truth counts a non-token request correctly: RequestQuota (COUNT(*),
+// no unit filter) must count it, and TokenQuota (SUM(total_tokens)) must read a
+// truthful 0 for it. principal_limits.go is not touched by this task -- it is
+// unit-blind by construction -- so this falls out of the XOR rather than
+// needing limiter changes, but it is the operator-visible half of the spec's
+// requirement, so it gets a test rather than an assumption.
+//
+// UsageAggregateSince only recognizes routing.PrincipalTypeService
+// ("service") and routing.PrincipalTypeUser ("user") -- there is no "token"
+// principal type -- so this filters by user_id (matching principal_limits.go's
+// actual call, which always passes p.Type/p.ID from a resolved Service or User
+// principal) rather than by TokenID.
+func TestUsageAggregateSinceCountsANonTokenRequestWithZeroTokens(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, st *SQLStore) {
+		now := time.Now().UTC()
+		since := now.Add(-time.Hour)
+		for _, ev := range []usage.Event{
+			{
+				ID: "ev_tok", UserID: "usr_1", TokenID: "tok_1", Host: "h1", Model: "m1",
+				InputTokens: 10, OutputTokens: 20, TotalTokens: 30, EnergyWh: 4,
+				Status: "success", HTTPStatus: 200, CreatedAt: now.Add(-2 * time.Minute),
+			},
+			{
+				ID: "ev_img", UserID: "usr_1", TokenID: "tok_1", Host: "h1", Model: "m1",
+				BillingUnit: usage.BillingUnitImage, BillingQuantity: 3, EnergyWh: 6,
+				Status: "success", HTTPStatus: 200, CreatedAt: now.Add(-1 * time.Minute),
+			},
+		} {
+			if err := st.Record(ev); err != nil {
+				t.Fatalf("record %s: %v", ev.ID, err)
+			}
+		}
+
+		requests, tokens, _, err := st.UsageAggregateSince(context.Background(), routing.PrincipalTypeUser, "usr_1", since)
+		if err != nil {
+			t.Fatalf("usage aggregate since: %v", err)
+		}
+		if requests != 2 {
+			t.Errorf("requests = %d, want 2 (RequestQuota must count a non-token request)", requests)
+		}
+		if tokens != 30 {
+			t.Errorf("tokens = %d, want 30 (TokenQuota must be a truthful no-op for the non-token row)", tokens)
+		}
+	})
+}
+
 // --- 6b. Usage: energy writer + reconcile queries (P2 T2) -------------------
 
 // TestConformanceUpdateUsageEventEnergy verifies the energy writer sets exactly

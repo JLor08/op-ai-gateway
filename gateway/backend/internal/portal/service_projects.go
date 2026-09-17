@@ -148,9 +148,12 @@ type ProjectTokenDTO struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	LastUsedAt   *time.Time `json:"last_used_at,omitempty"`
 	RequestCount int        `json:"request_count"`
-	InputTokens  int        `json:"input_tokens"`
-	OutputTokens int        `json:"output_tokens"`
-	TotalTokens  int        `json:"total_tokens"`
+	// NonTokenRequests is the count of RequestCount that are non-token-metered
+	// rows. See usage.StatTotals.NonTokenRequests.
+	NonTokenRequests int `json:"non_token_requests"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ProjectTokenUsageTotalDTO is a project's TRUE total token usage: the SUM
@@ -162,9 +165,12 @@ type ProjectTokenDTO struct {
 // just because a contributing token was later unlinked.
 type ProjectTokenUsageTotalDTO struct {
 	RequestCount int `json:"request_count"`
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	// NonTokenRequests is the count of RequestCount that are non-token-metered
+	// rows. See usage.StatTotals.NonTokenRequests.
+	NonTokenRequests int `json:"non_token_requests"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ProjectTokensView is ProjectTokens' response: the project's currently-
@@ -1032,7 +1038,7 @@ func (s *Service) ProjectTokens(ctx context.Context, principal auth.Token, id st
 			ProjectIDExact:    p.ID,
 		}, "token"); uerr == nil {
 			type agg struct {
-				count, input, output, cached, write int
+				count, nonToken, input, output, cached, write int
 			}
 			byToken := make(map[string]*agg, len(out))
 			var all agg
@@ -1043,11 +1049,13 @@ func (s *Service) ProjectTokens(ctx context.Context, principal auth.Token, id st
 					byToken[b.Key] = a
 				}
 				a.count += b.Count
+				a.nonToken += b.NonTokenRequests
 				a.input += b.InputTokens
 				a.output += b.OutputTokens
 				a.cached += b.CachedTokens
 				a.write += b.CacheWriteTokens
 				all.count += b.Count
+				all.nonToken += b.NonTokenRequests
 				all.input += b.InputTokens
 				all.output += b.OutputTokens
 				all.cached += b.CachedTokens
@@ -1061,16 +1069,18 @@ func (s *Service) ProjectTokens(ctx context.Context, principal auth.Token, id st
 			for i := range out {
 				if a, ok := byToken[out[i].ID]; ok {
 					out[i].RequestCount = a.count
+					out[i].NonTokenRequests = a.nonToken
 					out[i].InputTokens = a.input
 					out[i].OutputTokens = a.output
 					out[i].TotalTokens = a.input + a.output + a.cached + a.write
 				}
 			}
 			total = ProjectTokenUsageTotalDTO{
-				RequestCount: all.count,
-				InputTokens:  all.input,
-				OutputTokens: all.output,
-				TotalTokens:  all.input + all.output + all.cached + all.write,
+				RequestCount:     all.count,
+				NonTokenRequests: all.nonToken,
+				InputTokens:      all.input,
+				OutputTokens:     all.output,
+				TotalTokens:      all.input + all.output + all.cached + all.write,
 			}
 		}
 		// A usage-store error is swallowed here (best-effort): the token list

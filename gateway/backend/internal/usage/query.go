@@ -143,10 +143,15 @@ func NumericValue(e Event, colID string) float64 {
 // GroupBucket is one (group-value, host) aggregate row from UsageGroups. The
 // portal layer folds buckets by Key (summing) and weights cost per Host price.
 type GroupBucket struct {
-	Key              string
-	Host             string
-	Count            int
-	ErrorCount       int
+	Key        string
+	Host       string
+	Count      int
+	ErrorCount int
+	// NonTokenRequests is the count of non-token-metered rows in this bucket.
+	// See StatTotals.NonTokenRequests. Note there is deliberately no quantity
+	// sum: adding images to audio seconds would be exactly the lie the
+	// (unit, quantity) pair exists to prevent.
+	NonTokenRequests int
 	InputTokens      int
 	OutputTokens     int
 	CachedTokens     int
@@ -198,7 +203,15 @@ type Histogram struct {
 
 // StatTotals are the tile sums over ALL filtered rows (zeros included).
 type StatTotals struct {
-	TotalRequests    int `json:"total_requests"`
+	TotalRequests int `json:"total_requests"`
+	// NonTokenRequests is how many of TotalRequests carry a non-empty
+	// billing_unit, i.e. are NOT token-metered. It exists so a consumer can tell
+	// a not-applicable from a measured zero: without it, a non-token row's 0
+	// tokens is indistinguishable from a token-metered request whose upstream
+	// reported no usage object. 0 == the whole population is token-metered;
+	// == TotalRequests == none of it is; in between == a mixed population, where
+	// the token sums are correct for the token-metered SUBSET.
+	NonTokenRequests int `json:"non_token_requests"`
 	ErrorCount       int `json:"error_count"`
 	CachedTokens     int `json:"cached_tokens"`
 	CacheWriteTokens int `json:"cache_write_tokens"`

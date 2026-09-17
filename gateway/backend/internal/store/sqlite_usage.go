@@ -752,7 +752,7 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 	// with the memory recorder, which passes a nil name resolver for Stats).
 	where, args := usageWhere(s.dl, q, "")
 	rows, err := s.query(context.Background(),
-		"select e.status, e.http_status, e.cached_tokens, e.cache_write_tokens, e.input_tokens, e.output_tokens, e.prompt_per_second, e.tokens_per_second, e.energy_wh from usage_events as e"+where,
+		"select e.status, e.http_status, e.cached_tokens, e.cache_write_tokens, e.input_tokens, e.output_tokens, e.prompt_per_second, e.tokens_per_second, e.energy_wh, e.billing_unit from usage_events as e"+where,
 		args...,
 	)
 	if err != nil {
@@ -770,13 +770,17 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 			httpStatus                     int
 			cached, cacheWrite, input, out int
 			pps, tps, energyWh             float64
+			billingUnit                    string
 		)
-		if err := rows.Scan(&status, &httpStatus, &cached, &cacheWrite, &input, &out, &pps, &tps, &energyWh); err != nil {
+		if err := rows.Scan(&status, &httpStatus, &cached, &cacheWrite, &input, &out, &pps, &tps, &energyWh, &billingUnit); err != nil {
 			wrapped := fmt.Errorf("scan usage stats: %w", err)
 			s.setLastUsageError("stats.scan", wrapped)
 			return emptyUsageStats(), wrapped
 		}
 		totals.TotalRequests++
+		if billingUnit != usage.BillingUnitTokens {
+			totals.NonTokenRequests++
+		}
 		if usage.IsError(status, httpStatus) {
 			totals.ErrorCount++
 		}
@@ -1022,6 +1026,7 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	sqlText := "select e." + col + " as gkey, e.host," +
 		" count(*)," +
 		" sum(case when e.status = 'error' or e.http_status >= 400 then 1 else 0 end)," +
+		" sum(case when e.billing_unit <> '' then 1 else 0 end)," +
 		" sum(e.input_tokens), sum(e.output_tokens), sum(e.cached_tokens), sum(e.cache_write_tokens)," +
 		" sum(e.energy_wh), min(e.created_at), max(e.created_at)" +
 		usageEventsFromClause + where +
@@ -1034,13 +1039,13 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	out := make([]usage.GroupBucket, 0)
 	for rows.Next() {
 		var b usage.GroupBucket
-		var count, errCount, in, outTok, cached, cacheWrite int64
+		var count, errCount, nonToken, in, outTok, cached, cacheWrite int64
 		var energy float64
 		var first, last aggTime
-		if err := rows.Scan(&b.Key, &b.Host, &count, &errCount, &in, &outTok, &cached, &cacheWrite, &energy, &first, &last); err != nil {
+		if err := rows.Scan(&b.Key, &b.Host, &count, &errCount, &nonToken, &in, &outTok, &cached, &cacheWrite, &energy, &first, &last); err != nil {
 			return nil, fmt.Errorf("scan usage group: %w", err)
 		}
-		b.Count, b.ErrorCount = int(count), int(errCount)
+		b.Count, b.ErrorCount, b.NonTokenRequests = int(count), int(errCount), int(nonToken)
 		b.InputTokens, b.OutputTokens = int(in), int(outTok)
 		b.CachedTokens, b.CacheWriteTokens = int(cached), int(cacheWrite)
 		b.EnergyWh = energy

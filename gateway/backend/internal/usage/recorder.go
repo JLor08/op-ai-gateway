@@ -349,6 +349,9 @@ func (r *Recorder) Stats(q Query) (Stats, error) {
 	tokens := make([]float64, 0, len(filtered))
 	for _, e := range filtered {
 		totals.TotalRequests++
+		if e.BillingUnit != BillingUnitTokens {
+			totals.NonTokenRequests++
+		}
 		if IsError(e.Status, e.HTTPStatus) {
 			totals.ErrorCount++
 		}
@@ -429,6 +432,9 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 			acc[id] = b
 		}
 		b.Count++
+		if e.BillingUnit != BillingUnitTokens {
+			b.NonTokenRequests++
+		}
 		if IsError(e.Status, e.HTTPStatus) {
 			b.ErrorCount++
 		}
