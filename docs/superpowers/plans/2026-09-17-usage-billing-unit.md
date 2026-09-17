@@ -2225,8 +2225,12 @@ An existing test's **title** pins the old behaviour as intended (`StatTiles.test
         render(<StatTiles t={t} totals={totals} {...showAll} {...defaultCostProps} />);
         // An absent energy total is UNKNOWN, not zero. It now matches
         // formatCost's long-standing 0/undefined convention instead of
-        // contradicting it.
-        expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2);
+        // contradicting it. Assert per TILE rather than counting em dashes, so
+        // this stays as specific as the assertion it replaces.
+        const energyTile = screen.getByText(t.activityEnergyTile).closest('div') as HTMLElement;
+        expect(within(energyTile).getByText('—')).toBeInTheDocument();
+        const costTile = screen.getByText(t.activityCostTile).closest('div') as HTMLElement;
+        expect(within(costTile).getByText('—')).toBeInTheDocument();
       });
 ```
 
@@ -2246,6 +2250,8 @@ Then apply the three-state rule to the four token tiles in `StatTiles.tsx:44-61`
     output_tokens: tokenTile(t.activityOutputTokens, totals.output_tokens),
 ```
 
+`StatTile`'s DOM shape decides whether `.closest('div')` reaches the tile wrapper — read `shared/StatTile.tsx` first and use whatever container query actually scopes to one tile (a `role`/`aria-label`, or `closest('[class*=...]')`). The requirement is that each assertion is scoped to its own tile rather than counting occurrences on the page.
+
 Add a `StatTiles.test.tsx` case:
 
 ```tsx
@@ -2258,8 +2264,16 @@ Add a `StatTiles.test.tsx` case:
             {...defaultCostProps}
           />,
         );
-        // Four token tiles, all not-applicable.
-        expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4);
+        // Assert per tile, not by counting em dashes on the page.
+        for (const label of [
+          t.activityCachedTokens,
+          t.activityCacheWriteTokens,
+          t.activityInputTokens,
+          t.activityOutputTokens,
+        ]) {
+          const tile = screen.getByText(label).closest('div') as HTMLElement;
+          expect(within(tile).getByText('—')).toBeInTheDocument();
+        }
       });
 
       it('marks the token tiles when the population is mixed', () => {
