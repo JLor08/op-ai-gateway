@@ -940,21 +940,54 @@ func TestRecorderUsageMixedUnitAggregatesDiscloseNonTokenRequests(t *testing.T) 
 	// not a row count. A non-token row is genuinely IN its input set -- it bumps
 	// Connections, Concurrency and EnergyWh -- and contributes nothing to the
 	// rate numerators. Assert that, rather than trusting it.
+	//
+	// bucketSecs=3600 spans exactly the 1-hour [from,to) query window, so
+	// ComputeTimeSeries produces n=ceil(3600/3600)=1: a SINGLE bucket. Both
+	// seeded rows' CreatedAt (well inside the window) and their tiny
+	// (1s/3s) latency-shifted concurrency intervals therefore land in that
+	// one bucket -- there is no "different bucket" case to distinguish here,
+	// so summing across series.Points (only one element) is equivalent to,
+	// and no less precise than, reading that single point directly.
 	series, err := rec.TimeSeries(Query{ScopeAll: true, From: now.Add(-time.Hour), To: now}, 3600)
 	if err != nil {
 		t.Fatalf("time series: %v", err)
 	}
-	var conns int
-	var energy float64
+	if len(series.Points) != 1 {
+		t.Fatalf("points = %d, want 1 (a 3600s bucket over a 1h window is exactly one bucket)", len(series.Points))
+	}
+	var conns, concurrency int
+	var energy, promptRate, completionRate float64
 	for _, pt := range series.Points {
 		conns += pt.Connections
+		concurrency += pt.Concurrency
 		energy += pt.EnergyWh
+		promptRate += pt.PromptTokensPerSecond
+		completionRate += pt.CompletionTokensPerSecond
 	}
 	if conns != 2 {
 		t.Errorf("Connections total = %d, want 2 (a non-token request is a real connection)", conns)
 	}
+	// Concurrency counts a request whose [CreatedAt-LatencyMS, CreatedAt]
+	// window overlaps the bucket. Both rows' windows (1s and 3s wide) sit
+	// entirely inside the single 1h bucket, so both are counted: want 2.
+	if concurrency != 2 {
+		t.Errorf("Concurrency total = %d, want 2 (both rows' latency windows overlap the one bucket)", concurrency)
+	}
 	if energy != 10 {
 		t.Errorf("EnergyWh total = %v, want 10 (a non-token row's energy IS real)", energy)
+	}
+	// PromptTokensPerSecond/CompletionTokensPerSecond are sum(InputTokens|
+	// OutputTokens)/bucketSecs. Only ev_tok contributes to the numerator (10
+	// input, 20 output); ev_img's token columns are 0 by the XOR. Assert the
+	// actual expected rate, not merely ">0" -- the point is that the
+	// non-token row adds nothing to the numerator.
+	const wantPromptRate = 10.0 / 3600.0
+	const wantCompletionRate = 20.0 / 3600.0
+	if !approxEqual(promptRate, wantPromptRate) {
+		t.Errorf("PromptTokensPerSecond = %v, want %v (10 input tokens / 3600s; the non-token row adds 0)", promptRate, wantPromptRate)
+	}
+	if !approxEqual(completionRate, wantCompletionRate) {
+		t.Errorf("CompletionTokensPerSecond = %v, want %v (20 output tokens / 3600s; the non-token row adds 0)", completionRate, wantCompletionRate)
 	}
 }
 
