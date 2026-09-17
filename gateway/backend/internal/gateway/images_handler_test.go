@@ -6,11 +6,13 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -47,6 +49,12 @@ func TestImagesRefusesIncapableModel(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "routing.model_not_capable") {
 		t.Fatalf("body = %s, want the capability code, not an unknown-model code", rec.Body.String())
+	}
+	// The unit is endpoint identity, set on EVERY recordUsage call this path
+	// makes -- this refusal is relayImages' own resolve-failure branch
+	// (images_handler.go), which is otherwise untested for BillingUnit.
+	if got := lastUsageEvent(t, srv).BillingUnit; got != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q on the refusal path, want %q", got, usage.BillingUnitImage)
 	}
 }
 
@@ -115,6 +123,12 @@ func TestImagesUsageRowCarriesItsOwnPath(t *testing.T) {
 	}
 	if got.ProviderPath == "/v1/chat/completions" {
 		t.Fatal("ProviderPath fell through to the chat default: upstreamPath needs its own case")
+	}
+	// Same refusal path as TestImagesRefusesIncapableModel; pinning the unit
+	// here too since this is one of only two of relayImages/proxyNative's
+	// five images-reachable recordUsage call sites this file exercised.
+	if got.BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q on the refusal path, want %q", got.BillingUnit, usage.BillingUnitImage)
 	}
 }
 
@@ -247,5 +261,319 @@ func TestImagesRelayNormalisesUpstreamErrorOverHTTP(t *testing.T) {
 	}
 	if body.Error.Type == "" || body.Error.Code == "" {
 		t.Fatalf("type/code = %q/%q, want gateway-authored values, not sd-server's (which states neither)", body.Error.Type, body.Error.Code)
+	}
+}
+
+// newImageCapableTestServer returns a NewTestServer() (same base seed --
+// seedGatewayTestRoutes' qwen-coder mapping, which carries no image verdict)
+// whose route store ADDITIONALLY carries an application/mapping pointing at
+// upstreamURL for the model "sd-turbo", with an image:yes capability row so
+// the resolver's gate admits it. Mirrors seedGatewayTestRoutes' own seeding
+// shape (CreateAIServer + CreateApplication + CreateMapping +
+// UpsertMappingCapabilities + UpsertTelemetry) rather than inventing a second
+// seeding style.
+//
+// Unlike NewTestServer, the Provider here is a REAL
+// provider.NewOpenAICompatibleClient making a genuine HTTP round trip to
+// upstreamURL. provider.NewMock's own ProxyNative (internal/provider/mock.go)
+// returns a canned SSE stream and never looks at the target or path at all,
+// so a server built with NewTestServer's own Provider could never reach the
+// stub upstream these usage tests depend on -- the same reason
+// newImagesHTTPTestServer above uses a real provider instead of the mock.
+func newImageCapableTestServer(t *testing.T, upstreamURL string) *Server {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin"]`, CreatedAt: now, UpdatedAt: now}, "dev-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	seedGatewayTestRoutes(routeStore, now)
+
+	ctx := context.Background()
+	// ApplicationEndpoint (routing/store.go) builds the reachable origin from
+	// the SERVER's Domain + the APPLICATION's Scheme/Port -- not from
+	// AIServer.Endpoint, which is descriptive only here -- so upstreamURL (the
+	// httptest server's real address) must be decomposed into those fields for
+	// the resolved Target to actually reach it. Mirrors newImagesHTTPTestServer
+	// above, which hit this exact requirement first.
+	up, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", upstreamURL, err)
+	}
+	port, err := strconv.Atoi(up.Port())
+	if err != nil {
+		t.Fatalf("upstream port %q: %v", up.Port(), err)
+	}
+	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo", Name: "SD Turbo Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo", ApplicationID: "app-sd-turbo", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, "route-sd-turbo", []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-sd-turbo", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+
+	return New(ServerDeps{
+		Tokens:   tokens,
+		Usage:    recorder,
+		Provider: provider.NewOpenAICompatibleClient(http.DefaultClient),
+		Routes:   routeStore,
+		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+	})
+}
+
+// lastUsageEvent returns the most recently recorded usage event on srv,
+// failing the test when none was recorded.
+func lastUsageEvent(t *testing.T, srv *Server) usage.Event {
+	t.Helper()
+	events := srv.Usage.All()
+	if len(events) == 0 {
+		t.Fatal("no usage event recorded")
+	}
+	return events[len(events)-1]
+}
+
+// The quantity comes from the RESPONSE, not the request. n states what was asked
+// for; data[] states what was produced, and a partial failure makes those
+// differ. Metering the ask would be the same class of error as counting a
+// measured zero as a measurement.
+func TestImagesUsageQuantityComesFromTheResponse(t *testing.T) {
+	// Stub upstream: two images back for a request that asked for four.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="},{"b64_json":"BB=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat","n":4}`)
+
+	got := lastUsageEvent(t, srv)
+	if got.BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q, want %q", got.BillingUnit, usage.BillingUnitImage)
+	}
+	if got.BillingQuantity != 2 {
+		t.Fatalf("BillingQuantity = %v, want 2 (what the response produced, not the n=4 that was asked for)", got.BillingQuantity)
+	}
+}
+
+// The XOR: all seven token-denominated columns must be zero on a non-token row.
+func TestImagesUsageRowSatisfiesTheBillingXOR(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+
+	if err := usage.ValidateBillingXOR(lastUsageEvent(t, srv)); err != nil {
+		t.Fatalf("the recorded image row violates the billing XOR: %v", err)
+	}
+}
+
+// A failed image request is still a NON-TOKEN row: the unit is endpoint
+// identity, never response-derived, so a 500 must not be recorded as
+// token-metered with a zero measure -- the exact lie the pair exists to prevent.
+func TestImagesUsageOnFailureIsStillImageUnit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"out of memory"}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+
+	got := lastUsageEvent(t, srv)
+	if got.BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q on a FAILED image request, want %q", got.BillingUnit, usage.BillingUnitImage)
+	}
+	if got.BillingQuantity != 0 {
+		t.Fatalf("BillingQuantity = %v, want 0: nothing was produced", got.BillingQuantity)
+	}
+	if err := usage.ValidateBillingXOR(got); err != nil {
+		t.Fatalf("the failed image row violates the billing XOR: %v", err)
+	}
+}
+
+// response_format:"url" is REJECTED at the request boundary rather than
+// relayed and billed afterwards -- see validateImagesRequest's own doc
+// comment for the reasoning (sd-server cannot host a URL for its own
+// in-process output, and imagesDataCounter is built against the b64_json
+// KEY, so a "url" response would relay successfully while counting 0
+// produced images for every one of them).
+func TestImagesRejectsUnsupportedResponseFormat(t *testing.T) {
+	srv := NewTestServer()
+
+	rec := postImages(t, srv, `{"model":"qwen-coder","prompt":"a cat","response_format":"url"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), imagesResponseFormatUnsupported) {
+		t.Fatalf("body = %s, want %s", rec.Body.String(), imagesResponseFormatUnsupported)
+	}
+}
+
+// imagesDataCounter must count "b64_json" only when it is used as a JSON
+// KEY, never when it appears as a matching STRING VALUE -- the reviewer's
+// three concrete over-count repros, reproduced directly against the real
+// counter (no HTTP, no server): an echoed response_format, an echoed
+// parameters object, and a prompt/revised_prompt whose text happens to be
+// exactly "b64_json". Each body carries exactly ONE real image key.
+func TestImagesDataCounterCountsKeysNotValues(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "echoed response_format",
+			body: `{"created":1,"response_format":"b64_json","data":[{"b64_json":"AA=="}]}`,
+		},
+		{
+			name: "echoed parameters object",
+			body: `{"created":1,"parameters":{"n":1,"response_format":"b64_json"},"data":[{"b64_json":"AA=="}]}`,
+		},
+		{
+			name: "revised_prompt text happens to be the literal string",
+			body: `{"created":1,"data":[{"b64_json":"AA==","revised_prompt":"b64_json"}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &imagesDataCounter{}
+			c.feed([]byte(tc.body))
+			if got := c.total(); got != 1 {
+				t.Fatalf("total() = %d, want 1 (one real image key; the rest are string values) -- body: %s", got, tc.body)
+			}
+		})
+	}
+}
+
+// A successful (2xx) images relay that counts zero produced images must not
+// silently record it as a plain zero -- indistinguishable from a genuine
+// empty data[] -- it must say so loudly. See imagesDataCounter's own doc
+// comment and the log call beside BillingQuantity's assignment in
+// proxyNative (native_passthrough.go).
+func TestImagesUsageLogsLoudlyWhenASuccessfulRelayCountsZeroImages(t *testing.T) {
+	logs := logbuffer.NewBuffer(50, logbuffer.LevelTrace)
+	setDefaultSlogForTest(t, logs)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// 2xx, but a shape this relay's counter cannot recognise any b64_json
+		// KEY in -- e.g. an upstream whose response shape drifted unannounced.
+		_, _ = w.Write([]byte(`{"created":1,"data":[{"unexpected_field":"oops"}]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+
+	got := lastUsageEvent(t, srv)
+	if got.BillingQuantity != 0 {
+		t.Fatalf("BillingQuantity = %v, want 0 (nothing this relay could count)", got.BillingQuantity)
+	}
+	var found bool
+	for _, rec := range logs.Snapshot() {
+		if rec.Level == "ERROR" && strings.Contains(rec.Msg, "zero produced images") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a successful images relay that counted zero images must log loudly, not silently record a bare zero")
+	}
+}
+
+// newImageCapableTestServerWithProvider mirrors newImageCapableTestServer's
+// route seeding (sd-turbo, image:yes) but wires prov directly instead of a
+// real HTTP client -- for exercising proxyNative's PRE-RESPONSE branches
+// ("provider is not a NativeProxyClient", a ProxyNative transport error),
+// which never reach an actual upstream at all, so no httptest server or URL
+// decomposition is needed here.
+func newImageCapableTestServerWithProvider(t *testing.T, prov provider.Client) *Server {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin"]`, CreatedAt: now, UpdatedAt: now}, "dev-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	seedGatewayTestRoutes(routeStore, now)
+	ctx := context.Background()
+	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo-fake", Name: "SD Turbo Fake", Domain: "sd-turbo.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://sd-turbo.example.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo-fake", ServerID: "srv-sd-turbo-fake", Type: routing.ProviderVLLM, Port: 80, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo-fake", ApplicationID: "app-sd-turbo-fake", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, "route-sd-turbo-fake", []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-sd-turbo-fake", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	return New(ServerDeps{
+		Tokens:   tokens,
+		Usage:    recorder,
+		Provider: prov,
+		Routes:   routeStore,
+		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+	})
+}
+
+// TestImagesProviderUnavailableStillRecordsImageUnit pins the third of the
+// five images-reachable recordUsage call sites: proxyNative's own
+// "provider is not a NativeProxyClient" branch (native_passthrough.go),
+// shared with every other native-passthrough flavor, which must still read
+// the unit from pfReq.APIFlavor (billingUnitFor) for an images request.
+func TestImagesProviderUnavailableStillRecordsImageUnit(t *testing.T) {
+	srv := newImageCapableTestServerWithProvider(t, nonProxyCapableProvider{})
+
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+
+	got := lastUsageEvent(t, srv)
+	if got.ErrorCode != "provider.unavailable" {
+		t.Fatalf("ErrorCode = %q, want provider.unavailable", got.ErrorCode)
+	}
+	if got.BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q, want %q (endpoint identity, set even when the provider itself can't proxy)", got.BillingUnit, usage.BillingUnitImage)
+	}
+}
+
+// TestImagesUpstreamCallFailureStillRecordsImageUnit pins the fourth of the
+// five images-reachable recordUsage call sites: proxyNative's pre-response
+// ProxyNative-error branch (native_passthrough.go, upstream unreachable),
+// also shared with every other native-passthrough flavor.
+func TestImagesUpstreamCallFailureStillRecordsImageUnit(t *testing.T) {
+	srv := newImageCapableTestServerWithProvider(t, erroringProxyProvider{err: errors.New("dial tcp: connection refused")})
+
+	postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" {
+		t.Fatalf("Status = %q, want error", got.Status)
+	}
+	if got.BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("BillingUnit = %q, want %q (endpoint identity, set even on a pre-response transport failure)", got.BillingUnit, usage.BillingUnitImage)
 	}
 }

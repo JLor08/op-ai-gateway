@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/usage"
 	"strings"
 	"time"
 )
@@ -26,6 +28,195 @@ import (
 // labelling (usage rows, upstreamPath) and for its own sessionEndpoint case,
 // never for filtering.
 const apiFlavorImages = "openai_images"
+
+// billingUnitFor returns usage.BillingUnitImage when apiFlavor identifies an
+// images request and usage.BillingUnitTokens (the zero value) otherwise. The
+// name is deliberately NOT "imagesBillingUnit": proxyNative's three shared
+// recordUsage call sites (native_passthrough.go -- the "provider is not a
+// NativeProxyClient" branch, the pre-response ProxyNative-error branch, and
+// the terminal success/error branch) call this on EVERY native-passthrough
+// request, including every openai_responses and anthropic_messages one,
+// where it answers "" -- a function whose own name claimed to be about
+// images would misdescribe those calls. Each call site must read the unit
+// from the CALLER's own endpoint identity, never default it or infer it from
+// whatever (if anything) the upstream answered -- see usageMeta's own doc
+// comment for why a response-derived unit would record a failed images
+// request as token-metered with a zero measure, the exact lie the
+// (unit, quantity) pair exists to prevent. relayImages and
+// relayImagesUpstreamError below don't need this helper: both are
+// images-only functions, so their own recordUsage calls set
+// usage.BillingUnitImage directly.
+func billingUnitFor(apiFlavor string) string {
+	if apiFlavor == apiFlavorImages {
+		return usage.BillingUnitImage
+	}
+	return usage.BillingUnitTokens
+}
+
+// imagesDataMarker is the JSON key an images response uses for one produced
+// image (sd-server's b64_json response format; see the response_format
+// decision below validateImagesRequest). The quotes rule out the marker
+// appearing by CHANCE inside base64 image data (the base64 alphabet never
+// emits a `"` byte) -- they do NOT, by themselves, distinguish a JSON KEY
+// from a matching STRING VALUE: "b64_json" is also OpenAI's own canonical
+// response_format value, so the identical quoted bytes appear verbatim in
+// request-echoing fields too (response_format:"b64_json", a parameters
+// object, even a prompt or revised_prompt whose text happens to be exactly
+// "b64_json"). imagesDataCounter.feed's own colon check is what makes that
+// distinction; see there.
+const imagesDataMarker = `"b64_json"`
+
+var imagesDataMarkerBytes = []byte(imagesDataMarker)
+
+// imagesDataKeyLookahead bounds how many bytes past a matched
+// imagesDataMarker occurrence feed looks for the byte that decides KEY vs
+// VALUE: a ':' (after skipping ordinary JSON whitespace) means "b64_json" is
+// being used as a KEY -- one produced image; anything else means it is a
+// STRING VALUE and must not be counted (see imagesDataMarker's own doc
+// comment for why quoting alone cannot tell the two apart). A real JSON key
+// is followed by its colon with at most incidental whitespace, so this bound
+// is ample while still capping a hostile upstream that pads a key occurrence
+// with unbounded whitespace to grow feed's carry without limit.
+const imagesDataKeyLookahead = 8
+
+// imagesDataCounter counts KEY occurrences of imagesDataMarker AS THE
+// RESPONSE BYTES PASS THROUGH THE COPIER (nativeCopier.writeChunk,
+// native_passthrough.go), independently of the capture tee's bounded
+// respBuf.
+//
+// That independence is the whole reason this exists rather than reading
+// data's length off respBuf after the copy finishes: respBuf is capped at
+// captureMaxBytes (defaultCaptureMaxBytes = 1<<20, 1 MiB -- see server.go),
+// the SAME budget usageScanner's own doc comment (passthrough_usage_scan.go)
+// explains is shared with the capture feature and nothing else. A
+// base64-encoded image response routinely exceeds that: base64 inflates the
+// raw bytes by ~33%, so a single modest PNG already sits in the hundreds of
+// KB, and an n>1 request multiplies that. Reading data's length from a
+// silently truncated respBuf would UNDER-REPORT the count on exactly the
+// large responses this measure matters most for -- worse than recording no
+// count at all (see relayImages' own doc comment on the (unit, quantity)
+// pair, and billingUnitFor above). So this scans the FULL byte stream
+// instead, keeping only a small, bounded carry across chunk boundaries --
+// never the whole body -- the same reason usageScanner is fed independently
+// of respBuf's cap.
+//
+// Failure mode: if a successful (2xx) response never contains the key AS A
+// KEY at all -- a malformed/truncated body, or a shape this relay was not
+// built against -- the count is 0, indistinguishable from a genuine empty
+// data[]. This relay cannot tell "produced nothing" from "said nothing this
+// counter recognises" any more precisely than that, so proxyNative logs that
+// case at Error rather than recording it silently (native_passthrough.go,
+// beside the BillingQuantity assignment) -- the same posture recordUsage
+// itself takes on an XOR violation (inference_complete.go): make the
+// unmeasurable case LOUD, never quietly indistinguishable from a genuine
+// zero.
+type imagesDataCounter struct {
+	carry []byte
+	count int
+	// bytesSeen is the TOTAL number of response bytes fed, uncapped -- unlike
+	// respBuf, so the "counted zero" log line above can report an honest body
+	// size even for a response many times captureMaxBytes.
+	bytesSeen int
+}
+
+// feed counts new KEY occurrences of imagesDataMarker in chunk -- i.e. ones
+// immediately followed, after skipping up to imagesDataKeyLookahead bytes of
+// JSON whitespace, by ':' -- folding in the bounded carry retained from the
+// previous call so a marker, or its still-unresolved key/value
+// determination, split across two upstream reads is neither missed nor
+// double-counted. A quoted match that resolves to anything other than ':' is
+// a STRING VALUE and is never counted; see imagesDataMarker's own doc
+// comment for why the quotes alone cannot make that call. Nil-safe, matching
+// usageScanner.feed's own convention, so a nativeCopier built without a
+// counter (every non-images flavor) pays nothing.
+func (c *imagesDataCounter) feed(chunk []byte) {
+	if c == nil {
+		return
+	}
+	window := make([]byte, len(c.carry)+len(chunk))
+	copy(window, c.carry)
+	copy(window[len(c.carry):], chunk)
+	c.bytesSeen += len(chunk)
+
+	pos := 0
+	deferredFrom := -1
+scan:
+	for {
+		i := bytes.Index(window[pos:], imagesDataMarkerBytes)
+		if i < 0 {
+			break
+		}
+		matchStart := pos + i
+		after := matchStart + len(imagesDataMarkerBytes)
+		limit := after + imagesDataKeyLookahead
+		ranOutOfWindow := false
+		if limit >= len(window) {
+			limit = len(window)
+			ranOutOfWindow = true
+		}
+		j := after
+		for j < limit && isJSONSpace(window[j]) {
+			j++
+		}
+		switch {
+		case j < limit:
+			// A resolving (non-whitespace) byte was found within the window
+			// and within the lookahead bound: ':' means this occurrence is a
+			// KEY, anything else means it is a VALUE.
+			if window[j] == ':' {
+				c.count++
+			}
+			pos = after
+		case ranOutOfWindow:
+			// Every byte to the end of the CURRENT window was whitespace, and
+			// the lookahead bound was not yet reached: the resolving byte may
+			// be in the NEXT chunk. Defer this match to the next feed call
+			// rather than guess.
+			deferredFrom = matchStart
+			break scan
+		default:
+			// The lookahead bound was reached with nothing but whitespace: a
+			// real JSON key never puts this much space before its colon, so
+			// this is treated as a VALUE (not counted) rather than grown
+			// further.
+			pos = after
+		}
+	}
+
+	tailLen := len(imagesDataMarkerBytes) - 1
+	if len(window) < tailLen {
+		tailLen = len(window)
+	}
+	carryStart := len(window) - tailLen
+	if deferredFrom >= 0 && deferredFrom < carryStart {
+		carryStart = deferredFrom
+	}
+	tail := window[carryStart:]
+	next := make([]byte, len(tail))
+	copy(next, tail)
+	c.carry = next
+}
+
+// total returns the number of images this response reports having produced.
+// Nil-safe: a non-images request's nil counter reports 0, which proxyNative
+// never actually reads -- it only consults this when the endpoint identity
+// (pfReq.APIFlavor) is images.
+func (c *imagesDataCounter) total() int {
+	if c == nil {
+		return 0
+	}
+	return c.count
+}
+
+// bytesFed returns the total number of response bytes this counter has
+// seen, uncapped by captureMaxBytes -- see imagesDataCounter's bytesSeen
+// field. Nil-safe, matching total().
+func (c *imagesDataCounter) bytesFed() int {
+	if c == nil {
+		return 0
+	}
+	return c.bytesSeen
+}
 
 // handleOpenAIImages serves POST /v1/images/generations by relaying to a
 // natively OpenAI-shaped image backend. There is no translate path: the gateway
@@ -71,22 +262,46 @@ func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 	s.relayImages(w, r, token, pf.Req, raw)
 }
 
+// imagesResponseFormatUnsupported is validateImagesRequest's own code for a
+// response_format this relay cannot honor -- see its check below for the
+// decision and the reason.
+const imagesResponseFormatUnsupported = "images.response_format_unsupported"
+
 // validateImagesRequest validates the shape this handler owns, instead of
 // calling inference.Request.Validate: that validator requires len(Messages) > 0,
 // and an images request has none, so calling it would reject every one of them.
-// Only "prompt" (non-empty) and "model" (non-empty, resolved by the caller's own
-// tolerant probe -- see sniffRoutingModel) are required; every other field is
-// the client's own business and reaches the upstream unexamined.
+// "prompt" (non-empty) and "model" (non-empty, resolved by the caller's own
+// tolerant probe -- see sniffRoutingModel) are required. With ONE exception
+// below (response_format), every other field is the client's own business
+// and reaches the upstream unexamined.
+//
+// response_format decision: only "b64_json" (sd-server's own shape, and
+// OpenAI's own default) is accepted; an explicit "url" -- or anything else
+// -- is REJECTED here with its own code, rather than relayed and billed
+// afterwards. Two reasons, both about what happens AFTER this function
+// returns, not before: sd-server has no way to host a URL for output it
+// generates in-process, so a "url" request could only ever get an error or a
+// shape this relay does not expect; and imagesDataCounter (below) is built
+// specifically against the b64_json KEY -- a "url"-format response would
+// relay successfully while every one of its images counts as 0 produced,
+// which is exactly the silently-wrong measurement this feature exists to
+// prevent (see imagesDataCounter's own doc comment). Rejecting the request
+// up front turns that into a 400 the client can act on, instead of a usage
+// row that quietly under-bills a response that streamed just fine.
 func validateImagesRequest(raw []byte, model string) error {
 	if strings.TrimSpace(model) == "" {
 		return &inference.Error{Code: "images.model_required", Message: "model is required"}
 	}
 	var body struct {
-		Prompt string `json:"prompt"`
+		Prompt         string `json:"prompt"`
+		ResponseFormat string `json:"response_format"`
 	}
 	_ = json.Unmarshal(raw, &body)
 	if strings.TrimSpace(body.Prompt) == "" {
 		return &inference.Error{Code: "images.prompt_required", Message: "prompt is required"}
+	}
+	if body.ResponseFormat != "" && body.ResponseFormat != "b64_json" {
+		return &inference.Error{Code: imagesResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"b64_json\" is", body.ResponseFormat)}
 	}
 	return nil
 }
@@ -117,7 +332,13 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 			slog.Debug("images request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
 		}
 		body := writeCompletionErrorCaptured(w, err)
-		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
+		// BillingUnit is set here unconditionally (not via imagesBillingUnit):
+		// relayImages is an images-only function, so req.APIFlavor is always
+		// apiFlavorImages -- the unit is endpoint identity, set on EVERY
+		// recordUsage call this path makes, success and failure alike (see
+		// usageMeta's own doc comment). BillingQuantity is left at its zero
+		// value: nothing was produced by a resolve failure.
+		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
 		return
 	}
 	path := upstreamPath(target, req.APIFlavor)
@@ -172,7 +393,11 @@ func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request
 		written = upstreamBody
 	}
 
-	s.recordUsage(start, token, req, target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), written, resp.StatusCode, req.APIFlavor))
+	// BillingUnit is set unconditionally, as in relayImages above:
+	// relayImagesUpstreamError is images-only, so req.APIFlavor is always
+	// apiFlavorImages. A non-2xx upstream response is still a non-token
+	// request -- BillingQuantity stays 0, nothing was produced.
+	s.recordUsage(start, token, req, target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), written, resp.StatusCode, req.APIFlavor))
 }
 
 // imagesUpstreamErrorType and imagesUpstreamErrorCode are the GATEWAY's own

@@ -312,7 +312,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	proxyClient, ok := s.Provider.(provider.NativeProxyClient)
 	if !ok {
 		body := writeJSONCaptured(w, http.StatusBadGateway, apierror.Response("provider.unavailable", "native passthrough not supported", ""))
-		s.recordUsage(start, token, req, target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadGateway, pfReq.APIFlavor))
+		// BillingUnit is read from pfReq.APIFlavor via billingUnitFor
+		// (images_handler.go): this branch is shared by every native-
+		// passthrough flavor, so the images unit must come from the CALLER's
+		// own endpoint identity here too, not only in images_handler.go's own
+		// two call sites.
+		s.recordUsage(start, token, req, target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadGateway, pfReq.APIFlavor))
 		return
 	}
 
@@ -441,7 +446,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		httpStatus := completionHTTPStatus(err)
 		slog.Error("inference native passthrough failed", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName, "code", code, "err", err)
 		body := writeCompletionErrorCaptured(w, err)
-		s.recordUsage(start, token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, httpStatus, pfReq.APIFlavor))
+		// Same reasoning as the provider.unavailable branch above: this is a
+		// pre-response failure (nothing came back from sd-server at all), and
+		// it is still a non-token images request when pfReq.APIFlavor says so.
+		s.recordUsage(start, token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, httpStatus, pfReq.APIFlavor))
 		return
 	}
 	defer resp.Body.Close()
@@ -542,32 +550,67 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// (TTFT, and whatever count/rate the upstream itself reports) into `progress`
 	// when there is one — display only: nothing on this path writes a routing
 	// input, which stays where it was, on the end-of-request recordUsage below.
+	// imgCounter counts data[]'s produced-image entries as bytes stream through
+	// the copier, for images only (nil, and never fed, for every other
+	// flavor -- see imagesDataCounter's own doc comment in images_handler.go
+	// for why it must not read the capped respBuf above instead).
+	var imgCounter *imagesDataCounter
+	if pfReq.APIFlavor == apiFlavorImages {
+		imgCounter = &imagesDataCounter{}
+	}
 	var respBuf bytes.Buffer
 	scanner := newUsageScanner(pfReq.APIFlavor, s.captureMaxBytes, progress)
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner}
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter}
 	copyErr := copier.run(resp.Body)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, pfReq, serverName, idledOut.Load(), copyErr, start)
 
 	usg := scanner.usage()
-	s.recordUsage(start, token, req, target, provider.Response{Usage: usg}, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), respBuf.Bytes(), resp.StatusCode, pfReq.APIFlavor))
+	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}
+	// The quantity comes from the RESPONSE, not the request: n states what was
+	// asked for, data[] states what was produced, and a partial failure makes
+	// those differ. Only trust imgCounter's count once the FULL body actually
+	// reached the client without error (status == "success" -- upstreamOK, no
+	// idle timeout, no client disconnect, no copy error; a non-2xx images
+	// response never reaches here at all, see the branch above). Otherwise
+	// BillingQuantity stays 0: nothing is asserted about what was produced.
+	if pfReq.APIFlavor == apiFlavorImages && status == "success" {
+		n := imgCounter.total()
+		if n == 0 {
+			// A successful relay that counted zero produced images is
+			// indistinguishable, in the recorded row alone, from a genuine
+			// empty data[] -- imagesDataCounter's own doc comment names this
+			// as its failure mode. The (unit, quantity) pair has no "unknown"
+			// representation to fall back on, so discoverability is the
+			// alternative: log it at Error, with enough to find the request,
+			// exactly as recordUsage below logs an XOR violation rather than
+			// silently repairing the row.
+			slog.Error("images relay succeeded but counted zero produced images", "id", id, "path", r.URL.Path, "model", pfReq.Model, "server", serverName, "body_bytes", imgCounter.bytesFed())
+		}
+		meta.BillingQuantity = float64(n)
+	}
+	s.recordUsage(start, token, req, target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), respBuf.Bytes(), resp.StatusCode, pfReq.APIFlavor))
 }
 
 // nativeCopier bundles everything proxyNative's body-copy needs: the client
 // writer (+ flusher/write-deadline controller), the idle watchdog to re-arm on
-// activity, the bounded tee buffer feeding capture, and the usage scanner fed
-// independently of that buffer's cap (see usageScanner). scanner is nil-safe: a
+// activity, the bounded tee buffer feeding capture, the usage scanner fed
+// independently of that buffer's cap (see usageScanner), and — for images
+// only — the imgCounter fed the same way (see imagesDataCounter,
+// images_handler.go). Both scanner and imgCounter are nil-safe: a
 // nativeCopier built without one — several tests here do, when they only care
-// about the copy mechanics — simply skips usage scanning.
+// about the copy mechanics, and every non-images flavor never builds an
+// imgCounter at all — simply skips that scan.
 type nativeCopier struct {
-	w        http.ResponseWriter
-	rc       *http.ResponseController
-	flusher  http.Flusher
-	watchdog *time.Timer
-	idle     time.Duration
-	respBuf  *bytes.Buffer
-	capBytes int
-	scanner  *usageScanner
+	w          http.ResponseWriter
+	rc         *http.ResponseController
+	flusher    http.Flusher
+	watchdog   *time.Timer
+	idle       time.Duration
+	respBuf    *bytes.Buffer
+	capBytes   int
+	scanner    *usageScanner
+	imgCounter *imagesDataCounter
 }
 
 // run streams the upstream body to the client chunk by chunk and returns the
@@ -598,10 +641,11 @@ func (c *nativeCopier) run(body io.Reader) error {
 
 // writeChunk forwards one upstream chunk: re-arm the idle watchdog + write
 // deadline (streams only), write, flush (so SSE frames reach the client live),
-// feed the usage scanner, and tee into the bounded respBuf. The scanner is fed
-// BEFORE the capture-cap check so usage/timings accounting never depends on the
-// capture budget — that check bounds respBuf only, a separate, capture-only
-// buffer with its own purpose (see usageScanner).
+// feed the usage scanner and (images only) the image-count scanner, and tee
+// into the bounded respBuf. Both scanners are fed BEFORE the capture-cap check
+// so their accounting never depends on the capture budget — that check bounds
+// respBuf only, a separate, capture-only buffer with its own purpose (see
+// usageScanner and imagesDataCounter).
 func (c *nativeCopier) writeChunk(chunk []byte) error {
 	if c.watchdog != nil {
 		c.watchdog.Reset(c.idle)
@@ -614,6 +658,7 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 		c.flusher.Flush()
 	}
 	c.scanner.feed(chunk, time.Now())
+	c.imgCounter.feed(chunk)
 	if c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}

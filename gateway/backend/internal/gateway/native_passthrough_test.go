@@ -146,6 +146,37 @@ func TestNativeCopierRunCapStopsTeeingOnceExceeded(t *testing.T) {
 	}
 }
 
+// TestNativeCopierImageCounterCountsAcrossCapAndChunkBoundary pins the two
+// properties imagesDataCounter's own doc comment (images_handler.go) argues
+// for at length: its count must be INDEPENDENT of capBytes (a base64 image
+// response routinely exceeds it) and must SURVIVE a "b64_json" key split
+// across a single upstream Read call's boundary. Both are exercised at once:
+// the cap is set far below where either marker appears, and the first
+// marker is deliberately split across the two scripted reads.
+//
+// Without this test, both properties could regress silently: moving
+// imgCounter.feed inside the respBuf cap guard, or dropping the carry
+// between feed calls, leaves every OTHER test in this package green (proven
+// below by reproducing exactly those two mutations and confirming THIS test
+// -- and no other -- catches each).
+func TestNativeCopierImageCounterCountsAcrossCapAndChunkBoundary(t *testing.T) {
+	w := &fakeFlushWriter{}
+	c := newNativeCopier(w, 4) // tiny cap: respBuf stops teeing after chunk 1
+	c.imgCounter = &imagesDataCounter{}
+	body := &scriptedReader{reads: []scriptedRead{
+		{chunk: []byte(`{"data":[{"b64_`), err: nil},                     // marker #1 split HERE; already past capBytes=4
+		{chunk: []byte(`json":"AAAA"},{"b64_json":"BBBB"}]}`), err: nil}, // completes #1, carries #2 whole
+		{chunk: nil, err: io.EOF},
+	}}
+
+	if err := c.run(body); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	if got := c.imgCounter.total(); got != 2 {
+		t.Fatalf("imgCounter.total() = %d, want 2 (independent of capBytes=%d and the marker split across the read boundary; respBuf itself only ever holds %q, which contains no complete key at all)", got, c.capBytes, c.respBuf.String())
+	}
+}
+
 // TestNativeCopierRunWriteErrorTakesPrecedenceOverReadError proves that when a
 // single Read call returns BOTH data and a non-EOF error, and writing that data
 // to the client fails, run() returns the WRITE error — the read error is never
