@@ -121,6 +121,38 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/images/generations:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible image generation (relay only, no translate path)
+      description: >
+        Bearer-only, scope `gateway:use` or `llm:invoke`. Always relayed to a
+        natively image-shaped upstream; there is no translate fallback.
+        Admission is a per-mapping capability verdict, not an application
+        setting: a model without an `image` verdict of `yes` is refused with
+        404 `routing.model_not_capable`. Non-streaming only, and
+        `response_format` must be `b64_json` or absent (400
+        `images.response_format_unsupported` otherwise). Metered in images
+        (`billing_unit: image`), not in tokens. Alias:
+        /openai/v1/images/generations.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /openai/v1/images/generations:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/images/generations
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/messages/count_tokens:
     post:
       tags: [inference]

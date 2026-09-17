@@ -42,13 +42,14 @@ Only requests that actually arrived on `agentMux` get `r.TLS` transport-hop repo
 
 ## 1. Inference / compatibility endpoints
 
-Client-facing, OpenAI/Anthropic/Codex/Claude-Code-compatible completion and model-listing routes. All require **session-or-bearer or bearer-only** auth with scope `gateway:use` or `llm:invoke` (service tokens); see the table for which variant each path uses. `/v1/responses` and `/v1/messages` also attempt **native passthrough** first (proxying the raw body straight to an upstream that natively speaks Codex/Claude Code) before falling back to translation.
+Client-facing, OpenAI/Anthropic/Codex/Claude-Code-compatible completion, image-generation and model-listing routes. All require **session-or-bearer or bearer-only** auth with scope `gateway:use` or `llm:invoke` (service tokens); see the table for which variant each path uses. `/v1/responses` and `/v1/messages` also attempt **native passthrough** first (proxying the raw body straight to an upstream that natively speaks Codex/Claude Code) before falling back to translation. `/v1/images/generations` is passthrough-**only** — it has no translate path, and admission to it is a per-mapping capability verdict rather than an application setting.
 
 | Path(s) | Method | Auth | Purpose |
 |---|---|---|---|
 | `/v1/chat/completions`, `/openai/v1/chat/completions` | POST | Session-or-bearer, `gateway:use`\|`llm:invoke` | OpenAI-compatible chat completions (streaming supported) |
 | `/v1/responses`, `/openai/v1/responses` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI Responses API (Codex); native passthrough when the target app supports it |
 | `/v1/messages`, `/anthropic/v1/messages` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | Anthropic Messages API (Claude Code); native passthrough when the target app supports it — the only path where Anthropic streaming works end-to-end |
+| `/v1/images/generations`, `/openai/v1/images/generations` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI-compatible image generation, relayed to a natively image-shaped upstream (`sd-server`). No translate path: a mapping without an `image` capability verdict of `yes` is refused with 404 `routing.model_not_capable`. Non-streaming only; `response_format` must be `b64_json` or absent. Metered in images, not tokens |
 | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | Anthropic token counting (utility call, no upstream inference, no billing) |
 | `/v1/models`, `/openai/v1/models` | GET | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI-shaped model listing; discovery is unfiltered by a service token's own allowlist, but IS filtered by resource-group provisioning visibility |
 | `/anthropic/v1/models` | GET | Session-or-bearer, `gateway:use` | Anthropic-shaped model listing |

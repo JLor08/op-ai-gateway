@@ -1360,8 +1360,10 @@ repairing the data would destroy the evidence that a producer is wrong, and
 dropping the row would lose a request from billing outright.
 
 **(c) A unit may only come from ENDPOINT IDENTITY, never from the response.**
-Seven of the ten `recordUsage` call sites pass a zero `provider.Response`
-(every error, timeout, disconnect and admission-rejection path), so a
+Nine of the twelve `recordUsage` call sites pass a zero `provider.Response`
+(every error, timeout, disconnect and admission-rejection path — seven of ten
+when this was decided, before the images endpoint added two more of the same
+kind), so a
 response-derived unit would stamp `""` on a *failed* image request and record
 it as token-metered with a zero measure — the exact lie the pair exists to
 prevent, arriving through the one path an operator is most likely to inspect.
@@ -1451,3 +1453,170 @@ so the int4/float4 class cannot recur on a brand-new column.
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [Glossary](12-glossary.md).
+
+## ADR-042 — The images gate keys on a required capability, and an absent verdict refuses
+**Context:** `POST /v1/images/generations` (issue #71) is the first endpoint
+whose model requirement is a hard **precondition** rather than a preference. A
+chat model handed an image request does not produce a degraded image; it
+produces a wrong answer, or an upstream error far from its cause. Capability
+verdicts already existed as ranked child rows
+([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped))
+with a researched three-state vocabulary
+([ADR-038](#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)),
+and **nothing on the request path had ever refused a model for lacking one**:
+the live-timings gate annotates, the models-list fold advertises, and the
+scorer does not read a verdict at all. So the gate this endpoint needs is not
+one more consumer of an existing filter — it is the gateway's first *excluding*
+one, and the axis it keys on is the decision.
+
+Issue #71 proposed that axis be a new **fine API flavor**, `openai_images`.
+That cannot work, and the reason is one function: `routing.NormalizeAPIFlavor`
+folds **every** `openai*` value to the coarse `openai` that a
+`model_mapping`'s application actually declares support for
+([Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model)).
+A fine flavor therefore has nothing to refuse *with* — it is a label that
+survives only as far as the first normalisation. `openai_images` does ship, as
+`apiFlavorImages`, and it is exactly that: a label for usage rows, for
+`upstreamPath`, and for its own `sessionEndpoint` case. It filters nothing.
+
+**Decision: the gate keys on `inference.Request.RequiredCapabilities []string`,
+set by an endpoint handler from its own identity and never from the request
+body.** It is nil for chat, responses and messages — which is what makes this
+a true no-op on every existing path — and `[]string{routing.CapabilityImage}`
+for images. `Resolver.filterCapable` (`internal/routing/resolver.go`) drops
+every candidate whose mapping does not carry a `yes` verdict for each required
+name.
+
+**The cost comparison is the whole argument, because the rejected shape was the
+issue's own.** `RequiredCapabilities` needed **no store change at all**:
+`MappingCapabilitiesForMappings` already existed on every driver — chunked in
+SQLite, mirrored in `MemoryStore`, wrapped in the generated tracing decorator,
+and already carrying an N+1 guard test in `internal/portal` — so admitting it
+to `resolverStore` cost one interface line. There is **no new `LEFT JOIN`** and
+**no capability field on `MappingCandidate`**: the gate reads verdicts in one
+bulk call keyed on the candidate list it already holds, so the per-resolution
+join cost stays where ADR-040 left it. A fine flavor, by contrast, would have
+had to grow an application-declared support column, a candidacy mirror, a
+normaliser exemption and three-driver conformance coverage — **per endpoint**,
+because the next one (speech, multipart uploads: issues #68/#69) would repeat
+all of it. The capability list generalises instead: those endpoints inherit
+this gate, and both of its affinity write guards, by naming their own
+capability.
+
+**(a) An ABSENT capability row means unknown, and unknown REFUSES.** This
+direction is chosen on evidence, not on taste. `Extra`-sourced rows are
+written **yes-only** (`cmd/gateway/app_health.go`), and the Ollama detector
+can structurally never emit `no` — ADR-038 records why absence there means
+only "Ollama did not tell us". In a real fleet, therefore, almost no mapping
+carries a `no` row for anything, so reading unknown as *permission* would
+refuse nothing at all: it would reproduce the exact defect the gate exists to
+fix, while looking like a gate. **A capability store error refuses too**,
+rather than failing open, for the same reason — a filter that opens on a
+transient read failure is a filter an outage can switch off.
+
+**The day-one cost is stated here rather than left to be discovered: nothing
+in a deployed fleet carries an `image` row, so every image request answers
+404 `routing.model_not_capable` until an operator writes one.** The
+enablement path already works today with no schema change and no API change —
+`{"capability_verdicts":{"image":"yes"}}` on the mapping, a `manual` row,
+rank 3. That is a deliberate trade: an endpoint that serves nothing until an
+operator says which models generate images is strictly better than one that
+routes an image request to whatever chat model answered last.
+
+**(b) `(image, no)` is RESERVED before its writer exists, and that costs
+nothing.** `reservedManualVerdicts` (`internal/portal/service_applications.go`)
+is keyed on the `(capability, verdict)` **pair**; every other entry reserves a
+verdict whose automated writer already ships. This one does not, and reserving
+it anyway is free precisely *because* of (a): an absent row already refuses,
+so "this model cannot generate images" is saying nothing an operator needs to
+say. What it prevents is a **permanent veto** — a `manual` row is rank 3,
+outranks every automated source, and nothing re-derives it, so a `no` written
+before the capability writer lands would outrank that writer forever against a
+genuinely capable model, and clearing it would need a migration that first has
+to find such rows. `(image, yes)` stays writable, and is the operator's only
+enablement path until the writer ships. Clearing a verdict is never refused —
+the reservation is on *stating* the pair, not on the reset.
+
+**(c) A refusal must be legible, and making it so fixed two PRE-EXISTING
+502s.** `routing.ErrModelNotCapable` is deliberately not `ErrNoModelRoute`:
+"this model cannot do that" and "there is no such model" are different facts,
+and a client that cannot tell them apart can act on neither. It maps to code
+`routing.model_not_capable` and **HTTP 404**. Folded into the same change,
+because a gate that refuses legibly on one branch and illegibly on another is
+not a legible gate: **`ErrNoModelRoute` moves 502 → 404 and `ErrNoHealthyHost`
+moves 502 → 503.** Both had no case in `completionHTTPStatus` and fell through
+to 502, which made a routing refusal indistinguishable from an upstream
+outage. **The remap is global** — every inference endpoint, prefixed and
+streaming variants included — and it is the one externally visible behavior
+change here: a consumer that treats 502 as retryable and 404 as terminal now
+sees the second where it used to see the first, which is the correct reading
+of both facts.
+
+**(d) `/v1/models` keeps advertising what the router refuses, and that is
+recorded rather than fixed here.** The model-offering path
+(`portal.ModelOfferingFor`) is called with the **coarse** flavor
+(`inference_handlers.go`, `routing.NormalizeAPIFlavor(shape.apiFlavor)`), so it
+cannot see a capability dimension at all: an images-only model is still listed
+to a chat client, and a chat model is still listed to an images client. Fixing
+it means teaching the offering path — and the unknown-model redirect that reads
+`Callable`, [Routing & Model Selection
+§2.2](cross-cutting/routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)
+— a dimension neither has, which is a separate unit of work. The gap is
+axis-independent (it is not about images) and is logged in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+**(e) The GROUP path deliberately does NOT return this sentinel.** Inside
+`eligibleCandidates`, returning `ErrModelNotCapable` would abort the group
+failover walk at the **first** incapable member, so an image request to a
+group whose second member is capable would fail outright. The gate therefore
+runs as an ordinary filter there, before `live` is taken, and an emptied member
+reads as `memberNoMapping` — the same no-leak posture the provisioning gate
+above it already uses. The residual is that an image request to an **all-chat
+group** answers 404 `routing.no_model_route`, which is honest about not being
+an outage but is byte-identical to a typo'd model name. Also in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+**(f) The automatic capability writer is a separate issue — and `image` must
+NOT be added to `reservedAgentCapabilityNames`.** That list
+(`internal/gateway/agent_ingest.go`) is what the ingest boundary refuses to
+accept from an agent. Adding `image` to it would block the very writer this
+design is waiting for **before it is written**, and the block would look like
+a security decision rather than the mistake it is. The two lists are not
+symmetric and must not be kept in step: `reservedManualVerdicts` reserves an
+*operator's* `(name, verdict)` pair, `reservedAgentCapabilityNames` reserves a
+*name* against an agent, and (b) is a statement about the first only.
+
+**Rejected:** **`openai_images` as a gating fine API flavor** — the Context is
+the whole argument; it ships as a label and nothing else. — **A second
+`admitPrincipal` call site** for the new endpoint: there is exactly one in
+`internal/gateway`, and its own comment records what broke when there were
+four; the images handler consumes the shared `inferencePreflight` instead. —
+**Gating inside `affinityApplicationStale`**: every rejection there *deletes*
+the affinity row, and `AffinityKey.APIFlavor` is coarse, so an image request
+declaring a pin stale would delete a chat client's pin. The gate sits in
+`resolveAffinity` instead, where its refusal is non-destructive
+([Routing & Model Selection §4](cross-cutting/routing-and-model-selection.md#4-route-affinity)).
+— **A `route_affinity` migration** to make the key capability-aware: the two
+pin-*creating* writes are guarded on a non-empty required list instead, which
+needs no schema change and which #68/#69 inherit. — **A new runtime kind, an
+`images_mode` application column, and a wider `captureMaxBytes`**: each would
+have made an endpoint-shaped fact into a stored one. `sd-server` launches under
+the existing `custom` kind ([Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-custom));
+images has no per-application mode to read at all, which is why
+`endpointModeFor` deliberately has no case for it; and the capture cap stays
+1 MiB, so a large base64 response is captured truncated while the billable
+count is scanned off the full byte stream regardless.
+→ [API Compatibility & Inference
+§3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
+[§13](cross-cutting/compatibility-and-inference.md#13-errors),
+[Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[§4](cross-cutting/routing-and-model-selection.md#4-route-affinity),
+[§8](cross-cutting/routing-and-model-selection.md#8-errors-and-http-mapping),
+[Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[HTTP API Surface
+§1](reference/api-surface.md#1-inference--compatibility-endpoints).

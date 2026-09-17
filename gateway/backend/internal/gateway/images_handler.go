@@ -275,19 +275,30 @@ const imagesResponseFormatUnsupported = "images.response_format_unsupported"
 // below (response_format), every other field is the client's own business
 // and reaches the upstream unexamined.
 //
-// response_format decision: only "b64_json" (sd-server's own shape, and
-// OpenAI's own default) is accepted; an explicit "url" -- or anything else
-// -- is REJECTED here with its own code, rather than relayed and billed
-// afterwards. Two reasons, both about what happens AFTER this function
-// returns, not before: sd-server has no way to host a URL for output it
-// generates in-process, so a "url" request could only ever get an error or a
-// shape this relay does not expect; and imagesDataCounter (below) is built
-// specifically against the b64_json KEY -- a "url"-format response would
-// relay successfully while every one of its images counts as 0 produced,
-// which is exactly the silently-wrong measurement this feature exists to
-// prevent (see imagesDataCounter's own doc comment). Rejecting the request
-// up front turns that into a 400 the client can act on, instead of a usage
-// row that quietly under-bills a response that streamed just fine.
+// response_format decision: only "b64_json" (sd-server's own shape) is
+// accepted; an explicit "url" -- or anything else -- is REJECTED here with
+// its own code, rather than relayed and billed afterwards. Two reasons, both
+// about what happens AFTER this function returns, not before: sd-server has
+// no way to host a URL for output it generates in-process, so a "url"
+// request could only ever get an error or a shape this relay does not
+// expect; and imagesDataCounter (below) is built specifically against the
+// b64_json KEY -- a "url"-format response would relay successfully while
+// every one of its images counts as 0 produced, which is exactly the
+// silently-wrong measurement this feature exists to prevent (see
+// imagesDataCounter's own doc comment). Rejecting the request up front turns
+// that into a 400 the client can act on, instead of a usage row that quietly
+// under-bills a response that streamed just fine.
+//
+// b64_json is NOT OpenAI's default, and the compatibility cost of this rule
+// is therefore real: OpenAI's Images API defaults response_format to "url"
+// for dall-e-2/dall-e-3, and gpt-image-1 does not accept the parameter at
+// all. So a strict OpenAI client that explicitly sends the documented OpenAI
+// default gets a 400 from this gateway. That is accepted deliberately --
+// relaying a base64 body to a client that asked for URLs is a silent
+// wire-contract violation, and a 400 is the only answer that is neither
+// wrong nor silent -- but it is a PRECONDITION for using this endpoint, not
+// a preference, and it is documented as such in
+// docs/architecture/cross-cutting/compatibility-and-inference.md section 3.4.
 func validateImagesRequest(raw []byte, model string) error {
 	if strings.TrimSpace(model) == "" {
 		return &inference.Error{Code: "images.model_required", Message: "model is required"}
@@ -332,7 +343,7 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 			slog.Debug("images request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
 		}
 		body := writeCompletionErrorCaptured(w, err)
-		// BillingUnit is set here unconditionally (not via imagesBillingUnit):
+		// BillingUnit is set here unconditionally (not via billingUnitFor):
 		// relayImages is an images-only function, so req.APIFlavor is always
 		// apiFlavorImages -- the unit is endpoint identity, set on EVERY
 		// recordUsage call this path makes, success and failure alike (see

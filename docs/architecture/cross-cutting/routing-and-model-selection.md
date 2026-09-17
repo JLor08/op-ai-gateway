@@ -67,8 +67,8 @@ gatewayModel, apiFlavor)` returns every candidate whose mapping is
 server exists — health/enablement are filtered later, in the resolver, not the
 store query.
 
-The same query also carries the **one** capability verdict the request path
-acts on — `LiveProgressSupport` — through a **LEFT JOIN on
+The same query also carries the one capability verdict that travels **on the
+candidate** — `LiveProgressSupport` — through a **LEFT JOIN on
 `model_mapping_capabilities` filtered to that capability name** in the join
 condition. Filtering there rather than in the `WHERE` clause is what keeps one
 row per mapping (the table's primary key is `(mapping_id, capability)`) and
@@ -83,6 +83,17 @@ filtered to `mtp`, it fed nothing but that bonus, and dropping it took its
 all — so a mapping read through `MappingByID`, which joins nothing, cannot
 present an unpopulated verdict as a real one
 ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+
+**A second capability verdict is now read on the request path, and deliberately
+not through this join.** The capability gate (§2.3) needs an arbitrary set of
+names per request, which a join filtered to one literal name cannot express
+without one join per name. It calls `Store.MappingCapabilitiesForMappings`
+instead — **one** bulk read keyed on the candidate list the resolver already
+holds — so this query gained no third join and `MappingCandidate` gained no
+capability field. `LiveProgressSupport` stays on the candidate because it is an
+*annotation* every candidate carries; a required-capability verdict is consumed
+and discarded inside the filter, and nothing downstream should be able to read
+one off a candidate as if it were a property of the route.
 
 `ApplicationEndpoint(server, app)` (`internal/routing/store.go`) composes the
 reachable base URL: `scheme://domain:port` plus the server's and application's
@@ -150,7 +161,9 @@ flowchart TD
     Affinity -->|hit| ReuseTarget["reuse pinned Target;\ntouch session reservation"]
     Affinity -->|miss| LoadCands["Store.ActiveMappingsForModel(model, flavor)"]
     LoadCands --> FilterProv["filterProvisioned\n(resource-group gate)"]
-    FilterProv --> Select["selectCandidate (see §3)"]
+    FilterProv --> FilterCap["filterCapable\n(required-capability gate,\nsee §2.3)"]
+    FilterCap -->|"emptied, and the request\nrequired a capability"| ErrCap["404: ErrModelNotCapable"]
+    FilterCap --> Select["selectCandidate (see §3)"]
     Select -->|all candidates at\neffective cap| Queue["AdmissionController.WaitForSlot\n(see §6)"]
     Queue -->|slot signalled / recheck tick| Select
     Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout\n/ ErrAdmissionQueueFull"]
@@ -177,6 +190,12 @@ the default, is a no-op — every candidate passes). This is the only place
 authorization intersects routing; see
 [Security, Authentication & Authorization](security-auth-rbac.md) for the gate
 itself.
+
+`filterCapable` runs immediately after it and drops candidates whose mapping
+does not carry a `yes` verdict for every capability the **endpoint** requires.
+It is a no-op for a request that requires none — which is every chat,
+Responses and Messages request — and §2.3 is entirely about the one case where
+it is not.
 
 ### 2.1 Per-token model resolution
 
@@ -360,6 +379,93 @@ built without the per-token filter and without the listing switches, because
 only that separation lets the redirect tell "no such model" from "not yours";
 groups share the model namespace, so an active group's own name is in it too.
 
+### 2.3 The capability gate
+
+`filterCapable` (`internal/routing/resolver.go`) is this gateway's **first
+filter that genuinely excludes a model for lacking a capability**. Every other
+reader of a capability verdict either *annotates* a request
+(`wantsResponsesLiveTimings`, off `LiveProgressSupport`) or *advertises* a
+model (the models-list fold of `vision` into the model DTO, and the portal's
+mapping views); none of them refuses, and the scorer never sees a verdict at
+all (§3, and the [Glossary](../12-glossary.md) entry for candidate scoring).
+
+**The fail-open rule the next section documents does not apply here, and the
+asymmetry is the point.** Every filter in §3 falls back to the pre-filter pool
+rather than refuse a request a degraded server could still serve — the right
+call there, because a slow or busy server still answers a chat request. A chat
+model cannot answer an image request at all, so falling open here would not
+degrade the answer; it would route to a model that produces the wrong one.
+
+**What it refuses.** The request carries
+`inference.Request.RequiredCapabilities []string`, set by the endpoint handler
+from its **own identity** and never from the request body — nil for chat,
+Responses and Messages, `["image"]` for `/v1/images/generations`
+([API Compatibility & Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)).
+A candidate survives only if its mapping carries a `yes` verdict for **every**
+name in that list. The verdicts come from one bulk
+`Store.MappingCapabilitiesForMappings` read over the candidate list (§1), not
+from a join and not from a per-candidate lookup.
+
+**An absent row means unknown, and unknown refuses. A store error refuses
+too.** Both directions are evidence-based rather than conservative by habit:
+`Extra`-sourced capability rows are written **yes-only**, and the Ollama
+detector can structurally never emit `no`, so a real fleet holds almost no `no`
+rows for anything — reading unknown as *permission* would refuse nothing while
+looking like a gate. Failing open on a transient read error would hand the same
+result to any store hiccup. The day-one consequence — every image request 404s
+until an operator writes a `yes` verdict — and the reasoning behind accepting
+it are in
+[ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses).
+
+**Four places apply it**, three of them ordinary candidate filters and one a
+deviation:
+
+| # | Site | Behavior when the gate empties the pool |
+|---|---|---|
+| 1 | `Resolve`'s fresh-candidate path, right after `filterProvisioned`/`filterServesEndpoint` | `ErrModelNotCapable` (404, §8) — checked **before** the general empty-pool case, and conditioned on a non-empty required list, so a chat request falls through to `ErrNoModelRoute` exactly as before |
+| 2 | `resolveServerOverride` | `ErrServerOverrideModelUnavailable` (404) — the override's own existing sentinel; a forced server that does not carry the verdict is not a usable target |
+| 3 | `eligibleCandidates` (every group-member read: `selectMember` **and** `orderMembersBySpeed`) | the member reads as `memberNoMapping`, and the group walk continues to the next member |
+| 4 | `resolveAffinity` (the pinned mapping) | the pin is **skipped**, not deleted, and resolution falls through to the fresh path |
+
+Site 3 deliberately does **not** raise `ErrModelNotCapable`: returning an error
+from inside `eligibleCandidates` would abort the failover walk at the first
+incapable member, so a group whose *second* member can serve images would fail
+outright. The gate therefore runs there before `live` is taken, which also
+keeps an emptied member on the no-leak side of the
+`memberNoMapping`/`memberUnavailable` split, matching the provisioning gate
+above it. The residual — an image request to an **all-chat group** answers 404
+`routing.no_model_route`, honest about not being an outage but indistinguishable
+from a typo'd model name — is recorded in
+[Risks & Technical Debt §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+`ScoreModelServers` is a fourth caller of `ActiveMappingsForModel` and is
+**deliberately not gated**: it is the read-only portal ordering path, it routes
+nothing, and gating it would silently empty an operator's server list.
+
+**Site 4 deviates from `resolveAffinity`'s own conventions in two ways, both
+deliberate.** That branch has no candidate filter at all — its mapping comes
+from `MappingsByApplication`, which joins no capability rows — so the gate
+reads the verdicts off the keyed `MappingCapabilities` call the branch already
+makes for `LiveProgressSupport`, costing no extra store round trip. But:
+
+1. **A read error is "not satisfied" here, where live progress degrades to
+   `""`.** The live-progress read is advisory: failing open costs one
+   annotation. This gate failing open would route an image request to a chat
+   model for the whole of `AffinityTTLSeconds`.
+2. **The refusal is NON-DESTRUCTIVE.** It returns "no pin" and lets the caller
+   fall through to fresh selection. Every *other* rejection in that function
+   deletes the affinity row — and that would be wrong here, for the reason
+   §4 gives: the key's `APIFlavor` is coarse.
+
+The gate is placed **before** the pin's `LastUsedAt`/`UpdatedAt` refresh, so a
+refused request never touches the row at all. That ordering does not make the
+refresh unreachable for capability-carrying requests: a pin that *does* satisfy
+the gate refreshes exactly as a chat request's would, which is safe because the
+refresh rewrites the row it just read with only those two timestamps advanced —
+`ApplicationID`/`ServerID`/`ExpiresAt` unchanged, and `LastUsedAt` is never
+read for a routing decision anywhere in the backend. That is why the refresh is
+not one of the two guarded writes in §4.
+
 ## 3. Candidate scoring
 
 `selectCandidate` (`internal/routing/resolver.go`) narrows the candidate pool
@@ -486,6 +592,38 @@ conversation keeps talking to the same server while a model is resident there.
   default 60s) recording that session as "live" there. The capacity cap (§3,
   filter 3) subtracts this count from `MaxConcurrency` so unpinned traffic
   cannot fill the slots active pinned conversations will return to.
+- **Capability.** A pinned mapping is re-checked against the request's required
+  capabilities on every hit (§2.3, site 4), so a pin never serves a stale
+  verdict for its whole TTL. A refusal there is non-destructive, and the two
+  pin-**creating** writes are guarded outright — both below.
+
+**The key's `APIFlavor` is COARSE, and that is what makes the two write guards
+necessary.** `AffinityKey` is built after `NormalizeAPIFlavor`, so a request to
+`/v1/images/generations` and a request to `/v1/chat/completions` from the same
+token, for the same model name and session, hash to the **same**
+`aff_<...>` id. Two consequences follow, and they are not symmetric:
+
+- **On the READ side, a refusal must not delete.** An image request that finds
+  a chat client's pin unsatisfying is not evidence that the pin is stale — it
+  is evidence that this request is not the one the pin was written for. So the
+  gate skips the pin and falls through, and the gate is deliberately **not**
+  placed in `affinityApplicationStale`, where every rejection deletes the row.
+  Putting it there would let any image request evict a working chat pin.
+- **On the WRITE side, a capability-carrying request never creates a pin at
+  all.** Both pin-creating writes — `Resolve`'s own `UpsertAffinity` and
+  `upsertGroupPin` — carry a `len(RequiredCapabilities) == 0` guard. Without
+  it, an image resolve would write its target *under the chat client's key* and
+  repoint that client at an image server on its next request; the read-side
+  gate cannot help, because it is the write that does the damage. The guard is
+  keyed on the capability list rather than on a flavor string precisely so the
+  next capability-carrying endpoint (speech, multipart: issues #68/#69)
+  inherits it without touching the resolver.
+
+The cost accepted is that image traffic takes **no** affinity pin and re-selects
+every request. For a single-JSON, non-conversational endpoint that is not a
+regression worth a schema change; a capability-aware affinity key would have
+been a `route_affinity` migration
+([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)).
 
 ## 5. Model groups
 
@@ -821,12 +959,27 @@ caller may see, for a dashboard-style overview without subscribing per server.
 
 | Routing error | HTTP status | When |
 |---|---|---|
-| `ErrNoModelRoute` | 502 | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly) |
-| `ErrNoHealthyHost` | 502 | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
+| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3) |
+| `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
+| `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server that does not offer the model via a live mapping |
 | `ErrServerOverrideServerUnavailable` | 502 | a server-override request named a disabled/unreachable server and did not force through it |
+
+**`ErrNoModelRoute` and `ErrNoHealthyHost` used to be 502 as well.** Neither
+had a case in `completionHTTPStatus`, so both fell through to the 502 default
+alongside genuine upstream failures — which made a routing *refusal*
+indistinguishable from an upstream *outage*. Both were remapped in the same
+change that added `ErrModelNotCapable`, because a gate that refuses legibly on
+one branch and illegibly on another is not a legible gate. **The remap is
+global**: it applies to `/v1/chat/completions`, `/v1/responses`, `/v1/messages`
+and `/v1/images/generations`, their prefixed aliases and their streaming
+variants alike. It is the one externally visible behavior change, and a
+consumer that retries 502 but not 404 now sees the second where it used to see
+the first — the correct reading of both facts
+([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+[API Compatibility & Inference §13](compatibility-and-inference.md#13-errors)).
 
 ## 9. Configuration reference
 
