@@ -983,12 +983,24 @@ would have removed both to prevent nothing, since on the Responses side the same
 verdict is a veto and permits nothing. A first cut of this narrowing was
 name-keyed and did exactly that.
 
-What the refusal does cost is recorded rather than hidden: a manual
-`live_progress: "no"` was the translate path's only DURABLE opt-out against an
-upstream known to refuse the parameter pair, since both rejection paths write
-only an in-process memo. That cost now recurs per memo TTL and after every
-restart, with no remedy on `/v1/chat/completions` — accepted, because a silent
-permanent cross-endpoint veto is worse than a bounded self-healing round trip
+What the refusal costs is recorded rather than hidden, and it is **one
+configuration rather than a class**. A manual `"no"` only ever bought something
+where something else would otherwise SEND the parameters, and on the translate
+path that is `wantsLiveProgress`'s shape clause — `llama_cpp` and `vllm` only.
+Off that clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `custom`) the absence
+of a row already means "do not send", so the pin was redundant; vLLM tolerates
+both parameters, so it has nothing to refuse; and for a `llama_cpp` upstream that
+genuinely refuses them the `/props` detector writes `"unsupported"` **itself** at
+rank 1, off a `params` object lacking `timings_per_token` — the older-build case.
+
+The remainder is a `llama_cpp`-typed upstream that refuses the parameters and has
+**no probe path configured**, which is the portal's default. There the pin was
+the only durable way to stop paying one wasted round trip per mapping per memo
+TTL, since neither rejection path persists anything. That operator gains a better
+remedy than the one they lost: configuring the probe path lets the detector
+answer at rank 1 and, unlike a manual row, be re-derived when the build changes.
+Accepted on that basis — a silent permanent cross-endpoint veto is worse than a
+bounded, self-healing round trip on one configuration that has its own fix
 ([Telemetry, Usage & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 

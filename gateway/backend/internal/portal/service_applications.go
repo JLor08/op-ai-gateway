@@ -196,14 +196,35 @@ var (
 //     mapping form cannot clear it either, since that form submits "mtp" and
 //     "vision" only.
 //
-//     Its cost is recorded rather than hidden: on the TRANSLATE path a manual
-//     "no" was the only DURABLE way to stop the gateway paying one wasted round
-//     trip per mapping per memo TTL against an upstream known to refuse the
-//     parameter pair, because neither rejection path persists anything (both
-//     write only the in-process memo). Refusing the pair gives that up, and the
-//     trade is deliberate: a silent permanent veto on a control the operator
-//     explicitly switched ON is worse than a bounded, self-healing round trip
-//     that recurs every TTL.
+//     Its cost is recorded rather than hidden, and it is NARROW -- narrower
+//     than an earlier cut of this comment claimed. A manual "no" only ever
+//     bought anything where something else would otherwise have SENT the
+//     parameters, and on the translate path that is wantsLiveProgress's shape
+//     clause, which holds only llama_cpp and vllm. So:
+//
+//     For every kind off that clause -- llama_swap, litellm, tgi, ollama,
+//     custom -- the absence of a row ALREADY means "do not send", so a manual
+//     "no" was redundant. vLLM tolerates both parameters (its request models
+//     allow unknown fields and continuous_usage_stats is a first-class field),
+//     so it has nothing to refuse. And for a llama_cpp upstream that really
+//     does refuse them, the /props detector writes "unsupported" ITSELF at
+//     rank 1, off a document whose params object lacks timings_per_token --
+//     which is precisely the older-build case.
+//
+//     What is left is one row of that table: a llama_cpp-typed upstream that
+//     refuses the parameters and has NO probe path configured, which is the
+//     portal's default (CreateApplication takes ContextProbePath verbatim and
+//     app_health skips a probe when it is empty). There, and only there, a
+//     manual "no" was the single durable way to stop paying one wasted round
+//     trip per mapping per memo TTL -- neither rejection path persists
+//     anything, both write only the in-process memo. That operator now has a
+//     better remedy than the pin they lost: configuring the probe path lets the
+//     detector answer authoritatively at rank 1, and unlike a manual row it is
+//     re-derived when the build changes.
+//
+//     The trade is deliberate either way: a silent permanent veto on a control
+//     the operator explicitly switched ON is worse than a bounded,
+//     self-healing round trip on one configuration that has its own fix.
 //
 //   - CapabilityLiveProgress + CapabilityYes is deliberately ALLOWED, and an
 //     earlier cut of this rule refused it on a justification that was false.

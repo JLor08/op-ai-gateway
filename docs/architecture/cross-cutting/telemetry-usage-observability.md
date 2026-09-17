@@ -1554,17 +1554,31 @@ reservation existed would otherwise be permanently uncorrectable — the objecti
 and the reason [§11.1](../11-risks-and-technical-debt.md#111-operational-risks)
 can keep recording "a manual verdict has no way back" as closed.
 
-**What the refusal does cost, stated because nothing else records it.** On the
-TRANSLATE path a manual `live_progress: "no"` was the only DURABLE way to stop
-the gateway paying one wasted round trip per mapping per memo TTL against an
-upstream known to refuse the parameter pair: neither rejection path persists
-anything — `CompleteStream`'s retry and `proxyNative` both write only the
-in-process memo — so that cost now recurs every TTL and after every restart, with
-no operator remedy on `/v1/chat/completions`, which has no
-`responses_live_timings_enabled` switch of its own. The trade is deliberate: a
-silent, permanent, CROSS-ENDPOINT veto on a control the operator explicitly
-switched on is worse than a bounded, self-healing round trip. `/v1/responses`
-keeps its own remedy, the switch itself.
+**What the refusal costs, stated because nothing else records it — and it is one
+configuration, not a class.** A manual `"no"` only ever bought something where
+something else would otherwise SEND the parameters, and on the translate path
+that is `wantsLiveProgress`'s shape clause, which holds `llama_cpp` and `vllm`
+alone. Four of the five cases therefore lose nothing:
+
+| upstream | did a manual `"no"` buy anything? |
+|---|---|
+| off the shape clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `custom`) | **no** — no row already means "do not send" |
+| `vllm` | **no** — it tolerates both parameters, so it has nothing to refuse |
+| `llama_cpp` that refuses, **with** a probe path | **no** — the `/props` detector writes `"unsupported"` itself, at rank 1 |
+| `llama_cpp` that refuses, **without** a probe path (the portal default) | **yes** — the only durable opt-out |
+
+Only the last row pays. There a manual `"no"` was the single way to stop one
+wasted round trip per mapping per memo TTL, because neither rejection path
+persists anything — `CompleteStream`'s retry and `proxyNative` both write only the
+in-process memo — so the cost recurs every TTL and after every restart, and
+`/v1/chat/completions` has no `responses_live_timings_enabled` switch of its own
+to fall back on. What that operator gains instead is a **better** remedy than the
+pin: configuring the probe path lets the detector answer authoritatively at rank
+1, and unlike a manual row it is re-derived when the build changes. The trade is
+deliberate on that basis — a silent, permanent, CROSS-ENDPOINT veto on a control
+the operator explicitly switched on is worse than a bounded, self-healing round
+trip on one configuration that has its own fix. `/v1/responses` keeps the switch
+itself.
 
 `speculation_observed` is refused in both directions because it costs nothing:
 nothing routes, scores or filters on it, so no control is taken away.
