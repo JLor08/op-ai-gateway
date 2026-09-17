@@ -438,9 +438,15 @@ above it. The residual — an image request to an **all-chat group** answers 404
 from a typo'd model name — is recorded in
 [Risks & Technical Debt §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
-`ScoreModelServers` is a fourth caller of `ActiveMappingsForModel` and is
-**deliberately not gated**: it is the read-only portal ordering path, it routes
-nothing, and gating it would silently empty an operator's server list.
+**Two further callers of `ActiveMappingsForModel` are deliberately NOT gated**,
+and for the same reason: neither routes a request, so neither has a
+required-capability list to gate on. `ScoreModelServers`
+(`internal/routing/score_servers.go`) is the read-only portal ordering path —
+gating it would silently empty an operator's server list. The model warmer
+(`internal/gateway/model_warmer.go`) pre-loads a model by trying each coarse
+flavor in turn, which is flavor-agnostic by construction and endpoint-agnostic
+by definition. That makes five production callers in total: the three gated
+sites in the table above, plus these two.
 
 **Site 4 deviates from `resolveAffinity`'s own conventions in two ways, both
 deliberate.** That branch has no candidate filter at all — its mapping comes
@@ -688,7 +694,7 @@ of resolving a single mapping.
     **candidate**, not per member, so a member with one fast and one slow
     candidate can never be served on the slow one. An unmeasured candidate
     (0 tok/s) never satisfies a nonzero floor. When no candidate anywhere
-    reaches it, `error` surfaces `ErrNoHealthyHost` (502, §8); `ignore`
+    reaches it, `error` surfaces `ErrNoHealthyHost` (503, §8); `ignore`
     re-resolves the group without the floor.
 - **Evaluation order and relaxation.** `min_tokens_per_second` and
   `loaded_only` are both candidate-level filters inside `eligibleCandidates`

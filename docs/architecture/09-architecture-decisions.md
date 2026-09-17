@@ -66,9 +66,15 @@ capture is visible only to its owner (even admins are excluded).
 **Consequence:** OS-level swap/core-dump of RAM is explicitly out of scope.
 
 ## ADR-009 — No body-size cap on inference; 1 MiB on control-plane
-**Decision:** the four inference endpoints read the body with no size cap (large
+**Decision:** the inference endpoints read the body with no size cap (large
 base64/multimodal requests); control-plane endpoints keep a 1 MiB cap. Any reverse
-proxy must set `client_max_body_size 0` on the inference paths.
+proxy must set `client_max_body_size 0` on the inference paths. **Consequence:**
+the rule is per-endpoint-class, not a fixed list — there were four such
+endpoints when this was decided and there are five since
+`/v1/images/generations`, which reads an uncapped body for the same reason and
+was admitted under this decision rather than amending it
+([Compatibility & Inference
+§10](cross-cutting/compatibility-and-inference.md#10-request-bodies-and-size-limits)).
 
 ## ADR-010 — Streaming: idle watchdog + lifted deadlines, no total cap
 **Decision:** the inference endpoints lift the 30 s server read/write deadlines and
@@ -1231,7 +1237,18 @@ after that costs a map lookup.
 **No capability verdict influences model selection any more** — `scorer.go`
 names none, `live_progress` is the one verdict the candidate query still
 joins, and it decides what the gateway SENDS upstream rather than which
-upstream it picks.
+upstream it picks. **That headline no longer holds, and the part of it that
+changed is exactly one thing.** A capability verdict now *excludes* a
+candidate: `filterCapable` refuses a mapping that lacks a required capability
+([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)).
+What this entry said about *ranking* is still true and is what it was actually
+defending — `scorer.go` still names no capability, and `live_progress` is
+still the only verdict the candidate **query joins**, because the gate reads
+its verdicts through a separate bulk call rather than a second join, so the
+per-resolution cost this deletion bought is intact. The distinction to keep:
+scoring is capability-blind by design; **candidacy is not, any more**
+([Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
 **One discipline this deletion earned, for whoever deletes the next behaviour:
 sweep the user-visible prose, not only the code — and sweep every module and
 every test, not only the one the deletion lived in.** Removing the bonus took
@@ -1553,17 +1570,23 @@ sees the second where it used to see the first, which is the correct reading
 of both facts.
 
 **(d) `/v1/models` keeps advertising what the router refuses, and that is
-recorded rather than fixed here.** The model-offering path
-(`portal.ModelOfferingFor`) is called with the **coarse** flavor
-(`inference_handlers.go`, `routing.NormalizeAPIFlavor(shape.apiFlavor)`), so it
-cannot see a capability dimension at all: an images-only model is still listed
-to a chat client, and a chat model is still listed to an images client. Fixing
-it means teaching the offering path — and the unknown-model redirect that reads
-`Callable`, [Routing & Model Selection
-§2.2](cross-cutting/routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)
-— a dimension neither has, which is a separate unit of work. The gap is
-axis-independent (it is not about images) and is logged in
-[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+recorded rather than fixed here.** `handleOpenAIModels`
+(`internal/gateway/server.go`) calls
+`Portal.ModelsForFlavor(ctx, token, routing.APIFlavorOpenAI)` — the coarse
+flavor **hardcoded at the call site**, not derived from a request — and that
+resolves through `modelFlavorSetsWithPreSuppress` → `flavorSetsFromViews`
+(`internal/portal/service.go`), neither of which reads a capability row at all.
+So an images-only model is still listed to a chat client, and a chat model is
+still listed to an images client. **There are two consumers of this gap and
+they are different code paths**: the listing above, and the unknown-model
+redirect, which reads `ModelOffering.Callable` built by `ModelOfferingFor` —
+also called with a coarse flavor
+(`NormalizeAPIFlavor(shape.apiFlavor)`, `internal/gateway/inference_handlers.go`)
+and also capability-blind ([Routing & Model Selection
+§2.2](cross-cutting/routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)).
+Closing the gap means teaching **both** a dimension neither has, which is a
+separate unit of work. It is axis-independent (not about images) and is logged
+in [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 **(e) The GROUP path deliberately does NOT return this sentinel.** Inside
 `eligibleCandidates`, returning `ErrModelNotCapable` would abort the group

@@ -19,9 +19,9 @@ different trust boundary:
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
 token — see [§7](#7-request-authentication-decision-flow). Every other
 inference endpoint (`/v1/responses`, `/v1/messages`,
-`/v1/messages/count_tokens`, and the `/v0/models`, `/openai/v1/models`,
-`/anthropic/v1/models` model-listing endpoints) is **bearer-only**: no session
-cookie is accepted there at all.
+`/v1/messages/count_tokens`, `/v1/images/generations`, and the `/v0/models`,
+`/openai/v1/models`, `/anthropic/v1/models` model-listing endpoints) is
+**bearer-only**: no session cookie is accepted there at all.
 
 ## 2. Local password authentication
 
@@ -212,7 +212,7 @@ flowchart TD
     N -- "session + optional\nX-OP-Run-As-Token" --> O["AuthorizeRunAsToken\n(ownership + active + scope)"]
     N -- pass --> L
 
-    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
+    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\n/v1/images/generations,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
@@ -771,10 +771,10 @@ through `http.MaxBytesReader` capped at exactly 1 MiB
 body gets `413` before JSON decoding is even attempted.
 
 **Inference bodies are intentionally uncapped.** `/v1/chat/completions`,
-`/v1/responses`, `/v1/messages`, and `/v1/messages/count_tokens` read their
-body with no `MaxBytesReader` limit at all, matching the reality that a
-chat/completions request can legitimately carry large base64-encoded image
-data. The body is still fully buffered into memory — "uncapped" means no
+`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` and
+`/v1/images/generations` read their body with no `MaxBytesReader` limit at all,
+matching the reality that a chat/completions request can legitimately carry
+large base64-encoded image data. The body is still fully buffered into memory — "uncapped" means no
 *size* ceiling, not streamed processing.
 
 **Streaming idle watchdog.** A streamed inference response

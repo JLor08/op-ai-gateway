@@ -592,7 +592,7 @@ watchdog timer is reset on every event the provider emits, so an arbitrarily
 long but continuously-producing stream never times out. `http.ResponseController`
 (`SetReadDeadline`/`SetWriteDeadline`) is used for two distinct purposes:
 `liftInferenceDeadlines` clears the connection's default 30s read/write
-deadline entirely for the four inference endpoints at request start (an
+deadline entirely for all five inference endpoints at request start (an
 uncapped multimodal upload can take longer than 30s to arrive), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
