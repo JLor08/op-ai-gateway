@@ -531,6 +531,27 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(cellFor(row, 'billing_unit')).toHaveTextContent('\u2014');
         expect(cellFor(row, 'billing_quantity')).toHaveTextContent('\u2014');
       });
+
+      it('keys the quantity cell on the UNIT, so a measured zero reads as 0', () => {
+        // Both directions of the one column that IS the measure. Guarding on the
+        // VALUE instead would collapse them: a FAILED image request legitimately
+        // has quantity 0, and it must not read like a request tokens do not
+        // apply to. Every recordUsage error path passes a zero provider.Response,
+        // so this is the common case for a non-token row, not a corner one.
+        renderTable({
+          rows: [
+            makeRow({ id: 'req_tok', billing_unit: '', billing_quantity: 0 }),
+            makeRow({ id: 'req_img', billing_unit: 'image', billing_quantity: 0 }),
+          ],
+          columns: allColumns,
+        });
+
+        const tokenRow = screen.getAllByRole('row')[1];
+        const imageRow = screen.getAllByRole('row')[2];
+        expect(cellFor(tokenRow, 'billing_quantity')).toHaveTextContent('\u2014');
+        expect(cellFor(imageRow, 'billing_quantity')).toHaveTextContent('0');
+        expect(cellFor(imageRow, 'billing_quantity')).not.toHaveTextContent('\u2014');
+      });
     });
   });
 }

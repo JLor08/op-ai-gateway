@@ -647,8 +647,17 @@ token-metered *subset* and silently misleading about the rest, so the answer is
 a count rather than a different aggregate: `NonTokenRequests`
 (`non_token_requests` on the wire) on `usage.StatTotals` and
 `usage.GroupBucket`, plus `non_token_requests_24h` on
-`portal.DashboardMetrics`, from one extra
-`sum(case when billing_unit <> '' then 1 else 0 end)` in the same query. Two
+`portal.DashboardMetrics`. Only **one** of the three counts in SQL:
+`UsageGroups` adds a
+`sum(case when billing_unit <> '' then 1 else 0 end)` to its existing
+aggregate list (`store/sqlite_usage.go`). `StatTotals.NonTokenRequests` and
+`DashboardMetrics.NonTokenRequests24h` count **in Go** instead — the former over
+the `billing_unit` column the `Stats` query already fetches per row
+(`store/sqlite_usage.go`, mirrored in the in-memory `usage/recorder.go`), the
+latter over the events `Dashboard` walks anyway (`portal/service.go`). The
+semantics are identical in all three: every one tests against the empty
+sentinel, never against a list of known units, so a unit a future backend
+invents is classified the same way everywhere. Two
 things deliberately did **not** change, and both are load-bearing
 ([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)):
 the `GROUP BY` clause is untouched, because folding by `billing_unit` would

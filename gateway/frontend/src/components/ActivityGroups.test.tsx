@@ -608,9 +608,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         const noTokens = rowFor('No tokens');
         expect(within(noTokens).getAllByText('\u2014')).toHaveLength(4);
         expect(within(noTokens).queryByText('0')).not.toBeInTheDocument();
-        // The TOOLTIP, not just the dash: tokenAggregate already returns '—' in
-        // its text, so asserting the glyph alone passes even if the
-        // not-applicable branch is removed and the dash loses its explanation.
+        // The TOOLTIP, not just the dash: a bare em dash with no way to learn
+        // what it means is barely better than the wrong 0 it replaced, so the
+        // explanation is asserted separately from the glyph.
         fireEvent.mouseOver(within(noTokens).getAllByText('\u2014')[0]);
         expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
       });

@@ -1423,12 +1423,16 @@ history it does not understand. — **Widening `UsageGroups`' `GROUP BY` with
 `billing_unit`**, and **summing `billing_quantity` at group level.** Folding by
 unit would silently change every existing grouped row's identity, and a summed
 quantity across a mixed population is the dimensionless number this entry
-rejects. What ships instead is a *disclosure*: a
-`sum(case when billing_unit <> '' then 1 else 0 end)` aggregate —
+rejects. What ships instead is a *disclosure*: a count of the non-token rows —
 `NonTokenRequests` on `usage.StatTotals` and `usage.GroupBucket`,
 `non_token_requests` on the wire — so a consumer can tell that a token
 aggregate covers a subset, without the aggregate itself pretending otherwise
 ([§8.4.2](cross-cutting/telemetry-usage-observability.md#842-query-stats-groups-time-series)).
+Only `UsageGroups` expresses that count in SQL, as a
+`sum(case when billing_unit <> '' then 1 else 0 end)` aggregate; `StatTotals`
+and `portal.DashboardMetrics` count it in Go over rows they already walk. All
+three test against the empty sentinel rather than a list of known units, so the
+classification is identical — including for a unit a future backend invents.
 — **A second limiter dimension** keyed on `billing_unit`. #70 forbids it
 explicitly; the capability gap it leaves (a non-token request consumes
 `RequestQuota` and `CostBudget` but never `TokenQuota`) is recorded in

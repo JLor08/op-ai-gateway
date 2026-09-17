@@ -103,13 +103,19 @@ function chipWithHelp(
   // Translation, so a missing or misspelled key fails the build here instead of
   // silently rendering nothing.
   //
-  // DO NOT DELETE the guard below because the type looks non-optional. It is:
+  // The lookup CAN be undefined at runtime even though its type says otherwise:
   // tsconfig has `strict` but not `noUncheckedIndexedAccess`, so an index into a
-  // Record<string, ...> is typed as if it always hit. At runtime it does not --
-  // an unrecognised wire value (a newer backend's energy_source, any
-  // billing_unit outside the two known ones) yields undefined here, and this
-  // guard is the whole reason such a value renders with NO tooltip instead of an
-  // empty one. `billingUnit.test.ts` pins the undefined lookup.
+  // Record<string, ...> is typed as if it always hit. An unrecognised wire value
+  // (a newer backend's energy_source, any billing_unit outside the two known
+  // ones) yields undefined here. `billingUnit.test.ts` pins that lookup.
+  //
+  // The early return below is a SIMPLIFICATION, not a correctness guard: MUI's
+  // Tooltip already suppresses itself on a falsy `title`, so deleting it would
+  // render the same DOM -- it only avoids wrapping `body` in a Tooltip that
+  // would do nothing. What actually holds the "an unknown value gets NO tooltip"
+  // rule is the test: ActivityTable.test.tsx hovers an unrecognised
+  // energy_source and waits past MUI's enter delay before asserting the absence,
+  // so inventing a fallback tooltip here fails it.
   if (!helpKey) return body;
   return <Tooltip title={t[helpKey]}>{body}</Tooltip>;
 }
@@ -166,7 +172,13 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
     case 'billing_unit':
       return chipWithHelp(row.billing_unit ?? '', BILLING_UNIT_HELP_KEYS, t);
     case 'billing_quantity':
-      return row.billing_quantity ? row.billing_quantity : '—';
+      // Guarded on the UNIT, not on the value -- unlike the energy cells above,
+      // and deliberately so. This column IS the measure for a non-token row, so
+      // a quantity of 0 is a measurement (every FAILED image request has one)
+      // and must read as `0`; only a token-metered row, where the quantity does
+      // not apply at all, gets the em dash. Same rule as tokenCountCell, applied
+      // in the other direction.
+      return isTokenMetered(row) ? '—' : row.billing_quantity;
     case 'session':
       return row.session_id ? (
         <span title={row.session_id}>

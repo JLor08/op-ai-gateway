@@ -38,11 +38,13 @@ export function TokenAggregateValue({
   /** Number formatter for the applicable states; defaults to String. Pass e.g. toLocaleString to keep a surface's existing thousands separators. */
   format?: (value: number) => string;
 }>): ReactNode {
-  const agg = tokenAggregate(value, nonTokenRequests, totalRequests);
+  // tokenAggregate only CLASSIFIES; every cell string is produced here, so the
+  // not-applicable glyph and the `format`ted number cannot drift apart.
+  const agg = tokenAggregate(nonTokenRequests, totalRequests);
   if (!agg.applicable) {
     return (
       <Tooltip title={t.activityNotTokenMetered}>
-        <span>{agg.text}</span>
+        <span>—</span>
       </Tooltip>
     );
   }

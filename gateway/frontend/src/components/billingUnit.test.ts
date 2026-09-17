@@ -26,22 +26,22 @@ describe('isTokenMetered', () => {
 });
 
 describe('tokenAggregate', () => {
-  it('renders the number when the whole population is token-metered', () => {
-    expect(tokenAggregate(300, 0, 10)).toEqual({ text: '300', mixed: false, applicable: true });
+  it('is plainly applicable when the whole population is token-metered', () => {
+    expect(tokenAggregate(0, 10)).toEqual({ mixed: false, applicable: true });
   });
 
-  it('renders an em dash when none of the population is token-metered', () => {
-    expect(tokenAggregate(0, 10, 10)).toEqual({ text: '—', mixed: false, applicable: false });
+  it('is not applicable when none of the population is token-metered', () => {
+    expect(tokenAggregate(10, 10)).toEqual({ mixed: false, applicable: false });
   });
 
-  it('renders the number and flags mixed when the population is mixed', () => {
+  it('is applicable and flags mixed when the population is mixed', () => {
     // The sum is arithmetically correct for the token-metered subset; the flag is
     // what lets the caller say so instead of implying it covers everything.
-    expect(tokenAggregate(300, 4, 10)).toEqual({ text: '300', mixed: true, applicable: true });
+    expect(tokenAggregate(4, 10)).toEqual({ mixed: true, applicable: true });
   });
 
-  it('renders the number for an empty population rather than an em dash', () => {
-    expect(tokenAggregate(0, 0, 0)).toEqual({ text: '0', mixed: false, applicable: true });
+  it('is applicable for an empty population rather than not-applicable', () => {
+    expect(tokenAggregate(0, 0)).toEqual({ mixed: false, applicable: true });
   });
 });
 

@@ -17,9 +17,13 @@ export function isTokenMetered(row: { billing_unit?: string }): boolean {
   return !row.billing_unit;
 }
 
+// A CLASSIFICATION of the population, not rendered text. It carries no cell
+// string on purpose: the not-applicable state's glyph and the two applicable
+// states' number belong to the renderer, which is the only place that knows the
+// surface's number format (TokenAggregateValue takes a `format`, and ProjectsView
+// passes toLocaleString). A formatter-free `String(value)` in here would be a
+// ready-looking field that silently drops a surface's thousands separators.
 export type TokenAggregate = {
-  /** Ready-to-render cell text. */
-  text: string;
   /** True when the population mixes token-metered and non-token rows: the number is correct for the token-metered SUBSET only. */
   mixed: boolean;
   /** False when tokens do not apply to any row in the population. */
@@ -33,18 +37,17 @@ export type TokenAggregate = {
  * project-token rollups (rows and total) -- so all four agree. TokenAggregateValue
  * renders the result, including the tooltip each exceptional state needs.
  *
- * An empty population (totalRequests === 0) renders the number, not a dash:
- * "no rows at all" is not "tokens do not apply here".
+ * An empty population (totalRequests === 0) is APPLICABLE -- the number, not a
+ * dash: "no rows at all" is not "tokens do not apply here".
+ *
+ * It takes only the two counts, because the classification does not depend on
+ * the aggregate's own value; the caller renders that value itself.
  */
-export function tokenAggregate(
-  value: number,
-  nonTokenRequests: number,
-  totalRequests: number,
-): TokenAggregate {
+export function tokenAggregate(nonTokenRequests: number, totalRequests: number): TokenAggregate {
   if (totalRequests > 0 && nonTokenRequests >= totalRequests) {
-    return { text: '—', mixed: false, applicable: false };
+    return { mixed: false, applicable: false };
   }
-  return { text: String(value), mixed: nonTokenRequests > 0, applicable: true };
+  return { mixed: nonTokenRequests > 0, applicable: true };
 }
 
 /**
