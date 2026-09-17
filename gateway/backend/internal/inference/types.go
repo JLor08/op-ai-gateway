@@ -173,7 +173,19 @@ func (e *Error) Error() string {
 type Request struct {
 	ID        string `json:"id,omitempty"`
 	APIFlavor string `json:"api_flavor"`
-	Model     string `json:"model"`
+	// RequiredCapabilities are capability names a candidate mapping MUST carry a
+	// "yes" verdict for, or it is not a routing candidate at all. Nil for chat,
+	// responses and messages -- which is what keeps this a no-op on every
+	// existing path -- and set by an endpoint handler from its own identity,
+	// never from the request body.
+	//
+	// This is the axis the capability gate keys on, deliberately instead of a new
+	// fine API flavor: NormalizeAPIFlavor folds any openai* flavor to the coarse
+	// "openai", so a flavor cannot refuse anything, while this list needs no
+	// store change at all (routing.Store already has
+	// MappingCapabilitiesForMappings). See ADR-042.
+	RequiredCapabilities []string `json:"-"`
+	Model                string   `json:"model"`
 	// RequestedModel is the model name exactly as the client sent it, before
 	// any token model override rewrote Model. Recorded on the usage event so
 	// the activity list can show the pre-override name (issue #7).

@@ -1107,6 +1107,18 @@ const (
 	CapabilityMTP                 = "mtp"
 	CapabilityLiveProgress        = "live_progress"
 	CapabilitySpeculationObserved = "speculation_observed"
+
+	// CapabilityImage means the model GENERATES images. It is orthogonal to
+	// CapabilityVision, which means the model ACCEPTS them, and the two can
+	// co-occur. Never map one onto the other: advertising a generator as a
+	// consumer fails far from its cause.
+	//
+	// The string is "image" rather than "image_generation" because that is what
+	// already has live data -- cmd/gateway/app_health.go writes it verbatim as a
+	// yes-row for every Extra name, migration 78 backfilled it, and the agent's
+	// probe already pins it to generation. It also equals usage.BillingUnitImage,
+	// so the capability and #70's billable unit speak one vocabulary.
+	CapabilityImage = "image"
 )
 
 // Capability verdicts.

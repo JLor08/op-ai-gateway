@@ -325,6 +325,13 @@ type resolverStore interface {
 	// (unwritten, pre-migration-78) column for the life of the pin -- up to
 	// AffinityTTLSeconds.
 	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
+	// MappingCapabilitiesForMappings is filterCapable's bulk read -- one query
+	// for the whole candidate list rather than one per candidate. It is already
+	// implemented on every driver (chunked in SQLite, mirrored in MemoryStore,
+	// wrapped in the generated tracing decorator) and already carries an N+1
+	// guard test in internal/portal, so adding it here costs nothing but this
+	// line.
+	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
 }
 
 type Resolver struct {
@@ -499,6 +506,10 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		return Target{}, err
 	}
 	candidates = filterServesEndpoint(candidates, req.APIFlavor)
+	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
+	if err != nil {
+		return Target{}, err
+	}
 	if len(candidates) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
@@ -599,6 +610,10 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 		}
 	}
 	mine = filterServesEndpoint(mine, req.APIFlavor)
+	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities)
+	if err != nil {
+		return Target{}, err
+	}
 	if len(mine) == 0 {
 		return Target{}, ErrServerOverrideModelUnavailable
 	}
@@ -652,6 +667,58 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 		}
 	}
 	return out, nil
+}
+
+// filterCapable drops every candidate whose mapping does not carry a "yes"
+// verdict for each of the required capabilities. It is this gateway's FIRST
+// filter that genuinely excludes a model for lacking a capability -- the scorer
+// ranks, wantsLiveProgress annotates and the models-list fold advertises, but
+// none of them refuses.
+//
+// An ABSENT row means unknown, not no, and this filter treats unknown as a
+// refusal. That direction is chosen on evidence rather than taste: Extra-sourced
+// rows are written yes-only (cmd/gateway/app_health.go) and the Ollama detector
+// can structurally never emit "no", so treating unknown as permission would
+// refuse nothing in a real fleet -- reproducing the exact defect the gate exists
+// to fix. See ADR-042 for the cost this accepts on day one.
+//
+// A store error REFUSES rather than failing open, for the same reason.
+func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
+	if len(required) == 0 || len(cands) == 0 {
+		return cands, nil
+	}
+	ids := make([]string, 0, len(cands))
+	seen := map[string]bool{}
+	for _, c := range cands {
+		if !seen[c.Mapping.ID] {
+			seen[c.Mapping.ID] = true
+			ids = append(ids, c.Mapping.ID)
+		}
+	}
+	caps, err := r.store.MappingCapabilitiesForMappings(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("capability gate: %w", err)
+	}
+	out := cands[:0:0]
+	for _, c := range cands {
+		if capabilityRowsSatisfy(caps[c.Mapping.ID], required) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// capabilityRowsSatisfy reports whether rows carry a "yes" verdict for every
+// required capability. Shared by filterCapable and resolveAffinity's own gate,
+// which reads its rows from a different place.
+func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
+	byName := CapabilityRowsByName(rows)
+	for _, name := range required {
+		if byName[name].Verdict != CapabilityYes {
+			return false
+		}
+	}
+	return true
 }
 
 // filterServesEndpoint drops candidates whose application does not serve the
@@ -1218,7 +1285,7 @@ const modeClimbUp = "climb_up"
 // The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
 // no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
 // before those settings existed.
-func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
 	cands, err = r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve member mappings: %w", err)
@@ -1228,6 +1295,14 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 		return nil, false, err
 	}
 	cands = filterServesEndpoint(cands, fineFlavor)
+	// Gated BEFORE live is taken: a member whose only live mappings are all
+	// capability-gated must read as memberNoMapping (unknown model), the same
+	// no-leak posture the provisioning gate above already uses, not as
+	// memberUnavailable (a gated-but-real member).
+	cands, err = r.filterCapable(ctx, cands, required)
+	if err != nil {
+		return nil, false, err
+	}
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
@@ -1292,7 +1367,7 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
 func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, policy)
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, policy)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
@@ -1330,14 +1405,14 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
 // priority-ordered walk stops at the first available member. That is the price of the
 // ordering, and only groups that opt into it pay it.
-func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, policy GroupPolicy) ([]GroupMember, error) {
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
 		}
 		best := 0.0
-		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, policy)
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -1565,7 +1640,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.policy)
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
