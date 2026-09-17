@@ -109,11 +109,15 @@ const liveTimingsRefusalMsg = "live timings"
 // FIELD (TestPassthroughNativeDebugLineRecordsTheInjection: "a field emitted only
 // when true is indistinguishable, to an operator grepping a log, from a build
 // that never had the field"). This is the same rule for the line.
+// It reports with Errorf rather than Fatalf on purpose: one of its three callers
+// runs inside a loop over six statuses beside an Errorf of its own, and aborting
+// there would hide which of the remaining statuses also warn -- exactly the
+// information a reader of the failure needs.
 func assertNoLiveTimingsRefusalWarning(t *testing.T, buf *logbuffer.Buffer, why string) {
 	t.Helper()
 	recs := buf.Snapshot()
 	if findLogRecord(recs, "WARN", liveTimingsRefusalMsg) {
-		t.Fatalf("a live-timings refusal WARN was emitted although %s; records = %+v", why, recs)
+		t.Errorf("a live-timings refusal WARN was emitted although %s; records = %+v", why, recs)
 	}
 }
 
