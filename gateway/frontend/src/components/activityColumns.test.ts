@@ -102,7 +102,13 @@ describe('activityColumns catalogue', () => {
     expect(costEur).toBeDefined();
     expect(costEur!.numeric).toBe(true);
     expect(costEur!.labelKey).toBe('activityColCostEur');
-    expect(DEFAULT_HIDDEN_COLUMNS).toHaveLength(19);
+    expect(DEFAULT_HIDDEN_COLUMNS).toContain('billing_unit');
+    expect(DEFAULT_HIDDEN_COLUMNS).toContain('billing_quantity');
+    // The billing pair is grouped immediately after the cost column, the way
+    // cost_eur is grouped after energy_source.
+    expect(ids.indexOf('billing_unit')).toBe(ids.indexOf('cost_eur') + 1);
+    expect(ids.indexOf('billing_quantity')).toBe(ids.indexOf('billing_unit') + 1);
+    expect(DEFAULT_HIDDEN_COLUMNS).toHaveLength(21);
   });
 
   it('includes the scope-gated owner column as a normal catalogue entry', () => {

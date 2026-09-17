@@ -32,6 +32,12 @@ import { usageChipStatus } from './shared/status';
 import { ColumnFilter } from './shared/ColumnFilter';
 import { useColumnDrag, columnDragSx, type DragPlace } from './shared/columnDrag';
 import type { ColumnDef, ColumnId } from './activityColumns';
+import {
+  BILLING_UNIT_HELP_KEYS,
+  ENERGY_SOURCE_HELP_KEYS,
+  isTokenMetered,
+  type HelpMessageKey,
+} from './billingUnit';
 
 const LIMIT_OPTIONS = [25, 50, 100];
 
@@ -64,7 +70,43 @@ const TEXT_FILTER_COLUMNS = new Set<ColumnId>([
   'service_name',
 ]);
 
-function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
+// A token count on a row that is not token-metered is NOT APPLICABLE, not zero.
+// The em dash carries a tooltip, so the reason is one hover away rather than a
+// mystery.
+//
+// renderCell and these two helpers are module-level and therefore do NOT close
+// over the component's `t`; it is threaded through as an explicit parameter
+// instead. A module-level mutable would be the alternative, and it would make
+// the rendered language depend on call order.
+function tokenCountCell(row: UsageEvent, value: number, t: Translation): ReactNode {
+  if (isTokenMetered(row)) return value;
+  return (
+    <Tooltip title={t.activityNotTokenMetered}>
+      <span>—</span>
+    </Tooltip>
+  );
+}
+
+// An opaque wire enum, rendered as a chip with its RAW value plus an explanatory
+// tooltip. The raw label is the portal's forward-compatibility convention: an
+// unrecognised value from a newer backend must show as itself rather than as a
+// misleading label -- and it gets NO tooltip, because a wrong explanation is
+// worse than none.
+function chipWithHelp(
+  value: string,
+  helpKeys: Record<string, HelpMessageKey>,
+  t: Translation,
+): ReactNode {
+  const body = value ? <Chip size="small" variant="outlined" label={value} /> : <span>—</span>;
+  const helpKey = helpKeys[value];
+  // No cast on this lookup: HelpMessageKey is derived from the keys of
+  // Translation, so a missing or misspelled key fails the build here instead of
+  // silently rendering nothing.
+  if (!helpKey) return body;
+  return <Tooltip title={t[helpKey]}>{body}</Tooltip>;
+}
+
+function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
   switch (id) {
     case 'created_at':
       return new Date(row.created_at).toLocaleString();
@@ -82,13 +124,13 @@ function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
         />
       );
     case 'total_tokens':
-      return row.total_tokens;
+      return tokenCountCell(row, row.total_tokens, t);
     case 'latency_ms':
       return `${row.latency_ms} ms`;
     case 'input_tokens':
-      return row.input_tokens;
+      return tokenCountCell(row, row.input_tokens, t);
     case 'output_tokens':
-      return row.output_tokens;
+      return tokenCountCell(row, row.output_tokens, t);
     case 'prompt_per_second':
       return formatMetric(row.prompt_per_second, 1);
     case 'tokens_per_second':
@@ -100,9 +142,9 @@ function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
     case 'provider_path':
       return row.provider_path;
     case 'cached_tokens':
-      return row.cached_tokens;
+      return tokenCountCell(row, row.cached_tokens, t);
     case 'cache_write_tokens':
-      return row.cache_write_tokens;
+      return tokenCountCell(row, row.cache_write_tokens, t);
     case 'stream':
       return row.stream ? '✓' : '–';
     case 'provider_model':
@@ -112,11 +154,11 @@ function renderCell(row: UsageEvent, id: ColumnId): ReactNode {
     case 'energy_marginal_wh':
       return row.energy_marginal_wh ? row.energy_marginal_wh.toFixed(3) : '—';
     case 'energy_source':
-      return row.energy_source ? (
-        <Chip size="small" variant="outlined" label={row.energy_source} />
-      ) : (
-        '—'
-      );
+      return chipWithHelp(row.energy_source ?? '', ENERGY_SOURCE_HELP_KEYS, t);
+    case 'billing_unit':
+      return chipWithHelp(row.billing_unit ?? '', BILLING_UNIT_HELP_KEYS, t);
+    case 'billing_quantity':
+      return row.billing_quantity ? row.billing_quantity : '—';
     case 'session':
       return row.session_id ? (
         <span title={row.session_id}>
@@ -247,7 +289,7 @@ export function ActivityTable({
       case 'cost_eur':
         return formatCost(row.cost_eur, costUnit, currencyFactor);
       default:
-        return renderCell(row, col.id);
+        return renderCell(row, col.id, t);
     }
   }
 

@@ -9,6 +9,7 @@ import { StatusChip } from './shared/StatusChip';
 import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
 import { StatTile } from './shared/StatTile';
+import { tokenAggregate } from './billingUnit';
 
 type Metric = {
   labelKey: MessageKey;
@@ -39,8 +40,15 @@ export function Dashboard({
           detailKey: 'requests24hDetail',
         },
         {
+          // The same three-state rule the Activity tiles use (#70): a 24h window
+          // whose requests are ALL non-token-metered has no token figure at all,
+          // and rendering "0" there would assert a measured zero.
           labelKey: 'tokens24h',
-          value: String(dashboard.metrics.tokens_24h),
+          value: tokenAggregate(
+            dashboard.metrics.tokens_24h,
+            dashboard.metrics.non_token_requests_24h ?? 0,
+            dashboard.metrics.requests_24h,
+          ).text,
           detailKey: 'tokens24hDetail',
         },
         {

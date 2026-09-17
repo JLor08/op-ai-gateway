@@ -14,6 +14,7 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import KeyboardArrowDown from '@mui/icons-material/KeyboardArrowDown';
@@ -22,6 +23,7 @@ import { type ActivityQuery, type UsageEvent, type UsageGroupRow } from '../api'
 import type { PortalApi, Translation } from './shared/types';
 import { formatCost, type CurrencyUnit } from '../currency';
 import { formatEnergyWh } from './StatTiles';
+import { isTokenMetered, tokenAggregate } from './billingUnit';
 import { SettingsMenu } from './SettingsMenu';
 import { useColumnSettings } from './shared/useColumnSettings';
 import { dimLabel } from './GroupByChainBuilder';
@@ -37,6 +39,7 @@ const MEMBER_LIMIT = 25;
 type GroupColId =
   | 'count'
   | 'error_count'
+  | 'non_token_requests'
   | 'input_tokens'
   | 'output_tokens'
   | 'total_tokens'
@@ -56,6 +59,16 @@ type GroupColDef = {
 const GROUP_COLUMNS: GroupColDef[] = [
   { id: 'count', labelKey: 'activityGroupCount', align: 'right', defaultVisible: true },
   { id: 'error_count', labelKey: 'activityErrorCount', align: 'right', defaultVisible: true },
+  // How many of the group's requests are NOT token-metered (#70). Hidden by
+  // default -- it is the denominator behind the token cells' three states, not a
+  // metric operators asked for; switching it on is how they see the excluded
+  // count as a column instead of only in a tooltip.
+  {
+    id: 'non_token_requests',
+    labelKey: 'activityColBillingUnit',
+    align: 'right',
+    defaultVisible: false,
+  },
   // Token block order (per request): Tokens, Prompt, Cached, Cache-Write (hidden), Generiert.
   { id: 'total_tokens', labelKey: 'tableTokens', align: 'right', defaultVisible: true },
   { id: 'input_tokens', labelKey: 'activityColInput', align: 'right', defaultVisible: true },
@@ -212,23 +225,49 @@ export function ActivityGroups({
     return row.key_label || row.key;
   }
 
+  // '' already means "token-metered" on the wire, so a GROUP needs a third state
+  // the unit field cannot carry. non_token_requests supplies it as a count:
+  // none, all, or some -- and in the "some" case the sum is genuinely correct
+  // for the token-metered subset, so it is shown WITH a marker rather than
+  // suppressed.
+  function groupTokenCell(row: UsageGroupRow, value: number): ReactNode {
+    const agg = tokenAggregate(value, row.non_token_requests, row.count);
+    if (!agg.applicable) {
+      return (
+        <Tooltip title={t.activityNotTokenMetered}>
+          <span>—</span>
+        </Tooltip>
+      );
+    }
+    if (agg.mixed) {
+      return (
+        <Tooltip title={t.activityMixedUnitsHint(row.non_token_requests)}>
+          <span>{agg.text}*</span>
+        </Tooltip>
+      );
+    }
+    return agg.text;
+  }
+
   // Rendered content of a configurable metric cell for a group row.
-  function cellValue(id: GroupColId, row: UsageGroupRow): string | number {
+  function cellValue(id: GroupColId, row: UsageGroupRow): ReactNode {
     switch (id) {
       case 'count':
         return row.count;
       case 'error_count':
         return row.error_count;
+      case 'non_token_requests':
+        return row.non_token_requests;
       case 'input_tokens':
-        return row.input_tokens;
+        return groupTokenCell(row, row.input_tokens);
       case 'output_tokens':
-        return row.output_tokens;
+        return groupTokenCell(row, row.output_tokens);
       case 'total_tokens':
-        return row.total_tokens;
+        return groupTokenCell(row, row.total_tokens);
       case 'cached_tokens':
-        return row.cached_tokens;
+        return groupTokenCell(row, row.cached_tokens);
       case 'cache_write_tokens':
-        return row.cache_write_tokens;
+        return groupTokenCell(row, row.cache_write_tokens);
       case 'energy_wh':
         return formatEnergyWh(row.energy_wh);
       case 'cost_eur':
@@ -376,7 +415,15 @@ export function ActivityGroups({
               <TableRow key={m.id}>
                 <TableCell>{m.model}</TableCell>
                 <TableCell>{m.server_name || '-'}</TableCell>
-                <TableCell align="right">{m.total_tokens}</TableCell>
+                <TableCell align="right">
+                  {isTokenMetered(m) ? (
+                    m.total_tokens
+                  ) : (
+                    <Tooltip title={t.activityNotTokenMetered}>
+                      <span>—</span>
+                    </Tooltip>
+                  )}
+                </TableCell>
                 <TableCell align="right">
                   {m.http_status || (m.status === 'error' ? t.no : t.yes)}
                 </TableCell>

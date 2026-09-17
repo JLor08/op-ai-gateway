@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActivityGroups } from './ActivityGroups';
 import { formatEnergyWh } from './StatTiles';
@@ -22,6 +22,7 @@ function makeGroup(overrides: Partial<UsageGroupRow> = {}): UsageGroupRow {
     key_label: 'GPU A',
     count: 12,
     error_count: 1,
+    non_token_requests: 0,
     input_tokens: 100,
     output_tokens: 200,
     total_tokens: 300,
@@ -555,6 +556,75 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // Exactly one column-settings trigger (top level); the nested server
       // sub-table (showSettings=false) must add none.
       expect(screen.getAllByRole('button', { name: t.listColumns })).toHaveLength(1);
+    });
+
+    describe('billable unit (#70): the three-state rule for a group', () => {
+      it('marks a mixed-unit group and dashes an all-non-token group', async () => {
+        const usageGroups = vi.fn(async () => ({
+          data: [
+            makeGroup({
+              key: 'all-tokens',
+              key_label: 'All tokens',
+              count: 10,
+              non_token_requests: 0,
+              total_tokens: 300,
+            }),
+            makeGroup({
+              key: 'mixed',
+              key_label: 'Mixed',
+              count: 10,
+              non_token_requests: 4,
+              total_tokens: 300,
+            }),
+            makeGroup({
+              key: 'no-tokens',
+              key_label: 'No tokens',
+              count: 10,
+              non_token_requests: 10,
+              total_tokens: 0,
+              input_tokens: 0,
+              output_tokens: 0,
+            }),
+          ],
+          group_by: 'server',
+        }));
+        renderGroups({ usageGroups });
+
+        await screen.findByText('All tokens');
+        const rowFor = (label: string) => screen.getByText(label).closest('tr') as HTMLElement;
+
+        // Entirely token-metered: a plain number.
+        expect(within(rowFor('All tokens')).getByText('300')).toBeInTheDocument();
+
+        // Mixed: the sum is CORRECT for the token-metered subset, so it is shown
+        // with a marker rather than suppressed, and the tooltip names what it excludes.
+        expect(within(rowFor('Mixed')).getByText('300*')).toBeInTheDocument();
+        fireEvent.mouseOver(within(rowFor('Mixed')).getByText('300*'));
+        expect(await screen.findByText(t.activityMixedUnitsHint(4))).toBeInTheDocument();
+
+        // Entirely non-token: tokens do not apply. All four default-visible token
+        // columns (Tokens, Prompt, Cached, Generiert) dash, and -- the whole point
+        // -- not one of them prints a 0.
+        const noTokens = rowFor('No tokens');
+        expect(within(noTokens).getAllByText('\u2014')).toHaveLength(4);
+        expect(within(noTokens).queryByText('0')).not.toBeInTheDocument();
+      });
+
+      it("dashes the expanded member table's Tokens cell for a non-token member", async () => {
+        const activity = vi.fn(async () =>
+          makePage([makeMember({ id: 'm_img', billing_unit: 'image', total_tokens: 0 })]),
+        );
+        const api = renderGroups({ activity }, ['server']);
+
+        fireEvent.click(await screen.findByText('GPU A'));
+        await waitFor(() => expect(api.activity).toHaveBeenCalled());
+
+        // The member table's Tokens cell is a raw UsageEvent value, so it needs
+        // the same guard as the row table's five token cells.
+        const memberRow = (await screen.findByText('qwen-coder')).closest('tr') as HTMLElement;
+        expect(within(memberRow).getByText('\u2014')).toBeInTheDocument();
+        expect(within(memberRow).queryByText('0')).not.toBeInTheDocument();
+      });
     });
   });
 }

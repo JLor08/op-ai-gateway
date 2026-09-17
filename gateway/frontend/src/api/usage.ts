@@ -55,6 +55,13 @@ export type UsageEvent = {
   energy_wh?: number;
   energy_marginal_wh?: number;
   energy_source?: string;
+  // The non-token billable measure, an XOR with the token fields: billing_unit
+  // "" (or absent) means TOKEN-METERED and the token fields are the measure;
+  // any other value means billing_quantity is the measure and every token field
+  // is 0 because tokens do not APPLY -- which is why those cells render an em
+  // dash rather than a number. No producer writes a unit yet.
+  billing_unit?: string;
+  billing_quantity?: number;
   // Additive P3 T1 field: a TRANSIENT, portal-computed display value — (energy_wh
   // / 1000) * the serving server's price_per_kwh (falling back to the system
   // default). Never a DB column; a store-returned event never carries it until the
@@ -114,6 +121,10 @@ export type UsageGroupRow = {
   key_label: string;
   count: number;
   error_count: number;
+  // How many of `count` are not token-metered. 0 = all token-metered,
+  // == count = none, in between = a mixed population whose token sums are
+  // correct for the token-metered subset only.
+  non_token_requests: number;
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
@@ -226,6 +237,13 @@ export type Histogram = {
 
 export type StatTotals = {
   total_requests: number;
+  // How many of `total_requests` are NOT token-metered (non-empty billing_unit).
+  // It is what lets a tile tell a not-applicable from a measured zero: 0 = the
+  // whole population is token-metered, == total_requests = none of it is, in
+  // between = mixed, where the token sums are correct for the token-metered
+  // SUBSET only. Optional like the sibling additive aggregates below (an older
+  // response omits it); treat as 0 when absent.
+  non_token_requests?: number;
   error_count: number;
   cached_tokens: number;
   cache_write_tokens: number;
@@ -249,6 +267,10 @@ export type DashboardResponse = {
   metrics: {
     requests_24h: number;
     tokens_24h: number;
+    // How many of `requests_24h` are NOT token-metered. Note the `_24h` suffix:
+    // the dashboard payload names this field differently from the group/stat
+    // surfaces. Optional (an older response omits it); treat as 0 when absent.
+    non_token_requests_24h?: number;
     healthy_hosts: string;
     latency_p95_ms: number;
   };
