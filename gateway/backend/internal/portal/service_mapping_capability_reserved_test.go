@@ -30,13 +30,15 @@ import (
 // `live_progress: "yes"` is a different matter and stays ALLOWED, which is why
 // the rule is keyed on the PAIR: internal/provider's wantsLiveProgress decides
 // on this verdict in BOTH directions ("supported" returns true ahead of its
-// shape clause, which covers only llama_cpp and vllm), and no probe writes this
-// row for llama_swap, litellm, tgi or custom -- so a manual "yes" is the only
-// mechanism that ever existed for opting such an upstream into an exact
-// mid-stream token count on /v1/chat/completions. Refusing it would have removed
-// a real capability to prevent nothing: on the Responses side condition 5 is a
-// veto, so a positive verdict permits nothing the veto has not already allowed.
-// TestManualLiveProgressYesStaysAllowed below is that half.
+// shape clause, which covers only llama_cpp and vllm). The /props detectors are
+// document-keyed rather than type-keyed, so for a tolerant upstream that serves
+// no such document -- or any mapping with no probe path -- a manual "yes" is the
+// only opt-in that ever existed; and where a probe does answer, manual is rank 3
+// against its rank 1, so "yes" is also the operator's override of a detector
+// they distrust. Refusing it would have removed both to prevent nothing: on the
+// Responses side condition 5 is a veto, so a positive verdict permits nothing
+// the veto has not already allowed. TestManualLiveProgressYesStaysAllowed below
+// is that half.
 //
 // speculation_observed is reserved in BOTH directions because it costs nothing:
 // its only writer is the gateway's own observation of relayed traffic, at rank 1

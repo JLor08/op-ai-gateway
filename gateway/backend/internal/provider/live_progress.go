@@ -77,9 +77,14 @@ var liveProgressUpstreams = map[string]struct{}{
 // ordered by the quality of their evidence -- observation beats prediction,
 // prediction beats guessing, guessing beats silence:
 //
-//  1. target.LiveProgressSupport == "unsupported": always no. This is either an
-//     OBSERVED upstream rejection (CompleteStream's retry, on a 400/422) or a
-//     verdict copied from one -- no shape guess outranks it.
+//  1. target.LiveProgressSupport == "unsupported": always no. Its only
+//     producers are the two /props detectors, off a document whose
+//     `default_generation_settings.params` exists but offers no
+//     `timings_per_token` -- a real verdict about a real, older build -- and an
+//     operator's own `"no"` row. No shape guess outranks either. A
+//     retry-confirmed rejection is NOT among them: nothing persists one into the
+//     capability row, it is remembered only in the memo below, which is exactly
+//     why this layer does not expire and the memo does.
 //  2. target.LiveProgressSupport == "supported": always yes, for the same
 //     reason -- the verdict overrides the shape in either direction.
 //  3. target.LiveProgressSupport == "" (never determined): falls back to

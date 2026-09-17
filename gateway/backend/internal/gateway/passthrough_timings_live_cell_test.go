@@ -138,8 +138,19 @@ func TestTranslateModeApplicationWithTheOptInInjectsNothing(t *testing.T) {
 	// positive and the /v1/messages negative. The spec's own mode is what
 	// targetFrom reads for a server_agent application, so switching it there
 	// reaches the same decision.
+	//
+	// The control below is derived from THIS spec value, differing only in the
+	// mode, so the two halves cannot disagree about anything else by
+	// construction. Two weaker shapes were tried and both left the control
+	// vacuous for the mutation unique to this test -- an edit that disables the
+	// opt-in on the translate side alone: a second constructor call reads an
+	// untouched seed, and so does a second copy of a shared base, because the
+	// edit lands after the copy. Copying the translate spec itself is the only
+	// form where "opted in" cannot differ between the halves.
+	translateSpec := *serverAgentSpecOptedIn().spec
+	translateSpec.ResponsesMode = routing.EndpointModeTranslate
 	seed := serverAgentSpecOptedIn()
-	seed.spec.ResponsesMode = routing.EndpointModeTranslate
+	seed.spec = &translateSpec
 
 	prov := &recordingProxyProvider{respBody: terminalOnlyResponsesStream}
 	srv := newLiveTimingsTestServer(t, prov, seed)
@@ -167,12 +178,15 @@ func TestTranslateModeApplicationWithTheOptInInjectsNothing(t *testing.T) {
 	// `spec.ResponsesLiveTimingsEnabled = false` would leave this test green
 	// while it silently stopped testing the mode at all.
 	//
-	// Instead the same seed runs again with the ONE field under test flipped
-	// back. If the seed is genuinely opted in, that run injects; if it is not,
-	// this control fails and says so. So the zero injections above are
-	// attributable to the MODE and to nothing else.
+	// Instead the spec the first half actually used runs again with the ONE
+	// field under test flipped back. If it is genuinely opted in, this run
+	// injects; if it is not, the control fails and says so. So the zero
+	// injections above are attributable to the MODE and to nothing else: the two
+	// specs are the same value apart from ResponsesMode.
+	passthroughSpec := translateSpec
+	passthroughSpec.ResponsesMode = routing.EndpointModePassthrough
 	control := serverAgentSpecOptedIn()
-	control.spec.ResponsesMode = routing.EndpointModePassthrough
+	control.spec = &passthroughSpec
 	controlProv := &recordingProxyProvider{respBody: terminalOnlyResponsesStream}
 	controlSrv := newLiveTimingsTestServer(t, controlProv, control)
 

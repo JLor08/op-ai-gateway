@@ -969,12 +969,19 @@ control on the mapping form, whose rank-3 permanence is precisely how that
 control works. And `live_progress: "yes"` stays accepted, because this row has
 two consumers with OPPOSITE semantics — `internal/provider`'s `wantsLiveProgress`
 returns true on `"supported"` *ahead of* its shape clause, which covers only
-`llama_cpp` and `vllm`, and no probe writes this row for `llama_swap`,
-`litellm`, `tgi` or `custom`. A manual `"yes"` is therefore the only opt-in
-those kinds ever had for an exact mid-stream count on `/v1/chat/completions`,
-and refusing it would have removed a real capability to prevent nothing (on the
-Responses side the same verdict is a veto, so a positive value permits nothing).
-A first cut of this narrowing was name-keyed and did exactly that.
+`llama_cpp` and `vllm`. The probes are DOCUMENT-keyed rather than type-keyed, so
+they do establish this row for anything answering the configured probe path with
+a llama.cpp `/props` document — a `server_agent` child resolved as `custom` but
+running llama-server included, which `collector.LiveProgressProbePath` names as
+the case its detector exists to recover. What is left without any probe answer is
+a tolerant upstream serving no such document (`tgi`, a `litellm` forwarding
+elsewhere) or a mapping with no probe path, and for those a manual `"yes"` is the
+only opt-in that ever existed. Where a probe DOES answer, `manual` is rank 3
+against its rank 1, so allowing `"yes"` is also how an operator overrides a
+detector they distrust — what every other manual verdict is for. Refusing it
+would have removed both to prevent nothing, since on the Responses side the same
+verdict is a veto and permits nothing. A first cut of this narrowing was
+name-keyed and did exactly that.
 
 What the refusal does cost is recorded rather than hidden: a manual
 `live_progress: "no"` was the translate path's only DURABLE opt-out against an

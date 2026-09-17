@@ -426,17 +426,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	//     `timings_per_token_injected` too, but it is Debug and
 	//     OP_AI_GATEWAY_LOG_LEVEL defaults to "info", so in a default deployment
 	//     the operator's "one grep" for an unexplained upstream 4xx found
-	//     nothing. Warn is this package's level for a refusal with a nameable
-	//     cause, and a separate CONDITIONAL line rather than a promotion of the
-	//     per-request one, which would be per-request spam. It is distinct from
-	//     nativeTerminalStatus's own upstream-error Warn because that one reports
-	//     the status; this one reports the cause and the remedy.
+	//     nothing. Warn is this package's level for a refused or dropped request
+	//     with a nameable subject, and this is a separate CONDITIONAL line rather
+	//     than a promotion of the per-request one, which would be per-request
+	//     spam. It is distinct from nativeTerminalStatus's own upstream-error
+	//     Warn, which fires for EVERY non-2xx and says nothing about the
+	//     injection: this one fires only when the gateway's own key was on the
+	//     wire, and it names the suppression that follows. Neither asserts a
+	//     cause -- see the paragraph below.
 	//  2. It is REMEMBERED, in the same memo internal/provider's CompleteStream
 	//     consults, so neither endpoint asks this mapping again until the memo's
 	//     TTL expires. There is still no retry -- this request keeps the
 	//     upstream's own status and body, relayed verbatim below -- so the
 	//     residual narrows from "every request on that application" to "the
-	//     first request per serving mapping per TTL".
+	//     first request per serving mapping per TTL", plus whatever was already
+	//     in flight when the record was written (it is written only once the
+	//     upstream response has arrived) and again after a restart, the memo
+	//     being in-process. The canonical statement, with the memo's entry cap,
+	//     is the telemetry architecture document's §8.4.3.
 	//
 	// Both are guarded on injectedLiveTimings, which is false when the CLIENT
 	// sent the key itself: a refusal that body earned says nothing about the

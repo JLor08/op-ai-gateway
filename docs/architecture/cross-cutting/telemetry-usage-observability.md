@@ -1535,12 +1535,18 @@ read it with OPPOSITE semantics and only one of them is what #81 was about. The
 Responses gate's condition 5 is a veto, so a positive verdict permits nothing
 there; but `internal/provider`'s `wantsLiveProgress` decides on it in BOTH
 directions — `"supported"` returns true *ahead of* its shape clause, which covers
-only `llama_cpp` and `vllm` — and **no probe ever writes this row for
-`llama_swap`, `litellm`, `tgi` or `custom`** (the `/props` detector needs a
-llama.cpp document). So a manual `"yes"` is the only mechanism that ever existed
-to opt a tolerant-but-unlisted upstream into an exact mid-stream token count on
-`/v1/chat/completions`. A name-keyed refusal would have removed that capability
-to prevent nothing.
+only `llama_cpp` and `vllm`. The detectors are **document-keyed, not
+type-keyed**: a probe establishes this row for anything that answers the
+configured probe path with a llama.cpp `/props` document, which includes a
+`server_agent` child whose resolved type is `custom` but whose binary is
+llama-server — `collector.LiveProgressProbePath` is deliberately not type-derived
+for exactly that reason — and a proxy an operator pointed at `/props`. So the
+population with no probe answer at all is narrower than the kind list: a tolerant
+upstream serving no such document (`tgi`, a `litellm` forwarding elsewhere), or
+any mapping with no probe path configured. For those a manual `"yes"` is the only
+opt-in that ever existed; and where a probe DOES answer, `manual` is rank 3
+against its rank 1, so allowing `"yes"` is also the operator's override of a
+detector they distrust. A name-keyed refusal removed both to prevent nothing.
 
 The RESET (`""`) is never refused either, because a row minted before the
 reservation existed would otherwise be permanently uncorrectable — the objection

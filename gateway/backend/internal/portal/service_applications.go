@@ -208,17 +208,27 @@ var (
 //   - CapabilityLiveProgress + CapabilityYes is deliberately ALLOWED, and an
 //     earlier cut of this rule refused it on a justification that was false.
 //     The claim was that an operator cannot attest a server build's request
-//     schema "which the probe would otherwise establish honestly" -- but no
-//     probe ever writes this row for llama_swap, litellm, tgi or custom
-//     (internal/provider's shape clause covers only llama_cpp and vllm, and the
-//     /props detector needs a llama.cpp document), and internal/provider's
-//     wantsLiveProgress decides on this verdict in BOTH directions ("supported"
-//     returns true AHEAD of the shape clause). So a manual "yes" is the only
-//     mechanism that ever existed for opting a tolerant-but-unlisted upstream
-//     INTO an exact mid-stream token count on /v1/chat/completions -- a
-//     capability its own doc comment names. It is also harmless on the Responses
-//     side, where condition 5 is a veto and a positive verdict permits nothing
-//     the veto has not already allowed.
+//     schema "which the probe would otherwise establish honestly". The second
+//     half of that is true for less of the population than it sounds: the
+//     detectors are DOCUMENT-keyed, not type-keyed, so a probe establishes this
+//     row for anything that answers the configured probe path with a llama.cpp
+//     /props document -- including a server_agent child whose resolved type is
+//     "custom" but whose binary is llama-server (collector.LiveProgressProbePath
+//     says so outright: the path is deliberately not type-derived, "exactly the
+//     case this detector exists to recover"), and a proxy an operator pointed at
+//     /props. Where it holds is the rest: a tolerant upstream that serves no such
+//     document (tgi, or a litellm forwarding elsewhere) and any mapping with no
+//     probe path configured at all.
+//
+//     For THAT population a manual "yes" is the only opt-in that ever existed,
+//     because internal/provider's wantsLiveProgress decides on this verdict in
+//     BOTH directions ("supported" returns true AHEAD of its shape clause, which
+//     covers only llama_cpp and vllm). And even where a probe does answer, the
+//     manual row is rank 3 against its rank 1, so allowing "yes" is also how an
+//     operator overrides a detector they have reason to distrust -- the same
+//     thing every other manual verdict is for. It is harmless on the Responses
+//     side either way, where condition 5 is a veto and a positive verdict
+//     permits nothing the veto has not already allowed.
 //
 //   - routing.CapabilitySpeculationObserved is reserved in BOTH directions,
 //     because it loses nothing: its only writer is the gateway's own observation
@@ -1936,8 +1946,8 @@ type UpdateMappingRequest struct {
 	// structurally -- the response is the post-write DTO, so the form's next
 	// render re-seeds from truth.
 	//
-	// The NAME vocabulary is OPEN: any name is accepted, not just the six
-	// constants the code reasons about, because an Ollama/agent-reported name
+	// The NAME vocabulary is OPEN: any name is accepted, not just the ones this
+	// codebase has constants for, because an Ollama/agent-reported name
 	// gets its own row like any other and must be correctable like any other.
 	// The one narrowing is keyed on the (name, verdict) PAIR rather than the
 	// name -- reservedManualVerdicts: `live_progress: "no"` and either verdict

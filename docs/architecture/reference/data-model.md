@@ -578,8 +578,8 @@ plausible-looking validation rule would break the normal case:
   in
   [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
   A capability NAME
-  is validated in exactly one narrow place and otherwise not at all: the
-  vocabulary is open on purpose (`vision`,
+  is validated only for emptiness; the vocabulary is otherwise open on purpose
+  (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress` and
   `speculation_observed` are the names the code itself reasons about, while an
   upstream may report others — since #54 the agent's Ollama probe actually
@@ -587,10 +587,11 @@ plausible-looking validation rule would break the normal case:
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
-  silently drop the very verdicts the open shape exists to keep. The three
-  rules that DO constrain names are each about one producer instead of the
-  vocabulary, and they sit at three DIFFERENT layers — none of them the
-  store, and only one of them the gateway:
+  silently drop the very verdicts the open shape exists to keep. What DOES
+  constrain a write is three producer-scoped rules at three DIFFERENT layers —
+  none of them the store, and only one of them the gateway. Two of the three
+  are about the NAME; the third, added last, narrows a VERDICT instead, which
+  is what lets it coexist with the open vocabulary above:
   - The COUNT and LENGTH clamp is in the **agent's own detector**
     (`server-agent/internal/collector/probe.go`,
     `detectOllamaCapabilities`): one `/api/show` document contributes at most
@@ -613,16 +614,18 @@ plausible-looking validation rule would break the normal case:
     keyed on the (name, verdict) PAIR rather than the name, and the two
     asymmetries are the rule rather than exceptions to it. `live_progress:
     "yes"` stays allowed because `internal/provider`'s `wantsLiveProgress`
-    reads that verdict in BOTH directions and no probe writes this row for
-    `llama_swap`/`litellm`/`tgi`/`custom`, so a manual `yes` is the only
-    opt-in those kinds ever had for an exact mid-stream count on
-    `/v1/chat/completions`; and the RESET (`""`) is never refused, which is
+    reads that verdict in BOTH directions while the `/props` detectors are
+    document-keyed rather than type-keyed — so a manual `yes` is the only
+    opt-in for a tolerant upstream that serves no `/props` document (`tgi`, a
+    forwarding `litellm`) or a mapping with no probe path, and elsewhere it is
+    the rank-3 override of a rank-1 probe verdict; and the RESET (`""`) is never refused, which is
     what keeps a row an older build stored correctable and is the only reason
     a name check is admissible here at all
     ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
-    Unlike the ingest rule above it is about an ordinary, reasonable-looking
-    admin request rather than untrusted bytes, which is why it narrows a
-    verdict instead of banning a name.
+    Unlike the two rules above it is about an ordinary, reasonable-looking
+    admin request rather than a probe's bytes — which is exactly why it narrows
+    a VERDICT instead of banning a name: an admin has legitimate reasons to
+    write most of these rows, so only the pair that causes the harm is refused.
 
   Where each rule is NOT matters as much: the ingest enforces **no** count or
   length bound of its own, so what bounds an arriving pass is the honest

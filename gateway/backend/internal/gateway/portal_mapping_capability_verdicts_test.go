@@ -189,10 +189,11 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 			wantCode: "mapping.capability_duplicate",
 		},
 		{
-			// Issue #81's reserved internal name: a manual rank-3 row on
-			// live_progress permanently vetoes the operator's own
-			// responses-live-timings switch, and no probe outranks it.
-			name:     "a verdict stated for a reserved internal capability",
+			// Issue #81's reserved PAIR: a manual rank-3 "no" on live_progress
+			// permanently vetoes the operator's own responses-live-timings
+			// switch, and no probe outranks it. Keyed on the pair, not the name
+			// -- the allowed half is the 200 two tests below.
+			name:     "a reserved (name, verdict) pair",
 			body:     `{"capability_verdicts":{"live_progress":"no"}}`,
 			wantCode: "mapping.capability_reserved",
 		},
@@ -217,19 +218,33 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 	}
 }
 
-// TestPortalMappingReservedCapabilityResetReturns200 is the other half of the
-// reservation at the HTTP layer, and the one that keeps it safe: a stored row an
-// older build allowed must still be clearable through the same endpoint. The
-// refusal above is SET-only, so an empty verdict answers 200 rather than the
-// 400 a name-based whitelist would have returned -- which is what makes §11.1's
-// "a manual verdict has no way back" risk stay closed.
-func TestPortalMappingReservedCapabilityResetReturns200(t *testing.T) {
-	srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
-	appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8033,"scheme":"https"}`)
-	created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reset","app_model_name":"cap-reset-up"}`)
+// TestPortalMappingReservedCapabilityAcceptedBodiesReturn200 pins the two halves
+// of the reservation the 400 table above cannot express, both at the HTTP layer
+// where a client actually meets them.
+//
+// The RESET is what keeps the refusal safe: a row an older build allowed must
+// still be clearable through the same endpoint, or §11.1's "a manual verdict has
+// no way back" risk re-opens. And `live_progress: "yes"` is the half the rule is
+// keyed on a PAIR for -- it is the only opt-in a tolerant upstream serving no
+// /props document ever had on /v1/chat/completions, and the rank-3 override of a
+// probe verdict elsewhere. A name-based whitelist would have answered 400 to
+// both of these.
+func TestPortalMappingReservedCapabilityAcceptedBodiesReturn200(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{name: "the reset of a reserved capability", body: `{"capability_verdicts":{"live_progress":""}}`},
+		{name: "a manual yes on live_progress", body: `{"capability_verdicts":{"live_progress":"yes"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
+			appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8033,"scheme":"https"}`)
+			created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reset","app_model_name":"cap-reset-up"}`)
 
-	rec := patchMapping(t, srv, created.ID, `{"capability_verdicts":{"live_progress":""}}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s -- resetting a reserved name must stay allowed", rec.Code, rec.Body.String())
+			rec := patchMapping(t, srv, created.ID, tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
