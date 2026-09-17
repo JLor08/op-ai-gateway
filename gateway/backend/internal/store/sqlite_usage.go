@@ -62,8 +62,9 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 			route_id, provider, host, status, error_code, input_tokens, output_tokens,
 			total_tokens, latency_ms, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second,
 			http_status, content_type, req_path, provider_path, provider_model, stream, token_name,
-			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
 		event.ID,
 		event.UserID,
@@ -103,6 +104,8 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 		event.EnergyMarginalWh,
 		event.EnergySource,
 		event.CreatedAt,
+		event.BillingUnit,
+		event.BillingQuantity,
 	)
 	s.setLastUsageError("record", err)
 	if err != nil {
@@ -205,7 +208,8 @@ func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
-			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
+			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
 		from usage_events
 		where user_id = ?
 		order by created_at, id`, userID)
@@ -228,7 +232,8 @@ func (s *SQLiteStore) All() []usage.Event {
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
-			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
+			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
 		from usage_events
 		order by created_at, id`)
 	if err != nil {
@@ -376,6 +381,8 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 			&event.EnergyMarginalWh,
 			&event.EnergySource,
 			&event.CreatedAt,
+			&event.BillingUnit,
+			&event.BillingQuantity,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage event: %w", err)
 		}
@@ -394,7 +401,8 @@ const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_
 	e.route_id, e.host, e.input_tokens, e.output_tokens, e.total_tokens, e.latency_ms, e.status,
 	e.error_code, e.cached_tokens, e.cache_write_tokens, e.prompt_per_second, e.tokens_per_second, e.http_status,
 	e.content_type, e.req_path, e.provider_path, e.provider_model, e.stream, e.token_name, e.server_name,
-	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at`
+	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at,
+	e.billing_unit, e.billing_quantity`
 
 var usageSortColumns = map[string]string{
 	"created_at":        "e.created_at",
@@ -707,6 +715,8 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 			&row.EnergyMarginalWh,
 			&row.EnergySource,
 			&row.CreatedAt,
+			&row.BillingUnit,
+			&row.BillingQuantity,
 			&row.UserName,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage row: %w", err)

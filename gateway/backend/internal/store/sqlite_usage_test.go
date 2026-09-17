@@ -1165,3 +1165,67 @@ func TestSQLiteUsageRecordQueryStatsTimeSeriesReturnErrorOnClosedStore(t *testin
 		t.Fatal("LastUsageError after failures: want a non-nil error, got nil")
 	}
 }
+
+// TestSQLiteUsageStorePersistsBillingPairByPosition proves BillingUnit/
+// BillingQuantity round-trip through Record and every read path at their
+// actual column position (last, after created_at). It seeds DISTINCT values
+// into the new pair AND its same-kind neighbours, because the silent failure
+// mode this test exists to catch is a swap against a same-kind column (a
+// float64 into energy_wh's slot, a string into token_name's), not a mix-up
+// between the two new columns themselves.
+func TestSQLiteUsageStorePersistsBillingPairByPosition(t *testing.T) {
+	st := openMigratedTestSQLite(t)
+	defer st.Close()
+
+	tokenMetered := usage.Event{
+		ID: "req_tok", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+		TokenName: "token-name-sentinel", ServerName: "server-name-sentinel",
+		InputTokens: 11, OutputTokens: 22, TotalTokens: 33,
+		CachedTokens: 44, CacheWriteTokens: 55,
+		PromptPerSecond: 1.5, TokensPerSecond: 2.5,
+		EnergyWh: 3.5, EnergyMarginalWh: 4.5, EnergySource: "measured",
+		LatencyMS: 120, Status: "success", HTTPStatus: 200,
+		CreatedAt: time.Now().UTC().Truncate(time.Second),
+	}
+	nonToken := usage.Event{
+		ID: "req_img", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+		TokenName: "other-token-name", ServerName: "other-server-name",
+		PromptPerSecond: 0, TokensPerSecond: 0,
+		EnergyWh: 6.5, EnergyMarginalWh: 7.5, EnergySource: "estimated",
+		BillingUnit: "image", BillingQuantity: 3,
+		LatencyMS: 900, Status: "success", HTTPStatus: 200,
+		CreatedAt: time.Now().UTC().Truncate(time.Second),
+	}
+
+	for _, ev := range []usage.Event{tokenMetered, nonToken} {
+		if err := st.Record(ev); err != nil {
+			t.Fatalf("record %s: %v", ev.ID, err)
+		}
+	}
+
+	byID := map[string]usage.Event{}
+	for _, got := range st.All() {
+		byID[got.ID] = got
+	}
+	// Whole-struct equality: any mis-positioned column shows up as a diff on a
+	// NEIGHBOUR field, which is the failure this test exists to catch.
+	if got := byID["req_tok"]; got != tokenMetered {
+		t.Errorf("token-metered round trip mismatch:\n got %+v\nwant %+v", got, tokenMetered)
+	}
+	if got := byID["req_img"]; got != nonToken {
+		t.Errorf("non-token round trip mismatch:\n got %+v\nwant %+v", got, nonToken)
+	}
+
+	// The same values must survive the Query path, whose SELECT concatenates
+	// userNameExpr AFTER usageEventColumns -- the ordering trap in scanUsageRows.
+	page, err := st.Query(usage.Query{ScopeAll: true, Limit: 25, Page: 1})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for _, row := range page.Data {
+		want := byID[row.Event.ID]
+		if row.Event != want {
+			t.Errorf("query row %s mismatch:\n got %+v\nwant %+v", row.Event.ID, row.Event, want)
+		}
+	}
+}

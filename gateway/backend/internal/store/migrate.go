@@ -113,6 +113,7 @@ var migrations = []migration{
 	{version: 78, name: "model_mapping_capabilities_table", up: migration78Up},
 	{version: 79, name: "model_mappings_drop_capability_columns", up: migration79Up},
 	{version: 80, name: "application_responses_live_timings", up: migration80Up},
+	{version: 81, name: "usage_events_billing_unit", up: migration81Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3823,4 +3824,27 @@ func migration80Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 			join applications a on a.id = m.application_id
 			where m.id = agent_runtime_specs.mapping_id), responses_live_timings_enabled)
 		where responses_live_timings_enabled = 0`)
+}
+
+// migration81Up adds the non-token billable measure to usage_events as a
+// (unit, quantity) PAIR: billing_unit says HOW to read the row, billing_quantity
+// is the measure. The defaults are load-bearing rather than incidental --
+// billing_unit "" means TOKEN-METERED, so every pre-existing row is backfilled
+// truthfully and no LLM path changes at all.
+//
+// billing_quantity is 'double precision', not 'real': migration43FloatColumns is
+// frozen to v43's columns and its own comment puts the type obligation on the
+// later migration, and a separate invariant asserts no 'real' column survives a
+// full chain. baselineCreateStatements is NOT touched (frozen as of v60), so the
+// columns live only here -- the same discipline migration61Up follows.
+func migration81Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"billing_unit text not null default ''",
+		"billing_quantity double precision not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "usage_events", col); err != nil {
+			return err
+		}
+	}
+	return nil
 }

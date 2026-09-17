@@ -8443,3 +8443,53 @@ func TestConformanceUpdateMappingEditable(t *testing.T) {
 		}
 	})
 }
+
+// Migration v81's defaults must be a TRUTHFUL no-op: a row written before the
+// billing pair existed reads back as token-metered, not as an unknown unit.
+//
+// Uses forEachDialectMigratedTo(80, ...) rather than forEachDialect: the
+// latter migrates to head BEFORE invoking the callback, so a v81 backfill
+// would never actually run against a pre-existing row — the columns would
+// already exist when the row is inserted, defeating the point of this test
+// (mirrors the migration-78 backfill tests' use of the same helper).
+//
+// The seed INSERT names only columns that exist at v80 and omits every
+// column that carries a DEFAULT at that version, but usage_events has four
+// NOT NULL columns with NO default even at v60/v80 (session_id, api_flavor,
+// provider, error_code) alongside the five identity/measure columns that
+// have never had one (id, request_id, user_id, token_id, host is exempted
+// because it is supplied, status likewise) -- baselineCreateStatements
+// (frozen as of v60) is the source of truth for which those are, and this
+// list was verified against it rather than assumed.
+func TestMigration81BillingPairDefaultsAreANoOp(t *testing.T) {
+	forEachDialectMigratedTo(t, 80, func(t *testing.T, st *SQLStore) {
+		ctx := context.Background()
+		if _, err := st.exec(ctx, `insert into usage_events
+			(id, request_id, user_id, token_id, session_id, api_flavor, model, provider, host, status, error_code, http_status,
+			 input_tokens, output_tokens, total_tokens, latency_ms, created_at)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"legacy1", "legacy1", "u1", "t1", "", "", "m1", "p1", "h1", "success", "", 200,
+			10, 20, 30, 100, time.Now().UTC()); err != nil {
+			t.Fatalf("seed pre-v81 row: %v", err)
+		}
+
+		if err := st.Migrate(ctx); err != nil {
+			t.Fatalf("migrate to head: %v", err)
+		}
+
+		events := st.All()
+		if len(events) != 1 {
+			t.Fatalf("want 1 event, got %d", len(events))
+		}
+		got := events[0]
+		if got.BillingUnit != "" {
+			t.Errorf("BillingUnit = %q, want \"\" (token-metered)", got.BillingUnit)
+		}
+		if got.BillingQuantity != 0 {
+			t.Errorf("BillingQuantity = %v, want 0", got.BillingQuantity)
+		}
+		if got.TotalTokens != 30 {
+			t.Errorf("TotalTokens = %d, want 30 (the pre-existing measure must survive)", got.TotalTokens)
+		}
+	})
+}
