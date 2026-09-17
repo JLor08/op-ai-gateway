@@ -216,11 +216,16 @@ flowchart TD
     Marker -->|no| Fallback{"UnknownModelFallback\ncallableFor?"}
     Fallback -->|yes| UseFB["redirect onto the fallback"] --> Gates
     Fallback -->|no| Keep["keep the requested model\n(today's error)"] --> Gates
-    Gates["admission gates, unchanged:\nserver-override re-authorization,\nservice-token model allowlist,\nrate/quota/budget\n→ Resolver.Resolve (§2)"]
+    Gates["pre-Resolve gates, unchanged:\nserver-override re-authorization,\nservice-token model allowlist,\nrate/quota/budget\n→ Resolver.Resolve (§2)"]
 ```
 
-**The invariant.** The redirect target passes every admission gate exactly as
-if the client had named it. The redirect changes *which* name is requested,
+**The invariant.** The redirect target passes every pre-`Resolve` gate exactly
+as if the client had named it. (“Pre-`Resolve` gate”, not “admission gate”:
+this document reserves *admission* for the CP4 capacity queue in
+[§6.3](#63-cp4--the-admission-queue), which is a different mechanism on the
+other side of `Resolve` — see [Compatibility & Inference
+§13](compatibility-and-inference.md#13-errors) for why the distinction is
+operator-visible.) The redirect changes *which* name is requested,
 never *what* a token may reach. That is why step 3 sits where it does — before
 `applyServerOverride`, `modelAllowed`, and `admitPrincipal`, not after them —
 and why it is never terminal: with nothing usable to redirect onto, the

@@ -737,10 +737,38 @@ Every inference error response uses the gateway-wide envelope
 | `provider.stream_idle_timeout` | mid-stream error frame | idle watchdog fired (§7) |
 | `provider.client_disconnected` | (no frame written) | client gone before/during the stream |
 
-A rejection at any pre-`Resolve` gate (invalid body, model not allowed,
-admission denied, server-override forbidden) never reaches an upstream and is
-still recorded as a usage event with `status:"error"` — see [Telemetry, Usage
-Analytics & Observability](telemetry-usage-observability.md).
+**Not every rejection becomes a usage event, and the line is `Resolve`.**
+`Server.recordUsage` is called only from the paths that have a resolved (or
+attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
+`usage_events` row at all:
+
+- **Not recorded** — the four gates `inferencePreflight` and the body parse run
+  first: `request.*` (the body failed `compat.Parse*`/`Validate`),
+  `model.not_allowed`, every `limit.*` denial from the **principal limiter**,
+  and `server_override.forbidden`. Each writes its response and returns; no
+  upstream is contacted and nothing reaches `recordUsage`.
+- **Recorded**, with `status:"error"` — everything from `Resolve` onward:
+  `routing.no_model_route` / `routing.no_healthy_host`, both
+  `routing.admission_queue_*` rejections, `responses.endpoint_disabled` /
+  `messages.endpoint_disabled` (only knowable after model resolution, and
+  recorded against the resolved target), and every `provider.*` outcome.
+
+So the honest answer to "is my 429'd request in Activity?" is *it depends which
+429*: a principal-limiter denial is not, a 503 from the capacity queue is.
+
+**Two different gates are called "admission" in this repository, and they fall
+on opposite sides of that line.** (1) The **principal limiter**
+(`PrincipalLimiter.Admit`) is the per-principal rate/quota/budget gate; it runs
+pre-`Resolve`, answers 429/402, and is **not** recorded. (2) The **CP4 capacity
+admission queue** (`routing.ErrAdmissionQueueTimeout` / `...Full`) is the
+bounded FIFO wait for a serving slot; it runs *inside* `Resolve`, answers 503,
+and **is** recorded. A third, unrelated sense — the agent-side co-residency and
+VRAM admission for managed model *processes* — belongs to
+[Agent-Managed Model Runtime](agent-runtime-manager.md) and never touches an
+inference request's usage row. See [Telemetry, Usage Analytics &
+Observability §8.4.1](telemetry-usage-observability.md#841-the-usage-event) for
+the row itself and [§8.4.5](telemetry-usage-observability.md#845-cost-and-currency)
+for what the limiter reads.
 
 ## 14. Configuration reference
 

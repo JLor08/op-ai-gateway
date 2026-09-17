@@ -308,6 +308,25 @@ func (s *SQLiteStore) TimeSeries(q usage.Query, bucketSecs int) (usage.TimeSerie
 	// row into ComputeTimeSeries; a SQL GROUP BY into buckets would scale better,
 	// but that is out of scope here (ComputeTimeSeries already coarsens/bounds the
 	// output side).
+	//
+	// NOTE: this projection is deliberately NARROW -- five columns, not
+	// usageEventColumns -- so the usage.Event values it builds are PARTIAL. In
+	// particular billing_unit/billing_quantity are not fetched, so every Event on
+	// this path carries BillingUnit == "" (token-metered) regardless of what is
+	// stored. The query is nevertheless correct as it stands: ComputeTimeSeries
+	// reads only CreatedAt, LatencyMS, InputTokens, OutputTokens and EnergyWh, and
+	// never branches on the unit, so a column it cannot observe cannot change its
+	// output.
+	//
+	// It is recorded because the two TimeSeries implementations are ASYMMETRIC
+	// here, and the asymmetry is invisible from either one alone: usage.Recorder
+	// passes whole stored Events to the same ComputeTimeSeries, so it DOES carry
+	// the unit. A future change that gated time-series logic on BillingUnit would
+	// therefore work on the memory twin and silently no-op on this one. Mutation
+	// testing proved exactly that shape: a mutation leaking BillingQuantity into
+	// the prompt-rate numerator was caught by the memory twin and NOT by the SQL
+	// twin. Anything added to ComputeTimeSeries that reads the pair must add both
+	// columns to this projection and its Scan below, in the same change.
 	query := "select e.created_at, e.latency_ms, e.input_tokens, e.output_tokens, e.energy_wh" +
 		usageEventsFromClause + where
 
