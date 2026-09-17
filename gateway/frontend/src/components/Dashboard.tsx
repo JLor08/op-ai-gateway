@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import { type ReactNode } from 'react';
 import type { DashboardResponse } from '../api';
 import type { Translation, MessageKey, RouteStatus } from './shared/types';
 import { Box, TableRow, TableCell, Typography } from '@mui/material';
@@ -9,11 +10,14 @@ import { StatusChip } from './shared/StatusChip';
 import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
 import { StatTile } from './shared/StatTile';
-import { tokenAggregate } from './billingUnit';
+import { TokenAggregateValue } from './TokenAggregateValue';
 
 type Metric = {
   labelKey: MessageKey;
-  value: string;
+  // ReactNode, not string: StatTile has always rendered `value` as a ReactNode,
+  // and this local narrowing was the only thing standing between the 24h token
+  // tile and the same marker-plus-tooltip the tables get.
+  value: ReactNode;
   detailKey: MessageKey;
 };
 
@@ -40,15 +44,21 @@ export function Dashboard({
           detailKey: 'requests24hDetail',
         },
         {
-          // The same three-state rule the Activity tiles use (#70): a 24h window
-          // whose requests are ALL non-token-metered has no token figure at all,
-          // and rendering "0" there would assert a measured zero.
+          // The same three-state rule the Activity tiles use (#70), through the
+          // same component: a 24h window whose requests are ALL non-token-metered
+          // has no token figure at all, and a MIXED one shows the sum of its
+          // token-metered subset with the marker and the tooltip naming what the
+          // sum leaves out. Rendering a bare number in either case would assert a
+          // coverage the figure does not have.
           labelKey: 'tokens24h',
-          value: tokenAggregate(
-            dashboard.metrics.tokens_24h,
-            dashboard.metrics.non_token_requests_24h ?? 0,
-            dashboard.metrics.requests_24h,
-          ).text,
+          value: (
+            <TokenAggregateValue
+              value={dashboard.metrics.tokens_24h}
+              nonTokenRequests={dashboard.metrics.non_token_requests_24h ?? 0}
+              totalRequests={dashboard.metrics.requests_24h}
+              t={t}
+            />
+          ),
           detailKey: 'tokens24hDetail',
         },
         {

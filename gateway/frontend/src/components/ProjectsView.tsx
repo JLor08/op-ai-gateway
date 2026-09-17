@@ -35,6 +35,7 @@ import type {
 } from '../api';
 import type { Translation, MessageKey, PortalApi } from './shared/types';
 import { formatPortalError, formatDate } from './shared/format';
+import { TokenAggregateValue } from './TokenAggregateValue';
 import { useResource } from './shared/useResource';
 import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
@@ -292,7 +293,13 @@ export function ProjectsView({
           showError(formatPortalError(err, t));
           setProjectTokens({
             tokens: [],
-            total: { request_count: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            total: {
+              request_count: 0,
+              non_token_requests: 0,
+              input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 0,
+            },
           });
         }
       })
@@ -1044,21 +1051,54 @@ export function ProjectsView({
         label: t.projectsTokensColPrompt,
         value: (tok) => String(tok.input_tokens),
         numeric: true,
-        render: (tok) => tok.input_tokens.toLocaleString(),
+        // Three states (#70): tokens do not APPLY to a non-token-metered request,
+        // so a token-only population dashes and a mixed one is marked; `value`
+        // stays the raw number so sorting and filtering keep working on it.
+        render: (tok) => (
+          <TokenAggregateValue
+            value={tok.input_tokens}
+            nonTokenRequests={tok.non_token_requests}
+            totalRequests={tok.request_count}
+            t={t}
+            format={(n) => n.toLocaleString()}
+          />
+        ),
       },
       {
         id: 'generated',
         label: t.projectsTokensColGenerated,
         value: (tok) => String(tok.output_tokens),
         numeric: true,
-        render: (tok) => tok.output_tokens.toLocaleString(),
+        // Three states (#70): tokens do not APPLY to a non-token-metered request,
+        // so a token-only population dashes and a mixed one is marked; `value`
+        // stays the raw number so sorting and filtering keep working on it.
+        render: (tok) => (
+          <TokenAggregateValue
+            value={tok.output_tokens}
+            nonTokenRequests={tok.non_token_requests}
+            totalRequests={tok.request_count}
+            t={t}
+            format={(n) => n.toLocaleString()}
+          />
+        ),
       },
       {
         id: 'total',
         label: t.projectsTokensColTotal,
         value: (tok) => String(tok.total_tokens),
         numeric: true,
-        render: (tok) => tok.total_tokens.toLocaleString(),
+        // Three states (#70): tokens do not APPLY to a non-token-metered request,
+        // so a token-only population dashes and a mixed one is marked; `value`
+        // stays the raw number so sorting and filtering keep working on it.
+        render: (tok) => (
+          <TokenAggregateValue
+            value={tok.total_tokens}
+            nonTokenRequests={tok.non_token_requests}
+            totalRequests={tok.request_count}
+            t={t}
+            format={(n) => n.toLocaleString()}
+          />
+        ),
       },
     ];
 
@@ -1115,14 +1155,34 @@ export function ProjectsView({
                     {projectTokens.total.request_count.toLocaleString()}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    {t.projectsTokensColPrompt}: {projectTokens.total.input_tokens.toLocaleString()}
+                    {t.projectsTokensColPrompt}:{' '}
+                    <TokenAggregateValue
+                      value={projectTokens.total.input_tokens}
+                      nonTokenRequests={projectTokens.total.non_token_requests}
+                      totalRequests={projectTokens.total.request_count}
+                      t={t}
+                      format={(n) => n.toLocaleString()}
+                    />
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
                     {t.projectsTokensColGenerated}:{' '}
-                    {projectTokens.total.output_tokens.toLocaleString()}
+                    <TokenAggregateValue
+                      value={projectTokens.total.output_tokens}
+                      nonTokenRequests={projectTokens.total.non_token_requests}
+                      totalRequests={projectTokens.total.request_count}
+                      t={t}
+                      format={(n) => n.toLocaleString()}
+                    />
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    {t.projectsTokensColTotal}: {projectTokens.total.total_tokens.toLocaleString()}
+                    {t.projectsTokensColTotal}:{' '}
+                    <TokenAggregateValue
+                      value={projectTokens.total.total_tokens}
+                      nonTokenRequests={projectTokens.total.non_token_requests}
+                      totalRequests={projectTokens.total.request_count}
+                      t={t}
+                      format={(n) => n.toLocaleString()}
+                    />
                   </Typography>
                 </Box>
               </Box>

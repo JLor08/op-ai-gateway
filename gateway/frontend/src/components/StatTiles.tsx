@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import { type ReactNode } from 'react';
 import { Box } from '@mui/material';
 import type { StatTotals } from '../api';
 import { formatCost, type CurrencyUnit } from '../currency';
 import type { Translation } from './shared/types';
 import { StatTile } from './shared/StatTile';
-import { tokenAggregate } from './billingUnit';
+import { TokenAggregateValue } from './TokenAggregateValue';
 import type { TileId } from './activityTiles';
 
 // Watt-hours -> a compact display string: kWh above the 1000 Wh threshold (2
@@ -51,12 +52,22 @@ export function StatTiles({
   // The four token tiles apply the shared three-state rule: a population that is
   // entirely non-token-metered has no token figure at all (em dash), and a mixed
   // one carries the "*" marker because the sum is correct for the token-metered
-  // SUBSET only.
-  const tokenTile = (label: string, value: number) => {
-    const agg = tokenAggregate(value, totals.non_token_requests ?? 0, totals.total_requests);
-    return { label, value: agg.mixed ? `${agg.text}*` : agg.text };
-  };
-  const byId: Record<TileId, { label: string; value: string }> = {
+  // SUBSET only. Both exceptional states carry their explanation as a tooltip --
+  // a tile is the surface with the LEAST context around it, so a bare "*" or a
+  // bare dash here is the least readable of all; hence the shared
+  // TokenAggregateValue rather than a formatted string.
+  const tokenTile = (label: string, value: number) => ({
+    label,
+    value: (
+      <TokenAggregateValue
+        value={value}
+        nonTokenRequests={totals.non_token_requests ?? 0}
+        totalRequests={totals.total_requests}
+        t={t}
+      />
+    ),
+  });
+  const byId: Record<TileId, { label: string; value: ReactNode }> = {
     running: { label: t.activityActiveTitle, value: String(runningCount ?? 0) },
     total_requests: { label: t.activityTotalRequests, value: String(totals.total_requests) },
     error_count: { label: t.activityErrorCount, value: String(totals.error_count) },

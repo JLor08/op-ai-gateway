@@ -20,10 +20,11 @@ import {
 import KeyboardArrowDown from '@mui/icons-material/KeyboardArrowDown';
 import KeyboardArrowRight from '@mui/icons-material/KeyboardArrowRight';
 import { type ActivityQuery, type UsageEvent, type UsageGroupRow } from '../api';
-import type { PortalApi, Translation } from './shared/types';
+import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { formatCost, type CurrencyUnit } from '../currency';
 import { formatEnergyWh } from './StatTiles';
-import { isTokenMetered, tokenAggregate } from './billingUnit';
+import { isTokenMetered } from './billingUnit';
+import { TokenAggregateValue } from './TokenAggregateValue';
 import { SettingsMenu } from './SettingsMenu';
 import { useColumnSettings } from './shared/useColumnSettings';
 import { dimLabel } from './GroupByChainBuilder';
@@ -51,7 +52,13 @@ type GroupColId =
 
 type GroupColDef = {
   id: GroupColId;
-  labelKey: string;
+  // MessageKey, not string: a plain `string` here let the non_token_requests
+  // column ship with a labelKey that named the BILLING-UNIT label, so a count of
+  // requests was headed "Abrechnungseinheit" and neither the compiler nor a test
+  // could see it. Typing it like ColumnDef.labelKey in activityColumns.ts makes
+  // a wrong-but-existing key at least a key the reader can check, and a
+  // misspelled one a build error.
+  labelKey: MessageKey;
   align: 'left' | 'right';
   defaultVisible: boolean;
 };
@@ -65,7 +72,7 @@ const GROUP_COLUMNS: GroupColDef[] = [
   // count as a column instead of only in a tooltip.
   {
     id: 'non_token_requests',
-    labelKey: 'activityColBillingUnit',
+    labelKey: 'activityColNonTokenRequests',
     align: 'right',
     defaultVisible: false,
   },
@@ -229,24 +236,18 @@ export function ActivityGroups({
   // the unit field cannot carry. non_token_requests supplies it as a count:
   // none, all, or some -- and in the "some" case the sum is genuinely correct
   // for the token-metered subset, so it is shown WITH a marker rather than
-  // suppressed.
+  // suppressed. TokenAggregateValue is the one carrier of that rule and of the
+  // tooltips that explain it, shared with the stat tiles, the Dashboard tile and
+  // the project rollups.
   function groupTokenCell(row: UsageGroupRow, value: number): ReactNode {
-    const agg = tokenAggregate(value, row.non_token_requests, row.count);
-    if (!agg.applicable) {
-      return (
-        <Tooltip title={t.activityNotTokenMetered}>
-          <span>—</span>
-        </Tooltip>
-      );
-    }
-    if (agg.mixed) {
-      return (
-        <Tooltip title={t.activityMixedUnitsHint(row.non_token_requests)}>
-          <span>{agg.text}*</span>
-        </Tooltip>
-      );
-    }
-    return agg.text;
+    return (
+      <TokenAggregateValue
+        value={value}
+        nonTokenRequests={row.non_token_requests}
+        totalRequests={row.count}
+        t={t}
+      />
+    );
   }
 
   // Rendered content of a configurable metric cell for a group row.
@@ -283,10 +284,7 @@ export function ActivityGroups({
   const settingsBar = (
     <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1 }}>
       <SettingsMenu
-        items={GROUP_COLUMNS.map((c) => ({
-          id: c.id,
-          label: t[c.labelKey as keyof typeof t] as string,
-        }))}
+        items={GROUP_COLUMNS.map((c) => ({ id: c.id, label: t[c.labelKey] }))}
         hidden={hiddenCols}
         order={colOrder}
         onToggle={toggleCol}
@@ -476,7 +474,7 @@ export function ActivityGroups({
               <TableCell>{dimLabel(t, groupBy)}</TableCell>
               {visibleCols.map((c) => (
                 <TableCell key={c.id} align={c.align === 'right' ? 'right' : 'left'}>
-                  {t[c.labelKey as keyof typeof t] as string}
+                  {t[c.labelKey]}
                 </TableCell>
               ))}
             </TableRow>

@@ -197,7 +197,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(within(tileFor(t.activityCostTile)).getByText('—')).toBeInTheDocument();
       });
 
-      it('dashes the token tiles when nothing in the population is token-metered', () => {
+      it('dashes the token tiles when nothing in the population is token-metered', async () => {
         render(
           <StatTiles
             t={t}
@@ -215,9 +215,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         ]) {
           expect(within(tileFor(label)).getByText('—')).toBeInTheDocument();
         }
+        // A tile has the least context of any surface, so the dash must say why
+        // it is a dash -- the glyph on its own was never the requirement.
+        fireEvent.mouseOver(within(tileFor(t.activityInputTokens)).getByText('—'));
+        expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
       });
 
-      it('marks the token tiles when the population is mixed', () => {
+      it('marks the token tiles when the population is mixed', async () => {
         render(
           <StatTiles
             t={t}
@@ -227,6 +231,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           />,
         );
         expect(within(tileFor(t.activityInputTokens)).getByText('100*')).toBeInTheDocument();
+        // And the marker explains itself, naming the count it excludes.
+        fireEvent.mouseOver(within(tileFor(t.activityInputTokens)).getByText('100*'));
+        expect(await screen.findByText(t.activityMixedUnitsHint(4))).toBeInTheDocument();
       });
     });
   });

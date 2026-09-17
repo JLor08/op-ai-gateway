@@ -28,10 +28,10 @@ export type TokenAggregate = {
 
 /**
  * The three-state rule for a token-denominated aggregate over a population that
- * may mix units. Shared by the group table, the stat tiles and the dashboard so
- * all three agree. The project-token rollups (ProjectsView) receive the same
- * non_token_requests field on the wire but are not routed through this helper
- * yet, so their token columns still print a raw count.
+ * may mix units. Every surface that shows one goes through it -- the grouped
+ * table, the four Activity stat tiles, the Dashboard 24h-token tile and the
+ * project-token rollups (rows and total) -- so all four agree. TokenAggregateValue
+ * renders the result, including the tooltip each exceptional state needs.
  *
  * An empty population (totalRequests === 0) renders the number, not a dash:
  * "no rows at all" is not "tokens do not apply here".

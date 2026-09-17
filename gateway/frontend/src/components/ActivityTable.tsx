@@ -102,6 +102,14 @@ function chipWithHelp(
   // No cast on this lookup: HelpMessageKey is derived from the keys of
   // Translation, so a missing or misspelled key fails the build here instead of
   // silently rendering nothing.
+  //
+  // DO NOT DELETE the guard below because the type looks non-optional. It is:
+  // tsconfig has `strict` but not `noUncheckedIndexedAccess`, so an index into a
+  // Record<string, ...> is typed as if it always hit. At runtime it does not --
+  // an unrecognised wire value (a newer backend's energy_source, any
+  // billing_unit outside the two known ones) yields undefined here, and this
+  // guard is the whole reason such a value renders with NO tooltip instead of an
+  // empty one. `billingUnit.test.ts` pins the undefined lookup.
   if (!helpKey) return body;
   return <Tooltip title={t[helpKey]}>{body}</Tooltip>;
 }

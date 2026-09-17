@@ -608,6 +608,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         const noTokens = rowFor('No tokens');
         expect(within(noTokens).getAllByText('\u2014')).toHaveLength(4);
         expect(within(noTokens).queryByText('0')).not.toBeInTheDocument();
+        // The TOOLTIP, not just the dash: tokenAggregate already returns '—' in
+        // its text, so asserting the glyph alone passes even if the
+        // not-applicable branch is removed and the dash loses its explanation.
+        fireEvent.mouseOver(within(noTokens).getAllByText('\u2014')[0]);
+        expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
       });
 
       it("dashes the expanded member table's Tokens cell for a non-token member", async () => {

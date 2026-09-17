@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActivityTable } from './ActivityTable';
 import { ACTIVITY_COLUMNS, type ColumnId } from './activityColumns';
@@ -508,10 +508,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         // An unknown value gets no tooltip at all: a wrong explanation is worse
         // than none. Asserted FIRST, while no tooltip has been opened yet, so a
         // still-open sibling tooltip cannot mask the absence.
+        //
+        // The delay is LOAD-BEARING, and a waitFor here would not be: an absence
+        // assertion satisfies waitFor on its very first poll, at t=0, before
+        // MUI's enterDelay could have mounted anything -- so it passes even when
+        // the code DOES open a tooltip. Only waiting past the enter delay makes
+        // the absence mean something.
         fireEvent.mouseOver(screen.getByText('future_tier'));
-        await waitFor(() => {
-          expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
-        });
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
 
         // A known value gets its explanation on hover; MUI renders the Tooltip
         // content into a portal, so wait for it.

@@ -1849,6 +1849,7 @@ const de = {
   activityColCostEur: 'Kosten',
   activityColBillingUnit: 'Abrechnungseinheit',
   activityColBillingQuantity: 'Abrechnungsmenge',
+  activityColNonTokenRequests: 'Nicht-Token-Anfragen',
   activityNotTokenMetered: 'Nicht in Token abgerechnet',
   activityMixedUnitsHint: (n: number) => `Summe ohne ${n} nicht in Token abgerechnete Anfrage(n).`,
   energySourceHelpMeasured:
@@ -4106,6 +4107,7 @@ const en: PortalMessages = {
   activityColCostEur: 'Cost',
   activityColBillingUnit: 'Billing unit',
   activityColBillingQuantity: 'Billing quantity',
+  activityColNonTokenRequests: 'Non-token requests',
   activityNotTokenMetered: 'Not token-metered',
   activityMixedUnitsHint: (n: number) => `Sum excludes ${n} request(s) that are not token-metered.`,
   energySourceHelpMeasured:
