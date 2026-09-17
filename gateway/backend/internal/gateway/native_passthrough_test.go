@@ -644,6 +644,26 @@ func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
 	}
 }
 
+// TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks proves
+// upstreamPath's apiFlavorImages branch fires BEFORE both the endpointModeFor
+// lookup (which has no case for images and would answer ("", "")) and the
+// provider fallbacks below it. target.Provider is deliberately ProviderOllama
+// -- the provider whose OWN fallback ("/api/chat") would otherwise answer here
+// -- so this only passes if the images branch itself ran: removing it would
+// make this test observe "/api/chat", not "/v1/images/generations". This is a
+// direct unit test of upstreamPath because no HTTP-level test in this package
+// exercises the SUCCESS path far enough to reach it (a refused images request
+// never gets a resolved target at all, see images_handler_test.go).
+func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) {
+	target := routing.Target{Provider: routing.ProviderOllama}
+
+	got := upstreamPath(target, apiFlavorImages)
+
+	if got != "/v1/images/generations" {
+		t.Fatalf("upstreamPath(images) = %q, want /v1/images/generations", got)
+	}
+}
+
 // TestOpenAIResponsesDisabledEndpointRejects proves a resolved target whose
 // EFFECTIVE ResponsesMode is disabled is REJECTED with the stable code + 4xx and
 // is NOT translated: the simple body used here WOULD translate+succeed (200) if it

@@ -57,6 +57,14 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 // Codex uses the OpenAI Responses API (/v1/responses); Claude Code uses the
 // Anthropic Messages API (/v1/messages). A flavor that is neither yields ("", ""),
 // which every caller treats as translate.
+//
+// images (apiFlavorImages) is deliberately absent: there is no per-application
+// images mode to read (unlike ResponsesMode/MessagesMode, no EndpointMode field
+// exists for it), so there is nothing this function could return for it. That
+// is not the same as "falls through and is treated as translate" -- there is
+// no translate path for images at all, see images_handler.go -- so images
+// never reaches this function; its own upstream path is decided directly in
+// upstreamPath, before the mode lookup this function answers.
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case "openai_responses":
@@ -109,6 +117,13 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 func upstreamPath(target routing.Target, apiFlavor string) string {
 	if target.Provider == "" {
 		return ""
+	}
+	// images has no EndpointMode to look up (see endpointModeFor's doc comment)
+	// and no translate fallback either, so it is answered here, before the
+	// mode lookup and the provider fallbacks below apply -- both of which
+	// are chat/responses/messages concerns that do not exist for images.
+	if apiFlavor == apiFlavorImages {
+		return "/v1/images/generations"
 	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
@@ -164,7 +179,18 @@ func sniffRoutingModel(raw []byte) (model string, stream bool) {
 // application it returns false, leaving the caller's existing translate path
 // to handle (and properly error-record) the request, reusing the SAME pf
 // rather than re-running the gate a second time.
-func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, pf preflight) bool {
+//
+// apiFlavor and endpoint are two different axes the caller already knows and
+// this function must not blur: apiFlavor drives target-flavor/mode lookups
+// (endpointModeFor, targetServesFlavor), while endpoint is the
+// session-extraction discriminator forwarded to proxyNative unchanged. They
+// used to coincide (proxyNative derived one from the other), but
+// NormalizeAPIFlavor folds every openai* flavor — responses AND images — to
+// the same coarse "openai", so that derivation could no longer tell them
+// apart once a second native-only, non-translate endpoint existed. Passing
+// endpoint through explicitly is the smaller change against threading a new
+// inference chain into proxyNative.
+func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight) bool {
 	start := time.Now()
 	req := pf.Req
 	model := req.Model
@@ -216,7 +242,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	}
 	switch mode {
 	case routing.EndpointModePassthrough:
-		s.proxyNative(w, r, *token, target, path, raw, req)
+		s.proxyNative(w, r, *token, target, path, raw, req, endpoint)
 		return true
 	case routing.EndpointModeDisabled:
 		// The resolved application (or, for a server_agent app, the resolved runtime
@@ -258,17 +284,19 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 // the upstream's mapped name, and -- only where the operator switched it on for
 // a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
 // field reaches the upstream as the client wrote it.
-func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, path string, raw []byte, pfReq inference.Request) {
+//
+// endpoint is the session-extraction discriminator, supplied by the caller
+// rather than inferred from pfReq.APIFlavor here (see tryProxyNative's doc
+// comment for why the coarse flavor stopped being able to carry that
+// inference once a second, non-translate native endpoint — images — shared
+// "openai" with responses).
+func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, path string, raw []byte, pfReq inference.Request, endpoint sessionEndpoint) {
 	start := time.Now()
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
 	// SessionID mirrors the translate path so usage/activity rows carry it for
 	// native-passthrough traffic too (it's also what keyed the routing affinity).
-	nativeEndpoint := endpointResponses
-	if routing.NormalizeAPIFlavor(pfReq.APIFlavor) == routing.APIFlavorAnthropic {
-		nativeEndpoint = endpointMessages
-	}
-	si := extractClientSession(r.Header, raw, nativeEndpoint)
+	si := extractClientSession(r.Header, raw, endpoint)
 	req := inference.Request{
 		Model:           pfReq.Model,
 		RequestedModel:  pfReq.RequestedModel,

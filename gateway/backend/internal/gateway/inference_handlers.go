@@ -123,7 +123,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		// Native passthrough: if the resolved application supports Codex natively,
 		// proxy the raw body to the upstream /v1/responses instead of translating.
-		if s.tryProxyNative(w, r, &token, raw, "openai_responses", pf) {
+		if s.tryProxyNative(w, r, &token, raw, "openai_responses", endpointResponses, pf) {
 			return
 		}
 	}
@@ -185,7 +185,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// proxy the raw body to the upstream /v1/messages instead of translating (this
 		// is also the only way Anthropic streaming works, since the translate path
 		// rejects it).
-		if s.tryProxyNative(w, r, &token, raw, "anthropic_messages", pf) {
+		if s.tryProxyNative(w, r, &token, raw, "anthropic_messages", endpointMessages, pf) {
 			return
 		}
 	}
@@ -447,11 +447,20 @@ func (pf preflight) mergeInto(req inference.Request) inference.Request {
 // (chat) or the pre-parse routing probe's (responses/messages; see
 // sniffRoutingModel). Bundled purely to keep inferencePreflight's own
 // parameter list short; it carries no behavior of its own.
+//
+// requiredCapabilities is nil for every translate-capable endpoint (chat,
+// responses, messages) and is set only by a handler whose endpoint IDENTITY
+// demands a capability verdict (currently images, via routing.CapabilityImage
+// -- see ADR-042). It is declared here, at the same call site as apiFlavor and
+// endpoint, rather than mutated onto the preflight's result afterwards, so the
+// gate a later caller runs is exactly the one its own shape declares and never
+// depends on a follow-up assignment a copy/pasted handler could omit.
 type inferenceShape struct {
-	apiFlavor string
-	endpoint  sessionEndpoint
-	model     string
-	stream    bool
+	apiFlavor            string
+	endpoint             sessionEndpoint
+	model                string
+	stream               bool
+	requiredCapabilities []string
 }
 
 // inferencePreflight is the ONE shared pre-dispatch gate for every inference
@@ -494,7 +503,7 @@ type inferenceShape struct {
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
-	req := inference.Request{Model: resolveModelOverride(token, shape.model), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream}
+	req := inference.Request{Model: resolveModelOverride(token, shape.model), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities}
 	// Only tokens that opted in pay for the offering lookup; for every other
 	// token this is a single boolean test. req.RequestedModel keeps the client's
 	// original wish either way — the usage events already carry it, so a
