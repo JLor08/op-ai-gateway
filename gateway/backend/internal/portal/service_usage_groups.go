@@ -21,10 +21,15 @@ import (
 // label (only group-by-user and group-by-service resolve a name; every other
 // dimension echoes Key).
 type UsageGroupDTO struct {
-	Key              string  `json:"key"`
-	KeyLabel         string  `json:"key_label"`
-	Count            int     `json:"count"`
-	ErrorCount       int     `json:"error_count"`
+	Key        string `json:"key"`
+	KeyLabel   string `json:"key_label"`
+	Count      int    `json:"count"`
+	ErrorCount int    `json:"error_count"`
+	// NonTokenRequests is the count of Count that are non-token-metered rows.
+	// See usage.StatTotals.NonTokenRequests. It is folded by simple summation,
+	// exactly like Count/ErrorCount; there is no quantity sum here for the same
+	// reason there is none on GroupBucket.
+	NonTokenRequests int     `json:"non_token_requests"`
 	InputTokens      int     `json:"input_tokens"`
 	OutputTokens     int     `json:"output_tokens"`
 	TotalTokens      int     `json:"total_tokens"`
@@ -95,6 +100,7 @@ func (s *Service) UsageGroups(principal auth.Token, q usage.Query, groupBy strin
 		}
 		a.dto.Count += b.Count
 		a.dto.ErrorCount += b.ErrorCount
+		a.dto.NonTokenRequests += b.NonTokenRequests
 		a.dto.InputTokens += b.InputTokens
 		a.dto.OutputTokens += b.OutputTokens
 		a.dto.CachedTokens += b.CachedTokens

@@ -62,8 +62,9 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 			route_id, provider, host, status, error_code, input_tokens, output_tokens,
 			total_tokens, latency_ms, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second,
 			http_status, content_type, req_path, provider_path, provider_model, stream, token_name,
-			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
 		event.ID,
 		event.UserID,
@@ -103,6 +104,8 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 		event.EnergyMarginalWh,
 		event.EnergySource,
 		event.CreatedAt,
+		event.BillingUnit,
+		event.BillingQuantity,
 	)
 	s.setLastUsageError("record", err)
 	if err != nil {
@@ -205,7 +208,8 @@ func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
-			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
+			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
 		from usage_events
 		where user_id = ?
 		order by created_at, id`, userID)
@@ -228,7 +232,8 @@ func (s *SQLiteStore) All() []usage.Event {
 			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
-			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at
+			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
+			billing_unit, billing_quantity
 		from usage_events
 		order by created_at, id`)
 	if err != nil {
@@ -303,6 +308,25 @@ func (s *SQLiteStore) TimeSeries(q usage.Query, bucketSecs int) (usage.TimeSerie
 	// row into ComputeTimeSeries; a SQL GROUP BY into buckets would scale better,
 	// but that is out of scope here (ComputeTimeSeries already coarsens/bounds the
 	// output side).
+	//
+	// NOTE: this projection is deliberately NARROW -- five columns, not
+	// usageEventColumns -- so the usage.Event values it builds are PARTIAL. In
+	// particular billing_unit/billing_quantity are not fetched, so every Event on
+	// this path carries BillingUnit == "" (token-metered) regardless of what is
+	// stored. The query is nevertheless correct as it stands: ComputeTimeSeries
+	// reads only CreatedAt, LatencyMS, InputTokens, OutputTokens and EnergyWh, and
+	// never branches on the unit, so a column it cannot observe cannot change its
+	// output.
+	//
+	// It is recorded because the two TimeSeries implementations are ASYMMETRIC
+	// here, and the asymmetry is invisible from either one alone: usage.Recorder
+	// passes whole stored Events to the same ComputeTimeSeries, so it DOES carry
+	// the unit. A future change that gated time-series logic on BillingUnit would
+	// therefore work on the memory twin and silently no-op on this one. Mutation
+	// testing proved exactly that shape: a mutation leaking BillingQuantity into
+	// the prompt-rate numerator was caught by the memory twin and NOT by the SQL
+	// twin. Anything added to ComputeTimeSeries that reads the pair must add both
+	// columns to this projection and its Scan below, in the same change.
 	query := "select e.created_at, e.latency_ms, e.input_tokens, e.output_tokens, e.energy_wh" +
 		usageEventsFromClause + where
 
@@ -376,6 +400,8 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 			&event.EnergyMarginalWh,
 			&event.EnergySource,
 			&event.CreatedAt,
+			&event.BillingUnit,
+			&event.BillingQuantity,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage event: %w", err)
 		}
@@ -394,7 +420,8 @@ const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_
 	e.route_id, e.host, e.input_tokens, e.output_tokens, e.total_tokens, e.latency_ms, e.status,
 	e.error_code, e.cached_tokens, e.cache_write_tokens, e.prompt_per_second, e.tokens_per_second, e.http_status,
 	e.content_type, e.req_path, e.provider_path, e.provider_model, e.stream, e.token_name, e.server_name,
-	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at`
+	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at,
+	e.billing_unit, e.billing_quantity`
 
 var usageSortColumns = map[string]string{
 	"created_at":        "e.created_at",
@@ -707,6 +734,8 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 			&row.EnergyMarginalWh,
 			&row.EnergySource,
 			&row.CreatedAt,
+			&row.BillingUnit,
+			&row.BillingQuantity,
 			&row.UserName,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage row: %w", err)
@@ -742,7 +771,7 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 	// with the memory recorder, which passes a nil name resolver for Stats).
 	where, args := usageWhere(s.dl, q, "")
 	rows, err := s.query(context.Background(),
-		"select e.status, e.http_status, e.cached_tokens, e.cache_write_tokens, e.input_tokens, e.output_tokens, e.prompt_per_second, e.tokens_per_second, e.energy_wh from usage_events as e"+where,
+		"select e.status, e.http_status, e.cached_tokens, e.cache_write_tokens, e.input_tokens, e.output_tokens, e.prompt_per_second, e.tokens_per_second, e.energy_wh, e.billing_unit from usage_events as e"+where,
 		args...,
 	)
 	if err != nil {
@@ -760,13 +789,17 @@ func (s *SQLiteStore) Stats(q usage.Query) (usage.Stats, error) {
 			httpStatus                     int
 			cached, cacheWrite, input, out int
 			pps, tps, energyWh             float64
+			billingUnit                    string
 		)
-		if err := rows.Scan(&status, &httpStatus, &cached, &cacheWrite, &input, &out, &pps, &tps, &energyWh); err != nil {
+		if err := rows.Scan(&status, &httpStatus, &cached, &cacheWrite, &input, &out, &pps, &tps, &energyWh, &billingUnit); err != nil {
 			wrapped := fmt.Errorf("scan usage stats: %w", err)
 			s.setLastUsageError("stats.scan", wrapped)
 			return emptyUsageStats(), wrapped
 		}
 		totals.TotalRequests++
+		if billingUnit != usage.BillingUnitTokens {
+			totals.NonTokenRequests++
+		}
 		if usage.IsError(status, httpStatus) {
 			totals.ErrorCount++
 		}
@@ -1012,6 +1045,7 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	sqlText := "select e." + col + " as gkey, e.host," +
 		" count(*)," +
 		" sum(case when e.status = 'error' or e.http_status >= 400 then 1 else 0 end)," +
+		" sum(case when e.billing_unit <> '' then 1 else 0 end)," +
 		" sum(e.input_tokens), sum(e.output_tokens), sum(e.cached_tokens), sum(e.cache_write_tokens)," +
 		" sum(e.energy_wh), min(e.created_at), max(e.created_at)" +
 		usageEventsFromClause + where +
@@ -1024,13 +1058,13 @@ func (s *SQLiteStore) UsageGroups(ctx context.Context, q usage.Query, groupBy st
 	out := make([]usage.GroupBucket, 0)
 	for rows.Next() {
 		var b usage.GroupBucket
-		var count, errCount, in, outTok, cached, cacheWrite int64
+		var count, errCount, nonToken, in, outTok, cached, cacheWrite int64
 		var energy float64
 		var first, last aggTime
-		if err := rows.Scan(&b.Key, &b.Host, &count, &errCount, &in, &outTok, &cached, &cacheWrite, &energy, &first, &last); err != nil {
+		if err := rows.Scan(&b.Key, &b.Host, &count, &errCount, &nonToken, &in, &outTok, &cached, &cacheWrite, &energy, &first, &last); err != nil {
 			return nil, fmt.Errorf("scan usage group: %w", err)
 		}
-		b.Count, b.ErrorCount = int(count), int(errCount)
+		b.Count, b.ErrorCount, b.NonTokenRequests = int(count), int(errCount), int(nonToken)
 		b.InputTokens, b.OutputTokens = int(in), int(outTok)
 		b.CachedTokens, b.CacheWriteTokens = int(cached), int(cacheWrite)
 		b.EnergyWh = energy

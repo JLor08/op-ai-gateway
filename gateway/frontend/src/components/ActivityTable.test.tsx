@@ -4,7 +4,7 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActivityTable } from './ActivityTable';
-import { ACTIVITY_COLUMNS } from './activityColumns';
+import { ACTIVITY_COLUMNS, type ColumnId } from './activityColumns';
 import { messages, type Locale } from '../i18n';
 import type { UsageEvent } from '../api';
 
@@ -427,6 +427,130 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         });
         expect(screen.getByRole('cell', { name: '12.5' })).toBeInTheDocument();
         expect(screen.getByRole('cell', { name: '40.0' })).toBeInTheDocument();
+      });
+    });
+
+    describe('billable unit (#70): a not-applicable is never a zero', () => {
+      // Every column visible, so the billing pair and the token cells are all in the DOM.
+      const allColumns = ACTIVITY_COLUMNS;
+      // The data cells render in `allColumns` order, so a column id maps to a
+      // cell INDEX -- which is what makes "this particular cell is an em dash"
+      // assertable instead of "some cell on the row is".
+      const cellFor = (row: HTMLElement, id: ColumnId) =>
+        within(row).getAllByRole('cell')[allColumns.findIndex((c) => c.id === id)];
+
+      it('renders an em dash for every token cell of a non-token row', () => {
+        // A non-token row's token columns are 0 because tokens do not APPLY.
+        // Printing "0" five times would make a not-applicable indistinguishable
+        // from a token-metered request whose upstream reported no usage object.
+        renderTable({
+          rows: [
+            makeRow({
+              billing_unit: 'image',
+              billing_quantity: 3,
+              input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 0,
+              cached_tokens: 0,
+              cache_write_tokens: 0,
+              prompt_per_second: 0,
+              tokens_per_second: 0,
+            }),
+          ],
+          columns: allColumns,
+        });
+
+        const row = screen.getAllByRole('row')[1];
+        // Each of the five token cells specifically -- an em dash, not a bare 0.
+        for (const id of [
+          'total_tokens',
+          'input_tokens',
+          'output_tokens',
+          'cached_tokens',
+          'cache_write_tokens',
+        ] as const) {
+          expect(cellFor(row, id)).toHaveTextContent('\u2014');
+        }
+        expect(within(row).getByText('image')).toBeInTheDocument();
+        expect(within(row).getByText('3')).toBeInTheDocument();
+        expect(within(row).queryByText('0')).not.toBeInTheDocument();
+      });
+
+      it('renders token cells as numbers for a token-metered row', () => {
+        renderTable({
+          rows: [
+            makeRow({ billing_unit: '', total_tokens: 30, input_tokens: 10, output_tokens: 20 }),
+          ],
+          columns: allColumns,
+        });
+
+        const row = screen.getAllByRole('row')[1];
+        expect(within(row).getByText('30')).toBeInTheDocument();
+        expect(within(row).getByText('10')).toBeInTheDocument();
+        expect(within(row).getByText('20')).toBeInTheDocument();
+      });
+
+      it('explains a known energy source in a tooltip and invents none for an unknown value', async () => {
+        renderTable({
+          rows: [
+            makeRow({ id: 'req_m', energy_source: 'measured' }),
+            makeRow({ id: 'req_u', energy_source: 'unpriceable' }),
+            makeRow({ id: 'req_x', energy_source: 'future_tier' }),
+          ],
+          columns: allColumns,
+        });
+
+        // The chip label is ALWAYS the raw wire value -- including the unknown one.
+        expect(screen.getByText('measured')).toBeInTheDocument();
+        expect(screen.getByText('unpriceable')).toBeInTheDocument();
+        expect(screen.getByText('future_tier')).toBeInTheDocument();
+
+        // An unknown value gets no tooltip at all: a wrong explanation is worse
+        // than none. Asserted FIRST, while no tooltip has been opened yet, so a
+        // still-open sibling tooltip cannot mask the absence.
+        //
+        // The delay is LOAD-BEARING, and a waitFor here would not be: an absence
+        // assertion satisfies waitFor on its very first poll, at t=0, before
+        // MUI's enterDelay could have mounted anything -- so it passes even when
+        // the code DOES open a tooltip. Only waiting past the enter delay makes
+        // the absence mean something.
+        fireEvent.mouseOver(screen.getByText('future_tier'));
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+        // A known value gets its explanation on hover; MUI renders the Tooltip
+        // content into a portal, so wait for it.
+        fireEvent.mouseOver(screen.getByText('unpriceable'));
+        expect(await screen.findByText(t.energySourceHelpUnpriceable)).toBeInTheDocument();
+      });
+
+      it('renders the billing pair as an em dash on a token-metered row', () => {
+        renderTable({ rows: [makeRow()], columns: allColumns });
+        const row = screen.getAllByRole('row')[1];
+        // No producer writes a unit yet, so today every row reads "—/—" here.
+        expect(cellFor(row, 'billing_unit')).toHaveTextContent('\u2014');
+        expect(cellFor(row, 'billing_quantity')).toHaveTextContent('\u2014');
+      });
+
+      it('keys the quantity cell on the UNIT, so a measured zero reads as 0', () => {
+        // Both directions of the one column that IS the measure. Guarding on the
+        // VALUE instead would collapse them: a FAILED image request legitimately
+        // has quantity 0, and it must not read like a request tokens do not
+        // apply to. Every recordUsage error path passes a zero provider.Response,
+        // so this is the common case for a non-token row, not a corner one.
+        renderTable({
+          rows: [
+            makeRow({ id: 'req_tok', billing_unit: '', billing_quantity: 0 }),
+            makeRow({ id: 'req_img', billing_unit: 'image', billing_quantity: 0 }),
+          ],
+          columns: allColumns,
+        });
+
+        const tokenRow = screen.getAllByRole('row')[1];
+        const imageRow = screen.getAllByRole('row')[2];
+        expect(cellFor(tokenRow, 'billing_quantity')).toHaveTextContent('\u2014');
+        expect(cellFor(imageRow, 'billing_quantity')).toHaveTextContent('0');
+        expect(cellFor(imageRow, 'billing_quantity')).not.toHaveTextContent('\u2014');
       });
     });
   });

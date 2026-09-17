@@ -631,6 +631,16 @@ type usageMeta struct {
 	ReqPath     string
 	HTTPStatus  int
 	ContentType string
+	// BillingUnit/BillingQuantity are the non-token billable measure for this
+	// request, and they must come from ENDPOINT IDENTITY -- never from resp.
+	// 7 of the 10 call sites pass a zero provider.Response, so a
+	// response-derived unit would record a FAILED image request as ""
+	// (token-metered with a zero measure), the exact lie the pair exists to
+	// prevent. Left as the zero value by every token-metered call site, which is
+	// what makes the pair a structural no-op for all existing traffic; see
+	// usage.ValidateBillingXOR for the contract.
+	BillingUnit     string
+	BillingQuantity float64
 }
 
 // opportunisticEWMAAlpha weights each live throughput sample against the running
@@ -660,7 +670,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// below — this call inserting a usage_events row is fire-and-forget from the
 	// HTTP response's perspective (the client already got its answer by the
 	// time recordUsage runs).
-	if err := s.Usage.Record(usage.Event{
+	event := usage.Event{
 		ID:               id,
 		UserID:           token.UserID,
 		TokenID:          token.ID,
@@ -696,7 +706,17 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		Status:           status,
 		ErrorCode:        errorCode,
 		CreatedAt:        time.Now().UTC(),
-	}); err != nil {
+		BillingUnit:      meta.BillingUnit,
+		BillingQuantity:  meta.BillingQuantity,
+	}
+	// The XOR is an invariant of the row, not a suggestion. A violation means a
+	// producer is wrong, so it is logged at Error and the row is written
+	// UNMODIFIED: silently repairing the data would destroy the evidence, and
+	// dropping the row would lose a request from billing entirely.
+	if err := usage.ValidateBillingXOR(event); err != nil {
+		slog.Error("usage billing contract violated", "id", id, "req_path", meta.ReqPath, "err", err)
+	}
+	if err := s.Usage.Record(event); err != nil {
 		slog.Error("usage record failed", "id", id, "err", err)
 	}
 	// A recorded row means the activity views may be stale; signal subscribers.

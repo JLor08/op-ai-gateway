@@ -842,6 +842,155 @@ func TestRecorderUsageGroups(t *testing.T) {
 	}
 }
 
+// seedMixedUnitEvents returns a MIXED-unit population: one token-metered row
+// and one non-token (image) row on the same user/token/model/host. The token
+// sums must exclude the non-token row, and NonTokenRequests must disclose it.
+// Without the count, a non-token row's "0 tokens" is indistinguishable from a
+// token-metered request whose upstream reported no usage object. This is the
+// memory-store twin of the SQL scenario in store/conformance_test.go's
+// seedMixedUnitEvents -- there is no automated memory-vs-SQL conformance
+// suite for usage.Store, so the scenario is hand-mirrored in both packages.
+func seedMixedUnitEvents(now time.Time) []Event {
+	return []Event{
+		{
+			ID: "ev_tok", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+			InputTokens: 10, OutputTokens: 20, TotalTokens: 30,
+			CachedTokens: 5, CacheWriteTokens: 2,
+			PromptPerSecond: 50, TokensPerSecond: 25,
+			EnergyWh: 4, LatencyMS: 1000, Status: "success", HTTPStatus: 200,
+			CreatedAt: now.Add(-2 * time.Minute),
+		},
+		{
+			ID: "ev_img", UserID: "u1", TokenID: "t1", Model: "m1", Host: "h1",
+			BillingUnit: BillingUnitImage, BillingQuantity: 3,
+			// All seven token-denominated columns stay 0, per the XOR. The two
+			// per-second columns are set EXPLICITLY to 0 to pin the contract
+			// rather than rely on the zero value.
+			PromptPerSecond: 0, TokensPerSecond: 0,
+			EnergyWh: 6, LatencyMS: 3000, Status: "success", HTTPStatus: 200,
+			CreatedAt: now.Add(-1 * time.Minute),
+		},
+	}
+}
+
+// totalHistogramCount sums a Histogram's per-bin counts.
+func totalHistogramCount(h Histogram) int {
+	total := 0
+	for _, bin := range h.Bins {
+		total += bin.Count
+	}
+	return total
+}
+
+// TestRecorderUsageMixedUnitAggregatesDiscloseNonTokenRequests proves the
+// in-memory Recorder handles a mixed-unit population exactly like the SQL
+// stores (see TestConformanceUsageMixedUnitAggregatesDiscloseNonTokenRequests
+// in store/conformance_test.go): token sums exclude the non-token row, but
+// request counts, error counts, concurrency, and energy sums correctly include
+// it -- and NonTokenRequests discloses which rows those are. An all-"" seed
+// would pass either implementation silently, which is why this seed is mixed.
+func TestRecorderUsageMixedUnitAggregatesDiscloseNonTokenRequests(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	rec := NewRecorder()
+	for _, e := range seedMixedUnitEvents(now) {
+		if err := rec.Record(e); err != nil {
+			t.Fatalf("record %s: %v", e.ID, err)
+		}
+	}
+
+	stats, err := rec.Stats(Query{ScopeAll: true, From: now.Add(-time.Hour), To: now})
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Totals.TotalRequests != 2 {
+		t.Errorf("TotalRequests = %d, want 2 (a non-token request is a real request)", stats.Totals.TotalRequests)
+	}
+	if stats.Totals.NonTokenRequests != 1 {
+		t.Errorf("NonTokenRequests = %d, want 1", stats.Totals.NonTokenRequests)
+	}
+	if stats.Totals.InputTokens != 10 || stats.Totals.OutputTokens != 20 ||
+		stats.Totals.CachedTokens != 5 || stats.Totals.CacheWriteTokens != 2 {
+		t.Errorf("token sums polluted by the non-token row: %+v", stats.Totals)
+	}
+	if stats.Totals.TotalEnergyWh != 10 {
+		t.Errorf("TotalEnergyWh = %v, want 10 (a non-token row's energy IS real)", stats.Totals.TotalEnergyWh)
+	}
+	// ComputeHistogram drops zeros by design, so the non-token row contributes no
+	// bin. Assert it explicitly rather than relying on that behaviour silently.
+	if got := totalHistogramCount(stats.TokensPerSecond); got != 1 {
+		t.Errorf("tokens/s histogram counted %d values, want 1 (the non-token row's 0 must not bin)", got)
+	}
+
+	buckets, err := rec.UsageGroups(context.Background(), Query{ScopeAll: true, From: now.Add(-time.Hour), To: now}, "model")
+	if err != nil {
+		t.Fatalf("usage groups: %v", err)
+	}
+	var count, nonToken, input int
+	for _, b := range buckets {
+		count += b.Count
+		nonToken += b.NonTokenRequests
+		input += b.InputTokens
+	}
+	if count != 2 || nonToken != 1 || input != 10 {
+		t.Errorf("groups: count=%d nonToken=%d input=%d, want 2/1/10", count, nonToken, input)
+	}
+
+	// The time series is the SECOND token-per-second aggregate, and it is safe
+	// for a different reason than the histogram: the divisor is bucket seconds,
+	// not a row count. A non-token row is genuinely IN its input set -- it bumps
+	// Connections, Concurrency and EnergyWh -- and contributes nothing to the
+	// rate numerators. Assert that, rather than trusting it.
+	//
+	// bucketSecs=3600 spans exactly the 1-hour [from,to) query window, so
+	// ComputeTimeSeries produces n=ceil(3600/3600)=1: a SINGLE bucket. Both
+	// seeded rows' CreatedAt (well inside the window) and their tiny
+	// (1s/3s) latency-shifted concurrency intervals therefore land in that
+	// one bucket -- there is no "different bucket" case to distinguish here,
+	// so summing across series.Points (only one element) is equivalent to,
+	// and no less precise than, reading that single point directly.
+	series, err := rec.TimeSeries(Query{ScopeAll: true, From: now.Add(-time.Hour), To: now}, 3600)
+	if err != nil {
+		t.Fatalf("time series: %v", err)
+	}
+	if len(series.Points) != 1 {
+		t.Fatalf("points = %d, want 1 (a 3600s bucket over a 1h window is exactly one bucket)", len(series.Points))
+	}
+	var conns, concurrency int
+	var energy, promptRate, completionRate float64
+	for _, pt := range series.Points {
+		conns += pt.Connections
+		concurrency += pt.Concurrency
+		energy += pt.EnergyWh
+		promptRate += pt.PromptTokensPerSecond
+		completionRate += pt.CompletionTokensPerSecond
+	}
+	if conns != 2 {
+		t.Errorf("Connections total = %d, want 2 (a non-token request is a real connection)", conns)
+	}
+	// Concurrency counts a request whose [CreatedAt-LatencyMS, CreatedAt]
+	// window overlaps the bucket. Both rows' windows (1s and 3s wide) sit
+	// entirely inside the single 1h bucket, so both are counted: want 2.
+	if concurrency != 2 {
+		t.Errorf("Concurrency total = %d, want 2 (both rows' latency windows overlap the one bucket)", concurrency)
+	}
+	if energy != 10 {
+		t.Errorf("EnergyWh total = %v, want 10 (a non-token row's energy IS real)", energy)
+	}
+	// PromptTokensPerSecond/CompletionTokensPerSecond are sum(InputTokens|
+	// OutputTokens)/bucketSecs. Only ev_tok contributes to the numerator (10
+	// input, 20 output); ev_img's token columns are 0 by the XOR. Assert the
+	// actual expected rate, not merely ">0" -- the point is that the
+	// non-token row adds nothing to the numerator.
+	const wantPromptRate = 10.0 / 3600.0
+	const wantCompletionRate = 20.0 / 3600.0
+	if !approxEqual(promptRate, wantPromptRate) {
+		t.Errorf("PromptTokensPerSecond = %v, want %v (10 input tokens / 3600s; the non-token row adds 0)", promptRate, wantPromptRate)
+	}
+	if !approxEqual(completionRate, wantCompletionRate) {
+		t.Errorf("CompletionTokensPerSecond = %v, want %v (20 output tokens / 3600s; the non-token row adds 0)", completionRate, wantCompletionRate)
+	}
+}
+
 func TestRecorderTokenFilter(t *testing.T) {
 	rec := NewRecorder()
 	rec.Record(Event{ID: "req_tok", UserID: "usr_1", TokenID: "tok_a", HTTPStatus: 200})

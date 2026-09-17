@@ -541,6 +541,69 @@ func TestEnergyComputeTier3CoeffZeroStillModeled(t *testing.T) {
 	requireCloseWh(t, "WhMarginal", res.WhMarginal, 0)
 }
 
+// Tier 3 is coeff * OutputTokens, so it is structurally inapplicable to a row
+// whose measure is not tokens. It must stamp a terminal provenance rather than a
+// "modeled" zero: "modeled" claims a derivation that did not happen, and a
+// zero-Wh "modeled" row is byte-identical to a legitimately-modeled token row on
+// a zero-coefficient mapping -- once the two share a shape, no later query,
+// backfill or audit can separate them.
+func TestEnergyComputeNonTokenRowIsUnpriceableNotModeled(t *testing.T) {
+	ev := usage.Event{
+		LatencyMS:       1500,
+		CreatedAt:       time.Now().UTC(),
+		BillingUnit:     usage.BillingUnitImage,
+		BillingQuantity: 2,
+	}
+	// No telemetry and EstimatedWatts unset: a Tier-3-only host.
+	res := ComputeEnergy(ev, nil, nil, ServerEnergyConfig{}, 0, 0.5, 0.25)
+
+	if res.Source != "unpriceable" {
+		t.Errorf("Source = %q, want \"unpriceable\"", res.Source)
+	}
+	if res.WhTotal != 0 || res.WhMarginal != 0 {
+		t.Errorf("Wh = (%v, %v), want (0, 0)", res.WhTotal, res.WhMarginal)
+	}
+}
+
+// The guard keys on the UNIT, not on the token count, so it RESPECTS the XOR
+// rather than trusting it: a producer bug that leaves OutputTokens non-zero can
+// never be multiplied by a Wh-per-token coefficient.
+func TestEnergyComputeNonTokenRowWithStrayTokensStillUnpriceable(t *testing.T) {
+	ev := usage.Event{
+		LatencyMS:       1500,
+		CreatedAt:       time.Now().UTC(),
+		BillingUnit:     usage.BillingUnitImage,
+		BillingQuantity: 2,
+		OutputTokens:    9999, // contract violation; must not become a Wh figure
+	}
+	res := ComputeEnergy(ev, nil, nil, ServerEnergyConfig{}, 0, 0.5, 0.25)
+
+	if res.Source != "unpriceable" || res.WhTotal != 0 {
+		t.Errorf("got (%q, %v), want (\"unpriceable\", 0)", res.Source, res.WhTotal)
+	}
+}
+
+// Tiers 1 and 2 never read a token count, so a non-token request on a host with
+// telemetry or a configured wattage gets a REAL figure. The guard must not
+// change that -- it is the whole reason the gap is narrow.
+func TestEnergyComputeNonTokenRowStillReachesTier2(t *testing.T) {
+	now := time.Now().UTC()
+	ev := usage.Event{
+		LatencyMS:       2000,
+		CreatedAt:       now,
+		BillingUnit:     usage.BillingUnitImage,
+		BillingQuantity: 1,
+	}
+	res := ComputeEnergy(ev, nil, nil, ServerEnergyConfig{EstimatedWatts: 300}, 0, 0, 0)
+
+	if res.Source != "estimated" {
+		t.Errorf("Source = %q, want \"estimated\"", res.Source)
+	}
+	if res.WhTotal <= 0 {
+		t.Errorf("WhTotal = %v, want a positive time-based figure", res.WhTotal)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Guards
 // ---------------------------------------------------------------------------

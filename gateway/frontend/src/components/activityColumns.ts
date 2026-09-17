@@ -30,7 +30,9 @@ export type ColumnId =
   | 'energy_wh'
   | 'energy_marginal_wh'
   | 'energy_source'
-  | 'cost_eur';
+  | 'cost_eur'
+  | 'billing_unit'
+  | 'billing_quantity';
 
 export type ColumnDef = {
   id: ColumnId;
@@ -229,6 +231,24 @@ export const ACTIVITY_COLUMNS: ColumnDef[] = [
   {
     id: 'cost_eur',
     labelKey: 'activityColCostEur',
+    defaultVisible: false,
+    sortable: false,
+    numeric: true,
+  },
+  // The non-token billable measure (#70). No producer writes a unit yet, so
+  // every row shows "—/—" today; hidden by default. billing_unit copies
+  // energy_source's shape exactly -- a free-text wire enum rendered as a chip,
+  // non-sortable, em dash when empty.
+  {
+    id: 'billing_unit',
+    labelKey: 'activityColBillingUnit',
+    defaultVisible: false,
+    sortable: false,
+    numeric: false,
+  },
+  {
+    id: 'billing_quantity',
+    labelKey: 'activityColBillingQuantity',
     defaultVisible: false,
     sortable: false,
     numeric: true,

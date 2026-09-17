@@ -1847,6 +1847,22 @@ const de = {
   activityColEnergyMarginalWh: 'Energie marginal (Wh)',
   activityColEnergySource: 'Energie-Quelle',
   activityColCostEur: 'Kosten',
+  activityColBillingUnit: 'Abrechnungseinheit',
+  activityColBillingQuantity: 'Abrechnungsmenge',
+  activityColNonTokenRequests: 'Nicht-Token-Anfragen',
+  activityNotTokenMetered: 'Nicht in Token abgerechnet',
+  activityMixedUnitsHint: (n: number) => `Summe ohne ${n} nicht in Token abgerechnete Anfrage(n).`,
+  energySourceHelpMeasured:
+    'Gemessen: echte Leistungstelemetrie des Servers deckt das Zeitfenster dieser Anfrage lückenlos ab.',
+  energySourceHelpEstimated:
+    'Geschätzt: die konfigurierte Wattzahl des Servers (estimated_watts), über das Anfragefenster integriert und mit gleichzeitigen Anfragen geteilt.',
+  energySourceHelpModeled: 'Modelliert: ein Koeffizient für Wh pro Ausgabe-Token wurde angewandt.',
+  energySourceHelpUnpriceable:
+    'Keine Grundlage: diese Anfrage wird nicht in Token abgerechnet, und der Server hat weder Telemetrie noch eine konfigurierte Wattzahl. Setze estimated_watts für diesen Server, um sie zu bepreisen.',
+  energySourceHelpPending:
+    'Noch nicht bepreist: der Energie-Reconciler hat diese Zeile noch nicht verarbeitet.',
+  billingUnitHelpImage: 'Diese Anfrage wird pro Bild abgerechnet, nicht in Token.',
+  billingUnitHelpAudioSecond: 'Diese Anfrage wird pro Audiosekunde abgerechnet, nicht in Token.',
   activityCostUnit: 'Kosten-Einheit',
   activityGroupBy: 'Gruppieren nach',
   activityGroupAddLevel: '+ Ebene',
@@ -4089,6 +4105,21 @@ const en: PortalMessages = {
   activityColEnergyMarginalWh: 'Marginal energy (Wh)',
   activityColEnergySource: 'Energy source',
   activityColCostEur: 'Cost',
+  activityColBillingUnit: 'Billing unit',
+  activityColBillingQuantity: 'Billing quantity',
+  activityColNonTokenRequests: 'Non-token requests',
+  activityNotTokenMetered: 'Not token-metered',
+  activityMixedUnitsHint: (n: number) => `Sum excludes ${n} request(s) that are not token-metered.`,
+  energySourceHelpMeasured:
+    'Measured: real power telemetry from the server covers this request’s window without gaps.',
+  energySourceHelpEstimated:
+    'Estimated: the server’s configured wattage (estimated_watts), integrated over the request window and shared with concurrent requests.',
+  energySourceHelpModeled: 'Modeled: a Wh-per-output-token coefficient was applied.',
+  energySourceHelpUnpriceable:
+    'No basis: this request is not token-metered, and the server has neither telemetry nor a configured wattage. Set estimated_watts on this server to price it.',
+  energySourceHelpPending: 'Not yet priced: the energy reconciler has not processed this row.',
+  billingUnitHelpImage: 'This request is billed per image, not in tokens.',
+  billingUnitHelpAudioSecond: 'This request is billed per second of audio, not in tokens.',
   activityCostUnit: 'Cost unit',
   activityGroupBy: 'Group by',
   activityGroupAddLevel: '+ Level',

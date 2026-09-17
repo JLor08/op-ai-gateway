@@ -82,10 +82,25 @@ type Event struct {
 	// will fill EnergyWh (attributed energy for this request, watt-hours),
 	// EnergyMarginalWh (marginal energy vs. an idle baseline, watt-hours), and
 	// EnergySource (how it was derived, e.g. "measured"/"estimated").
-	EnergyWh         float64   `json:"energy_wh"`
-	EnergyMarginalWh float64   `json:"energy_marginal_wh"`
-	EnergySource     string    `json:"energy_source"`
-	CreatedAt        time.Time `json:"created_at"`
+	EnergyWh         float64 `json:"energy_wh"`
+	EnergyMarginalWh float64 `json:"energy_marginal_wh"`
+	EnergySource     string  `json:"energy_source"`
+	// BillingUnit/BillingQuantity are the non-token billable measure, and they are
+	// an XOR with the token columns: BillingUnit == "" means TOKEN-METERED (the
+	// five token columns are the measure and BillingQuantity is meaningless),
+	// while a non-empty BillingUnit means BillingQuantity is the measure and all
+	// seven token-denominated columns (the five token counts plus PromptPerSecond
+	// and TokensPerSecond) are 0. See ValidateBillingXOR.
+	//
+	// Both ARE real usage_events columns (unlike CostEUR below, which never is).
+	// No producer writes a non-empty unit yet -- every event today carries ""/0,
+	// which is what makes migration v81's defaults a truthful no-op over all
+	// history. "" is a POSITIVE assertion of token-metering and is never inferred:
+	// a unit may only ever come from endpoint identity, never from an upstream
+	// response.
+	BillingUnit     string    `json:"billing_unit"`
+	BillingQuantity float64   `json:"billing_quantity"`
+	CreatedAt       time.Time `json:"created_at"`
 	// CostEUR is a TRANSIENT, derived display field: (EnergyWh/1000) *
 	// price(Host), where price is the serving AI-server's own price_per_kwh
 	// when set (>0) else the system-wide energy_default_price_per_kwh
@@ -334,6 +349,9 @@ func (r *Recorder) Stats(q Query) (Stats, error) {
 	tokens := make([]float64, 0, len(filtered))
 	for _, e := range filtered {
 		totals.TotalRequests++
+		if e.BillingUnit != BillingUnitTokens {
+			totals.NonTokenRequests++
+		}
 		if IsError(e.Status, e.HTTPStatus) {
 			totals.ErrorCount++
 		}
@@ -414,6 +432,9 @@ func (r *Recorder) UsageGroups(_ context.Context, q Query, groupBy string) ([]Gr
 			acc[id] = b
 		}
 		b.Count++
+		if e.BillingUnit != BillingUnitTokens {
+			b.NonTokenRequests++
+		}
 		if IsError(e.Status, e.HTTPStatus) {
 			b.ErrorCount++
 		}

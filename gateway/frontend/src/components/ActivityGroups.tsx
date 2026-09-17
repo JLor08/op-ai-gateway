@@ -14,14 +14,17 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import KeyboardArrowDown from '@mui/icons-material/KeyboardArrowDown';
 import KeyboardArrowRight from '@mui/icons-material/KeyboardArrowRight';
 import { type ActivityQuery, type UsageEvent, type UsageGroupRow } from '../api';
-import type { PortalApi, Translation } from './shared/types';
+import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { formatCost, type CurrencyUnit } from '../currency';
 import { formatEnergyWh } from './StatTiles';
+import { isTokenMetered } from './billingUnit';
+import { TokenAggregateValue } from './TokenAggregateValue';
 import { SettingsMenu } from './SettingsMenu';
 import { useColumnSettings } from './shared/useColumnSettings';
 import { dimLabel } from './GroupByChainBuilder';
@@ -37,6 +40,7 @@ const MEMBER_LIMIT = 25;
 type GroupColId =
   | 'count'
   | 'error_count'
+  | 'non_token_requests'
   | 'input_tokens'
   | 'output_tokens'
   | 'total_tokens'
@@ -48,7 +52,13 @@ type GroupColId =
 
 type GroupColDef = {
   id: GroupColId;
-  labelKey: string;
+  // MessageKey, not string: a plain `string` here let the non_token_requests
+  // column ship with a labelKey that named the BILLING-UNIT label, so a count of
+  // requests was headed "Abrechnungseinheit" and neither the compiler nor a test
+  // could see it. Typing it like ColumnDef.labelKey in activityColumns.ts makes
+  // a wrong-but-existing key at least a key the reader can check, and a
+  // misspelled one a build error.
+  labelKey: MessageKey;
   align: 'left' | 'right';
   defaultVisible: boolean;
 };
@@ -56,6 +66,16 @@ type GroupColDef = {
 const GROUP_COLUMNS: GroupColDef[] = [
   { id: 'count', labelKey: 'activityGroupCount', align: 'right', defaultVisible: true },
   { id: 'error_count', labelKey: 'activityErrorCount', align: 'right', defaultVisible: true },
+  // How many of the group's requests are NOT token-metered (#70). Hidden by
+  // default -- it is the denominator behind the token cells' three states, not a
+  // metric operators asked for; switching it on is how they see the excluded
+  // count as a column instead of only in a tooltip.
+  {
+    id: 'non_token_requests',
+    labelKey: 'activityColNonTokenRequests',
+    align: 'right',
+    defaultVisible: false,
+  },
   // Token block order (per request): Tokens, Prompt, Cached, Cache-Write (hidden), Generiert.
   { id: 'total_tokens', labelKey: 'tableTokens', align: 'right', defaultVisible: true },
   { id: 'input_tokens', labelKey: 'activityColInput', align: 'right', defaultVisible: true },
@@ -212,23 +232,43 @@ export function ActivityGroups({
     return row.key_label || row.key;
   }
 
+  // '' already means "token-metered" on the wire, so a GROUP needs a third state
+  // the unit field cannot carry. non_token_requests supplies it as a count:
+  // none, all, or some -- and in the "some" case the sum is genuinely correct
+  // for the token-metered subset, so it is shown WITH a marker rather than
+  // suppressed. TokenAggregateValue is the one carrier of that rule and of the
+  // tooltips that explain it, shared with the stat tiles, the Dashboard tile and
+  // the project rollups.
+  function groupTokenCell(row: UsageGroupRow, value: number): ReactNode {
+    return (
+      <TokenAggregateValue
+        value={value}
+        nonTokenRequests={row.non_token_requests}
+        totalRequests={row.count}
+        t={t}
+      />
+    );
+  }
+
   // Rendered content of a configurable metric cell for a group row.
-  function cellValue(id: GroupColId, row: UsageGroupRow): string | number {
+  function cellValue(id: GroupColId, row: UsageGroupRow): ReactNode {
     switch (id) {
       case 'count':
         return row.count;
       case 'error_count':
         return row.error_count;
+      case 'non_token_requests':
+        return row.non_token_requests;
       case 'input_tokens':
-        return row.input_tokens;
+        return groupTokenCell(row, row.input_tokens);
       case 'output_tokens':
-        return row.output_tokens;
+        return groupTokenCell(row, row.output_tokens);
       case 'total_tokens':
-        return row.total_tokens;
+        return groupTokenCell(row, row.total_tokens);
       case 'cached_tokens':
-        return row.cached_tokens;
+        return groupTokenCell(row, row.cached_tokens);
       case 'cache_write_tokens':
-        return row.cache_write_tokens;
+        return groupTokenCell(row, row.cache_write_tokens);
       case 'energy_wh':
         return formatEnergyWh(row.energy_wh);
       case 'cost_eur':
@@ -244,10 +284,7 @@ export function ActivityGroups({
   const settingsBar = (
     <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1 }}>
       <SettingsMenu
-        items={GROUP_COLUMNS.map((c) => ({
-          id: c.id,
-          label: t[c.labelKey as keyof typeof t] as string,
-        }))}
+        items={GROUP_COLUMNS.map((c) => ({ id: c.id, label: t[c.labelKey] }))}
         hidden={hiddenCols}
         order={colOrder}
         onToggle={toggleCol}
@@ -376,7 +413,15 @@ export function ActivityGroups({
               <TableRow key={m.id}>
                 <TableCell>{m.model}</TableCell>
                 <TableCell>{m.server_name || '-'}</TableCell>
-                <TableCell align="right">{m.total_tokens}</TableCell>
+                <TableCell align="right">
+                  {isTokenMetered(m) ? (
+                    m.total_tokens
+                  ) : (
+                    <Tooltip title={t.activityNotTokenMetered}>
+                      <span>—</span>
+                    </Tooltip>
+                  )}
+                </TableCell>
                 <TableCell align="right">
                   {m.http_status || (m.status === 'error' ? t.no : t.yes)}
                 </TableCell>
@@ -429,7 +474,7 @@ export function ActivityGroups({
               <TableCell>{dimLabel(t, groupBy)}</TableCell>
               {visibleCols.map((c) => (
                 <TableCell key={c.id} align={c.align === 'right' ? 'right' : 'left'}>
-                  {t[c.labelKey as keyof typeof t] as string}
+                  {t[c.labelKey]}
                 </TableCell>
               ))}
             </TableRow>

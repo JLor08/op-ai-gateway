@@ -21,6 +21,12 @@ import type { StatTotals } from '../api';
 const defaultCostProps = { costUnit: 'eur_cent' as const, currencyFactor: 1 };
 const showAll = { order: DEFAULT_TILE_ORDER, hidden: [] as TileId[] };
 
+// Scope an assertion to ONE tile. StatTile renders its card as
+// <Paper component="article">, so the label's closest <article> is exactly that
+// tile -- `closest('div')` would escape to the surrounding tile GRID and make a
+// per-tile assertion a page-wide one.
+const tileFor = (label: string) => screen.getByText(label).closest('article') as HTMLElement;
+
 const totals: StatTotals = {
   total_requests: 42,
   error_count: 3,
@@ -179,11 +185,55 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(formatEnergyWh(2500)).toBe('2.50 kWh');
       });
 
-      it('defaults the energy tile to zero and the cost tile to an em dash when the totals omit them', () => {
+      it('defaults both the energy and the cost tile to an em dash when the totals omit them', () => {
         render(<StatTiles t={t} totals={totals} {...showAll} {...defaultCostProps} />);
-        expect(screen.getByText(formatEnergyWh(0))).toBeInTheDocument();
+        // An absent energy total is UNKNOWN, not zero. It now matches
+        // formatCost's long-standing 0/undefined convention instead of
+        // contradicting it. Assert per TILE rather than counting em dashes, so
+        // this stays as specific as the assertion it replaces.
+        expect(formatEnergyWh(0)).toBe('—');
+        expect(within(tileFor(t.activityEnergyTile)).getByText('—')).toBeInTheDocument();
         // total_cost_eur is undefined -> formatCost renders "—" (0/undefined convention).
-        expect(screen.getByText('—')).toBeInTheDocument();
+        expect(within(tileFor(t.activityCostTile)).getByText('—')).toBeInTheDocument();
+      });
+
+      it('dashes the token tiles when nothing in the population is token-metered', async () => {
+        render(
+          <StatTiles
+            t={t}
+            totals={{ ...totals, total_requests: 10, non_token_requests: 10 }}
+            {...showAll}
+            {...defaultCostProps}
+          />,
+        );
+        // Assert per tile, not by counting em dashes on the page.
+        for (const label of [
+          t.activityCachedTokens,
+          t.activityCacheWriteTokens,
+          t.activityInputTokens,
+          t.activityOutputTokens,
+        ]) {
+          expect(within(tileFor(label)).getByText('—')).toBeInTheDocument();
+        }
+        // A tile has the least context of any surface, so the dash must say why
+        // it is a dash -- the glyph on its own was never the requirement.
+        fireEvent.mouseOver(within(tileFor(t.activityInputTokens)).getByText('—'));
+        expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
+      });
+
+      it('marks the token tiles when the population is mixed', async () => {
+        render(
+          <StatTiles
+            t={t}
+            totals={{ ...totals, total_requests: 10, non_token_requests: 4, input_tokens: 100 }}
+            {...showAll}
+            {...defaultCostProps}
+          />,
+        );
+        expect(within(tileFor(t.activityInputTokens)).getByText('100*')).toBeInTheDocument();
+        // And the marker explains itself, naming the count it excludes.
+        fireEvent.mouseOver(within(tileFor(t.activityInputTokens)).getByText('100*'));
+        expect(await screen.findByText(t.activityMixedUnitsHint(4))).toBeInTheDocument();
       });
     });
   });

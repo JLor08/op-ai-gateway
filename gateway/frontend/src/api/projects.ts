@@ -76,6 +76,11 @@ export type ProjectToken = {
   created_at: string;
   last_used_at?: string;
   request_count: number;
+  // How many of `request_count` are NOT token-metered (a non-empty
+  // billing_unit). Required, like its sibling counters: the backend always sends
+  // it (portal.ProjectTokenDTO). Without it the three token columns below cannot
+  // tell a not-applicable from a measured zero.
+  non_token_requests: number;
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
@@ -86,6 +91,8 @@ export type ProjectToken = {
 // it may exceed the sum of the ProjectToken rows returned alongside it.
 export type ProjectTokenUsageTotal = {
   request_count: number;
+  // As on ProjectToken above, over the project's TRUE all-time population.
+  non_token_requests: number;
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;

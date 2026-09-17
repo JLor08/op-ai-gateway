@@ -112,6 +112,49 @@ func TestUsageGroupsScopedToOwnUser(t *testing.T) {
 	}
 }
 
+// TestUsageGroupsFoldCarriesNonTokenRequests proves the folded DTO discloses a
+// mixed population, and that TotalTokens stays the FORCED derivation over the
+// four component columns -- GroupBucket carries no stored total, so there is
+// nothing else it could be.
+func TestUsageGroupsFoldCarriesNonTokenRequests(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	rec := usage.NewRecorder()
+	// Same session key, DIFFERENT hosts, so the portal fold genuinely combines
+	// two buckets rather than passing one through.
+	rec.Record(usage.Event{
+		ID: "ev_tok", UserID: "usr_1", SessionID: "sess_x", Host: "srv_1", CreatedAt: now,
+		InputTokens: 10, OutputTokens: 7, CachedTokens: 2, CacheWriteTokens: 1,
+	})
+	rec.Record(usage.Event{
+		ID: "ev_img", UserID: "usr_1", SessionID: "sess_x", Host: "srv_2", CreatedAt: now,
+		BillingUnit: usage.BillingUnitImage, BillingQuantity: 5,
+	})
+
+	svc := NewService(ServiceDeps{Usage: rec, Clock: func() time.Time { return now }})
+
+	groups, err := svc.UsageGroups(
+		auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}},
+		usage.Query{},
+		"session",
+	)
+	if err != nil {
+		t.Fatalf("usage groups: %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("groups = %d, want 1 (both hosts fold under one session key)", len(groups))
+	}
+	g := groups[0]
+	if g.Count != 2 {
+		t.Fatalf("Count = %d, want 2 (a non-token request is a real request)", g.Count)
+	}
+	if g.NonTokenRequests != 1 {
+		t.Fatalf("NonTokenRequests = %d, want 1", g.NonTokenRequests)
+	}
+	if g.TotalTokens != 20 {
+		t.Fatalf("TotalTokens = %d, want 20 (10+7+2+1; the non-token row contributes nothing)", g.TotalTokens)
+	}
+}
+
 type stubUsers struct{ byID map[string]store.User }
 
 func (s stubUsers) UserByID(_ context.Context, id string) (store.User, error) {

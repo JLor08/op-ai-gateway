@@ -558,6 +558,56 @@ Because Codex and generic OpenAI traffic share `api_flavor="openai"`, the
 discriminator is the **endpoint**, not the flavor — `sessionEndpoint` distinguishes
 them explicitly.
 
+**The billable measure is a `(billing_unit, billing_quantity)` pair** (migration
+v81), not a scalar, and it is an **XOR** with the token columns.
+`billing_unit == ''` means the row is **token-metered**: the five token counts
+are its measure, and `billing_quantity` must be `0` (the XOR is enforced from
+both sides, so "meaningless" is not the same as "ignored"). Any other value —
+`image`, `audio_second` (`internal/usage/billing.go`) — means
+`billing_quantity` is the measure and every token-denominated column is `0`.
+The full decision, including why a scalar `units` column would have been wrong
+in three separate ways, is
+[ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar).
+Four properties of the contract are load-bearing and easy to undo by accident:
+
+- **The XOR covers SEVEN columns, not five.** `ValidateBillingXOR` requires a
+  non-token row to carry `0` in `input_tokens`, `output_tokens`,
+  `total_tokens`, `cached_tokens` and `cache_write_tokens` **and in
+  `prompt_per_second` and `tokens_per_second`**. The two rates are in the
+  invariant deliberately: they are not token counts, but `ComputeHistogram`
+  (§8.4.2) bins over **non-zero** values only, so a stray rate on a non-token
+  row would enter the speed histograms with nothing there that could fail it.
+  `recordUsage` validates, logs a violation at `Error`, and records the row
+  **unmodified** — repairing it silently would destroy the evidence that a
+  producer is wrong, and dropping it would lose a request from billing.
+- **`''` is a POSITIVE assertion that the row is token-metered, and a one-way
+  one.** That is what makes v81's defaults (`text not null default ''`,
+  `double precision not null default 0`) backfill all recorded history
+  *truthfully* rather than merely conveniently, and why no LLM path changed.
+  It is the opposite of `energy_source`'s `''` (§8.4.4), which means *not yet
+  processed*, is the reconciler's work queue, and is therefore expected to be
+  written over. Nothing may ever **default to** `billing_unit == ''`: reading
+  it as "unknown" turns the column back into the lie the pair replaced.
+- **A unit may only come from ENDPOINT IDENTITY, never from the provider
+  response.** Seven of the ten `recordUsage` call sites pass a zero
+  `provider.Response` — every error, timeout, client-disconnect and
+  capacity-queue-rejection path (the CP4 queue inside `Resolve`, *not* the
+  principal limiter, which never reaches `recordUsage` at all; see
+  [Compatibility & Inference
+  §13](compatibility-and-inference.md#13-errors)) — so a response-derived unit
+  would record a **failed** image request as token-metered with a zero
+  measure. The unit
+  travels on `usageMeta` instead, filled by the call site from the endpoint it
+  is serving, and left at its zero value by every token-metered call site.
+- **There is deliberately no normalizer.** An unknown unit is
+  `ErrBillingUnitUnknown`, an error — never a clamp to `''`. Clamping is the
+  ordinary-looking move (`NormalizeSort` in the same package does exactly that,
+  harmlessly), but here it would assert token-metering about a request that is
+  not token-metered. Do not add one.
+
+`usage.Row` embeds `usage.Event`, so the pair reaches the Activity list API
+with no DTO in between; there is no separate mapping step to keep in sync.
+
 ### 8.4.2 Query, stats, groups, time-series
 
 `usage.Store` (implemented by `usage.Recorder` in-memory and a SQL store behind the
@@ -569,13 +619,15 @@ same `dialect` seam) exposes:
   drill-down pins (`ServerExact`/`SessionIDExact`/`ModelExact`/`ProjectIDExact`) used
   to expand a folded group back into its member rows.
 - **`Stats`** — tile totals (`total_requests`, `error_count`, token sums,
-  `total_energy_wh`) plus Sturges-binned histograms (`ComputeHistogram`, 5–20 bins,
-  P50/P95/P99) of prompt/completion tokens-per-second over the **non-zero** values
-  only (`/api/portal/usage/stats`).
+  `total_energy_wh`, `non_token_requests`) plus Sturges-binned histograms
+  (`ComputeHistogram`, 5–20 bins, P50/P95/P99) of prompt/completion
+  tokens-per-second over the **non-zero** values only
+  (`/api/portal/usage/stats`).
 - **`UsageGroups`** — folds the filtered set by `session|server|user|token|model|
   service|project` into `(key, host)` buckets (`/api/portal/usage/groups`); the
   portal layer (`service_usage_groups.go`) folds by key across hosts and
-  cost-weights each host's energy by that server's resolved price.
+  cost-weights each host's energy by that server's resolved price. Each bucket
+  also carries `NonTokenRequests`, folded by plain summation.
 - **`TimeSeries`** — buckets events into `[connections, concurrency,
   prompt/completion tokens-per-second, energy_wh]` per bucket
   (`/api/portal/usage/timeseries`); `Connections` attributes to the bucket
@@ -588,6 +640,78 @@ same `dialect` seam) exposes:
 - A `usage.Broker` (`broker.go`) is a payload-free fan-out: any write calls
   `Publish()`, and every SSE subscriber (`/api/portal/usage/events`) just re-fetches
   its own scope — no data crosses a user boundary through the broker itself.
+
+**Mixed billable units are DISCLOSED, not folded.** A token sum over a
+population that contains non-token rows (§8.4.1) is correct for the
+token-metered *subset* and silently misleading about the rest, so the answer is
+a count rather than a different aggregate: `NonTokenRequests`
+(`non_token_requests` on the wire) on `usage.StatTotals` and
+`usage.GroupBucket`, plus `non_token_requests_24h` on
+`portal.DashboardMetrics`. Only **one** of the three counts in SQL:
+`UsageGroups` adds a
+`sum(case when billing_unit <> '' then 1 else 0 end)` to its existing
+aggregate list (`store/sqlite_usage.go`). `StatTotals.NonTokenRequests` and
+`DashboardMetrics.NonTokenRequests24h` count **in Go** instead — the former over
+the `billing_unit` column the `Stats` query already fetches per row
+(`store/sqlite_usage.go`, mirrored in the in-memory `usage/recorder.go`), the
+latter over the events `Dashboard` walks anyway (`portal/service.go`). The
+semantics are identical in all three: every one tests against the empty
+sentinel, never against a list of known units, so a unit a future backend
+invents is classified the same way everywhere. Two
+things deliberately did **not** change, and both are load-bearing
+([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)):
+the `GROUP BY` clause is untouched, because folding by `billing_unit` would
+change every existing grouped row's identity; and `billing_quantity` is
+**never summed at group level**, because a sum of images plus seconds plus
+tokens has no dimension.
+
+The portal renders that in **two** rules, and they are different rules over
+different inputs — conflating them is the easy mistake, because both produce an
+em dash:
+
+- **Per ROW: a two-state rule**, keyed on that one row's own `billing_unit` and
+  reading no count at all. Tokens either apply to the row or they do not: the
+  value, or an em dash with a tooltip. There is no "mixed" state, because a
+  single row has one unit.
+- **Per AGGREGATE: the three-state rule**, keyed on `non_token_requests`
+  against the population size. All rows token-metered → the number; none → an
+  em dash; a mixed population → the number followed by `*`, meaning "correct
+  for the token-metered subset". Both exceptional states carry a tooltip
+  saying what the marker means — a bare `*` an operator cannot interpret is
+  barely better than the wrong number it replaced. An **empty** population
+  renders the number, not a dash: "no rows at all" is not "tokens do not apply
+  here".
+
+**The aggregate rule is centralised; the row rule is not.** One shared
+component, `gateway/frontend/src/components/TokenAggregateValue.tsx` over
+`billingUnit.ts`'s `tokenAggregate`, carries the three-state rule and its
+tooltips for all **four** aggregate surfaces — the grouped table's own row
+cells, the four Activity stat tiles, the Dashboard 24h tile, and the
+ProjectsView rollups (rows and total) — so a change to the rule or to its
+wording lands on all four at once. The per-row two-state rule is instead
+applied at each row-rendering site, and there are **two** of them, both with
+their own inline `Tooltip`: `ActivityTable.tsx`'s `tokenCountCell` (the
+Activity list's token cells) and the inline conditional in `ActivityGroups.tsx`
+that renders a folded group's **expanded member table**. Both carry the tooltip
+today; neither is reached by editing `TokenAggregateValue`. A maintainer
+changing row-level behaviour has to change both, and `isTokenMetered` is the
+only thing they share.
+
+This is the converse of §8.4.3's live-counter rule that a measured zero must
+read as `0` — here a not-applicable zero must never be indistinguishable from
+a measured one, which is also why `formatEnergyWh(0)` now renders an em dash.
+
+The `energy_source` and `billing_unit` cells render as chips showing the **raw
+wire value**, with an explanatory tooltip keyed on the full enum value in both
+UI languages; a value this build does not recognise gets the chip and **no**
+tooltip, because silence is honest where a guessed label would not be. The
+`billing_unit` and `billing_quantity` columns ship **hidden**, revealed from the
+Activity column menu: no endpoint in this repository writes a unit yet (#71,
+#68 and #69 own the endpoints that will), so on current traffic every row is
+token-metered and both cells read as an em dash. The disclosure count and both
+rules are therefore in place *before* the first producer, which is
+the point — they are what makes the first non-token row readable on arrival
+instead of silently wrong.
 
 ### 8.4.3 Running connections (active requests)
 
@@ -1063,7 +1187,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-80-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-81-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -1465,7 +1589,7 @@ columns had a lock.** Every verdict either capability detector yields is a
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-80-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-81-migrations)). The four
 names the detector itself reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
@@ -2065,8 +2189,9 @@ Energy is **not** computed at request time — `recordUsage` always inserts
 telemetry/sibling events to land) but is still inside a bounded backfill horizon,
 so a persistently un-priceable event is retried rather than forever. Idempotency
 comes from that same `energy_source==""` selector: every event the reconciler
-touches is stamped (even a zero-Wh "modeled" fallback), so a re-run never
-reprocesses it.
+touches is stamped (even a zero-Wh "modeled" fallback, and even a row no tier
+could price at all — see `unpriceable` below), so a re-run never reprocesses
+it.
 
 `ComputeEnergy` (`energy_engine.go`) is a pure, tiered hybrid — it always produces a
 result:
@@ -2077,10 +2202,13 @@ flowchart TD
     T1 -->|yes| M["Integrate ∫ power(t)/concurrency(t) dt\nover the request's own window,\nshared with concurrent sibling requests"]
     T1 -->|no| T2{"Tier 2: estimated\nServer.EstimatedWatts set?"}
     T2 -->|yes| E["Integrate a flat wattage,\nsame concurrency-sharing model"]
-    T2 -->|no| T3["Tier 3: modeled\nWh = coeff × OutputTokens\n(mapping coefficient, else system default)"]
+    T2 -->|no| U{"Is the row token-metered?\n(billing_unit == '')"}
+    U -->|yes| T3["Tier 3: modeled\nWh = coeff × OutputTokens\n(mapping coefficient, else system default)"]
+    U -->|no| X["unpriceable\nNOT a tier: no tier could apply.\n0 Wh, stamped, terminal"]
     M --> Result["EnergyResult{WhTotal, WhMarginal, Source}"]
     E --> Result
     T3 --> Result
+    X --> Result
     Result --> Idle["WhMarginal subtracts an idle baseline:\noperator IdleWatts override,\nelse idleTracker's rolling-minimum estimate"]
     Idle --> Store["UpdateUsageEventEnergy(id, WhTotal, WhMarginal, Source)"]
 ```
@@ -2100,6 +2228,60 @@ A system-wide Power Usage Effectiveness (PUE) multiplier (`effectivePue`) is app
 on top of every tier's raw server-watts figure: the server's own configured value,
 else a system default, else 1.0.
 
+**Tier 3 is a TOKEN-ONLY surface, and a non-token row is stamped
+`unpriceable`.** `Wh = coeff × OutputTokens` is denominated in watt-hours per
+*token*; there is no honest way to evaluate it for a request whose measure is
+an image or a second of audio (§8.4.1). So `modeledEnergy` opens with a guard
+keyed on `ev.BillingUnit != usage.BillingUnitTokens` and returns a **fourth**
+`energy_source` value, `unpriceable` — provenance rather than a tier, meaning
+*no tier could apply*. Tiers 1 and 2 are token-blind and still price such a row
+whenever their own preconditions hold, so only a **Tier-3-only host** on a
+non-token row ends up here. The guard lives inside `modeledEnergy` rather than
+at a caller because Tier 3 has **two** entry points — `ComputeEnergy` and
+`reconcileEnergyEvent`'s deleted-server shortcut — and a guard on one of them
+is not a guard. It is keyed on the unit and deliberately **not** on
+`OutputTokens == 0`: that confines the new value to rows which cannot exist
+before v81, leaves every token path byte-identical (including the zero-
+coefficient row that is pinned as desirable), and *respects* the XOR instead of
+trusting it — a producer bug leaving `OutputTokens` non-zero on an image row can
+then never be multiplied by a Wh-per-token coefficient.
+
+**The stamp is mandatory, not optional, and the argument is about starvation
+rather than tidiness.** `UnpricedUsageEvents` selects on
+`energy_source == ''`, oldest-first, `LIMIT 500`, over a 168h horizon. Leaving
+a never-priceable row at `''` would not merely accumulate a backlog: such rows
+occupy the **oldest end of every batch**, so the reconciler stops reaching
+newer events altogether — including token rows Tier 1 would have measured
+perfectly. The only real choice is *which* non-empty string, and `modeled`
+would claim a derivation that never happened. `unpriceable` is terminal by
+design: the stamp removes the row from the selector, which is exactly what
+keeps the reconciler idempotent. It is not irreversible, though —
+`UpdateUsageEventEnergy` writes by id with no source predicate, so a later
+mechanism can re-stamp these rows.
+
+**The operator remedy is `estimated_watts` on that server.** Tier 2 is
+time-based and concurrency-shared, so it prices *every* endpoint kind at once,
+dimensionally honestly, with no new column and no per-family coefficient. That
+is the answer to "my image requests show no energy", and it is a one-field
+change.
+
+**Any future per-unit coefficient must carry its own declared unit and apply
+only on an exact match** against the row's `billing_unit`, with a mismatch
+yielding **0 Wh and never a wrong Wh**. A bare coefficient with no declared
+unit is the same lie a scalar `units` column would have been, moved to the
+pricing side — see
+[ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar),
+which also records why synthesizing an `OutputTokens` value to make Tier 3
+answer is the one shortcut that must never be taken here.
+
+**The EWMA calibration is likewise token-only, explicitly.** A measured Tier-1
+event calibrates its mapping's `energy_wh_per_token` only when
+`ev.BillingUnit == usage.BillingUnitTokens`. That conjunct is written out rather
+than left implied by `OutputTokens > 0`, because dividing `WhMarginal` by
+`billing_quantity` is the second surface ADR-041 names: it would write a
+per-image number into a per-token column and corrupt Tier 3 for every chat
+request on that mapping.
+
 ### 8.4.5 Cost and currency
 
 Cost is a **transient, read-time** figure — never a DB column, never touched by any
@@ -2111,6 +2293,71 @@ display-only `PriceUnit` (migration 37) so the operator's configured currency/un
 label round-trips even though the underlying figure is always computed in the same
 base unit.
 
+**`CostBudget` is enforced against a SECOND derivation of the same figure, and
+`routing.Store.UsageAggregateSince` is its source of truth.** The read-time
+path above is a display path: it computes cost in the portal layer, per row or
+per bucket, and never stores it. The principal limiter cannot use it, because a
+budget is a per-principal, per-calendar-period total rather than a per-row
+figure. `UsageAggregateSince(principalType, principalID, since)` therefore sums
+three things in the store — request **count**, `total_tokens`, and
+price-weighted **cost** — over `usage_events` with `created_at >= since`,
+matching `service_id` for a service principal and `user_id` for a user one, and
+it re-derives the cost with the *same* per-host weighting (`energy_wh/1000 ×`
+that server's own `price_per_kwh` when set, else the system-wide
+`energy_default_price_per_kwh`) so a `CostBudget` threshold compares
+apples-to-apples with every cost the portal displays. `PrincipalLimiter.Admit`
+reads it through a 10s per-`(principal, period)` cache, and a store error is
+treated as a **zero** aggregate — fail-open, since zero can never exceed a
+positive threshold. The memory driver holds no `usage_events` at all (usage in
+memory/dev mode lives in the non-persistent `usage.Recorder`), so it returns a
+zero aggregate honestly: quota and budget enforcement is a
+persistent-store feature by design.
+
+**Durable quota accounting comes from the usage_events ROW, not from
+`Limiter.Record`.** This seam is easy to miss because three different things
+count a request, at three different lifetimes:
+
+1. **The rate bucket** is consumed inside `Admit` itself
+   (`PrincipalLimiter.checkRate` increments its per-window counter before the
+   request proceeds), so it is spent by the *attempt*, whatever happens next.
+2. **`PrincipalLimiter.Record`** is an optimistic, **in-memory** bump of the
+   aggregate-cache entry for each of the principal's configured quota/budget
+   periods. It takes no context, does no I/O, and cannot fail; its only job is
+   to keep pace with a dense burst between store reloads. A restart, a calendar
+   rollover or the next 10s TTL expiry all discard it and reconcile back to the
+   store. It is explicitly **not** a source of truth — which is also why it may
+   pass `cost = 0`, that being exactly what a fresh read would return for a row
+   the energy reconciler has not priced yet.
+3. **The durable figure is derived entirely from the row.**
+   `UsageAggregateSince` is a plain `count(*)` and `sum(total_tokens)` over
+   `usage_events` (plus the per-host energy weighting for cost), with no status
+   filter. If there is no row, there is no consumption — permanently.
+
+`Limiter.Record` has exactly **one** call site, and it is inside `recordUsage`.
+So the two counts stand or fall together with the row, and **a future handler
+that writes its own response without going through `recordUsage` would pass
+`Admit`, spend its rate bucket, and consume no durable request quota, token
+quota or cost budget at all.** Nothing would fail; the principal's aggregate
+would simply never see those requests. Any new inference-shaped endpoint
+(#71, #68, #69) must therefore record a `usage_events` row — recording the row
+*is* the quota write, and calling `Limiter.Record` instead would only warm a
+cache that the next TTL expiry throws away.
+
+Two further consequences of that shape matter for a non-token request
+(§8.4.1). Its
+`total_tokens` is `0`, so it consumes `RequestQuota` and `CostBudget` but can
+never move `TokenQuota` — and that is the point: the alternative is
+synthesizing a token count, which
+[ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)
+forbids precisely *because* this sum is the quota source of truth. And its
+`CostBudget` contribution is whatever energy attribution produced, so on a
+Tier-3-only host it is `0` — the row is `unpriceable` (§8.4.4) and the budget
+does not bite. The remedy is the same one-field change, `estimated_watts`
+([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)); there is no
+quota or budget denominated in `billing_quantity`, and that gap is owned by
+issue #119
+([§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
 ```mermaid
 flowchart LR
     subgraph "Request time (synchronous)"
@@ -2120,7 +2367,7 @@ flowchart LR
         D --> E["usage.Broker.Publish()\n→ Activity/Active SSE refetch"]
     end
     subgraph "Energy reconciliation (async, every 15s)"
-        F["UnpricedUsageEvents\n(settled + within backfill window)"] --> G["ComputeEnergy\n(measured/estimated/modeled)"]
+        F["UnpricedUsageEvents\n(settled + within backfill window)"] --> G["ComputeEnergy\n(measured/estimated/modeled,\nelse unpriceable)"]
         G --> H["UpdateUsageEventEnergy"]
     end
     subgraph "Read time (portal layer)"

@@ -35,6 +35,7 @@ import type {
 } from '../api';
 import type { Translation, MessageKey, PortalApi } from './shared/types';
 import { formatPortalError, formatDate } from './shared/format';
+import { TokenAggregateValue } from './TokenAggregateValue';
 import { useResource } from './shared/useResource';
 import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
@@ -292,7 +293,13 @@ export function ProjectsView({
           showError(formatPortalError(err, t));
           setProjectTokens({
             tokens: [],
-            total: { request_count: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            total: {
+              request_count: 0,
+              non_token_requests: 0,
+              input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 0,
+            },
           });
         }
       })
@@ -1012,6 +1019,26 @@ export function ProjectsView({
     const tokenRows = projectTokens?.tokens ?? [];
     const tokenStillLoading = tokensLoading && projectTokens === null;
 
+    // Three states (#70): tokens do not APPLY to a non-token-metered request, so
+    // a token-only population dashes and a mixed one is marked. All six
+    // token-denominated cells on this screen -- the three ProjectToken columns
+    // and the three ProjectTokenUsageTotal footers -- differ only in `value`, so
+    // the population counts, `t` and the locale formatter live here once. The
+    // columns' own `value` accessors stay the raw number, so sorting and
+    // filtering keep working on it.
+    const tokenCell = (
+      population: { non_token_requests: number; request_count: number },
+      value: number,
+    ) => (
+      <TokenAggregateValue
+        value={value}
+        nonTokenRequests={population.non_token_requests}
+        totalRequests={population.request_count}
+        t={t}
+        format={(n) => n.toLocaleString()}
+      />
+    );
+
     const tokenColumns: ListColumn<ProjectToken>[] = [
       { id: 'name', label: t.tableName, value: (tok) => tok.name, filter: 'text' },
       {
@@ -1044,21 +1071,21 @@ export function ProjectsView({
         label: t.projectsTokensColPrompt,
         value: (tok) => String(tok.input_tokens),
         numeric: true,
-        render: (tok) => tok.input_tokens.toLocaleString(),
+        render: (tok) => tokenCell(tok, tok.input_tokens),
       },
       {
         id: 'generated',
         label: t.projectsTokensColGenerated,
         value: (tok) => String(tok.output_tokens),
         numeric: true,
-        render: (tok) => tok.output_tokens.toLocaleString(),
+        render: (tok) => tokenCell(tok, tok.output_tokens),
       },
       {
         id: 'total',
         label: t.projectsTokensColTotal,
         value: (tok) => String(tok.total_tokens),
         numeric: true,
-        render: (tok) => tok.total_tokens.toLocaleString(),
+        render: (tok) => tokenCell(tok, tok.total_tokens),
       },
     ];
 
@@ -1115,14 +1142,16 @@ export function ProjectsView({
                     {projectTokens.total.request_count.toLocaleString()}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    {t.projectsTokensColPrompt}: {projectTokens.total.input_tokens.toLocaleString()}
+                    {t.projectsTokensColPrompt}:{' '}
+                    {tokenCell(projectTokens.total, projectTokens.total.input_tokens)}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
                     {t.projectsTokensColGenerated}:{' '}
-                    {projectTokens.total.output_tokens.toLocaleString()}
+                    {tokenCell(projectTokens.total, projectTokens.total.output_tokens)}
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    {t.projectsTokensColTotal}: {projectTokens.total.total_tokens.toLocaleString()}
+                    {t.projectsTokensColTotal}:{' '}
+                    {tokenCell(projectTokens.total, projectTokens.total.total_tokens)}
                   </Typography>
                 </Box>
               </Box>

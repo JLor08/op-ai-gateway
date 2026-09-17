@@ -507,7 +507,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-80-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -563,7 +563,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-80-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -732,7 +732,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-80-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -893,7 +893,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-80-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1108,7 +1108,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-80-migrations),
+[§4](reference/data-model.md#4-migration-history-81-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1297,4 +1297,157 @@ extended — whereas this changes what the scorer reads and what the words mean.
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
 [Agent-Managed Model Runtime
 §11.7](cross-cutting/agent-runtime-manager.md#117-live-runtime-state-on-the-models-catalog),
+[Glossary](12-glossary.md).
+
+## ADR-041 — A billable measure is a (unit, quantity) pair, never a scalar
+**Context:** `usage_events` was built for exactly one kind of request. Its
+measure is five token columns, every aggregate over it is a `sum` of one of
+those columns, and both readers that turn a request into a physical quantity —
+`modeledEnergy`'s Tier 3 and the EWMA calibration in `energy_reconciler.go` —
+are denominated in *watt-hours per token*. Issue #70 admits request families
+whose natural measure is not a token at all: an image generation is billed per
+image, speech synthesis and transcription per second of audio. The obvious
+shape is one more numeric column — `units double precision` — and it is the
+wrong one, because the number it would hold means something different on every
+row and therefore means nothing about the table. **It would be a lie in three
+directions at once.** *Aggregation:* `sum(units)` over a mixed population adds
+tokens to images to seconds and returns a figure with no dimension, and
+neither SQL nor Go would object — the sum is the natural thing to write, so the
+column's mere existence is the defect. *Readability:* no reader of a single row
+could recover whether a `4` was four tokens, four images or four seconds, so
+every consumer would have to re-derive the unit from `req_path` — the endpoint
+identity the column was supposed to be recording in the first place.
+*Pricing:* a coefficient multiplied into an undeclared scalar is itself
+undeclared, so a Wh-per-token number would be applied to a count of images and
+yield a plausible, wrong watt-hour figure — worse than no figure, because
+nothing downstream can tell it from a real one.
+
+**Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-81-migrations)),
+because a quantity without its unit is the scalar this entry rejects and a unit
+without its quantity records nothing. The quantity is only ever read *through*
+the unit: whoever wants a number must first agree what it counts. The
+vocabulary is deliberately small and open only at the code level —
+`BillingUnitTokens` (`""`), `BillingUnitImage` (`"image"`),
+`BillingUnitAudioSecond` (`"audio_second"`) in
+`internal/usage/billing.go`. Two named units, not three: `"character"` belongs
+to an external price list rather than to this system, and audio.cpp's own
+metering signal is a *duration*, so speech and transcription share one unit.
+
+**(a) `""` means token-metered, and it is a POSITIVE assertion — a one-way
+one.** This is what makes the pair a true no-op for every row that already
+exists: the DDL defaults (`text not null default ''`,
+`double precision not null default 0`) backfill the whole of history
+*truthfully*, because every recorded request to date really was token-metered.
+The asymmetry with `energy_source` is the part worth holding on to. There,
+`""` means *not yet processed* and is the reconciler's own work queue, so a
+value may be written into it and later replaced. Here `""` is a claim about
+what was measured, and nothing may ever *default to* it: a row that arrives
+carrying an unknown unit is not a token-metered row, and writing `""` over it
+would manufacture the assertion. Reading `""` as "unknown" is the single
+misreading that turns this column back into the lie it replaced.
+
+**(b) The XOR is enforced, over SEVEN columns, and a violation is logged rather
+than repaired.** `ValidateBillingXOR` requires that a token-metered row carry
+no `billing_quantity`, and that a non-token row carry zero in the five token
+counts **plus `prompt_per_second` and `tokens_per_second`**. The two rates are
+in the invariant deliberately, and they are the non-obvious half of it: they
+are not token *counts*, but `ComputeHistogram` bins over non-zero values only
+by design, so a stray rate on a non-token row would enter the speed histograms
+and there is nothing there that could fail. `recordUsage` validates, logs a
+violation at `Error`, and then records the row **unmodified** — silently
+repairing the data would destroy the evidence that a producer is wrong, and
+dropping the row would lose a request from billing outright.
+
+**(c) A unit may only come from ENDPOINT IDENTITY, never from the response.**
+Seven of the ten `recordUsage` call sites pass a zero `provider.Response`
+(every error, timeout, disconnect and admission-rejection path), so a
+response-derived unit would stamp `""` on a *failed* image request and record
+it as token-metered with a zero measure — the exact lie the pair exists to
+prevent, arriving through the one path an operator is most likely to inspect.
+The unit therefore travels on `usageMeta`, which the call site fills from the
+endpoint it is serving, and is left at its zero value by every token-metered
+call site.
+
+**(d) There is deliberately NO normalizer.** An unknown unit is
+`ErrBillingUnitUnknown`, not a clamp. Clamping to `""` would be the ordinary,
+harmless-looking move — `NormalizeSort`'s default a few files away is exactly
+that — but here it would assert token-metering about a request that is not
+token-metered, which is (a) run backwards. Do not add one.
+
+**Consequence: two code surfaces would each tempt a unit→token conversion, and
+both are forbidden.** They are named here because in both cases the conversion
+is the *shortest* available change, and neither would fail a test that only
+checks for a number.
+
+1. **`modeledEnergy`'s `coeff * ev.OutputTokens`.** The least-effort way to
+   make Tier 3 produce a watt-hour figure for an image is to synthesize an
+   `OutputTokens` value from the image count. Tier 3 is instead a token-only
+   surface: a guard at the top of `modeledEnergy`, keyed on
+   `ev.BillingUnit != usage.BillingUnitTokens`, returns the terminal provenance
+   `unpriceable` ([Telemetry, Usage Analytics & Observability
+   §8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution)).
+   The guard sits inside `modeledEnergy` rather than at a caller because Tier 3
+   has **two** entry points — `ComputeEnergy` and `reconcileEnergyEvent`'s
+   deleted-server shortcut — and a guard at one of them is not a guard.
+2. **The EWMA calibration divisor in `energy_reconciler.go`.** Dividing
+   `WhMarginal` by `billing_quantity` would write a per-image number into
+   `energy_wh_per_token`, poisoning Tier 3 for every *chat* request on that
+   mapping. That guard now carries an explicit
+   `ev.BillingUnit == usage.BillingUnitTokens` conjunct rather than leaning on
+   `OutputTokens > 0`, which holds only because a producer in another package
+   honours an unenforced convention.
+
+**Neither is acceptable, and the reason is not aesthetic: a fabricated token
+count poisons `sum(total_tokens)`, which is the quota source of truth.**
+`routing.Store.UsageAggregateSince` sums that column per principal per
+calendar period, and `PrincipalLimiter.Admit` compares the sum against
+`LimitConfig.TokenQuota` ([§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency)).
+A synthesized token count is therefore not a display artefact — it silently
+consumes somebody's quota and eventually denies their chat traffic with a 429
+for images they were never told cost tokens. The XOR's zeroed token columns are
+what keep that sum honest, and (b) is why they are enforced rather than assumed.
+
+**Any future per-unit coefficient must carry its own declared unit and apply
+only on an exact match.** A coefficient of `0.4 Wh` is meaningless; `0.4 Wh per
+image` is not. A mismatch between a coefficient's declared unit and the row's
+`billing_unit` must yield **0 Wh and never a wrong Wh** — the same rule as (d),
+one layer out. A bare coefficient without a declared unit is precisely the lie
+a scalar `units` column would have been, re-introduced on the pricing side.
+
+**Rejected:** **a scalar `units` column** — the Context is the whole argument.
+— **A column per family** (`image_count`, `audio_seconds`, …): every new
+endpoint family costs a migration, the XOR grows quadratically, and
+`usage_events` already carries no foreign keys precisely so it can absorb
+history it does not understand. — **Widening `UsageGroups`' `GROUP BY` with
+`billing_unit`**, and **summing `billing_quantity` at group level.** Folding by
+unit would silently change every existing grouped row's identity, and a summed
+quantity across a mixed population is the dimensionless number this entry
+rejects. What ships instead is a *disclosure*: a count of the non-token rows —
+`NonTokenRequests` on `usage.StatTotals` and `usage.GroupBucket`,
+`non_token_requests` on the wire — so a consumer can tell that a token
+aggregate covers a subset, without the aggregate itself pretending otherwise
+([§8.4.2](cross-cutting/telemetry-usage-observability.md#842-query-stats-groups-time-series)).
+Only `UsageGroups` expresses that count in SQL, as a
+`sum(case when billing_unit <> '' then 1 else 0 end)` aggregate; `StatTotals`
+and `portal.DashboardMetrics` count it in Go over rows they already walk. All
+three test against the empty sentinel rather than a list of known units, so the
+classification is identical — including for a unit a future backend invents.
+— **A second limiter dimension** keyed on `billing_unit`. #70 forbids it
+explicitly; the capability gap it leaves (a non-token request consumes
+`RequestQuota` and `CostBudget` but never `TokenQuota`) is recorded in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) and
+owned by issue #119. — **`real` for `billing_quantity`**: `double precision`
+from the start, per [ADR-005](#adr-005--postgresql-needs-wide-column-types),
+so the int4/float4 class cannot recur on a brand-new column.
+→ [Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[§8.4.2](cross-cutting/telemetry-usage-observability.md#842-query-stats-groups-time-series),
+[§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
+[§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
+[Data Model §1](reference/data-model.md#1-current-tables-by-area),
+[§4](reference/data-model.md#4-migration-history-81-migrations),
+[Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks),
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [Glossary](12-glossary.md).

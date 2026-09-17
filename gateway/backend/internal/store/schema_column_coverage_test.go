@@ -89,3 +89,41 @@ func assertColumnCoverage(ctx context.Context, t *testing.T, s *SQLStore, table 
 		t.Errorf("%s.%s exists in the migrated schema but the parity fixture covers no such column. A column no fixture row seeds a distinguishing value into reads back its zero from every reader, so a reader that drops it (e.g. the ActiveMappingsForModel join) stays GREEN while live routing ignores it (issue #84). Classify it: if it is an integer-boolean, add it to the bit-pattern (bools) and widen the table; if the fixture should vary it, add it to seeded and seed a distinct value; only if it is genuinely unread, add it to ignored WITH a reason.", table, col)
 	}
 }
+
+// TestUsageEventsSchemaColumnsAllCovered is the #84 guard applied to
+// usage_events. Unlike applications/ai_servers/agent_runtime_specs it has no
+// reader-agreement fixture pinning a bit-pattern for its one
+// integer-boolean column (stream) -- this test exists purely so a future
+// column that reaches neither usageEventColumns nor Record's INSERT list
+// cannot stay invisible to every test in this package the way the billing
+// pair itself could have.
+//
+// request_id is the one WRITE-only column: Record's INSERT list carries it,
+// but usageEventColumns (and its textual duplicates in ByUser/All) never
+// select it back, because id already identifies the row for every lookup.
+// It is declared in `ignored` rather than `seeded` for that reason -- it is
+// not "genuinely unread" by oversight, it is unread by design, but the
+// distinction the ignored map exists to record is the same: no fixture row
+// needs to seed it a distinguishing value.
+func TestUsageEventsSchemaColumnsAllCovered(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		assertColumnCoverage(context.Background(), t, s, "usage_events", columnCoverage{
+			bools: []string{"stream"},
+			seeded: []string{
+				"agent_id", "api_flavor", "billing_quantity", "billing_unit",
+				"cache_write_tokens", "cached_tokens", "content_type", "created_at",
+				"energy_marginal_wh", "energy_source", "energy_wh", "error_code",
+				"host", "http_status", "id", "input_tokens", "latency_ms", "model",
+				"output_tokens", "project_id", "project_name", "prompt_per_second",
+				"provider", "provider_model", "provider_path", "req_path",
+				"requested_model", "route_id", "server_name", "service_id",
+				"service_name", "session_id", "session_source", "status",
+				"token_id", "token_name", "tokens_per_second", "total_tokens",
+				"user_id",
+			},
+			ignored: map[string]string{
+				"request_id": "written by Record's INSERT but never selected back by any reader (id already identifies the row; usageEventColumns, ByUser and All all omit it)",
+			},
+		})
+	})
+}

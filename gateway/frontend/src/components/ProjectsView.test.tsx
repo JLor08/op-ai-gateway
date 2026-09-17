@@ -41,6 +41,7 @@ function makeProjectToken(overrides: Partial<ProjectToken> = {}): ProjectToken {
     status: 'active',
     created_at: '2026-08-01T00:00:00Z',
     request_count: 0,
+    non_token_requests: 0,
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
@@ -49,7 +50,14 @@ function makeProjectToken(overrides: Partial<ProjectToken> = {}): ProjectToken {
 }
 
 function makeUsageTotal(overrides: Partial<ProjectTokenUsageTotal> = {}): ProjectTokenUsageTotal {
-  return { request_count: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, ...overrides };
+  return {
+    request_count: 0,
+    non_token_requests: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    ...overrides,
+  };
 }
 
 function makeAdminGroup(
@@ -902,6 +910,71 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText(`${t.projectsTokensColPrompt}: 5,000`)).toBeInTheDocument();
       expect(screen.getByText(`${t.projectsTokensColGenerated}: 4,000`)).toBeInTheDocument();
       expect(screen.getByText(`${t.projectsTokensColTotal}: 9,000`)).toBeInTheDocument();
+    });
+
+    it('applies the three-state rule to the token rows and the total line (#70)', async () => {
+      const owned = makeProject({
+        id: 'proj_owned',
+        name: 'Owned Project',
+        owner_user_id: 'usr_1',
+        my_role: 'owner',
+        can_manage: true,
+      });
+      renderProjectsView({
+        projects: [owned],
+        userId: 'usr_1',
+        tokens: [
+          // Every request billed per image: its three token columns are 0
+          // because tokens do not APPLY, not because nothing was measured.
+          makeProjectToken({
+            id: 'tok_img',
+            name: 'Image Token',
+            request_count: 4,
+            non_token_requests: 4,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+          }),
+          // Mixed: the sums are correct for the token-metered subset only.
+          makeProjectToken({
+            id: 'tok_mixed',
+            name: 'Mixed Token',
+            request_count: 10,
+            non_token_requests: 4,
+            input_tokens: 1000,
+            output_tokens: 20,
+            total_tokens: 1020,
+          }),
+        ],
+        tokensTotal: makeUsageTotal({
+          request_count: 20,
+          non_token_requests: 8,
+          input_tokens: 5000,
+          output_tokens: 4000,
+          total_tokens: 9000,
+        }),
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.projectsActionTokens }));
+      await screen.findByRole('heading', { name: t.projectsTokensTitle('Owned Project') });
+      const imageRow = (await screen.findByText('Image Token')).closest('tr') as HTMLElement;
+      const mixedRow = (await screen.findByText('Mixed Token')).closest('tr') as HTMLElement;
+
+      // Prompt / Generated / Total all dash, and not one of them prints a 0.
+      expect(within(imageRow).getAllByText('—')).toHaveLength(3);
+      expect(within(imageRow).queryByText('0')).not.toBeInTheDocument();
+      fireEvent.mouseOver(within(imageRow).getAllByText('—')[0]);
+      expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
+
+      // The marker keeps the surface's own thousands separators.
+      expect(within(mixedRow).getByText('1,000*')).toBeInTheDocument();
+      fireEvent.mouseOver(within(mixedRow).getByText('1,000*'));
+      expect(await screen.findByText(t.activityMixedUnitsHint(4))).toBeInTheDocument();
+
+      // The project TOTAL line obeys the same rule over its own population.
+      expect(screen.getByText('5,000*')).toBeInTheDocument();
+      fireEvent.mouseOver(screen.getByText('5,000*'));
+      expect(await screen.findByText(t.activityMixedUnitsHint(8))).toBeInTheDocument();
     });
 
     it('shows the empty-state label when no tokens are assigned', async () => {

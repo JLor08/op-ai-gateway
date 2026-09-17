@@ -938,10 +938,13 @@ type DashboardResponse struct {
 }
 
 type DashboardMetrics struct {
-	Requests24h  int    `json:"requests_24h"`
-	Tokens24h    int    `json:"tokens_24h"`
-	HealthyHosts string `json:"healthy_hosts"`
-	LatencyP95MS int64  `json:"latency_p95_ms"`
+	Requests24h int `json:"requests_24h"`
+	Tokens24h   int `json:"tokens_24h"`
+	// NonTokenRequests24h is how many of Requests24h are non-token-metered
+	// rows. See usage.StatTotals.NonTokenRequests.
+	NonTokenRequests24h int    `json:"non_token_requests_24h"`
+	HealthyHosts        string `json:"healthy_hosts"`
+	LatencyP95MS        int64  `json:"latency_p95_ms"`
 }
 
 type RouteDTO struct {
@@ -1966,12 +1969,16 @@ func (s *Service) Dashboard(ctx context.Context, token auth.Token) DashboardResp
 	latencies := make([]int64, 0)
 	requests := 0
 	tokens := 0
+	nonTokenRequests := 0
 	for _, event := range events {
 		if event.CreatedAt.Before(cutoff) {
 			continue
 		}
 		requests++
 		tokens += event.TotalTokens
+		if event.BillingUnit != usage.BillingUnitTokens {
+			nonTokenRequests++
+		}
 		latencies = append(latencies, event.LatencyMS)
 	}
 	healthyHosts := "mock"
@@ -1981,10 +1988,11 @@ func (s *Service) Dashboard(ctx context.Context, token auth.Token) DashboardResp
 	}
 	return DashboardResponse{
 		Metrics: DashboardMetrics{
-			Requests24h:  requests,
-			Tokens24h:    tokens,
-			HealthyHosts: healthyHosts,
-			LatencyP95MS: percentile95(latencies),
+			Requests24h:         requests,
+			Tokens24h:           tokens,
+			NonTokenRequests24h: nonTokenRequests,
+			HealthyHosts:        healthyHosts,
+			LatencyP95MS:        percentile95(latencies),
 		},
 		Routes: routes,
 	}

@@ -153,6 +153,7 @@ function makeGroupRow(overrides: Partial<UsageGroupRow> = {}): UsageGroupRow {
     key_label: 'GPU A',
     count: 3,
     error_count: 0,
+    non_token_requests: 0,
     input_tokens: 10,
     output_tokens: 20,
     total_tokens: 30,
