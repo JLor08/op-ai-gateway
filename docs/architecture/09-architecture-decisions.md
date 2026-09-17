@@ -943,18 +943,70 @@ against a mapping with no row must stay inert, while a PRESENT map key can only
 be an explicit statement. Collapsing the two rules into one would either
 re-open the minting defect or re-close the third state. The map accepts ANY
 capability name — the vocabulary is open below — and rejects a blank one, a
-value outside the three, stating a capability whose legacy boolean the same
-request also sends, and two keys that name one capability once trimmed. Its
+value outside the three, a reserved (name, verdict) PAIR, stating a capability
+whose legacy boolean the same request also sends, and two keys that name one
+capability once trimmed. Its
 store error is PROPAGATED, unlike the accompanying upsert's best-effort write:
 relinquishing the verdict is the whole effect of the action, so swallowing the
 failure would report success for nothing. What is NOT closed is minting one by
 accident from a form gone stale mid-edit
 ([11.1](11-risks-and-technical-debt.md#111-operational-risks)). What is open
-is the *vocabulary*, not the validation: no check compares a name against a
-known list, so the code reasons about `vision`, `video`, `audio`, `tools`,
-`mtp`, `live_progress` and `speculation_observed` while an unrecognised
-upstream name is accepted, stored and shown verbatim — which is why the open
-vocabulary needs no escape hatch. Two verdicts reached the request path
+is the *vocabulary*, not the validation, with exactly one narrowing added after
+the fact: the code reasons about `vision`, `video`, `audio`, `tools`, `mtp`,
+`live_progress` and `speculation_observed` while an unrecognised upstream name is
+accepted, stored and shown verbatim — which is why the open vocabulary needs no
+escape hatch. The narrowing (issue #81) compares the (name, VERDICT) pair against a
+short list, never the name alone: `live_progress: "no"`, and either verdict on
+`speculation_observed`, may not be stated. A `manual` row is rank 3 and nothing
+re-derives it, and for `live_progress` the row is read by the Responses
+passthrough gate as a veto — so an operator could permanently and silently
+disable their own live-timings switch, on an endpoint they were not thinking
+about, with a request that looks entirely reasonable.
+
+Two things are deliberately NOT refused, and both are load-bearing. `mtp` is
+absent from every reserved list: it is the one internal name with an operator
+control on the mapping form, whose rank-3 permanence is precisely how that
+control works. And `live_progress: "yes"` stays accepted, because this row has
+two consumers with OPPOSITE semantics — `internal/provider`'s `wantsLiveProgress`
+returns true on `"supported"` *ahead of* its shape clause, which covers only
+`llama_cpp` and `vllm`. The probes are DOCUMENT-keyed rather than type-keyed, so
+they do establish this row for anything answering the configured probe path with
+a llama.cpp `/props` document — a `server_agent` child resolved as `custom` but
+running llama-server included, which `collector.LiveProgressProbePath` names as
+the case its detector exists to recover. What is left without any probe answer is
+a tolerant upstream serving no such document (`tgi`, a `litellm` forwarding
+elsewhere) or a mapping with no probe path, and for those a manual `"yes"` is the
+only opt-in that ever existed. Where a probe DOES answer, `manual` is rank 3
+against its rank 1, so allowing `"yes"` is also how an operator overrides a
+detector they distrust — what every other manual verdict is for. Refusing it
+would have removed both to prevent nothing, since on the Responses side the same
+verdict is a veto and permits nothing. A first cut of this narrowing was
+name-keyed and did exactly that.
+
+What the refusal costs is recorded rather than hidden, and it is **one
+configuration rather than a class**. A manual `"no"` only ever bought something
+where something else would otherwise SEND the parameters, and on the translate
+path that is `wantsLiveProgress`'s shape clause — `llama_cpp` and `vllm` only.
+Off that clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `custom`) the absence
+of a row already means "do not send", so the pin was redundant; vLLM tolerates
+both parameters, so it has nothing to refuse; and for a `llama_cpp` upstream that
+genuinely refuses them the `/props` detector writes `"unsupported"` **itself** at
+rank 1, off a `params` object lacking `timings_per_token` — the older-build case.
+
+The remainder is a `llama_cpp`-typed upstream that refuses the parameters and has
+**no probe path configured**, which is the portal's default. There the pin was
+the only durable way to stop paying one wasted round trip per mapping per memo
+TTL, since neither rejection path persists anything. That operator gains a better
+remedy than the one they lost: configuring the probe path lets the detector
+answer at rank 1 and, unlike a manual row, be re-derived when the build changes.
+Accepted on that basis — a silent permanent cross-endpoint veto is worse than a
+bounded, self-healing round trip on one configuration that has its own fix
+([Telemetry, Usage & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
+
+The RESET stays open for every name, which is what keeps this compatible with
+the paragraph above: a row a pre-narrowing build stored is still relinquishable,
+so no row is made uncorrectable. Two verdicts reached the request path
 through the candidate query's own **filtered** LEFT JOINs when this decision
 was taken; `mtp` and its join went with the scorer's flat bonus, so today
 there is one

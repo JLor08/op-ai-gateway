@@ -3804,7 +3804,7 @@ gateway adds `"timings_per_token": true` to the body it forwards, which is what
 makes llama.cpp attach a `timings` object to the partial frames and fills the
 running-connections row's live tokens/sec and live output-token count — the
 count on a column that ships **hidden**, which an operator who has never changed
-that panel's columns reveals from its column menu. Five conditions gate it — the
+that panel's columns reveals from its column menu. Five conditions gate it, plus a sixth ANDed at the call site (no rejection already observed in this process) — the
 opt-in itself, the effective kind, the Responses flavor, the stream flag, and a
 recorded live-progress rejection as a veto — and **nothing retries without it**,
 so an upstream that rejects the key answers the client's request with its own

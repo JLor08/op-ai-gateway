@@ -77,9 +77,14 @@ var liveProgressUpstreams = map[string]struct{}{
 // ordered by the quality of their evidence -- observation beats prediction,
 // prediction beats guessing, guessing beats silence:
 //
-//  1. target.LiveProgressSupport == "unsupported": always no. This is either an
-//     OBSERVED upstream rejection (CompleteStream's retry, on a 400/422) or a
-//     verdict copied from one -- no shape guess outranks it.
+//  1. target.LiveProgressSupport == "unsupported": always no. Its only
+//     producers are the two /props detectors, off a document whose
+//     `default_generation_settings.params` exists but offers no
+//     `timings_per_token` -- a real verdict about a real, older build -- and an
+//     operator's own `"no"` row. No shape guess outranks either. A
+//     retry-confirmed rejection is NOT among them: nothing persists one into the
+//     capability row, it is remembered only in the memo below, which is exactly
+//     why this layer does not expire and the memo does.
 //  2. target.LiveProgressSupport == "supported": always yes, for the same
 //     reason -- the verdict overrides the shape in either direction.
 //  3. target.LiveProgressSupport == "" (never determined): falls back to
@@ -123,10 +128,19 @@ const liveProgressRejectionTTL = 5 * time.Minute
 const maxLiveProgressRejections = 1024
 
 // liveProgressMemo remembers, per serving model mapping (routing.Target.RouteID),
-// that an upstream REJECTED the two live-progress parameters. Consulted before the
-// parameters are added and written only from CompleteStream's retry path, it turns
-// a genuinely incompatible upstream's cost from one wasted round trip per REQUEST
+// that an upstream REJECTED the live-progress request parameters. It turns a
+// genuinely incompatible upstream's cost from one wasted round trip per REQUEST
 // into one per mapping per TTL.
+//
+// TWO writers and TWO readers, on two endpoints, and the second pair reaches it
+// from another package through LiveProgressRejectionMemo below -- read that
+// doc comment for why the sharing is sound and what it is slightly over-broad
+// about. In this package: CompleteStream's retry writes it and CompleteStream's
+// own guard reads it. Outside it: internal/gateway's proxyNative writes it when a
+// body carrying the `timings_per_token` IT injected earns a 400/422, and reads it
+// as the sixth condition on that injection. Do not "simplify" this back to one
+// writer -- a passthrough refusal that only the passthrough path remembered is
+// exactly the split issue #81 was reopened to close.
 //
 // It records ONLY the negative verdict, and that asymmetry is the property that
 // makes it safe. A stale NEGATIVE costs at most a missing advisory number -- the
@@ -210,4 +224,52 @@ func (m *liveProgressMemo) recordRejection(routeID string) {
 		delete(m.rejectedAt, oldestID)
 	}
 	m.rejectedAt[routeID] = now
+}
+
+// LiveProgressRejectionMemo is the optional capability of remembering, per
+// serving model mapping, that an upstream REFUSED the live-progress request
+// parameters -- the exported seam onto the memo above. Optional in the same
+// sense as NativeProxyClient (proxy.go): a caller type-asserts for it and
+// carries on unchanged when the resolved client does not have it, which is why
+// it is a second interface rather than a method on NativeProxyClient -- that
+// one is implemented by three production types and by a test fake per behaviour
+// internal/gateway needs to drive, so widening it would make every one of those
+// fakes carry a method it has no use for. The count is deliberately not written
+// here: it grew by one in the very commit that first cited it.
+//
+// It exists because the memo has TWO writers and TWO readers across a package
+// boundary, and before the seam only one pair could reach it. CompleteStream
+// (translate, /v1/chat/completions) records its own retry-confirmed rejection
+// and consults the memo at its guard; internal/gateway's native passthrough
+// (/v1/responses) injects llama.cpp's `timings_per_token` under the operator's
+// opt-in, has NO retry to absorb a wrong guess, and so both needs to stop
+// asking after a refusal and to be told when another endpoint already learned
+// one. Since Multiplexer.dispatchProxyNative and dispatchCompleteStream resolve
+// the SAME m.clients[target.Provider] entry, and production registers one
+// OpenAICompatibleClient under every OpenAI-compatible provider key, a record
+// made through either path is seen by both.
+//
+// Both methods take a routing.Target rather than a bare route id so *Multiplexer
+// can implement them: it has to resolve target.Provider to a client exactly as
+// its other dispatchers do. The memo itself still keys on target.RouteID alone.
+//
+// The asymmetry that makes sharing one memo across two endpoints safe is the
+// memo's own: it records NEGATIVES only, and a stale negative costs at most a
+// missing advisory number that the portal already renders as its "never
+// measured" em-dash, healing by itself when the TTL expires. The two paths do
+// not send the same parameter SET -- translate sends `timings_per_token` AND
+// `stream_options.continuous_usage_stats`, passthrough only the former -- so a
+// translate-learned rejection is very slightly over-broad for the passthrough
+// path (the refusal may have been earned by the other key). That direction is
+// deliberate: it loses a display figure, never a request, and the TTL undoes it.
+type LiveProgressRejectionMemo interface {
+	// LiveProgressRejected reports whether target's upstream has an un-expired
+	// rejection on record. False for an empty RouteID and for an empty memo,
+	// which is what makes "nothing recorded" mean "send them".
+	LiveProgressRejected(target routing.Target) bool
+	// RecordLiveProgressRejection notes that target's upstream refused the
+	// parameters. A no-op for an empty RouteID: a hand-built target (probe,
+	// benchmark, test) has no mapping id, and treating "" as one shared key
+	// would let one upstream's refusal suppress the figure everywhere.
+	RecordLiveProgressRejection(target routing.Target)
 }

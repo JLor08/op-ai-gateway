@@ -155,7 +155,7 @@ func TestPortalMappingCreateStatesACapabilityVerdict(t *testing.T) {
 	}
 }
 
-// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the four
+// TestPortalMappingCapabilityVerdictRejectionsReturn400 guards that the five
 // sentinels reach the HTTP layer as 400s with their own codes rather than a
 // default 500 -- the same guard TestPortalMappingCreateNegativeMetricReturns400
 // provides for ErrMappingMetricInvalid, and equally easy to lose: a sentinel
@@ -188,6 +188,15 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 			body:     `{"capability_verdicts":{"vision":"no"," vision":"yes"}}`,
 			wantCode: "mapping.capability_duplicate",
 		},
+		{
+			// Issue #81's reserved PAIR: a manual rank-3 "no" on live_progress
+			// permanently vetoes the operator's own responses-live-timings
+			// switch, and no probe outranks it. Keyed on the pair, not the name
+			// -- the allowed half is the 200 two tests below.
+			name:     "a reserved (name, verdict) pair",
+			body:     `{"capability_verdicts":{"live_progress":"no"}}`,
+			wantCode: "mapping.capability_reserved",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := patchMapping(t, srv, created.ID, tc.body)
@@ -204,6 +213,37 @@ func TestPortalMappingCapabilityVerdictRejectionsReturn400(t *testing.T) {
 			}
 			if body.Error.Code != tc.wantCode {
 				t.Fatalf("error code = %q, want %q (body = %s)", body.Error.Code, tc.wantCode, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestPortalMappingReservedCapabilityAcceptedBodiesReturn200 pins the two halves
+// of the reservation the 400 table above cannot express, both at the HTTP layer
+// where a client actually meets them.
+//
+// The RESET is what keeps the refusal safe: a row an older build allowed must
+// still be clearable through the same endpoint, or §11.1's "a manual verdict has
+// no way back" risk re-opens. And `live_progress: "yes"` is the half the rule is
+// keyed on a PAIR for -- it is the only opt-in a tolerant upstream serving no
+// /props document ever had on /v1/chat/completions, and the rank-3 override of a
+// probe verdict elsewhere. A name-based whitelist would have answered 400 to
+// both of these.
+func TestPortalMappingReservedCapabilityAcceptedBodiesReturn200(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{name: "the reset of a reserved capability", body: `{"capability_verdicts":{"live_progress":""}}`},
+		{name: "a manual yes on live_progress", body: `{"capability_verdicts":{"live_progress":"yes"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServerWithTokenScopes([]string{"gateway:use", "admin", "system"})
+			appID := createTestApplication(t, srv, "mock-host-qwen", `{"type":"vllm","port":8033,"scheme":"https"}`)
+			created := createTestMappingWire(t, srv, appID, `{"gateway_model_name":"cap-reset","app_model_name":"cap-reset-up"}`)
+
+			rec := patchMapping(t, srv, created.ID, tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
 		})
 	}

@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"net/http"
 	"op-ai-gateway/internal/routing"
 	"strconv"
 	"testing"
@@ -245,5 +246,152 @@ func TestLiveProgressMemoIsBounded(t *testing.T) {
 	}
 	if m.rejects("map_0") {
 		t.Fatal("oldest entry map_0 survived eviction")
+	}
+}
+
+// TestOpenAICompatibleClientExposesItsRejectionMemo pins the EXPORTED seam that
+// lets the native-passthrough path — a different package — reach the very memo
+// CompleteStream already consults, so a rejection observed on one endpoint
+// suppresses the parameters on the other. Before this seam existed the memo was
+// unreachable outside this package and the two endpoints could disagree forever
+// about the same upstream (issue #81's "a recorded rejection beats everything",
+// which had no implementation on the passthrough path).
+//
+// It asserts through the INTERFACE rather than the concrete type, because the
+// gateway reaches it by exactly this assertion.
+func TestOpenAICompatibleClientExposesItsRejectionMemo(t *testing.T) {
+	c := NewOpenAICompatibleClient(nil)
+	var memo LiveProgressRejectionMemo = c
+	target := routing.Target{RouteID: "map_a", Provider: routing.ProviderLlamaCPP}
+
+	if memo.LiveProgressRejected(target) {
+		t.Fatal("a fresh client reports map_a as rejected; an empty memo must mean \"send them\"")
+	}
+	memo.RecordLiveProgressRejection(target)
+	if !memo.LiveProgressRejected(target) {
+		t.Fatal("map_a is not reported rejected after RecordLiveProgressRejection")
+	}
+	// The record is per RouteID, never per client: a second mapping on the same
+	// upstream kind must be unaffected.
+	if memo.LiveProgressRejected(routing.Target{RouteID: "map_b", Provider: routing.ProviderLlamaCPP}) {
+		t.Fatal("recording map_a also suppressed map_b; the memo must key on RouteID alone")
+	}
+}
+
+// TestRejectionMemoSeamSharesOneMemoWithCompleteStreamsGuard is the whole point
+// of the seam, and the ONE property a per-path memo would have silently broken:
+// what the exported recorder writes is what CompleteStream's own guard reads.
+// Asserted against the guard's real expression rather than against the memo's
+// internals, so folding the memo into wantsLiveProgress (or giving either path
+// its own) fails here.
+func TestRejectionMemoSeamSharesOneMemoWithCompleteStreamsGuard(t *testing.T) {
+	c := NewOpenAICompatibleClient(nil)
+	// LiveProgressSupport "" so the decision rests on the shape clause plus the
+	// memo — the same combination CompleteStream evaluates at its call site.
+	target := routing.Target{RouteID: "map_a", Provider: routing.ProviderLlamaCPP}
+
+	if !(wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)) {
+		t.Fatal("CompleteStream's guard is already false before anything was recorded")
+	}
+	c.RecordLiveProgressRejection(target)
+	if wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID) {
+		t.Fatal("CompleteStream's guard still true after the EXPORTED recorder ran: the two paths hold different memos")
+	}
+}
+
+// TestRejectionMemoSeamIgnoresAnEmptyRouteID mirrors the memo's own rule at the
+// exported boundary: a hand-built target (probe, benchmark, test) has no mapping
+// id to key on, and treating "" as one shared key would let one upstream's
+// rejection suppress the figure everywhere.
+func TestRejectionMemoSeamIgnoresAnEmptyRouteID(t *testing.T) {
+	c := NewOpenAICompatibleClient(nil)
+	empty := routing.Target{Provider: routing.ProviderLlamaCPP}
+
+	c.RecordLiveProgressRejection(empty)
+	if c.LiveProgressRejected(empty) {
+		t.Fatal("an empty RouteID was memoized through the exported seam")
+	}
+	if len(c.liveProgress.rejectedAt) != 0 {
+		t.Fatalf("memo holds %d entries after recording an empty RouteID, want 0", len(c.liveProgress.rejectedAt))
+	}
+}
+
+// TestMultiplexerDispatchesRejectionMemoToTheResolvedClient is the seam's
+// production shape: the gateway holds the MULTIPLEXER, not a concrete client, so
+// a Multiplexer that answered for itself (or not at all) would make the whole
+// mechanism dead in production while every client-level test stayed green.
+//
+// It also pins the dispatch KEY. ProxyNative and CompleteStream both resolve
+// m.clients[target.Provider], which is why one record reaches both endpoints;
+// a Multiplexer that keyed the memo on anything else would break that.
+func TestMultiplexerDispatchesRejectionMemoToTheResolvedClient(t *testing.T) {
+	llama := NewOpenAICompatibleClient(nil)
+	other := NewOpenAICompatibleClient(nil)
+	mux := NewMultiplexer(map[string]Client{
+		routing.ProviderLlamaCPP: llama,
+		routing.ProviderVLLM:     other,
+	}, nil)
+
+	var memo LiveProgressRejectionMemo = mux
+	target := routing.Target{RouteID: "map_a", Provider: routing.ProviderLlamaCPP}
+
+	memo.RecordLiveProgressRejection(target)
+	if !memo.LiveProgressRejected(target) {
+		t.Fatal("the Multiplexer does not report the rejection it was asked to record")
+	}
+	// The record landed on the client the provider key resolves to, and nowhere else.
+	if !llama.LiveProgressRejected(target) {
+		t.Fatal("the record did not reach the llama_cpp client the target resolves to")
+	}
+	if other.LiveProgressRejected(routing.Target{RouteID: "map_a", Provider: routing.ProviderVLLM}) {
+		t.Fatal("the record leaked to the client of a provider key the target does not resolve to")
+	}
+}
+
+// TestMultiplexerRejectionMemoIsInertForAClientWithoutTheCapability keeps the
+// interface OPTIONAL, which is why it is a second interface rather than a method
+// on NativeProxyClient. A provider whose client cannot remember must read as
+// "nothing recorded" — never panic, and never refuse — so the gate's behaviour
+// for such a provider is exactly what it was before the seam existed.
+func TestMultiplexerRejectionMemoIsInertForAClientWithoutTheCapability(t *testing.T) {
+	mux := NewMultiplexer(map[string]Client{routing.ProviderMock: Mock{}}, nil)
+	target := routing.Target{RouteID: "map_a", Provider: routing.ProviderMock}
+
+	mux.RecordLiveProgressRejection(target)
+	if mux.LiveProgressRejected(target) {
+		t.Fatal("a client without the memo capability reported a rejection")
+	}
+	// An unknown provider key resolves to the nil fallback: same contract.
+	unknown := routing.Target{RouteID: "map_a", Provider: "nope"}
+	mux.RecordLiveProgressRejection(unknown)
+	if mux.LiveProgressRejected(unknown) {
+		t.Fatal("an unresolvable provider key reported a rejection")
+	}
+	var nilMux *Multiplexer
+	nilMux.RecordLiveProgressRejection(target)
+	if nilMux.LiveProgressRejected(target) {
+		t.Fatal("a nil Multiplexer reported a rejection")
+	}
+}
+
+// TestSchemaRejectionStatusIsExportedForBothPaths pins the ONE rejection class
+// both endpoints now share. The native path has no retry to absorb a wrong
+// guess, so widening this set would let an auth failure (401/403) or a wrong
+// path (404) poison the memo for the whole TTL; 503 stays out because
+// unavailableStatus maps it to ErrUpstreamStarting.
+func TestSchemaRejectionStatusIsExportedForBothPaths(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		if !SchemaRejectionStatus(status) {
+			t.Errorf("SchemaRejectionStatus(%d) = false, want true", status)
+		}
+	}
+	for _, status := range []int{
+		http.StatusOK, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+		http.StatusRequestEntityTooLarge, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+	} {
+		if SchemaRejectionStatus(status) {
+			t.Errorf("SchemaRejectionStatus(%d) = true, want false", status)
+		}
 	}
 }

@@ -163,7 +163,133 @@ var (
 	// NOT this case and is not rejected: encoding/json collapses it to one map
 	// entry (the last value wins) before any of this code sees it.
 	ErrMappingCapabilityDuplicate = errors.New("mapping.capability_duplicate")
+	// ErrMappingCapabilityReserved rejects a request that states a verdict a
+	// manual row must not carry -- see reservedManualVerdicts. It is the one
+	// narrowing of the otherwise open name vocabulary, and it is deliberately
+	// narrow in TWO ways: it refuses a verdict rather than a name, and it never
+	// refuses the RESET (""). A refusal that also blocked the reset would leave
+	// a row a pre-reservation deployment already stores permanently
+	// uncorrectable -- the very objection normalizeCapabilityVerdicts' own doc
+	// raises against name-whitelisting, and the reason §11.1 can record "a
+	// manual verdict has no way back" as closed.
+	ErrMappingCapabilityReserved = errors.New("mapping.capability_reserved")
 )
+
+// reservedManualVerdicts are the (capability, verdict) pairs an operator may not
+// state, because a `manual` row is rank 3 -- above every automated source -- and
+// nothing re-derives one, so each of these would permanently override the only
+// writer entitled to establish it.
+//
+// It is keyed on the PAIR, not on the name, and that is the whole design. A
+// name-keyed list was the first cut and it was wrong: this row has TWO consumers
+// that read it with OPPOSITE semantics, so "an operator may not touch this name"
+// removes real capability on the consumer #81 was not about.
+//
+//   - routing.CapabilityLiveProgress + CapabilityNo is the pair issue #81 named,
+//     and the only one with a silent, permanent, cross-endpoint cost. The row
+//     reaches routing.Target.LiveProgressSupport through the source-blind
+//     candidate join, a "no" becomes "unsupported", and gateway's Responses
+//     passthrough gate reads exactly that string as a VETO. So a manual "no"
+//     disables the operator's own responses_live_timings_enabled switch on a
+//     DIFFERENT endpoint from the one they were thinking about, invisibly and
+//     for good: no /props probe can repair it (rank 1 loses to rank 3), and the
+//     mapping form cannot clear it either, since that form submits "mtp" and
+//     "vision" only.
+//
+//     Its cost is recorded rather than hidden, and it is NARROW -- narrower
+//     than an earlier cut of this comment claimed. A manual "no" only ever
+//     bought anything where something else would otherwise have SENT the
+//     parameters, and on the translate path that is wantsLiveProgress's shape
+//     clause, which holds only llama_cpp and vllm. So:
+//
+//     For every kind off that clause -- llama_swap, litellm, tgi, ollama,
+//     custom -- the absence of a row ALREADY means "do not send", so a manual
+//     "no" was redundant. vLLM tolerates both parameters (its request models
+//     allow unknown fields and continuous_usage_stats is a first-class field),
+//     so it has nothing to refuse. And for a llama_cpp upstream that really
+//     does refuse them, the /props detector writes "unsupported" ITSELF at
+//     rank 1, off a document whose params object lacks timings_per_token --
+//     which is precisely the older-build case.
+//
+//     What is left is one row of that table: a llama_cpp-typed upstream that
+//     refuses the parameters and has NO probe path configured, which is the
+//     portal's default (CreateApplication takes ContextProbePath verbatim and
+//     app_health skips a probe when it is empty). There, and only there, a
+//     manual "no" was the single durable way to stop paying one wasted round
+//     trip per mapping per memo TTL -- neither rejection path persists
+//     anything, both write only the in-process memo. That operator now has a
+//     better remedy than the pin they lost: configuring the probe path lets the
+//     detector answer authoritatively at rank 1, and unlike a manual row it is
+//     re-derived when the build changes.
+//
+//     The trade is deliberate either way: a silent permanent veto on a control
+//     the operator explicitly switched ON is worse than a bounded,
+//     self-healing round trip on one configuration that has its own fix.
+//
+//   - CapabilityLiveProgress + CapabilityYes is deliberately ALLOWED, and an
+//     earlier cut of this rule refused it on a justification that was false.
+//     The claim was that an operator cannot attest a server build's request
+//     schema "which the probe would otherwise establish honestly". The second
+//     half of that is true for less of the population than it sounds: the
+//     detectors are DOCUMENT-keyed, not type-keyed, so a probe establishes this
+//     row for anything that answers the configured probe path with a llama.cpp
+//     /props document -- including a server_agent child whose resolved type is
+//     "custom" but whose binary is llama-server (collector.LiveProgressProbePath
+//     says so outright: the path is deliberately not type-derived, "exactly the
+//     case this detector exists to recover"), and a proxy an operator pointed at
+//     /props. Where it holds is the rest: a tolerant upstream that serves no such
+//     document (tgi, or a litellm forwarding elsewhere) and any mapping with no
+//     probe path configured at all.
+//
+//     For THAT population a manual "yes" is the only opt-in that ever existed,
+//     because internal/provider's wantsLiveProgress decides on this verdict in
+//     BOTH directions ("supported" returns true AHEAD of its shape clause, which
+//     covers only llama_cpp and vllm). And even where a probe does answer, the
+//     manual row is rank 3 against its rank 1, so allowing "yes" is also how an
+//     operator overrides a detector they have reason to distrust -- the same
+//     thing every other manual verdict is for. It is harmless on the Responses
+//     side either way, where condition 5 is a veto and a positive verdict
+//     permits nothing the veto has not already allowed.
+//
+//   - routing.CapabilitySpeculationObserved is reserved in BOTH directions,
+//     because it loses nothing: its only writer is the gateway's own observation
+//     of drafted tokens on relayed traffic, at rank 1 and at most once per
+//     mapping per PROCESS lifetime, so a manual row is never repaired even by a
+//     restart; nothing routes, scores or filters on it, so no operator control
+//     is being taken away; and its verdict is structurally positive-only -- the
+//     absence of drafted tokens is "no evidence", never "does not speculate" --
+//     so a "no" states something the vocabulary cannot mean.
+//
+// "mtp" is on NEITHER list, and that asymmetry is the rule rather than a habit:
+// it is the one internal name that HAS an operator control, on the mapping form,
+// whose rank-3 manual row is exactly how the operator is meant to pin it
+// (nothing re-derives "mtp" either, which is why it needs that permanence).
+// Reserving it would break a shipped control.
+//
+// This is the portal's own rule, not a shared one. The gateway's agent-ingest
+// boundary refuses these NAMES outright from a reported verdict
+// (reservedAgentCapabilityNames), and there a name is the right key because the
+// threat is a buggy or hostile agent's bytes rather than an admin request that
+// looks entirely reasonable. internal/portal may not import internal/gateway (a
+// frozen forbidden edge), so the two are separate lists keyed on the same
+// routing.Capability* constants.
+var reservedManualVerdicts = map[string]map[string]bool{
+	routing.CapabilityLiveProgress: {routing.CapabilityNo: true},
+	routing.CapabilitySpeculationObserved: {
+		routing.CapabilityYes: true,
+		routing.CapabilityNo:  true,
+	},
+}
+
+// reservedManualVerdict reports whether stating verdict for capability is
+// refused. An empty verdict is a RESET and is never refused: see
+// ErrMappingCapabilityReserved.
+func reservedManualVerdict(capability, verdict string) bool {
+	if verdict == "" {
+		return false
+	}
+	return reservedManualVerdicts[capability][verdict]
+}
 
 const (
 	defaultApplicationTimeoutMS          = 30000
@@ -1771,8 +1897,12 @@ type CreateMappingRequest struct {
 	// Same validation as the update path: names are trimmed and a blank one is
 	// ErrMappingCapabilityNameRequired; a value that is not "yes", "no" or ""
 	// is ErrMappingCapabilityVerdictInvalid; two keys naming the same
-	// capability once trimmed are ErrMappingCapabilityDuplicate. The
-	// vocabulary is open.
+	// capability once trimmed are ErrMappingCapabilityDuplicate; and a
+	// reservedManualVerdicts pair -- `live_progress: "no"`, or either verdict on
+	// `speculation_observed` -- is ErrMappingCapabilityReserved. The vocabulary
+	// is otherwise open, and an empty verdict is accepted for every name (it is
+	// a reset, and on this path a no-op -- a brand-new mapping has no row to
+	// relinquish).
 	CapabilityVerdicts map[string]string `json:"capability_verdicts,omitempty"`
 }
 
@@ -1837,9 +1967,17 @@ type UpdateMappingRequest struct {
 	// structurally -- the response is the post-write DTO, so the form's next
 	// render re-seeds from truth.
 	//
-	// The NAME vocabulary is OPEN: any name is accepted, not just the six
-	// constants the code reasons about, because an Ollama/agent-reported name
+	// The NAME vocabulary is OPEN: any name is accepted, not just the ones this
+	// codebase has constants for, because an Ollama/agent-reported name
 	// gets its own row like any other and must be correctable like any other.
+	// The one narrowing is keyed on the (name, verdict) PAIR rather than the
+	// name -- reservedManualVerdicts: `live_progress: "no"` and either verdict
+	// on `speculation_observed` are ErrMappingCapabilityReserved, because a
+	// rank-3 `manual` row would permanently override the only writer entitled
+	// to establish them. `live_progress: "yes"` stays allowed on purpose (it is
+	// the only way to opt a tolerant-but-unlisted upstream into an exact
+	// mid-stream count on /v1/chat/completions), and an empty verdict always
+	// resets, so no stored row is ever uncorrectable.
 	// Names are trimmed; a blank one is ErrMappingCapabilityNameRequired. A
 	// value outside the three above is ErrMappingCapabilityVerdictInvalid, a
 	// capability named here whose legacy boolean is ALSO sent is
@@ -2699,7 +2837,7 @@ type capabilityVerdictIntent struct {
 // through a legacy boolean -- nil on the create path, where a boolean's
 // presence cannot be detected at all.
 //
-// Three rejections, all 400s, and none of them is something the store would
+// Five rejections, all 400s, and none of them is something the store would
 // catch: ValidateCapabilityRow never sees a reset at all, and on the DELETE
 // path an unknown name, an unknown mapping id and an empty name are each a
 // benign nil on both drivers -- so a blank key or a mistyped verdict would
@@ -2712,6 +2850,12 @@ type capabilityVerdictIntent struct {
 //     report anything -- Ollama passes manifest-declared names through
 //     verbatim), so a name-whitelisting check would leave exactly those rows
 //     uncorrectable.
+//   - A reservedManualVerdicts PAIR is ErrMappingCapabilityReserved. This is
+//     the one narrowing of the bullet above, and it does not contradict it
+//     because it is keyed on the (name, verdict) pair rather than the name:
+//     the reset ("") is never refused and still reaches the delete below, so a
+//     row a pre-reservation build stored can still be cleared -- which is the
+//     only reason any name check is admissible here at all.
 //   - A value outside "yes"/"no"/"" is ErrMappingCapabilityVerdictInvalid. The
 //     value is deliberately NOT trimmed -- see the sentinel's own comment.
 //   - A name whose legacy boolean is ALSO non-nil in the same request is
@@ -2740,6 +2884,14 @@ func normalizeCapabilityVerdicts(verdicts map[string]string, sentBooleans map[st
 		}
 		if verdict != routing.CapabilityYes && verdict != routing.CapabilityNo && verdict != "" {
 			return nil, ErrMappingCapabilityVerdictInvalid
+		}
+		// AFTER the value check, so an invalid verdict on a reserved pair still
+		// reports the error that shipped first -- a new refusal must not mask a
+		// validation that preceded it. reservedManualVerdict never refuses the
+		// empty verdict: a reset has to keep working on these names, or a row an
+		// older build allowed would be uncorrectable forever.
+		if reservedManualVerdict(name, verdict) {
+			return nil, ErrMappingCapabilityReserved
 		}
 		if sentBooleans[name] {
 			return nil, ErrMappingCapabilityConflict

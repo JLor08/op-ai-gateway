@@ -288,6 +288,36 @@ func TestPassthroughResponsesDoesNotInjectTimingsWhenTheGateRefuses(t *testing.T
 			body: liveTimingsStreamBody,
 		},
 		{
+			// Condition 2, END TO END. The unit table already covers the kind
+			// check (responses_live_timings_test.go), but nothing drove it
+			// through a real request: deleting the LiveTimingsCapableKind call
+			// from the gate left every request-path test in this package green.
+			//
+			// The seed is exactly the "restored dump or direct write" case the
+			// gate's doc comment cites as its reason for re-checking the kind at
+			// request time. The store is policy-free on purpose -- the PORTAL
+			// refuses a true on an incapable kind, no store path does -- so this
+			// row is seedable precisely because production can hold such a row.
+			name: "an opted-in application whose kind cannot answer the flag",
+			seed: liveTimingsSeed{appType: routing.ProviderVLLM, appLiveTimings: true},
+			path: "/v1/responses",
+			body: liveTimingsStreamBody,
+		},
+		{
+			// The same, via the server_agent branch: the SPEC's kind is what
+			// decides there, and Target.Provider is the literal "server_agent".
+			// Keeping the spec's opt-in true is what makes the refusal condition
+			// 2's rather than condition 1's.
+			name: "an opted-in runtime spec whose kind cannot answer the flag",
+			seed: func() liveTimingsSeed {
+				seed := serverAgentSpecOptedIn()
+				seed.spec.Type = string(routing.RuntimeSpecTypeVLLM)
+				return seed
+			}(),
+			path: "/v1/responses",
+			body: liveTimingsStreamBody,
+		},
+		{
 			name:            "a client's own explicit false survives",
 			seed:            llamaCppOptedIn(),
 			path:            "/v1/responses",

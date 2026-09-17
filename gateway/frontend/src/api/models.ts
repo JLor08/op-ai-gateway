@@ -228,7 +228,14 @@ export type CreateMappingRequest = {
   // A capability's verdict, stated outright and keyed by capability name.
   // 'yes'/'no' writes a `manual` row, '' writes none. A capability named here
   // wins over the legacy boolean above and over the backend's MTP name
-  // heuristic. The vocabulary is open (any capability name is accepted).
+  // heuristic. The vocabulary is open (any capability name is accepted), with
+  // one narrowing keyed on the (name, verdict) PAIR: 'live_progress': 'no' and
+  // either verdict on 'speculation_observed' are a 400, because a `manual` row
+  // would permanently outrank the only writer entitled to establish them.
+  // 'live_progress': 'yes' stays accepted (it is the translate path's only
+  // opt-in for an upstream no probe writes a verdict for), and '' always
+  // resets. MappingForm sends 'mtp' and 'vision' only, so no form can produce
+  // that refusal.
   capability_verdicts?: Record<string, CapabilityVerdictInput>;
 };
 
@@ -273,7 +280,13 @@ export type UpdateMappingRequest = {
   // a reset applied by a separate request would be undone by the operator's
   // next unrelated edit. Naming a capability here AND sending its legacy
   // boolean is a 400 (two statements about one row, read by two different
-  // rules), as is a value outside the three above.
+  // rules), as is a value outside the three above, and as is stating a reserved
+  // (name, verdict) pair: 'live_progress': 'no' (a `manual` row would
+  // permanently and silently disable the application's own
+  // responses-live-timings switch, on a different endpoint) or either verdict on
+  // 'speculation_observed'. 'live_progress': 'yes' stays accepted, and '' always
+  // resets, so a row an older build stored stays correctable. MappingForm sends
+  // 'mtp' and 'vision' only, so no form can produce that refusal.
   //
   // A `null` on the booleans could not have carried the third state:
   // is_mtp/vision_capable are optional, so `{vision_capable: null}` is

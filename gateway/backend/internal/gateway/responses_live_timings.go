@@ -3,7 +3,10 @@
 
 package gateway
 
-import "op-ai-gateway/internal/routing"
+import (
+	"op-ai-gateway/internal/provider"
+	"op-ai-gateway/internal/routing"
+)
 
 // liveTimingsVerdictUnsupported is the ONE spelling of "this upstream was
 // observed rejecting the live-progress parameters" that can ever reach
@@ -76,10 +79,19 @@ const liveTimingsVerdictUnsupported = "unsupported"
 // resembles: that predicate's verdict layer decides in BOTH directions -- a
 // "supported" verdict there OVERRIDES its shape clause and permits a kind the
 // shape would have refused, where here a positive verdict permits nothing the
-// veto has not allowed already -- its own set still includes vLLM (correctly --
-// it gates a different parameter pair on a different endpoint, where vLLM's
-// half is a first-class field), and a fourth check, its rejection memo, is
-// ANDed at its only call site that a caller from here would silently drop.
+// veto has not allowed already -- and its own set still includes vLLM
+// (correctly -- it gates a different parameter pair on a different endpoint,
+// where vLLM's half is a first-class field).
+//
+// Its FOURTH check, the in-process rejection memo, is ANDed at its only call
+// site, and this predicate deliberately does not fold it in either: an earlier
+// cut of this comment warned that "a caller from here would silently drop" it,
+// and a caller did, for two releases. The fix keeps the shape and adds the
+// conjunct where the precedent puts it -- liveProgressRejectedFor below, ANDed
+// at proxyNative's call site -- because folding a clock-and-state lookup in here
+// would cost the purity that makes TestWantsResponsesLiveTimings a statement
+// about the WHOLE rule. Read the two together: this function is what the
+// operator's configuration permits, the memo is what this process has observed.
 func wantsResponsesLiveTimings(target routing.Target, apiFlavor string, stream bool) bool {
 	if !target.ResponsesLiveTimingsEnabled {
 		return false
@@ -100,4 +112,55 @@ func wantsResponsesLiveTimings(target routing.Target, apiFlavor string, stream b
 		kind = target.LiveProgressSpecType
 	}
 	return routing.LiveTimingsCapableKind(kind)
+}
+
+// liveProgressRejectedFor reports whether THIS process has already seen target's
+// upstream refuse the live-progress parameters -- the sixth condition on the
+// injection, ANDed at proxyNative's call site rather than folded into
+// wantsResponsesLiveTimings above.
+//
+// It is the same memo internal/provider's CompleteStream consults at
+// `wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)`, reached
+// through the exported provider.LiveProgressRejectionMemo seam, which is what
+// makes the two endpoints agree: production registers ONE
+// OpenAICompatibleClient under every OpenAI-compatible provider key inside one
+// Multiplexer, and Multiplexer.dispatchProxyNative and dispatchCompleteStream
+// resolve the same m.clients[target.Provider] entry. So a refusal this path
+// records stops /v1/chat/completions asking, and one CompleteStream's retry
+// recorded stops this path asking.
+//
+// The capability is OPTIONAL, exactly like provider.NativeProxyClient two lines
+// above it at the call site: a provider that cannot remember reports "nothing
+// recorded", which is the state that means "send them". So the failure mode of a
+// client without the seam is the behaviour this gate had before the seam existed,
+// never a refusal an operator cannot explain.
+//
+// Unlike the stored "unsupported" verdict (condition 5) this observation EXPIRES:
+// the memo's TTL is 5 minutes, so an upstream that was replaced or reconfigured
+// behind the same mapping starts being asked again without a gateway restart.
+// That is the whole reason a rejection is memoized rather than persisted as a
+// capability row -- a row would outlive the build that earned it.
+func liveProgressRejectedFor(p provider.Client, target routing.Target) bool {
+	memo, ok := p.(provider.LiveProgressRejectionMemo)
+	if !ok {
+		return false
+	}
+	return memo.LiveProgressRejected(target)
+}
+
+// recordLiveProgressRejection notes, through the same optional seam, that
+// target's upstream refused a body carrying the key THIS gateway injected.
+//
+// Two guards belong to the caller and are stated here because getting either
+// wrong is silent: it must have INJECTED (a 400 the client's own
+// `timings_per_token` earned is not evidence about the gateway's key, and
+// blaming it would suppress the figure for a mapping that never objected), and
+// the status must be provider.SchemaRejectionStatus -- 400 or 422 alone. This
+// path has no retry to discover it guessed wrong, so a 401, 404 or 429 recorded
+// here would cost the mapping its live figure for the TTL over something the key
+// had no part in.
+func recordLiveProgressRejection(p provider.Client, target routing.Target) {
+	if memo, ok := p.(provider.LiveProgressRejectionMemo); ok {
+		memo.RecordLiveProgressRejection(target)
+	}
 }

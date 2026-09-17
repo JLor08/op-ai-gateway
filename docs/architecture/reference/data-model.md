@@ -36,7 +36,7 @@ not route-based).
 |---|---|
 | `ai_servers` | A physical/virtual host running Ollama, llama.cpp, or vLLM: domain/endpoint, health status, NetBird mesh linkage, energy-config (watts/price/PUE), admin-group containment root, per-server certificate/HTTPS-switch overrides, and the two managed-runtime columns `runtime_max_processes` (`0` = unlimited) and `managed_runtime_only`. |
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
-| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy), and `responses_live_timings_enabled` (migration 80: the operator's per-application opt-in to asking a capable upstream for mid-stream timings on a passthrough `/v1/responses` stream — orthogonal to `responses_mode`, default off; when it is on, a streaming `passthrough` `/v1/responses` request to a `llama_cpp` upstream has `timings_per_token` added to the body the gateway forwards, which is what puts a live tokens/sec and a live token count on the running-connections row (the count on a column that ships hidden, revealed from that panel's column menu). Five conditions gate the injection and **nothing retries without it**). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
+| `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy), and `responses_live_timings_enabled` (migration 80: the operator's per-application opt-in to asking a capable upstream for mid-stream timings on a passthrough `/v1/responses` stream — orthogonal to `responses_mode`, default off; when it is on, a streaming `passthrough` `/v1/responses` request to a `llama_cpp` upstream has `timings_per_token` added to the body the gateway forwards, which is what puts a live tokens/sec and a live token count on the running-connections row (the count on a column that ships hidden, revealed from that panel's column menu). Five conditions gate the injection, plus a sixth ANDed at the call site (this process has not already seen the upstream refuse the key), and **nothing retries without it**). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, energy/token), concurrency-capacity metrics, and their `metrics_locked`/`metrics_source`/`metrics_updated_at` provenance. Carries **no capability column at all** since migration 79 dropped the eleven it used to have — every per-model capability verdict is a `model_mapping_capabilities` row instead ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). |
 | `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`llama_cpp_timings`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
@@ -464,7 +464,7 @@ catch-all `model_override`, which has its own column).
 
 | # | Migration | Purpose |
 |---|---|---|
-| 80 | `application_responses_live_timings` | Adds `responses_live_timings_enabled integer not null default 0` to `applications` **and** `agent_runtime_specs` through `addColumnIfMissing`, and snapshots each spec from its parent application (`agent_runtime_specs.mapping_id → model_mappings.application_id → applications`, migration 72's join, `update … from` on PostgreSQL and correlated subqueries on SQLite, guarded on the target still being `0` so a replay never overwrites a later operator change). The operator's per-endpoint opt-in to asking a capable upstream for mid-stream timings on a `passthrough` `/v1/responses` stream — **orthogonal** to `responses_mode`, not a fourth value of it. The DDL default of `0` is the whole of the upgrade story: both columns are new, so the backfill is a no-op on every existing row and no running deployment's behaviour changes (the same argument migration 74 makes). The column lives on `applications` and on the spec because for a `server_agent` mapping the resolved spec — not the parent application — is the authority for the endpoint behaviour the flag qualifies, exactly as `responses_mode` is. The request path reads the resolved value: on a streaming `passthrough` `/v1/responses` request to a `llama_cpp` upstream the gateway adds `timings_per_token` to the body it forwards, under a five-condition gate and with **nothing retrying without it** ([Telemetry, Usage & Observability §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)). The column itself stays policy-free: an incapable kind may hold a `true` — the portal refuses to write one, never SQL — so the request path re-checks the kind rather than trusting the stored row. Does not touch `baselineCreateStatements` (frozen at v60) or migration 65's create-table. |
+| 80 | `application_responses_live_timings` | Adds `responses_live_timings_enabled integer not null default 0` to `applications` **and** `agent_runtime_specs` through `addColumnIfMissing`, and snapshots each spec from its parent application (`agent_runtime_specs.mapping_id → model_mappings.application_id → applications`, migration 72's join, `update … from` on PostgreSQL and correlated subqueries on SQLite, guarded on the target still being `0` so a replay never overwrites a later operator change). The operator's per-endpoint opt-in to asking a capable upstream for mid-stream timings on a `passthrough` `/v1/responses` stream — **orthogonal** to `responses_mode`, not a fourth value of it. The DDL default of `0` is the whole of the upgrade story: both columns are new, so the backfill is a no-op on every existing row and no running deployment's behaviour changes (the same argument migration 74 makes). The column lives on `applications` and on the spec because for a `server_agent` mapping the resolved spec — not the parent application — is the authority for the endpoint behaviour the flag qualifies, exactly as `responses_mode` is. The request path reads the resolved value: on a streaming `passthrough` `/v1/responses` request to a `llama_cpp` upstream the gateway adds `timings_per_token` to the body it forwards, under a five-condition gate plus a call-site rejection-memo check, and with **nothing retrying without it** (a 400/422 is recorded in that memo instead, so both endpoints stop asking the mapping for the memo's TTL) ([Telemetry, Usage & Observability §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)). The column itself stays policy-free: an incapable kind may hold a `true` — the portal refuses to write one, never SQL — so the request path re-checks the kind rather than trusting the stored row. Does not touch `baselineCreateStatements` (frozen at v60) or migration 65's create-table. |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:
@@ -578,7 +578,8 @@ plausible-looking validation rule would break the normal case:
   in
   [11.1 Operational risks](../11-risks-and-technical-debt.md#111-operational-risks).
   A capability NAME
-  is not validated at all: the vocabulary is open on purpose (`vision`,
+  is validated only for emptiness; the vocabulary is otherwise open on purpose
+  (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress` and
   `speculation_observed` are the names the code itself reasons about, while an
   upstream may report others — since #54 the agent's Ollama probe actually
@@ -586,10 +587,11 @@ plausible-looking validation rule would break the normal case:
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
   through verbatim, `image` deliberately as itself because in Ollama it means
   image GENERATION rather than vision), so a name-checking validator would
-  silently drop the very verdicts the open shape exists to keep. The two
-  rules that DO constrain names are about one producer instead of the
-  vocabulary, and they sit at two DIFFERENT layers — neither of them the
-  store, and only one of them the gateway:
+  silently drop the very verdicts the open shape exists to keep. What DOES
+  constrain a write is three producer-scoped rules at three DIFFERENT layers —
+  none of them the store, and only one of them the gateway. Two of the three
+  are about the NAME; the third, added last, narrows a VERDICT instead, which
+  is what lets it coexist with the open vocabulary above:
   - The COUNT and LENGTH clamp is in the **agent's own detector**
     (`server-agent/internal/collector/probe.go`,
     `detectOllamaCapabilities`): one `/api/show` document contributes at most
@@ -605,6 +607,25 @@ plausible-looking validation rule would break the normal case:
     in depth; the gateway's list is the load-bearing one, because a buggy or
     hostile agent puts a name straight into the verdicts it sends and no
     agent-side filter is in that path.
+  - The RESERVED-VERDICT refusal is at the **portal's own write path**
+    (`internal/portal.reservedManualVerdicts`, issue #81): an operator may not
+    STATE `live_progress: "no"`, nor either verdict on
+    `speculation_observed` — `mapping.capability_reserved`, a `400`. It is
+    keyed on the (name, verdict) PAIR rather than the name, and the two
+    asymmetries are the rule rather than exceptions to it. `live_progress:
+    "yes"` stays allowed because `internal/provider`'s `wantsLiveProgress`
+    reads that verdict in BOTH directions while the `/props` detectors are
+    document-keyed rather than type-keyed — so a manual `yes` is the only
+    opt-in for a tolerant upstream that serves no `/props` document (`tgi`, a
+    forwarding `litellm`) or a mapping with no probe path, and elsewhere it is
+    the rank-3 override of a rank-1 probe verdict; and the RESET (`""`) is never refused, which is
+    what keeps a row an older build stored correctable and is the only reason
+    a name check is admissible here at all
+    ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
+    Unlike the two rules above it is about an ordinary, reasonable-looking
+    admin request rather than a probe's bytes — which is exactly why it narrows
+    a VERDICT instead of banning a name: an admin has legitimate reasons to
+    write most of these rows, so only the pair that causes the harm is refused.
 
   Where each rule is NOT matters as much: the ingest enforces **no** count or
   length bound of its own, so what bounds an arriving pass is the honest
