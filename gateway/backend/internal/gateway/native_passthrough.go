@@ -446,6 +446,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	}
 	defer resp.Body.Close()
 
+	// A non-2xx from the IMAGES upstream (sd-server) needs its error shape
+	// normalised into an OpenAI-compatible object before the client sees it --
+	// see normalizeImagesUpstreamError's own doc comment for why the type/code
+	// it adds are the gateway's, never sd-server's. Gated strictly to this one
+	// flavor: every other native-passthrough error (openai_responses,
+	// anthropic_messages) still streams through the copier below, byte-for-
+	// byte, exactly as before this existed.
+	//
+	// Reading the whole body here rather than through the streaming
+	// nativeCopier changes no accepted behavior for images specifically:
+	// Stream is pinned false for this flavor (images_handler.go), so
+	// sd-server's response is always a single buffered payload, whichever
+	// code path reads it.
+	if pfReq.APIFlavor == apiFlavorImages && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		s.relayImagesUpstreamError(w, r, token, req, target, resp, serverName, start, id, capturing, raw)
+		return
+	}
+
 	// A body carrying the key WE added was refused the way an upstream refuses a
 	// body it cannot accept. Two things happen, and both are the whole of issue
 	// #81's rejection residual:
