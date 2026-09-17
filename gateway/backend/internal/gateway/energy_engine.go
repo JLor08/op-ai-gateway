@@ -19,6 +19,26 @@ import (
 // into a wrong one; a bigger gap falls through to Tier 2/3 instead.
 const maxSampleGap = 2 * time.Second
 
+// energySourceUnpriceable is a FOURTH energy_source value, and the only one that
+// is not a tier: it means no tier could apply, because the row's measure is not
+// tokens and the host offered neither telemetry (Tier 1) nor a configured
+// wattage (Tier 2). It is terminal by design -- a stamped row leaves
+// UnpricedUsageEvents' energy_source="" predicate, which is what keeps the
+// reconciler idempotent.
+//
+// A stamp is not optional. Leaving such a row at "" would not merely build a
+// backlog: UnpricedUsageEvents is oldest-first with LIMIT 500 over a 168h
+// horizon, so never-priceable rows occupy the oldest end of every batch and the
+// reconciler stops reaching newer events -- including token rows Tier 1 would
+// have measured. The choice is only WHICH non-empty string, and "modeled" would
+// claim a derivation that did not happen.
+//
+// The operator remedy is to set that server's estimated_watts: Tier 2 then
+// prices every endpoint kind at once, dimensionally honestly, with no new
+// column. A later per-unit coefficient can re-stamp these rows --
+// UpdateUsageEventEnergy writes by id with no source predicate.
+const energySourceUnpriceable = "unpriceable"
+
 // ServerEnergyConfig carries the per-server, operator-set energy knobs
 // (mirroring routing.AIServer.EstimatedWatts/IdleWatts/Pue) that this pure
 // engine needs. It exists so ComputeEnergy doesn't need to import/depend on
@@ -49,11 +69,16 @@ type EnergyResult struct {
 	// beyond simply keeping the server powered on. WhMarginal <= WhTotal by
 	// construction: idle subtraction only ever shrinks the integrand.
 	WhMarginal float64
-	// Source records which tier produced the result: "measured" (Tier 1,
-	// from real per-server power telemetry), "estimated" (Tier 2, from the
-	// server's configured EstimatedWatts), or "modeled" (Tier 3, from a
-	// Wh-per-output-token coefficient). ComputeEnergy always sets one of
-	// these three — there is no "unknown"/empty Source.
+	// Source records the result's PROVENANCE: which tier produced it, or, for
+	// the fourth value, that none could. Its meaning is therefore wider than
+	// "which tier ran" -- it also records the deliberate absence of one. The
+	// four values are "measured" (Tier 1, from real per-server power
+	// telemetry), "estimated" (Tier 2, from the server's configured
+	// EstimatedWatts), "modeled" (Tier 3, from a Wh-per-output-token
+	// coefficient), and "unpriceable" (NOT a tier: the row's measure is not
+	// tokens, so Tier 3 is structurally inapplicable, and neither Tier 1 nor
+	// Tier 2 applied either). ComputeEnergy always sets one of these four —
+	// there is no "unknown"/empty Source.
 	Source string
 }
 
@@ -198,7 +223,14 @@ func siblingWindow(ev usage.Event) (time.Time, time.Time) {
 //   - Tier 2 ("estimated"): the server's configured EstimatedWatts (cfg),
 //     when Tier 1 doesn't apply and EstimatedWatts is set.
 //   - Tier 3 ("modeled"): a Wh-per-output-token coefficient (mappingCoeff,
-//     falling back to sysDefaultWhPerToken), when neither above applies.
+//     falling back to sysDefaultWhPerToken), when neither above applies AND
+//     ev's measure is tokens (ev.BillingUnit == usage.BillingUnitTokens).
+//
+// A fourth Source value, "unpriceable", is PROVENANCE rather than a tier: it is
+// what modeledEnergy returns in Tier 3's place when ev's measure is not tokens,
+// since "coeff * OutputTokens" is then structurally inapplicable. Tiers 1 and 2
+// are token-blind and still apply to such a row when their own preconditions
+// hold; only a Tier-3-only host on a non-token row ends up "unpriceable".
 //
 // start/end are derived from ev as [CreatedAt-LatencyMS, CreatedAt] (request
 // END minus its duration). A zero or negative LatencyMS yields no real
@@ -422,12 +454,24 @@ func estimatedEnergy(start, end time.Time, siblings []usage.Event, watts, idleW 
 	}
 }
 
-// modeledEnergy implements Tier 3: WhTotal = WhMarginal = coeff *
-// ev.OutputTokens, where coeff is mappingCoeff if positive, else
-// sysDefaultWhPerToken (which may itself be 0 — a coeff of 0 still produces
-// Source="modeled" with WhTotal=0, rather than no result at all, so a
-// reconciler can stamp the event once and move on).
+// modeledEnergy implements Tier 3 for a token-metered row: WhTotal =
+// WhMarginal = coeff * ev.OutputTokens, where coeff is mappingCoeff if
+// positive, else sysDefaultWhPerToken (which may itself be 0 — a coeff of 0
+// still produces Source="modeled" with WhTotal=0, rather than no result at
+// all, so a reconciler can stamp the event once and move on). For a
+// non-token row it instead returns the terminal provenance
+// energySourceUnpriceable with zero Wh — see that constant's doc.
 func modeledEnergy(ev usage.Event, mappingCoeff, sysDefaultWhPerToken float64) EnergyResult {
+	// Keyed on the UNIT, deliberately not on ev.OutputTokens == 0. That confines
+	// the new value to rows that cannot exist before migration v81, leaves every
+	// token path byte-identical (including the zero-coefficient row
+	// TestEnergyComputeTier3CoeffZeroStillModeled pins as desirable), and
+	// RESPECTS the XOR instead of trusting it: a producer bug leaving
+	// OutputTokens non-zero can then never be multiplied by a Wh/token
+	// coefficient.
+	if ev.BillingUnit != usage.BillingUnitTokens {
+		return EnergyResult{Source: energySourceUnpriceable}
+	}
 	coeff := mappingCoeff
 	if coeff <= 0 {
 		coeff = sysDefaultWhPerToken

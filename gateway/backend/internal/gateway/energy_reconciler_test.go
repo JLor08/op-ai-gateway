@@ -321,6 +321,51 @@ func TestReconcileEnergyMeasuredCalibratesMapping(t *testing.T) {
 	requireCloseWh(t, "mapping EnergyWhPerToken (seeded from the first measured sample)", m.EnergyWhPerToken, 0.001)
 }
 
+// A measured non-token row must never calibrate energy_wh_per_token: a per-image
+// figure written into a per-token coefficient is exactly the unit-to-token
+// conversion ADR-041 forbids.
+//
+// OutputTokens is deliberately non-zero (a contract violation), to prove the new
+// billing-unit conjunct is what stops the calibration -- not the pre-existing
+// OutputTokens > 0 guard, which would let this through.
+func TestReconcileEnergyMeasuredNonTokenRowDoesNotCalibrate(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	start := base
+	end := base.Add(36 * time.Second)
+
+	f := newEnergyFixture(t, 0, 0)
+	f.createServer("srv1", routing.AIServer{})
+	for i := 0; i <= 36; i++ {
+		f.insertSample("srv1", sampleAt(start, i, 100))
+	}
+	f.createMapping("map1", "app1", "srv1", 8080, routing.ModelMapping{GatewayModelName: "gw", AppModelName: "upstream"})
+	f.usage.Record(usage.Event{
+		ID: "evt_img", Host: "srv1", RouteID: "map1", CreatedAt: end, LatencyMS: 36000,
+		BillingUnit: usage.BillingUnitImage, BillingQuantity: 4,
+		OutputTokens: 1000, // contract violation, on purpose
+	})
+
+	f.srv.reconcileEnergyOnce(context.Background(), end.Add(20*time.Second))
+
+	// Tier 1 still applies: a non-token row on a telemetry-covered host gets a
+	// REAL measured figure. Only the calibration must be refused.
+	ev := f.event("evt_img")
+	if ev.EnergySource != "measured" {
+		t.Fatalf("EnergySource = %q, want %q (Tier 1 is token-blind and must still apply)", ev.EnergySource, "measured")
+	}
+	if ev.EnergyWh <= 0 {
+		t.Fatalf("EnergyWh = %v, want > 0", ev.EnergyWh)
+	}
+
+	m := f.mapping("map1")
+	if m.EnergyWhPerToken != 0 {
+		t.Fatalf("mapping EnergyWhPerToken = %v, want 0 (a non-token row must never calibrate a per-token coefficient)", m.EnergyWhPerToken)
+	}
+	if m.MetricsSource == "energy" {
+		t.Fatalf("MetricsSource = %q: calibration fired on a non-token row", m.MetricsSource)
+	}
+}
+
 func TestReconcileEnergyLockedMappingNotCalibrated(t *testing.T) {
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	start := base
@@ -432,6 +477,37 @@ func TestReconcileEnergyEventForDeletedServerStillFinalized(t *testing.T) {
 	got := f.event("evt1")
 	if got.EnergySource != "modeled" {
 		t.Fatalf("EnergySource = %q, want %q (a deleted server must still finalize via Tier 3)", got.EnergySource, "modeled")
+	}
+}
+
+// reconcileEnergyEvent's deleted-server shortcut calls modeledEnergy directly,
+// bypassing ComputeEnergy. It is the one case where the gap is PERMANENT -- a
+// deleted server can never regain telemetry -- so it must produce the terminal
+// provenance too, and it must still STAMP, or the row never leaves the unpriced
+// queue and starves newer events behind it.
+func TestReconcileEnergyDeletedServerNonTokenRowStampsUnpriceable(t *testing.T) {
+	f := newEnergyFixture(t, 0, 0)
+	// Deliberately do NOT create the server "srv-gone".
+	f.usage.Record(usage.Event{
+		ID: "evt_img", Host: "srv-gone", RouteID: "",
+		CreatedAt: time.Now().Add(-time.Minute), LatencyMS: 1000,
+		BillingUnit: usage.BillingUnitImage, BillingQuantity: 2,
+	})
+
+	f.srv.reconcileEnergyOnce(context.Background(), time.Now())
+
+	got := f.event("evt_img")
+	if got.EnergySource != "unpriceable" {
+		t.Fatalf("EnergySource = %q, want %q", got.EnergySource, "unpriceable")
+	}
+	if got.EnergyWh != 0 || got.EnergyMarginalWh != 0 {
+		t.Fatalf("Wh = (%v, %v), want (0, 0)", got.EnergyWh, got.EnergyMarginalWh)
+	}
+
+	// Idempotency: a stamped row is terminal, so a second pass must not touch it.
+	f.srv.reconcileEnergyOnce(context.Background(), time.Now())
+	if again := f.event("evt_img"); again.EnergySource != "unpriceable" {
+		t.Fatalf("second pass changed EnergySource to %q", again.EnergySource)
 	}
 }
 

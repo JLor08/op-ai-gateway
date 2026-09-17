@@ -199,13 +199,21 @@ func (s *Server) reconcileEnergyEvent(ctx context.Context, ev usage.Event, now t
 	res := ComputeEnergy(ev, samples, siblings, cfg, idleW, mappingCoeff, sysDefaultWhPerToken)
 	s.finalizeEnergyEvent(ctx, ev, res)
 
-	// Calibration: only on a genuine per-request power MEASUREMENT, only with a
-	// resolvable mapping to calibrate, and only with real output tokens to
-	// divide by (a zero-token event carries no per-token signal).
+	// Calibration: only on a genuine per-request power MEASUREMENT, only on a
+	// TOKEN-METERED row, only with a resolvable mapping to calibrate, and only
+	// with real output tokens to divide by.
+	//
+	// The billing-unit conjunct is explicit rather than implied. The divide at
+	// the next line is guarded today only by OutputTokens > 0, which holds only
+	// because a producer in another package honours an unenforced convention --
+	// and dividing WhMarginal by a billing_quantity here is one of the two
+	// surfaces that would tempt a unit-to-token conversion, writing a per-image
+	// number into energy_wh_per_token. See ADR-041.
+	//
 	// UpdateMappingEnergyEWMA is itself metrics_locked-guarded at the store
 	// layer (a locked mapping's write is a benign no-op), so no separate lock
 	// check is needed here.
-	if res.Source == "measured" && ev.OutputTokens > 0 && mappingID != "" {
+	if res.Source == "measured" && ev.BillingUnit == usage.BillingUnitTokens && ev.OutputTokens > 0 && mappingID != "" {
 		sample := res.WhMarginal / float64(ev.OutputTokens)
 		if err := s.Routes.UpdateMappingEnergyEWMA(ctx, mappingID, sample, energyCalibrationAlpha, now); err != nil {
 			slog.Debug("energy reconcile: calibration write failed", "mapping_id", mappingID, "err", err)
