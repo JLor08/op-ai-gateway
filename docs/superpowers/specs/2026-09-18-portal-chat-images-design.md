@@ -207,10 +207,16 @@ So the composer leads with capacity, not with a clock.
 **Before Send.** The prompt field's label becomes "Bildprompt" — the only
 affordance signal, and a true statement about what the field now does. Beside
 it, a capacity line: the room left in this chat, computed from the current
-`buildDoc()` size against the 4 MiB `maxChatContentBytes` constant. Both
-numbers are client-side and exact; the cap is checked pre-gzip
-(`service_chats.go:208`), so base64 pays full price and the arithmetic is
-honest without modelling compression.
+`buildDoc()` size against the cap. The document size is client-side and exact,
+and the cap is checked pre-gzip (`service_chats.go:208`), so base64 pays full
+price and the arithmetic is honest without modelling compression.
+
+**The cap itself is not available to the client.** `maxChatContentBytes` is
+package-private to `portal` (`service_chats.go:43`) and no DTO carries it. It
+must be **served**, not duplicated: a second 4 MiB literal in TypeScript would
+drift from the Go constant with nothing to catch it, and the failure mode is a
+capacity line that confidently states the wrong number. Expose it once and
+read it.
 
 When the budget cannot hold another image, **Send refuses up front**. This is
 the repo's own rule applied one layer up: `validateImagesRequest` 400s a
@@ -225,7 +231,14 @@ mechanisms for a failure that can simply be declined.
 - A liveness dot, from the run's server-reported `running` status — the same
   claim the sidebar's existing indicator already makes, and no more.
 - An elapsed clock from the run's server-reported age, labelled as the
-  **wait**, not the work: "Warte auf Bild · 1:47". Not "Bild wird erzeugt":
+  **wait**, not the work: "Warte auf Bild · 1:47". **No such age exists
+  today** — the only `time.Time` on a `ChatRun` is `endedAt`
+  (`chat_runs.go:168`), so a start instant has to be added and surfaced on the
+  snapshot, the active-runs DTO and the start response. Deriving it client-side
+  from the moment of Send is not equivalent: a reopened tab never saw that
+  moment. The `m:ss` formatter the design wants already exists as
+  `formatElapsed` (`ActiveRequestsPanel.tsx:13-19`) but is **not exported**, so
+  it needs lifting into a shared module rather than copying. Not "Bild wird erzeugt":
   between dispatch and terminal the request may still be queued for admission
   or waiting on a model load, during which "is being generated" is false.
   "Warte auf Bild" is true for the whole span and makes the clock's referent
@@ -250,6 +263,20 @@ the run. "This finishes or fails within N minutes" then becomes a
 configuration value rather than an estimate, and it is the one thing that
 turns an open-ended wait into a bounded one. Without it the most likely real
 failure is a user cancelling a run that would have succeeded.
+
+Two traps make this more than a one-line change, both verified:
+
+- **A timeout would be reported as a user cancel.** `executeRun` turns any
+  context error into `finishRun(..., "canceled", "")` with an empty message
+  (`chat_runs.go:520`). A deadline firing would therefore be indistinguishable
+  from the user pressing Stop — the exact silent-conflation this design
+  rejects elsewhere. The timeout needs its own terminal status or message.
+- **The deadline could abort its own commit.** `finishRun` is called with the
+  run's own context on three paths (`:484`, `:489`, `:529`). Once that context
+  carries a deadline, the terminal `CommitAssistant` inside `finishRun` can be
+  cancelled by the very timeout that ended the run — losing the turn instead
+  of recording it. The commit must run on a context that does not carry the
+  run's deadline.
 
 **Cancel says what it discards.** For a buffered relay there is no partial
 result: at the moment of cancel nothing has been received, so Stop loses the
@@ -339,15 +366,41 @@ byte-identical on the wire and an absent kind reads as text.
 Once pinned, the model picker filters to models of that kind. The thread's
 kind, not the picker's current value, decides what the composer offers.
 
-**The pin is a UI constraint, not an authorization.** `PrepareChatRun` already
-establishes the pattern for a persisted setting that must not be trusted from
-storage: `ServerOverride` is re-validated against the owner's permissions on
-every single run (`:390-392`, and see the doc at `:372-389` — "trusts nothing
-it reads from storage"). The pinned kind gets the same treatment. A thread
-pinned to `image` whose model later loses its `image` verdict — the operator
-revoked it, the mapping changed — must fail the capability gate exactly as it
-would unpinned. The pin decides what the composer offers; the gate decides
-what the gateway serves, and it stays the only authority.
+**The pin must be enforced server-side, and the obvious place does not work.**
+`PrepareChatRun` does not read the persisted settings blob at all — it
+**replaces** it wholesale with the settings the client submitted on this
+request:
+
+```go
+settingsRaw, err := json.Marshal(req.Settings)   // req, i.e. the CLIENT's settings
+...
+doc.Settings = settingsRaw                        // service_chats.go:399
+```
+
+So a `kind` written into `doc.Settings` and left there is overwritten by the
+next run's submitted settings. Worse, `startRunRequest.Settings` is
+`portal.ChatRunSettings` **verbatim** (`chat_run_endpoints.go:23`), so every
+field added to that struct becomes client-settable over the API the moment it
+exists. A naive pin is therefore not a pin: the client sets it.
+
+The pin must be read from the stored document **before** the overwrite and
+re-imposed on the submitted settings — a first send establishes it, and every
+later send has it forced back regardless of what was submitted.
+
+This also corrects a misreading in an earlier draft of this spec: the
+`ServerOverride` self-heal is **not** an example of distrusting storage,
+because nothing here reads storage. It re-validates the value the *client
+submitted in this request* (`req.Settings.ServerOverride`, `:390`). It is
+still the right precedent, but for a different reason than stated — it shows
+that this function is where a submitted setting gets overridden by a
+server-side truth, which is exactly the hook the pin needs.
+
+**And the pin is still a UI constraint, not an authorization.** A thread
+pinned to `image` whose model later loses its `image` verdict — operator
+revoked, mapping changed — must fail the capability gate exactly as it would
+unpinned. The pin decides what the composer offers; `filterCapable` decides
+what the gateway serves and stays the only authority. Given that the field is
+client-settable, this is a requirement rather than a nicety.
 
 ## 7. Pre-existing defects this feature walks into
 
@@ -366,6 +419,13 @@ if (empty) return prev.slice(0, -1);
 ```
 
 Any **non-string** content counts as empty, and the bubble is then sliced off.
+
+**There are two such prunes and only this one is wrong.**
+`pruneEmptyAssistantTail` (`chatDoc.ts:264-267`), which `buildDoc` runs on
+every save, tests `last.content.length === 0` under the comment "`.length`
+covers both the string and (defensively) the array shape" — correct for an
+array, because a one-part image array has length 1. Only the `useChatRuns`
+copy takes the `typeof` branch. Fix that one; do not "align" them.
 An image written as an array of content parts is therefore deleted after a
 successful generation *and* a successful persist — it survives only via the
 best-effort canonical refetch (`:196-204`, whose own comment says a failed
@@ -400,7 +460,11 @@ multiplies by roughly fifty, and what it clobbers is a just-committed image.
 checked across the whole file, not a prefix. The backend can return three:
 `portal.chat_too_large` (`error_map.go:45`), `portal.chat_run_active` and
 `portal.chat_run_limit` (`chat_run_endpoints.go:49-50`, with `maxPerUser`
-defaulting to 5). All three toast raw English today. The run-contention pair
+defaulting to 5 — hardcoded in two places, `chat_runs.go:268-270` and
+`cmd/gateway/main.go:1082`, and configurable in neither). A fourth is
+reachable from the operator form this feature adds: `mapping.capability_reserved`
+(`portal_mapping_endpoints.go:138`), returned when someone tries to write the
+refused `(image, no)`. All four toast raw English today. The run-contention pair
 becomes ordinary rather than exotic precisely because this feature's answer to
 a multi-minute wait is "go work in another chat".
 
@@ -435,3 +499,30 @@ for, data[] states what was produced, and a partial failure makes those
 differ." So the backend already bills plural, a plural response is a real
 case, and the UI must render and offer download per item and size the
 capacity arithmetic on the sum.
+
+### 7.9 The pagehide keepalive is dead for any image thread
+
+`useChatPersistence.ts:227-229` refuses to send its unload-time save when
+`JSON.stringify(payload).length > 60000`. A single inline base64 image is far
+past that, so the keepalive silently returns and a last-moment change is lost
+on navigate-away — in exactly the threads this feature creates. The size guard
+exists for a real reason (a `sendBeacon`-class payload limit), so the answer is
+not to raise it blindly.
+
+### 7.10 A non-200 from the gateway's own loopback call loses its body
+
+`executeRun` turns any non-200 into `errMsg = "upstream status " + resp.Status`
+without reading `resp.Body` (`chat_runs.go:528-531`). Every error code the
+images endpoint was built to return — `images.prompt_required`,
+`images.stream_unsupported`, `images.response_format_unsupported`,
+`images.upstream_error` — is therefore discarded before the user can see it,
+and the chat reports a bare status line instead. The endpoint's careful error
+vocabulary is only useful if the executor relays it.
+
+### 7.11 `npm test` does not type-check
+
+`npm test` is `vitest run`; only `npm run build` runs `tsc`
+(`package.json:8-9`). A `ChatStore` field missing from
+`ChatSidebar.test.tsx`'s `makeStore` — which enumerates all 47 fields and is
+typed `ChatStore` with no cast — passes the test suite and fails the build. Any
+task touching that type must run `npm run build`, not just `npm test`.
