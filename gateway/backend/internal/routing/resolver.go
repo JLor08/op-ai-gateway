@@ -816,6 +816,80 @@ func (r *Resolver) affinityApplicationStale(app Application, affinity RouteAffin
 		(r.checker != nil && !r.checker.Reachable(app.ID))
 }
 
+// affinityServer loads the AI server a stored affinity's application sits on and
+// decides whether that server is still a usable destination for the pin -- it
+// must exist, be selectable (active and not unhealthy), and not be temporarily
+// busy. Extracted from resolveAffinity, alongside affinityApplicationStale
+// above, so that method's cognitive complexity stays within budget.
+//
+// The three-way result is what resolveAffinity's own three-way handling needs,
+// and the split is deliberate: usable == false is a DROP -- the server is gone,
+// unselectable or busy, and the caller deletes the affinity row -- while a
+// non-nil error is a store failure that says nothing about the pin, so the
+// caller surfaces it and leaves the row alone. A vanished server
+// (storeerr.ErrNotFound) is a drop, not an error, for the same reason a
+// vanished application is.
+func (r *Resolver) affinityServer(ctx context.Context, serverID string) (server AIServer, usable bool, err error) {
+	server, err = r.store.AIServerByID(ctx, serverID)
+	if errors.Is(err, storeerr.ErrNotFound) {
+		return AIServer{}, false, nil
+	}
+	if err != nil {
+		return AIServer{}, false, fmt.Errorf("load affinity server: %w", err)
+	}
+	if !serverSelectable(server) {
+		return AIServer{}, false, nil
+	}
+	if r.busy != nil && r.busy.ServerBusy(server.ID) {
+		return AIServer{}, false, nil
+	}
+	return server, true, nil
+}
+
+// affinityCapabilityVerdict performs resolveAffinity's ONE keyed capability read
+// and answers the two different questions that read serves: the live-progress
+// annotation for the synthetic candidate, and whether the pinned mapping still
+// satisfies the capabilities this request requires.
+//
+// resolveAffinity's mapping comes from activeMappingForApplication
+// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
+// model_mapping_capabilities, so unlike every other targetFrom call site this
+// one has to fetch the verdict itself with a dedicated keyed read. That read is
+// on a path that already makes four store calls just to reach this point
+// (Affinity, ApplicationByID, AIServerByID, activeMappingForApplication's
+// MappingsByApplication); one more keyed lookup is the cost of the pin no
+// longer serving a stale verdict for its entire TTL. Both answers come off that
+// single read: the capability gate costs no extra store call.
+//
+// The two answers read the SAME rows with deliberately different failure
+// postures:
+//
+//   - LIVE PROGRESS is best-effort: a read failure degrades to ""
+//     (never-determined) -- the same reading an absent capability row would
+//     produce -- rather than failing an otherwise-servable affinity hit. The
+//     cost is that a transient store error can make one pinned request look
+//     like the verdict was never determined, which is strictly better than
+//     serving the wrong (frozen, possibly stale) column value.
+//   - The GATE treats a read error as not-satisfied. Live progress failing open
+//     costs one annotation; this failing open would route an image request to a
+//     chat model for the whole AffinityTTLSeconds.
+//
+// satisfied is true for a request that requires nothing (required empty), which
+// is every chat request: the gate is skipped, not evaluated, so no verdict can
+// refuse a pin that was never asked about a capability.
+func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID string, required []string) (liveProgressSupport string, satisfied bool) {
+	caps, capErr := r.store.MappingCapabilities(ctx, mappingID)
+	if capErr == nil {
+		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
+			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
+		}
+	}
+	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(caps, required)) {
+		return liveProgressSupport, false
+	}
+	return liveProgressSupport, true
+}
+
 func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, required []string, now time.Time) (Target, bool, error) {
 	affinity, ok, err := r.store.Affinity(ctx, key)
 	if err != nil {
@@ -840,19 +914,11 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
-	server, err := r.store.AIServerByID(ctx, app.ServerID)
-	if errors.Is(err, storeerr.ErrNotFound) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
+	server, usable, err := r.affinityServer(ctx, app.ServerID)
 	if err != nil {
-		return Target{}, false, fmt.Errorf("load affinity server: %w", err)
+		return Target{}, false, err
 	}
-	if !serverSelectable(server) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
-	if r.busy != nil && r.busy.ServerBusy(server.ID) {
+	if !usable {
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
@@ -864,43 +930,19 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
-	// resolveAffinity's mapping comes from activeMappingForApplication
-	// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
-	// model_mapping_capabilities, so unlike every other targetFrom call site
-	// this one has to fetch the verdict itself with a dedicated keyed read.
-	// That read is on a path that already makes four store calls just to
-	// reach this point (Affinity, ApplicationByID, AIServerByID,
-	// activeMappingForApplication's MappingsByApplication); one more keyed
-	// lookup is the cost of the pin no longer serving a stale verdict for its
-	// entire TTL. Best-effort for LIVE PROGRESS: a read failure degrades to ""
-	// (never-determined) -- the same reading an absent capability row would
-	// produce -- rather than failing an otherwise-servable affinity hit; the
-	// cost is that a transient store error can make one pinned request look
-	// like the verdict was never determined, which is strictly better than
-	// serving the wrong (frozen, possibly stale) column value.
-	liveProgressSupport := ""
-	caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID)
-	if capErr == nil {
-		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
-			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
-		}
-	}
-	// The capability gate on the pinned mapping -- this is the one Resolve branch
-	// with no candidate filter at all (its mapping comes from MappingsByApplication,
-	// which never joins model_mapping_capabilities), so it gates off the very read
-	// fetched above for live progress: no extra store call. Two things differ from
-	// that live-progress read, both deliberate:
+	// One keyed capability read serves both the live-progress annotation and the
+	// capability gate on the pinned mapping; the read, and the different failure
+	// posture each answer takes, are documented on affinityCapabilityVerdict.
+	// This is the one Resolve branch with no candidate filter at all -- its
+	// mapping comes from MappingsByApplication, which never joins
+	// model_mapping_capabilities -- so the gate has to live here.
 	//
-	//  1. A read ERROR is not-satisfied here, where live progress degrades to ""
-	//     (advisory). Live progress failing open costs one annotation; this
-	//     failing open would route an image request to a chat model for the
-	//     whole AffinityTTLSeconds.
-	//  2. The refusal is NON-DESTRUCTIVE -- it returns (Target{}, false, nil) and
-	//     lets the caller fall through to the fresh-candidate path. Every other
-	//     rejection in this function deletes the affinity row, and that would be
-	//     wrong here: AffinityKey.APIFlavor is COARSE, so an image request
-	//     declaring the pin stale would delete the chat client's pin. For the
-	//     same reason the gate is not in affinityApplicationStale.
+	// The refusal is NON-DESTRUCTIVE: it returns (Target{}, false, nil) and lets
+	// the caller fall through to the fresh-candidate path. Every other rejection
+	// in this function deletes the affinity row, and that would be wrong here:
+	// AffinityKey.APIFlavor is COARSE, so an image request declaring the pin
+	// stale would delete the chat client's pin. For the same reason the gate is
+	// not in affinityApplicationStale.
 	//
 	// Placed BEFORE the LastUsedAt/UpdatedAt refresh below so a REFUSED request
 	// never touches the affinity row at all. This ordering does NOT make the
@@ -912,7 +954,8 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	// for a routing decision anywhere in this backend) -- so unlike the two
 	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
 	// on the capability list, and does not need to be.
-	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(caps, required)) {
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, required)
+	if !capable {
 		return Target{}, false, nil
 	}
 	affinity.LastUsedAt = now

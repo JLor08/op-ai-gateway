@@ -119,6 +119,71 @@ type imagesDataCounter struct {
 	bytesSeen int
 }
 
+// newImagesDataCounter answers a counter for an images request and nil for
+// every other flavor, mirroring newUsageScanner's own nil-for-images
+// convention (passthrough_usage_scan.go) -- the two are exact complements, and
+// proxyNative builds both the same way so neither flavor test is spelled out at
+// the call site. A nil counter is fed and read safely (every method here is
+// nil-safe), so a non-images relay pays nothing.
+func newImagesDataCounter(apiFlavor string) *imagesDataCounter {
+	if apiFlavor != apiFlavorImages {
+		return nil
+	}
+	return &imagesDataCounter{}
+}
+
+// markerRole is what resolveMarkerRole decides about ONE quoted
+// imagesDataMarker occurrence inside feed's window.
+type markerRole int
+
+const (
+	markerIsKey      markerRole = iota // resolved by ':' -- one produced image
+	markerIsValue                      // resolved by any other byte -- a string value, never counted
+	markerUnresolved                   // the window ended before any byte resolved it
+)
+
+// resolveMarkerRole decides whether the imagesDataMarker occurrence whose bytes
+// end just before `after` in window is being used as a JSON KEY or as a string
+// VALUE, by looking for the first byte from `after` on that is not whitespace:
+// ':' means KEY, anything else means VALUE. See imagesDataMarker's own doc
+// comment for why the marker's quotes alone cannot make that call.
+//
+// Two bounds cut the search short, and they answer DIFFERENTLY on purpose:
+//
+//   - Running out of WINDOW having seen nothing but whitespace is
+//     markerUnresolved: the deciding byte may be the first byte of the next
+//     upstream read, so feed defers the match into its carry rather than guess.
+//   - Reaching the imagesDataKeyLookahead bound having seen nothing but
+//     whitespace is markerIsValue: a real JSON key never puts that much space
+//     before its colon, and this is the bound that stops a hostile upstream
+//     padding a key occurrence with unbounded whitespace to grow feed's carry
+//     without limit.
+func resolveMarkerRole(window []byte, after int) markerRole {
+	limit := after + imagesDataKeyLookahead
+	ranOutOfWindow := false
+	if limit >= len(window) {
+		limit = len(window)
+		ranOutOfWindow = true
+	}
+	j := after
+	for j < limit && isJSONSpace(window[j]) {
+		j++
+	}
+	switch {
+	case j < limit:
+		// A resolving (non-whitespace) byte was found within the window and
+		// within the lookahead bound.
+		if window[j] == ':' {
+			return markerIsKey
+		}
+		return markerIsValue
+	case ranOutOfWindow:
+		return markerUnresolved
+	default:
+		return markerIsValue
+	}
+}
+
 // feed counts new KEY occurrences of imagesDataMarker in chunk -- i.e. ones
 // immediately followed, after skipping up to imagesDataKeyLookahead bytes of
 // JSON whitespace, by ':' -- folding in the bounded carry retained from the
@@ -126,9 +191,11 @@ type imagesDataCounter struct {
 // determination, split across two upstream reads is neither missed nor
 // double-counted. A quoted match that resolves to anything other than ':' is
 // a STRING VALUE and is never counted; see imagesDataMarker's own doc
-// comment for why the quotes alone cannot make that call. Nil-safe, matching
-// usageScanner.feed's own convention, so a nativeCopier built without a
-// counter (every non-images flavor) pays nothing.
+// comment for why the quotes alone cannot make that call. The per-match
+// decision itself, and the two bounds that cut it short, are
+// resolveMarkerRole's above; feed owns the walk, the count and the carry.
+// Nil-safe, matching usageScanner.feed's own convention, so a nativeCopier
+// built without a counter (every non-images flavor) pays nothing.
 func (c *imagesDataCounter) feed(chunk []byte) {
 	if c == nil {
 		return
@@ -148,38 +215,19 @@ scan:
 		}
 		matchStart := pos + i
 		after := matchStart + len(imagesDataMarkerBytes)
-		limit := after + imagesDataKeyLookahead
-		ranOutOfWindow := false
-		if limit >= len(window) {
-			limit = len(window)
-			ranOutOfWindow = true
-		}
-		j := after
-		for j < limit && isJSONSpace(window[j]) {
-			j++
-		}
-		switch {
-		case j < limit:
-			// A resolving (non-whitespace) byte was found within the window
-			// and within the lookahead bound: ':' means this occurrence is a
-			// KEY, anything else means it is a VALUE.
-			if window[j] == ':' {
-				c.count++
-			}
+		switch resolveMarkerRole(window, after) {
+		case markerIsKey:
+			c.count++
 			pos = after
-		case ranOutOfWindow:
+		case markerIsValue:
+			pos = after
+		case markerUnresolved:
 			// Every byte to the end of the CURRENT window was whitespace, and
 			// the lookahead bound was not yet reached: the resolving byte may
 			// be in the NEXT chunk. Defer this match to the next feed call
 			// rather than guess.
 			deferredFrom = matchStart
 			break scan
-		default:
-			// The lookahead bound was reached with nothing but whitespace: a
-			// real JSON key never puts this much space before its colon, so
-			// this is treated as a VALUE (not counted) rather than grown
-			// further.
-			pos = after
 		}
 	}
 
@@ -396,17 +444,29 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
 		return
 	}
-	path := upstreamPath(target, req.APIFlavor)
-	s.proxyNative(w, r, token, target, path, raw, req, endpointImages)
+	s.proxyNative(w, r, nativeRelay{
+		token:    token,
+		target:   target,
+		path:     upstreamPath(target, req.APIFlavor),
+		raw:      raw,
+		pfReq:    req,
+		endpoint: endpointImages,
+	})
 }
 
 // relayImagesUpstreamError handles a non-2xx response from the images
 // upstream (sd-server): it buffers the (bounded) body, normalises it via
 // normalizeImagesUpstreamError, and relays either the normalised OpenAI object
 // or -- when the body matches neither recognised shape -- the original bytes
-// unchanged, never guessed at. Called from proxyNative (native_passthrough.go),
-// gated to apiFlavorImages so no other native-passthrough flavor's error
+// unchanged, never guessed at. Called from proxyNative (native_passthrough.go)
+// behind needsImagesErrorRelay, so no other native-passthrough flavor's error
 // handling changes.
+//
+// ex carries this request's identity -- principal, session-enriched request,
+// target, client bytes, and the start/id/capturing bookkeeping -- as one value.
+// This function both writes the client's response and records its usage row, so
+// it needs everything proxyNative's own terminal step needs; see nativeExchange
+// (native_passthrough.go).
 //
 // Reads the whole body via io.ReadAll rather than proxyNative's streaming
 // nativeCopier: images never streams (Stream is pinned false in
@@ -416,7 +476,7 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 // design. The read is bounded by s.captureMaxBytes (the same cap the copier's
 // own capture buffer already uses, not widened here): an error body has no
 // reason to exceed it.
-func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, target routing.Target, resp *provider.ProxyResponse, serverName string, start time.Time, id string, capturing bool, raw []byte) {
+func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
 	upstreamBody, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
 	errorCode := fmt.Sprintf("upstream.%d", resp.StatusCode)
 	if readErr != nil {
@@ -425,9 +485,9 @@ func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request
 		// provider.stream_copy_error on the streaming path; named the same way
 		// here for one consistent code across both.
 		errorCode = "provider.stream_copy_error"
-		slog.Error("inference native passthrough copy error", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", serverName, "err", readErr)
+		slog.Error("inference native passthrough copy error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "err", readErr)
 	} else {
-		slog.Warn("inference native passthrough upstream error", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", serverName, "status", resp.StatusCode)
+		slog.Warn("inference native passthrough upstream error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "status", resp.StatusCode)
 	}
 
 	var written []byte
@@ -449,10 +509,56 @@ func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request
 	}
 
 	// BillingUnit is set unconditionally, as in relayImages above:
-	// relayImagesUpstreamError is images-only, so req.APIFlavor is always
+	// relayImagesUpstreamError is images-only, so ex.req.APIFlavor is always
 	// apiFlavorImages. A non-2xx upstream response is still a non-token
 	// request -- BillingQuantity stays 0, nothing was produced.
-	s.recordUsage(start, token, req, target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), written, resp.StatusCode, req.APIFlavor))
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor))
+}
+
+// needsImagesErrorRelay reports whether a native-passthrough response must go
+// through relayImagesUpstreamError instead of proxyNative's streaming copier: an
+// images-flavor request whose upstream answered a non-2xx status, whose error
+// SHAPE has to be normalised before the client sees it.
+//
+// It is deliberately narrow on both axes. The flavor test is what keeps every
+// other native-passthrough error (openai_responses, anthropic_messages) on the
+// copier, relayed byte-for-byte exactly as before this endpoint existed; the
+// status test is the same 2xx window proxyNative's own success path uses, so a
+// 2xx images response still streams.
+func needsImagesErrorRelay(apiFlavor string, statusCode int) bool {
+	return apiFlavor == apiFlavorImages && (statusCode < 200 || statusCode >= 300)
+}
+
+// setImagesBillingQuantity records, on meta, how many images a finished relay
+// reports having produced -- and does nothing at all for a non-images flavor or
+// a request that did not finish cleanly, leaving BillingQuantity at 0 so
+// nothing is asserted about what was produced.
+//
+// The quantity comes from the RESPONSE, not the request: n states what was asked
+// for, data[] states what was produced, and a partial failure makes those
+// differ. imgCounter's count is only trusted once the FULL body actually reached
+// the client without error (status == "success" -- upstream 2xx, no idle
+// timeout, no client disconnect, no copy error; a non-2xx images response never
+// gets here at all, see needsImagesErrorRelay above).
+//
+// A successful relay that counted zero produced images is indistinguishable, in
+// the recorded row alone, from a genuine empty data[] -- imagesDataCounter's own
+// doc comment names this as its failure mode. The (unit, quantity) pair has no
+// "unknown" representation to fall back on, so discoverability is the
+// alternative: log it at Error, with enough to find the request, exactly as
+// recordUsage logs an XOR violation rather than silently repairing the row.
+//
+// meta.ReqPath is read for that log line rather than taking the request a
+// second time: it is the same r.URL.Path the caller already put there.
+func setImagesBillingQuantity(meta *usageMeta, ex nativeExchange, counter *imagesDataCounter, status string) {
+	if ex.req.APIFlavor != apiFlavorImages || status != "success" {
+		return
+	}
+	n := counter.total()
+	if n == 0 {
+		slog.Error("images relay succeeded but counted zero produced images", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "body_bytes", counter.bytesFed())
+	}
+	meta.BillingQuantity = float64(n)
 }
 
 // imagesUpstreamErrorType and imagesUpstreamErrorCode are the GATEWAY's own

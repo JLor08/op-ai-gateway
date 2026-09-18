@@ -242,7 +242,14 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	}
 	switch mode {
 	case routing.EndpointModePassthrough:
-		s.proxyNative(w, r, *token, target, path, raw, req, endpoint)
+		s.proxyNative(w, r, nativeRelay{
+			token:    *token,
+			target:   target,
+			path:     path,
+			raw:      raw,
+			pfReq:    req,
+			endpoint: endpoint,
+		})
 		return true
 	case routing.EndpointModeDisabled:
 		// The resolved application (or, for a server_agent app, the resolved runtime
@@ -285,29 +292,40 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 // a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
 // field reaches the upstream as the client wrote it.
 //
-// endpoint is the session-extraction discriminator, supplied by the caller
-// rather than inferred from pfReq.APIFlavor here (see tryProxyNative's doc
-// comment for why the coarse flavor stopped being able to carry that
-// inference once a second, non-translate native endpoint — images — shared
-// "openai" with responses).
-func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.Token, target routing.Target, path string, raw []byte, pfReq inference.Request, endpoint sessionEndpoint) {
+// Everything the caller decides about the relay arrives in rel; see
+// nativeRelay below for what each of its fields is and why it cannot be
+// derived here.
+func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeRelay) {
 	start := time.Now()
 	id := nextRequestID()
-	capturing := s.capturingEnabled(token)
+	capturing := s.capturingEnabled(rel.token)
 	// SessionID mirrors the translate path so usage/activity rows carry it for
 	// native-passthrough traffic too (it's also what keyed the routing affinity).
-	si := extractClientSession(r.Header, raw, endpoint)
+	si := extractClientSession(r.Header, rel.raw, rel.endpoint)
 	req := inference.Request{
-		Model:           pfReq.Model,
-		RequestedModel:  pfReq.RequestedModel,
-		APIFlavor:       pfReq.APIFlavor,
-		Stream:          pfReq.Stream,
+		Model:           rel.pfReq.Model,
+		RequestedModel:  rel.pfReq.RequestedModel,
+		APIFlavor:       rel.pfReq.APIFlavor,
+		Stream:          rel.pfReq.Stream,
 		SessionID:       si.ExplicitHeader,
 		ClientSessionID: si.ClientSession,
 		SessionSource:   si.Source,
 		AgentID:         si.AgentID,
 	}
-	serverName := s.serverName(target.ServerID)
+	serverName := s.serverName(rel.target.ServerID)
+	// The request's identity, assembled once so the helpers that finish it (and
+	// record its usage row) take one value rather than repeating this list --
+	// see nativeExchange.
+	ex := nativeExchange{
+		token:      rel.token,
+		req:        req,
+		target:     rel.target,
+		raw:        rel.raw,
+		serverName: serverName,
+		start:      start,
+		id:         id,
+		capturing:  capturing,
+	}
 
 	proxyClient, ok := s.Provider.(provider.NativeProxyClient)
 	if !ok {
@@ -317,7 +335,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		// passthrough flavor, so the images unit must come from the CALLER's
 		// own endpoint identity here too, not only in images_handler.go's own
 		// two call sites.
-		s.recordUsage(start, token, req, target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadGateway, pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor))
 		return
 	}
 
@@ -364,7 +382,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// The payload capture keeps recording the CLIENT's bytes, so the debug line
 	// below is where an operator debugging a 400 learns that the gateway added
 	// a key at all.
-	upstreamBody := rewriteModelField(raw, target.ProviderModel)
+	upstreamBody := rewriteModelField(rel.raw, rel.target.ProviderModel)
 
 	// The operator's opt-in, applied as a SECOND, separate edit rather than
 	// folded into the rewrite above. rewriteModelField returns the client's own
@@ -393,7 +411,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// Same construction as internal/provider's own guard,
 	// `wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)`.
 	injectedLiveTimings := false
-	if wantsResponsesLiveTimings(target, pfReq.APIFlavor, pfReq.Stream) && !liveProgressRejectedFor(s.Provider, target) {
+	if wantsResponsesLiveTimings(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream) && !liveProgressRejectedFor(s.Provider, rel.target) {
 		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
 	}
 
@@ -406,12 +424,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	var idledOut atomic.Bool
 	var watchdog *time.Timer
 	switch {
-	case pfReq.Stream && idle > 0:
+	case rel.pfReq.Stream && idle > 0:
 		watchdog = time.AfterFunc(idle, func() { idledOut.Store(true); cancel() })
 		defer watchdog.Stop()
-	case !pfReq.Stream && target.Timeout > 0:
+	case !rel.pfReq.Stream && rel.target.Timeout > 0:
 		var tcancel context.CancelFunc
-		ctx, tcancel = context.WithTimeout(ctx, target.Timeout)
+		ctx, tcancel = context.WithTimeout(ctx, rel.target.Timeout)
 		defer tcancel()
 	}
 
@@ -428,28 +446,28 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// "measured 0" where nil says "nothing to measure", which is the distinction
 	// this whole feature is built on (see liveProgressDTO and formatLiveTps).
 	var progress *requestProgress
-	if pfReq.Stream {
+	if rel.pfReq.Stream {
 		progress = &requestProgress{}
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: serverName, ServerID: target.ServerID, Model: pfReq.Model, RequestedModel: pfReq.RequestedModel, APIFlavor: pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: pfReq.Stream, StartedAt: start, Progress: progress})
+	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
-	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "stream", pfReq.Stream, "server", serverName, "upstream_path", path, "token_id", token.ID, "user_id", token.UserID, "timings_per_token_injected", injectedLiveTimings)
+	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings)
 
 	// Attach the resolved application's per-app upstream credential (fail-open).
-	ctx = s.upstreamAuthCtx(ctx, target)
-	resp, err := proxyClient.ProxyNative(ctx, target, path, upstreamBody)
+	ctx = s.upstreamAuthCtx(ctx, rel.target)
+	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
 		code := completionErrorCode(err)
 		httpStatus := completionHTTPStatus(err)
-		slog.Error("inference native passthrough failed", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName, "code", code, "err", err)
+		slog.Error("inference native passthrough failed", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "server", serverName, "code", code, "err", err)
 		body := writeCompletionErrorCaptured(w, err)
 		// Same reasoning as the provider.unavailable branch above: this is a
 		// pre-response failure (nothing came back from sd-server at all), and
 		// it is still a non-token images request when pfReq.APIFlavor says so.
-		s.recordUsage(start, token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, httpStatus, pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor))
 		return
 	}
 	defer resp.Body.Close()
@@ -467,8 +485,8 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// Stream is pinned false for this flavor (images_handler.go), so
 	// sd-server's response is always a single buffered payload, whichever
 	// code path reads it.
-	if pfReq.APIFlavor == apiFlavorImages && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
-		s.relayImagesUpstreamError(w, r, token, req, target, resp, serverName, start, id, capturing, raw)
+	if needsImagesErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
+		s.relayImagesUpstreamError(w, r, ex, resp)
 		return
 	}
 
@@ -519,9 +537,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// same standard the translate path's retry has always applied.
 	if injectedLiveTimings && provider.SchemaRejectionStatus(resp.StatusCode) {
 		slog.Warn("upstream answered 400/422 to a body carrying the injected live timings parameter; suppressing it for this mapping until the memo expires (not retried)",
-			"path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName,
-			"route_id", target.RouteID, "status", resp.StatusCode)
-		recordLiveProgressRejection(s.Provider, target)
+			"path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "server", serverName,
+			"route_id", rel.target.RouteID, "status", resp.StatusCode)
+		recordLiveProgressRejection(s.Provider, rel.target)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -529,7 +547,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 		contentType = jsonContentType
 	}
 	w.Header().Set("Content-Type", contentType)
-	if pfReq.Stream {
+	if rel.pfReq.Stream {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 	}
@@ -561,42 +579,77 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// imagesDataCounter's own doc comment in images_handler.go for the
 	// key-versus-value check and for why it must not read the capped respBuf
 	// above instead).
-	var imgCounter *imagesDataCounter
-	if pfReq.APIFlavor == apiFlavorImages {
-		imgCounter = &imagesDataCounter{}
-	}
+	imgCounter := newImagesDataCounter(rel.pfReq.APIFlavor)
 	var respBuf bytes.Buffer
-	scanner := newUsageScanner(pfReq.APIFlavor, s.captureMaxBytes, progress)
+	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress)
 	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter}
 	copyErr := copier.run(resp.Body)
 
-	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, pfReq, serverName, idledOut.Load(), copyErr, start)
+	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
 
 	usg := scanner.usage()
-	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(pfReq.APIFlavor)}
-	// The quantity comes from the RESPONSE, not the request: n states what was
-	// asked for, data[] states what was produced, and a partial failure makes
-	// those differ. Only trust imgCounter's count once the FULL body actually
-	// reached the client without error (status == "success" -- upstreamOK, no
-	// idle timeout, no client disconnect, no copy error; a non-2xx images
-	// response never reaches here at all, see the branch above). Otherwise
-	// BillingQuantity stays 0: nothing is asserted about what was produced.
-	if pfReq.APIFlavor == apiFlavorImages && status == "success" {
-		n := imgCounter.total()
-		if n == 0 {
-			// A successful relay that counted zero produced images is
-			// indistinguishable, in the recorded row alone, from a genuine
-			// empty data[] -- imagesDataCounter's own doc comment names this
-			// as its failure mode. The (unit, quantity) pair has no "unknown"
-			// representation to fall back on, so discoverability is the
-			// alternative: log it at Error, with enough to find the request,
-			// exactly as recordUsage below logs an XOR violation rather than
-			// silently repairing the row.
-			slog.Error("images relay succeeded but counted zero produced images", "id", id, "path", r.URL.Path, "model", pfReq.Model, "server", serverName, "body_bytes", imgCounter.bytesFed())
-		}
-		meta.BillingQuantity = float64(n)
-	}
-	s.recordUsage(start, token, req, target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), respBuf.Bytes(), resp.StatusCode, pfReq.APIFlavor))
+	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}
+	// The images measure, for an images request that finished cleanly and for
+	// nothing else -- see setImagesBillingQuantity (images_handler.go) for why
+	// the count comes off the RESPONSE and why a counted zero is logged rather
+	// than quietly recorded.
+	setImagesBillingQuantity(&meta, ex, imgCounter, status)
+	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor))
+}
+
+// nativeRelay is everything, beyond the HTTP pair, that describes ONE native
+// passthrough relay its caller has already decided on: which principal, which
+// resolved destination, which client bytes, and which endpoint identity. The two
+// call sites (tryProxyNative above and relayImages in images_handler.go) each
+// hold all six as locals by the time they call, so this groups values that
+// already travel together rather than unrelated ones bundled to shorten a
+// signature.
+//
+// pfReq is the PREFLIGHT request (inferencePreflight's own pf.Req), deliberately
+// named apart from the session-enriched inference.Request proxyNative builds
+// from it: the two are not interchangeable -- only four fields are copied
+// across -- and they stay separate values for the whole of proxyNative.
+//
+// path is the upstream path the CALLER derived -- from endpointModeFor on the
+// coding-agent passthrough path, from upstreamPath on the images path -- so it
+// travels rather than being recomputed here.
+//
+// endpoint is the session-extraction discriminator, likewise supplied by the
+// caller rather than inferred from pfReq.APIFlavor (see tryProxyNative's doc
+// comment for why the coarse flavor stopped being able to carry that inference
+// once a second, non-translate native endpoint — images — shared "openai" with
+// responses).
+type nativeRelay struct {
+	token    auth.Token
+	target   routing.Target
+	path     string
+	raw      []byte
+	pfReq    inference.Request
+	endpoint sessionEndpoint
+}
+
+// nativeExchange is the request-scoped state proxyNative COMPUTES once and then
+// forwards to the helpers that finish the request — as opposed to nativeRelay
+// above, which is what the caller handed in. req is the session-enriched
+// inference.Request (its Model/RequestedModel/APIFlavor/Stream are copied
+// verbatim from the relay's pfReq, so either answers the same flavor and model),
+// serverName the resolved server's display name, and start/id/capturing the
+// per-request bookkeeping that every recordUsage + buildCaptureInput pair on
+// this path needs.
+//
+// It exists so a helper that finishes a request on its own —
+// relayImagesUpstreamError, which writes the client's response AND records its
+// usage row — can take that identity as one value instead of eight positional
+// parameters.
+type nativeExchange struct {
+	token      auth.Token
+	req        inference.Request
+	target     routing.Target
+	raw        []byte
+	serverName string
+	start      time.Time
+	id         string
+	capturing  bool
 }
 
 // nativeCopier bundles everything proxyNative's body-copy needs: the client
