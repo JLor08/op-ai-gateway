@@ -101,12 +101,11 @@ func TestImagesRejectsMissingModel(t *testing.T) {
 // path (qwen-coder has no image verdict, see TestImagesRefusesIncapableModel):
 // relayImages records a usage event for that terminal rejection too, exactly
 // like the admission-queue and endpoint-disabled branches in
-// native_passthrough.go already do. On a resolve failure target is the zero
-// value, so ProviderPath is "" here (upstreamPath returns "" immediately for
-// an empty target.Provider) -- this test only pins ReqPath and confirms
-// ProviderPath is NOT the chat default; it does NOT exercise upstreamPath's
-// own apiFlavorImages branch (that never runs against a zero target), which
-// is why TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks in
+// native_passthrough.go already do. It pins ReqPath and the billing unit only:
+// on a resolve failure the target is the zero value, so upstreamPath is never
+// consulted at all and ProviderPath is "" -- there is nothing about
+// upstreamPath's own apiFlavorImages branch to assert from here, which is why
+// TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks in
 // native_passthrough_test.go pins that branch directly instead.
 func TestImagesUsageRowCarriesItsOwnPath(t *testing.T) {
 	srv := NewTestServer()
@@ -120,9 +119,6 @@ func TestImagesUsageRowCarriesItsOwnPath(t *testing.T) {
 	got := events[len(events)-1]
 	if got.ReqPath != "/v1/images/generations" {
 		t.Fatalf("ReqPath = %q, want /v1/images/generations", got.ReqPath)
-	}
-	if got.ProviderPath == "/v1/chat/completions" {
-		t.Fatal("ProviderPath fell through to the chat default: upstreamPath needs its own case")
 	}
 	// Same refusal path as TestImagesRefusesIncapableModel; pinning the unit
 	// here too since this is one of only two of relayImages/proxyNative's
@@ -425,6 +421,60 @@ func TestImagesRejectsUnsupportedResponseFormat(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), imagesResponseFormatUnsupported) {
 		t.Fatalf("body = %s, want %s", rec.Body.String(), imagesResponseFormatUnsupported)
+	}
+}
+
+// A NON-STRING response_format must be rejected too. It used to slip through:
+// validateImagesRequest decoded the field straight into a string and discarded
+// the unmarshal error, so ["url"] and 123 both left the field at "" and walked
+// past the one check the function makes -- the exact values a client sends when
+// it means something this relay cannot honor. Both are rejected by the raw
+// decode now; the "url" case above is the same rule on a well-typed value.
+func TestImagesRejectsNonStringResponseFormat(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"qwen-coder","prompt":"a cat","response_format":["url"]}`,
+		`{"model":"qwen-coder","prompt":"a cat","response_format":123}`,
+	} {
+		srv := NewTestServer()
+
+		rec := postImages(t, srv, body)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400; body = %s", body, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), imagesResponseFormatUnsupported) {
+			t.Fatalf("%s: body = %s, want %s", body, rec.Body.String(), imagesResponseFormatUnsupported)
+		}
+	}
+}
+
+// stream:true is refused for the same reason response_format:"url" is: the
+// gateway has pinned this endpoint to the buffered path, so relaying the flag
+// unexamined sent the upstream a "stream":true the gateway then ignored and
+// handed the client a single application/json body where it asked for a stream.
+// stream:false and an absent stream describe what the endpoint already does and
+// are accepted -- the acceptance is what makes this a refusal of the value
+// rather than of the field.
+func TestImagesRejectsStreamTrue(t *testing.T) {
+	srv := NewTestServer()
+
+	rec := postImages(t, srv, `{"model":"qwen-coder","prompt":"a cat","stream":true}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), imagesStreamUnsupported) {
+		t.Fatalf("body = %s, want %s", rec.Body.String(), imagesStreamUnsupported)
+	}
+
+	// stream:false and a non-boolean stream: the first must pass validation (it
+	// then hits the capability refusal, 404, like every other request in this
+	// file against the no-verdict qwen-coder), the second must not.
+	if got := postImages(t, NewTestServer(), `{"model":"qwen-coder","prompt":"a cat","stream":false}`); got.Code != http.StatusNotFound {
+		t.Fatalf("stream:false status = %d, want 404 (validation passed, routing refused); body = %s", got.Code, got.Body.String())
+	}
+	if got := postImages(t, NewTestServer(), `{"model":"qwen-coder","prompt":"a cat","stream":"true"}`); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), imagesStreamUnsupported) {
+		t.Fatalf(`stream:"true" status = %d, body = %s, want 400 %s`, got.Code, got.Body.String(), imagesStreamUnsupported)
 	}
 }
 

@@ -43,7 +43,12 @@ var (
 	// disabled, or unhealthy/unreachable and the override did not force through it.
 	ErrServerOverrideServerUnavailable = errors.New("routing.server_override_server_unavailable")
 	// ErrServerOverrideModelUnavailable: a server-override request named a server that has
-	// no live (active mapping + active app) offering of the requested model.
+	// no USABLE live (active mapping + active app) offering of the requested model —
+	// either no such offering at all, or one whose mapping does not carry a "yes" verdict
+	// for a capability the endpoint requires (resolveServerOverride's capability gate).
+	// The two share one sentinel deliberately: from the caller's side both are "that
+	// server cannot serve this model", and an override names ONE server, so there is no
+	// second candidate the distinction could steer to.
 	ErrServerOverrideModelUnavailable = errors.New("routing.server_override_model_unavailable")
 )
 
@@ -512,6 +517,22 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		return Target{}, err
 	}
 	candidates = filterServesEndpoint(candidates, req.APIFlavor)
+	// capableFrom is the pool size the capability filter is about to reduce, and
+	// the sentinel below is conditioned on it being non-zero. Without that
+	// measurement the sentinel is not a statement about capability at all:
+	// filterCapable early-returns on empty input, so EVERY upstream reason the
+	// pool is already empty -- no such model, a provisioning denial, an endpoint
+	// the application does not serve -- would arrive at the check with
+	// len(candidates) == 0 and be reported as "this model cannot do that" about a
+	// model that may carry `image: yes`, or may not exist. It also made
+	// ErrNoModelRoute unreachable on this path for any capability-carrying
+	// request, collapsing the very distinction the sentinel exists to draw.
+	//
+	// Taken AFTER filterProvisioned/filterServesEndpoint deliberately: a
+	// provisioning denial then reads ErrNoModelRoute, which is the same no-leak
+	// posture (404, indistinguishable from an unknown model) the rest of the
+	// codebase takes and the e2e suite pins for chat.
+	capableFrom := len(candidates)
 	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
 	if err != nil {
 		return Target{}, err
@@ -521,7 +542,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	// the required capability, which is not the same fact as "no such
 	// model". Conditioned on RequiredCapabilities so a chat request (nil)
 	// falls through to the existing check unchanged.
-	if len(candidates) == 0 && len(req.RequiredCapabilities) > 0 {
+	if capableFrom > 0 && len(candidates) == 0 && len(req.RequiredCapabilities) > 0 {
 		return Target{}, ErrModelNotCapable
 	}
 	if len(candidates) == 0 {
@@ -702,9 +723,9 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 
 // filterCapable drops every candidate whose mapping does not carry a "yes"
 // verdict for each of the required capabilities. It is this gateway's FIRST
-// filter that genuinely excludes a model for lacking a capability -- the scorer
-// ranks, wantsLiveProgress annotates and the models-list fold advertises, but
-// none of them refuses.
+// filter that genuinely excludes a model for lacking a capability --
+// wantsLiveProgress annotates and the models-list fold advertises, but neither
+// refuses, and the scorer (scorer.go) reads no verdict at all.
 //
 // An ABSENT row means unknown, not no, and this filter treats unknown as a
 // refusal. That direction is chosen on evidence rather than taste: Extra-sourced

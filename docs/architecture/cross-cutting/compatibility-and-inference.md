@@ -241,7 +241,12 @@ one of them. `validateImagesRequest` requires a non-empty `prompt`
 probe the other native endpoints use — `sd-server` itself **ignores** the
 `model` field, since one process serves one model, so the value is purely the
 gateway's routing input). Every other field is the client's own business and
-reaches the upstream unexamined, with one exception.
+reaches the upstream unexamined, with two exceptions — and both are type-checked
+rather than decoded straight into a Go string/bool, because a struct decode that
+discards its type error (which this validator does, deliberately, being as
+tolerant as `sniffRoutingModel` about everything it does not own) would leave a
+non-string `response_format` such as `["url"]` at its zero value and walk past
+the very check below.
 
 **3. `response_format` accepts only `b64_json` or an absent value; anything
 else is 400 `images.response_format_unsupported`.** The reason is what happens
@@ -265,6 +270,19 @@ neither wrong nor silent — but a client-side `response_format` of `b64_json`
 (or its omission) is a **precondition** for using this endpoint, not a
 preference.
 
+**`stream` is the second exception, refused by the same argument: `stream: true`
+is 400 `images.stream_unsupported`.** The gateway has pinned this endpoint to
+the buffered path — `Stream` is `false` in the request `proxyNative` builds, with
+the deadline consequence spelled out below — so relaying the flag unexamined
+sends the upstream a `"stream": true` the gateway then ignores and hands the
+client a single `application/json` body where it asked for a stream. That is the
+same silent wire-contract violation the `response_format` rule exists to
+prevent, so it gets the same non-silent answer and its own code. `stream: false`
+and an absent `stream` describe what the endpoint already does and are accepted,
+which is what makes this a refusal of the *value* rather than of the field. The
+case is reachable rather than theoretical: OpenAI's `gpt-image-1` accepts
+`stream`/`partial_images`, so a real client has a reason to send it.
+
 **4. A non-2xx upstream response is normalised, and the classification is the
 gateway's own.** `sd-server` answers `{"error": "<plain string>"}`; OpenAI
 clients expect `{"error": {message, type, code}}`.
@@ -284,7 +302,8 @@ bounded by `captureMaxBytes`, not by a wider cap.
 
 **Two consequences of the relay's shape, both load-bearing.**
 
-- **`Stream` is pinned `false`, so this endpoint always takes `proxyNative`'s
+- **`Stream` is pinned `false` (and a client asking otherwise is refused up
+  front, above), so this endpoint always takes `proxyNative`'s
   buffered-deadline branch — a *total* timeout, with no idle watchdog.** That
   total is `target.Timeout`, i.e. the serving application's `timeout_ms`, a
   value almost certainly tuned for chat. **An operator must raise it on an
@@ -881,7 +900,8 @@ Every inference error response uses the gateway-wide envelope
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
 | `images.model_required` / `images.prompt_required` | 400 | the images body failed `validateImagesRequest` (§3.4) |
-| `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url` (§3.4) |
+| `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url`, and any non-string value (§3.4) |
+| `images.stream_unsupported` | 400 | an images request asking for a streamed response (`stream: true`, or a non-boolean `stream`); this endpoint is pinned to the buffered path (§3.4) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) |
 | `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |

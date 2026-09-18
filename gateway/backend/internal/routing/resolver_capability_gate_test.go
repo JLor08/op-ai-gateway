@@ -405,3 +405,116 @@ func TestImageResolveWritesNoGroupPin(t *testing.T) {
 		t.Fatalf("affinity writes = %d, want 0 on the group path too", store.upserts)
 	}
 }
+
+// --- What the sentinel must NOT claim -------------------------------------
+//
+// ErrModelNotCapable asserts that candidates EXISTED and none was capable. The
+// check that produces it therefore measures the pool immediately before
+// filterCapable runs (`capableFrom`), because filterCapable early-returns on
+// empty input: without that measurement every upstream reason the pool is
+// already empty arrives at the check indistinguishable from a capability
+// refusal, and the client is told "this model is not capable of this endpoint"
+// about a model that does not exist, or one that carries `image: yes`. The two
+// tests below are the two reachable shapes of that, and both must read
+// ErrNoModelRoute.
+//
+// Mutation evidence (see final-fix-report.md): dropping the `capableFrom > 0`
+// guard from resolver.go's check fails both of them and nothing else in the
+// package.
+
+// A model nothing in the store offers must stay "no such model" for an images
+// request, exactly as it is for a chat request -- it is the one case where the
+// capability sentinel would be a statement about a model that does not exist.
+func TestResolveUnknownModelIsNoModelRouteForAnImagesRequest(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	store := seededGroupStore(t, now)
+	r := NewResolver(store, func() time.Time { return now }, nil)
+
+	_, err := r.Resolve(context.Background(), auth.Token{}, imagesReq("this-model-does-not-exist"))
+	if !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v, want ErrNoModelRoute for a model that does not exist", err)
+	}
+	if errors.Is(err, ErrModelNotCapable) {
+		t.Fatalf("err = %v also matches ErrModelNotCapable -- the model does not exist, so nothing is known about its capabilities", err)
+	}
+}
+
+// A provisioning denial must not be reported as a capability refusal either,
+// and here the model is genuinely image-CAPABLE -- so the capability sentinel
+// would be affirmatively false about a mapping carrying `image: yes`.
+// ErrNoModelRoute (404) is also the no-leak answer the codebase gives a
+// provisioning denial everywhere else: the principal learns nothing about a
+// server it may not use.
+func TestResolveProvisioningDenialIsNoModelRouteNotIncapable(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	mem := seededGroupStore(t, now)
+	if err := mem.UpsertMappingCapabilities(ctx, "map_a", []CapabilityRow{
+		{Capability: CapabilityImage, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("seed map_a: %v", err)
+	}
+	r := NewResolver(mem, func() time.Time { return now }, nil)
+	r.SetProvisioningGate(fakeGate{allow: map[string]bool{}}) // every server denied
+
+	_, err := r.Resolve(ctx, auth.Token{ID: "tok_1"}, imagesReq("coder-a"))
+	if !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v, want ErrNoModelRoute when provisioning denies every server", err)
+	}
+	if errors.Is(err, ErrModelNotCapable) {
+		t.Fatalf("err = %v also matches ErrModelNotCapable -- map_a carries image:yes, so that claim is false", err)
+	}
+}
+
+// --- Site 2: the server-override branch's gate ----------------------------
+//
+// resolveServerOverride short-circuits everything else in Resolve, so its own
+// filterCapable call is the ONLY capability check a server-override request
+// meets. Before these two tests, deleting that call left both
+// ./internal/routing/... and ./internal/gateway/... fully green -- the one gate
+// site of the four with no coverage at all, and reachable in production
+// (inferencePreflight -> applyServerOverride stamps req.ServerOverrideID for an
+// images request like any other).
+
+// An override naming a server that DOES offer the model, via a mapping with no
+// image verdict, is refused: ErrServerOverrideModelUnavailable, the override's
+// own sentinel for "that server cannot serve this model" (the capability case
+// shares it deliberately -- see the sentinel's doc comment).
+func TestServerOverrideRefusesIncapableMapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	// map_over offers qwen-coder on srv_over and carries NO image verdict.
+	store := maintenanceOverrideStore(t, now, ServerStatusActive, HealthHealthy)
+	r := NewResolver(store, func() time.Time { return now }, nil)
+
+	req := imagesReq("qwen-coder")
+	req.ServerOverrideID = "srv_over"
+	_, err := r.Resolve(ctx, auth.Token{}, req)
+	if !errors.Is(err, ErrServerOverrideModelUnavailable) {
+		t.Fatalf("err = %v, want ErrServerOverrideModelUnavailable for an override whose mapping has no image verdict", err)
+	}
+}
+
+// The contrast that proves the refusal above is the GATE and not the fixture:
+// the same store, the same override, one `image: yes` row added -> served.
+func TestServerOverrideServesCapableMapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	store := maintenanceOverrideStore(t, now, ServerStatusActive, HealthHealthy)
+	if err := store.UpsertMappingCapabilities(ctx, "map_over", []CapabilityRow{
+		{Capability: CapabilityImage, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("seed map_over: %v", err)
+	}
+	r := NewResolver(store, func() time.Time { return now }, nil)
+
+	req := imagesReq("qwen-coder")
+	req.ServerOverrideID = "srv_over"
+	target, err := r.Resolve(ctx, auth.Token{}, req)
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the image-capable override target served", err)
+	}
+	if target.ServerID != "srv_over" || target.RouteID != "map_over" {
+		t.Fatalf("target = {%q,%q}, want {srv_over, map_over}", target.ServerID, target.RouteID)
+	}
+}

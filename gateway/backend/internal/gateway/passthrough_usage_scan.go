@@ -151,13 +151,32 @@ type usageScanner struct {
 	progress *requestProgress
 }
 
-// newUsageScanner returns a scanner for one native-passthrough response.
+// newUsageScanner returns a scanner for one native-passthrough response, or NIL
+// for a flavor this scanner can extract nothing from.
 // capBytes should be the same budget the capture tee uses (see usageScanner's
 // doc comment for why the two share a budget without being related features).
 // progress is the live counter to publish per-frame facts into, or nil for a
 // response whose progress is not displayed (a buffered one, and every test that
 // only cares about the recorded totals).
+//
+// apiFlavorImages gets NO scanner. Every field the scan can produce comes out of
+// mergePassthroughUsage (native_passthrough.go), whose switch has cases for
+// openai_responses and anthropic_messages and NO default, so for an images
+// response the whole pass is a guaranteed no-op -- as are isContentFrame and
+// isTerminalUsageFrame, switching on the same two flavors. What it is not is
+// free: an images body is a single buffered JSON value, so feed takes the
+// buffered branch and RETAINS up to 2×capBytes (2 MiB at the default) of it per
+// in-flight request, and finish then scans that tail. This is the endpoint with
+// the largest bodies in the system, and the image count that IS wanted from
+// those bytes is taken by imagesDataCounter, which keeps only a small bounded
+// carry. Returning nil is safe by construction, not by audit: feed, finish and
+// usage() are all nil-receiver no-ops, and nativeCopier documents its scanner
+// field as nil-safe for exactly this. The images path's own usage row is the
+// (unit, quantity) pair, not tokens.
 func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) *usageScanner {
+	if apiFlavor == apiFlavorImages {
+		return nil
+	}
 	return &usageScanner{apiFlavor: apiFlavor, capBytes: capBytes, progress: progress}
 }
 

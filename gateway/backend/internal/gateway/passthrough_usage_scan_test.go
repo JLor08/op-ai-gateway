@@ -1232,3 +1232,33 @@ func TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure(t *testing
 		t.Fatalf("counts = in %d / out %d / total %d, want 8/40/48 (the rate rules must not disturb them)", u.InputTokens, u.OutputTokens, u.TotalTokens)
 	}
 }
+
+// An images response gets NO usage scanner. Two independent reasons, and the
+// test pins the decision rather than either symptom: mergePassthroughUsage
+// (native_passthrough.go) switches on openai_responses/anthropic_messages with
+// no default, so a scan of an images body can produce nothing at all; and
+// discovering that is not free -- an images body is one buffered JSON value, so
+// feed takes its buffered branch and retains up to 2×capBytes (2 MiB by
+// default) of base64 per in-flight request on the endpoint with the largest
+// bodies in the system. The count that IS wanted from those bytes comes from
+// imagesDataCounter, whose carry is small and bounded.
+func TestNewUsageScannerSkipsImages(t *testing.T) {
+	if s := newUsageScanner(apiFlavorImages, defaultCaptureMaxBytes, nil); s != nil {
+		t.Fatalf("newUsageScanner(%q) = %+v, want nil -- the scan is a guaranteed no-op for images and retains the body to prove it", apiFlavorImages, s)
+	}
+	// The contrast: the two flavors the merge does have cases for still get one.
+	for _, flavor := range []string{"openai_responses", "anthropic_messages"} {
+		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil) == nil {
+			t.Fatalf("newUsageScanner(%q) = nil, want a scanner", flavor)
+		}
+	}
+	// nil is what proxyNative then hands nativeCopier, so the whole sequence the
+	// copier drives must be a no-op on a nil receiver rather than a panic.
+	var s *usageScanner
+	at := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	s.feed([]byte(`{"data":[{"b64_json":"QUJD"}]}`), at)
+	s.finish(at)
+	if got := s.usage(); got != (inference.Usage{}) {
+		t.Fatalf("nil scanner usage() = %+v, want the zero Usage", got)
+	}
+}

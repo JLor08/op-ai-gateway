@@ -550,10 +550,17 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, token auth.
 	// (TTFT, and whatever count/rate the upstream itself reports) into `progress`
 	// when there is one — display only: nothing on this path writes a routing
 	// input, which stays where it was, on the end-of-request recordUsage below.
-	// imgCounter counts data[]'s produced-image entries as bytes stream through
-	// the copier, for images only (nil, and never fed, for every other
-	// flavor -- see imagesDataCounter's own doc comment in images_handler.go
-	// for why it must not read the capped respBuf above instead).
+	// An images response gets NO usage scanner at all (newUsageScanner answers
+	// nil): there is nothing in it that scan could extract, and the buffered
+	// branch of feed would retain megabytes of base64 to find that out — see
+	// newUsageScanner's own doc comment.
+	// imgCounter counts KEY occurrences of the `"b64_json"` marker as bytes
+	// stream through the copier — which is what it takes to be a count of
+	// data[]'s produced images, not the same thing as parsing data[] — for
+	// images only (nil, and never fed, for every other flavor; see
+	// imagesDataCounter's own doc comment in images_handler.go for the
+	// key-versus-value check and for why it must not read the capped respBuf
+	// above instead).
 	var imgCounter *imagesDataCounter
 	if pfReq.APIFlavor == apiFlavorImages {
 		imgCounter = &imagesDataCounter{}

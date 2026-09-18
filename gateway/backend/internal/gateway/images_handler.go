@@ -267,13 +267,18 @@ func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 // decision and the reason.
 const imagesResponseFormatUnsupported = "images.response_format_unsupported"
 
+// imagesStreamUnsupported is validateImagesRequest's code for a request asking
+// for a streamed response, which this relay does not produce -- same shape and
+// same reasoning as imagesResponseFormatUnsupported; see the check below.
+const imagesStreamUnsupported = "images.stream_unsupported"
+
 // validateImagesRequest validates the shape this handler owns, instead of
 // calling inference.Request.Validate: that validator requires len(Messages) > 0,
 // and an images request has none, so calling it would reject every one of them.
 // "prompt" (non-empty) and "model" (non-empty, resolved by the caller's own
-// tolerant probe -- see sniffRoutingModel) are required. With ONE exception
-// below (response_format), every other field is the client's own business
-// and reaches the upstream unexamined.
+// tolerant probe -- see sniffRoutingModel) are required. With TWO exceptions
+// below (response_format and stream), every other field is the client's own
+// business and reaches the upstream unexamined.
 //
 // response_format decision: only "b64_json" (sd-server's own shape) is
 // accepted; an explicit "url" -- or anything else -- is REJECTED here with
@@ -299,20 +304,59 @@ const imagesResponseFormatUnsupported = "images.response_format_unsupported"
 // wrong nor silent -- but it is a PRECONDITION for using this endpoint, not
 // a preference, and it is documented as such in
 // docs/architecture/cross-cutting/compatibility-and-inference.md section 3.4.
+//
+// stream decision: the SAME reasoning, applied to the other parameter whose
+// value this relay cannot honor. The gateway has pinned itself to the buffered
+// path for this endpoint (Stream is false in proxyNative's request, and the
+// deadline policy that follows from it is documented there), so relaying a
+// client's `stream: true` unexamined would send the upstream a flag the gateway
+// then ignores and hand the client one `application/json` body where it asked
+// for a stream -- the same silent wire-contract violation the response_format
+// rule exists to prevent, and 400 is the same only-non-silent answer.
+// `stream: false` and an absent stream are both accepted: they describe what
+// this endpoint already does. This is reachable rather than theoretical --
+// OpenAI's gpt-image-1 does accept `stream`/`partial_images`, so a real client
+// has a reason to send it.
+//
+// Both fields are decoded as json.RawMessage and then type-checked, rather than
+// straight into a string/bool. A single struct decode collects the FIRST type
+// error and keeps going, and this function discards that error (deliberately --
+// it is as tolerant as sniffRoutingModel about everything it does not own), so a
+// non-string response_format such as ["url"] or 123 would leave the field at its
+// zero value and walk straight past the one check this function makes. The raw
+// form has no type to mismatch, so the check below sees the value that was
+// actually sent. A JSON `null` decodes into either target as a no-op, which is
+// the right reading: an explicit null is an absent value.
 func validateImagesRequest(raw []byte, model string) error {
 	if strings.TrimSpace(model) == "" {
 		return &inference.Error{Code: "images.model_required", Message: "model is required"}
 	}
 	var body struct {
-		Prompt         string `json:"prompt"`
-		ResponseFormat string `json:"response_format"`
+		Prompt         string          `json:"prompt"`
+		ResponseFormat json.RawMessage `json:"response_format"`
+		Stream         json.RawMessage `json:"stream"`
 	}
 	_ = json.Unmarshal(raw, &body)
 	if strings.TrimSpace(body.Prompt) == "" {
 		return &inference.Error{Code: "images.prompt_required", Message: "prompt is required"}
 	}
-	if body.ResponseFormat != "" && body.ResponseFormat != "b64_json" {
-		return &inference.Error{Code: imagesResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"b64_json\" is", body.ResponseFormat)}
+	if len(body.ResponseFormat) > 0 {
+		var format string
+		if err := json.Unmarshal(body.ResponseFormat, &format); err != nil {
+			return &inference.Error{Code: imagesResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be the string \"b64_json\"; got %s", body.ResponseFormat)}
+		}
+		if format != "" && format != "b64_json" {
+			return &inference.Error{Code: imagesResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"b64_json\" is", format)}
+		}
+	}
+	if len(body.Stream) > 0 {
+		var stream bool
+		if err := json.Unmarshal(body.Stream, &stream); err != nil {
+			return &inference.Error{Code: imagesStreamUnsupported, Message: fmt.Sprintf("stream must be the boolean false or absent; got %s", body.Stream)}
+		}
+		if stream {
+			return &inference.Error{Code: imagesStreamUnsupported, Message: "stream is not supported on this endpoint; it always returns a single buffered JSON response"}
+		}
 	}
 	return nil
 }

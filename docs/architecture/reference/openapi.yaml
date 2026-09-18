@@ -130,7 +130,8 @@ paths:
         natively image-shaped upstream; there is no translate fallback.
         Admission is a per-mapping capability verdict, not an application
         setting: a model without an `image` verdict of `yes` is refused with
-        404 `routing.model_not_capable`. Non-streaming only, and
+        404 `routing.model_not_capable`. Non-streaming only (a `stream: true`
+        is refused with 400 `images.stream_unsupported`), and
         `response_format` must be `b64_json` or absent (400
         `images.response_format_unsupported` otherwise). Metered in images
         (`billing_unit: image`), not in tokens. Beyond those two it answers the

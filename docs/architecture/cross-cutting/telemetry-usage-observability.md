@@ -657,6 +657,19 @@ Three properties of how that count is obtained are load-bearing:
   byte); what separates a key from a value is the **colon** that must follow
   it, with the decision deferred across a chunk boundary rather than guessed
   when the window runs out.
+- **One residual the key check cannot close, recorded rather than implied.**
+  The count is of `"b64_json"` used as a **key**, anywhere in the response — not
+  of `data[]`'s entries, which would require parsing a body this path
+  deliberately does not parse. The request body reaches the upstream unexamined
+  (§3.4 of [API Compatibility & Inference](compatibility-and-inference.md#34-openai-images-generations)
+  validates `prompt`, `model`, `response_format` and `stream` and nothing else),
+  so a client is free to send a top-level request key *named* `b64_json`; an
+  upstream that echoed request parameters back **as keys** would then produce one
+  key occurrence that is not a produced image, and the row would over-count by
+  one. It is left open knowingly: `sd-server`, the only backend this endpoint is
+  built against, echoes nothing, and the alternative is parsing megabytes of
+  base64 to close a one-off over-count that requires a deliberately odd request
+  and a cooperating upstream.
 
 **A 2xx images response that counts zero is logged at `Error`.** The pair has
 no "unknown" representation to fall back on, so a row reading

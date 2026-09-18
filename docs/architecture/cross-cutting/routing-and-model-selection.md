@@ -422,10 +422,26 @@ deviation:
 
 | # | Site | Behavior when the gate empties the pool |
 |---|---|---|
-| 1 | `Resolve`'s fresh-candidate path, right after `filterProvisioned`/`filterServesEndpoint` | `ErrModelNotCapable` (404, §8) — checked **before** the general empty-pool case, and conditioned on a non-empty required list, so a chat request falls through to `ErrNoModelRoute` exactly as before |
-| 2 | `resolveServerOverride` | `ErrServerOverrideModelUnavailable` (404) — the override's own existing sentinel; a forced server that does not carry the verdict is not a usable target |
+| 1 | `Resolve`'s fresh-candidate path, right after `filterProvisioned`/`filterServesEndpoint` | `ErrModelNotCapable` (404, §8) — checked **before** the general empty-pool case, conditioned on a non-empty required list (so a chat request falls through to `ErrNoModelRoute` exactly as before) **and** on the pool having been non-empty when the filter ran (see below) |
+| 2 | `resolveServerOverride` | `ErrServerOverrideModelUnavailable` (404) — the override's own existing sentinel, shared with "that server does not offer the model at all"; a forced server whose mapping does not carry the verdict is not a usable target either |
 | 3 | `eligibleCandidates` (every group-member read: `selectMember` **and** `orderMembersBySpeed`) | the member reads as `memberNoMapping`, and the group walk continues to the next member |
 | 4 | `resolveAffinity` (the pinned mapping) | the pin is **skipped**, not deleted, and resolution falls through to the fresh path |
+
+**Site 1's sentinel is conditioned on the pool having been non-empty, and that
+condition is what makes the sentinel's own claim true.** `filterCapable`
+early-returns on empty input, so an unconditional "empty after the filter" check
+is not a statement about capability at all: an unknown model, a provisioning
+denial and an application that does not serve the endpoint all reach it with an
+empty pool, and each would be answered *"the requested model is not capable of
+this endpoint"* — false about a model that does not exist, and false about a
+mapping that may carry `image: yes`. It would also leave `ErrNoModelRoute`
+unreachable on this path for every capability-carrying request, collapsing the
+one distinction the sentinel exists to draw. `Resolve` therefore measures the
+pool immediately before the filter and raises the sentinel only when candidates
+existed and the capability filter is what emptied it. That measurement is taken
+**after** `filterProvisioned`/`filterServesEndpoint` deliberately, so a
+provisioning denial reads `ErrNoModelRoute` — the same no-leak answer (a 404
+indistinguishable from an unknown model) the rest of the pipeline gives it.
 
 Site 3 deliberately does **not** raise `ErrModelNotCapable`: returning an error
 from inside `eligibleCandidates` would abort the failover walk at the first
@@ -445,8 +461,10 @@ required-capability list to gate on. `ScoreModelServers`
 gating it would silently empty an operator's server list. The model warmer
 (`internal/gateway/model_warmer.go`) pre-loads a model by trying each coarse
 flavor in turn, which is flavor-agnostic by construction and endpoint-agnostic
-by definition. That makes five production callers in total: the three gated
-sites in the table above, plus these two.
+by definition. That makes five production callers of `ActiveMappingsForModel` in
+total: sites 1–3 of the table above, plus these two. Site 4 is not one of them —
+`resolveAffinity` reads its pinned mapping through `MappingsByApplication`, which
+is why it needs a gate of its own at all.
 
 **Site 4 deviates from `resolveAffinity`'s own conventions in two ways, both
 deliberate.** That branch has no candidate filter at all — its mapping comes
@@ -970,7 +988,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
-| `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server that does not offer the model via a live mapping |
+| `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
 | `ErrServerOverrideServerUnavailable` | 502 | a server-override request named a disabled/unreachable server and did not force through it |
 
 **`ErrNoModelRoute` and `ErrNoHealthyHost` used to be 502 as well.** Neither
