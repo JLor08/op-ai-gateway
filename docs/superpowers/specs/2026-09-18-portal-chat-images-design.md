@@ -39,10 +39,20 @@ this endpoint at all.
 (`store/migrate.go:535-542`), and a message's content is
 `json.RawMessage` — already structured and opaque to the persistence layer
 (`portal/service_chats.go:274-277`). `buildAPIHistory` passes that content
-through verbatim (`:415-434`). The frontend already renders OpenAI-style
-`image_url` parts out of it: `contentImages` filters
-`part.type === 'image_url'` and maps `part.image_url.url`
-(`frontend/src/components/ChatMessage.tsx:24-31`).
+through verbatim (`:418-434`). The frontend already has the renderer for OpenAI-style
+`image_url` parts: `contentImages` filters `part.type === 'image_url'` and
+maps `part.image_url.url` (`frontend/src/components/ChatMessage.tsx:24-31`).
+
+**But not on the assistant path.** `contentImages` is called at
+`ChatMessage.tsx:298`, and the `role === 'assistant'` branch returns at `:89`
+— so an assistant message never reaches it. Today that is unobservable
+(assistants only ever produced text); for this feature it means the call has
+to be hoisted above the assistant branch, not merely reused.
+
+**The size cap is on the assistant write path.** `writeAssistant` ends in
+`SaveChat` (`service_chats.go:571`), which seals through `sealChat`
+(`:172`), which is where `ErrChatTooLarge` comes from. So an over-cap image
+turn fails exactly at `CommitAssistant` — the error `finishRun` swallows.
 
 **The capability has no writer.** `routing.CapabilityImage` exists
 (`routing/store.go:1121`) and gates the endpoint, but the admin capability
@@ -70,7 +80,7 @@ from the pick.
 
 This mirrors how `vision` already works: `portal.ModelDTO.Vision`
 (`portal/service.go:998`) is AND-folded across a mapping's servers in
-`modelsResponse` (`:2060-2105`), and the attach button is enabled or not from
+`modelsResponse` (`:2023`, the fold at `:2105`), and the attach button is enabled or not from
 that one flag. Adding a second, independent axis of user intent would mean the
 UI can ask for an image from a model that cannot make one — a state the
 capability gate would then have to reject at the bottom of the stack, after
@@ -104,10 +114,10 @@ change; what it must not do is fake token deltas for a response that has none.
 
 `handleOpenAIImages` moves from `requireAnyScope` to a new helper that accepts
 the **internal loopback pair or a bearer token** — `authenticateWeb`
-(`auth.go:76-113`) minus its cookie leg.
+(`auth.go:77-113`) minus its cookie leg.
 
 The browser never calls this endpoint. Only the run executor does, over the
-loopback pair (`chat_runs.go:493-494`). So the cookie leg is not needed, and
+loopback pair (`chat_runs.go:494-495`). So the cookie leg is not needed, and
 granting it would make `/v1/images/generations` directly reachable from a
 browser session — which would falsify `docs/architecture/02-constraints.md:38`
 ("/v1/chat/completions also accepts the session; the other inference endpoints
@@ -119,7 +129,7 @@ strictly more than the feature needs. The narrow helper keeps the documented
 boundary literally true and still admits the executor.
 
 Session attribution needs no work: the executor already sets
-`sessionHeaderName` to the chat id (`chat_runs.go:495`), and the explicit
+`sessionHeaderName` to the chat id (`chat_runs.go:496`), and the explicit
 session-override header is read **before** the per-endpoint switch, tagging
 the request `source = "chat"` when the internal auth header is present
 (`session_extract.go:61-68`). The endpoint-specific gap documented at
@@ -127,7 +137,7 @@ the request `source = "chat"` when the internal auth header is present
 all, which the executor is not.
 
 Run-as attribution is copied from the chat path: the block at
-`inference_handlers.go:41-51`, gated on `token.ID == ""`, applies
+`inference_handlers.go:42-51`, gated on `token.ID == ""`, applies
 `X-OP-Run-As-Token`. Without it an image turn bills to a different principal
 than the text turn beside it in the same thread.
 
@@ -136,8 +146,8 @@ than the text turn beside it in the same thread.
 The generated image is stored as an OpenAI-style `image_url` content part
 carrying a data URL, inside the sealed chat blob — the same shape an uploaded
 vision image already uses, which means `buildAPIHistory` feeds it back as a
-vision input on the next turn for free, and `contentImages` already knows how
-to render it.
+vision input on the next turn for free, and the existing `contentImages`
+renderer applies once it is hoisted past the assistant branch (§2).
 
 This is policy-compliant, not a hole in the no-persist rule:
 `docs/architecture/cross-cutting/security-auth-rbac.md:687` names chat
@@ -145,7 +155,7 @@ transcripts among what the capture encryption key seals, so an inline image
 inherits the same guarantee as the prompts already in that blob.
 
 `AssistantTurn.Content` is a `string` and `writeAssistant` sets
-`"content": turn.Content` unconditionally (`service_chats.go:487`, `:537`), so
+`"content": turn.Content` unconditionally (`service_chats.go:487-489`, `:537-540`), so
 the turn type widens to carry structured content. The widening must keep the
 plain-string case byte-identical on the wire — every existing chat is that
 shape.
@@ -166,7 +176,7 @@ feature needs to work. Filed as #124.
 
 **Rejected: server-side re-encode to fit the cap.** The client already
 downscales its **own uploads** above 1568px, keeping the original data URL
-below it (`Chat.test.tsx:212`). Re-encoding what the *model produced* is
+below it (`frontend/src/components/Chat.test.tsx:208-212`). Re-encoding what the *model produced* is
 different: it silently degrades the artifact the user asked for. Upstream
 bytes are stored as-is, with a download button so the user can keep the
 original.
