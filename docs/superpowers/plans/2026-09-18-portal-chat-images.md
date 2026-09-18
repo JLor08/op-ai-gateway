@@ -125,7 +125,9 @@ New files:
 | `gateway/backend/internal/gateway/chat_runs_images.go` | The executor's images branch: body build, buffered relay, response decode into a content part. |
 | `gateway/frontend/src/components/shared/downloadBinary.ts` | Saving a data URL as a real file (the existing `downloadText` cannot). |
 | `gateway/frontend/src/components/shared/elapsed.ts` | `formatElapsed`, lifted out of `ActiveRequestsPanel.tsx` so two call sites share one implementation. |
-| `gateway/frontend/src/components/chat/ImageTurn.tsx` | Rendering a generated-image assistant turn: images, per-item download, `revised_prompt`. |
+| `gateway/frontend/src/components/ImageTurn.tsx` | Rendering a generated-image assistant turn: images, per-item download. |
+
+`ImageTurn.tsx` sits in `components/`, **not** `components/chat/`: `ChatMessage.tsx` lives in `components/` and `arch.test.ts:256-270` fails the suite for any import of a `components/chat/` module other than `ChatStore.tsx` or `ChatSidebar.tsx` from outside that directory.
 
 The rest is modification of existing files, listed per task.
 
@@ -1629,28 +1631,67 @@ func TestRunSnapshotCarriesAServerMeasuredAge(t *testing.T) {
 // the sending tab renders the TEXT pending state for the whole window between
 // the 201 and the first snapshot -- the 0-Zeichen counter, on the common path.
 func TestStartRunResponseCarriesTheKind(t *testing.T) {
-	// Drive the HTTP surface with startRunViaHandler (chat_run_endpoints_test.go)
-	// and a body whose settings carry {"kind":"image"}, then decode the 201 and
-	// assert Kind == "image". Read startRunViaHandler's signature at
-	// chat_run_endpoints_test.go before writing the call.
-	t.Skip("write with startRunViaHandler; see the note below")
+	srv, _, chatID := newRunTestServer(t)
+	rec := startRunViaHandler(srv, chatID,
+		`{"user_message":{"id":"u9","role":"user","content":"a cat"},"settings":{"model":"sd-turbo","kind":"image"}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		RunID     string `json:"run_id"`
+		Status    string `json:"status"`
+		Kind      string `json:"kind"`
+		ElapsedMs int64  `json:"elapsed_ms"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode 201: %v (%s)", err, rec.Body.String())
+	}
+	if got.Kind != "image" {
+		t.Fatalf("kind = %q on the 201, want image -- otherwise the sending tab "+
+			"renders the text pending state until the first snapshot", got.Kind)
+	}
+	if got.RunID == "" {
+		t.Fatal("run_id missing from the 201")
+	}
 }
 
-// A deadline must NOT masquerade as a user cancel.
+// A deadline must NOT masquerade as a user cancel: the user pressed nothing.
 func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
-	// Shrink the deadline the way the checkpoint tests shrink
-	// runCheckpointInterval (a package var the test overrides and restores),
-	// drive a run with a provider that never returns, and assert the terminal
-	// status/message is the TIMEOUT one and not the empty-message cancel.
-	t.Skip("write once the deadline is a package var; see Step 3")
+	restore := runDeadline
+	runDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { runDeadline = restore })
+
+	// A provider that never produces anything, so the deadline is what ends the
+	// run. pacedStreamer with a gap far beyond the deadline is the existing fake
+	// for "slow upstream" (server_stream_timeout_test.go).
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		Settings: portal.ChatRunSettings{Model: "gpt-oss-20b"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error -- a deadline is not a cancel", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != runTimedOutMessage {
+		t.Fatalf("error = %q, want the timeout code %q -- an empty message is "+
+			"what a USER cancel looks like, and conflating the two is the "+
+			"silent-conflation this feature refuses", snap.Err, runTimedOutMessage)
+	}
 }
 ```
 
-> **Two `t.Skip`s are written above on purpose and must be replaced, not
-> committed.** They mark the two tests whose bodies depend on identifiers this
-> task itself introduces (the deadline package var) or whose helper signature
-> must be read from a second file (`startRunViaHandler`). Replace both with
-> real bodies in Step 4; a task is not done while a `t.Skip` remains.
+`startRunViaHandler(srv *Server, chatID, body string) *httptest.ResponseRecorder`
+(`chat_run_endpoints_test.go:81`) takes no `*testing.T` and authenticates with
+`authBearer(r, "dev-secret")` itself. `srv.startChatRun(owner, chatID, prep)`
+returns `(*ChatRun, error)` (`chat_runs.go:467`). Check `pacedStreamer`'s field
+names in `server_stream_timeout_test.go` before using it — the run tests inject
+it as a `provider.Client`.
 
 - [ ] **Step 2: Add the fields**
 
@@ -1976,9 +2017,12 @@ func TestImageRunCommitsAnImagePartPerDataItem(t *testing.T) {
 	defer upstream.Close()
 
 	srv, owner, chatID := newImageRunTestServer(t, upstream.URL)
-	run := srv.startChatRun(owner, chatID, PrepareRunResult{
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
 		Settings: portal.ChatRunSettings{Model: "sd-turbo", Kind: "image"},
 	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
 	waitFor(t, func() bool { return run.statusValue() != "running" })
 
 	if got := run.statusValue(); got != "completed" {
@@ -2012,9 +2056,12 @@ func TestImageRunTreatsAnEmptyDataArrayAsAnError(t *testing.T) {
 	defer upstream.Close()
 
 	srv, owner, chatID := newImageRunTestServer(t, upstream.URL)
-	run := srv.startChatRun(owner, chatID, PrepareRunResult{
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
 		Settings: portal.ChatRunSettings{Model: "sd-turbo", Kind: "image"},
 	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
 	waitFor(t, func() bool { return run.statusValue() != "running" })
 
 	if got := run.statusValue(); got != "error" {
@@ -2231,180 +2278,743 @@ Unobservable before now, because assistants only ever produced text."
 
 **Files:**
 - Create: `gateway/frontend/src/components/shared/downloadBinary.ts`
-- Create: `gateway/frontend/src/components/chat/ImageTurn.tsx`
-- Modify: `gateway/frontend/src/components/ChatMessage.tsx` — hoist `contentImages` above the assistant branch's return (`:89`), and the render block (`:354-372`)
-- Modify: `gateway/frontend/src/i18n.ts`
+- Create: `gateway/frontend/src/components/ImageTurn.tsx`
+- Modify: `gateway/frontend/src/components/ChatMessage.tsx` — hoist the `contentImages` call above the assistant branch's return (`:89`), and the user-branch render block (`:354-372`) stays as it is
+- Modify: `gateway/frontend/src/i18n.ts` — two keys, both locales
 - Test: `gateway/frontend/src/components/ChatMessage.test.tsx`, `gateway/frontend/src/i18n.test.ts`
 
 **Interfaces:**
-- Produces `downloadBinary(filename: string, dataUrl: string): void`.
+- Consumes: Task 7's committed content shape —
+  `[{"type":"text","text":<revised_prompt>}?, {"type":"image_url","image_url":{"url":"data:<mime>;base64,<b64>"}}...]`
+- Produces: `downloadBinary(filename: string, dataUrl: string): void` in
+  `components/shared/downloadBinary.ts`.
 
-**Five separate defects, one task, because they are one screen:**
+**`revised_prompt` needs no new part type.** Task 7 emits it as an ordinary
+`{type:'text'}` part, so `contentText` (`ChatMessage.tsx:18-21`) already renders
+it and `buildAPIHistory` already carries it forward. Do not invent a field on
+the `image_url` part.
 
-1. **`contentImages` never runs for an assistant message.** It is called at
-   `:298`; the assistant branch returns at `:89`.
-2. **`downloadText` cannot save an image.** It wraps a **string** in a Blob —
-   its own doc comment says it was written for PEM/text — so handing it a data
-   URL saves a text file containing the data URL. The new helper decodes
-   base64 to a `Uint8Array` and Blobs that. Keep `downloadText` untouched: its
+**Four defects, one screen:**
+
+1. `contentImages` (`:24-32`) is called at `:298`; the assistant branch returns
+   at `:89`, so it never runs for an assistant message.
+2. `downloadText` (`shared/download.ts`) wraps a **string** in a Blob — its own
+   doc says it was written for PEM/text — so a data URL saves as a text file
+   containing the data URL. **Leave `downloadText` untouched**: its
    detached-anchor click and its immediate `revokeObjectURL` are load-bearing
-   for the certificate panels, and there is no `download.test.ts` to catch a
+   for the certificate panels and there is no `download.test.ts` to catch a
    regression.
-3. **The alt text is false.** `:361` hardcodes `t.chatAttachedImage`
-   ("Angehängtes Bild"). For a generated image the correct accessible name is
-   the prompt, which is the preceding user turn's text.
-4. **The size is wrong.** `:362-366` renders `72×72` with
-   `objectFit: 'cover'` — right for an upload thumbnail, wrong for the
-   artifact the user asked for. A generated image renders at its natural size,
-   capped to the bubble width.
-5. **`data[]` is plural.** Render every part, with its own download control.
-   Show `revised_prompt` under the image when the upstream reported one: it is
-   the only substantive news this endpoint ever returns.
+3. `:361` hardcodes `alt={t.chatAttachedImage}` ("Angehängtes Bild"), false for
+   a generated image.
+4. `:362-366` renders `72×72` with `objectFit:'cover'` — right for an upload
+   thumbnail, wrong for the artifact the user asked for.
 
-**Eight existing tests select images by `altText(t.chatAttachedImage)`**
-(`Chat.test.tsx:410`, `:421`, `:444`, `:461`, `:588`, `:599`, `:610`, `:615`).
-They cover **uploaded** images and must keep passing unchanged — the alt change
-applies to the **assistant** branch only. If any of them starts matching two
+**The eight existing tests that select images by `altText(t.chatAttachedImage)`**
+(`Chat.test.tsx:410`, `:421`, `:444`, `:461`, `:588`, `:599`, `:610`, `:615`)
+cover **uploaded** images and must keep passing untouched. The alt change
+applies to the **assistant** branch only. If one of them starts matching two
 elements, the change leaked into the user branch.
+
+**Keep the memo intact.** `ChatMessage`'s `React.memo` (`:399-403`) is a shallow
+prop compare relying on referentially stable per-message callbacks. Do not add
+an `onDownload` prop built as an inline arrow in the parent's render — it would
+defeat the memo for every message in the thread. The handler lives inside
+`ImageTurn`, where the data URL already is.
+
+- [ ] **Step 1: Write the failing tests**
 
 `ChatMessage` is tested standalone with literal props and no provider
 (`ChatMessage.test.tsx:26-41`), which is the cheapest place to pin all of this.
-`URL.createObjectURL` / `revokeObjectURL` must be stubbed — jsdom implements
-neither; copy the stub from `EdgeCertificatePanel.test.tsx:96-104`.
+Append inside the existing `for (const locale of ['de','en'])` loop:
 
-**Keep the memo intact.** `ChatMessage`'s `React.memo` (`:399-403`) is a
-shallow prop compare that relies on referentially stable per-message
-callbacks. A new inline-arrow prop (an `onDownload` closure built in the
-parent's render) defeats it for every message in the thread. Put the download
-handler inside `ImageTurn` where the data URL already is.
+```tsx
+    it('renders a generated assistant image at full size with the prompt as its alt text', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat on a bicycle"
+          content={[
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          ]}
+        />,
+      );
+      const images = screen.getAllByRole('img');
+      expect(images).toHaveLength(1);
+      expect(images[0]).toHaveAttribute('src', 'data:image/png;base64,AAAA');
+      // The accessible name is the prompt, not "Angehängtes Bild": the alt text
+      // of a generated image is what it was asked to be.
+      expect(images[0]).toHaveAttribute('alt', 'a cat on a bicycle');
+      // NOT the 72x72 objectFit:cover upload thumbnail -- this is the artifact.
+      expect(images[0]).not.toHaveAttribute('width', '72');
+    });
 
-- [ ] Steps: test → fail → `downloadBinary` + `ImageTurn` → hoist the
-  `contentImages` call above `:89` and branch the assistant render on whether
-  parts are present → i18n keys in both locales → full frontend gate block →
-  commit.
+    it('renders one image and one download control per data item', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="two cats"
+          content={[
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+          ]}
+        />,
+      );
+      expect(screen.getAllByRole('img')).toHaveLength(2);
+      // data[] is plural by design -- the endpoint's own counter takes the
+      // billed quantity from the response because a partial failure makes n and
+      // data[] differ.
+      expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+    });
 
----
+    it('renders a revised prompt as ordinary text beside the image', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[
+            { type: 'text', text: 'a photorealistic cat, studio lighting' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          ]}
+        />,
+      );
+      // The only substantive news this endpoint ever reports about a
+      // generation, and it needs no new part type to carry it.
+      expect(screen.getByText('a photorealistic cat, studio lighting')).toBeInTheDocument();
+      expect(screen.getAllByRole('img')).toHaveLength(1);
+    });
+
+    it('still renders a plain text assistant answer unchanged', () => {
+      render(<ChatMessage t={t} role="assistant" content={'**bold** answer'} />);
+      expect(screen.getByText('bold').tagName).toBe('STRONG');
+      expect(screen.queryAllByRole('img')).toHaveLength(0);
+    });
+```
+
+And a download test. jsdom implements neither `URL.createObjectURL` nor
+`revokeObjectURL`; copy the stub from `EdgeCertificatePanel.test.tsx:96-104`
+into a `beforeEach` in this file:
+
+```tsx
+    it('downloads an image as binary, not as a text file containing the data URL', () => {
+      const blobs: Blob[] = [];
+      const createObjectURL = vi.fn((b: Blob) => {
+        blobs.push(b);
+        return 'blob:stub';
+      });
+      vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      // The saved Blob must be the DECODED bytes with the reported media type.
+      // downloadText would have produced a text/plain Blob whose content is the
+      // literal "data:image/png;base64,AAAA" string -- a text file, not an image.
+      expect(blobs[0].type).toBe('image/png');
+      expect(blobs[0].size).toBe(3); // "AAAA" base64-decodes to 3 bytes
+    });
+```
+
+In `i18n.test.ts`, a per-feature key block in the established shape:
+
+```ts
+  describe('chat generated-image i18n keys', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      it(`has the generated-image keys in ${locale}`, () => {
+        const t = messages[locale];
+        expect(t.chatDownloadImage).toBeTruthy();
+        expect(t.chatGeneratedImage).toBeTruthy();
+        // The generated-image alt must not reuse the ATTACHED-image string.
+        expect(t.chatGeneratedImage).not.toBe(t.chatAttachedImage);
+      });
+    }
+  });
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/ChatMessage.test.tsx -t 'generated'
+```
+
+Expected: FAIL — `promptText` is not a prop of `ChatMessage`, and no image is
+rendered for an assistant message.
+
+- [ ] **Step 3: Write `downloadBinary`**
+
+```ts
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+// Saving a data: URL as a real file. The sibling downloadText wraps a STRING in
+// a Blob -- it was written for PEM/text blobs and its own doc says so -- so
+// handing it a data URL saves a text file whose contents are the data URL
+// itself. That is not a smaller problem than a missing button: the user thinks
+// they saved their image.
+//
+// The media type is taken from the data URL's own prefix, which Task 7 fills
+// from the upstream response's output_format. Nothing here assumes PNG.
+export function downloadBinary(filename: string, dataUrl: string) {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+  if (!match) return;
+  const [, mime, b64] = match;
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// extensionFor maps a media type to a file extension for the download name. A
+// bare fallback rather than a lookup table: the only producer today is
+// sd-server via output_format, and inventing entries for types nothing emits
+// would be dead code.
+export function extensionFor(dataUrl: string): string {
+  const match = /^data:image\/([a-z0-9+.-]+);base64,/i.exec(dataUrl);
+  return match ? match[1].replace('jpeg', 'jpg') : 'bin';
+}
+```
+
+- [ ] **Step 4: Write `ImageTurn.tsx`**
+
+A presentational component taking the image URLs and the prompt, rendering each
+image at natural size capped to the bubble, each with its own download button.
+It owns the `downloadBinary` call so no unstable callback prop reaches
+`ChatMessage` and defeats its memo. Style with the existing CSS variables
+(`--line`, `--surface`) and MUI `sx`, matching the user-branch block's border
+and radius but without the `72×72` / `objectFit:'cover'` crop.
+
+- [ ] **Step 5: Hoist the extractor and branch the assistant render**
+
+In `ChatMessage.tsx`, move the `const images = contentImages(content);`
+computation from `:298` to **above** the `if (role === 'assistant')` at `:78`
+so both branches can read it. Add a `promptText?: string` prop, passed by
+`Chat.tsx` from the preceding user turn's text, and render `ImageTurn` inside
+the assistant branch when `images.length > 0`. Leave the user-branch block at
+`:354-372` exactly as it is — that is what keeps the eight `chatAttachedImage`
+tests green.
+
+- [ ] **Step 6: Add the two i18n keys to BOTH locales**
+
+```ts
+  chatDownloadImage: 'Bild herunterladen',
+  chatGeneratedImage: 'Erzeugtes Bild',
+```
+
+```ts
+  chatDownloadImage: 'Download image',
+  chatGeneratedImage: 'Generated image',
+```
+
+`chatGeneratedImage` is the alt-text fallback for a generated image whose
+prompt is unavailable (an old transcript, or a regenerated turn whose preceding
+user message was edited away). The prompt is preferred when present.
+
+- [ ] **Step 7: Run the tests, then the full frontend gate block**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/ChatMessage.test.tsx src/components/Chat.test.tsx src/i18n.test.ts
+```
+
+`Chat.test.tsx` is in that list on purpose: it holds the eight uploaded-image
+tests that must not change.
+
+```bash
+cd gateway/frontend && npm run format:check && npm run lint && npm run build && npm test
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add gateway/frontend/src/components/shared/downloadBinary.ts gateway/frontend/src/components/ImageTurn.tsx gateway/frontend/src/components/ChatMessage.tsx gateway/frontend/src/components/ChatMessage.test.tsx gateway/frontend/src/i18n.ts gateway/frontend/src/i18n.test.ts
+git commit -m "feat: Render a generated image as the artifact it is
+
+Four defects on one screen, none of them observable before assistants could
+produce images.
+
+contentImages was called after the assistant branch had already returned, so it
+never ran for an assistant message -- the extractor existed and was
+unreachable. The call is hoisted above the branch.
+
+The alt text was the hardcoded 'attached image' string, which is false for a
+generated one; the accessible name is now the prompt, falling back to a
+generated-image label when the prompt is gone. The size was the 72x72
+objectFit:cover upload thumbnail, which cropped the thing the user asked for;
+a generated image renders at its natural size, capped to the bubble.
+
+The download path could not download an image at all. downloadText wraps a
+STRING in a Blob -- it was written for PEM text and says so -- so a data URL
+saved as a text file containing the data URL. downloadBinary decodes the base64
+and uses the media type the data URL carries, which comes from the upstream
+response's output_format rather than an assumed image/png. downloadText is left
+untouched: its detached-anchor click and immediate revoke are load-bearing for
+the certificate panels and have no test of their own.
+
+And every data[] item is rendered with its own download control, because the
+response is plural by design. A revised_prompt needs no new part type: it
+arrives as an ordinary text part and the existing text renderer shows it.
+
+The download handler lives inside ImageTurn rather than arriving as a prop, so
+ChatMessage's shallow-compare memo is not defeated for every message in the
+thread. ImageTurn sits in components/ rather than components/chat/ because
+arch.test.ts fails the suite for a cross-boundary import of that directory."
+```
 
 ### Task 12: Edit and regenerate stop refusing an image thread
 
 **Files:**
-- Modify: `gateway/frontend/src/components/chat/ChatStore.tsx:720`
+- Modify: `gateway/frontend/src/components/chat/ChatStore.tsx:715-723`
 - Test: `gateway/frontend/src/components/chat/ChatStore.test.tsx`
 
-**The fix is kind-aware, not role-aware.** Spec §7.2 describes the defect
-accurately — `historyHasImage` (`chatDoc.ts:273-277`) is role-blind, so it
-matches the assistant's own generated images — but the fix is **not** to make
-it role-aware, and this task overrides that reading:
+**Interfaces:** consumes Task 5's pinned kind as it reaches the store. No new
+exports.
 
-- For a **text** thread the current guard is *correct as it stands*, including
+**The fix is kind-aware, not role-aware — this overrides spec §7.2's implied
+fix.** §7.2 describes the defect correctly (`historyHasImage`,
+`chatDoc.ts:273-277`, is role-blind and matches the assistant's own generated
+images), but making it role-aware would be wrong:
+
+- For a **text** thread the guard is *correct exactly as it stands*, including
   its role-blindness. `buildAPIHistory` passes every message's content through
   verbatim, so an assistant-generated image in a replayed history really does
-  become a vision input. Blocking it on a non-vision model is right.
-- For an **image** thread the guard is simply irrelevant: the images request
-  body is `{model, prompt, response_format}` (Task 7) and carries **no
-  history at all**, so there is no vision input to refuse.
+  become a vision input on the next chat completion. Refusing that on a
+  non-vision model is the right behaviour, and its existing comment
+  (`:715-719`) explains why it checks `history` rather than
+  `messagesRef.current`.
+- For an **image** thread the guard is simply irrelevant: Task 7's request body
+  is `{model, prompt, response_format}` and carries **no history at all**, so
+  there is no vision input to refuse.
 
-So the guard becomes conditional on the thread's kind, and its message stops
-being reachable in image threads — which is also what stops the false
-"Dieses Modell unterstützt keine Bilder" from appearing on a model whose only
-purpose is images.
+So the guard becomes conditional on the thread's kind. That is also what stops
+the false `chatImageModelUnsupported` — "Dieses Modell unterstützt keine
+Bilder." — from appearing on a model whose only purpose is images.
+
+**`chatImageModelUnsupported` has four call sites and five tests.** This task
+touches only the one at `:721`. The others (the attach tooltip `Chat.tsx:384`,
+the clear-attachments toast `ChatStore.tsx:642`, and the `send()` guard
+`:838`) belong to Task 13.
 
 **The existing test at `ChatStore.test.tsx:1484-1513` must keep passing
 unchanged.** It regenerates on a non-vision **text** model with an uploaded
-image in the replayed history, and blocking that is the behaviour being
-preserved. Add the image-thread case beside it; do not edit it.
+image in the replayed history, and blocking that is exactly the behaviour being
+preserved. Add the new case beside it; do not edit it.
 
-- [ ] Steps: add the new test (an image-kind thread regenerates successfully
-  with generated images in history) → verify it fails → make the guard
-  conditional on the pinned kind → verify both tests pass → full frontend
-  gates → commit.
+- [ ] **Step 1: Write the failing test**
 
----
+Inside the same `describe` as the existing guard tests, reusing that block's
+`imageContent` fixture (`:1447-1450`) and the `renderProvider` / `waitForReady`
+/ `makeChatApi` harness:
+
+```tsx
+    // An image thread's request body carries no history at all, so the vision
+    // guard has nothing to protect and must not fire. Before this change it
+    // did, and it told the user that a model whose only purpose is images
+    // "does not support images" -- from the SECOND image turn onward, because
+    // that is when the replayed history first contains one.
+    it('regenerates in an image thread whose history contains generated images', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: models[0].id, kind: 'image' },
+            messages: [
+              { id: 'u1', role: 'user', content: 'a cat' },
+              { id: 'a1', role: 'assistant', content: imageContent, status: 'complete' },
+              { id: 'u2', role: 'user', content: 'a dog' },
+              { id: 'a2', role: 'assistant', content: imageContent, status: 'complete' },
+            ],
+          },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+      // The run starts and no refusal toast appears.
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
+```
+
+Note the fixture pins `kind: 'image'` in the persisted settings — that is how
+the store learns the thread's kind, and it is the same key Task 5 persists.
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/chat/ChatStore.test.tsx -t 'image thread whose history contains generated images'
+```
+
+Expected: FAIL — `startChatRun` was never called and the refusal toast is
+present, because the role-blind guard matched the assistant's own images.
+
+- [ ] **Step 3: Make the guard conditional on the kind**
+
+```tsx
+      // Same guard for image support: the REPLAYED history (what is actually
+      // sent as edited_history below) must not carry an image the model can't
+      // process. Checking `history` (not the full messagesRef.current) matters
+      // when regenerating/editing an EARLIER turn: truncation drops everything
+      // after it, so a later turn's image is never resent and must not block.
+      //
+      // It is deliberately role-BLIND for a text thread: buildAPIHistory
+      // forwards every message's content verbatim, so an assistant's own
+      // generated image in a replayed history becomes a vision input just as a
+      // user's upload does, and refusing it on a non-vision model is correct.
+      //
+      // An IMAGE thread is exempt because its request body carries no history
+      // at all -- just {model, prompt, response_format} -- so there is no
+      // vision input to refuse. Without this exemption an image thread refused
+      // its own regenerate from the second turn onward, telling the user that a
+      // model whose only purpose is images does not support images.
+      if (
+        chatKindRef.current !== 'image' &&
+        !modelVisionCapableRef.current &&
+        historyHasImage(history)
+      ) {
+        showErrorRef.current(tRef.current.chatImageModelUnsupported);
+        return;
+      }
+```
+
+`chatKindRef` is the ref mirroring the thread's pinned kind. If Task 13 has not
+landed yet, add the ref here (beside `modelVisionCapableRef`, following the
+refs block's own comment at `:311-312` about why the stable callbacks read
+refs) and let Task 13 reuse it — whichever task runs first owns it.
+
+- [ ] **Step 4: Run both tests**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/chat/ChatStore.test.tsx -t 'regenerat'
+```
+
+Expected: PASS, including `:1484`'s unchanged text-thread refusal and
+`:1452`'s earlier-turn case.
+
+- [ ] **Step 5: Full gates and commit**
+
+```bash
+cd gateway/frontend && npm run format:check && npm run lint && npm run build && npm test
+```
+
+```bash
+git add gateway/frontend/src/components/chat/ChatStore.tsx gateway/frontend/src/components/chat/ChatStore.test.tsx
+git commit -m "fix: Stop an image thread from refusing its own regenerate
+
+historyHasImage is role-blind, so the vision guard on edit/regenerate matched
+the assistant's OWN generated images. From the second image turn onward --
+the first point at which a replayed history contains one -- regenerating was
+refused with 'this model does not support images', on a model whose only
+purpose is images.
+
+The fix is kind-aware rather than role-aware, and that distinction matters. For
+a text thread the guard is correct exactly as it stands, role-blindness
+included: buildAPIHistory forwards content verbatim, so an assistant's
+generated image in a replayed history becomes a vision input just as a user's
+upload does, and refusing it on a non-vision model is right. An image thread is
+exempt because its request body carries no history at all -- only the model,
+the prompt and the response format -- so there is nothing to refuse.
+
+The existing text-thread refusal test is untouched, because the behaviour it
+pins is the behaviour being kept."
+```
 
 ### Task 13: The composer before Send
 
-Spec §3.6's pre-send half: the relabelled prompt field, the capacity line, and
-the refusal.
+Spec §3.6's pre-send half — the relabelled prompt field, the capacity line and
+the refusal — plus spec §5's image-only affordances and §7.9's dead keepalive.
 
 **Files:**
-- Modify: `gateway/backend/internal/portal/service_chats.go` — export the cap
-- Modify: `gateway/backend/internal/gateway/portal_chat_endpoints.go` or the chats DTO — serve it
-- Modify: `gateway/frontend/src/api/models.ts` — `ModelOption` (`:402`) gains `image?: boolean` beside `vision?: boolean` (`:425`). **Optional, not required**: `vision` is optional and `ChatStore.test.tsx`'s module-level model fixture omits it entirely, which is what makes that file's non-vision guard tests work — a required field would break them.
+- Modify: `gateway/backend/internal/portal/service_chats.go` — export the cap; `ChatListResponse` (`:68`) carries it
+- Modify: `gateway/frontend/src/api/models.ts` — `ModelOption` (`:402`) gains `image?: boolean` beside `vision?: boolean` (`:425`)
 - Modify: `gateway/frontend/src/api/chat.ts` — `ChatSettings` (`:19-31`) **and** the duplicated inline settings shape in `StartChatRunBody` (`:49-57`)
-- Modify: `gateway/frontend/src/components/chat/ChatStore.tsx` — `modelImageCapable` beside `modelVisionCapable` (`:308-309`), the `send()` guard, the attach gate, the clear-attachments effect (`:639-645`)
-- Modify: `gateway/frontend/src/components/Chat.tsx` — the prompt field label (`:311`), the capacity line, the attach tooltip (`:384`)
-- Modify: `gateway/frontend/src/components/chat/useChatPersistence.ts` — the `state` parameter type (`:76-86`), its destructure (`:108-118`), and the debounced-save effect's dep array (`:202-213`)
+- Modify: `gateway/frontend/src/components/chat/ChatStore.tsx` — `modelImageCapable` beside `modelVisionCapable` (`:308-309`), `chatKind` + its ref, `activateChat` (`:451-499`), `send()` (`:824-848`), the clear-attachments effect (`:639-645`)
+- Modify: `gateway/frontend/src/components/Chat.tsx` — the prompt field (`:309-335`), the capacity line, the attach gate (`:391`) and its tooltip (`:384`)
+- Modify: `gateway/frontend/src/components/chat/useChatPersistence.ts` — the `state` type (`:76-86`), its destructure (`:108-118`), the debounced effect's dep array (`:202-213`), and the keepalive guard (`:228`)
 - Modify: `gateway/frontend/src/i18n.ts`
 - Test: `Chat.test.tsx`, `ChatStore.test.tsx`, `ChatSidebar.test.tsx`, `i18n.test.ts`
 
-**Serve the cap; do not duplicate it.** `maxChatContentBytes` is
-package-private to `portal` (`service_chats.go:43`) and no DTO carries it. A
-second `4 << 20` in TypeScript would drift from the Go constant with nothing to
-catch it, and the failure mode is a capacity line that confidently states the
-wrong number. Export it and put it on a DTO the chat view already fetches.
+**Interfaces:**
+- Consumes Task 1's `ModelDTO.Image` and Task 5's persisted `kind`.
+- Produces `ChatStore.modelImageCapable: boolean`, `ChatStore.chatKind: string`,
+  and a served `max_content_bytes`.
+
+**Serve the cap on the chat list; do not duplicate it.**
+`maxChatContentBytes` is package-private to `portal` (`service_chats.go:43`)
+and no DTO carries it. A second `4 << 20` in TypeScript would drift from the Go
+constant with nothing to catch it, and the failure mode is a capacity line that
+confidently states the wrong number — the exact defect this composer exists to
+avoid. `handlePortalChatSettings` is **not** the place: it is PUT-only and
+about capture flags, and its own comment says there is no GET there. Put it on
+`ChatListResponse` (`{Data []ChatSummaryDTO}`, `:68`), which the chat view
+already fetches:
+
+```go
+// ChatListResponse is the chat list plus the limits a client needs to stay
+// inside it. MaxContentBytes is maxChatContentBytes: the client cannot
+// otherwise know it (it is package-private and on no other DTO), and a client
+// that hardcodes its own copy would drift from this one silently.
+type ChatListResponse struct {
+	Data           []ChatSummaryDTO `json:"data"`
+	MaxContentBytes int             `json:"max_content_bytes"`
+}
+```
 
 **Five things that fail silently if missed:**
 
 1. **A new persisted setting needs three lockstep edits** in
-   `useChatPersistence.ts` — the `state` type, the destructure, and the
-   debounced effect's **explicit** dep array, which carries
+   `useChatPersistence.ts`: the `state` parameter type (`:76-86`), its
+   destructure (`:108-118`), and the debounced effect's **explicit** dep array
+   (`:202-213`), which sits under
    `// eslint-disable-next-line react-hooks/exhaustive-deps`. Miss the dep and
-   the setting simply never triggers a save.
-2. **`activateChat` (`ChatStore.tsx:451-499`) destroys an unhandled setting.**
-   It seeds React state from `normalizeDoc`'s output; a setting not loaded
-   there reverts to defaults and the next debounced save writes the default
-   over the stored value.
+   the setting never triggers a save, with no warning.
+2. **`activateChat` destroys an unhandled setting.** It seeds React state from
+   `normalizeDoc`'s output (`:451-499`); a setting not loaded there reverts to
+   its default and the next debounced save writes that default over the stored
+   value.
 3. **`ChatSidebar.test.tsx`'s `makeStore` (`:13-65`) enumerates all 47
-   `ChatStore` fields** and is typed `ChatStore` with no cast. A new required
-   field is a **tsc** error there — and `npm test` does not type-check, so only
-   `npm run build` catches it.
-4. **`api/chat.ts` declares the settings shape twice** — `ChatSettings`
-   (`:19-31`) and again inline in `StartChatRunBody` (`:49-57`). Add the field
-   in both.
-5. **The synthetic injected model option has no capability fields**
+   `ChatStore` fields** and is typed `ChatStore` with no cast, so a new
+   required field is a **tsc** error there — and `npm test` does not
+   type-check. Only `npm run build` catches it.
+4. **`api/chat.ts` declares the settings shape twice** (`:19-31` and inline at
+   `:49-57`). Add `kind` in both.
+5. **The synthetic injected model option carries no capability fields**
    (`ChatStore.tsx:247-258` injects `{id, display_name, flavors,
-   loading_on_count}` for a model that is not in the catalogue). It will have
-   no `image` either, so an image thread whose model has vanished from the
-   listing derives `modelImageCapable === false`. Decide that deliberately:
-   the pinned **kind** is the thread's truth, and the model flag only gates the
-   composer's *new* affordances.
+   loading_on_count}` for a picked model absent from the catalogue), so it
+   derives `image === false`. That is fine and deliberate: the **pinned kind**
+   is the thread's truth, and `modelImageCapable` only gates what the composer
+   newly offers. Do not derive the thread's behaviour from the model flag.
 
-**`components/chat/**` is an enforced import boundary** (`arch.test.ts:136-139`,
-`:256-270`): only `ChatStore.tsx` and `ChatSidebar.tsx` may be imported from
-outside that directory. A capacity helper used by `Chat.tsx` therefore belongs
-in `components/shared/`, not in `components/chat/`.
+**`ModelOption.image` must be OPTIONAL.** `vision?` is optional and
+`ChatStore.test.tsx`'s module-level model fixture omits it entirely — that
+omission is what makes the file's non-vision guard tests work
+(`:1444-1446` says so). A required field would break them.
 
-**Also in this task: the pagehide keepalive, which is dead for every image
-thread** (spec §7.9). `useChatPersistence.ts:228` is
-`if (JSON.stringify(payload).length > 60000) return;` — a silent return, and
-a single inline base64 image is far past 60000, so a last-moment change is lost
-on navigate-away in exactly the threads this feature creates. The guard exists
-for a real reason (a keepalive payload limit), so do **not** raise it blindly.
-The honest fix is for the user to be told rather than for the save to
-silently vanish: surface it, and let the normal debounced save — which has no
-such limit — remain the path that actually persists an image turn. Decide and
-implement one of those two, and say which in the commit body.
+**`components/chat/**` is an enforced import boundary**
+(`arch.test.ts:136-139`, `:256-270`): only `ChatStore.tsx` and
+`ChatSidebar.tsx` may be imported from outside. A capacity helper used by
+`Chat.tsx` belongs in `components/shared/`.
 
-- [ ] Steps: tests (a capacity line renders and Send refuses when the budget
-  cannot hold an image; the prompt label changes for an image thread; attach is
-  disabled) → verify failure → export and serve the cap → `modelImageCapable`
-  → the composer changes → the three lockstep persistence edits → i18n both
-  locales → `npm run build` specifically for the `makeStore` breakage → full
-  gates → commit.
+**Also here: the pagehide keepalive, dead for every image thread** (§7.9).
+`useChatPersistence.ts:228` is
+`if (JSON.stringify(payload).length > 60000) return;` — a silent return, and a
+single inline base64 image is far past it, so a last-moment change is lost on
+navigate-away in exactly the threads this feature creates. Do **not** raise the
+limit: it exists for a real keepalive payload ceiling. Make the skip
+observable instead — the debounced save has no such limit and remains the path
+that actually persists an image turn — and say in the commit body which of the
+two you chose and why.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `Chat.test.tsx`, inside the locale loop, following the drive-a-send pattern
+at `:333-345` and using `renderChat` / `waitForChatReady` / `pickOption`:
+
+```tsx
+    it('labels the prompt field as an image prompt for an image-capable model', async () => {
+      renderChat(undefined, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+    });
+
+    it('sends the image kind in the started run settings', async () => {
+      renderChat(undefined, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat on a bicycle' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.kind).toBe('image');
+    });
+
+    it('disables the attach button for an image model that is not vision-capable', async () => {
+      renderChat(undefined, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // An image GENERATOR has no reason to accept an image INPUT, and the two
+      // are different capabilities. The tooltip must say which one it means.
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toBeDisabled();
+    });
+
+    it('shows the remaining capacity for an image thread', async () => {
+      renderChat(undefined, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // The one number in this feature that is exact and known BEFORE the user
+      // commits to a multi-minute wait.
+      expect(screen.getByTestId('chat-capacity')).toBeInTheDocument();
+    });
+```
+
+`imageModels` is a new describe-local fixture beside the existing
+`nonVisionModels` / `mixedModels` (`Chat.test.tsx:532-566` shows their shape) —
+the same objects with `image: true` and no `vision`.
+
+In `ChatStore.test.tsx`, the refusal and the persistence round-trip:
+
+```tsx
+    it('refuses to send when the transcript has no room for another image', async () => {
+      // Seed a chat whose document is already within one image of
+      // max_content_bytes, then attempt a send and assert startChatRun was
+      // NEVER called and the capacity error was shown. Spending minutes of
+      // upstream CPU on an artifact we can already prove we cannot store is the
+      // failure this refusal exists to prevent.
+      renderProvider();
+      await waitForReady();
+      // ... seed via makeChatApi with a large content blob, then:
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(await screen.findByText(t.chatCapacityExhausted)).toBeTruthy();
+    });
+
+    it('persists the pinned kind across a save and a reload', async () => {
+      // The three lockstep edits in useChatPersistence are what make this pass;
+      // miss the dep array and the setting simply never triggers a save.
+      renderProvider();
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled());
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { kind?: string } };
+      };
+      expect(saved.content.settings.kind).toBe('image');
+    });
+```
+
+The first body's seeding step is left as a comment because the size of the
+blob depends on the served `max_content_bytes` this task introduces; everything
+it must assert is written out.
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/Chat.test.tsx -t 'image prompt'
+```
+
+- [ ] **Step 3: Backend — export and serve the cap**
+
+Rename `maxChatContentBytes` to an exported `MaxChatContentBytes` (or keep the
+private const and add an exported accessor — either is fine, one of them), add
+the field to `ChatListResponse`, and populate it in `ListChats`. Add a Go test
+that the listing's JSON carries a non-zero `max_content_bytes`, because nothing
+else would notice it silently becoming zero.
+
+- [ ] **Step 4: Frontend — the flag, the kind, and the composer**
+
+`modelImageCapable` mirrors `:308-309` exactly:
+
+```tsx
+  // Whether the effective model GENERATES images (drives the image-thread
+  // composer). Independent of modelVisionCapable, which is whether it ACCEPTS
+  // them; the backend AND-aggregates both into ModelOption.
+  const modelImageCapable =
+    chatModels.find((option) => option.id === effectiveModel)?.image ?? false;
+```
+
+Then: `chatKind` state seeded in `activateChat` from the document's
+`settings.kind`; the prompt field's label switches to
+`t.chatImagePromptLabel` when the thread is an image thread; the capacity line
+renders beside it; `send()` gains the capacity refusal **before** it builds the
+user message; the attach button's condition becomes
+`disabled={c.streaming || !c.modelVisionCapable || c.modelImageCapable}` and
+its tooltip says which capability it means.
+
+- [ ] **Step 4b: Add the composer's new i18n keys to BOTH locales**
+
+The Step 1 tests reference these; without them `getByLabelText(undefined)`
+cannot match and `npm run build` fails on the `PortalMessages` parity type.
+
+```ts
+  chatImagePromptLabel: 'Bildprompt',
+  chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  chatCapacityRemaining: 'Platz für etwa noch {count} Bild(er) in diesem Chat.',
+  chatCapacityExhausted:
+    'Dieser Chat hat keinen Platz mehr für ein weiteres Bild. Lade die vorhandenen Bilder herunter und beginne einen neuen Chat.',
+```
+
+```ts
+  chatImagePromptLabel: 'Image prompt',
+  chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatCapacityRemaining: 'Room for about {count} more image(s) in this chat.',
+  chatCapacityExhausted:
+    'This chat has no room for another image. Download the images you have and start a new chat.',
+```
+
+Check how this file already interpolates a count before writing
+`{count}` — grep for an existing parameterised message and follow that
+mechanism rather than inventing one.
+
+- [ ] **Step 5: The attach tooltip string, which is currently false**
+
+`chatImageModelUnsupported` reads "Dieses Modell unterstützt keine Bilder." /
+"This model does not support images." (`i18n.ts:191`, `:2539`) and gates image
+**input**. On an image-generating model without vision the portal would tell
+the user that model does not support images. Reword it to name what it gates —
+image input — and add a distinct string for the image-model case. Four call
+sites share this key (`Chat.tsx:384`, `ChatStore.tsx:642`, `:721`, `:838`) and
+five tests reference it; Task 12 owns `:721`.
+
+- [ ] **Step 6: The three lockstep persistence edits, plus the keepalive**
+
+Add `kind` to the `state` type, the destructure, and the dep array. Then
+handle `:228` per the decision above.
+
+- [ ] **Step 7: Build FIRST, then the rest of the gates**
+
+`npm run build` is the gate that catches `makeStore`'s missing field and the
+i18n parity break; `npm test` catches neither.
+
+```bash
+cd gateway/frontend && npm run build && npm run format:check && npm run lint && npm test
+```
+
+```bash
+cd gateway/backend && golangci-lint fmt --diff && golangci-lint run && go test ./...
+```
+
+- [ ] **Step 8: Commit.**
 
 ---
 
 ### Task 14: The composer during generation
 
-Spec §3.6's during half: liveness, the server-anchored clock, the static
-sentence — and no progress.
+Spec §3.6's during half: liveness, a server-anchored clock, one static
+sentence — and no progress of any kind.
 
 **Files:**
 - Create: `gateway/frontend/src/components/shared/elapsed.ts`
 - Modify: `gateway/frontend/src/components/ActiveRequestsPanel.tsx:13-19` — import the lifted helper instead of declaring it
 - Modify: `gateway/frontend/src/api/chat.ts` — `ActiveChatRun` (`:45`) and the 201 response type gain `kind` and `elapsed_ms`
-- Modify: `gateway/frontend/src/components/chat/useChatRuns.ts` — carry kind and the age anchor through `RunState`
-- Modify: `gateway/frontend/src/components/ChatMessage.tsx` — the assistant branch's pending state (`:79-87`)
+- Modify: `gateway/frontend/src/components/chat/useChatRuns.ts` — carry the kind and the age anchor through `RunState`
+- Modify: `gateway/frontend/src/components/Chat.tsx:290` — pass the kind through to `ChatMessage`
+- Modify: `gateway/frontend/src/components/ChatMessage.tsx:79-87` — the pending render
 - Modify: `gateway/frontend/src/i18n.ts`
 - Test: `ChatMessage.test.tsx`, `ChatStore.test.tsx`, `i18n.test.ts`
 
@@ -2413,42 +3023,186 @@ sentence — and no progress.
 - Produces `formatElapsed(ms: number): string` in
   `components/shared/elapsed.ts`.
 
-**Lift `formatElapsed`, do not copy it.** It exists at
-`ActiveRequestsPanel.tsx:13-19` and is not exported. Two copies of a time
-formatter drift.
+**Lift `formatElapsed`, do not copy it.** It exists verbatim at
+`ActiveRequestsPanel.tsx:13-19` and is not exported:
 
-**Anchor the clock, do not re-fetch it.** Take `elapsed_ms` from the snapshot
-once, record `performance.now()` at that moment, and tick locally from the
-difference. The server value is the anchor; the local clock only interpolates
-between snapshots. This is what makes a reopened tab and the sending tab agree.
+```ts
+// Elapsed since a request started: "Xs" under a minute, otherwise "m:ss".
+export function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+```
+
+Move it to the new module, export it, and have `ActiveRequestsPanel` import it.
+Two copies of a time formatter drift.
+
+**Why `elapsed_ms` and not `started_at`, diverging from the repo's own
+precedent.** The active-requests DTO sends `started_at` as RFC3339
+(`active_requests.go:199`, `:318`) and the panel computes the difference against
+the local clock. That is fine there: the numbers are seconds and the audience
+is an operator diagnostic. Here the clock is the **only** signal during a
+multi-minute wait shown to an end user, so a client clock skewed by N would
+display an elapsed time wrong by N — a confidently wrong headline number, which
+is exactly what this composer exists to avoid. `elapsed_ms` plus a
+`performance.now()` anchor compares no two clocks and cannot skew. Record this
+divergence in the commit body so the next reader does not "fix" it back.
+
+**Anchor once, interpolate locally.** Take `elapsed_ms` from the snapshot,
+record `performance.now()` at that instant, and tick from the difference. The
+server value is the anchor; the local clock only fills the gap between
+snapshots. This is what makes a reopened tab and the sending tab agree.
 
 **The clock must be `aria-hidden`.** The transcript box is `role="log"` with
 `aria-live="polite"` and `aria-relevant="additions text"`
-(`Chat.tsx:266-269`), so an unhidden once-per-second clock would announce
-every tick and make the thread unusable with a screen reader. The liveness and
-the static sentence are announced; the number is not.
+(`Chat.tsx:266-269`), so an unhidden once-per-second clock would announce every
+tick and make the thread unusable with a screen reader. The label and the
+static sentence are announced; the number is not.
 
-**Replace the `0 Zeichen` counter rather than feeding it.** The fabricated
-counter is at `ChatMessage.tsx:82-83` and fires whenever
-`streaming && text.length === 0` — which for an image run is the **entire**
-run. Branch on the kind before that condition, not inside it.
+**Replace the fabricated counter, do not feed it.** `ChatMessage.tsx:82-83`
+renders `${t.chatReasoningActive} · ${reasoningText.length} ${t.chatCharsUnit}`
+whenever `streaming && text.length === 0` — which for an image run is the
+**entire** run, so it would read `Denkt ... · 0 Zeichen` from the first
+millisecond to the last. Branch on the kind **before** that condition, not
+inside it.
 
-**Test the ticker with fake timers.** The proven pattern in this repo is
-`vi.useFakeTimers()` + `advanceTimersByTimeAsync`
-(`Activity.active.test.tsx:365-399`).
+- [ ] **Step 1: Write the failing tests**
 
-**`message.status` is not passed to `ChatMessage` today** (`Chat.tsx:276-296`
-lists every prop it receives). If the during-state needs to distinguish
-terminal outcomes in the bubble, that prop has to be threaded — decide and do
-it here rather than discovering it in Task 8's territory.
+In `ChatMessage.test.tsx`, standalone props as that file does:
 
-- [ ] Steps: tests (an image run's pending bubble shows the label, a ticking
-  clock and the static sentence, and shows **no** character counter; the clock
-  is `aria-hidden`; a text run's pending state is byte-identical to today) →
-  verify failure → lift `formatElapsed` → thread kind and the anchor → branch
-  the pending render → i18n both locales → full gates → commit.
+```tsx
+    it('shows the image wait label, a clock and the no-news sentence while an image run is pending', () => {
+      render(
+        <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={107_000} />,
+      );
+      expect(screen.getByText(t.chatImageRunPending)).toBeInTheDocument();
+      expect(screen.getByText('1:47')).toBeInTheDocument();
+      expect(screen.getByText(t.chatImageNoIntermediateNews)).toBeInTheDocument();
+    });
 
----
+    it('shows NO character counter for a pending image run', () => {
+      render(
+        <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={0} />,
+      );
+      // The counter is honest for text -- the number is real and it moves. For
+      // an image run there is nothing to count, so it must be ABSENT, not zero:
+      // proxyNative makes the same distinction one layer down when it gives a
+      // buffered relay progress = nil rather than an always-zero struct.
+      expect(screen.queryByText(new RegExp(t.chatCharsUnit))).toBeNull();
+      expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
+    });
+
+    it('hides the clock from assistive technology', () => {
+      render(
+        <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={5_000} />,
+      );
+      // The transcript is an aria-live log; a ticking number would be announced
+      // once a second and make the thread unusable with a screen reader.
+      expect(screen.getByText('5s').closest('[aria-hidden="true"]')).not.toBeNull();
+    });
+
+    it('leaves the text pending state exactly as it was', () => {
+      render(<ChatMessage t={t} role="assistant" content="" streaming reasoning="thinking" />);
+      // No kind prop: the existing counter must be untouched, because this is
+      // the overwhelmingly common case.
+      expect(screen.getByText(new RegExp(t.chatReasoningActive))).toBeInTheDocument();
+      expect(screen.getByText(new RegExp(t.chatCharsUnit))).toBeInTheDocument();
+    });
+```
+
+And the ticker, with the repo's proven fake-timer pattern
+(`Activity.active.test.tsx:365-399` — `vi.useFakeTimers()` +
+`advanceTimersByTimeAsync`, inside a `try`/`finally` that restores real
+timers):
+
+```tsx
+    it('ticks the clock once a second from the server anchor', async () => {
+      vi.useFakeTimers();
+      try {
+        render(
+          <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={3_000} />,
+        );
+        expect(screen.getByText('3s')).toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2_000);
+        });
+        expect(screen.getByText('5s')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+```
+
+In `i18n.test.ts`, a key-presence block for `chatImageRunPending` and
+`chatImageNoIntermediateNews`.
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cd gateway/frontend && npx vitest run src/components/ChatMessage.test.tsx -t 'image run'
+```
+
+- [ ] **Step 3: Create `shared/elapsed.ts`** with the exported helper above and
+  make `ActiveRequestsPanel` import it. Run that panel's own tests immediately:
+
+```bash
+cd gateway/frontend && npx vitest run src/components/Activity.active.test.tsx
+```
+
+- [ ] **Step 4: Thread the kind and the anchor**
+
+`api/chat.ts`: `ActiveChatRun` and the start response gain `kind?: string` and
+`elapsed_ms?: number`. `useChatRuns`: `RunState` carries the kind and, on each
+snapshot, `{ serverElapsedMs, anchor: performance.now() }`. `Chat.tsx:290`
+already computes the `streaming` prop per message — pass `kind` and the derived
+`elapsedMs` the same way.
+
+- [ ] **Step 5: Branch the pending render**
+
+In `ChatMessage.tsx`, above the existing `showReasoning` computation at `:79`:
+
+```tsx
+    // An image run emits ZERO incremental events -- the endpoint refuses
+    // `stream` outright -- so there is nothing to count and the character
+    // counter below would read "0 Zeichen" for the whole multi-minute wait.
+    // Three elements instead, each backed by a value that exists: liveness from
+    // the run's server-reported status, an elapsed clock anchored on the
+    // server's own measurement, and one sentence stating that no intermediate
+    // news is coming.
+    if (streaming && kind === 'image' && images.length === 0) {
+      return <ImagePendingTurn t={t} elapsedMs={elapsedMs} roleLabel={roleLabel} />;
+    }
+```
+
+`images.length === 0` keeps the pending state from replacing an arriving image
+in the same render. `ImagePendingTurn` lives beside `ImageTurn` in
+`components/` (not `components/chat/` — see Task 11).
+
+- [ ] **Step 6: i18n, both locales**
+
+```ts
+  chatImageRunPending: 'Warte auf Bild',
+  chatImageNoIntermediateNews: 'Keine Zwischenmeldungen – das Bild erscheint fertig oder gar nicht.',
+```
+
+```ts
+  chatImageRunPending: 'Waiting for image',
+  chatImageNoIntermediateNews: 'No intermediate updates – the image arrives finished or not at all.',
+```
+
+Deliberately **not** "Bild wird erzeugt": between dispatch and terminal the
+request may still be queued for admission or waiting on a model load, during
+which "is being generated" is false. "Warte auf Bild" is true for the whole
+span and makes the clock's referent unambiguous — the wait, not the work.
+
+- [ ] **Step 7: Full gates and commit**
+
+```bash
+cd gateway/frontend && npm run build && npm run format:check && npm run lint && npm test
+```
 
 ### Task 15: Fold the branch-local docs into the architecture and remove them
 
