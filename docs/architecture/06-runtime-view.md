@@ -35,7 +35,7 @@ sequenceDiagram
     GW->>U: record usage event (tokens, cost, energy, status)
 ```
 
-Notes: the four inference endpoints read the request body with no size cap (large
+Notes: all five inference endpoints read the request body with no size cap (large
 multimodal payloads) and lift the server read/write deadlines; SSE streams are
 bounded by an idle watchdog and client disconnect, not a total cap. See
 [Compatibility & Inference](cross-cutting/compatibility-and-inference.md).

@@ -26,6 +26,12 @@ import (
 var (
 	ErrNoModelRoute  = errors.New("routing.no_model_route")
 	ErrNoHealthyHost = errors.New("routing.no_healthy_host")
+	// ErrModelNotCapable reports that candidates existed for the requested model
+	// but none carries a "yes" verdict for a capability the endpoint requires.
+	// It is deliberately NOT ErrNoModelRoute: "this model cannot do that" and
+	// "there is no such model" are different facts, and a client that cannot
+	// tell them apart cannot act on either.
+	ErrModelNotCapable = errors.New("routing.model_not_capable")
 	// ErrAdmissionQueueTimeout: an unpinned request waited for a free concurrency slot up
 	// to the per-app admission_queue_timeout_seconds without one freeing. Maps to HTTP 503.
 	ErrAdmissionQueueTimeout = errors.New("routing.admission_queue_timeout")
@@ -37,7 +43,12 @@ var (
 	// disabled, or unhealthy/unreachable and the override did not force through it.
 	ErrServerOverrideServerUnavailable = errors.New("routing.server_override_server_unavailable")
 	// ErrServerOverrideModelUnavailable: a server-override request named a server that has
-	// no live (active mapping + active app) offering of the requested model.
+	// no USABLE live (active mapping + active app) offering of the requested model —
+	// either no such offering at all, or one whose mapping does not carry a "yes" verdict
+	// for a capability the endpoint requires (resolveServerOverride's capability gate).
+	// The two share one sentinel deliberately: from the caller's side both are "that
+	// server cannot serve this model", and an override names ONE server, so there is no
+	// second candidate the distinction could steer to.
 	ErrServerOverrideModelUnavailable = errors.New("routing.server_override_model_unavailable")
 )
 
@@ -325,6 +336,13 @@ type resolverStore interface {
 	// (unwritten, pre-migration-78) column for the life of the pin -- up to
 	// AffinityTTLSeconds.
 	MappingCapabilities(ctx context.Context, mappingID string) ([]CapabilityRow, error)
+	// MappingCapabilitiesForMappings is filterCapable's bulk read -- one query
+	// for the whole candidate list rather than one per candidate. It is already
+	// implemented on every driver (chunked in SQLite, mirrored in MemoryStore,
+	// wrapped in the generated tracing decorator) and already carries an N+1
+	// guard test in internal/portal, so adding it here costs nothing but this
+	// line.
+	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
 }
 
 type Resolver struct {
@@ -466,7 +484,7 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		}
 	}
 	if token.ID != "" {
-		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, now)
+		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
 		if err != nil {
 			return Target{}, err
 		}
@@ -499,6 +517,34 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		return Target{}, err
 	}
 	candidates = filterServesEndpoint(candidates, req.APIFlavor)
+	// capableFrom is the pool size the capability filter is about to reduce, and
+	// the sentinel below is conditioned on it being non-zero. Without that
+	// measurement the sentinel is not a statement about capability at all:
+	// filterCapable early-returns on empty input, so EVERY upstream reason the
+	// pool is already empty -- no such model, a provisioning denial, an endpoint
+	// the application does not serve -- would arrive at the check with
+	// len(candidates) == 0 and be reported as "this model cannot do that" about a
+	// model that may carry `image: yes`, or may not exist. It also made
+	// ErrNoModelRoute unreachable on this path for any capability-carrying
+	// request, collapsing the very distinction the sentinel exists to draw.
+	//
+	// Taken AFTER filterProvisioned/filterServesEndpoint deliberately: a
+	// provisioning denial then reads ErrNoModelRoute, which is the same no-leak
+	// posture (404, indistinguishable from an unknown model) the rest of the
+	// codebase takes and the e2e suite pins for chat.
+	capableFrom := len(candidates)
+	candidates, err = r.filterCapable(ctx, candidates, req.RequiredCapabilities)
+	if err != nil {
+		return Target{}, err
+	}
+	// Checked BEFORE the general empty-candidates case below, so the more
+	// specific fact wins: candidates existed for this model but none carried
+	// the required capability, which is not the same fact as "no such
+	// model". Conditioned on RequiredCapabilities so a chat request (nil)
+	// falls through to the existing check unchanged.
+	if capableFrom > 0 && len(candidates) == 0 && len(req.RequiredCapabilities) > 0 {
+		return Target{}, ErrModelNotCapable
+	}
 	if len(candidates) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
@@ -556,7 +602,24 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		if err != nil {
 			return Target{}, err
 		}
-		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 {
+		// The two PIN-CREATING writes -- this one and upsertGroupPin's -- are guarded
+		// on the capability list rather than on a flavor string, so the speech and
+		// multipart endpoints (#68/#69) inherit the guard. AffinityKey.APIFlavor is
+		// COARSE (NormalizeAPIFlavor above), so an unguarded image resolve would
+		// write its pin under the same key a chat client uses and repoint that
+		// client at an image server. The read-side gate (resolveAffinity) does not
+		// help here -- it is the WRITE that does the damage.
+		//
+		// This guard does NOT make every UpsertAffinity call site unreachable for a
+		// capability-carrying request: resolveAffinity's own in-place refresh (the
+		// LastUsedAt/UpdatedAt touch-up on a pin that already satisfies its
+		// capability gate) still runs -- it is not guarded, and it does not need to
+		// be. It rewrites the SAME row it just read, advancing only
+		// LastUsedAt/UpdatedAt; ApplicationID/ServerID/ExpiresAt are unchanged, and
+		// LastUsedAt is never read for a routing decision anywhere in this backend,
+		// so that refresh cannot repoint anything. It just is not "guarded" the way
+		// these two pin-creating writes are.
+		if token.ID != "" && selected.Application.AffinityTTLSeconds > 0 && len(req.RequiredCapabilities) == 0 {
 			if err := r.store.UpsertAffinity(ctx, RouteAffinity{
 				ID:            affinityID(key),
 				APITokenID:    token.ID,
@@ -599,6 +662,10 @@ func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Requ
 		}
 	}
 	mine = filterServesEndpoint(mine, req.APIFlavor)
+	mine, err = r.filterCapable(ctx, mine, req.RequiredCapabilities)
+	if err != nil {
+		return Target{}, err
+	}
 	if len(mine) == 0 {
 		return Target{}, ErrServerOverrideModelUnavailable
 	}
@@ -654,6 +721,58 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 	return out, nil
 }
 
+// filterCapable drops every candidate whose mapping does not carry a "yes"
+// verdict for each of the required capabilities. It is this gateway's FIRST
+// filter that genuinely excludes a model for lacking a capability --
+// wantsLiveProgress annotates and the models-list fold advertises, but neither
+// refuses, and the scorer (scorer.go) reads no verdict at all.
+//
+// An ABSENT row means unknown, not no, and this filter treats unknown as a
+// refusal. That direction is chosen on evidence rather than taste: Extra-sourced
+// rows are written yes-only (cmd/gateway/app_health.go) and the Ollama detector
+// can structurally never emit "no", so treating unknown as permission would
+// refuse nothing in a real fleet -- reproducing the exact defect the gate exists
+// to fix. See ADR-042 for the cost this accepts on day one.
+//
+// A store error REFUSES rather than failing open, for the same reason.
+func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
+	if len(required) == 0 || len(cands) == 0 {
+		return cands, nil
+	}
+	ids := make([]string, 0, len(cands))
+	seen := map[string]bool{}
+	for _, c := range cands {
+		if !seen[c.Mapping.ID] {
+			seen[c.Mapping.ID] = true
+			ids = append(ids, c.Mapping.ID)
+		}
+	}
+	caps, err := r.store.MappingCapabilitiesForMappings(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("capability gate: %w", err)
+	}
+	out := cands[:0:0]
+	for _, c := range cands {
+		if capabilityRowsSatisfy(caps[c.Mapping.ID], required) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// capabilityRowsSatisfy reports whether rows carry a "yes" verdict for every
+// required capability. Shared by filterCapable and resolveAffinity's own gate,
+// which reads its rows from a different place.
+func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
+	byName := CapabilityRowsByName(rows)
+	for _, name := range required {
+		if byName[name].Verdict != CapabilityYes {
+			return false
+		}
+	}
+	return true
+}
+
 // filterServesEndpoint drops candidates whose application does not serve the
 // request's FINE api flavor once the per-endpoint mode is applied. It refines only
 // the two coding-agent endpoints (openai_responses / anthropic_messages); for
@@ -697,7 +816,81 @@ func (r *Resolver) affinityApplicationStale(app Application, affinity RouteAffin
 		(r.checker != nil && !r.checker.Reachable(app.ID))
 }
 
-func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, now time.Time) (Target, bool, error) {
+// affinityServer loads the AI server a stored affinity's application sits on and
+// decides whether that server is still a usable destination for the pin -- it
+// must exist, be selectable (active and not unhealthy), and not be temporarily
+// busy. Extracted from resolveAffinity, alongside affinityApplicationStale
+// above, so that method's cognitive complexity stays within budget.
+//
+// The three-way result is what resolveAffinity's own three-way handling needs,
+// and the split is deliberate: usable == false is a DROP -- the server is gone,
+// unselectable or busy, and the caller deletes the affinity row -- while a
+// non-nil error is a store failure that says nothing about the pin, so the
+// caller surfaces it and leaves the row alone. A vanished server
+// (storeerr.ErrNotFound) is a drop, not an error, for the same reason a
+// vanished application is.
+func (r *Resolver) affinityServer(ctx context.Context, serverID string) (server AIServer, usable bool, err error) {
+	server, err = r.store.AIServerByID(ctx, serverID)
+	if errors.Is(err, storeerr.ErrNotFound) {
+		return AIServer{}, false, nil
+	}
+	if err != nil {
+		return AIServer{}, false, fmt.Errorf("load affinity server: %w", err)
+	}
+	if !serverSelectable(server) {
+		return AIServer{}, false, nil
+	}
+	if r.busy != nil && r.busy.ServerBusy(server.ID) {
+		return AIServer{}, false, nil
+	}
+	return server, true, nil
+}
+
+// affinityCapabilityVerdict performs resolveAffinity's ONE keyed capability read
+// and answers the two different questions that read serves: the live-progress
+// annotation for the synthetic candidate, and whether the pinned mapping still
+// satisfies the capabilities this request requires.
+//
+// resolveAffinity's mapping comes from activeMappingForApplication
+// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
+// model_mapping_capabilities, so unlike every other targetFrom call site this
+// one has to fetch the verdict itself with a dedicated keyed read. That read is
+// on a path that already makes four store calls just to reach this point
+// (Affinity, ApplicationByID, AIServerByID, activeMappingForApplication's
+// MappingsByApplication); one more keyed lookup is the cost of the pin no
+// longer serving a stale verdict for its entire TTL. Both answers come off that
+// single read: the capability gate costs no extra store call.
+//
+// The two answers read the SAME rows with deliberately different failure
+// postures:
+//
+//   - LIVE PROGRESS is best-effort: a read failure degrades to ""
+//     (never-determined) -- the same reading an absent capability row would
+//     produce -- rather than failing an otherwise-servable affinity hit. The
+//     cost is that a transient store error can make one pinned request look
+//     like the verdict was never determined, which is strictly better than
+//     serving the wrong (frozen, possibly stale) column value.
+//   - The GATE treats a read error as not-satisfied. Live progress failing open
+//     costs one annotation; this failing open would route an image request to a
+//     chat model for the whole AffinityTTLSeconds.
+//
+// satisfied is true for a request that requires nothing (required empty), which
+// is every chat request: the gate is skipped, not evaluated, so no verdict can
+// refuse a pin that was never asked about a capability.
+func (r *Resolver) affinityCapabilityVerdict(ctx context.Context, mappingID string, required []string) (liveProgressSupport string, satisfied bool) {
+	caps, capErr := r.store.MappingCapabilities(ctx, mappingID)
+	if capErr == nil {
+		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
+			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
+		}
+	}
+	if len(required) > 0 && (capErr != nil || !capabilityRowsSatisfy(caps, required)) {
+		return liveProgressSupport, false
+	}
+	return liveProgressSupport, true
+}
+
+func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFlavor string, required []string, now time.Time) (Target, bool, error) {
 	affinity, ok, err := r.store.Affinity(ctx, key)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("lookup affinity: %w", err)
@@ -721,19 +914,11 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
-	server, err := r.store.AIServerByID(ctx, app.ServerID)
-	if errors.Is(err, storeerr.ErrNotFound) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
+	server, usable, err := r.affinityServer(ctx, app.ServerID)
 	if err != nil {
-		return Target{}, false, fmt.Errorf("load affinity server: %w", err)
+		return Target{}, false, err
 	}
-	if !serverSelectable(server) {
-		_ = r.store.DeleteAffinity(ctx, key)
-		return Target{}, false, nil
-	}
-	if r.busy != nil && r.busy.ServerBusy(server.ID) {
+	if !usable {
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
@@ -745,30 +930,38 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 		_ = r.store.DeleteAffinity(ctx, key)
 		return Target{}, false, nil
 	}
+	// One keyed capability read serves both the live-progress annotation and the
+	// capability gate on the pinned mapping; the read, and the different failure
+	// posture each answer takes, are documented on affinityCapabilityVerdict.
+	// This is the one Resolve branch with no candidate filter at all -- its
+	// mapping comes from MappingsByApplication, which never joins
+	// model_mapping_capabilities -- so the gate has to live here.
+	//
+	// The refusal is NON-DESTRUCTIVE: it returns (Target{}, false, nil) and lets
+	// the caller fall through to the fresh-candidate path. Every other rejection
+	// in this function deletes the affinity row, and that would be wrong here:
+	// AffinityKey.APIFlavor is COARSE, so an image request declaring the pin
+	// stale would delete the chat client's pin. For the same reason the gate is
+	// not in affinityApplicationStale.
+	//
+	// Placed BEFORE the LastUsedAt/UpdatedAt refresh below so a REFUSED request
+	// never touches the affinity row at all. This ordering does NOT make the
+	// refresh below unreachable in general: for a capability-carrying request
+	// whose pin already satisfies the gate, the refusal above is skipped and the
+	// refresh runs exactly as it would for a chat request. That is safe -- it
+	// rewrites the SAME row it just read, advancing only LastUsedAt/UpdatedAt
+	// (ApplicationID/ServerID/ExpiresAt untouched, and LastUsedAt is never read
+	// for a routing decision anywhere in this backend) -- so unlike the two
+	// PIN-CREATING writes in Resolve and upsertGroupPin, this one is not guarded
+	// on the capability list, and does not need to be.
+	liveProgressSupport, capable := r.affinityCapabilityVerdict(ctx, mapping.ID, required)
+	if !capable {
+		return Target{}, false, nil
+	}
 	affinity.LastUsedAt = now
 	affinity.UpdatedAt = now
 	if err := r.store.UpsertAffinity(ctx, affinity); err != nil {
 		return Target{}, false, fmt.Errorf("update affinity: %w", err)
-	}
-	// resolveAffinity's mapping comes from activeMappingForApplication
-	// (MappingsByApplication), NOT ActiveMappingsForModel -- it never joins
-	// model_mapping_capabilities, so unlike every other targetFrom call site
-	// this one has to fetch the verdict itself with a dedicated keyed read.
-	// That read is on a path that already makes five store calls just to
-	// reach this point (Affinity, ApplicationByID, AIServerByID,
-	// activeMappingForApplication's MappingsByApplication, UpsertAffinity);
-	// one more keyed lookup is the cost of the pin no longer serving a stale
-	// verdict for its entire TTL. Best-effort: a read failure degrades to ""
-	// (never-determined) -- the same reading an absent capability row would
-	// produce -- rather than failing an otherwise-servable affinity hit; the
-	// cost is that a transient store error can make one pinned request look
-	// like the verdict was never determined, which is strictly better than
-	// serving the wrong (frozen, possibly stale) column value.
-	liveProgressSupport := ""
-	if caps, capErr := r.store.MappingCapabilities(ctx, mapping.ID); capErr == nil {
-		if row, ok := CapabilityRowsByName(caps)[CapabilityLiveProgress]; ok {
-			liveProgressSupport = LiveProgressSupportFromVerdict(row.Verdict)
-		}
 	}
 	target, err := r.targetFrom(ctx, MappingCandidate{
 		Server:              server,
@@ -1218,7 +1411,7 @@ const modeClimbUp = "climb_up"
 // The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
 // no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
 // before those settings existed.
-func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
 	cands, err = r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve member mappings: %w", err)
@@ -1228,6 +1421,14 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 		return nil, false, err
 	}
 	cands = filterServesEndpoint(cands, fineFlavor)
+	// Gated BEFORE live is taken: a member whose only live mappings are all
+	// capability-gated must read as memberNoMapping (unknown model), the same
+	// no-leak posture the provisioning gate above already uses, not as
+	// memberUnavailable (a gated-but-real member).
+	cands, err = r.filterCapable(ctx, cands, required)
+	if err != nil {
+		return nil, false, err
+	}
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
@@ -1292,7 +1493,7 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
 func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, policy)
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, policy)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
@@ -1330,14 +1531,14 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
 // priority-ordered walk stops at the first available member. That is the price of the
 // ordering, and only groups that opt into it pay it.
-func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, policy GroupPolicy) ([]GroupMember, error) {
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
 		}
 		best := 0.0
-		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, policy)
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -1441,8 +1642,13 @@ func (r *Resolver) groupPin(ctx context.Context, key AffinityKey, members []Grou
 // serving application enables affinity. Mirrors the main Resolve pin: on an UpsertAffinity
 // failure it returns the error (a pin that could not be stored is a hard failure, exactly
 // as the single-model path treats it).
-func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key AffinityKey, name string, sel MappingCandidate, now time.Time) error {
-	if token.ID == "" || name == "" || sel.Application.AffinityTTLSeconds <= 0 {
+//
+// It also mirrors the main pin's capability guard: a capability-carrying request
+// (required non-empty) never writes a pin here either, for the same reason -- key
+// is COARSE, so a group image resolve would repoint a chat client sharing that key
+// at an image server. See the guard in Resolve for the full rationale.
+func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key AffinityKey, name string, sel MappingCandidate, required []string, now time.Time) error {
+	if token.ID == "" || name == "" || sel.Application.AffinityTTLSeconds <= 0 || len(required) > 0 {
 		return nil
 	}
 	id := affinityID(key)
@@ -1565,7 +1771,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.policy)
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
@@ -1574,7 +1780,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 
 	// serve builds the target for a selected member and (re)pins the group affinity to it.
 	serve := func(name string, sel MappingCandidate) (Target, error) {
-		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.now); err != nil {
+		if err := r.upsertGroupPin(ctx, g.token, g.key, name, sel, g.req.RequiredCapabilities, g.now); err != nil {
 			return Target{}, err
 		}
 		return r.targetFrom(ctx, sel, g.apiFlavor)

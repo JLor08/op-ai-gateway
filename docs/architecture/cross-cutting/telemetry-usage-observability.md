@@ -589,7 +589,7 @@ Four properties of the contract are load-bearing and easy to undo by accident:
   written over. Nothing may ever **default to** `billing_unit == ''`: reading
   it as "unknown" turns the column back into the lie the pair replaced.
 - **A unit may only come from ENDPOINT IDENTITY, never from the provider
-  response.** Seven of the ten `recordUsage` call sites pass a zero
+  response.** Nine of the twelve `recordUsage` call sites pass a zero
   `provider.Response` — every error, timeout, client-disconnect and
   capacity-queue-rejection path (the CP4 queue inside `Resolve`, *not* the
   principal limiter, which never reaches `recordUsage` at all; see
@@ -607,6 +607,80 @@ Four properties of the contract are load-bearing and easy to undo by accident:
 
 `usage.Row` embeds `usage.Event`, so the pair reaches the Activity list API
 with no DTO in between; there is no separate mapping step to keep in sync.
+
+**`image` is the first unit to arrive on those rails, and it changes none of
+them.** `/v1/images/generations` ([Compatibility & Inference
+§3.4](compatibility-and-inference.md#34-openai-images-generations)) records
+`billing_unit: "image"` on **every** one of the five `recordUsage` call sites
+it can reach — its own two, plus the three in `proxyNative` it shares with the
+other native-passthrough flavors — success and failure alike, because the unit
+is endpoint identity and the bullet above admits no exception for an error
+path. On the three shared sites the unit is derived from the caller's own
+`APIFlavor` rather than defaulted, which is what keeps a chat passthrough
+answering `''` there.
+The XOR then keeps the five token counts and the two rates at zero for those
+rows, which is exactly what it was built to do; no migration, no new column and
+no LLM path changed.
+
+**The QUANTITY, unlike the unit, is response-sourced — and that is not a
+contradiction of the rule above.** The rule forbids deriving the *unit* from
+the response, because a zero `provider.Response` on a failed request would
+assert token-metering about a request that was not token-metered. The quantity
+is the opposite kind of value: it is a *measurement*, and the only honest
+source for "how many images were produced" is the response. `n` states what was
+**asked for**; `data[]` states what was **produced**; a partial upstream
+failure makes the two differ, and billing the request is the one place that
+difference must not be papered over. So `billing_quantity` is taken from the
+response, and only when the full body reached the client without error —
+`status == "success"`: upstream 2xx, no idle timeout, no client disconnect, no
+copy error. Every other outcome leaves it `0`, asserting nothing about
+production.
+
+Three properties of how that count is obtained are load-bearing:
+
+- **It is a byte-scan of the streaming response, not a parse of `data[]`.**
+  `imagesDataCounter` (`internal/gateway/images_handler.go`) is fed from the
+  copier chunk by chunk, keeping only a small bounded carry across chunk
+  boundaries, and it counts occurrences of the `"b64_json"` **key**.
+- **It is deliberately independent of `captureMaxBytes`.** Reading `data[]`'s
+  length off the capture tee would be the obvious implementation and it would
+  **under-report on exactly the responses that matter most**: base64 inflates
+  the payload by roughly a third, so a single modest image already runs to
+  hundreds of KB and an `n > 1` response is a multiple of that, well past the
+  1 MiB cap — a silently truncated buffer would yield a plausible, low count.
+  The counter is fed before the cap check, for the same reason `usageScanner`
+  is (§8.4.3).
+- **The key/value distinction is checked, not assumed.** `"b64_json"` is also
+  the canonical *value* of `response_format`, so the identical quoted bytes
+  appear in any request-echoing field an upstream cares to emit. Quoting alone
+  rules out only a chance match inside base64 data (that alphabet emits no `"`
+  byte); what separates a key from a value is the **colon** that must follow
+  it, with the decision deferred across a chunk boundary rather than guessed
+  when the window runs out.
+- **One residual the key check cannot close, recorded rather than implied.**
+  The count is of `"b64_json"` used as a **key**, anywhere in the response — not
+  of `data[]`'s entries, which would require parsing a body this path
+  deliberately does not parse. The request body reaches the upstream unexamined
+  (§3.4 of [API Compatibility & Inference](compatibility-and-inference.md#34-openai-images-generations)
+  validates `prompt`, `model`, `response_format` and `stream` and nothing else),
+  so a client is free to send a top-level request key *named* `b64_json`; an
+  upstream that echoed request parameters back **as keys** would then produce one
+  key occurrence that is not a produced image, and the row would over-count by
+  one. It is left open knowingly: `sd-server`, the only backend this endpoint is
+  built against, echoes nothing, and the alternative is parsing megabytes of
+  base64 to close a one-off over-count that requires a deliberately odd request
+  and a cooperating upstream.
+
+**A 2xx images response that counts zero is logged at `Error`.** The pair has
+no "unknown" representation to fall back on, so a row reading
+`(image, 0)` on a successful relay is indistinguishable from a genuine empty
+`data[]` — a malformed body, or a response shape this relay was not built
+against, would both look like "produced nothing". Rather than record that
+silently, the relay makes it loud, with the request id and the honest
+(uncapped) body size, which is the same posture `recordUsage` takes on an XOR
+violation: never let an unmeasurable case pass as a measurement. The
+`response_format` restriction in §3.4 exists partly to shrink this failure
+mode's reachable surface in the first place.
 
 ### 8.4.2 Query, stats, groups, time-series
 

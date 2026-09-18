@@ -298,7 +298,7 @@ func TestTryProxyNativeRecordsLastUsedModel(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	w := httptest.NewRecorder()
 
-	if handled := s.tryProxyNative(w, r, &token, []byte("{}"), "", pf); handled {
+	if handled := s.tryProxyNative(w, r, &token, []byte("{}"), "", endpointResponses, pf); handled {
 		t.Fatalf("tryProxyNative returned true, want false (seeded application has no native flags)")
 	}
 	if len(writes) != 1 || writes[0] != "tok_1=llama-70b" {

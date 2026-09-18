@@ -49,7 +49,7 @@ flowchart TB
 
 | Actor | Interface | Auth |
 |---|---|---|
-| AI clients (OpenAI/Anthropic/Codex/Claude Code) | Inference APIs: `/v1/*`, `/openai/v1/*`, `/anthropic/v1/*` (chat/completions, responses, messages, count_tokens, models) | Bearer API token (chat/completions also accepts session+CSRF — the basis of the in-portal chat) |
+| AI clients (OpenAI/Anthropic/Codex/Claude Code) | Inference APIs: `/v1/*`, `/openai/v1/*`, `/anthropic/v1/*` (chat/completions, responses, messages, count_tokens, images/generations, models) | Bearer API token (chat/completions also accepts session+CSRF — the basis of the in-portal chat) |
 | Operators & users | Portal SPA + portal/system APIs `/api/portal/*`, `/api/system/*`, `/api/auth/*` | Server-side session cookie + `X-OP-CSRF`; some endpoints require the `admin`/`system` scope |
 | Server-Agents | Agent APIs `/api/agent/v1/*` (telemetry, system-report, ca, certificate, proxy-routes, stream, download) | Per-server bearer **agent token** |
 | Load balancers / uptime checks | `/healthz`, and the container `-healthcheck` subcommand | none |

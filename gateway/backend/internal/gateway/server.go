@@ -1167,6 +1167,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChat)
 	s.mux.HandleFunc("/openai/v1/responses", s.handleOpenAIResponses)
 	s.mux.HandleFunc("/v1/responses", s.handleOpenAIResponses)
+	s.mux.HandleFunc("/openai/v1/images/generations", s.handleOpenAIImages)
+	s.mux.HandleFunc("/v1/images/generations", s.handleOpenAIImages)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/api/v0/models", s.handleLMStudioModels)

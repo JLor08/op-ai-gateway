@@ -78,8 +78,8 @@ func TestChatCompletionAppliesTokenModelOverrideMap(t *testing.T) {
 
 // TestModelOverrideMapPassthroughForUnmappedModel verifies that, with a map and NO
 // catch-all, a requested model NOT in the map is left unchanged — so an unroutable
-// model stays unroutable (502) rather than being forced. This proves the map does
-// not act as a catch-all.
+// model stays unroutable (404, ErrNoModelRoute: no such model) rather than being
+// forced. This proves the map does not act as a catch-all.
 func TestModelOverrideMapPassthroughForUnmappedModel(t *testing.T) {
 	srv, _ := newModelOverrideMapTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
@@ -87,7 +87,7 @@ func TestModelOverrideMapPassthroughForUnmappedModel(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer ovr-secret")
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 (unmapped model not overridden -> unroutable), body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (unmapped model not overridden -> unroutable), body=%s", rr.Code, rr.Body.String())
 	}
 }

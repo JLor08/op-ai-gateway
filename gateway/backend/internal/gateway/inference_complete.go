@@ -906,6 +906,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrServerOverrideModelUnavailable) {
 		message = "the server-override target does not offer the requested model"
 	}
+	if errors.Is(err, routing.ErrModelNotCapable) {
+		message = "the requested model is not capable of this endpoint"
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -931,11 +934,24 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, routing.ErrServerOverrideServerUnavailable) {
 		return http.StatusBadGateway
 	}
+	// ErrModelNotCapable, ErrNoModelRoute and ErrNoHealthyHost had no cases here
+	// and all three fell through to 502, which made a routing refusal
+	// indistinguishable from an upstream outage. A capability gate that refuses
+	// legibly on one branch and illegibly on another is not a legible gate, so
+	// all three are mapped in the same change.
+	if errors.Is(err, routing.ErrModelNotCapable) || errors.Is(err, routing.ErrNoModelRoute) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, routing.ErrNoHealthyHost) {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusBadGateway
 }
 
 func completionErrorCode(err error) string {
 	switch {
+	case errors.Is(err, routing.ErrModelNotCapable):
+		return routing.ErrModelNotCapable.Error()
 	case errors.Is(err, routing.ErrNoModelRoute):
 		return routing.ErrNoModelRoute.Error()
 	case errors.Is(err, routing.ErrNoHealthyHost):

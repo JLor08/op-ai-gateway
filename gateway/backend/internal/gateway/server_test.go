@@ -212,8 +212,8 @@ func TestOpenAIChatStreamResolveErrorRecordsJSONContentType(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	events := srv.Usage.All()
 	if len(events) != 1 {
@@ -237,8 +237,8 @@ func TestOpenAIChatReturnsNoModelRoute(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
 		Error struct {
@@ -699,8 +699,8 @@ func TestOpenAIChatStreamResolveErrorIsJSON(t *testing.T) {
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -991,8 +991,8 @@ func TestOpenAIResponsesStreamResolveErrorReturnsJSON(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	// A pre-stream resolve failure has no stream yet, so it returns a JSON error.
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -1572,8 +1572,8 @@ func TestAnthropicMessagesStreamResolveErrorReturnsJSON(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	// A pre-stream resolve failure has no stream yet, so it returns a JSON error.
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (ErrNoModelRoute: no such model), body = %s", rec.Code, rec.Body.String())
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want application/json (not SSE)", ct)
@@ -2034,6 +2034,42 @@ func TestOpenAIResponsesNativePassthroughProxiesRawBody(t *testing.T) {
 	}
 }
 
+// TestOpenAIResponsesNativePassthroughSessionSourceIsCodex pins the
+// sessionEndpoint value proxyNative uses for session extraction on THIS
+// native-passthrough path to endpointResponses. proxyNative used to derive
+// that value itself from pfReq.APIFlavor; it is now threaded in explicitly by
+// the caller (tryProxyNative, itself called from handleOpenAIResponses with
+// endpointResponses -- see inference_handlers.go:126) because a coarse-flavor
+// derivation can no longer tell Responses and Images apart (both fold to
+// "openai" under NormalizeAPIFlavor). Nothing type-checks that the literal
+// passed at each call site is the RIGHT one, so this asserts the outcome: a
+// request carrying the Codex "session_id" header must be attributed with
+// session_source=codex on the recorded usage row. Swapping the endpointResponses/
+// endpointMessages literals at inference_handlers.go:126,188 must fail this
+// test (proxyNative would read x-claude-code-session-id instead, find nothing,
+// and record an empty session_source).
+func TestOpenAIResponsesNativePassthroughSessionSourceIsCodex(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: `{"output_text":"hi"}`}
+	srv := newNativeProxyTestServer(prov, true, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("session_id", "sess-codex-1")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].SessionSource != "codex" || events[0].SessionID != "sess-codex-1" {
+		t.Fatalf("usage event = %+v, want session_source=codex session_id=sess-codex-1", events[0])
+	}
+}
+
 func TestOpenAIResponsesNonNativeUsesTranslatePath(t *testing.T) {
 	prov := &recordingProxyProvider{respBody: "unused"}
 	srv := newNativeProxyTestServer(prov, false, false) // native OFF
@@ -2076,6 +2112,34 @@ func TestAnthropicNativePassthroughProxiesRawBody(t *testing.T) {
 	events := srv.Usage.All()
 	if len(events) != 1 || events[0].OutputTokens != 42 {
 		t.Fatalf("usage = %+v, want 1 event with 42 output tokens", events)
+	}
+}
+
+// TestAnthropicMessagesNativePassthroughSessionSourceIsClaudeCode is the
+// Claude Code counterpart to TestOpenAIResponsesNativePassthroughSessionSourceIsCodex
+// above -- see that test's comment for why this needs its own assertion at
+// all (proxyNative's endpoint parameter is now a caller-supplied literal, not
+// a self-checking derivation). Swapping the endpointResponses/endpointMessages
+// literals at inference_handlers.go:126,188 must fail this test.
+func TestAnthropicMessagesNativePassthroughSessionSourceIsClaudeCode(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: `{"type":"message","content":[{"type":"text","text":"hi"}]}`}
+	srv := newNativeProxyTestServer(prov, false, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("x-claude-code-session-id", "sess-cc-1")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].SessionSource != "claude-code" || events[0].SessionID != "sess-cc-1" {
+		t.Fatalf("usage event = %+v, want session_source=claude-code session_id=sess-cc-1", events[0])
 	}
 }
 
@@ -4914,7 +4978,7 @@ func TestPortalTokenItemDeleteRemovesTokenAndRevokesBearer(t *testing.T) {
 // "ovr-secret". Completion tests send a body model of "gpt-oss-20b", which is
 // unroutable — so a 200 + a usage event with Model "qwen-coder" proves the
 // override (not the request body) drove routing; without the override the
-// resolver would return 502 routing.no_model_route.
+// resolver would return 404 routing.no_model_route.
 func newModelOverrideTestServer(t *testing.T) (*Server, *usage.Recorder) {
 	t.Helper()
 	tokens := auth.NewTokenStore()

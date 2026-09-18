@@ -52,12 +52,16 @@ flowchart TD
         Resp["POST /v1/responses\n/openai/v1/responses"]
         Msg["POST /v1/messages\n/anthropic/v1/messages"]
         CT["POST /v1/messages/count_tokens"]
+        Img["POST /v1/images/generations\n/openai/v1/images/generations"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
     Resp --> NativeGate{"endpointModeFor(target,\nopenai_responses)"}
     Msg --> NativeGate2{"endpointModeFor(target,\nanthropic_messages)"}
     CT --> CountTok["compat.CountAnthropicTokens\n(word-count estimate, no upstream call)"]
+    Img --> CapGate{"Resolve with\nRequiredCapabilities=[image]"}
+    CapGate -->|refused| Reject3["404 routing.model_not_capable"]
+    CapGate -->|target| Native3["relayImages -> proxyNative:\nforward raw body\nto upstream /v1/images/generations"]
 
     NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
@@ -74,6 +78,7 @@ flowchart TD
     Resolve --> Mux["provider.Multiplexer\n(dispatch by target.Provider)"]
     Native --> ProxyMux["provider.Multiplexer.ProxyNative\n(dispatch by target.Provider)"]
     Native2 --> ProxyMux
+    Native3 --> ProxyMux
 
     Mux --> Ollama["OllamaClient\n/api/chat"]
     Mux --> OAIC["OpenAICompatibleClient\n/v1/chat/completions"]
@@ -113,6 +118,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI Chat Completions | `/v1/chat/completions`, `/openai/v1/chat/completions` | `handleOpenAIChat` | `requireWebAnyScope` (session cookie **or** bearer) | none — always translated |
 | OpenAI Responses (Codex) | `/v1/responses`, `/openai/v1/responses` | `handleOpenAIResponses` | `requireAnyScope` (bearer only) | `Target.ResponsesMode` (§6) |
 | Anthropic Messages (Claude Code) | `/v1/messages`, `/anthropic/v1/messages` | `handleAnthropicMessages` | `requireAnyScope` (bearer only) | `Target.MessagesMode` (§6) |
+| OpenAI Images generations | `/v1/images/generations`, `/openai/v1/images/generations` | `handleOpenAIImages` | `requireAnyScope` (bearer only) | **always** — there is no translate path (§3.4) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -123,7 +129,7 @@ service token's sole `llm:invoke` scope (service accounts); `requireWebAnyScope`
 additionally accepts the portal session cookie (+ CSRF header on state-changing
 methods) — `/v1/chat/completions` is deliberately the one inference endpoint
 reachable that way (§9). All bodies are read with `readRawJSONUnlimited`
-(§7); all four POST endpoints call `liftInferenceDeadlines` before reading the
+(§7); all five POST endpoints call `liftInferenceDeadlines` before reading the
 body (§6).
 
 ### 3.1 OpenAI Chat Completions
@@ -198,6 +204,145 @@ Rendering (`compat.AnthropicMessageResponse`) emits content blocks in
 Anthropic's required order: `thinking` (if any) → `text` (if any, or always
 when there are no tool calls) → one `tool_use` block per tool call, each with
 `input` reconstructed as a JSON **object** from the internal string arguments.
+
+### 3.4 OpenAI Images generations
+
+`POST /v1/images/generations` (`handleOpenAIImages`,
+`internal/gateway/images_handler.go`) relays to a natively OpenAI-shaped image
+backend — `sd-server` from `leejet/stable-diffusion.cpp`, launched under the
+agent's existing `custom` runtime kind ([Agent-Managed Model Runtime
+§3.4](agent-runtime-manager.md#a-worked-sd-server-launch-under-custom)). Four
+things separate it from every other endpoint in §3.
+
+**1. There is NO translate path, and the capability gate is what makes that
+honest.** The gateway proxies image requests; it does not synthesize them. So
+unlike `/v1/responses` and `/v1/messages` — where `translate` is the safe
+fallback for a backend that cannot speak the native shape (§6) — an application
+that does not serve this shape must simply not be a candidate. The request
+therefore declares `RequiredCapabilities = ["image"]`, and `Resolver.Resolve`
+refuses a model that carries no `yes` verdict for it: 404
+`routing.model_not_capable` ([Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate)). The refusal
+needs no new gate of its own — the handler consumes the shared
+`inferencePreflight` like every other endpoint, and adds **no** second
+`admitPrincipal` call site (there is exactly one in the package, deliberately).
+Consequently
+`endpointModeFor` has **no case** for this flavor — there is no `images_mode`
+column to read — and `upstreamPath` answers `/v1/images/generations` directly,
+before the mode lookup and provider fallbacks that only chat, Responses and
+Messages need.
+
+**2. It validates its own shape and never calls
+`inference.Request.Validate()`.** That validator requires `len(Messages) > 0`,
+and an images request has no messages at all, so calling it would reject every
+one of them. `validateImagesRequest` requires a non-empty `prompt`
+(`images.prompt_required`) and a non-empty `model`
+(`images.model_required`, resolved by the same tolerant `sniffRoutingModel`
+probe the other native endpoints use — `sd-server` itself **ignores** the
+`model` field, since one process serves one model, so the value is purely the
+gateway's routing input). Every other field is the client's own business and
+reaches the upstream unexamined, with two exceptions — and both are type-checked
+rather than decoded straight into a Go string/bool, because a struct decode that
+discards its type error (which this validator does, deliberately, being as
+tolerant as `sniffRoutingModel` about everything it does not own) would leave a
+non-string `response_format` such as `["url"]` at its zero value and walk past
+the very check below.
+
+**3. `response_format` accepts only `b64_json` or an absent value; anything
+else is 400 `images.response_format_unsupported`.** The reason is what happens
+*after* the relay, not OpenAI conformance: `sd-server` cannot host a URL for
+output it generates in-process, and the billable-quantity counter is built
+against the `b64_json` key (§13, and [Telemetry, Usage Analytics &
+Observability §8.4.1](telemetry-usage-observability.md#841-the-usage-event)),
+so a `url`-format request could only ever relay a shape this path does not
+expect while billing every image in it as zero produced. Rejecting up front
+turns that into a 400 the client can act on instead of a usage row that quietly
+under-bills a response that streamed just fine.
+
+**The compatibility cost is real and is stated here rather than discovered.**
+`b64_json` is **not** OpenAI's default: the OpenAI Images API defaults
+`response_format` to `url` for `dall-e-2`/`dall-e-3`, and `gpt-image-1` does
+not accept the parameter at all. So a strict OpenAI client that explicitly
+sends the documented OpenAI default now receives a 400 rather than an image.
+That is the accepted trade — relaying a base64 body to a client that asked for
+URLs is a silent wire-contract violation, and a 400 is the only answer that is
+neither wrong nor silent — but a client-side `response_format` of `b64_json`
+(or its omission) is a **precondition** for using this endpoint, not a
+preference.
+
+**`stream` is the second exception, refused by the same argument: `stream: true`
+is 400 `images.stream_unsupported`.** The gateway has pinned this endpoint to
+the buffered path — `Stream` is `false` in the request `proxyNative` builds, with
+the deadline consequence spelled out below — so relaying the flag unexamined
+sends the upstream a `"stream": true` the gateway then ignores and hands the
+client a single `application/json` body where it asked for a stream. That is the
+same silent wire-contract violation the `response_format` rule exists to
+prevent, so it gets the same non-silent answer and its own code. `stream: false`
+and an absent `stream` describe what the endpoint already does and are accepted,
+which is what makes this a refusal of the *value* rather than of the field. The
+case is reachable rather than theoretical: OpenAI's `gpt-image-1` accepts
+`stream`/`partial_images`, so a real client has a reason to send it.
+
+**4. A non-2xx upstream response is normalised, and the classification is the
+gateway's own.** `sd-server` answers `{"error": "<plain string>"}`; OpenAI
+clients expect `{"error": {message, type, code}}`.
+`normalizeImagesUpstreamError` converts the first into the second with
+`type: "upstream_error"` and `code: "images.upstream_error"` — **ours, not the
+backend's**, because `sd-server` states neither and nothing downstream may read
+them as an upstream statement. Three branches, and the fall-through matters: a
+body that is *already* OpenAI-shaped passes through untouched (re-normalising
+would overwrite an attested type/code with a gateway-authored one), a
+plain-string body is converted, and a body matching **neither** shape is
+relayed byte-unchanged rather than guessed at. The two fixed values are
+deliberately independent of the upstream's HTTP status, since a plain string
+carries no more information than itself. This normalisation is gated strictly
+to this flavor: a non-2xx `/v1/responses` or `/v1/messages` passthrough body
+still reaches the client byte-for-byte as before. The error body is read
+bounded by `captureMaxBytes`, not by a wider cap.
+
+**Two consequences of the relay's shape, both load-bearing.**
+
+- **`Stream` is pinned `false` (and a client asking otherwise is refused up
+  front, above), so this endpoint always takes `proxyNative`'s
+  buffered-deadline branch — a *total* timeout, with no idle watchdog.** That
+  total is `target.Timeout`, i.e. the serving application's `timeout_ms`, a
+  value almost certainly tuned for chat. **An operator must raise it on an
+  image application**: a diffusion request producing several images at high
+  step counts can exceed a chat-shaped timeout while working perfectly, and
+  because there are no frames, `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` (§7) does
+  not apply and cannot rescue it. The pinning is correct for a single-JSON
+  backend — there is nothing to stream, and a buffered response gets no live
+  TTFT or tokens/sec row either (§6) — but it means the whole generation is
+  governed by one number, and that number is the application's.
+- **Resolving an image request writes the token's last-used-model marker.**
+  `relayImages` goes through the shared `resolveTarget`, so an image model can
+  become the redirect target of a **later chat request** on the same token
+  under `UnknownModelRedirect` ([Routing & Model Selection
+  §2.1](routing-and-model-selection.md#21-per-token-model-resolution)). That
+  chat request then answers 404 `routing.model_not_capable` — legible, but
+  surprising unless expected, and it is one more reason the models-list gap in
+  [ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
+  (d) is worth closing.
+
+**Session and affinity.** The endpoint has its own `sessionEndpoint` case and
+that case is deliberately empty: an OpenAI images request carries no
+`prompt_cache_key`, no `user` and no `metadata`, so there is no session signal
+to extract. Image requests also take **no** affinity pin at all, by an explicit
+write guard — see [Routing & Model Selection
+§4](routing-and-model-selection.md#4-route-affinity) for why the coarse
+affinity key makes that necessary.
+
+**Payload capture is clipped in practice on this endpoint.** A base64 image
+inflates its raw bytes by roughly a third, so a single modest PNG already
+occupies hundreds of KB and an `n > 1` response is a multiple of that —
+routinely past `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` (default 1 MiB), which stores
+the body truncated with its `truncated` flag set ([Security, Authentication &
+Authorization §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+The cap was **not** widened for this endpoint. The billable image count is
+unaffected, because it is scanned off the full byte stream rather than read
+back off the capped capture buffer — that independence is the whole reason the
+counter exists, and it is documented with the usage event
+([§8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
 ## 4. Session / continuity signals
 
@@ -292,6 +437,13 @@ eligibility and the pass-through decision:
 responsesServed = ("openai"    ∈ APIFlavors) && ResponsesMode != disabled
 messagesServed  = ("anthropic" ∈ APIFlavors) && MessagesMode  != disabled
 ```
+
+**There is deliberately no third line for images.** `/v1/images/generations` has
+no `EndpointMode` column and no `imagesServed` rule: what admits an application
+to it is a **capability verdict on the mapping**, not a mode on the
+application, so `endpointModeFor` has no case for that flavor and never sees
+one (§3.4). That is not "falls through and is treated as translate" — there is
+no translate path for images at all.
 
 So an endpoint can be off two independent ways: the coarse `openai`/`anthropic`
 flavor is unchecked, or the flavor stays checked and the mode is set to
@@ -459,7 +611,7 @@ watchdog timer is reset on every event the provider emits, so an arbitrarily
 long but continuously-producing stream never times out. `http.ResponseController`
 (`SetReadDeadline`/`SetWriteDeadline`) is used for two distinct purposes:
 `liftInferenceDeadlines` clears the connection's default 30s read/write
-deadline entirely for the four inference endpoints at request start (an
+deadline entirely for all five inference endpoints at request start (an
 uncapped multimodal upload can take longer than 30s to arrive), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
@@ -469,6 +621,13 @@ implementation applies a total deadline of its own** (`internal/provider/ollama.
 path) wraps `ctx` in `context.WithTimeout(target.Timeout)`; a stream's only
 cancellation source is the caller's idle watchdog or the client's own
 disconnect.
+
+`/v1/images/generations` sits entirely on the *other* side of that split: it
+pins `Stream` to `false`, so it always takes the buffered branch and is bounded
+by `target.Timeout` alone, with no idle watchdog at all. Because a diffusion
+request can legitimately occupy that whole budget without emitting anything,
+the application's `timeout_ms` is the only thing standing between a working
+long generation and a cancelled one — see §3.4.
 
 The control plane (every `/api/portal/*`, `/api/admin/*`, `/api/system/*`
 handler) keeps the server's default 30s `ReadTimeout`/`WriteTimeout` (60s
@@ -616,7 +775,7 @@ gateway model name, everything §1–§9 of this chapter routes around.
 
 | Scope | Reader | Cap |
 |---|---|---|
-| The four inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full |
+| The five inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
 This mirrors llama-swap's own behavior of proxying request bodies without a
@@ -626,8 +785,17 @@ content (chat transcripts) read uncapped too, with their own service-level cap
 
 ## 11. Multimodal images
 
-On the wire, an image is always a `ContentImage` `ContentPart` carrying either
-a `data:<mime>;base64,...` URI or a plain URL:
+**This section is about images as INPUT.** Image *generation* — a model that
+produces images, served at `/v1/images/generations` — is §3.4, and the two are
+orthogonal axes that must never be folded into one: the `vision` capability
+means a model **accepts** images, the `image` capability means it **generates**
+them, and a model can carry both, either or neither. Advertising a generator as
+a consumer (or the reverse) fails far from its cause, which is why the two
+capability names are kept distinct all the way down to the verdict rows
+([ADR-038](../09-architecture-decisions.md#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)).
+
+On the wire, an input image is always a `ContentImage` `ContentPart` carrying
+either a `data:<mime>;base64,...` URI or a plain URL:
 
 - **OpenAI Chat Completions** accepts `image_url` content blocks
   (`{"type":"image_url","image_url":{"url":...}}`); the same shape is what the
@@ -731,11 +899,29 @@ Every inference error response uses the gateway-wide envelope
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
-| `routing.no_model_route` / `routing.no_healthy_host` | 502 | no mapping / every candidate gated |
+| `images.model_required` / `images.prompt_required` | 400 | the images body failed `validateImagesRequest` (§3.4) |
+| `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url`, and any non-string value (§3.4) |
+| `images.stream_unsupported` | 400 | an images request asking for a streamed response (`stream: true`, or a non-boolean `stream`); this endpoint is pinned to the buffered path (§3.4) |
+| `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) |
+| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request |
+| `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
+| `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |
 | `provider.timeout` / `.invalid_response` / `.unavailable` | 502 | upstream call failed or returned something unparseable |
 | `provider.stream_idle_timeout` | mid-stream error frame | idle watchdog fired (§7) |
 | `provider.client_disconnected` | (no frame written) | client gone before/during the stream |
+
+**`routing.no_model_route` and `routing.no_healthy_host` were 502 until the
+capability gate landed**, because neither had a case in `completionHTTPStatus`
+and both fell through to the 502 default that genuine upstream failures use.
+Remapping them was folded into the change that added
+`routing.model_not_capable` rather than deferred: a refusal that is legible on
+the new branch and illegible on the two next to it is not legible at all. **The
+remap is global** — every endpoint in §3, prefixed aliases and streaming
+variants included — and it is the one externally visible behavior change, so a
+consumer whose retry policy distinguishes 502 (retryable) from 404 (terminal)
+now gets the correct reading of a fact that used to be misreported
+([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)).
 
 **Not every rejection becomes a usage event, and the line is `Resolve`.**
 `Server.recordUsage` is called only from the paths that have a resolved (or
@@ -748,10 +934,16 @@ attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
   and `server_override.forbidden`. Each writes its response and returns; no
   upstream is contacted and nothing reaches `recordUsage`.
 - **Recorded**, with `status:"error"` — everything from `Resolve` onward:
-  `routing.no_model_route` / `routing.no_healthy_host`, both
-  `routing.admission_queue_*` rejections, `responses.endpoint_disabled` /
-  `messages.endpoint_disabled` (only knowable after model resolution, and
-  recorded against the resolved target), and every `provider.*` outcome.
+  `routing.no_model_route` / `routing.no_healthy_host` /
+  `routing.model_not_capable`, both `routing.admission_queue_*` rejections,
+  `responses.endpoint_disabled` / `messages.endpoint_disabled` (only knowable
+  after model resolution, and recorded against the resolved target), and every
+  `provider.*` outcome. The images codes fall on both sides of the line, as the
+  rule predicts: the three `images.*` 400s are pre-`Resolve` body validation
+  and are **not** recorded, while `images.upstream_error` is post-`Resolve` and
+  **is** — carrying `billing_unit: "image"` with a zero quantity, because
+  nothing was produced
+  ([§8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
 So the honest answer to "is my 429'd request in Activity?" is *it depends which
 429*: a principal-limiter denial is not, a 503 from the capacity queue is.

@@ -146,6 +146,37 @@ func TestNativeCopierRunCapStopsTeeingOnceExceeded(t *testing.T) {
 	}
 }
 
+// TestNativeCopierImageCounterCountsAcrossCapAndChunkBoundary pins the two
+// properties imagesDataCounter's own doc comment (images_handler.go) argues
+// for at length: its count must be INDEPENDENT of capBytes (a base64 image
+// response routinely exceeds it) and must SURVIVE a "b64_json" key split
+// across a single upstream Read call's boundary. Both are exercised at once:
+// the cap is set far below where either marker appears, and the first
+// marker is deliberately split across the two scripted reads.
+//
+// Without this test, both properties could regress silently: moving
+// imgCounter.feed inside the respBuf cap guard, or dropping the carry
+// between feed calls, leaves every OTHER test in this package green (proven
+// below by reproducing exactly those two mutations and confirming THIS test
+// -- and no other -- catches each).
+func TestNativeCopierImageCounterCountsAcrossCapAndChunkBoundary(t *testing.T) {
+	w := &fakeFlushWriter{}
+	c := newNativeCopier(w, 4) // tiny cap: respBuf stops teeing after chunk 1
+	c.imgCounter = &imagesDataCounter{}
+	body := &scriptedReader{reads: []scriptedRead{
+		{chunk: []byte(`{"data":[{"b64_`), err: nil},                     // marker #1 split HERE; already past capBytes=4
+		{chunk: []byte(`json":"AAAA"},{"b64_json":"BBBB"}]}`), err: nil}, // completes #1, carries #2 whole
+		{chunk: nil, err: io.EOF},
+	}}
+
+	if err := c.run(body); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	if got := c.imgCounter.total(); got != 2 {
+		t.Fatalf("imgCounter.total() = %d, want 2 (independent of capBytes=%d and the marker split across the read boundary; respBuf itself only ever holds %q, which contains no complete key at all)", got, c.capBytes, c.respBuf.String())
+	}
+}
+
 // TestNativeCopierRunWriteErrorTakesPrecedenceOverReadError proves that when a
 // single Read call returns BOTH data and a non-EOF error, and writing that data
 // to the client fails, run() returns the WRITE error — the read error is never
@@ -641,6 +672,118 @@ func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
 				t.Fatalf("endpointModeFor(%q) = (%q, %q), want (%q, %q)", tc.apiFlavor, path, mode, tc.wantPath, tc.wantMode)
 			}
 		})
+	}
+}
+
+// TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks proves
+// upstreamPath's apiFlavorImages branch fires BEFORE both the endpointModeFor
+// lookup (which has no case for images and would answer ("", "")) and the
+// provider fallbacks below it. target.Provider is deliberately ProviderOllama
+// -- the provider whose OWN fallback ("/api/chat") would otherwise answer here
+// -- so this only passes if the images branch itself ran: removing it would
+// make this test observe "/api/chat", not "/v1/images/generations". This is a
+// direct unit test of upstreamPath because no HTTP-level test in this package
+// exercises the SUCCESS path far enough to reach it (a refused images request
+// never gets a resolved target at all, see images_handler_test.go).
+func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) {
+	target := routing.Target{Provider: routing.ProviderOllama}
+
+	got := upstreamPath(target, apiFlavorImages)
+
+	if got != "/v1/images/generations" {
+		t.Fatalf("upstreamPath(images) = %q, want /v1/images/generations", got)
+	}
+}
+
+// plainTextErrorProxyProvider returns a non-2xx upstream response with a
+// Content-Type that is NOT application/json, and a body that must reach the
+// client byte-for-byte. It exists for
+// TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim /
+// TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim below, which pin
+// the OTHER side of images_handler.go's error-normalisation branch in
+// proxyNative (native_passthrough.go): that branch is gated on
+// pfReq.APIFlavor == apiFlavorImages specifically so that responses/messages
+// passthrough keeps relaying a non-2xx body untouched. Every existing
+// non-2xx fake (rejectingProxyProvider in passthrough_timings_rejection_test.go
+// included) is only ever asserted against by status/log/call-count, never
+// rec.Body, so nothing previously would have caught that gate being widened
+// or removed.
+type plainTextErrorProxyProvider struct {
+	status      int
+	contentType string
+	body        string
+}
+
+func (plainTextErrorProxyProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (plainTextErrorProxyProvider) CompleteStream(context.Context, routing.Target, inference.Request, provider.StreamEmit) error {
+	return nil
+}
+
+func (p plainTextErrorProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+	return &provider.ProxyResponse{
+		StatusCode: p.status,
+		Header:     http.Header{"Content-Type": []string{p.contentType}},
+		Body:       io.NopCloser(strings.NewReader(p.body)),
+	}, nil
+}
+
+// TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim guards
+// images_handler.go's error-normalisation branch (wired into proxyNative in
+// native_passthrough.go) from ever being widened past apiFlavorImages by
+// accident: a /v1/responses non-2xx passthrough must keep reaching the client
+// with the upstream's own body AND the upstream's own Content-Type, neither
+// rewritten to the OpenAI object shape nor overwritten as JSON. See
+// TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks above for the
+// sibling guard on upstreamPath's own images branch.
+func TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim(t *testing.T) {
+	const upstreamBody = `{"error":"nope"}`
+	const upstreamContentType = "text/plain; charset=utf-8"
+	prov := plainTextErrorProxyProvider{status: http.StatusInternalServerError, contentType: upstreamContentType, body: upstreamBody}
+	srv := newNativeProxyTestServer(prov, true, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status, unchanged); body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("client body = %q, want the upstream body byte-for-byte unchanged: %q", rec.Body.String(), upstreamBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != upstreamContentType {
+		t.Fatalf("content-type = %q, want the upstream's own %q preserved, not overwritten as JSON", ct, upstreamContentType)
+	}
+}
+
+// TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim is the /v1/messages
+// twin of TestResponsesNonJSONNativePassthroughErrorRelayedVerbatim above --
+// cheap to add given newNativeProxyTestServer's existing (nativeResponses,
+// nativeMessages) bool pair, so both flavors the images branch must not touch
+// are covered rather than just one.
+func TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim(t *testing.T) {
+	const upstreamBody = `{"error":"nope"}`
+	const upstreamContentType = "text/plain; charset=utf-8"
+	prov := plainTextErrorProxyProvider{status: http.StatusInternalServerError, contentType: upstreamContentType, body: upstreamBody}
+	srv := newNativeProxyTestServer(prov, false, true)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status, unchanged); body = %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("client body = %q, want the upstream body byte-for-byte unchanged: %q", rec.Body.String(), upstreamBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != upstreamContentType {
+		t.Fatalf("content-type = %q, want the upstream's own %q preserved, not overwritten as JSON", ct, upstreamContentType)
 	}
 }
 

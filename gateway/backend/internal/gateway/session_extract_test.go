@@ -93,6 +93,21 @@ func TestExtractClientSession(t *testing.T) {
 			h:      hdr("X-OP-AI-Gateway-Session-ID", strings.Repeat("b", 250)),
 			wantID: strings.Repeat("b", 200), wantSource: "header", wantExpl: strings.Repeat("b", 200),
 		},
+		{
+			// images has no per-endpoint header case and no body-fallback case with
+			// any actual field read -- both are explicit, empty cases (see
+			// endpointImages in extractClientSession's header switch and in
+			// sessionFromBody). This body carries every OTHER endpoint's signal at
+			// once (codex's prompt_cache_key, chat's user, anthropic's
+			// metadata.user_id) plus both per-endpoint headers, so a regression that
+			// let endpointImages fall into another endpoint's case (or hit a
+			// default) would read one of them; wantID/wantSource stay empty only if
+			// the explicit "no signal" case actually fires.
+			name: "images: every other endpoint's signal present -> still empty", endpoint: endpointImages,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
