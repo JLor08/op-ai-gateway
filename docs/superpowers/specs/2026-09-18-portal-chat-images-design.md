@@ -202,15 +202,49 @@ writes the enabling verdict, not the refusing one.
   validation, or its billing — #71 settled those.
 - Streaming or partial images.
 
-## 5. Open questions
+## 5. Decided: an image model makes the thread image-only
 
-None blocking. Two the plan should decide explicitly:
+A model whose `image` verdict is `yes` sends every turn to
+`/v1/images/generations`. There is no branch in which the portal sends a chat
+completion to such a model.
 
-1. Whether a run whose model has `image = yes` should still be able to send a
-   plain text turn, or whether an image model is image-only for the thread.
-   Leaning: the model decides the shape, so image-only — but the thread's
-   model can be changed between turns, so a mixed thread is reachable either
-   way and the history must render both.
-2. What the composer shows while an unstreamed image is generating. There are
-   no deltas to animate, and image generation is slow enough that the existing
-   pending state may read as a hang.
+This follows from §3.1 — the model is the affordance — and it is the reason
+that principle is worth anything: one axis, so the composer can never offer
+something the gate will refuse.
+
+Three consequences the implementation must carry:
+
+- **The attach button stays vision-gated, and that gate is a different
+  capability.** It is disabled unless `c.modelVisionCapable`
+  (`Chat.tsx:391`), and `image` is not `vision`. So in an image-only thread the
+  attach button is disabled unless the same mapping also declares vision. That
+  is correct — an image *generator* has no reason to accept an image *input* —
+  but it must be deliberate rather than incidental, because the two capability
+  names are one word apart — and the existing UI already blurs them: the attach
+  button's disabled tooltip uses the i18n key `chatImageModelUnsupported`
+  (`Chat.tsx:384`), which today means "this model cannot accept an image as
+  *input*". Its text is worse than its name: `'Dieses Modell unterstützt keine
+  Bilder.'` / `'This model does not support images.'` (`i18n.ts:191`, `:2539`).
+  On an image-generating model without vision, the portal would say that model
+  does not support images — about a model whose entire job is images. The
+  string has to say what it actually gates (image *input*), not "images".
+- **History still renders both shapes.** The thread's model can change between
+  turns, so a thread containing text turns and image turns is reachable and
+  normal. Image-only constrains what the composer *offers now*, not what the
+  transcript *contains*.
+- **A hypothetically multimodal mapping loses its text path in the portal.**
+  If one mapping ever declared `image = yes` while also serving chat, this rule
+  makes it image-only there. Accepted for v1: the capability table is per
+  mapping, and today an `image = yes` mapping is an sd-server process, which
+  serves one model and does not do chat at all. Revisit when a mapping that is
+  genuinely both exists — not before, because the alternative is the toggle
+  §3.1 rejects.
+
+## 6. Open questions
+
+What the composer shows while an unstreamed image is generating — see §3.2:
+there are zero incremental events between Send and the finished image, and
+generation on sd_cpp takes tens of seconds to minutes, so the existing pending
+state is both unusable and misleading. The existing text pending state is a
+live character counter (`ChatMessage.tsx:82-83`), which would read `0 Zeichen`
+for the entire wait.
