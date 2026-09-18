@@ -194,6 +194,77 @@ screen can change the verdict.
 `(image, no)` stays reserved (`service_applications.go:278-294`); the UI
 writes the enabling verdict, not the refusing one.
 
+### 3.6 The composer: lead with the number that is exact
+
+A design panel of four independent designs plus a completeness critic produced
+one finding that inverts the obvious approach. All four designs spent their
+effort on the one quantity **nobody can bound** — progress — and all four
+withheld the one that is **exact and known before the user commits**: the
+remaining transcript budget.
+
+So the composer leads with capacity, not with a clock.
+
+**Before Send.** The prompt field's label becomes "Bildprompt" — the only
+affordance signal, and a true statement about what the field now does. Beside
+it, a capacity line: the room left in this chat, computed from the current
+`buildDoc()` size against the 4 MiB `maxChatContentBytes` constant. Both
+numbers are client-side and exact; the cap is checked pre-gzip
+(`service_chats.go:208`), so base64 pays full price and the arithmetic is
+honest without modelling compression.
+
+When the budget cannot hold another image, **Send refuses up front**. This is
+the repo's own rule applied one layer up: `validateImagesRequest` 400s a
+`response_format` it cannot honor rather than relaying and mis-measuring, and
+the same logic forbids spending minutes of sd_cpp CPU on an artifact we can
+already prove we cannot store. Every panel design surfaced the cap only
+*afterwards* — toasts, chips, download rescues — which is four recovery
+mechanisms for a failure that can simply be declined.
+
+**During generation.** Three elements, each backed by a value that exists:
+
+- A liveness dot, from the run's server-reported `running` status — the same
+  claim the sidebar's existing indicator already makes, and no more.
+- An elapsed clock from the run's server-reported age, labelled as the
+  **wait**, not the work: "Warte auf Bild · 1:47". Not "Bild wird erzeugt":
+  between dispatch and terminal the request may still be queued for admission
+  or waiting on a model load, during which "is being generated" is false.
+  "Warte auf Bild" is true for the whole span and makes the clock's referent
+  unambiguous. The clock is `aria-hidden`, because the transcript box is
+  `aria-live="polite"` (`Chat.tsx:266-269`) and a once-per-second announcement
+  would make the thread unusable with a screen reader.
+- One static sentence stating the structural truth: there are no intermediate
+  messages; the image arrives finished or not at all.
+
+**The character counter is absent, not zero.** That distinction is not
+invented here — it is the same one `proxyNative` already makes one layer down,
+where a buffered relay gets `progress = nil` rather than `&requestProgress{}`
+precisely because "measured 0" asserts something different from "nothing to
+measure". Rendering `0 Zeichen` for a three-minute wait would be the exact
+class of silently-wrong measurement this codebase rejects everywhere else.
+
+**A bound, because one exists.** `reserveRun` creates the run's context itself
+with `context.WithCancel` (`chat_runs.go:436-444`). Making that a
+`context.WithTimeout` gives the run a deadline it owns outright — no plumbing
+through `proxyNative`, and self-consistent because the deadline is what ends
+the run. "This finishes or fails within N minutes" then becomes a
+configuration value rather than an estimate, and it is the one thing that
+turns an open-ended wait into a bounded one. Without it the most likely real
+failure is a user cancelling a run that would have succeeded.
+
+**Cancel says what it discards.** For a buffered relay there is no partial
+result: at the moment of cancel nothing has been received, so Stop loses the
+entire generation and the upstream may keep burning CPU regardless. That is
+not true of the text path, where the received deltas are kept, so the image
+path must say it rather than inherit the text path's silence.
+
+**Every terminal state gets a distinguishable ending.** Today all three end
+the same way — silently — because `finishRun` prunes an assistant bubble it
+considers empty, and a zero-event turn is *always* empty until the terminal
+moment. So cancel, an interrupted run, and a failed commit all currently
+leave the user's prompt sitting alone with no trace a run happened. See
+§7.1: this is not polish, it is the same defect that deletes a successful
+image.
+
 ## 4. Out of scope
 
 - Lifting or working around the 4 MiB transcript cap (issue #124).
@@ -240,11 +311,127 @@ Three consequences the implementation must carry:
   genuinely both exists — not before, because the alternative is the toggle
   §3.1 rejects.
 
-## 6. Open questions
+## 6. Decided: the kind is pinned to the thread at first send
 
-What the composer shows while an unstreamed image is generating — see §3.2:
-there are zero incremental events between Send and the finished image, and
-generation on sd_cpp takes tens of seconds to minutes, so the existing pending
-state is both unusable and misleading. The existing text pending state is a
-live character counter (`ChatMessage.tsx:82-83`), which would read `0 Zeichen`
-for the entire wait.
+§5 says an image model makes the thread image-only. As written that is a
+property of the **thread**; implemented naively it is a property of the
+**currently-picked model**, which the user can change between every turn. The
+gap is not cosmetic, and it is worse in the direction nobody expects:
+
+- Switching an image thread to a **text** model hits §7.2's role-blind
+  `historyHasImage` guard and is refused. Accidentally correct, and
+  unexplained.
+- Switching an image thread to a **vision** model *lifts* that guard — and the
+  entire multi-megabyte image history is then POSTed to
+  `/v1/chat/completions` as vision input. A real cost and privacy surprise, on
+  a thread the rule called image-only.
+
+So the kind is **pinned to the thread on its first send** and persisted.
+
+`chatDoc` already carries `Settings json.RawMessage` beside `Messages`
+(`service_chats.go:316-318`), typed as `ChatRunSettings` (`:280-301`), inside
+the same sealed blob. The pin is a new field there — a `kind` string rather
+than an `image_only` boolean, because a string is the same value that selects
+the request URL (§3.2) and extends to a future audio or speech kind without a
+second flag. It carries `omitempty`, so every existing chat stays
+byte-identical on the wire and an absent kind reads as text.
+
+Once pinned, the model picker filters to models of that kind. The thread's
+kind, not the picker's current value, decides what the composer offers.
+
+**The pin is a UI constraint, not an authorization.** `PrepareChatRun` already
+establishes the pattern for a persisted setting that must not be trusted from
+storage: `ServerOverride` is re-validated against the owner's permissions on
+every single run (`:390-392`, and see the doc at `:372-389` — "trusts nothing
+it reads from storage"). The pinned kind gets the same treatment. A thread
+pinned to `image` whose model later loses its `image` verdict — the operator
+revoked it, the mapping changed — must fail the capability gate exactly as it
+would unpinned. The pin decides what the composer offers; the gate decides
+what the gateway serves, and it stays the only authority.
+
+## 7. Pre-existing defects this feature walks into
+
+Found by the design panel, each verified by reading the code rather than taken
+on report. None of them are caused by this feature; all of them are reachable
+*because* of it, and several are silent data loss. They are in scope.
+
+### 7.1 The happy path deletes the image
+
+`useChatRuns.ts:177-178`:
+
+```ts
+const empty =
+  (typeof last.content === 'string' ? last.content.length === 0 : true) && !last.reasoning;
+if (empty) return prev.slice(0, -1);
+```
+
+Any **non-string** content counts as empty, and the bubble is then sliced off.
+An image written as an array of content parts is therefore deleted after a
+successful generation *and* a successful persist — it survives only via the
+best-effort canonical refetch (`:196-204`, whose own comment says a failed
+refetch leaves the buffer as-is). The fix is on the content-shape axis; a
+status-based narrowing does not work, because `completed` is exactly the
+status an arriving image carries.
+
+### 7.2 Edit and Regenerate die from the second image turn on
+
+`ChatStore.tsx:720` guards on `!modelVisionCapableRef.current &&
+historyHasImage(history)`, and `historyHasImage` (`chatDoc.ts:273-277`) is
+role-blind — it matches the assistant's own generated images. An image
+generator is not vision-capable, so from the second turn onward editing or
+regenerating is refused, with the message from §5: "Dieses Modell unterstützt
+keine Bilder", on a model whose only purpose is images.
+
+### 7.3 `PUT /chats/{id}` has no live-run guard, and `DELETE` has one
+
+`portal_chat_endpoints.go:104-119` goes straight to `SaveChat`.
+`:120-123` — the very next case in the same switch — calls
+`s.ChatRuns.cancelChat(...)` under the comment "tear down an active run before
+deleting". The save path never asks the registry. `flushSave` skips only
+`if (isRunning(id)) return` (`useChatPersistence.ts:164`), and `runsRef` is
+**per-tab** with no cross-tab signal, so a second already-open view never
+learns a run started and can PUT its stale document over the transcript
+mid-run. The exposure window is the run duration, which this feature
+multiplies by roughly fifty, and what it clobbers is a just-committed image.
+
+### 7.4 No chat error code is mapped
+
+`errorLabelByCode` (`shared/format.ts`) contains no chat-related code at all —
+checked across the whole file, not a prefix. The backend can return three:
+`portal.chat_too_large` (`error_map.go:45`), `portal.chat_run_active` and
+`portal.chat_run_limit` (`chat_run_endpoints.go:49-50`, with `maxPerUser`
+defaulting to 5). All three toast raw English today. The run-contention pair
+becomes ordinary rather than exotic precisely because this feature's answer to
+a multi-minute wait is "go work in another chat".
+
+### 7.5 The download rescue cannot download an image
+
+`shared/download.ts` exports only `downloadText(filename, content, mime)`,
+which wraps a **string** in a Blob — its own doc comment says it was written
+for PEM/text. Handing it a data URL saves a text file containing the data URL.
+A binary path is needed, plus a real extension.
+
+### 7.6 The generated image is misnamed and cropped
+
+`ChatMessage.tsx:361-366` hardcodes `alt={t.chatAttachedImage}`
+("Angehängtes Bild") and renders at `72×72` with `objectFit: 'cover'`.
+Correct for an upload thumbnail, wrong for the artifact the user asked for: a
+false accessible name and a cropped stamp. The right alt text is one message
+above — the prompt.
+
+### 7.7 Two real upstream signals go unused
+
+The response body carries `output_format` at the top level and may carry a
+per-item `revised_prompt`. The MIME prefix and the download extension must
+come from `output_format`; hardcoding `image/png` would be a fabricated
+measurement of the same class as the `0 Zeichen` counter. `revised_prompt` is
+the only substantive news this endpoint ever reports about a generation.
+
+### 7.8 `data[]` is plural by design
+
+`imagesDataCounter`'s own doc comment (`images_handler.go:537-539`): "The
+quantity comes from the RESPONSE, not the request: n states what was asked
+for, data[] states what was produced, and a partial failure makes those
+differ." So the backend already bills plural, a plural response is a real
+case, and the UI must render and offer download per item and size the
+capacity arithmetic on the sum.
