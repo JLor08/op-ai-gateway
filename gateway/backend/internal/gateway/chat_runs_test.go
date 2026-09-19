@@ -828,10 +828,13 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 // "canceled" with an empty message too.
 //
 // It was written against consumeRunStream's scanner error, where the same
-// branch exists. It cannot be: only an image run is bounded, and an image run
-// never enters consumeRunStream -- so the equivalent branch there is, as of
-// this task, unreachable, and pointing this test at it would be pinning
-// nothing. The upstream below sends the first body chunk (which the gateway's
+// branch exists. It cannot be: that branch is currently UNREACHABLE -- only
+// the image kind is bounded and an image run never enters consumeRunStream --
+// so pointing this test at it would be pinning nothing. The branch is kept
+// and annotated where it lives (chat_runs.go, the DeadlineExceeded case), for
+// the day the text kind is bounded; its lack of a test is a consequence of
+// that unreachability rather than a gap, and one cannot be written without
+// first making it reachable. The upstream below sends the first body chunk (which the gateway's
 // copier flushes straight through, so the run's Do returns) and then stalls,
 // putting the run mid-response when the deadline fires.
 func TestRunDeadlineMidResponseIsNotACancelEither(t *testing.T) {

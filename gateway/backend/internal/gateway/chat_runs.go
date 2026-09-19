@@ -802,6 +802,24 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			// The other half of the same conflation: once the upstream has
 			// answered 200 the deadline lands here, as a read error on a
 			// cancelled request, rather than on the Do above.
+			//
+			// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image
+			// kind is bounded (runDeadlineFor) and an image run never enters
+			// consumeRunStream -- it has no stream to consume -- while the
+			// reservation's context is a plain WithCancel over
+			// context.Background(), so no deadline reaches a text run from
+			// the HTTP request either. Bounding the text kind, or adding a
+			// future streaming kind that is bounded, makes this live again,
+			// and on that day the conflation it exists to prevent would
+			// otherwise return silently: a user who pressed nothing, told
+			// they pressed Stop.
+			//
+			// It therefore has NO test, and that is a consequence of the
+			// unreachability rather than a gap -- one cannot be written
+			// without first making the branch reachable. So: do not delete
+			// this as dead weight, and do not "fix" the missing coverage. The
+			// live equivalent is the body-read branch in chat_runs_images.go,
+			// pinned by TestRunDeadlineMidResponseIsNotACancelEither.
 			status, errMsg = "error", runTimedOutMessage
 		case ctx.Err() != nil:
 			status, errMsg = "canceled", ""
