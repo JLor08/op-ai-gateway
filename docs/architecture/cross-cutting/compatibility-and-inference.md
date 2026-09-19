@@ -938,6 +938,22 @@ runs on a context stripped of cancellation (`context.WithoutCancel`), because
 it is reached with the run's *own* context: without that, the very timeout that
 ended the run would cancel the write recording why it ended.
 
+**That stripped context carries a fresh bound of its own, and it is the one
+deadline that applies to a TEXT run too.** `run.finish` and
+`chatRunRegistry.retire` both sit *below* the commit, so an unbounded commit
+that never returns leaves the run `running` with nothing to evict it, Stop
+unable to reach it (the cancel does not reach a context stripped of
+cancellation), and — with `PUT /api/portal/chats/{id}` refused during a run
+(below) — the chat unsaveable and unrenameable until a restart. So the commit
+context is `context.WithTimeout(context.WithoutCancel(ctx),
+chatRunCommitTimeout)`: stripped first, so the run's expired deadline still
+cannot reach it, then bounded independently at 30 s — two orders of magnitude
+above a legitimate 4 MiB gzip+seal+`UPDATE`, 20x below `imageRunDeadline`, and
+equal to `runEvictionDelay`. Unlike the run deadline above, this one is not
+kind-specific: the terminal step is the single thing both halves of the
+executor share, and a kilobyte text commit that has not returned in 30 s is
+already pathological ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+
 **A failed terminal commit ends the run as an ERROR.** It used to be logged
 while the run reported success — leaving the trailing assistant message stuck
 at `pending`, which a later restart reads as a false `interrupted`, and telling

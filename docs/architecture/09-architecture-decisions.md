@@ -1838,12 +1838,28 @@ because both are silent and both would return under a refactor.**
    system telling someone who pressed nothing that they pressed it. A timeout
    carries its own terminal code on both branches it can land on: before the
    upstream answers, and mid-response once it has.
-2. **The terminal commit must not inherit the deadline that ended the run.**
-   The terminal step is called with the run's own context on every failing
-   path, so once that context carries a deadline the `CommitAssistant` inside it
-   is cancelled by the very timeout that ended the run — losing the turn
-   instead of recording why it ended. The commit runs on a context stripped of
-   cancellation.
+2. **The terminal commit must not inherit the deadline that ended the run —
+   and must not therefore be unbounded.** The terminal step is called with the
+   run's own context on every failing path, so once that context carries a
+   deadline the `CommitAssistant` inside it is cancelled by the very timeout
+   that ended the run — losing the turn instead of recording why it ended. The
+   commit therefore runs on a context stripped of cancellation. Stripping
+   alone, though, buys the opposite failure: `run.finish` and
+   `chatRunRegistry.retire` both sit *below* the commit, so a store write that
+   never returns leaves the run `running` with nothing to evict it and Stop
+   unable to reach it — and, with `PUT /api/portal/chats/{id}` now refused
+   while a run is active ([API Compatibility & Inference
+   §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground)),
+   the chat unsaveable and unrenameable until a restart. So the context is
+   **stripped and then given a fresh bound of its own**,
+   `context.WithTimeout(context.WithoutCancel(ctx), chatRunCommitTimeout)`:
+   the run's expired deadline still cannot reach the commit, while a hang
+   becomes terminal instead of permanent. 30 s — two orders of magnitude above
+   a legitimate 4 MiB sealed write, 20x below `imageRunDeadline`, equal to
+   `runEvictionDelay`. It bounds **text** runs too, because the terminal step
+   is the one thing both kinds share; that is intended rather than incidental,
+   since a kilobyte text commit that has not returned in 30 s is already
+   pathological ([§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
 
 **Rejected: reusing the streaming executor for the image kind.** It opens a
 scanner over a delta stream, drives the periodic checkpoint goroutine and

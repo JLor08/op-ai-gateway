@@ -579,8 +579,44 @@ const runTimedOutMessage = "gateway.chat_run_timeout"
 
 // chatRunCommitFailedMessage is finishRunWithParts' terminal code for a commit
 // failure it cannot name more specifically than "the store write failed" --
-// see commitFailureCode, which is the only place that returns it.
+// see commitFailureCode, which is the only place that returns it. A commit
+// that exceeds chatRunCommitTimeout below is one such failure.
 const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
+
+// chatRunCommitTimeout bounds the TERMINAL COMMIT -- and only it. Its context
+// is built fresh (see finishRunWithParts) rather than inherited, so this bound
+// is independent of the run's own deadline; that is what keeps
+// context.WithoutCancel doing the single job it is there for (an expired run
+// deadline must not cancel the write that records why the run ended) while
+// still making a store write that never returns terminal rather than
+// permanent. Without a bound, run.finish and chatRunRegistry.retire -- both
+// after the commit -- are never reached, so the run stays `running` forever:
+// the spinner never stops, Stop answers OK and does nothing (the cancel
+// cannot reach a context stripped of cancellation), and sending, saving and
+// renaming that chat are 409 until the gateway restarts.
+//
+// THE BOUND APPLIES TO TEXT RUNS TOO. finishRunWithParts is the one terminal
+// step both kinds share, and that is deliberate: a text commit is kilobytes
+// and a text commit that has not returned in 30 s is already pathological, so
+// there is nothing legitimate for the bound to cut short.
+//
+// Why 30 s. The write it must never interrupt is the largest one the store
+// accepts: a whole chat document at portal.MaxChatContentBytes (4 MiB), gzipped
+// and sealed, as one UPDATE. Compressing and sealing 4 MiB is tens of
+// milliseconds; the round trip for a few MiB to PostgreSQL over a local socket
+// or a LAN is well under a second even with fsync on a busy WAL -- so 30 s is
+// roughly two orders of magnitude of headroom over the legitimate worst case
+// and cannot plausibly fire for a write that is merely slow. In the other
+// direction it is 20x shorter than the image run's own 10-minute deadline
+// (imageRunDeadline) and equal to runEvictionDelay, the grace a terminal run
+// already spends in the registry -- so a wedged commit resolves inside a
+// window the product already asks a user to wait, rather than the unbounded
+// one that needs a restart.
+//
+// A package-level var, not a const, for the same reason runCheckpointInterval
+// and imageRunDeadline are: a test that proves a blocked store still reaches a
+// terminal state has to shrink it.
+var chatRunCommitTimeout = 30 * time.Second
 
 // commitFailureIsChatGone reports whether a failed CommitAssistant's error
 // means the chat itself no longer exists, rather than that the write to an
@@ -988,7 +1024,17 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// call site), so on a timeout the ctx is ALREADY expired and the commit
 	// below would be cancelled before it wrote -- losing the turn instead of
 	// recording why it ended. Same idiom as benchmark_vram_runner.go:236.
-	commitCtx := context.WithoutCancel(ctx)
+	//
+	// It must not, however, be UNBOUNDED: everything that makes this run
+	// terminal (run.finish, retire) is below the commit, so a store write
+	// that never returns strands the run -- and, since this branch refuses
+	// PUT /chats/{id} while a run is active, the whole chat with it. The
+	// bound is therefore FRESH rather than inherited: WithoutCancel first
+	// (the run's own expired deadline still cannot reach the commit), then a
+	// new deadline of our own on top. See chatRunCommitTimeout for the value
+	// and for why it covers text runs as well.
+	commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), chatRunCommitTimeout)
+	defer cancelCommit()
 	reasoning, content := run.buffered()
 	m := run.currentMetrics()
 	persistStatus := map[string]string{"completed": "complete", "error": "error", "canceled": "canceled"}[status]

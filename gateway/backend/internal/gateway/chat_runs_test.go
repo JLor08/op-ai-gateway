@@ -20,6 +20,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -240,6 +241,15 @@ func newRunTestServer(t *testing.T) (*Server, auth.Token, string) {
 // provider so tests can pace the deltas (e.g. to span checkpoint ticks).
 func newRunTestServerWithProvider(t *testing.T, prov provider.Client) (*Server, auth.Token, string) {
 	t.Helper()
+	return newRunTestServerWithChats(t, prov, nil)
+}
+
+// newRunTestServerWithChats is newRunTestServerWithProvider with an injectable
+// chat STORE as well, so a test can make a store write misbehave (block, fail)
+// underneath the real portal.Service rather than replacing the service with a
+// stub. A nil chats uses the ordinary in-memory store.
+func newRunTestServerWithChats(t *testing.T, prov provider.Client, chats portal.ChatStore) (*Server, auth.Token, string) {
+	t.Helper()
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
 		t.Fatalf("capture.New: %v", err)
@@ -262,10 +272,13 @@ func newRunTestServerWithProvider(t *testing.T, prov provider.Client) (*Server, 
 	recorder := usage.NewRecorder()
 	routeStore := routing.NewMemoryStore()
 	seedGatewayTestRoutes(routeStore, now)
+	if chats == nil {
+		chats = store.NewMemoryChatStore(0)
+	}
 	svc := portal.NewService(portal.ServiceDeps{
 		Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore,
 		Clock: func() time.Time { return now }, ModelLister: provider.NewMock(),
-		Chats: store.NewMemoryChatStore(0), Cipher: cipher,
+		Chats: chats, Cipher: cipher,
 	})
 	srv := New(ServerDeps{
 		Tokens:             tokens,
@@ -1289,5 +1302,83 @@ func TestExecuteRunFallsBackToTheStatusLineForANonEnvelopeBody(t *testing.T) {
 
 	if got := runError(t, run); got != "upstream status 502 Bad Gateway" {
 		t.Fatalf("error = %q, want %q (fallback to the status line)", got, "upstream status 502 Bad Gateway")
+	}
+}
+
+// wedgedChatStore is a real chat store whose UpdateChat never returns on its
+// own: once armed it waits for its context and nothing else. That is the one
+// failure mode the terminal commit had no answer to -- a driver that accepts
+// the write and then hangs (a lost connection with no keepalive, a lock it
+// never gets) rather than one that errors.
+//
+// It blocks in UpdateChat, not ChatByID, so only the WRITE half is affected:
+// reads keep working, which is what makes the run's own path up to the commit
+// realistic.
+type wedgedChatStore struct {
+	portal.ChatStore
+	armed   atomic.Bool
+	blocked atomic.Int64
+}
+
+func (s *wedgedChatStore) UpdateChat(ctx context.Context, chat store.Chat) error {
+	if s.armed.Load() {
+		s.blocked.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return s.ChatStore.UpdateChat(ctx, chat)
+}
+
+// A terminal commit that never returns used to strand the run FOREVER:
+// run.finish and chatRunRegistry.retire are both below the commit, and the
+// context it runs on is stripped of cancellation, so Stop could not reach it
+// either. The run stayed "running", its per-chat slot stayed held, and (since
+// this branch refuses PUT /chats/{id} while a run is active) the chat could
+// not be sent to, saved or renamed until the gateway restarted.
+//
+// chatRunCommitTimeout makes that terminal instead of permanent. The
+// assertions below are the three things the wedge took away: the run reaches
+// a terminal status at all, it says WHY (the mapped commit-failure code, not
+// a silent success), and its chat slot is released so the chat is usable
+// again.
+func TestTerminalCommitThatHangsStillEndsTheRun(t *testing.T) {
+	restore := chatRunCommitTimeout
+	chatRunCommitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { chatRunCommitTimeout = restore })
+
+	chats := &wedgedChatStore{ChatStore: store.NewMemoryChatStore(0)}
+	srv, owner, chatID := newRunTestServerWithChats(t, provider.Mock{}, chats)
+	// Armed only AFTER the seeded chat exists, so creation is unaffected and
+	// the only write left in this run is the terminal commit itself (the
+	// periodic checkpoint fires on runCheckpointInterval, which this run is
+	// far too short to reach).
+	chats.armed.Store(true)
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error: a commit that never returned is not a success", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != chatRunCommitFailedMessage {
+		t.Fatalf("error = %q, want %q", snap.Err, chatRunCommitFailedMessage)
+	}
+	if n := chats.blocked.Load(); n != 1 {
+		t.Fatalf("blocked store writes = %d, want exactly 1 (the terminal commit)", n)
+	}
+	// The single-active slot for this chat is what a stranded run held, and
+	// holding it is what made the chat unsendable, unsaveable and
+	// unrenameable. retire() runs below the commit, so this is only reachable
+	// because the commit returned.
+	if held := srv.ChatRuns.Get(owner.UserID, chatID); held != nil {
+		t.Fatal("the chat's single-active slot is still held: the chat stays 409 for send/save/rename")
 	}
 }
