@@ -996,6 +996,13 @@ type ModelDTO struct {
 	// model/group is advertised as vision-capable only when it can be trusted to
 	// accept image inputs no matter which offering server serves the request.
 	Vision bool `json:"vision"`
+	// Image is true only when EVERY offering mapping (or, for a group, every
+	// offerable member) has an "image" capability row whose verdict is yes
+	// (AND aggregation, fail-closed), exactly like Vision. It is INDEPENDENT
+	// of Vision: Image means the model GENERATES images, Vision means it
+	// ACCEPTS them, and routing.CapabilityImage's doc comment is explicit that
+	// mapping one onto the other "fails far from its cause".
+	Image bool `json:"image"`
 }
 
 type ServerOwnerDTO struct {
@@ -2052,23 +2059,26 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// -- a fail-closed outage with no diagnostic trail unless it
 				// is logged. Every sibling best-effort read in this package
 				// logs for exactly that reason.
-				slog.Warn("portal: models-listing capability read failed; vision withheld for every model",
+				slog.Warn("portal: models-listing capability read failed; vision and image withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
-			// The fold below asks each mapping exactly ONE capability
-			// question, so its row is picked out here in a single pass rather
-			// than by keying that mapping's whole row set by name inside the
-			// loop -- a map allocated per mapping to answer one lookup, on a
-			// path the SSE stream recomputes on every registry change. A
-			// mapping with no vision row is simply absent, which is what the
-			// fold reads as "not capable" (see below).
+			// The fold below asks each mapping exactly TWO capability questions
+			// (vision and image), so both rows are picked out here in one pass
+			// rather than by keying that mapping's whole row set by name inside
+			// the loop -- a map allocated per mapping to answer two lookups. A
+			// mapping with no such row is simply absent, which is what the fold
+			// reads as "not capable" (see below). There is no early break: it
+			// would stop at whichever of the two rows came first.
 			visionRows := make(map[string]routing.CapabilityRow, len(capsByMapping))
+			imageRows := make(map[string]routing.CapabilityRow, len(capsByMapping))
 			for mappingID, rows := range capsByMapping {
 				for _, row := range rows {
-					if row.Capability == routing.CapabilityVision {
+					switch row.Capability {
+					case routing.CapabilityVision:
 						visionRows[mappingID] = row
-						break
+					case routing.CapabilityImage:
+						imageRows[mappingID] = row
 					}
 				}
 			}
@@ -2092,17 +2102,23 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// see routing.CapabilityRow's doc-comment on why "unknown" is a row's
 			// absence rather than a third verdict.
 			visionOn := make(map[string]bool)
+			// imageOn: same AND-fold, same fail-closed seeding, for the "image"
+			// capability. Kept as a separate map rather than a struct so the
+			// group and alias plumbing below mirrors visionOn line for line.
+			imageOn := make(map[string]bool)
 			for _, view := range views {
 				name := view.mapping.GatewayModelName
 				if _, ok := flavors[name]; !ok {
 					flavors[name] = make(map[string]struct{})
 					visionOn[name] = true
+					imageOn[name] = true
 				}
 				if _, ok := offeredOn[name]; !ok {
 					offeredOn[name] = make(map[string]struct{})
 				}
 				offeredOn[name][view.server.Name] = struct{}{}
 				visionOn[name] = visionOn[name] && visionRows[view.mapping.ID].Verdict == routing.CapabilityYes
+				imageOn[name] = imageOn[name] && imageRows[view.mapping.ID].Verdict == routing.CapabilityYes
 				if cs := view.mapping.ContextSize; cs > 0 {
 					if cur, ok := contextSizeOn[name]; !ok || cs < cur {
 						contextSizeOn[name] = cs
@@ -2222,6 +2238,20 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					groupVision[e.Name] = all
 				}
+				// A group's image flag mirrors groupVision line for line: the AND
+				// of its offerable members' image flags, false (fail-closed) for
+				// an empty offerable member set.
+				groupImage := make(map[string]bool, len(entries))
+				for _, e := range entries {
+					all := len(e.OrderedOfferableMembers) > 0
+					for _, member := range e.OrderedOfferableMembers {
+						if !imageOn[member] {
+							all = false
+							break
+						}
+					}
+					groupImage[e.Name] = all
+				}
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2257,6 +2287,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 						contextSizeOn[e.Name] = cs
 					}
 					visionOn[e.Name] = groupVision[e.Name]
+					imageOn[e.Name] = groupImage[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2305,6 +2336,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := visionOn[rule.To]; ok {
 						visionOn[name] = v
 					}
+					if v, ok := imageOn[rule.To]; ok {
+						imageOn[name] = v
+					}
 					if _, ok := isGroup[rule.To]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -2325,6 +2359,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.OfferedOnCount = len(offeredOn[id])
 				dto.ContextSize = contextSizeOn[id]
 				dto.Vision = visionOn[id]
+				dto.Image = imageOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}

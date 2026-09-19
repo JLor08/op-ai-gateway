@@ -186,6 +186,9 @@ func TestModelsResponseCapabilityReadFailureDegradesAndLogs(t *testing.T) {
 	if model.Vision {
 		t.Fatalf("m1 vision = true after a failed capability read, want false (fail-closed)")
 	}
+	if model.Image {
+		t.Fatalf("m1 image = true after a failed capability read, want false (fail-closed, same contract as vision)")
+	}
 	if !strings.Contains(logged, "capability read failed") || !strings.Contains(logged, "capability table unavailable") {
 		t.Fatalf("log output = %q, want a warning naming the failure -- withholding vision gateway-wide must leave a diagnostic trail", logged)
 	}
