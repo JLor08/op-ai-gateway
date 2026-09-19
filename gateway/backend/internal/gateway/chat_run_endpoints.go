@@ -226,12 +226,7 @@ func (s *Server) handleCancelChatRun(w http.ResponseWriter, r *http.Request, cha
 		writeJSON(w, http.StatusNotFound, apierror.Response("portal.chat_run_not_found", "run not found", ""))
 		return
 	}
-	run.mu.Lock()
-	cancel := run.cancel
-	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	run.cancelContext()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

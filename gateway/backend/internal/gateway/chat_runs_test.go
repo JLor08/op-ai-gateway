@@ -690,33 +690,63 @@ func TestExecuteRunOmitsServerOverrideHeadersWhenUnset(t *testing.T) {
 // TestRunSnapshotCarriesAServerMeasuredAge: the snapshot must carry a
 // server-measured age, because a reopened tab never saw the moment of Send and
 // must still show the same true number as the tab that did.
+//
+// The assertions run through snapshotLocked (via subscribe), which is the path
+// Task 14's clock anchors on -- and they are bounded on BOTH sides: a
+// hardwired zero, an age measured from the wrong instant, and an age that is
+// not milliseconds all fail. A non-negativity check would pass for all three.
 func TestRunSnapshotCarriesAServerMeasuredAge(t *testing.T) {
+	const age = 30 * time.Millisecond
 	srv, owner, chatID := newRunTestServer(t)
+	before := time.Now()
 	run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap, _, unsub := run.subscribe()
-	defer unsub()
-	if snap.ElapsedMs < 0 {
-		t.Fatalf("ElapsedMs = %d, want >= 0", snap.ElapsedMs)
-	}
-	// A freshly-registered run is young; the point is that the field is
-	// POPULATED from the run's own start instant rather than absent.
 	if run.startedAt.IsZero() {
 		t.Fatal("startedAt must be set at construction")
+	}
+	time.Sleep(age)
+
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	// Lower bound: time.Sleep sleeps at LEAST its duration, and the run was
+	// constructed before it, so a truthful age cannot be under it. Upper bound:
+	// the wall time this test itself spent, which the run's age cannot exceed
+	// because startedAt was stamped after `before` (+1ms for the truncation
+	// Milliseconds() does).
+	ceiling := time.Since(before).Milliseconds() + 1
+	if snap.ElapsedMs < age.Milliseconds() || snap.ElapsedMs > ceiling {
+		t.Fatalf("snapshot ElapsedMs = %d, want within [%d, %d] -- the snapshot's "+
+			"age is the value the client anchors its clock on",
+			snap.ElapsedMs, age.Milliseconds(), ceiling)
 	}
 }
 
 // TestRunAgeIsFrozenOnceTerminal: a terminal run's age is its DURATION, not its
 // time since start. A late subscriber (the eviction grace period is 30s) would
 // otherwise be told a two-second run took thirty.
+//
+// The run is given a real, measurable duration first, so the frozen value has
+// to land in a window around that duration. Two reads of a ~0ms run would let
+// a hardwired zero satisfy the equality check on its own.
 func TestRunAgeIsFrozenOnceTerminal(t *testing.T) {
+	const duration = 30 * time.Millisecond
+	before := time.Now()
 	run := newChatRun("run_age", "c1", "u1", func() {})
+	time.Sleep(duration)
 	run.finish("completed", "")
+	ceiling := time.Since(before).Milliseconds() + 1
+
 	first, _, unsub := run.subscribe()
 	unsub()
-	time.Sleep(15 * time.Millisecond)
+	if first.ElapsedMs < duration.Milliseconds() || first.ElapsedMs > ceiling {
+		t.Fatalf("terminal ElapsedMs = %d, want within [%d, %d] (the run's real duration)",
+			first.ElapsedMs, duration.Milliseconds(), ceiling)
+	}
+	// The done event -- the other snapshotLocked caller -- carries the same
+	// duration, because finish() stamps endedAt before it builds the frame.
+	time.Sleep(20 * time.Millisecond)
 	second, _, unsub2 := run.subscribe()
 	defer unsub2()
 	if first.ElapsedMs != second.ElapsedMs {
@@ -846,10 +876,14 @@ func TestUserCancelStaysACancelUnderADeadline(t *testing.T) {
 	}
 }
 
-// TestTimedOutRunStillCommitsItsTurn is trap 2: finishRun is called with the
-// run's own context on several paths, so once that context carries a deadline
-// the terminal CommitAssistant would be cancelled by the very timeout that
-// ended the run -- losing the turn instead of recording why it ended.
+// TestTimedOutRunStillCommitsItsTurn is an END-TO-END SMOKE TEST: a run its own
+// deadline ended still has a terminal turn in the transcript, recorded as
+// "error". It is deliberately NOT the pin for trap 2 (the detached commit
+// context) and cannot fail for that reason -- the memory chat store ignores
+// the context it is handed, so this stays green with commitCtx reverted to
+// ctx. TestFinishRunCommitDoesNotInheritAnExpiredContext is that pin. What
+// this one catches is the coarser failure: a timeout path that finishes the
+// run without committing anything at all.
 func TestTimedOutRunStillCommitsItsTurn(t *testing.T) {
 	restore := imageRunDeadline
 	imageRunDeadline = 10 * time.Millisecond
@@ -1002,5 +1036,50 @@ func TestRunDeadlineForOnlyBoundsImages(t *testing.T) {
 		if d, bounded := runDeadlineFor(kind); bounded || d != 0 {
 			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image runs are bounded", kind, d, bounded)
 		}
+	}
+}
+
+// TestRunKindWriteIsSynchronizedWithItsReaders pins the mutex guard on
+// ChatRun.kind -- and it exists because `-race` alone does NOT catch that
+// guard's removal. reserveRun registers the run, so it is reachable by GET
+// runs/active and by a subscriber, but launchRun writes the kind afterwards
+// and every other test calls both from the same goroutine: the detector never
+// observes a concurrent pair, and an unguarded kind passes the whole suite.
+//
+// So the pair is constructed here. Both goroutines wait on one barrier, and
+// the reader hammers listView() across the write. Under -race an unsynchronized
+// setKind reports a data race even though listView itself takes the lock --
+// synchronization requires BOTH sides to take the same one.
+func TestRunKindWriteIsSynchronizedWithItsReaders(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	run, ctx, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-barrier
+		srv.launchRun(ctx, owner, run, PrepareRunResult{
+			History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+			Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		<-barrier
+		for i := 0; i < 5000; i++ {
+			_, _, _ = run.listView()
+		}
+	}()
+	close(barrier)
+	wg.Wait()
+
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.kindValue(); got != "image" {
+		t.Fatalf("kind = %q after the concurrent window, want image", got)
 	}
 }
