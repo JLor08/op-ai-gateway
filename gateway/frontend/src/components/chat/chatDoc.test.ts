@@ -2,8 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { DEFAULTS, kindSetting, normalizeDoc } from './chatDoc';
-import { metricsOf } from './chatDoc';
+import { DEFAULTS, kindSetting, metricsOf, normalizeDoc } from './chatDoc';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {

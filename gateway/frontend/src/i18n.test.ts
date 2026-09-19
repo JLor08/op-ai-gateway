@@ -791,9 +791,11 @@ describe('image-thread composer i18n keys', () => {
   });
 
   it('keeps the image-INPUT refusal distinct from the image-GENERATOR one', () => {
-    // chatImageModelUnsupported gates image INPUT. An image-generating model is
-    // never vision-capable, so the old wording ("does not support images") told
-    // the user that a model whose only purpose is images does not support them.
+    // chatImageModelUnsupported gates image INPUT, which is a capability
+    // ORTHOGONAL to generating images -- a model can carry either, both, or
+    // neither. On one that generates images without reading them, the old
+    // wording ("does not support images") told the user that a model whose
+    // only purpose is images does not support them.
     for (const locale of ['de', 'en'] as const) {
       expect(messages[locale].chatImageModelUnsupported).not.toBe(
         messages[locale].chatImageGeneratorNoInput,

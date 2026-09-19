@@ -1670,9 +1670,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   });
 
   describe(`ChatStoreProvider image-thread kind and capacity [${locale}]`, () => {
-    // An image GENERATOR; never vision-capable (a generated image is output,
-    // not input), so `vision` is deliberately absent -> modelVisionCapable
-    // derives false, exactly as it does in production.
+    // An image GENERATOR that does not also read images. `vision` is
+    // deliberately absent so modelVisionCapable derives false -- that is the
+    // combination these tests need (it is what makes the regenerate guard's
+    // history check reachable), NOT a claim that the two go together:
+    // generating and accepting images are orthogonal capabilities the backend
+    // aggregates separately, and a model can carry both. Chat.test.tsx covers
+    // that case explicitly, because it is the one where the attach gate's
+    // image clause is load-bearing.
     const imageModels: ModelOption[] = [
       {
         id: 'sd-turbo',

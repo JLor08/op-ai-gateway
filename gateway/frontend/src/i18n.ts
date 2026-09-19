@@ -189,10 +189,13 @@ const de = {
   chatModelLoaded: 'Geladen (sofort verfügbar)',
   chatModelLoadedOn: 'Geladen auf',
   // Gates image INPUT (attaching an image to a prompt). It must not say "does
-  // not support images": an image-GENERATING model is never vision-capable, so
-  // on such a model the old wording told the user that a model whose only
-  // purpose is images does not support them. chatImageGeneratorNoInput below
-  // is the image-model case.
+  // not support images": generating images and accepting them are ORTHOGONAL
+  // capabilities, aggregated separately by the backend, so a model that
+  // generates images may or may not also read them. On one that generates and
+  // does not read, the old wording told the user that a model whose only
+  // purpose is images does not support images. chatImageGeneratorNoInput below
+  // is the image-model case -- it applies whether or not that model is also
+  // vision-capable, because an image RUN carries no input image either way.
   chatImageModelUnsupported: 'Dieses Modell kann keine Bilder als Eingabe verarbeiten.',
   chatImageGeneratorNoInput:
     'Dieses Modell erzeugt Bilder und nimmt selbst keine Bilder als Eingabe entgegen.',

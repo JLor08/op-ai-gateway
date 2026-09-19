@@ -245,34 +245,38 @@ export function useChatPersistence(
       // Server owns the transcript while a run is live — skip the keepalive PUT.
       if (isRunning(id)) return;
       const payload = { title: activeTitleRef.current, content: buildDoc() };
-      // Skipped, and deliberately silently: for EVERY image thread this is the
+      // Skipped, and deliberately silently. For EVERY image thread this is the
       // taken branch (a single inline base64 image is far past 60 KB), so the
-      // keepalive simply does not exist for them. What that costs is bounded
-      // and small, and the bound is worth stating rather than warning about:
+      // keepalive does not exist for them at all.
       //
-      //   - The cap stays. It is the real keepalive body ceiling (~64 KB);
-      //     raising it moves the failure from this `return` to the browser
-      //     dropping the PUT, which is strictly worse because it is invisible
-      //     on BOTH sides.
-      //   - The debounced save above has no size limit and is the path that
-      //     actually persists an image turn. It fires SAVE_DEBOUNCE_MS (800 ms)
-      //     after the last persisted change, so everything older than that
-      //     settle time is already on the server when pagehide runs.
-      //   - dirtyRef is deliberately NOT cleared here, so the chat stays dirty:
-      //     the unmount flush (logout) and the next change both retry it.
+      // The cap stays: it is the real keepalive body ceiling (~64 KB), and
+      // raising it moves the failure from this `return` to the browser
+      // dropping the PUT, which is strictly worse because it is then invisible
+      // on BOTH sides. dirtyRef is deliberately NOT cleared, so the chat stays
+      // dirty and the unmount flush (logout) and the next change both retry.
       //
-      // Residual exposure: the persisted changes made since the last debounced
-      // save completed. That is normally at most the 800 ms settle window, but
-      // it is a settle window and not a ceiling -- the timer RESETS on every
-      // change, so a stream of changes arriving faster than that (dragging the
-      // temperature slider, typing a system prompt without pausing) postpones
-      // the save for as long as it continues, and all of it is exposed. The
-      // composer's own text is not a persisted setting, so ordinary typing in
-      // the prompt field is not affected.
+      // WHAT IS EXPOSED: every persisted change made since the last debounced
+      // save COMPLETED. The debounced save above has no size limit and is the
+      // path that actually persists an image turn, but it is a TRAILING
+      // debounce that RESETS its timer on each change -- so SAVE_DEBOUNCE_MS
+      // (800 ms) is a settle window, not a ceiling. After an 800 ms pause
+      // everything is on the server and this skip costs nothing; under a
+      // stream of changes arriving faster than that (dragging the temperature
+      // slider, typing a system prompt without pausing) the save never fires
+      // and ALL of those changes are exposed, for as long as it continues.
+      // Bounding that would mean a max-wait debounce, which is a change to
+      // every chat and not just to image threads.
+      //
+      // Not exposed: the composer's own text (`input` is not a persisted
+      // setting, so ordinary prompt typing never dirties the chat), and
+      // anything during a live run (both this handler and the debounced effect
+      // bail on isRunning -- the server owns that transcript and the
+      // stream-end flush covers it).
       //
       // No console.warn and no toast: a warning reaches nobody at the moment of
-      // a navigation, and a toast would fire on bfcache-restore for what is
-      // almost never a loss.
+      // a navigation, and pagehide also fires when the page enters the bfcache,
+      // where a toast would alarm the user on their way back for what is
+      // usually not a loss at all.
       if (JSON.stringify(payload).length > 60000) return;
       apiRef.current.saveChatKeepalive(id, payload);
       dirtyRef.current = false;
