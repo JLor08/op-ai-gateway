@@ -686,3 +686,269 @@ func TestExecuteRunOmitsServerOverrideHeadersWhenUnset(t *testing.T) {
 		t.Fatalf("%s = %q, want unset", serverOverrideForceHeaderName, v)
 	}
 }
+
+// TestRunSnapshotCarriesAServerMeasuredAge: the snapshot must carry a
+// server-measured age, because a reopened tab never saw the moment of Send and
+// must still show the same true number as the tab that did.
+func TestRunSnapshotCarriesAServerMeasuredAge(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.ElapsedMs < 0 {
+		t.Fatalf("ElapsedMs = %d, want >= 0", snap.ElapsedMs)
+	}
+	// A freshly-registered run is young; the point is that the field is
+	// POPULATED from the run's own start instant rather than absent.
+	if run.startedAt.IsZero() {
+		t.Fatal("startedAt must be set at construction")
+	}
+}
+
+// TestRunAgeIsFrozenOnceTerminal: a terminal run's age is its DURATION, not its
+// time since start. A late subscriber (the eviction grace period is 30s) would
+// otherwise be told a two-second run took thirty.
+func TestRunAgeIsFrozenOnceTerminal(t *testing.T) {
+	run := newChatRun("run_age", "c1", "u1", func() {})
+	run.finish("completed", "")
+	first, _, unsub := run.subscribe()
+	unsub()
+	time.Sleep(15 * time.Millisecond)
+	second, _, unsub2 := run.subscribe()
+	defer unsub2()
+	if first.ElapsedMs != second.ElapsedMs {
+		t.Fatalf("terminal age moved: %d -> %d; a finished run's age is its duration",
+			first.ElapsedMs, second.ElapsedMs)
+	}
+}
+
+// TestRunKindIsOnSnapshotAndDoneButNeverOnDelta pins the wire contract this
+// feature inherits from `metrics`: the per-run facts ride on `snapshot` and
+// `done`, never on `delta`. The client ticks its own clock between snapshots
+// from the anchor a snapshot gave it, so a per-delta age would be both
+// redundant and (on a text run) a per-token cost.
+func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
+	run := newChatRun("run_kind", "c1", "u1", func() {})
+	run.setKind("image")
+	snap, ch, unsub := run.subscribe()
+	defer unsub()
+	if snap.Kind != "image" {
+		t.Fatalf("snapshot kind = %q, want image", snap.Kind)
+	}
+	run.publish(sseDeltaEvent{Content: "x"})
+	ev := <-ch
+	if ev.Kind != "" || ev.ElapsedMs != 0 {
+		t.Fatalf("delta carries per-run facts: %+v", ev)
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal delta: %v", err)
+	}
+	if strings.Contains(string(raw), "elapsed_ms") || strings.Contains(string(raw), `"kind"`) {
+		t.Fatalf("delta wire frame must carry neither kind nor elapsed_ms: %s", raw)
+	}
+	run.finish("completed", "")
+	term := <-ch
+	if term.Kind != "image" {
+		t.Fatalf("done kind = %q, want image", term.Kind)
+	}
+}
+
+// TestRunDeadlineIsDistinguishableFromACancel: a deadline must NOT masquerade
+// as a user cancel -- the user pressed nothing.
+func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
+	restore := runDeadline
+	runDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { runDeadline = restore })
+
+	// A provider that never produces anything, so the deadline is what ends the
+	// run. pacedStreamer with a gap far beyond the deadline is the existing fake
+	// for "slow upstream" (server_stream_timeout_test.go).
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error -- a deadline is not a cancel", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != runTimedOutMessage {
+		t.Fatalf("error = %q, want the timeout code %q -- an empty message is "+
+			"what a USER cancel looks like, and conflating the two is the "+
+			"silent-conflation this feature refuses", snap.Err, runTimedOutMessage)
+	}
+}
+
+// TestRunDeadlineMidStreamIsNotACancelEither covers the SECOND context branch.
+// Once the upstream has answered 200, the executor is inside consumeRunStream
+// and a firing deadline surfaces as a scanner error, whose own ctx.Err() branch
+// also reported "canceled" with an empty message. The provider below emits one
+// delta well before the deadline, so the run is mid-stream when it fires.
+func TestRunDeadlineMidStreamIsNotACancelEither(t *testing.T) {
+	restore := runDeadline
+	runDeadline = 150 * time.Millisecond
+	t.Cleanup(func() { runDeadline = restore })
+
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 20, gap: 30 * time.Millisecond})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error -- a deadline is not a cancel", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != runTimedOutMessage {
+		t.Fatalf("error = %q, want the timeout code %q", snap.Err, runTimedOutMessage)
+	}
+}
+
+// TestUserCancelStaysACancelUnderADeadline is the counterpart invariant: with a
+// deadline in place, an explicit Stop must still end the run as "canceled" with
+// an empty message. A branch that treated every context error as a timeout
+// would be the same conflation in the other direction.
+func TestUserCancelStaysACancelUnderADeadline(t *testing.T) {
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 30, gap: 20 * time.Millisecond})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	srv.ChatRuns.cancelChat(owner.UserID, chatID)
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != "" {
+		t.Fatalf("cancel error = %q, want empty", snap.Err)
+	}
+}
+
+// TestTimedOutRunStillCommitsItsTurn is trap 2: finishRun is called with the
+// run's own context on several paths, so once that context carries a deadline
+// the terminal CommitAssistant would be cancelled by the very timeout that
+// ended the run -- losing the turn instead of recording why it ended.
+func TestTimedOutRunStillCommitsItsTurn(t *testing.T) {
+	restore := runDeadline
+	runDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { runDeadline = restore })
+
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	got, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	if !strings.Contains(string(got.Content), `"status":"error"`) {
+		t.Fatalf("a timed-out run must still record its terminal turn: %s", got.Content)
+	}
+}
+
+// TestCompletedRunReleasesItsDeadlineContext: reserveRun's context is now a
+// WithTimeout, whose timer stays armed until the deadline unless its cancel
+// runs. That cancel was only ever invoked on the release/cancel paths, never on
+// the normal terminal one, so every completed run would otherwise pin a
+// runDeadline-long timer.
+func TestCompletedRunReleasesItsDeadlineContext(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	run, ctx, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	srv.launchRun(ctx, owner, run, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	waitFor(t, func() bool { return run.statusValue() == "completed" })
+	waitFor(t, func() bool { return ctx.Err() != nil })
+}
+
+// commitCtxRecorder wraps a real portal.API and records the context state
+// CommitAssistant was handed, so a test can prove the terminal commit does not
+// inherit the run's deadline. It embeds the interface rather than implementing
+// it: portal.API is a wide facade and only this one method is under test.
+type commitCtxRecorder struct {
+	portal.API
+	mu  sync.Mutex
+	err error
+	hit bool
+}
+
+func (c *commitCtxRecorder) CommitAssistant(ctx context.Context, owner auth.Token, chatID string, turn portal.AssistantTurn, status string) error {
+	c.mu.Lock()
+	c.err, c.hit = ctx.Err(), true
+	c.mu.Unlock()
+	return c.API.CommitAssistant(ctx, owner, chatID, turn, status)
+}
+
+func (c *commitCtxRecorder) seen() (hit bool, ctxErr error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hit, c.err
+}
+
+// TestFinishRunCommitDoesNotInheritAnExpiredContext is trap 2, pinned where it
+// actually bites. finishRun is called with the RUN's own context on four paths
+// (the two request-construction failures, a non-context Do failure and the
+// non-200), and that context now carries the deadline -- so a run whose
+// deadline fires anywhere around those paths would have its terminal commit
+// cancelled by the very timeout that ended it, losing the turn instead of
+// recording why it ended. The memory chat store ignores the context, so the
+// assertion is on the context the commit was HANDED, which is what a real
+// database/sql store checks before it writes.
+func TestFinishRunCommitDoesNotInheritAnExpiredContext(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	rec := &commitCtxRecorder{API: srv.Portal}
+	srv.Portal = rec
+
+	run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if expired.Err() == nil {
+		t.Fatal("test setup: the context must already be expired")
+	}
+	srv.finishRun(expired, owner, run, "error", runTimedOutMessage)
+
+	hit, gotErr := rec.seen()
+	if !hit {
+		t.Fatal("CommitAssistant was never called")
+	}
+	if gotErr != nil {
+		t.Fatalf("the terminal commit inherited the run's expired context (%v); "+
+			"the deadline that ended the run must not cancel the record of why", gotErr)
+	}
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+}

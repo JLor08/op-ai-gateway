@@ -24,17 +24,31 @@ type startRunRequest struct {
 }
 
 // startRunResponse is the 201 body naming the launched run.
+//
+// It carries the kind as well as the snapshot does, because between this 201
+// and the first SSE snapshot the sending tab knows nothing about the run: a
+// kind that arrived only on the snapshot would leave that window rendering the
+// TEXT pending state -- the character counter reading zero -- on the most
+// common path of the very feature that exists to remove it.
 type startRunResponse struct {
 	RunID  string `json:"run_id"`
 	ChatID string `json:"chat_id"`
 	Status string `json:"status"`
+	// Omitted for a text run, so an existing client's 201 is unchanged.
+	Kind      string `json:"kind,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
 }
 
-// activeRunDTO is one entry of the active-runs list.
+// activeRunDTO is one entry of the active-runs list. Kind and ElapsedMs let a
+// REOPENED browser render the same pending state, with the same true clock, as
+// the tab that started the run -- which is the whole reason the age is measured
+// by the server rather than from the moment of Send.
 type activeRunDTO struct {
-	ChatID string `json:"chat_id"`
-	RunID  string `json:"run_id"`
-	Status string `json:"status"`
+	ChatID    string `json:"chat_id"`
+	RunID     string `json:"run_id"`
+	Status    string `json:"status"`
+	Kind      string `json:"kind,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
 }
 
 // portalRunErrRows are writePortalRunError's mapper-specific rows (checked
@@ -101,8 +115,15 @@ func (s *Server) handleStartChatRun(w http.ResponseWriter, r *http.Request, chat
 		writePortalRunError(w, err)
 		return
 	}
+	// launchRun stamps run.kind from the PREPARED settings, so the 201 below
+	// reports what the executor will actually run rather than what the client
+	// asked for (PrepareChatRun forces the thread's pinned kind on every send
+	// after the first).
 	s.launchRun(runCtx, token, run, PrepareRunResult{History: history, Settings: settings})
-	writeJSON(w, http.StatusCreated, startRunResponse{RunID: run.ID, ChatID: chatID, Status: "running"})
+	writeJSON(w, http.StatusCreated, startRunResponse{
+		RunID: run.ID, ChatID: chatID, Status: "running",
+		Kind: run.kindValue(), ElapsedMs: run.elapsedMs(),
+	})
 }
 
 // handleChatRunEvents streams a run over SSE: an initial snapshot event replays
@@ -227,7 +248,15 @@ func (s *Server) handleActiveChatRuns(w http.ResponseWriter, r *http.Request) {
 	runs := s.ChatRuns.ActiveForUser(token.UserID)
 	out := make([]activeRunDTO, 0, len(runs))
 	for _, run := range runs {
-		out = append(out, activeRunDTO{ChatID: run.ChatID, RunID: run.ID, Status: run.statusValue()})
+		// One acquisition of the run's own mutex per row, taken here rather
+		// than inside ActiveForUser: reg.mu is already released by the time
+		// this loop runs, and the documented lock order (never both at once)
+		// depends on it staying that way.
+		status, kind, elapsedMs := run.listView()
+		out = append(out, activeRunDTO{
+			ChatID: run.ChatID, RunID: run.ID, Status: status,
+			Kind: kind, ElapsedMs: elapsedMs,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string][]activeRunDTO{"data": out})
 }

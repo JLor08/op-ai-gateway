@@ -133,6 +133,14 @@ type runEvent struct {
 	Metrics   *runMetrics `json:"metrics,omitempty"`
 	Status    string      `json:"status,omitempty"`
 	Err       string      `json:"error,omitempty"`
+	// Kind and ElapsedMs are per-RUN facts, not per-event ones, so they ride on
+	// `snapshot` and `done` only -- exactly where Metrics already rides, and for
+	// the same reason: a delta describes the increment, a snapshot describes the
+	// run. The client anchors its own clock on the age a snapshot gave it and
+	// ticks locally between snapshots, so repeating either on every delta would
+	// add a per-token cost to every text run and buy nothing.
+	Kind      string `json:"kind,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
 }
 
 type runMetrics struct {
@@ -157,7 +165,26 @@ type ChatRun struct {
 	ChatID string
 	UserID string
 
-	mu          sync.Mutex
+	// startedAt is the run's own start instant, set once at construction and
+	// never written again -- so it is safe to read under r.mu in
+	// snapshotLocked without a self-locking accessor. It exists because a
+	// client cannot compute an honest age: a reopened or second tab never saw
+	// the moment of Send, and every view must show the same true number.
+	startedAt time.Time
+
+	mu sync.Mutex
+	// kind mirrors the thread's pinned kind ("" for text, "image"), set by
+	// launchRun from the prepared settings. It is the SAME value that selects
+	// the request the executor makes, so the UI can never describe a turn the
+	// executor did not run.
+	//
+	// Guarded by mu and NOT grouped with the immutable identity fields above:
+	// the run is registered (and therefore reachable by GET runs/active and by
+	// a subscriber) from reserveRun onwards, which is strictly before
+	// launchRun writes this -- so the write genuinely races those readers
+	// unless it is synchronized. startedAt needs no such guard because it is
+	// written by the constructor, before any reference escapes.
+	kind        string
 	status      string // running | completed | error | canceled
 	reasoning   strings.Builder
 	content     strings.Builder
@@ -168,11 +195,78 @@ type ChatRun struct {
 	endedAt     time.Time
 }
 
+// newChatRun stamps startedAt from time.Now() directly rather than from the
+// service Clock most of this package's timestamps come from. A ChatRun has no
+// clock dependency today, and this instant is only ever used to MEASURE an
+// elapsed duration against a later time.Now() -- never persisted, compared with
+// a stored timestamp, or rendered as a date -- so a wall-clock reading is the
+// honest source and threading a Clock through for it would buy nothing.
 func newChatRun(id, chatID, userID string, cancel func()) *ChatRun {
 	return &ChatRun{
 		ID: id, ChatID: chatID, UserID: userID,
-		status: "running", cancel: cancel,
+		startedAt: time.Now(),
+		status:    "running", cancel: cancel,
 		subscribers: map[chan runEvent]struct{}{},
+	}
+}
+
+// setKind records the thread's pinned kind on the run. Called by launchRun
+// before the executor goroutine starts and before the 201 is written.
+func (r *ChatRun) setKind(kind string) {
+	r.mu.Lock()
+	r.kind = kind
+	r.mu.Unlock()
+}
+
+// kindValue reads the run's kind. Self-locking: never call it from a function
+// that already holds r.mu (use r.kind directly there).
+func (r *ChatRun) kindValue() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kind
+}
+
+// elapsedMsLocked is the run's server-measured age in milliseconds. Once the
+// run is terminal the age FREEZES at its duration: a finished run lingers in
+// the registry for runEvictionDelay, and a late subscriber must be told how
+// long the run took, not how long ago it started. The caller must hold r.mu
+// (startedAt is immutable, endedAt is not).
+func (r *ChatRun) elapsedMsLocked() int64 {
+	if !r.endedAt.IsZero() {
+		return r.endedAt.Sub(r.startedAt).Milliseconds()
+	}
+	return time.Since(r.startedAt).Milliseconds()
+}
+
+// elapsedMs is the run's server-measured age for a caller that holds no lock.
+// Self-locking: never call it from a function that already holds r.mu (use
+// elapsedMsLocked there).
+func (r *ChatRun) elapsedMs() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.elapsedMsLocked()
+}
+
+// listView returns the three run facts the active-runs DTO needs in ONE
+// acquisition of r.mu, so the row cannot report a still-running status beside
+// an age that froze between two separate reads. It takes only the run's own
+// lock and is called from handleActiveChatRuns AFTER ActiveForUser has released
+// the registry lock -- reg.mu and r.mu are never held at the same time.
+func (r *ChatRun) listView() (status, kind string, elapsedMs int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status, r.kind, r.elapsedMsLocked()
+}
+
+// cancelContext invokes the run's context cancel func under r.mu (the field is
+// mu-guarded) and never while holding it. Cancel funcs are idempotent, so
+// calling this on an already-cancelled or already-finished run is a no-op.
+func (r *ChatRun) cancelContext() {
+	r.mu.Lock()
+	cancel := r.cancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -181,6 +275,7 @@ func (r *ChatRun) snapshotLocked() runEvent {
 	return runEvent{
 		Event: "snapshot", Reasoning: r.reasoning.String(), Content: r.content.String(),
 		Metrics: &m, Status: r.status, Err: r.errMsg,
+		Kind: r.kind, ElapsedMs: r.elapsedMsLocked(),
 	}
 }
 
@@ -391,12 +486,7 @@ func (reg *chatRunRegistry) cancelChat(userID, chatID string) bool {
 	if run == nil {
 		return false
 	}
-	run.mu.Lock()
-	cancel := run.cancel
-	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	run.cancelContext()
 	return true
 }
 
@@ -412,6 +502,20 @@ func compactHex(n int) string {
 // during a run. It is a package-level var (not const) so tests can shrink it to
 // force multiple checkpoint ticks within a run.
 var runCheckpointInterval = 3 * time.Second
+
+// runDeadline bounds a single chat run end to end. It exists so an unstreamed
+// image run is a BOUNDED wait rather than an open-ended one: with no
+// incremental events, "this finishes or fails within N minutes" is the only
+// honest thing the UI can promise, and it has to be true. A package var, not a
+// const, so tests can shrink it -- mirroring runCheckpointInterval.
+var runDeadline = 10 * time.Minute
+
+// runTimedOutMessage is the terminal error of a run its own deadline ended. A
+// CODE, not prose: the frontend maps it to a localized label (errorLabelByCode),
+// and it exists at all because the alternative -- the empty message a user
+// cancel carries -- would tell the user they pressed Stop when they pressed
+// nothing.
+const runTimedOutMessage = "gateway.chat_run_timeout"
 
 const runEvictionDelay = 30 * time.Second
 
@@ -433,8 +537,14 @@ func (r *ChatRun) statusValue() string {
 // nothing. It returns the reserved run and the context its executor will use.
 // On rejection the freshly-created context is cancelled and nil is returned.
 // The caller MUST either launchRun the reservation or releaseRun it.
+//
+// The context carries runDeadline, which is what makes a run a bounded wait.
+// The returned cancel stays the registry's (releaseRun, cancelChat,
+// handleCancelChatRun all still need it) and is ALSO invoked by executeRun on
+// every terminal path, so a normally finished run releases its timer instead of
+// pinning one for the rest of the deadline.
 func (s *Server) reserveRun(owner auth.Token, chatID string) (*ChatRun, context.Context, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), runDeadline)
 	run, err := s.ChatRuns.add(owner.UserID, chatID, cancel)
 	if err != nil {
 		cancel()
@@ -443,8 +553,13 @@ func (s *Server) reserveRun(owner auth.Token, chatID string) (*ChatRun, context.
 	return run, ctx, nil
 }
 
-// launchRun starts the executor goroutine for a previously reserved run.
+// launchRun starts the executor goroutine for a previously reserved run. The
+// run's kind is stamped from the PREPARED settings (the pin PrepareChatRun
+// forces, never the client's submitted value) and BEFORE the goroutine starts,
+// so the 201 its caller then writes already describes the run the executor is
+// about to make.
 func (s *Server) launchRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
+	run.setKind(prep.Settings.Kind)
 	go s.executeRun(ctx, owner, run, prep)
 }
 
@@ -452,12 +567,7 @@ func (s *Server) launchRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 // the registry, fully freeing the slot so a retry is not wrongly rejected. Only
 // valid before launchRun starts the executor goroutine.
 func (s *Server) releaseRun(run *ChatRun) {
-	run.mu.Lock()
-	cancel := run.cancel
-	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	run.cancelContext()
 	s.ChatRuns.remove(run)
 }
 
@@ -475,6 +585,14 @@ func (s *Server) startChatRun(owner auth.Token, chatID string, prep PrepareRunRe
 
 func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
 	defer func() {
+		// Release the run context's deadline timer now that the run is terminal.
+		// context.WithTimeout arms a timer that lives until the deadline fires
+		// unless its cancel runs, and the cancel was previously only ever
+		// invoked on the release/cancel paths -- so without this every
+		// completed run would pin a runDeadline-long timer. Everything that
+		// uses the context (the loopback request) is done by here, and the
+		// terminal commit no longer rides on it at all (see finishRun).
+		run.cancelContext()
 		// Evict after a grace period so late subscribers still see the terminal.
 		time.AfterFunc(runEvictionDelay, func() { s.ChatRuns.remove(run) })
 	}()
@@ -518,6 +636,13 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
+			// A deadline is NOT a cancel, and reporting it as one would be the
+			// same silent conflation this feature refuses elsewhere: the user
+			// pressed nothing.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				s.finishRun(context.Background(), owner, run, "error", runTimedOutMessage)
+				return
+			}
 			s.finishRun(context.Background(), owner, run, "canceled", "")
 			return
 		}
@@ -604,9 +729,15 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if ctx.Err() != nil {
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			// The other half of the same conflation: once the upstream has
+			// answered 200 the deadline lands here, as a read error on a
+			// cancelled request, rather than on the Do above.
+			status, errMsg = "error", runTimedOutMessage
+		case ctx.Err() != nil:
 			status, errMsg = "canceled", ""
-		} else {
+		default:
 			status, errMsg = "error", err.Error()
 		}
 	}
@@ -655,6 +786,13 @@ func (r *ChatRun) currentMetrics() runMetrics {
 // terminal. The persisted status uses the transcript vocabulary
 // (complete/error/canceled).
 func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string) {
+	// The commit must outlive the deadline that ended the run: finishRun is
+	// called with the run's own ctx on four paths (the two request-construction
+	// failures, the Do failure and the non-200), so on a timeout the ctx is
+	// ALREADY expired and the commit below would be cancelled before it wrote
+	// -- losing the turn instead of recording why it ended. Same idiom as
+	// benchmark_vram_runner.go:236.
+	commitCtx := context.WithoutCancel(ctx)
 	reasoning, content := run.buffered()
 	m := run.currentMetrics()
 	persistStatus := map[string]string{"completed": "complete", "error": "error", "canceled": "canceled"}[status]
@@ -665,7 +803,7 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 	// "pending", so a later restart would infer a false "interrupted". Log it
 	// (control flow is unchanged — the run still finishes) so the failure is not
 	// silently swallowed.
-	if err := s.Portal.CommitAssistant(ctx, owner, run.ChatID, portal.AssistantTurn{
+	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 	}, persistStatus); err != nil {
