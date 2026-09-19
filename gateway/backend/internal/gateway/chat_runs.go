@@ -583,22 +583,34 @@ const runTimedOutMessage = "gateway.chat_run_timeout"
 // that exceeds chatRunCommitTimeout below is one such failure.
 const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 
-// chatRunCommitTimeout bounds the TERMINAL COMMIT -- and only it. Its context
-// is built fresh (see finishRunWithParts) rather than inherited, so this bound
-// is independent of the run's own deadline; that is what keeps
-// context.WithoutCancel doing the single job it is there for (an expired run
-// deadline must not cancel the write that records why the run ended) while
-// still making a store write that never returns terminal rather than
-// permanent. Without a bound, run.finish and chatRunRegistry.retire -- both
-// after the commit -- are never reached, so the run stays `running` forever:
-// the spinner never stops, Stop answers OK and does nothing (the cancel
-// cannot reach a context stripped of cancellation), and sending, saving and
-// renaming that chat are 409 until the gateway restarts.
+// chatRunCommitTimeout bounds EVERY store write a run makes on a context of
+// its own: the terminal commit (finishRunWithParts) and the periodic
+// checkpoint (consumeRunStream). Both contexts are built fresh rather than
+// inherited -- WithoutCancel for the commit, Background for the checkpoint --
+// because neither write may be cancelled by the run whose progress it is
+// recording; this bound is what stops "cannot be cancelled" from also meaning
+// "can never end".
 //
-// THE BOUND APPLIES TO TEXT RUNS TOO. finishRunWithParts is the one terminal
-// step both kinds share, and that is deliberate: a text commit is kilobytes
-// and a text commit that has not returned in 30 s is already pathological, so
-// there is nothing legitimate for the bound to cut short.
+// BOTH sites, not just the commit, because the commit is not the only one
+// that can strand a run. Everything that makes a run terminal -- run.finish,
+// chatRunRegistry.retire -- is below the commit, so an unbounded commit that
+// never returns leaves the run `running` forever: the spinner never stops,
+// Stop answers OK and does nothing (the cancel cannot reach a context
+// stripped of cancellation), and sending, saving and renaming that chat are
+// 409 until the gateway restarts. A hung CHECKPOINT does exactly the same,
+// one step earlier and more insidiously: consumeRunStream's `finish:` label
+// joins the checkpoint goroutine (wg.Wait) BEFORE calling the terminal step,
+// so the commit and its bound are never even entered. Bounding only the
+// commit would leave the wedge fully reachable and the claim below false.
+//
+// THE BOUND APPLIES TO TEXT RUNS TOO -- and text is in fact the EXPOSED kind
+// here, not the protected one. finishRunWithParts is the one terminal step
+// both kinds share, but only the text executor checkpoints: executeImageRun
+// makes a single buffered request and has no periodic write at all. So a
+// hung store write reaches a text run by two routes and an image run by one.
+// Either way, a commit or checkpoint that has not returned in 30 s is already
+// pathological -- a text turn is kilobytes -- so there is nothing legitimate
+// for the bound to cut short on either kind.
 //
 // Why 30 s. The write it must never interrupt is the largest one the store
 // accepts: a whole chat document at portal.MaxChatContentBytes (4 MiB), gzipped
@@ -614,8 +626,8 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 // one that needs a restart.
 //
 // A package-level var, not a const, for the same reason runCheckpointInterval
-// and imageRunDeadline are: a test that proves a blocked store still reaches a
-// terminal state has to shrink it.
+// and imageRunDeadline are: the tests that prove a blocked store still reaches
+// a terminal state -- one per bounded write -- have to shrink it.
 var chatRunCommitTimeout = 30 * time.Second
 
 // commitFailureIsChatGone reports whether a failed CommitAssistant's error
@@ -874,10 +886,34 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			case <-ticker.C:
 				reasoning, content := run.buffered()
 				m := run.currentMetrics()
-				_ = s.Portal.CheckpointAssistant(context.Background(), owner, run.ChatID, portal.AssistantTurn{
+				// BOUNDED by the same chatRunCommitTimeout the terminal
+				// commit uses, and for the same reason -- this write can
+				// strand a run just as thoroughly. `finish:` below joins this
+				// goroutine (wg.Wait) BEFORE it reaches finishRunWithParts,
+				// so a checkpoint that never returns means the terminal
+				// commit is never even entered and its bound cannot help:
+				// the run stays `running`, its per-chat slot stays held, and
+				// Stop is powerless because context.Background() is nobody's
+				// to cancel. That made the hang a TEXT-run hazard
+				// specifically -- executeImageRun has no checkpoint at all --
+				// which is the opposite of where the risk looks like it
+				// should be, and it is why "the bound makes a hung store
+				// write terminal rather than permanent" is only true with
+				// this call bounded too.
+				//
+				// Still context.Background() underneath, not the run's ctx:
+				// a checkpoint records progress that has ALREADY happened, so
+				// a cancel or a firing deadline must not erase it any more
+				// than it may erase the terminal commit. The error is
+				// discarded exactly as before -- a lost checkpoint is
+				// recoverable by the next tick or by the commit, so a
+				// deadline here is not news.
+				checkpointCtx, cancelCheckpoint := context.WithTimeout(context.Background(), chatRunCommitTimeout)
+				_ = s.Portal.CheckpointAssistant(checkpointCtx, owner, run.ChatID, portal.AssistantTurn{
 					Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 					CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 				})
+				cancelCheckpoint()
 			}
 		}
 	}()

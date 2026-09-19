@@ -1871,10 +1871,27 @@ because both are silent and both would return under a refactor.**
    the run's expired deadline still cannot reach the commit, while a hang
    becomes terminal instead of permanent. 30 s — two orders of magnitude above
    a legitimate 4 MiB sealed write, 20x below `imageRunDeadline`, equal to
-   `runEvictionDelay`. It bounds **text** runs too, because the terminal step
-   is the one thing both kinds share; that is intended rather than incidental,
-   since a kilobyte text commit that has not returned in 30 s is already
-   pathological ([§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
+   `runEvictionDelay`.
+
+   **And the commit is not the only write that can strand a run, so the bound
+   is applied at BOTH sites.** The periodic checkpoint
+   (`consumeRunStream`) writes to the same store on its own
+   `context.Background()`, and the `finish:` label **joins that goroutine
+   before** calling the terminal step — so a checkpoint that never returns
+   means the commit is never even entered and its bound cannot help. Bounding
+   only the commit would leave the wedge fully reachable. The checkpoint is
+   therefore bounded by the same `chatRunCommitTimeout`; its error is
+   discarded exactly as before, because a lost checkpoint is recoverable by
+   the next tick or by the commit.
+
+   **The polarity is the reverse of what this ADR's other bounds suggest:
+   TEXT is the exposed kind here, not image.** Only the text executor
+   checkpoints — `executeImageRun` makes one buffered request and has no
+   periodic write at all — so a hung store reaches a text run by two routes
+   and an image run by one. The bound applying to text runs is therefore
+   required rather than merely tolerated; a kilobyte text write that has not
+   returned in 30 s is already pathological, so nothing legitimate is cut
+   short ([§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
 
 **Rejected: reusing the streaming executor for the image kind.** It opens a
 scanner over a delta stream, drives the periodic checkpoint goroutine and

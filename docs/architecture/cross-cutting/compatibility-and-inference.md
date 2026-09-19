@@ -951,10 +951,26 @@ context is `context.WithTimeout(context.WithoutCancel(ctx),
 chatRunCommitTimeout)`: stripped first, so the run's expired deadline still
 cannot reach it, then bounded independently at 30 s — two orders of magnitude
 above a legitimate 4 MiB gzip+seal+`UPDATE`, 20x below `imageRunDeadline`, and
-equal to `runEvictionDelay`. Unlike the run deadline above, this one is not
-kind-specific: the terminal step is the single thing both halves of the
-executor share, and a kilobyte text commit that has not returned in 30 s is
-already pathological ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+equal to `runEvictionDelay`.
+
+**The periodic checkpoint carries the same bound, because the commit is not
+the only write that can strand a run.** `consumeRunStream`'s checkpoint
+goroutine writes to the same store on its own `context.Background()`, and the
+`finish:` label **joins that goroutine before** calling the terminal step —
+so a checkpoint that never returns means the commit is never entered and the
+paragraph above is simply unreachable. It is bounded by the same
+`chatRunCommitTimeout`, with its error discarded as before (a lost checkpoint
+is recovered by the next tick or by the commit), and still on `Background`
+rather than the run's context: a checkpoint records progress that has already
+happened, so a cancel must not erase it either.
+
+**That makes TEXT the exposed kind here, the reverse of the run deadline
+above.** Only the text executor checkpoints — `executeImageRun` makes one
+buffered request and has no periodic write — so a hung store reaches a text
+run by two routes and an image run by one. Both bounds applying to text is
+therefore required rather than merely tolerated; a kilobyte text write that
+has not returned in 30 s is already pathological, so nothing legitimate is cut
+short ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 **A failed terminal commit ends the run as an ERROR.** It used to be logged
 while the run reported success — leaving the trailing assistant message stuck

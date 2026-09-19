@@ -1382,3 +1382,53 @@ func TestTerminalCommitThatHangsStillEndsTheRun(t *testing.T) {
 		t.Fatal("the chat's single-active slot is still held: the chat stays 409 for send/save/rename")
 	}
 }
+
+// THE OTHER HALF OF THE SAME WEDGE, and the one that is reachable on a TEXT
+// run rather than an image one. `consumeRunStream`'s `finish:` label joins
+// the periodic-checkpoint goroutine (wg.Wait) BEFORE calling the terminal
+// step, so a checkpoint write that never returns means finishRunWithParts is
+// never even entered -- the terminal commit's own bound cannot help, the run
+// stays `running`, its per-chat slot stays held, and Stop is powerless
+// because the checkpoint's context.Background() is nobody's to cancel.
+//
+// Only the TEXT executor checkpoints: executeImageRun makes one buffered
+// request and has no periodic write at all. So this is the route by which a
+// hung store reaches the kind that looks least exposed.
+//
+// The checkpoint interval is shrunk below the stream's own duration so a tick
+// reliably fires mid-run, and the store is armed from the start so both the
+// checkpoint AND the commit block.
+func TestAHungCheckpointDoesNotStrandATextRun(t *testing.T) {
+	restoreTimeout := chatRunCommitTimeout
+	chatRunCommitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { chatRunCommitTimeout = restoreTimeout })
+	restoreTick := runCheckpointInterval
+	runCheckpointInterval = 2 * time.Millisecond
+	t.Cleanup(func() { runCheckpointInterval = restoreTick })
+
+	chats := &wedgedChatStore{ChatStore: store.NewMemoryChatStore(0)}
+	// 6 deltas 5ms apart (~30ms) against a 2ms checkpoint tick.
+	srv, owner, chatID := newRunTestServerWithChats(t, pacedStreamer{n: 6, gap: 5 * time.Millisecond}, chats)
+	chats.armed.Store(true)
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	// More than one blocked write is what proves a CHECKPOINT was among them:
+	// the terminal commit accounts for exactly one, and without a tick firing
+	// (the default 3s interval) that is all this run would produce -- see
+	// TestTerminalCommitThatHangsStillEndsTheRun, which asserts exactly 1.
+	if n := chats.blocked.Load(); n < 2 {
+		t.Fatalf("blocked store writes = %d, want >= 2 (at least one checkpoint plus the commit); "+
+			"no checkpoint fired, so this test would not cover the checkpoint path", n)
+	}
+	if held := srv.ChatRuns.Get(owner.UserID, chatID); held != nil {
+		t.Fatal("the chat's single-active slot is still held: the chat stays 409 for send/save/rename")
+	}
+}
