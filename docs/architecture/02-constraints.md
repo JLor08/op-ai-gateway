@@ -33,6 +33,15 @@ several architectural decisions exist specifically to satisfy them.
 - **Prompts and responses are not persisted** except via the explicit, opt-in
   payload capture, which is either encrypted-at-rest or volatile-in-RAM and always
   redacts sensitive headers. See [Security](cross-cutting/security-auth-rbac.md).
+  The **portal chat transcript** is the one other store that holds prompt and
+  answer text, and it is user-initiated rather than an operator setting: a
+  thread the user chose to keep, sealed as one opaque blob by the same capture
+  encryption key
+  ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)). A
+  portal-generated image rides **inside** that blob as a content part, under
+  the transcript's own 4 MiB whole-document cap, so it inherits that sealing
+  rather than escaping it —
+  [ADR-043](09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (c).
 - **Browser vs. program auth are separate and both supported.** Browsers use a
   server-side session cookie plus an `X-OP-CSRF` header on state-changing
   requests; programs use bearer API tokens. Inference endpoints accept three

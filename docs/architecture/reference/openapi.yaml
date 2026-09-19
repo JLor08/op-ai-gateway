@@ -126,8 +126,13 @@ paths:
       tags: [inference]
       summary: OpenAI-compatible image generation (relay only, no translate path)
       description: >
-        Bearer-only, scope `gateway:use` or `llm:invoke`. Always relayed to a
-        natively image-shaped upstream; there is no translate fallback.
+        Scope `gateway:use` or `llm:invoke`. Authenticates with a bearer token
+        OR the internal trusted-loopback header pair (X-OP-Internal-Auth +
+        X-OP-Internal-User, blanked by nginx at the public edge and therefore
+        unreachable by any external client, which is why only bearerAuth is
+        modelled below); a portal session cookie is never accepted here.
+        Always relayed to a natively image-shaped upstream; there is no
+        translate fallback.
         Admission is a per-mapping capability verdict, not an application
         setting: a model without an `image` verdict of `yes` is refused with
         404 `routing.model_not_capable`. Non-streaming only (a `stream: true`

@@ -834,7 +834,8 @@ from the browser. Instead:
    `EventSource` on `/api/portal/chats/{id}/runs/{runId}/events` for live deltas.
 2. The gateway's own background run executor (`executeRun`,
    `internal/gateway/chat_runs.go`) makes a **loopback** `POST` to its own
-   `/v1/chat/completions`, authenticating via the internal trusted-loopback
+   `/v1/chat/completions` — or to `/v1/images/generations`, when the run's kind
+   is `image` (below) — authenticating via the internal trusted-loopback
    header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first* in
    `authenticateWeb`, `internal/gateway/auth.go`, and blanked by nginx at the
    public edge so an external client can never inject them), plus the same
@@ -861,6 +862,33 @@ from the browser. Instead:
 4. The executor relays the resulting SSE deltas into the chat's own live-run
    state, which the browser's `EventSource` streams to the UI — the browser
    itself never opens a fetch stream.
+
+**A run carries a KIND, and the kind chooses the target.**
+`portal.ChatRunSettings.Kind` is pinned to the thread at its first send and
+forced back on every later one, so what the executor posts to is a property of
+the **thread** rather than of the model the picker currently shows
+([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)).
+`""` is text — the default, and every chat that predates the field — and
+`image` posts to `/v1/images/generations` instead, with the prompt built from
+the last user message and `response_format: "b64_json"` stated explicitly
+rather than inherited from the endpoint's tolerance of an absent value (§3.4).
+A run is registered before its kind is known (the reservation predates
+`PrepareChatRun`), which is why that field is mutex-guarded rather than one of
+the run's immutable identity fields.
+
+**`kind` and a server-measured `elapsed_ms` ride on every run shape a client
+reads**: the `201` from run start, each row of the active-runs listing, and the
+`snapshot` and `done` SSE events — but deliberately **not** the deltas, which
+describe an increment rather than the run. The `201` carries them because
+between it and the first snapshot the sending tab knows nothing about the run
+and would otherwise render the *text* pending state, character counter and all,
+on the most common path of the very feature that exists to remove it. The age
+is measured by the **server** because a reopened or second tab never witnessed
+the moment of Send and must still show the same true number; the client
+re-anchors on each snapshot and ticks locally in between. Once a run is
+terminal the age **freezes at its duration** — a finished run lingers in the
+registry for the eviction grace period, and a late subscriber needs to know how
+long the run took, not how long ago it started.
 
 The executor also derives the turn's display metrics (`consumeRunStream`):
 
@@ -889,6 +917,105 @@ The executor also derives the turn's display metrics (`consumeRunStream`):
   a direct cast. In **both**, `tps` is the character rate (the key predates the
   tokens/s metric and is kept so old transcripts still render); the real
   tokens/s is always the separate `tokens_per_second`/`tokensPerSecond` key.
+
+**Only an image run is bounded.** `runDeadlineFor` gives the image kind an
+end-to-end deadline (`imageRunDeadline`, 10 minutes) and leaves the text kind
+unbounded exactly as it is today: a text run streams deltas, so its liveness is
+visible, while a process-wide ceiling would newly kill long generations from a
+slow local model that complete perfectly well now — a behaviour change to the
+text path arriving as a side effect rather than a simplification
+([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (e)).
+The deadline is applied in `executeRun`, the first point at which the kind is
+known, as a child of the reservation's context — so Stop still cancels it — and
+it is released on every terminal path, the ordinary success one included.
+
+**A timeout is its own terminal state, never a cancel.** A firing deadline ends
+the run `error` with `gateway.chat_run_timeout`, on both branches it can land
+on (before the upstream answers, and while the response body is being read),
+rather than the empty-message `canceled` the user's Stop produces — which would
+tell someone who pressed nothing that they pressed it. And the terminal commit
+runs on a context stripped of cancellation (`context.WithoutCancel`), because
+it is reached with the run's *own* context: without that, the very timeout that
+ended the run would cancel the write recording why it ended.
+
+**A failed terminal commit ends the run as an ERROR.** It used to be logged
+while the run reported success — leaving the trailing assistant message stuck
+at `pending`, which a later restart reads as a false `interrupted`, and telling
+the browser a turn succeeded that was never durably saved. That was tolerable
+while every turn was a few KB of text; an inline image routinely approaches
+`portal.MaxChatContentBytes`, so a too-large image turn rendered in the browser
+and then vanished on reload with only a log line behind it. A commit failure
+now overrides whatever terminal the run was about to report:
+`portal.chat_too_large` is surfaced **verbatim**, being a named and actionable
+condition (download the image on screen, start a new chat), while any other
+store failure degrades to one stable `gateway.chat_run_commit_failed` rather
+than reaching a portal bubble as a raw Go error string. **One exception:** a
+run already ending `canceled` whose chat is simply *gone* keeps its own status,
+because `DELETE /chats/{id}` cancels that chat's run and removes its row in the
+same request and there is nothing left to persist for. The `canceled` half of
+that condition is load-bearing — a DELETE landing after the stream ended but
+before the commit ran would otherwise let a **successful** run keep reporting
+success with nothing stored.
+
+**A non-200 on the loopback hop surfaces the upstream error code.** The
+executor turned any non-200 into `"upstream status " + resp.Status` without
+reading the body at all, discarding every code either endpoint was built to
+return — the four `images.*` codes and every routing refusal in §13 — and
+showing the chat a bare status line instead. It now reads the body bounded by
+`OP_AI_GATEWAY_CAPTURE_MAX_BYTES` (an error body has no reason to exceed it,
+and this is not the ordinary streamed 200) and lifts `error.code` out of the
+gateway's own envelope, falling back to the status line only when there is no
+code to find.
+
+**The image half of the executor shares four things with the text half and
+nothing else:** the reservation, the deadline, the loopback header set, and the
+one terminal commit. The stream consumer is not among them and cannot be partly
+reused — it scans a delta stream, drives the periodic checkpoint goroutine and
+computes TTFT, chars/s and tokens/s, all of which assume deltas that do not
+exist here, and a checkpoint alone would write a `pending` assistant turn with
+empty content that the terminal commit then has to replace. Its three added
+terminal codes each name a condition a user has to be able to tell apart from
+an ordinary failure: `gateway.chat_run_no_image` (a 2xx that produced no usable
+image — an error, not an empty success, since a committed turn with no image
+renders as a blank bubble indistinguishable from a bug);
+`gateway.chat_run_image_format_unknown` (a 2xx whose `output_format` is absent
+or is not a media subtype that can safely be named — the media type is the one
+thing about the image that **must** come from the response, and a default would
+stay stated in the transcript, in the download's file name, and in every later
+request the part is carried into); and
+`gateway.chat_run_image_response_unreadable` (a 2xx body that could not be read
+or decoded, which previously reached the browser as Go's own decode message).
+
+**The turn is committed as structured content.** `portal.AssistantTurn` carries
+an optional `ContentParts`, written as the message's `content` when it is
+non-empty and ignored otherwise, so a text turn's stored shape stays
+byte-for-byte what it was. An image turn's parts are OpenAI-style `image_url`
+parts carrying `data:` URLs — one per item of the upstream `data[]`, which is
+plural by design because the billed quantity comes from the response rather
+than from the request's `n` (§3.4). That is the same shape an *uploaded* vision
+image already has (§11), so history construction feeds a generated image back
+as a vision input on the next turn with no extra code, and the transcript
+renderer already understood it.
+
+**`PUT /api/portal/chats/{id}` is refused while a run is active for that
+chat** — 409 `portal.chat_run_active`, the same sentinel the run-start endpoint
+returns. That PUT writes the **whole** document, so a save racing a live run
+silently overwrites what the run has already checkpointed or is about to
+commit. The frontend's own skip is per-tab with no cross-tab signal, so a
+second already-open view never learns a run started; the exposure window is the
+run's duration, which an image run stretches from seconds to minutes, and what
+it clobbers is a just-committed image.
+
+**`GET /api/portal/chats` carries `max_content_bytes`.** The composer has to
+state an image thread's remaining capacity *before* the user commits to a
+multi-minute generation, and `portal.MaxChatContentBytes` is a Go constant that
+no DTO previously carried. It is **served, not duplicated**: a second `4 MiB`
+literal in TypeScript would drift from the Go one with nothing to catch it, and
+the failure mode is a capacity line that confidently states the wrong number.
+It is deliberately not `omitempty` — a missing field and a zero are the same
+thing on the wire, and the portal reads zero as *capacity unknown* (no capacity
+line, no refusal), so a gateway too old to send it degrades instead of
+inventing a number.
 
 ## 13. Errors
 
