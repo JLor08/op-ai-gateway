@@ -41,15 +41,31 @@ func TestWritePortalRunError(t *testing.T) {
 	// development-and-quality.md documents: a deleted errRow once made a 409
 	// answer 500 application.request_failed while the whole backend suite
 	// stayed green, because nothing asserted the code itself.
-	// portal.chat_run_active and mapping.capability_reserved already have
-	// their own literal pins elsewhere (TestStartRunCreatesRunAndConflicts,
-	// portal_mapping_capability_verdicts_test.go) and are not repeated here.
 	//
 	// Decoded and compared for EXACT equality, not strings.Contains: a code
 	// that grew an unwanted suffix ("portal.chat_run_limit_v2") would still
 	// contain the wanted substring, so Contains would not have caught the
 	// very drift this test exists to catch. (Caught by mutation testing this
 	// exact test before it was trusted -- see the task report.)
+	//
+	// portal.chat_run_active and mapping.capability_reserved are not repeated
+	// here because each is pinned in exactly that decode-and-compare shape
+	// where a client actually meets it. chat_run_active has TWO wire
+	// surfaces, one per writer of the shared errRow (error_map.go), and both
+	// are pinned: the second-start 409 in TestStartRunCreatesRunAndConflicts
+	// (below, via writePortalRunError) and the PUT 409 in
+	// TestPortalChatPutRefusedWhileRunActive (chats_test.go, via
+	// writePortalChatError). capability_reserved is pinned by the 400 table
+	// in portal_mapping_capability_verdicts_test.go.
+	//
+	// Every one of those was OPENED and re-read against this paragraph rather
+	// than taken on trust, because the version of this comment that first
+	// claimed them was wrong about one: the run-start pin it named was a
+	// strings.Contains -- the exact shape the paragraph above explains is not
+	// a pin -- so the comment refuted itself and was, worse, the reason a
+	// reader would not go and add the real assertion. If a further code is
+	// ever excused from this table the same way, open the test named and
+	// check its shape.
 	literalCodes := map[error]string{
 		portal.ErrChatTooLarge: "portal.chat_too_large",
 		ErrTooManyRuns:         "portal.chat_run_limit",
@@ -142,8 +158,28 @@ func TestStartRunCreatesRunAndConflicts(t *testing.T) {
 	if w2.Code != http.StatusConflict {
 		t.Fatalf("second start: expected 409, got %d body %s", w2.Code, w2.Body.String())
 	}
-	if !strings.Contains(w2.Body.String(), "portal.chat_run_active") {
-		t.Fatalf("expected chat_run_active code, got %s", w2.Body.String())
+	// THIS is the literal pin for portal.chat_run_active on the RUN-START
+	// surface (writePortalRunError) that TestWritePortalRunError's own
+	// comment points at, so it has to be the shape that comment demands: the
+	// body is DECODED and the code compared for exact equality. It read
+	// `strings.Contains(body, "portal.chat_run_active")` -- precisely the
+	// shape that same comment explains is not a pin at all, since
+	// "portal.chat_run_active_v2" contains "portal.chat_run_active" and
+	// sails through. A test named as the guarantee for a wire code has to be
+	// one.
+	//
+	// The PUT surface has its own pin already
+	// (TestPortalChatPutRefusedWhileRunActive, chats_test.go) and both are
+	// wanted: they share one errRow today, but they are two endpoints a
+	// client meets separately, and a future split of that row must not
+	// silently move one of them.
+	var conflict apierror.Body
+	if err := json.Unmarshal(w2.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("conflict body %s did not decode: %v", w2.Body.String(), err)
+	}
+	if conflict.Error.Code != "portal.chat_run_active" {
+		t.Fatalf("conflict code = %q, want %q (body = %s)",
+			conflict.Error.Code, "portal.chat_run_active", w2.Body.String())
 	}
 }
 
