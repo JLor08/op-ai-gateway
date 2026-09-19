@@ -791,19 +791,20 @@ func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
 // as a user cancel -- the user pressed nothing.
 func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 	restore := imageRunDeadline
-	imageRunDeadline = 10 * time.Millisecond
+	imageRunDeadline = 50 * time.Millisecond
 	t.Cleanup(func() { imageRunDeadline = restore })
 
-	// A provider that never produces anything, so the deadline is what ends the
-	// run. pacedStreamer with a gap far beyond the deadline is the existing fake
-	// for "slow upstream" (server_stream_timeout_test.go). The MODEL is the
-	// harness's mapped text model -- only the KIND selects the bound, and an
-	// unrouted image model would 404 before the deadline could fire.
-	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
-	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
-		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
-	})
+	// An upstream that never answers, so the deadline is what ends the run.
+	//
+	// The harness is the IMAGE one (chat_runs_images_test.go), not a text
+	// route with an image kind: only an image run is bounded, and the
+	// executor now dispatches that kind to /v1/images/generations, so a text
+	// model under an image kind no longer describes a reachable run at all --
+	// it is refused as not image-capable long before any deadline.
+	upstream, release := stalledImagesUpstream(t, "")
+	defer release()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
 	}
@@ -821,21 +822,27 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 	}
 }
 
-// TestRunDeadlineMidStreamIsNotACancelEither covers the SECOND context branch.
-// Once the upstream has answered 200, the executor is inside consumeRunStream
-// and a firing deadline surfaces as a scanner error, whose own ctx.Err() branch
-// also reported "canceled" with an empty message. The provider below emits one
-// delta well before the deadline, so the run is mid-stream when it fires.
-func TestRunDeadlineMidStreamIsNotACancelEither(t *testing.T) {
+// TestRunDeadlineMidResponseIsNotACancelEither covers the SECOND context
+// branch: once the upstream has answered 200 the deadline lands on the run's
+// READ of the response rather than on its round trip, and that branch reported
+// "canceled" with an empty message too.
+//
+// It was written against consumeRunStream's scanner error, where the same
+// branch exists. It cannot be: only an image run is bounded, and an image run
+// never enters consumeRunStream -- so the equivalent branch there is, as of
+// this task, unreachable, and pointing this test at it would be pinning
+// nothing. The upstream below sends the first body chunk (which the gateway's
+// copier flushes straight through, so the run's Do returns) and then stalls,
+// putting the run mid-response when the deadline fires.
+func TestRunDeadlineMidResponseIsNotACancelEither(t *testing.T) {
 	restore := imageRunDeadline
 	imageRunDeadline = 150 * time.Millisecond
 	t.Cleanup(func() { imageRunDeadline = restore })
 
-	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 20, gap: 30 * time.Millisecond})
-	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
-		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
-	})
+	upstream, release := stalledImagesUpstream(t, `{"created":1,`)
+	defer release()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
 	}
@@ -889,15 +896,22 @@ func TestTimedOutRunStillCommitsItsTurn(t *testing.T) {
 	imageRunDeadline = 10 * time.Millisecond
 	t.Cleanup(func() { imageRunDeadline = restore })
 
-	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
-	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
-		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
-	})
+	// The image harness, for the reason spelled out in
+	// TestRunDeadlineIsDistinguishableFromACancel: with the executor now
+	// branching on the kind, a text model under an image kind is refused as
+	// not image-capable and this test would assert its own `"status":"error"`
+	// against a routing failure instead of a timeout.
+	upstream, release := stalledImagesUpstream(t, "")
+	defer release()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
 	}
 	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := runError(t, run); got != runTimedOutMessage {
+		t.Fatalf("run ended %q, not by its deadline -- the transcript check below would prove nothing", got)
+	}
 
 	got, err := srv.Portal.GetChat(context.Background(), owner, chatID)
 	if err != nil {

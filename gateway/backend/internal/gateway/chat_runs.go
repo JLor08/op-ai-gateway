@@ -632,6 +632,16 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 		defer cancelDeadline()
 	}
 
+	// The image kind's executor is a different request against a different
+	// endpoint with a different response shape, and it shares none of the SSE
+	// machinery below (see chat_runs_images.go for why reusing any of it would
+	// be dishonest). Branching before the chat body is built keeps the text
+	// path byte-for-byte what it was.
+	if prep.Settings.Kind == chatRunKindImage {
+		s.executeImageRun(ctx, owner, run, prep)
+		return
+	}
+
 	body, err := buildChatCompletionsBody(prep)
 	if err != nil {
 		s.finishRun(ctx, owner, run, "error", err.Error())
@@ -642,31 +652,7 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 		s.finishRun(ctx, owner, run, "error", err.Error())
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(csrfHeaderName, "1")
-	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
-	req.Header.Set(internalUserHeaderName, owner.UserID)
-	req.Header.Set(sessionHeaderName, run.ChatID)
-	if prep.Settings.RunAsTokenID != "" {
-		req.Header.Set(runAsHeaderName, prep.Settings.RunAsTokenID)
-	}
-	// Carry the chat's (self-healed, see portal.Service.PrepareChatRun) per-run
-	// server override over the loopback call as the same two headers the
-	// gateway's own applyServerOverride re-authorizes on every routed request
-	// (never trusting this value's provenance — see auth.go's doc on the two
-	// consts and applyServerOverride's doc in server.go). Precedence is
-	// TOKEN-FIRST: when the run-as token carries its own ServerOverride, that
-	// governs and this chat header is ignored (the chat UI locks its
-	// server-override controls to match); the chat header applies only when the
-	// run-as token has none. So sending it unconditionally here is safe.
-	if prep.Settings.ServerOverride != "" {
-		req.Header.Set(serverOverrideHeaderName, prep.Settings.ServerOverride)
-		if prep.Settings.ServerOverrideForceUnreachable {
-			req.Header.Set(serverOverrideForceHeaderName, "1")
-		} else {
-			req.Header.Set(serverOverrideForceHeaderName, "0")
-		}
-	}
+	s.setRunLoopbackHeaders(req, owner, run, prep)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -691,6 +677,53 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	}
 
 	s.consumeRunStream(ctx, owner, run, resp)
+}
+
+// setRunLoopbackHeaders applies the header set EVERY loopback request a run
+// makes must carry, whichever endpoint it targets. Shared by the chat hop and
+// the images hop rather than copied: every header below is a property of "the
+// run executor is calling the gateway on the user's behalf", not of the
+// endpoint being called, and two copies would be two places for one of them to
+// go missing (the run-as header alone covers billing, capture flags, the
+// token's server override and its model override).
+//
+// The trusted-loopback pair authenticates the call as a token-less session
+// principal; /v1/images/generations admits it through the same
+// requireInternalOrBearerAnyScope leg /v1/chat/completions does.
+//
+// The session header is set to the chat id on both, and the extractor reads
+// that explicit override BEFORE its per-endpoint switch (session_extract.go),
+// so an image request is tagged as a chat session exactly like a chat one even
+// though /v1/images/generations has no session signal of its own.
+//
+// The chat's (self-healed, see portal.Service.PrepareChatRun) per-run server
+// override rides as the same two headers the gateway's own applyServerOverride
+// re-authorizes on every routed request (never trusting this value's
+// provenance — see auth.go's doc on the two consts and applyServerOverride's
+// doc in server.go). Precedence is TOKEN-FIRST: when the run-as token carries
+// its own ServerOverride, that governs and this chat header is ignored (the
+// chat UI locks its server-override controls to match); the chat header
+// applies only when the run-as token has none. So sending it unconditionally
+// here is safe. It matters on the images path too: that endpoint runs the same
+// inferencePreflight, so applyServerOverride reads these headers there as well,
+// and omitting them would silently ignore an image thread's own override.
+func (s *Server) setRunLoopbackHeaders(req *http.Request, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, "1")
+	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
+	req.Header.Set(internalUserHeaderName, owner.UserID)
+	req.Header.Set(sessionHeaderName, run.ChatID)
+	if prep.Settings.RunAsTokenID != "" {
+		req.Header.Set(runAsHeaderName, prep.Settings.RunAsTokenID)
+	}
+	if prep.Settings.ServerOverride != "" {
+		req.Header.Set(serverOverrideHeaderName, prep.Settings.ServerOverride)
+		if prep.Settings.ServerOverrideForceUnreachable {
+			req.Header.Set(serverOverrideForceHeaderName, "1")
+		} else {
+			req.Header.Set(serverOverrideForceHeaderName, "0")
+		}
+	}
 }
 
 // consumeRunStream reads the loopback SSE, publishing deltas, computing metrics,
@@ -821,12 +854,27 @@ func (r *ChatRun) currentMetrics() runMetrics {
 // terminal. The persisted status uses the transcript vocabulary
 // (complete/error/canceled).
 func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string) {
-	// The commit must outlive the deadline that ended the run: finishRun is
-	// called with the run's own ctx on four paths (the two request-construction
-	// failures, the Do failure and the non-200), so on a timeout the ctx is
-	// ALREADY expired and the commit below would be cancelled before it wrote
-	// -- losing the turn instead of recording why it ended. Same idiom as
-	// benchmark_vram_runner.go:236.
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, nil)
+}
+
+// finishRunWithParts is finishRun for a run whose output is NOT the streamed
+// text buffer: an image run commits its generated image(s) as the turn's
+// structured content instead (portal.AssistantTurn.ContentParts, which is
+// written as the message's `content` when it is non-empty). parts is nil for
+// every text run and on every failing image run, which is byte-for-byte the
+// behaviour finishRun had before this parameter existed.
+//
+// Keeping ONE commit function rather than a second one for images is what
+// keeps the retire/finish/log bookkeeping below single-sourced: a run's
+// terminal step is the same step whatever it produced.
+func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string, parts json.RawMessage) {
+	// The commit must outlive the deadline that ended the run: this is called
+	// with the run's OWN ctx on every failing path (the two
+	// request-construction failures, the Do failure and the non-200 on the
+	// text path; all of them on the image path, which has a single terminal
+	// call site), so on a timeout the ctx is ALREADY expired and the commit
+	// below would be cancelled before it wrote -- losing the turn instead of
+	// recording why it ended. Same idiom as benchmark_vram_runner.go:236.
 	commitCtx := context.WithoutCancel(ctx)
 	reasoning, content := run.buffered()
 	m := run.currentMetrics()
@@ -841,6 +889,7 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
+		ContentParts: parts,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
 	}

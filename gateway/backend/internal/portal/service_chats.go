@@ -504,7 +504,7 @@ func deriveChatTitle(messages []json.RawMessage) string {
 		if json.Unmarshal(m, &pm) != nil || pm.Role != "user" {
 			continue
 		}
-		text := extractText(pm.Content)
+		text := MessageText(pm.Content)
 		text = strings.Join(strings.Fields(text), " ")
 		if text == "" {
 			return ""
@@ -518,9 +518,14 @@ func deriveChatTitle(messages []json.RawMessage) string {
 	return ""
 }
 
-// extractText pulls the text out of a message content that is either a JSON
+// MessageText pulls the text out of a message content that is either a JSON
 // string or an array of parts ([{type:"text",text:...}, ...]).
-func extractText(content json.RawMessage) string {
+//
+// Exported because the gateway's image-run executor needs the SAME extraction
+// to build the upstream prompt from the last user message. A third parser for
+// these two shapes (deriveChatTitle below is the first caller) would be a
+// second definition of what a message's text is, free to drift from this one.
+func MessageText(content json.RawMessage) string {
 	var s string
 	if json.Unmarshal(content, &s) == nil {
 		return s

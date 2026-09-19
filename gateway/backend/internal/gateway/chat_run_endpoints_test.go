@@ -469,16 +469,17 @@ func TestStartRunResponseOmitsTheKindForATextRun(t *testing.T) {
 // through the run's own mutex AFTER ActiveForUser has released the registry
 // lock, keeping the documented lock order intact.
 func TestActiveRunsCarryKindAndAge(t *testing.T) {
-	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 30, gap: 20 * time.Millisecond})
-	// The MODEL is the harness's mapped text model, because the run has to stay
-	// alive long enough to be listed; an unrouted image model would 404 on the
-	// loopback and go terminal at once. What is under test is the kind the run
-	// carries and the age the server measures, not what the executor dispatches
-	// (branching the executor on the kind is a later task).
-	if _, err := srv.startChatRun(owner, chatID, PrepareRunResult{
-		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
-	}); err != nil {
+	// A REAL image run, held open by an upstream that never answers, so it is
+	// still listed while the assertions run. It used to be a text model under
+	// an image kind, with the note that what mattered was the kind the run
+	// carries rather than what the executor dispatches; the executor now
+	// dispatches on that kind, so such a run is refused as not image-capable
+	// and goes terminal at once -- exactly the "listed long enough" problem
+	// the old comment was avoiding, by the opposite route.
+	upstream, release := stalledImagesUpstream(t, "")
+	defer release()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	if _, err := srv.startChatRun(owner, chatID, imageRunPrep()); err != nil {
 		t.Fatalf("startChatRun: %v", err)
 	}
 	list := func(t *testing.T) []activeRunDTO {
