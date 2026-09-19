@@ -29,16 +29,42 @@ import {
 
 // A live run subscription for one chat. `es` is the open EventSource (null once
 // terminal / after close). Keyed by chatId in runsRef.
-type RunState = { runId: string; status: ChatRunStatus; es: EventSource | null };
+type RunState = {
+  runId: string;
+  status: ChatRunStatus;
+  es: EventSource | null;
+  // The run's server-measured age: the ms value from its own last
+  // snapshot/done/201/active-runs-listing payload ("serverMs"), paired with
+  // the performance.now() reading taken the instant THIS client read it
+  // ("anchor"). elapsedMsOf below interpolates from this single pair between
+  // snapshots -- anchoring on the SERVER's own measurement, never on the
+  // local moment of Send, is what lets a reopened tab and the sending tab
+  // agree on the same true elapsed time (see startRunResponse's doc comment,
+  // chat_run_endpoints.go). Re-anchored (a fresh serverMs + a fresh anchor)
+  // whenever a newer snapshot/done arrives; frozen from the terminal one on.
+  //
+  // Deliberately carries no `kind` field: the thread's kind is already real
+  // state on the ChatStore (chatKind/pinnedChatKind, landed by the previous
+  // task), and the composer's pending render reads THAT rather than a second
+  // copy re-derived here from the run's own wire `kind` -- one source for
+  // "what kind of thread is this", not two that could drift apart.
+  age: { serverMs: number; anchor: number };
+};
 
 // Shapes of the named SSE payloads the run endpoint emits (metrics keys are
 // snake_case on the wire; mapped to the camelCase message fields below).
+// `kind`/`elapsed_ms` ride on snapshot/done only (never delta -- see the
+// backend's own runEvent doc comment, chat_runs.go); `kind` is read here for
+// wire-shape completeness but not consumed (see RunState's doc comment above
+// for why), only `elapsed_ms` feeds the age anchor.
 type SnapshotPayload = {
   reasoning?: string;
   content?: string;
   metrics?: RunMetricsPayload;
   status?: ChatRunStatus;
   error?: string;
+  kind?: string;
+  elapsed_ms?: number;
 };
 type DeltaPayload = { reasoning?: string; content?: string };
 
@@ -62,6 +88,11 @@ export type ChatRunsApi = {
   statusOf: (chatId: string) => ChatRunStatus | undefined;
   // The live run's id for chatId, or undefined when it is not running.
   runIdIfRunning: (chatId: string) => string | undefined;
+  // chatId's live run's CURRENT elapsed ms, interpolated from its last known
+  // server anchor to "now" (performance.now()) at call time. Undefined when
+  // chatId has no live run. See RunState's `age` field for why this anchors
+  // on the server's own measurement rather than the local moment of Send.
+  elapsedMsOf: (chatId: string) => number | undefined;
   // Per-chat transcript buffers: a background chat's streamed deltas land
   // here (not in the visible `messages`), and it is also the seed source for
   // (re)activating a chat. Exposed as the live Map itself (stable identity
@@ -69,10 +100,14 @@ export type ChatRunsApi = {
   buffers: Map<string, ChatUiMessage[]>;
   // Register a run's metadata WITHOUT opening its EventSource yet (bootstrap
   // replay registers every active run before the active chat's transcript is
-  // loaded, so interrupted-detection never falsely fires for it).
-  registerRunning: (chatId: string, runId: string) => void;
-  // Open (or reopen) the SSE subscription for a chat's run.
-  subscribe: (chatId: string, runId: string) => void;
+  // loaded, so interrupted-detection never falsely fires for it). `elapsedMs`
+  // seeds the age anchor (from activeRunDTO for a bootstrap replay); omit it
+  // for a run that has genuinely just started, where 0 is the true age.
+  registerRunning: (chatId: string, runId: string, elapsedMs?: number) => void;
+  // Open (or reopen) the SSE subscription for a chat's run. `elapsedMs` seeds
+  // the age anchor exactly like registerRunning's, until the stream's own
+  // first snapshot supplies a fresher one.
+  subscribe: (chatId: string, runId: string, elapsedMs?: number) => void;
   // Close a chat's EventSource and drop its run + buffer bookkeeping.
   forget: (chatId: string) => void;
   // Close every open EventSource without otherwise touching state (provider
@@ -174,7 +209,12 @@ export function useChatRuns(
       const run = runsRef.current.get(chatId);
       if (run) {
         run.es?.close();
-        runsRef.current.set(chatId, { runId: run.runId, status, es: null });
+        // Spread (not a fresh literal): `age` carries over as-is, so the
+        // clock FREEZES at whatever it last was (the terminal snapshot/done's
+        // own elapsed_ms, applied below in the snapshot/done listeners before
+        // this is called) rather than being re-derived from a fresh
+        // performance.now() that would make it start ticking again.
+        runsRef.current.set(chatId, { ...run, status, es: null });
       }
       const msgStatus = messageStatusForRun(status);
       updateChatMessages(chatId, (prev) => {
@@ -243,8 +283,13 @@ export function useChatRuns(
   // Register a run's metadata WITHOUT opening its EventSource (bootstrap
   // replay, and the reopen path below before its transcript is seeded).
   const registerRunning = useCallback(
-    (chatId: string, runId: string) => {
-      runsRef.current.set(chatId, { runId, status: 'running', es: null });
+    (chatId: string, runId: string, elapsedMs = 0) => {
+      runsRef.current.set(chatId, {
+        runId,
+        status: 'running',
+        es: null,
+        age: { serverMs: elapsedMs, anchor: performance.now() },
+      });
       markRunning(chatId, true);
     },
     [markRunning],
@@ -264,7 +309,7 @@ export function useChatRuns(
   // doc, then open the stream — otherwise the snapshot would fabricate a lone
   // assistant bubble on an empty base and, on switch, mask the real transcript.
   const subscribe = useCallback(
-    (chatId: string, runId: string) => {
+    (chatId: string, runId: string, elapsedMs = 0) => {
       runsRef.current.get(chatId)?.es?.close();
 
       // Open the EventSource and wire the run listeners. Assumes the chat's
@@ -273,7 +318,16 @@ export function useChatRuns(
         const es = new EventSource(
           `/api/portal/chats/${encodeURIComponent(chatId)}/runs/${encodeURIComponent(runId)}/events`,
         );
-        runsRef.current.set(chatId, { runId, status: 'running', es });
+        // Seed the age anchor from THIS call's own elapsedMs (the 201's, ~0
+        // for a fresh send/regenerate, or activeRunDTO's real value for a
+        // bootstrap replay) -- never from any entry already in runsRef, which
+        // could belong to an unrelated PRIOR run this same chat once had.
+        runsRef.current.set(chatId, {
+          runId,
+          status: 'running',
+          es,
+          age: { serverMs: elapsedMs, anchor: performance.now() },
+        });
         markRunning(chatId, true);
 
         es.addEventListener('snapshot', (e) => {
@@ -285,6 +339,16 @@ export function useChatRuns(
             content: snap.content ?? '',
             ...metricsOf(snap.metrics),
           }));
+          // Re-anchor from this snapshot's OWN elapsed_ms before any terminal
+          // handling below (finishRun copies the run's CURRENT age verbatim,
+          // so it must already be the frozen, final one by the time it runs).
+          const run = runsRef.current.get(chatId);
+          if (run && typeof snap.elapsed_ms === 'number') {
+            runsRef.current.set(chatId, {
+              ...run,
+              age: { serverMs: snap.elapsed_ms, anchor: performance.now() },
+            });
+          }
           // A late subscriber (reopen/reconnect just after a run finished) gets
           // the terminal state as a `snapshot` (status completed/error/canceled)
           // and then the stream closes with no `done` to follow. Finalize here
@@ -313,6 +377,16 @@ export function useChatRuns(
             content: term.content ?? '',
             ...metricsOf(term.metrics),
           }));
+          // Re-anchor from the terminal event's own elapsed_ms BEFORE
+          // finishRun: from here on the age must read as the run's real,
+          // frozen duration -- not the running age from the last snapshot.
+          const run = runsRef.current.get(chatId);
+          if (run && typeof term.elapsed_ms === 'number') {
+            runsRef.current.set(chatId, {
+              ...run,
+              age: { serverMs: term.elapsed_ms, anchor: performance.now() },
+            });
+          }
           finishRun(chatId, term.status ?? 'completed', term.error);
           // Adopt the server-committed transcript (server ids + status) so the
           // buffer is canonical and never clobbered by the FE copy (follow-up #A).
@@ -336,7 +410,7 @@ export function useChatRuns(
       // Register its run metadata NOW (so switching to it treats it as running,
       // not interrupted), then seed its buffer from the server doc BEFORE
       // opening the stream. Best-effort: on a fetch failure just open the stream.
-      registerRunning(chatId, runId);
+      registerRunning(chatId, runId, elapsedMs);
       void (async () => {
         let docMessages: ChatUiMessage[] | null = null;
         try {
@@ -386,6 +460,29 @@ export function useChatRuns(
     const run = runsRef.current.get(chatId);
     return run?.status === 'running' ? run.runId : undefined;
   }, []);
+  // chatId's live run's current elapsed ms: its last known server anchor,
+  // interpolated to "now" by the performance.now() gap since it was taken.
+  // Called at render time (not itself reactive), so a caller that wants this
+  // to keep ticking on screen re-derives it every render, same as `now =
+  // Date.now()` in ActiveRequestsPanel -- the difference here is only WHICH
+  // clock anchors the value (see RunState's doc comment on `age`).
+  //
+  // Once the run is TERMINAL, `age.serverMs` already IS its final duration
+  // (the snapshot/done listener re-anchored it from the terminal event's own
+  // elapsed_ms), so it is returned verbatim, with NO further
+  // performance.now() gap added. Without this guard a chat left open past a
+  // run's completion would silently grow this value on every unrelated
+  // re-render (typing, switching models, ...) even though nothing is
+  // rendering it right now -- exactly the re-derived-after-terminal drift
+  // constraint 3 forbids, just one call deeper than where it would be
+  // visible. A late subscriber inside the run's eviction grace must be told
+  // how long the run TOOK, not how long ago the registry last touched it.
+  const elapsedMsOf = useCallback((chatId: string): number | undefined => {
+    const run = runsRef.current.get(chatId);
+    if (!run) return undefined;
+    if (run.status !== 'running') return run.age.serverMs;
+    return run.age.serverMs + (performance.now() - run.age.anchor);
+  }, []);
 
   // Close a chat's EventSource and drop its run/buffer bookkeeping (deleteChat;
   // the backend DELETE also cancels the server-side run).
@@ -412,6 +509,7 @@ export function useChatRuns(
     isRunning,
     statusOf,
     runIdIfRunning,
+    elapsedMsOf,
     buffers: chatBuffersRef.current,
     registerRunning,
     subscribe,

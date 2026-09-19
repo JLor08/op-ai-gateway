@@ -317,6 +317,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   tps={message.tps}
                   tokensPerSecond={message.tokensPerSecond}
                   streaming={c.streaming && isLast && message.role === 'assistant'}
+                  kind={c.chatKind}
+                  elapsedMs={c.runElapsedMs}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   canRun={c.modelAvailable}

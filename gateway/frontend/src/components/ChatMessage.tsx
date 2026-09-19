@@ -13,6 +13,7 @@ import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent } from './shared/chatContent';
 import type { Translation } from './shared/types';
 import { ImageTurn } from './ImageTurn';
+import { ImagePendingTurn } from './ImagePendingTurn';
 
 function contentText(content: ChatContent): string {
   if (typeof content === 'string') return content;
@@ -47,6 +48,8 @@ function ChatMessageComponent({
   reasoning,
   reasoningMs,
   streaming,
+  kind,
+  elapsedMs,
   ttftMs,
   tps,
   tokensPerSecond,
@@ -64,6 +67,16 @@ function ChatMessageComponent({
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
+  // The active THREAD's kind ("" text | "image", ChatStore's chatKind) --
+  // not this message's own history, since a thread's kind is pinned for its
+  // whole life. Only meaningful together with `streaming`: it selects the
+  // image-run pending render below for the one turn that is both streaming
+  // and imageless. Absent on every call site that predates image threads.
+  kind?: string;
+  // The active run's server-anchored elapsed ms (ChatStore's runElapsedMs),
+  // passed through untouched -- see ImagePendingTurn for how it is
+  // interpolated into a ticking display.
+  elapsedMs?: number;
   ttftMs?: number;
   tps?: number;
   tokensPerSecond?: number;
@@ -83,6 +96,20 @@ function ChatMessageComponent({
   const roleLabel = role === 'user' ? t.userRole : t.assistantRole;
 
   if (role === 'assistant') {
+    // An image run emits ZERO incremental events -- the endpoint refuses
+    // `stream` outright -- so there is nothing to count and the character
+    // counter below would read "0 Zeichen" for the WHOLE multi-minute wait.
+    // Three elements instead, each backed by a value that exists: liveness
+    // from the run's own server-reported status (streaming), an elapsed
+    // clock anchored on the server's own measurement, and one sentence
+    // stating that no intermediate news is coming (see ImagePendingTurn).
+    // `images.length === 0` keeps this from replacing an arriving image in
+    // the same render, and this check runs BEFORE showReasoning below is
+    // even computed, so the ordinary text-pending branch never sees it.
+    if (streaming && kind === 'image' && images.length === 0) {
+      return <ImagePendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
+    }
+
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
     let summary: string;

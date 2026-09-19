@@ -7,16 +7,8 @@ import type { Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { formatMetric } from './shared/format';
+import { formatElapsed } from './shared/elapsed';
 import type { ActivityScope } from './ActivityToolbar';
-
-// Elapsed since a request started: "Xs" under a minute, otherwise "m:ss".
-function formatElapsed(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  if (total < 60) return `${total}s`;
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return `${minutes}:${String(seconds).padStart(2, '0')}`;
-}
 
 // A MEASURED rate must never be indistinguishable from a measured zero — that is
 // this feature's whole thesis. formatMetric(value, 1) guards only falsy values, so

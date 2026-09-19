@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatMessage } from './ChatMessage';
 import { messages, type Locale } from '../i18n';
@@ -85,6 +85,91 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       render(<ChatMessage t={t} role="assistant" content="" streaming reasoning="still working" />);
       expect(screen.getByText((c) => c.startsWith(t.chatReasoningActive))).toBeInTheDocument();
       expect(screen.getByTestId('chat-stream-cursor')).toBeInTheDocument();
+    });
+
+    it('shows the image wait label, a clock and the no-news sentence while an image run is pending', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          content=""
+          streaming
+          kind="image"
+          elapsedMs={107_000}
+        />,
+      );
+      expect(screen.getByText(t.chatImageRunPending)).toBeInTheDocument();
+      expect(screen.getByText('1:47')).toBeInTheDocument();
+      expect(screen.getByText(t.chatImageNoIntermediateNews)).toBeInTheDocument();
+    });
+
+    it('shows NO character counter for a pending image run', () => {
+      render(
+        <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={0} />,
+      );
+      // The counter is honest for text -- the number is real and it moves. For
+      // an image run there is nothing to count, so it must be ABSENT, not zero:
+      // proxyNative makes the same distinction one layer down when it gives a
+      // buffered relay progress = nil rather than an always-zero struct.
+      expect(screen.queryByText(new RegExp(t.chatCharsUnit))).toBeNull();
+      expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
+    });
+
+    it('hides the clock from assistive technology', () => {
+      render(
+        <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={5_000} />,
+      );
+      // The transcript is an aria-live log; a ticking number would be announced
+      // once a second and make the thread unusable with a screen reader.
+      expect(screen.getByText('5s').closest('[aria-hidden="true"]')).not.toBeNull();
+    });
+
+    it('ticks the clock once a second from the server anchor', async () => {
+      vi.useFakeTimers();
+      try {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="image"
+            elapsedMs={3_000}
+          />,
+        );
+        expect(screen.getByText('3s')).toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2_000);
+        });
+        expect(screen.getByText('5s')).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('leaves the text pending state exactly as it was', () => {
+      render(<ChatMessage t={t} role="assistant" content="" streaming reasoning="thinking" />);
+      // No kind prop: the existing counter must be untouched, because this is
+      // the overwhelmingly common case.
+      expect(screen.getByText(new RegExp(t.chatReasoningActive))).toBeInTheDocument();
+      expect(screen.getByText(new RegExp(t.chatCharsUnit))).toBeInTheDocument();
+    });
+
+    it('does not show the image pending state once an image has arrived, even while still streaming', () => {
+      // images.length === 0 is the guard that keeps ImagePendingTurn from
+      // replacing an arriving image in the same render.
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+          streaming
+          kind="image"
+          elapsedMs={12_000}
+        />,
+      );
+      expect(screen.queryByText(t.chatImageRunPending)).toBeNull();
+      expect(screen.getAllByRole('img')).toHaveLength(1);
     });
 
     it('summarizes reasoning with char count and seconds once finished', () => {

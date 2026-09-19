@@ -163,6 +163,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model">{c.model}</span>
       <span data-testid="model-available">{String(c.modelAvailable)}</span>
       <span data-testid="chat-kind">{c.chatKind}</span>
+      <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
       <span data-testid="image-capacity">
         {c.imageCapacityLeft === null ? 'unknown' : String(c.imageCapacityLeft)}
@@ -1045,6 +1046,118 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // ...and the shown transcript is the server's canonical doc (not the FE buffer).
       await waitFor(() => expect(screen.getByTestId('last').textContent).toBe('canonical answer'));
       expect(screen.getByTestId('last-status').textContent).toBe('complete');
+    });
+  });
+
+  describe(`ChatStoreProvider run-elapsed anchor (Task 14) [${locale}]`, () => {
+    // /v1/images/generations refuses `stream`, so an image run's SSE stream
+    // carries exactly ONE snapshot near the start and then nothing until
+    // `done` -- tens of seconds to minutes later. The composer's pending
+    // clock must still tick through that whole gap, so this pins the anchor
+    // math end to end: seed from a snapshot's elapsed_ms, then advance real
+    // (fake) time with NO further server event, and the exposed
+    // `runElapsedMs` must have grown by the same amount. A client that
+    // recomputed elapsed time from the moment of Send (ignoring elapsed_ms)
+    // would still pass the "grows by ~3000" half of this test, so the FIRST
+    // assertion (the value right after the snapshot is ~5000, not ~0) is
+    // what pins the anchor itself, not just the ticking.
+    it("anchors on the run's own snapshot elapsed_ms and interpolates locally between snapshots", async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      // shouldAdvanceTime keeps wall-clock flowing so RTL's waitFor (a real
+      // setTimeout poll under the hood) still resolves -- same reasoning as
+      // the refreshModels-poll test above.
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderProvider();
+        await waitForReady();
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        const es = FakeEventSource.instances[0];
+
+        // The server says 5s had already elapsed (e.g. admission queueing)
+        // before this snapshot was taken.
+        await act(async () => {
+          es.emit('snapshot', { status: 'running', elapsed_ms: 5000 });
+        });
+        const afterSnapshot = Number(screen.getByTestId('run-elapsed-ms').textContent);
+        expect(afterSnapshot).toBeGreaterThanOrEqual(5000);
+        expect(afterSnapshot).toBeLessThan(5050);
+
+        // No further snapshot arrives (the whole point of a buffered image
+        // run) -- the clock must still advance from LOCAL interpolation
+        // alone. runElapsedMs is read at render time (ImagePendingTurn, not
+        // ChatStore, owns the actual once-a-second tick a user sees -- see
+        // ChatMessage.test.tsx), so force a fresh render via an unrelated
+        // store action, the same way the freeze test below does.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(3000);
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+        const afterTick = Number(screen.getByTestId('run-elapsed-ms').textContent);
+        expect(afterTick - afterSnapshot).toBeGreaterThanOrEqual(2900);
+        expect(afterTick).toBeLessThan(8100);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // A finished run lingers in the registry for the eviction grace period,
+    // and elapsedMsLocked's own backend contract (chat_runs.go) FREEZES at
+    // the run's real duration once terminal -- a late subscriber must be
+    // told how long the run TOOK, not how long ago it happened to be read.
+    // Without the `run.status !== 'running'` guard in elapsedMsOf, this value
+    // would silently keep growing on every unrelated re-render for as long as
+    // the chat stays open after completion, even though nothing is currently
+    // rendering it.
+    it("freezes the elapsed value at the run's final duration once terminal, instead of continuing to grow", async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderProvider();
+        await waitForReady();
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        const es = FakeEventSource.instances[0];
+
+        await act(async () => {
+          es.emit('done', { status: 'completed', content: 'answer', elapsed_ms: 8000 });
+        });
+        const afterDone = Number(screen.getByTestId('run-elapsed-ms').textContent);
+        expect(afterDone).toBeGreaterThanOrEqual(8000);
+        expect(afterDone).toBeLessThan(8050);
+
+        // Let a lot of (fake) wall-clock time pass, and force a fresh render
+        // via an unrelated store action -- a naive "always add
+        // performance.now() - anchor" implementation would show ~28000 here.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(20000);
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+        const afterWait = Number(screen.getByTestId('run-elapsed-ms').textContent);
+        expect(afterWait).toBe(afterDone);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

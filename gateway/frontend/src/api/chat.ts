@@ -70,7 +70,24 @@ export type ChatContentDoc = {
 // (surviving client disconnects) and is subscribed to via SSE elsewhere (the
 // ChatStore); this transport layer only starts/cancels/lists runs.
 export type ChatRunStatus = 'running' | 'completed' | 'error' | 'canceled' | 'interrupted';
-export type ActiveChatRun = { chat_id: string; run_id: string; status: ChatRunStatus };
+export type ActiveChatRun = {
+  chat_id: string;
+  run_id: string;
+  status: ChatRunStatus;
+  // Present only for a run whose thread is pinned "image" (both omitempty on
+  // the wire, mirroring activeRunDTO in chat_run_endpoints.go): the run's
+  // kind and its server-measured age in ms. elapsed_ms is what lets a
+  // REOPENED browser anchor the composer's pending clock on the same true
+  // value the sending tab saw, rather than starting it over from zero (see
+  // useChatRuns' elapsedMsOf and ImagePendingTurn). `kind` is carried here
+  // for wire fidelity with the backend DTO; the frontend renders the
+  // composer's kind from the thread's own pinned ChatSettings.kind
+  // (chatKind/pinnedChatKind in ChatStore, landed by the previous task)
+  // rather than from this per-run copy, so there is exactly one place that
+  // decides "what kind of thread is this".
+  kind?: string;
+  elapsed_ms?: number;
+};
 export type StartChatRunBody = {
   user_message?: unknown;
   edited_history?: unknown[];
@@ -89,7 +106,18 @@ export type StartChatRunBody = {
     kind: string;
   };
 };
-export type StartChatRunResponse = { run_id: string; chat_id: string; status: ChatRunStatus };
+export type StartChatRunResponse = {
+  run_id: string;
+  chat_id: string;
+  status: ChatRunStatus;
+  // Mirrors ActiveChatRun's kind/elapsed_ms above (see startRunResponse's own
+  // doc comment, chat_run_endpoints.go). elapsed_ms is ~0 here and, per its
+  // own omitempty, in practice absent from this response -- that absence
+  // says nothing. Kept unread by the frontend for the same reason as
+  // ActiveChatRun.kind above: chatKind already owns that decision.
+  kind?: string;
+  elapsed_ms?: number;
+};
 
 export function chatApi(fetcher: Fetcher) {
   return {

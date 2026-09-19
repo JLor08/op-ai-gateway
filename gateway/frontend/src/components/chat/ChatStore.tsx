@@ -127,6 +127,13 @@ export type ChatStore = {
   // modelImageCapable — a text thread stays a text thread even if the user
   // later picks an image model.
   chatKind: string;
+  // The active chat's live run elapsed ms, anchored on the run's own last
+  // server-reported measurement and interpolated to "now" at render time
+  // (see useChatRuns' elapsedMsOf). Undefined when the active chat has no
+  // live run. ChatMessage only reads this while it is ALSO told the chat is
+  // streaming (Chat.tsx gates that per-row already), so passing it here
+  // unconditionally is harmless for a text run or a finished chat.
+  runElapsedMs: number | undefined;
   // How many more generated images this chat is expected to hold before it
   // hits the backend's content cap, or null when that is unknown (a text
   // thread, or a gateway that serves no max_content_bytes). null means
@@ -443,6 +450,7 @@ export function ChatStoreProvider({
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
+    elapsedMsOf,
     buffers: chatBuffers,
     registerRunning,
     subscribe: subscribeRun,
@@ -455,6 +463,15 @@ export function ChatStoreProvider({
   // so streaming reflects only the chat currently on screen; background runs
   // still progress and keep their own entry in runningChatIds.
   const streaming = activeChatId ? runningChatIds.has(activeChatId) : false;
+
+  // The active chat's live run elapsed ms (undefined with no live run),
+  // recomputed at every render from its server anchor -- ChatMessage's own
+  // ImagePendingTurn does the per-second ticking locally, so this need not be
+  // (and for an image run, mostly ISN'T: it emits no incremental events to
+  // re-render on). Read via elapsedMsOf, not a separate piece of state, for
+  // the same reason chatKind above is read from settings rather than
+  // reconstructed here: one source per fact.
+  const runElapsedMs = activeChatId ? elapsedMsOf(activeChatId) : undefined;
 
   // The persistence layer (FA-2): owns buildDoc/flushSave, the debounced-save
   // effect, the pagehide keepalive, and the unmount flush behind a narrow
@@ -643,7 +660,7 @@ export function ChatStoreProvider({
           const active = await apiRef.current.activeChatRuns();
           if (cancelled) return;
           activeRuns = active.data;
-          for (const run of activeRuns) registerRunning(run.chat_id, run.run_id);
+          for (const run of activeRuns) registerRunning(run.chat_id, run.run_id, run.elapsed_ms);
         } catch {
           /* best-effort: no active-run replay */
         }
@@ -676,7 +693,7 @@ export function ChatStoreProvider({
         // its snapshot updates the already-shown trailing assistant; a background
         // running chat is seeded from its server doc inside subscribeRun before
         // its snapshot is applied.
-        for (const run of activeRuns) subscribeRun(run.chat_id, run.run_id);
+        for (const run of activeRuns) subscribeRun(run.chat_id, run.run_id, run.elapsed_ms);
       } catch (err) {
         if (!cancelled) showErrorRef.current(formatPortalError(err, tRef.current));
       } finally {
@@ -848,7 +865,7 @@ export function ChatStoreProvider({
           edited_history: history.map((m) => ({ ...m })),
           settings: currentSettings(),
         });
-        subscribeRun(chatId, res.run_id);
+        subscribeRun(chatId, res.run_id, res.elapsed_ms);
       } catch (err) {
         showErrorRef.current(formatPortalError(err, tRef.current));
       }
@@ -996,7 +1013,7 @@ export function ChatStoreProvider({
         user_message: content,
         settings: currentSettings(),
       });
-      subscribeRun(chatId, res.run_id);
+      subscribeRun(chatId, res.run_id, res.elapsed_ms);
     } catch (err) {
       showErrorRef.current(formatPortalError(err, tRef.current));
       const rolledBack = messagesRef.current.filter((m) => m.id !== userMessage.id);
@@ -1211,6 +1228,7 @@ export function ChatStoreProvider({
     modelVisionCapable,
     modelImageCapable,
     chatKind,
+    runElapsedMs,
     imageCapacityLeft,
     chats,
     activeChatId,

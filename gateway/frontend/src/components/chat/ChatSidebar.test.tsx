@@ -41,6 +41,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelVisionCapable: true,
     modelImageCapable: false,
     chatKind: '',
+    runElapsedMs: undefined,
     imageCapacityLeft: null,
     chats: [
       { id: 'c1', title: 'First chat', created_at: '', updated_at: '2026-07-17T13:00:00Z' },

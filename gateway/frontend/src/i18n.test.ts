@@ -808,6 +808,28 @@ describe('image-thread composer i18n keys', () => {
   });
 });
 
+describe('image-run pending composer i18n keys', () => {
+  const keys = ['chatImageRunPending', 'chatImageNoIntermediateNews'] as const;
+
+  it('defines the pending-composer keys in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // Deliberately not "the image is being generated": between dispatch and
+  // terminal the request may still be queued for admission or waiting on a
+  // model load, during which "is being generated" is false. The wording must
+  // describe the WAIT (true for the whole span), not the work.
+  it('describes the wait, not the (possibly not yet started) work', () => {
+    expect(messages.de.chatImageRunPending).not.toContain('wird erzeugt');
+    expect(messages.en.chatImageRunPending).not.toContain('being generated');
+  });
+});
+
 describe('loaded-model i18n keys', () => {
   it('defines the loaded-model table/chat/application keys in de and en', () => {
     const keys = [

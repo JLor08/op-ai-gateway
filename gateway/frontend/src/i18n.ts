@@ -205,6 +205,17 @@ const de = {
   // multi-minute generation, so it is stated up front rather than after.
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  // The composer during an image run's wait (spec §3.6): the pending label
+  // and the static "nothing more is coming" sentence -- ImagePendingTurn's
+  // only two announced strings (its clock is aria-hidden). Deliberately NOT
+  // "Bild wird erzeugt": between dispatch and terminal the request may still
+  // be queued for admission or waiting on a model load, during which "is
+  // being generated" is false, while "waiting for image" holds for the
+  // whole span and keeps the clock's referent unambiguous -- the wait, not
+  // the work.
+  chatImageRunPending: 'Warte auf Bild',
+  chatImageNoIntermediateNews:
+    'Keine Zwischenmeldungen – das Bild erscheint fertig oder gar nicht.',
   chatCapacityRemaining: (count: number) => `Platz für etwa noch ${count} Bild(er) in diesem Chat.`,
   chatCapacityExhausted:
     'Dieser Chat hat keinen Platz mehr für ein weiteres Bild. Lade die vorhandenen Bilder herunter und beginne einen neuen Chat.',
@@ -2618,6 +2629,9 @@ const en: PortalMessages = {
   chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
   chatImagePromptLabel: 'Image prompt',
   chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatImageRunPending: 'Waiting for image',
+  chatImageNoIntermediateNews:
+    'No intermediate updates – the image arrives finished or not at all.',
   chatCapacityRemaining: (count: number) => `Room for about ${count} more image(s) in this chat.`,
   chatCapacityExhausted:
     'This chat has no room for another image. Download the images you have and start a new chat.',
