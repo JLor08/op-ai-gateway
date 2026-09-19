@@ -203,10 +203,12 @@ curl -s http://localhost:8080/openai/v1/chat/completions \
 ```
 
 Browsers authenticate with a session cookie + `X-OP-CSRF` header instead
-(`/v1/chat/completions` additionally accepts that session auth; the other
-inference endpoints are bearer-only). The portal's chat playground runs each
-turn as a server-side run — surviving page reloads and disconnects — and
-streams it to the browser over SSE. The complete endpoint reference is in
+(`/v1/chat/completions` additionally accepts that session auth;
+`/v1/images/generations` additionally accepts the gateway's own internal
+loopback pair — never a browser session; every other inference endpoint is
+bearer-only). The portal's chat playground runs each turn as a server-side
+run — surviving page reloads and disconnects — and streams it to the browser
+over SSE. The complete endpoint reference is in
 [HTTP API Surface](docs/architecture/reference/api-surface.md).
 
 ## Local development

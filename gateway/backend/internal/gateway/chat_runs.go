@@ -813,8 +813,14 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 // token's server override and its model override).
 //
 // The trusted-loopback pair authenticates the call as a token-less session
-// principal; /v1/images/generations admits it through the same
-// requireInternalOrBearerAnyScope leg /v1/chat/completions does.
+// principal on both hops -- but through two DIFFERENT helpers, and the
+// difference is the point. /v1/chat/completions resolves it in
+// requireWebAnyScope -> authenticateWeb, which also admits a browser session
+// cookie; /v1/images/generations resolves it in
+// requireInternalOrBearerAnyScope -> authenticateInternalOrBearer, which is
+// that ladder MINUS the cookie branch, so no logged-in browser can reach it.
+// Only the loopback check itself is shared: both helpers call the same
+// loopbackPrincipal (auth.go), so the secret comparison exists once.
 //
 // The session header is set to the chat id on both, and the extractor reads
 // that explicit override BEFORE its per-endpoint switch (session_extract.go),

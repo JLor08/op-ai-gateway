@@ -137,9 +137,23 @@ want a chat run to inherit a *specific stored API token's* limits, model
 overrides, project attribution, or server pin instead of the session's
 defaults. `X-OP-Run-As-Token` carries that token's **ID** (not its secret —
 the caller is already a CSRF-protected authenticated session, so this header
-is a capability *selector*, not a credential) on chat-completions requests —
-those handled by `handleOpenAIChat`, reached via both `/v1/chat/completions`
-(the path the loopback run executor actually posts to) and its `/openai/` alias.
+is a capability *selector*, not a credential) on the requests handled by
+`handleOpenAIChat` — `/v1/chat/completions` (the path the loopback run
+executor actually posts to) and its `/openai/` alias — **and, since the portal
+gained image turns, on `/v1/images/generations` and its `/openai/` alias
+too**: `handleOpenAIImages` (`internal/gateway/images_handler.go`) carries the
+identical block, guarded the identical way, so an image turn started under a
+run-as token bills, captures and routes under that token rather than under the
+bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
+shows both edges into `AuthorizeRunAsToken`; do not read this section as
+naming chat completions exclusively.
+
+The gate is the resolved principal's **token id being empty**, not the path and
+not the headers the request carries: `token.ID == ""` is true only for the
+loopback/session-shaped principal and never for a bearer principal, so the
+header structurally cannot act on `/v1/responses` or `/v1/messages`, whose
+bearer-derived id is always populated ([API Compatibility & Inference
+§12](compatibility-and-inference.md#12-in-portal-chat-playground)).
 
 `portal.Service.AuthorizeRunAsToken(ctx, principal, tokenID)` is the sole
 authorization point:
@@ -155,8 +169,10 @@ On success, the request proceeds as that token's `auth.Token` — its scopes,
 project, and server override, not the session's. This is the mechanism the gateway's own
 background chat-run executor uses when it calls back into itself over the
 internal trusted-loopback path (`X-OP-Internal-Auth`): it optionally attaches
-`X-OP-Run-As-Token` to run the executed chat step under a specific token's
-identity. If the run-as token itself carries a `ServerOverride`, that takes
+`X-OP-Run-As-Token` to run the executed step under a specific token's
+identity — on its images hop as well as its chat hop, since
+`setRunLoopbackHeaders` (`internal/gateway/chat_runs.go`) sets one header set
+for both. If the run-as token itself carries a `ServerOverride`, that takes
 precedence over any separately-configured chat server override — the
 run-as token's own settings always win.
 

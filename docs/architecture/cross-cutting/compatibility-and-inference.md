@@ -836,10 +836,12 @@ from the browser. Instead:
    `internal/gateway/chat_runs.go`) makes a **loopback** `POST` to its own
    `/v1/chat/completions` — or to `/v1/images/generations`, when the run's kind
    is `image` (below) — authenticating via the internal trusted-loopback
-   header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first* in
-   `authenticateWeb`, `internal/gateway/auth.go`, and blanked by nginx at the
-   public edge so an external client can never inject them), plus the same
-   `X-OP-CSRF` header a direct browser call would need.
+   header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first*
+   by `loopbackPrincipal`, `internal/gateway/auth.go`, which both
+   `authenticateWeb` and, for the images hop, `authenticateInternalOrBearer`
+   call before anything else; blanked by nginx at the public edge so an
+   external client can never inject them), plus the same `X-OP-CSRF` header a
+   direct browser call would need.
 3. `/v1/chat/completions` and `/v1/images/generations` are the only two
    inference endpoints reachable through a token-less, session-shaped
    principal — chat completions via `requireWebAnyScope` → `authenticateWeb`

@@ -49,6 +49,21 @@ user's session without an API token — each chat turn runs as a server-side run
 whose executor calls the gateway's own `/v1/chat/completions` over loopback and
 streams the result to the browser via SSE (surviving page reloads/disconnects).
 
+**Amended by [ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (the image kind splits the loopback leg off the
+session leg).** The decision above is unchanged in substance and its two named
+bearer-only endpoints are still bearer-only. What it could not distinguish, because
+nothing needed the distinction yet, is that "the session" and "the internal
+trusted-loopback path" are two separate legs and an endpoint may admit the second
+without the first. `/v1/images/generations` does exactly that: the portal-chat run
+executor reaches it over loopback (`requireInternalOrBearerAnyScope` →
+`authenticateInternalOrBearer`, `internal/gateway/auth_internal_or_bearer.go`), while
+a logged-in browser cannot call it at all. So `/v1/chat/completions` remains the only
+inference endpoint reachable with a **session cookie**, and it is no longer the only
+one reachable over **loopback** — read the parenthesis above as naming a leg that
+ADR-043 later granted separately. See [Security, Authentication & Authorization
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)
+for the current three-leg table.
+
 ## ADR-007 — Secrets at rest: the `enc:`/`plain:` scheme
 **Decision:** decryptable secrets are sealed with a key, or held plaintext only in
 volatile RAM, or rejected on disk when no key is present; DTOs expose only `*_set`
