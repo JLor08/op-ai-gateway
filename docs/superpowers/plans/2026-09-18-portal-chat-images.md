@@ -243,8 +243,14 @@ func TestModelsResponseImageFlag(t *testing.T) {
 }
 
 // A model offered by TWO mappings is image-capable only when BOTH say yes.
-// This is the fail-closed half, and it works only because the accumulator is
-// seeded to true on a model's first view and then only ever ANDed down.
+//
+// NOTE: this test does NOT pin the fail-closed seed, despite what an earlier
+// draft of this comment claimed. One of its mappings says `no`, so the AND is
+// false whether the accumulator starts at the seeded true or at Go's
+// zero-value false. The seed's necessity is pinned by
+// TestModelsResponseImageFlag's "sd" case -- a single yes-verdict mapping,
+// which reads false without the seed. Verified by reverting the seed and
+// watching which test goes red.
 func TestModelsResponseImageAndAcrossMappings(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
