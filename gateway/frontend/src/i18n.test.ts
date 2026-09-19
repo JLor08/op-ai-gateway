@@ -2739,3 +2739,43 @@ describe('responses live-timings i18n keys', () => {
     }
   });
 });
+
+// Portal chat image generation (task 8): the chat run lifecycle's own error
+// codes, the mapping capability-form refusal, and the four images.* codes now
+// reachable from a chat run rather than only from a direct API client. The
+// wire codes themselves are pinned in format.test.ts; this only guards that
+// both locales define a non-empty string for each label key.
+describe('portal chat image generation error i18n keys', () => {
+  it('defines the chat-run, mapping and images error-code keys in de and en', () => {
+    const keys = [
+      'errorChatTooLarge',
+      'errorChatRunActive',
+      'errorChatRunLimit',
+      'errorMappingCapabilityReserved',
+      'errorChatRunTimeout',
+      'errorChatRunNoImage',
+      'errorChatRunImageFormatUnknown',
+      'errorChatRunImageResponseUnreadable',
+      'errorChatRunCommitFailed',
+      'errorImagesPromptRequired',
+      'errorImagesStreamUnsupported',
+      'errorImagesResponseFormatUnsupported',
+      'errorImagesUpstreamError',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // errorChatTooLarge is the one that matters most: the user's image exists
+  // on screen and cannot be stored, so the message must actually tell them
+  // what to do (download it, start a new chat) rather than just naming the
+  // failure.
+  it('tells the user what to do about a too-large chat, in both locales', () => {
+    expect(messages.de.errorChatTooLarge).toContain('neuen Chat');
+    expect(messages.en.errorChatTooLarge).toContain('new chat');
+  });
+});

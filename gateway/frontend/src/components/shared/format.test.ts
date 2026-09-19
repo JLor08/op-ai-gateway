@@ -220,6 +220,88 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ).toEqual(liveTimingsWireCodes.slice().sort());
   });
 
+  /**
+   * Task 8's chat-run-lifecycle codes, plus the mapping capability-form
+   * refusal reachable from the operator form this feature added, pinned as
+   * LITERALS for the same reason the VRAM/live-timings lists above are: the
+   * whole-map invariants cannot catch a code STRING drifting from the
+   * backend's, and an unmapped code is not an error reported badly --
+   * `formatPortalError` falls back to the raw English the server sent.
+   *
+   * Declared in Go as `portal.ErrChatTooLarge` (service_chats.go),
+   * `gateway.ErrRunAlreadyActive` / `ErrTooManyRuns` (chat_runs.go),
+   * `portal.ErrMappingCapabilityReserved` (service_applications.go, wired to
+   * this code in portal_mapping_endpoints.go's `errRow` table), and the
+   * three `gateway.chat_run_*` string constants in chat_runs.go /
+   * chat_runs_images.go (`runTimedOutMessage`, `imageRunNoImageMessage`,
+   * `imageRunFormatUnknownMessage`, `imageRunResponseUnreadableMessage`,
+   * `chatRunCommitFailedMessage`).
+   */
+  const chatRunWireCodes = [
+    'portal.chat_too_large',
+    'portal.chat_run_active',
+    'portal.chat_run_limit',
+    'mapping.capability_reserved',
+    'gateway.chat_run_timeout',
+    'gateway.chat_run_no_image',
+    'gateway.chat_run_image_format_unknown',
+    'gateway.chat_run_image_response_unreadable',
+    'gateway.chat_run_commit_failed',
+  ] as const;
+
+  it('carries every chat-run-lifecycle and mapping-capability code, by its exact wire string', () => {
+    for (const code of chatRunWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    // Both directions, like the lists above: a tenth `portal.chat_*` /
+    // `gateway.chat_run*` / `mapping.capability_reserved` code added to the
+    // map without being named here fails too.
+    expect(
+      entries
+        .filter(
+          ([code]) =>
+            code.startsWith('portal.chat_') ||
+            code.startsWith('gateway.chat_run') ||
+            code === 'mapping.capability_reserved',
+        )
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(chatRunWireCodes.slice().sort());
+  });
+
+  /**
+   * The four `images.*` codes Task 7 made reachable from a chat run, not
+   * just from a direct API client (validateImagesRequest's two refusals,
+   * plus the run's own relay of a non-2xx upstream body via
+   * `upstreamErrorCode` / `imagesUpstreamErrorCode`, all in
+   * `internal/gateway/images_handler.go`). Pinned as literals for the same
+   * reason as the group above.
+   */
+  const imagesWireCodes = [
+    'images.prompt_required',
+    'images.stream_unsupported',
+    'images.response_format_unsupported',
+    'images.upstream_error',
+  ] as const;
+
+  it('carries every images.* refusal code reachable from a chat run, by its exact wire string', () => {
+    for (const code of imagesWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('images.'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(imagesWireCodes.slice().sort());
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is

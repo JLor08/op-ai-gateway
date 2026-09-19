@@ -415,6 +415,59 @@ func TestImageRunKeepsTheUpstreamErrorCode(t *testing.T) {
 	}
 }
 
+// A 2xx body that is not valid JSON (an HTML error page from a proxy in
+// front of the upstream, a truncated buffer that still LOOKS successful at
+// the status line) must not end the run with json.Unmarshal's own Go error
+// text ("invalid character '<' looking for beginning of value") in a portal
+// bubble -- a user cannot act on that, and it names an implementation detail.
+func TestImageRunNonJSONBodyIsUnreadableNotARawGoError(t *testing.T) {
+	upstream, _ := imagesUpstream(t, http.StatusOK, `<html>not json</html>`)
+
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+	if got := runError(t, run); got != imageRunResponseUnreadableMessage {
+		t.Fatalf("error = %q, want %q, not a raw Go decode error", got, imageRunResponseUnreadableMessage)
+	}
+}
+
+// A body the client cannot even finish READING (the upstream declares a
+// Content-Length it then does not deliver, so io.ReadAll fails with
+// io.ErrUnexpectedEOF) is the other branch imageRunResponseUnreadableMessage
+// covers -- and it must be reached with the run's context still LIVE (no
+// deadline, no cancel), or this would actually be pinning
+// runContextOutcome's branch instead.
+func TestImageRunTruncatedBodyIsUnreadableNotARawGoError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "short")
+	}))
+	t.Cleanup(upstream.Close)
+
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+	if got := runError(t, run); got != imageRunResponseUnreadableMessage {
+		t.Fatalf("error = %q, want %q, not a raw Go read error", got, imageRunResponseUnreadableMessage)
+	}
+}
+
 // The same, for a refusal the GATEWAY itself writes before any upstream call:
 // a run whose history carries no user text sends no prompt, and
 // validateImagesRequest answers images.prompt_required. The run must say that,
@@ -594,6 +647,98 @@ func TestImageRunAttributionFollowsTheRunAsToken(t *testing.T) {
 	}
 }
 
+// TestImageRunServerOverrideReachesTheImagesHop is the server-override
+// counterpart to TestImageRunAttributionFollowsTheRunAsToken immediately
+// above: the header fix was structural (one shared setRunLoopbackHeaders),
+// and the run-as header already had its own end-to-end pin, but the
+// server-override pair did not. This proves an image thread's per-run
+// server_override actually steers the /v1/images/generations hop to the
+// OVERRIDDEN server -- not merely that a header was attached to some
+// intermediate request.
+//
+// The alt server is seeded UNHEALTHY on purpose, and the override run sets
+// ServerOverrideForceUnreachable. Without that, giving both servers the SAME
+// gateway model would make this test pass whether or not the override header
+// actually reached the images hop: normal (non-override) routing could pick
+// EITHER candidate by ordinary scoring, which would pin nothing. An unhealthy
+// server is never selected by the ordinary path, so the negative-control run
+// below (no override) proves it is unreachable by luck of candidate order,
+// and only the explicit force-override bypass in resolveServerOverride can
+// land a request there -- which is exactly the mechanism under test.
+func TestImageRunServerOverrideReachesTheImagesHop(t *testing.T) {
+	defaultUpstream, defaultSeen := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
+	overrideUpstream, overrideSeen := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"BB=="}]}`)
+
+	srv, _, owner, chatID := newImageRunTestServer(t, defaultUpstream.URL)
+
+	ctx := context.Background()
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	up, err := url.Parse(overrideUpstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	port, err := strconv.Atoi(up.Port())
+	if err != nil {
+		t.Fatalf("upstream port %q: %v", up.Port(), err)
+	}
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-alt", Name: "SD Alt Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: overrideUpstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnhealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := srv.Routes.CreateApplication(ctx, routing.Application{ID: "app-sd-alt", ServerID: "srv-sd-alt", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-alt", ApplicationID: "app-sd-alt", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, "route-sd-alt", []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	if err := srv.Routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-sd-alt", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	// resolveServerOverride re-authorizes the caller for the TARGET server
+	// (authorizeServer): a plain admin does not automatically manage every
+	// server (Phase B), so the override needs explicit ownership here.
+	if err := srv.Routes.SetServerOwners(ctx, "srv-sd-alt", []string{"usr_dev"}); err != nil {
+		t.Fatalf("SetServerOwners: %v", err)
+	}
+
+	// Negative control: with NO override, the unhealthy alt is unreachable by
+	// the ordinary path, so the run must land on the default upstream.
+	run1, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun (no override): %v", err)
+	}
+	waitFor(t, func() bool { return run1.statusValue() != "running" })
+	if got := run1.statusValue(); got != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", got, runError(t, run1))
+	}
+	select {
+	case <-defaultSeen:
+	default:
+		t.Fatal("negative control: the default upstream never saw the un-overridden run")
+	}
+
+	// The run under test: WITH the override (+ force, since the target is
+	// unhealthy), the SAME chat's next run must reach the OVERRIDDEN server.
+	prep := imageRunPrep()
+	prep.Settings.ServerOverride = "srv-sd-alt"
+	prep.Settings.ServerOverrideForceUnreachable = true
+	run2, err := srv.startChatRun(owner, chatID, prep)
+	if err != nil {
+		t.Fatalf("startChatRun (override): %v", err)
+	}
+	waitFor(t, func() bool { return run2.statusValue() != "running" })
+	if got := run2.statusValue(); got != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", got, runError(t, run2))
+	}
+	select {
+	case <-overrideSeen:
+	default:
+		t.Fatal("the OVERRIDE upstream never saw the request -- the server override did not reach the images hop")
+	}
+}
+
 // imageMediaType is the one place an upstream-controlled string is
 // interpolated into a URL the browser loads and the download names a file
 // from, so what it accepts is pinned directly rather than only through the
@@ -619,6 +764,12 @@ func TestImageMediaTypeAcceptsOnlyABareSubtype(t *testing.T) {
 		// Anything that could break out of the data: URL's own grammar.
 		{name: "url punctuation", outputFormat: `png;base64,AAAA`, wantErr: true},
 		{name: "a comma", outputFormat: "png,x", wantErr: true},
+		// The length is bounded (32) independently of the alphabet check: an
+		// upstream-controlled string this long, interpolated into every data:
+		// URL the part produces, has no legitimate reason to exceed a real
+		// media subtype's length -- see imageSubtypePattern's own doc comment.
+		{name: "at the 32-char length cap", outputFormat: strings.Repeat("a", 32), want: "image/" + strings.Repeat("a", 32)},
+		{name: "one character past the cap is refused", outputFormat: strings.Repeat("a", 33), wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

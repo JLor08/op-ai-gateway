@@ -69,10 +69,10 @@ type imageURLPart struct {
 	ImageURL imageURLTarget `json:"image_url"`
 }
 
-// The two terminal codes this path adds. Both are CODES, not prose, for the
+// The three terminal codes this path adds. All are CODES, not prose, for the
 // reason runTimedOutMessage already is one: the frontend maps a run's error to
-// a localized label, and both of these describe a condition a user has to be
-// able to tell apart from an ordinary failure.
+// a localized label, and each describes a condition a user has to be able to
+// tell apart from an ordinary failure.
 const (
 	// imageRunNoImageMessage: a 2xx that produced no usable image. This is an
 	// ERROR, not an empty success -- the endpoint's own counter already logs a
@@ -87,6 +87,18 @@ const (
 	// transcript, in the download's file name, and in every later request
 	// buildAPIHistory carries the part into.
 	imageRunFormatUnknownMessage = "gateway.chat_run_image_format_unknown"
+	// imageRunResponseUnreadableMessage: a 2xx whose body could not be turned
+	// into the response this relay understands -- either the read itself
+	// failed (a truncated body, a connection the upstream dropped mid-write)
+	// or json.Unmarshal rejected it (an HTML error page, a proxy's own error
+	// body, a truncated buffer). Both branches previously returned err.Error()
+	// verbatim, so a run could end with Go's own decode message ("invalid
+	// character '<' looking for beginning of value") in a portal bubble; a
+	// user cannot act on that, and it names an implementation detail rather
+	// than a condition. The context-ended case (deadline/cancel) is NOT this
+	// code -- runContextOutcome already reports that distinctly and is checked
+	// first at each call site.
+	imageRunResponseUnreadableMessage = "gateway.chat_run_image_response_unreadable"
 )
 
 // imageSubtypePattern bounds what may be interpolated into the data: URL's
@@ -98,7 +110,15 @@ const (
 // the whole media type (a forged "text/html;base64,..." would be saved and
 // opened as markup), and a refusal here is loud where a repair would be a
 // guess.
-var imageSubtypePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9+.-]*$`)
+//
+// The length is bounded too (32, ample for every real subtype), not just the
+// alphabet: without it a multi-megabyte output_format would pass the
+// character check and get interpolated into every data: URL the part
+// produces, with the chat store's own 4 MiB content cap as the only
+// backstop -- and a run whose commit is refused for exceeding THAT cap is
+// exactly the silent-success failure mode finishRunWithParts now surfaces
+// loudly (see commitFailureCode in chat_runs.go).
+var imageSubtypePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9+.-]{0,31}$`)
 
 // executeImageRun is executeRun's image branch: one buffered request to the
 // gateway's own /v1/images/generations, and one terminal commit carrying the
@@ -160,7 +180,7 @@ func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *C
 		if status, msg, ended := runContextOutcome(ctx); ended {
 			return nil, status, msg
 		}
-		return nil, "error", err.Error()
+		return nil, "error", imageRunResponseUnreadableMessage
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, "error", upstreamErrorCode(payload, resp.Status)
@@ -168,7 +188,7 @@ func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *C
 
 	var decoded imagesResponse
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return nil, "error", err.Error()
+		return nil, "error", imageRunResponseUnreadableMessage
 	}
 	parts, err := imagePartsFrom(decoded)
 	if err != nil {
@@ -203,9 +223,9 @@ func runContextOutcome(ctx context.Context) (status, errMsg string, ended bool) 
 // envelope is apierror.Body rather than a local anonymous struct so this
 // stays tied to the shape writeJSON actually emits.
 //
-// The text path's identical loss (executeRun's non-200 branch reads no body at
-// all) is a separate fix with its own frontend half; this function is written
-// to be reusable by it verbatim.
+// executeRun's non-200 branch (chat_runs.go) had the identical loss -- it read
+// no body at all -- and reuses this function verbatim rather than a second
+// copy of the same envelope-vs-fallback logic.
 func upstreamErrorCode(body []byte, status string) string {
 	var envelope apierror.Body
 	if json.Unmarshal(body, &envelope) == nil {

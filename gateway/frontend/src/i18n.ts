@@ -1288,6 +1288,33 @@ const de = {
     'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
   errorRuntimeSpecServerBenchmarking:
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
+  // Portal chat image generation (task 8): the chat run lifecycle's own
+  // codes, the mapping capability-form refusal, and the four images.* codes
+  // now reachable from a chat run. See format.ts's errorLabelByCode for the
+  // exact wire codes each key answers.
+  errorChatTooLarge:
+    'Der Chat ist zu groß zum Speichern. Laden Sie das Bild herunter und starten Sie einen neuen Chat.',
+  errorChatRunActive:
+    'Für diesen Chat läuft bereits eine Antwort. Bitte warten Sie, bis sie fertig ist.',
+  errorChatRunLimit:
+    'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
+  errorMappingCapabilityReserved:
+    '„live_progress" darf nicht auf „no" gesetzt werden, und „speculation_observed" akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
+  errorChatRunTimeout:
+    'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
+  errorChatRunNoImage: 'Es wurde kein Bild erzeugt. Bitte versuchen Sie es erneut.',
+  errorChatRunImageFormatUnknown:
+    'Das Format des erzeugten Bildes konnte nicht bestimmt werden. Bitte versuchen Sie es erneut.',
+  errorChatRunImageResponseUnreadable:
+    'Die Antwort der Bilderzeugung konnte nicht gelesen werden. Bitte versuchen Sie es erneut.',
+  errorChatRunCommitFailed:
+    'Die Antwort konnte nicht gespeichert werden. Bitte versuchen Sie es erneut.',
+  errorImagesPromptRequired:
+    'Für die Bilderzeugung wird ein Text-Prompt benötigt. Bitte geben Sie eine Beschreibung ein.',
+  errorImagesStreamUnsupported: 'Die Bilderzeugung unterstützt kein Streaming.',
+  errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
+  errorImagesUpstreamError:
+    'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -3563,6 +3590,26 @@ const en: PortalMessages = {
     "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
+  // Portal chat image generation (task 8): the chat run lifecycle's own
+  // codes, the mapping capability-form refusal, and the four images.* codes
+  // now reachable from a chat run. See format.ts's errorLabelByCode for the
+  // exact wire codes each key answers.
+  errorChatTooLarge: 'The chat is too large to save. Download the image and start a new chat.',
+  errorChatRunActive: 'A response is already running for this chat. Please wait until it finishes.',
+  errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
+  errorMappingCapabilityReserved:
+    '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
+  errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
+  errorChatRunNoImage: 'No image was generated. Please try again.',
+  errorChatRunImageFormatUnknown:
+    "The generated image's format could not be determined. Please try again.",
+  errorChatRunImageResponseUnreadable:
+    'The image generation response could not be read. Please try again.',
+  errorChatRunCommitFailed: 'The response could not be saved. Please try again.',
+  errorImagesPromptRequired: 'Image generation needs a text prompt. Please enter a description.',
+  errorImagesStreamUnsupported: 'Image generation does not support streaming.',
+  errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
+  errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",

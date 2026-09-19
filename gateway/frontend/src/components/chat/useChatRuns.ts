@@ -16,6 +16,8 @@ import {
   type SetStateAction,
 } from 'react';
 import type { Chat, ChatRunStatus, PortalApi } from '../../api';
+import { formatChatRunErrorCode } from '../shared/format';
+import type { Translation } from '../shared/types';
 import {
   messageStatusForRun,
   metricsOf,
@@ -88,6 +90,11 @@ export function useChatRuns(
   setMessages: Dispatch<SetStateAction<ChatUiMessage[]>>,
   onRefreshRef: RefObject<() => void | Promise<void>>,
   showErrorRef: RefObject<(message: string) => void>,
+  // Used ONLY to localize a terminal run's error CODE (formatChatRunErrorCode)
+  // before it reaches the toast -- every other string in this file is
+  // either already a translated caller-supplied value or a raw wire code
+  // this module has no business rendering untranslated.
+  tRef: RefObject<Translation>,
 ): ChatRunsApi {
   // Per-chat run subscriptions, keyed by chatId. The source of truth for "is
   // this chat running" (runningChatIds mirrors it for rendering). Entries are
@@ -187,10 +194,15 @@ export function useChatRuns(
       // the canonical adopt (below) can re-dirty via the `messages` state
       // change without the stream-end flushSave racing ahead of it.
       onTerminalRef.current?.(chatId);
-      if (error) showErrorRef.current(error);
+      // error is a WIRE CODE (runTimedOutMessage, ErrChatTooLarge.Error(),
+      // ...), not prose -- localize it through errorLabelByCode before it
+      // reaches the toast, or every chat-run code this task just mapped
+      // would still show up as raw English (see format.ts's own doc comment
+      // on formatChatRunErrorCode).
+      if (error) showErrorRef.current(formatChatRunErrorCode(error, tRef.current));
       void onRefreshRef.current();
     },
-    [updateChatMessages, markRunning, showErrorRef, onRefreshRef],
+    [updateChatMessages, markRunning, showErrorRef, onRefreshRef, tRef],
   );
 
   // Review follow-up #A: after a run's `done`, the backend has ALREADY committed

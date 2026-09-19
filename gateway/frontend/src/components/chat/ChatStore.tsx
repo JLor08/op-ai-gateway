@@ -363,6 +363,7 @@ export function ChatStoreProvider({
     setMessages,
     onRefreshRef,
     showErrorRef,
+    tRef,
   );
   const {
     runningChatIds,

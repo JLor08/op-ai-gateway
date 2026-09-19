@@ -641,6 +641,36 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(es.closed).toBe(true);
     });
 
+    // Task 8: a run's terminal `error` field is a WIRE CODE
+    // (errorLabelByCode), not prose -- the toast must show the localized
+    // label, never the raw code a future backend and this frontend now both
+    // know about (formatChatRunErrorCode, format.ts).
+    it('a terminal run error is localized before it reaches the toast, not shown as a raw code', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances.at(-1)!;
+
+      await act(async () => {
+        es.emit('done', { content: '', status: 'error', error: 'gateway.chat_run_timeout' });
+      });
+
+      expect(await screen.findByText(t.errorChatRunTimeout)).toBeTruthy();
+      expect(screen.queryByText('gateway.chat_run_timeout')).toBeNull();
+    });
+
     it("useChatStreaming reflects the store's streaming flag", async () => {
       chatApi = makeChatApi([
         {

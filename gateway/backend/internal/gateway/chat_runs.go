@@ -11,10 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/store"
 	"strings"
 	"sync"
 	"time"
@@ -539,6 +541,44 @@ func runDeadlineFor(kind string) (time.Duration, bool) {
 // nothing.
 const runTimedOutMessage = "gateway.chat_run_timeout"
 
+// chatRunCommitFailedMessage is finishRunWithParts' terminal code for a commit
+// failure it cannot name more specifically than "the store write failed" --
+// see commitFailureCode, which is the only place that returns it.
+const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
+
+// commitFailureIsChatGone reports whether a failed CommitAssistant's error
+// means the chat itself no longer exists, rather than that the write to an
+// existing chat failed. DELETE /chats/{id} cancels the chat's active run AND
+// removes its row in the same request (handlePortalChatItem), so the run's
+// own terminal commit can lose that race against the deletion and see
+// exactly this. It is NOT a loss to report: there is nothing left to persist
+// FOR, and no one will ever read this chat's transcript again, so the
+// caller must leave the run's own status/message (typically "canceled", from
+// the delete's own cancellation) standing rather than overriding it to
+// "error". store.ErrNotFound is the raw error every ChatByID implementation
+// returns for a missing row; portal.ErrChatNotFound is writeAssistant's own
+// mapping of the same fact when the row belongs to a different user.
+func commitFailureIsChatGone(err error) bool {
+	return errors.Is(err, store.ErrNotFound) || errors.Is(err, portal.ErrChatNotFound)
+}
+
+// commitFailureCode maps a failed CommitAssistant's error (once
+// commitFailureIsChatGone has ruled out "the chat is gone") to the
+// run-terminal code finishRunWithParts substitutes for the status/message the
+// run was about to report. portal.ErrChatTooLarge is surfaced VERBATIM: it is
+// a named, actionable sentinel (the frontend's label tells the user to
+// download the image on screen and start a new chat, per its own doc comment
+// in service_chats.go), unlike an arbitrary store failure -- a driver error, a
+// marshal failure -- which the user cannot act on and which therefore
+// degrades to one generic, stable code rather than reaching the browser as a
+// raw Go error string.
+func commitFailureCode(err error) string {
+	if errors.Is(err, portal.ErrChatTooLarge) {
+		return portal.ErrChatTooLarge.Error()
+	}
+	return chatRunCommitFailedMessage
+}
+
 const runEvictionDelay = 30 * time.Second
 
 // PrepareRunResult bundles the prepared history + settings from
@@ -672,7 +712,15 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		s.finishRun(ctx, owner, run, "error", "upstream status "+resp.Status)
+		// Bounded the same way relayImagesUpstreamError bounds an error body
+		// (images_handler.go): an error body has no reason to exceed it, and
+		// this is a non-200 -- not the ordinary streamed 200 consumeRunStream
+		// reads unbounded. upstreamErrorCode (chat_runs_images.go) pulls
+		// error.code out of the gateway's own envelope; every code either
+		// endpoint was built to return was previously discarded here in favor
+		// of the flat "upstream status ..." string.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
+		s.finishRun(ctx, owner, run, "error", upstreamErrorCode(body, resp.Status))
 		return
 	}
 
@@ -901,15 +949,29 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 		persistStatus = "complete"
 	}
 	// A failed terminal commit leaves the trailing assistant message stuck at
-	// "pending", so a later restart would infer a false "interrupted". Log it
-	// (control flow is unchanged — the run still finishes) so the failure is not
-	// silently swallowed.
+	// "pending" (or, on the memory/store paths that never wrote one, leaves no
+	// turn at all) -- so a later restart would infer a false "interrupted", and
+	// the browser would be told a turn succeeded that was never durably saved.
+	// That was tolerable while every turn was a few KB of text; an inline image
+	// routinely approaches the chat store's whole-document cap
+	// (maxChatContentBytes, portal/service_chats.go), so this is no longer a
+	// theoretical failure mode. Log it (still worth knowing about) AND override
+	// the run's own terminal status/message to "error" with a mapped code, so
+	// the browser is told the truth regardless of what status the run was about
+	// to report -- UNLESS the chat itself is simply gone (commitFailureIsChatGone):
+	// DELETE /chats/{id} cancels this run and removes its row in the same
+	// request, and this commit can lose that race. That is not a loss to
+	// report, so the run's own status (typically "canceled", from the
+	// delete's own cancellation) stands unchanged.
 	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 		ContentParts: parts,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
+		if !commitFailureIsChatGone(err) {
+			status, errMsg = "error", commitFailureCode(err)
+		}
 	}
 	run.finish(status, errMsg)
 	// Free the per-chat/cap slot immediately on terminal so the chat's next turn

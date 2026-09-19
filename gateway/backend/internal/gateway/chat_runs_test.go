@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -827,16 +828,18 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 // READ of the response rather than on its round trip, and that branch reported
 // "canceled" with an empty message too.
 //
-// It was written against consumeRunStream's scanner error, where the same
-// branch exists. It cannot be: that branch is currently UNREACHABLE -- only
-// the image kind is bounded and an image run never enters consumeRunStream --
-// so pointing this test at it would be pinning nothing. The branch is kept
-// and annotated where it lives (chat_runs.go, the DeadlineExceeded case), for
-// the day the text kind is bounded; its lack of a test is a consequence of
-// that unreachability rather than a gap, and one cannot be written without
-// first making it reachable. The upstream below sends the first body chunk (which the gateway's
-// copier flushes straight through, so the run's Do returns) and then stalls,
-// putting the run mid-response when the deadline fires.
+// This test was originally aimed at consumeRunStream's scanner error, where
+// the same branch exists, but it cannot pin THAT branch: it is currently
+// UNREACHABLE -- only the image kind is bounded and an image run never enters
+// consumeRunStream -- so pointing this test at it would be pinning nothing.
+// The branch is kept and annotated where it lives (chat_runs.go, the
+// DeadlineExceeded case), for the day the text kind is bounded; its lack of a
+// test is a consequence of that unreachability rather than a gap, and one
+// cannot be written without first making it reachable.
+//
+// The upstream below sends the first body chunk (which the gateway's copier
+// flushes straight through, so the run's Do returns) and then stalls, putting
+// the run mid-response when the deadline fires.
 func TestRunDeadlineMidResponseIsNotACancelEither(t *testing.T) {
 	restore := imageRunDeadline
 	imageRunDeadline = 150 * time.Millisecond
@@ -1098,5 +1101,164 @@ func TestRunKindWriteIsSynchronizedWithItsReaders(t *testing.T) {
 	waitFor(t, func() bool { return run.statusValue() != "running" })
 	if got := run.kindValue(); got != "image" {
 		t.Fatalf("kind = %q after the concurrent window, want image", got)
+	}
+}
+
+// commitFailingPortal wraps a real portal.API and makes every CommitAssistant
+// call fail with a configurable error, WITHOUT touching the underlying store
+// -- so a test can prove the run's TERMINAL status/message follow the
+// commit's own outcome rather than the status the executor was about to
+// report. Embeds the interface, like commitCtxRecorder above: only this one
+// method is under test.
+type commitFailingPortal struct {
+	portal.API
+	err error
+}
+
+func (c *commitFailingPortal) CommitAssistant(context.Context, auth.Token, string, portal.AssistantTurn, string) error {
+	return c.err
+}
+
+// TestFinishRunCommitFailureEndsTheRunAsError is the PRIMARY fix in this
+// task. Before it, a failed terminal commit was only logged (finishRun's own
+// comment said control flow was deliberately unchanged) and the run still
+// reported "completed" -- an over-cap image turn is a silent success end to
+// end, confirmed by task 7. Proven NON-VACUOUSLY: commitFailingPortal
+// actually fails the commit rather than the test asserting the mapping
+// function's own return value, so reverting the fix in finishRunWithParts
+// makes this fail (status would read "completed").
+func TestFinishRunCommitFailureEndsTheRunAsError(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	srv.Portal = &commitFailingPortal{API: srv.Portal, err: errors.New("boom: store unavailable")}
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error -- a failed commit must not report completed", got)
+	}
+	if got := runError(t, run); got != chatRunCommitFailedMessage {
+		t.Fatalf("error = %q, want the generic commit-failure code %q", got, chatRunCommitFailedMessage)
+	}
+}
+
+// TestFinishRunCommitFailureSurfacesChatTooLarge is the over-cap case task 7
+// confirmed as a silent success: portal.ErrChatTooLarge is a named,
+// actionable sentinel (the frontend's label tells the user to download the
+// image already on screen and start a new chat), so it must be surfaced
+// VERBATIM rather than degraded to the generic commitFailureCode.
+func TestFinishRunCommitFailureSurfacesChatTooLarge(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	srv.Portal = &commitFailingPortal{API: srv.Portal, err: portal.ErrChatTooLarge}
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+	if got := runError(t, run); got != "portal.chat_too_large" {
+		t.Fatalf("error = %q, want portal.chat_too_large -- named and actionable, unlike the generic code", got)
+	}
+}
+
+// TestFinishRunCommitFailureDoesNotOverrideACanceledRunWhenTheChatIsGone is
+// the carve-out the primary fix needs: DELETE /chats/{id} cancels the active
+// run AND removes the chat row in the SAME request, so this run's own
+// terminal commit can lose that race and see store.ErrNotFound. That is not
+// a loss to report -- the chat is gone, so there is nothing left to persist
+// for and no one will ever read its transcript again -- so the run's own
+// status (here "canceled", from the delete's own cancellation) must stand,
+// not flip to "error". TestDeleteChatCancelsActiveRun
+// (chat_run_endpoints_test.go) is the end-to-end pin for the same race; this
+// isolates just the commit-failure branch.
+func TestFinishRunCommitFailureDoesNotOverrideACanceledRunWhenTheChatIsGone(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	srv.Portal = &commitFailingPortal{API: srv.Portal, err: store.ErrNotFound}
+
+	run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	srv.finishRun(context.Background(), owner, run, "canceled", "")
+
+	if got := run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled -- a chat deleted out from under the run is not a loss to report", got)
+	}
+	if got := runError(t, run); got != "" {
+		t.Fatalf("error = %q, want empty (the run's own cancel message, unchanged)", got)
+	}
+}
+
+// TestExecuteRunKeepsTheUpstreamErrorCode is executeRun's non-200 branch: the
+// text path's counterpart to TestImageRunKeepsTheUpstreamErrorCode
+// (chat_runs_images_test.go). Before this the branch read no body at all, so
+// the run reported the flat "upstream status 429 Too Many Requests" and
+// discarded every code the loopback's own error envelope carried.
+func TestExecuteRunKeepsTheUpstreamErrorCode(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"routing.no_healthy_host","message":"no healthy host"}}`)
+	}))
+	t.Cleanup(fake.Close)
+	srv.selfBaseURL = fake.URL
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+	if got := runError(t, run); got != "routing.no_healthy_host" {
+		t.Fatalf("error = %q, want the upstream body's own code, not a flat status line", got)
+	}
+}
+
+// TestExecuteRunFallsBackToTheStatusLineForANonEnvelopeBody is
+// upstreamErrorCode's fallback branch, reached from the text path: a non-200
+// whose body is not the apierror.Body envelope (an HTML error page, a proxy
+// in front of the gateway) must not crash or produce an empty message -- it
+// degrades to the same "upstream status ..." line the branch used
+// unconditionally before this task.
+func TestExecuteRunFallsBackToTheStatusLineForANonEnvelopeBody(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, "<html>bad gateway</html>")
+	}))
+	t.Cleanup(fake.Close)
+	srv.selfBaseURL = fake.URL
+
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := runError(t, run); got != "upstream status 502 Bad Gateway" {
+		t.Fatalf("error = %q, want %q (fallback to the status line)", got, "upstream status 502 Bad Gateway")
 	}
 }
