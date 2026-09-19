@@ -1623,10 +1623,17 @@ the most common path.
 
 **Two traps in the deadline, both real:**
 
-1. **A timeout would be reported as a user cancel.** `executeRun` turns any
-   context error into `finishRun(..., "canceled", "")` with an empty message
-   (`:519-523`). Branch on `errors.Is(ctx.Err(), context.DeadlineExceeded)` and
-   give the timeout its own message so the UI can say which happened.
+1. **A timeout would be reported as a user cancel, in TWO places — and the
+   second is the one that matters here.** `executeRun` turns any context error
+   into `finishRun(..., "canceled", "")` with an empty message (`:519-523`),
+   and `consumeRunStream`'s scanner-error branch does the identical thing. The
+   **second** is the branch an image run actually reaches: the loopback hop
+   writes 200 plus the SSE headers before the provider has produced anything,
+   so a dispatched-then-silent run hits its deadline while reading the body,
+   not at `Do`. Fixing only `executeRun` leaves the image case reporting a
+   timeout as a user cancel. Both branches need the
+   `errors.Is(ctx.Err(), context.DeadlineExceeded)` split.
+   *(Corrected during execution: this plan originally named only `executeRun`.)*
 2. **The deadline could abort its own commit.** `finishRun` is called with the
    run's context on three paths (`:484`, `:489`, `:529`), and its terminal
    `CommitAssistant` (`:668`) would then be cancelled by the very timeout that
