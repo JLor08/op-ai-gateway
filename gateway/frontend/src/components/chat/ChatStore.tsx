@@ -381,18 +381,18 @@ export function ChatStoreProvider({
   const modelImageCapable =
     chatModels.find((option) => option.id === effectiveModel)?.image ?? false;
 
-  // The thread's kind. Once the thread has a transcript the backend has
-  // already pinned it (PrepareChatRun forces the stored kind on every send
-  // after the first), so the pin wins and the currently-picked model is
-  // irrelevant. While the thread is still empty there is no pin yet and the
-  // next send will establish one from the picked model, so the composer shows
-  // that prospective kind.
-  //
-  // Note the synthetic model option injected for a picked-but-uncatalogued
-  // model carries no capability fields and therefore derives image === false.
-  // That is deliberate and harmless: the PINNED kind is the thread's truth,
-  // and this derivation only applies while the thread has no history at all.
-  const chatKind = messages.length > 0 ? pinnedChatKind : modelImageCapable ? 'image' : '';
+  // The kind the NEXT send would pin, derived from the picked model. Only
+  // ever consulted while the thread has no transcript at all (below), which
+  // is why the synthetic model option injected for a picked-but-uncatalogued
+  // model — no capability fields, so image === false — is harmless here: the
+  // PINNED kind is the thread's truth the moment one exists.
+  const prospectiveKind = modelImageCapable ? 'image' : '';
+  // The thread's kind, and the whole distinction in one line: once the thread
+  // has a transcript the backend has already pinned it (PrepareChatRun forces
+  // the stored kind on every send after the first), so the pin wins and the
+  // currently-picked model is irrelevant; while it is still empty there is no
+  // pin yet, so the composer shows what the next send would establish.
+  const chatKind = messages.length > 0 ? pinnedChatKind : prospectiveKind;
 
   // Remaining room for generated images, computed only for an image thread:
   // measuring the transcript means serialising it, and a text thread neither

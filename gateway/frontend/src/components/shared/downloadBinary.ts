@@ -28,7 +28,11 @@ export function downloadBinary(filename: string, dataUrl: string): boolean {
     return false;
   }
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  // codePointAt, not charCodeAt: they differ only on a surrogate PAIR, and
+  // atob's output is binary-string by definition (every code unit 0..255), so
+  // no surrogate can occur here and the two are exactly equivalent. The `?? 0`
+  // is for the type only -- `i` is always in range.
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.codePointAt(i) ?? 0;
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   try {
     const a = document.createElement('a');

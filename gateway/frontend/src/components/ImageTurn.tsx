@@ -45,6 +45,13 @@ export function ImageTurn({
     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
       {images.map((url, index) => (
         <Box
+          // key={index} on purpose, and Sonar's S6479 is suppressed for this
+          // file with the full reasoning (sonar-project.properties, e7): this
+          // list comes from one turn's committed content parts and never
+          // reorders, there is no stable unique key to compute (a data URL
+          // collides when a response returns the same image twice), and
+          // failedIndex below is itself index-addressed, so the index IS this
+          // list's identity.
           key={index}
           sx={{
             display: 'inline-flex',
