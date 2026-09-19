@@ -6,7 +6,6 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
-	"op-ai-gateway/internal/store"
 	"testing"
 )
 
@@ -113,5 +112,3 @@ func TestInternalOrBearerFallsThroughWhenUsersIsNil(t *testing.T) {
 		t.Fatal("a nil user lookup must not authenticate")
 	}
 }
-
-var _ = store.User{} // keep the store import honest if the fixtures move

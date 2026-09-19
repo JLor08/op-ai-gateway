@@ -329,6 +329,60 @@ func newImageCapableTestServer(t *testing.T, upstreamURL string) *Server {
 	})
 }
 
+// newImageCapableLoopbackTestServer is newImageCapableTestServer's sibling for
+// the loopback-auth tests: same image-capable route wiring, but ALSO wires
+// InternalAuthSecret + Users so the internal trusted-loopback pair
+// (X-OP-Internal-Auth + X-OP-Internal-User) authenticates -- the path the
+// portal-chat run executor actually uses. Returns the directory so a caller
+// can seed a run-as token owned by "usr_dev" (or another user) via
+// CreatePlainToken.
+func newImageCapableLoopbackTestServer(t *testing.T, upstreamURL string) (*Server, *portal.MemoryDirectory) {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	seedGatewayTestRoutes(routeStore, now)
+
+	ctx := context.Background()
+	up, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", upstreamURL, err)
+	}
+	port, err := strconv.Atoi(up.Port())
+	if err != nil {
+		t.Fatalf("upstream port %q: %v", up.Port(), err)
+	}
+	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo", Name: "SD Turbo Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo", ApplicationID: "app-sd-turbo", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, "route-sd-turbo", []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-sd-turbo", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+
+	srv := New(ServerDeps{
+		Tokens:             tokens,
+		Usage:              recorder,
+		Provider:           provider.NewOpenAICompatibleClient(http.DefaultClient),
+		Routes:             routeStore,
+		Portal:             portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+		InternalAuthSecret: "s3cret",
+		Users:              directory,
+	})
+	return srv, directory
+}
+
 // lastUsageEvent returns the most recently recorded usage event on srv,
 // failing the test when none was recorded.
 func lastUsageEvent(t *testing.T, srv *Server) usage.Event {
@@ -659,7 +713,11 @@ func TestImagesStillAcceptsABearerToken(t *testing.T) {
 }
 
 // The alias route shares the handler and therefore the widened auth. No test
-// covered it before this change.
+// covered it before this change. Posts the LOOPBACK pair, not a bearer: a
+// bearer already worked on this alias before this task widened anything (the
+// alias has shared handleOpenAIImages, and therefore requireAnyScope, all
+// along) -- so a bearer-only assertion here would pin route registration, not
+// the widening. The loopback pair is the leg this task actually added.
 func TestImagesAliasRouteSharesTheAuth(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -667,10 +725,10 @@ func TestImagesAliasRouteSharesTheAuth(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	srv := newImageCapableTestServer(t, upstream.URL)
+	srv, _ := newImageCapableLoopbackTestServer(t, upstream.URL)
 	rec := postImagesWithHeaders(t, srv, "/openai/v1/images/generations",
 		`{"model":"sd-turbo","prompt":"a cat"}`,
-		map[string]string{"Authorization": "Bearer dev-secret"})
+		map[string]string{internalAuthHeaderName: "s3cret", internalUserHeaderName: "usr_dev"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("alias route status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -691,5 +749,95 @@ func TestImagesRefusesASessionCookie(t *testing.T) {
 		map[string]string{"Cookie": cookie.Name + "=" + cookie.Value, csrfHeaderName: "1"})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 from a real session cookie: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestImagesRunAsTokenAttributesUsage verifies that an image request carrying
+// the loopback pair plus X-OP-Run-As-Token swaps the principal to the named
+// token (owned by the loopback-resolved user) before routing, and that usage
+// is attributed to that token rather than to the bare loopback/session
+// principal -- the sibling of TestChatRunAsTokenAppliesOverrideAndUsage
+// (server_test.go) for the images path, mirroring its own assertion style
+// (lastUsageEvent's TokenID).
+func TestImagesRunAsTokenAttributesUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv, dir := newImageCapableLoopbackTestServer(t, upstream.URL)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_ra_img", UserID: "usr_dev", Name: "RA Img", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, "ra-secret"); err != nil {
+		t.Fatalf("seed run-as token: %v", err)
+	}
+
+	rec := postImagesWithHeaders(t, srv, "/v1/images/generations",
+		`{"model":"sd-turbo","prompt":"a cat"}`,
+		map[string]string{internalAuthHeaderName: "s3cret", internalUserHeaderName: "usr_dev", runAsHeaderName: "tok_ra_img"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := lastUsageEvent(t, srv).TokenID; got != "tok_ra_img" {
+		t.Fatalf("TokenID = %q, want tok_ra_img (the run-as token, not the bare loopback principal)", got)
+	}
+}
+
+// TestImagesRunAsTokenForbiddenForUnownedToken verifies that naming a run-as
+// token the loopback-resolved user does not own is rejected with 403
+// portal.token_forbidden -- refused rather than silently downgraded to the
+// bare loopback principal -- and that no image request reaches the upstream
+// or records usage. Sibling of TestChatRunAsTokenForbiddenForUnownedToken.
+func TestImagesRunAsTokenForbiddenForUnownedToken(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv, dir := newImageCapableLoopbackTestServer(t, upstream.URL)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	dir.AddUser(store.User{ID: "usr_other", Email: "other@example.test", DisplayName: "Other User", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_other_img", UserID: "usr_other", Name: "Other", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, "other-secret"); err != nil {
+		t.Fatalf("seed token: %v", err)
+	}
+
+	rec := postImagesWithHeaders(t, srv, "/v1/images/generations",
+		`{"model":"sd-turbo","prompt":"a cat"}`,
+		map[string]string{internalAuthHeaderName: "s3cret", internalUserHeaderName: "usr_dev", runAsHeaderName: "tok_other_img"})
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "portal.token_forbidden") {
+		t.Fatalf("run-as of unowned token should be 403 portal.token_forbidden, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if upstreamCalled {
+		t.Fatal("upstream must never be called for a forbidden run-as token")
+	}
+	if events := srv.Usage.All(); len(events) != 0 {
+		t.Fatalf("forbidden run-as should record no usage, got %#v", events)
+	}
+}
+
+// TestImagesRunAsWithoutPortalIsRefused guards the nil-Portal edge case a
+// bare &Server{} (no Portal wired) would otherwise hit: handleOpenAIChat's
+// AuthorizeRunAsToken call is unguarded against s.Portal == nil, and copying
+// that block verbatim into handleOpenAIImages would inherit the same nil
+// dereference. Refused with 403 rather than panicking, and rather than
+// silently proceeding as the bare loopback principal.
+func TestImagesRunAsWithoutPortalIsRefused(t *testing.T) {
+	s := &Server{internalAuthSecret: "s3cret", users: fakeUserLookup{
+		"usr_1": {ID: "usr_1", Role: "user"},
+	}} // Portal, Routes, Tokens all nil
+	r := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"sd-turbo","prompt":"a cat"}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set(internalAuthHeaderName, "s3cret")
+	r.Header.Set(internalUserHeaderName, "usr_1")
+	r.Header.Set(runAsHeaderName, "tok_whatever")
+	w := httptest.NewRecorder()
+
+	s.handleOpenAIImages(w, r)
+
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "portal.token_forbidden") {
+		t.Fatalf("status = %d body = %s, want 403 portal.token_forbidden", w.Code, w.Body.String())
 	}
 }
