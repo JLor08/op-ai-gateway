@@ -283,3 +283,70 @@ func TestCheckpointThenCommitAssistant(t *testing.T) {
 		t.Fatalf("expected single assistant message: %s", got.Content)
 	}
 }
+
+// An image turn's content is a structured array of parts, not a string. The
+// parts are written verbatim under `content` so buildAPIHistory feeds them back
+// as a vision input on the next turn, exactly as an uploaded image already is.
+func TestCommitAssistantWritesStructuredContentParts(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[{"id":"u1","role":"user","content":"a cat"}]}`),
+	})
+
+	parts := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`)
+	if err := svc.CommitAssistant(ctx, owner, created.ID, AssistantTurn{ContentParts: parts}, "complete"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(string(got.Content), `"content":[{"type":"image_url"`) {
+		t.Fatalf("structured content not written verbatim: %s", got.Content)
+	}
+	if strings.Contains(string(got.Content), `"content":""`) {
+		t.Fatalf("the empty Content string leaked into the document: %s", got.Content)
+	}
+	if !strings.Contains(string(got.Content), `"status":"complete"`) {
+		t.Fatalf("status not written: %s", got.Content)
+	}
+}
+
+// The text path must stay byte-identical: ContentParts absent means the string
+// is written exactly as before.
+func TestCommitAssistantTextPathUnchanged(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[{"id":"u1","role":"user","content":"hi"}]}`),
+	})
+
+	if err := svc.CommitAssistant(ctx, owner, created.ID, AssistantTurn{Content: "full answer"}, "complete"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(string(got.Content), `"content":"full answer"`) {
+		t.Fatalf("the string content must still be written as a JSON string: %s", got.Content)
+	}
+}
+
+// A zero-length (non-nil) ContentParts must not reach json.Marshal: it fails
+// with "unexpected end of JSON input" and would break the commit entirely.
+func TestCommitAssistantEmptyContentPartsFallsBackToTheString(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[{"id":"u1","role":"user","content":"hi"}]}`),
+	})
+
+	turn := AssistantTurn{Content: "text", ContentParts: json.RawMessage([]byte{})}
+	if err := svc.CommitAssistant(ctx, owner, created.ID, turn, "complete"); err != nil {
+		t.Fatalf("an empty ContentParts must not fail the commit: %v", err)
+	}
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(string(got.Content), `"content":"text"`) {
+		t.Fatalf("expected the string fallback: %s", got.Content)
+	}
+}

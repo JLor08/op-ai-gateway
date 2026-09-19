@@ -494,6 +494,16 @@ type AssistantTurn struct {
 	// tokens/sec, present only once the turn completed. See issue #56.
 	CharsPerSecond  float64
 	TokensPerSecond float64
+	// ContentParts is a structured message content (an array of OpenAI-style
+	// content parts) for a turn whose output is not text -- an image run's
+	// generated image_url part. When it is non-EMPTY it is written as the
+	// message's `content` and Content is ignored; otherwise Content is written
+	// as before, byte for byte.
+	//
+	// The guard is on LENGTH, not on nil: json.Marshal turns a nil RawMessage
+	// into `null` but FAILS outright on a non-nil zero-length one
+	// ("unexpected end of JSON input"), which would break the terminal commit.
+	ContentParts json.RawMessage
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -535,10 +545,14 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 		}
 	}
 	msg := map[string]any{
-		"id":      id,
-		"role":    "assistant",
-		"content": turn.Content,
-		"status":  status,
+		"id":     id,
+		"role":   "assistant",
+		"status": status,
+	}
+	if len(turn.ContentParts) > 0 {
+		msg["content"] = turn.ContentParts
+	} else {
+		msg["content"] = turn.Content
 	}
 	if turn.Reasoning != "" {
 		msg["reasoning"] = turn.Reasoning
