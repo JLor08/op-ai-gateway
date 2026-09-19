@@ -977,9 +977,13 @@ one terminal commit. The stream consumer is not among them and cannot be partly
 reused — it scans a delta stream, drives the periodic checkpoint goroutine and
 computes TTFT, chars/s and tokens/s, all of which assume deltas that do not
 exist here, and a checkpoint alone would write a `pending` assistant turn with
-empty content that the terminal commit then has to replace. Its three added
+empty content that the terminal commit then has to replace. Its four added
 terminal codes each name a condition a user has to be able to tell apart from
-an ordinary failure: `gateway.chat_run_no_image` (a 2xx that produced no usable
+an ordinary failure: `gateway.chat_run_image_dispatch_failed` (the loopback
+request never went out — the body could not be marshalled, the request could
+not be built, or the round trip failed outright; the Go transport error names
+the gateway's own internal base URL, so it goes to the log and the user gets
+the code); `gateway.chat_run_no_image` (a 2xx that produced no usable
 image — an error, not an empty success, since a committed turn with no image
 renders as a blank bubble indistinguishable from a bug);
 `gateway.chat_run_image_format_unknown` (a 2xx whose `output_format` is absent

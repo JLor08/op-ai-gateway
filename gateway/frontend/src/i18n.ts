@@ -1335,6 +1335,12 @@ const de = {
   // nichts zum Sichern auf dem Bildschirm.
   errorChatTooLarge:
     'Der Chat ist zu groß zum Speichern – dieser Beitrag wurde nicht gespeichert. Starten Sie einen neuen Chat und versuchen Sie es erneut.',
+  // Der 404, den jeder Chat-Endpunkt für einen gelöschten Chat liefert.
+  // Erreichbar aus jedem Schreibpfad (Speichern, Senden, Umbenennen,
+  // Löschen), typischerweise aus einem Tab, der den Chat noch offen hat,
+  // während er anderswo gelöscht wurde – deshalb der Hinweis aufs Neuladen.
+  errorChatNotFound:
+    'Dieser Chat existiert nicht mehr. Er wurde vermutlich anderswo gelöscht. Bitte laden Sie die Seite neu.',
   // Der Lauf war erfolgreich und der Beitrag liegt auf dem Server, aber dieser
   // Tab konnte den maßgeblichen Stand nicht nachladen. Er speichert diesen
   // Chat deshalb nicht mehr (ein PUT würde den Serverstand vollständig
@@ -1349,6 +1355,11 @@ const de = {
     '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
   errorChatRunTimeout:
     'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
+  // Die Anfrage hat das Gateway nie verlassen (Marshalling, Request-Bau oder
+  // der Loopback-Aufruf selbst). Der Go-Fehler nennt die interne Adresse und
+  // steht nur im Log; hier steht, was die Nutzerin tun kann.
+  errorChatRunImageDispatchFailed:
+    'Die Bilderzeugung konnte nicht gestartet werden. Bitte versuchen Sie es erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
   errorChatRunNoImage: 'Es wurde kein Bild erzeugt. Bitte versuchen Sie es erneut.',
   errorChatRunImageFormatUnknown:
     'Das Format des erzeugten Bildes konnte nicht bestimmt werden. Bitte versuchen Sie es erneut.',
@@ -3680,6 +3691,12 @@ const en: PortalMessages = {
   // screen to save either.
   errorChatTooLarge:
     'The chat is too large to save, so this turn was not stored. Start a new chat and try again.',
+  // The 404 every chat endpoint answers for a chat that is gone. Reachable
+  // from every writer (save, send, rename, delete), typically from a tab
+  // that still has the chat open after it was deleted elsewhere — hence the
+  // reload hint.
+  errorChatNotFound:
+    'This chat no longer exists. It was probably deleted elsewhere. Please reload.',
   // The run itself succeeded and the turn IS on the server, but this tab
   // could not fetch the authoritative copy back. It therefore stops saving
   // this chat (a PUT full-replaces the stored document) until it is reloaded.
@@ -3690,6 +3707,11 @@ const en: PortalMessages = {
   errorMappingCapabilityReserved:
     '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
   errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
+  // The request never left the gateway (marshalling, request construction,
+  // or the loopback call itself). The Go error names the internal address
+  // and stays in the log; this says what the user can do about it.
+  errorChatRunImageDispatchFailed:
+    'Image generation could not be started. Please try again, or contact an administrator if this continues.',
   errorChatRunNoImage: 'No image was generated. Please try again.',
   errorChatRunImageFormatUnknown:
     "The generated image's format could not be determined. Please try again.",

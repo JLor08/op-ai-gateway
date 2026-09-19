@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
@@ -69,11 +70,27 @@ type imageURLPart struct {
 	ImageURL imageURLTarget `json:"image_url"`
 }
 
-// The three terminal codes this path adds. All are CODES, not prose, for the
+// The four terminal codes this path adds. All are CODES, not prose, for the
 // reason runTimedOutMessage already is one: the frontend maps a run's error to
 // a localized label, and each describes a condition a user has to be able to
 // tell apart from an ordinary failure.
 const (
+	// imageRunDispatchFailedMessage: the run never got its request to the
+	// gateway's own /v1/images/generations at all -- marshalling our own body
+	// failed, the request could not be constructed, or the loopback round
+	// trip failed outright. All three previously returned err.Error(), and
+	// the third one's Go error embeds the request URL, so a gateway that
+	// cannot reach ITSELF showed the user `Post
+	// "http://127.0.0.1:8080/v1/images/generations": dial tcp ...: connection
+	// refused` -- an internal address and a transport detail, in a portal
+	// bubble, about a condition no user can act on. One code for the three
+	// because they are one fact to a user ("the request never went out") and
+	// the operator's signal is the log line at the call site, which keeps the
+	// full Go error.
+	//
+	// NOT used for a context that ended: runContextOutcome reports a deadline
+	// and a cancel distinctly and is checked FIRST at the Do call site.
+	imageRunDispatchFailedMessage = "gateway.chat_run_image_dispatch_failed"
 	// imageRunNoImageMessage: a 2xx that produced no usable image. This is an
 	// ERROR, not an empty success -- the endpoint's own counter already logs a
 	// counted zero on a 2xx at Error level, and committing a turn with no
@@ -146,11 +163,13 @@ func (s *Server) executeImageRun(ctx context.Context, owner auth.Token, run *Cha
 func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) (json.RawMessage, string, string) {
 	body, err := buildImagesBody(prep)
 	if err != nil {
-		return nil, "error", err.Error()
+		log.Printf("chat run %s: build images body failed: %v", run.ID, err)
+		return nil, "error", imageRunDispatchFailedMessage
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/images/generations", bytes.NewReader(body))
 	if err != nil {
-		return nil, "error", err.Error()
+		log.Printf("chat run %s: build images request failed: %v", run.ID, err)
+		return nil, "error", imageRunDispatchFailedMessage
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 
@@ -159,7 +178,11 @@ func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *C
 		if status, msg, ended := runContextOutcome(ctx); ended {
 			return nil, status, msg
 		}
-		return nil, "error", err.Error()
+		// The operator's copy keeps the whole Go error, internal URL and
+		// all; the user's copy is the code. See
+		// imageRunDispatchFailedMessage.
+		log.Printf("chat run %s: images loopback request failed: %v", run.ID, err)
+		return nil, "error", imageRunDispatchFailedMessage
 	}
 	defer resp.Body.Close()
 

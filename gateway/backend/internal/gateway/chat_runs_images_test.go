@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -949,5 +950,56 @@ func TestImageRunTerminalEventWithholdsPartsWhenTheCommitFailed(t *testing.T) {
 	}
 	if len(snap.ContentParts) != 0 {
 		t.Fatalf("ContentParts = %s, want none -- nothing was stored, so the event must claim nothing", snap.ContentParts)
+	}
+}
+
+// A gateway that cannot reach ITSELF is a real operator failure (the loopback
+// listener is down, the port moved) and the user's copy of it used to be the
+// raw Go transport error -- which embeds the request URL, so the portal bubble
+// read `Post "http://127.0.0.1:<port>/v1/images/generations": dial tcp ...:
+// connection refused`: an internal address and a transport detail, about
+// something no user can act on.
+//
+// Pointed at a port that is closed rather than a stub that 500s, because the
+// defect is specifically in the branch where Do itself returns an error; a
+// non-2xx takes upstreamErrorCode and was never affected.
+func TestImageRunDispatchFailureIsACodeNotARawGoError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+
+	// A listener that is bound and then closed: the port is real and refuses.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	deadURL := "http://" + dead.Addr().String()
+	if err := dead.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	srv.selfBaseURL = deadURL
+
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error", got)
+	}
+	got := runError(t, run)
+	if got != imageRunDispatchFailedMessage {
+		t.Fatalf("error = %q, want the mapped code %q", got, imageRunDispatchFailedMessage)
+	}
+	// The two properties the code exists for, asserted on the message the
+	// browser is actually handed.
+	if strings.Contains(got, deadURL) || strings.Contains(got, "127.0.0.1") {
+		t.Fatalf("the terminal message leaks the internal base URL: %q", got)
+	}
+	if strings.Contains(got, "connection refused") || strings.Contains(got, "dial tcp") {
+		t.Fatalf("the terminal message is a raw Go transport error: %q", got)
 	}
 }

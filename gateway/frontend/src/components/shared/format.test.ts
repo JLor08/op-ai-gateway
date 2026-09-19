@@ -233,16 +233,27 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `portal.ErrMappingCapabilityReserved` (service_applications.go, wired to
    * this code in portal_mapping_endpoints.go's `errRow` table), and the
    * three `gateway.chat_run_*` string constants in chat_runs.go /
-   * chat_runs_images.go (`runTimedOutMessage`, `imageRunNoImageMessage`,
+   * chat_runs_images.go (`runTimedOutMessage`,
+   * `imageRunDispatchFailedMessage`, `imageRunNoImageMessage`,
    * `imageRunFormatUnknownMessage`, `imageRunResponseUnreadableMessage`,
    * `chatRunCommitFailedMessage`).
+   *
+   * `portal.chat_not_found` rides in this group because it shares the
+   * `portal.chat_` prefix the both-directions assertion below filters on. It
+   * is NOT a run-lifecycle code and predates this feature: it is
+   * `portal.ErrChatNotFound` / `store.ErrNotFound` mapped by `error_map.go`,
+   * `portal_chat_endpoints.go` and `chat_run_endpoints.go`, and every chat
+   * writer (save, send, rename, delete) can raise it against a chat deleted
+   * in another tab.
    */
   const chatRunWireCodes = [
     'portal.chat_too_large',
+    'portal.chat_not_found',
     'portal.chat_run_active',
     'portal.chat_run_limit',
     'mapping.capability_reserved',
     'gateway.chat_run_timeout',
+    'gateway.chat_run_image_dispatch_failed',
     'gateway.chat_run_no_image',
     'gateway.chat_run_image_format_unknown',
     'gateway.chat_run_image_response_unreadable',
@@ -256,7 +267,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         `${code} is not mapped: the operator sees raw English`,
       ).toBeDefined();
     }
-    // Both directions, like the lists above: a tenth `portal.chat_*` /
+    // Both directions, like the lists above: an eleventh `portal.chat_*` /
     // `gateway.chat_run*` / `mapping.capability_reserved` code added to the
     // map without being named here fails too.
     expect(

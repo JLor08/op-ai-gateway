@@ -135,10 +135,20 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // reachable only from a direct API client -- now reachable from a chat run
   // too (images_handler.go, relayed verbatim by upstreamErrorCode).
   'portal.chat_too_large': 'errorChatTooLarge',
+  // The 404 every chat endpoint answers for a chat that is gone
+  // (portal.ErrChatNotFound / store.ErrNotFound, mapped in error_map.go,
+  // portal_chat_endpoints.go and chat_run_endpoints.go). Older than this
+  // feature, but it is the FOURTEENTH code of this group and the only one
+  // the block above left out, so a stale tab acting on a chat deleted
+  // elsewhere was the one chat failure that reached the toast as its raw
+  // wire code plus untranslated English. Every writer can raise it: save,
+  // send, rename and delete.
+  'portal.chat_not_found': 'errorChatNotFound',
   'portal.chat_run_active': 'errorChatRunActive',
   'portal.chat_run_limit': 'errorChatRunLimit',
   'mapping.capability_reserved': 'errorMappingCapabilityReserved',
   'gateway.chat_run_timeout': 'errorChatRunTimeout',
+  'gateway.chat_run_image_dispatch_failed': 'errorChatRunImageDispatchFailed',
   'gateway.chat_run_no_image': 'errorChatRunNoImage',
   'gateway.chat_run_image_format_unknown': 'errorChatRunImageFormatUnknown',
   'gateway.chat_run_image_response_unreadable': 'errorChatRunImageResponseUnreadable',
