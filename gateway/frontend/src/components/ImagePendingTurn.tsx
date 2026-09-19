@@ -6,7 +6,8 @@ import { Box, Typography } from '@mui/material';
 import type { Translation } from './shared/types';
 import { formatElapsed } from './shared/elapsed';
 
-// The composer during an image run's wait (spec §3.6's "during" half).
+// The composer during an image run's wait (ADR-043 (d),
+// docs/architecture/09-architecture-decisions.md).
 // `/v1/images/generations` refuses `stream` outright, so between Send and the
 // finished image there are exactly ZERO incremental events -- tens of
 // seconds to minutes of nothing. A progress bar, a percentage or an ETA

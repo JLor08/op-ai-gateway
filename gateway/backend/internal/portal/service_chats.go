@@ -317,7 +317,7 @@ type ChatRunSettings struct {
 	// pre-existing chat) or "image". It is established by the FIRST send and
 	// then forced by PrepareChatRun on every later send, because the composer's
 	// affordances follow the thread rather than the currently-picked model --
-	// see the spec's "the kind is pinned to the thread at first send".
+	// see ADR-043 (b) in docs/architecture/09-architecture-decisions.md.
 	//
 	// It is a UI constraint, NOT an authorization: this struct is the POST
 	// body verbatim (chat_run_endpoints.go), so a client can submit any value

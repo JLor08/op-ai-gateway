@@ -205,7 +205,7 @@ const de = {
   // multi-minute generation, so it is stated up front rather than after.
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
-  // The composer during an image run's wait (spec §3.6): the pending label
+  // The composer during an image run's wait (ADR-043 (d)): the pending label
   // and the static "nothing more is coming" sentence -- ImagePendingTurn's
   // only two announced strings (its clock is aria-hidden). Deliberately NOT
   // "Bild wird erzeugt": between dispatch and terminal the request may still
