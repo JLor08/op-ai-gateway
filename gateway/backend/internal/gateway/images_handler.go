@@ -266,13 +266,22 @@ func (c *imagesDataCounter) bytesFed() int {
 	return c.bytesSeen
 }
 
-// handleOpenAIImages serves POST /v1/images/generations by relaying to a
-// natively OpenAI-shaped image backend. There is no translate path: the gateway
+// handleOpenAIImages serves POST /v1/images/generations (and its
+// /openai/v1/images/generations alias, server.go) by relaying to a natively
+// OpenAI-shaped image backend. There is no translate path: the gateway
 // proxies image requests and does not synthesize them, so an application that
 // does not serve this shape is simply not a candidate.
 //
-// The capability gate is what makes that true, and it runs inside the ONE
-// existing admission gate: the request declares
+// Auth: requireInternalOrBearerAnyScope admits a bearer token (every ordinary
+// API client) OR the internal trusted-loopback header pair (the portal-chat
+// run executor calling itself as a token-less session principal) --
+// DELIBERATELY not the browser session cookie. See
+// authenticateInternalOrBearer's own doc comment
+// (auth_internal_or_bearer.go) for why a logged-in browser must never reach
+// this endpoint directly.
+//
+// The capability gate is what makes the "not a candidate" claim above true,
+// and it runs inside the ONE existing admission gate: the request declares
 // RequiredCapabilities = [routing.CapabilityImage] and inferencePreflight ->
 // Resolve refuses a model without a yes verdict. No second admitPrincipal call
 // site is added here; there is exactly one in this package and its comment
@@ -281,7 +290,7 @@ func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	token, ok := s.requireAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
+	token, ok := s.requireInternalOrBearerAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
 	if !ok {
 		return
 	}

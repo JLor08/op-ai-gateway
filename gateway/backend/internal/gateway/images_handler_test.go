@@ -627,3 +627,69 @@ func TestImagesUpstreamCallFailureStillRecordsImageUnit(t *testing.T) {
 		t.Fatalf("BillingUnit = %q, want %q (endpoint identity, set even on a pre-response transport failure)", got.BillingUnit, usage.BillingUnitImage)
 	}
 }
+
+// postImagesWithHeaders is postImages' sibling for the auth tests: same mux,
+// same path, but the caller owns the headers. postImages hardcodes a bearer and
+// every existing images test depends on that, so it is left alone.
+func postImagesWithHeaders(t *testing.T, srv *Server, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// The bearer leg must keep working: every existing API client uses it.
+func TestImagesStillAcceptsABearerToken(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	rec := postImages(t, srv, `{"model":"sd-turbo","prompt":"a cat"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The alias route shares the handler and therefore the widened auth. No test
+// covered it before this change.
+func TestImagesAliasRouteSharesTheAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`))
+	}))
+	defer upstream.Close()
+
+	srv := newImageCapableTestServer(t, upstream.URL)
+	rec := postImagesWithHeaders(t, srv, "/openai/v1/images/generations",
+		`{"model":"sd-turbo","prompt":"a cat"}`,
+		map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alias route status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// THE BOUNDARY THIS TASK EXISTS TO PRESERVE: a browser session cookie must NOT
+// reach this endpoint. newChatTestServer wires a real Account and loginCookie
+// mints a real session, so this is the genuine article rather than a stub. A
+// 401 proves auth refused; had the cookie been accepted the request would have
+// failed LATER and differently (the capability gate, a 404), never with a 401.
+func TestImagesRefusesASessionCookie(t *testing.T) {
+	srv, dir := newChatTestServer(t)
+	seedLoginUser(t, dir, "usr_img", "img@example.test", "password-1", "user")
+	cookie := loginCookie(t, srv, "img@example.test", "password-1")
+
+	rec := postImagesWithHeaders(t, srv, "/v1/images/generations",
+		`{"model":"sd-turbo","prompt":"a cat"}`,
+		map[string]string{"Cookie": cookie.Name + "=" + cookie.Value, csrfHeaderName: "1"})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 from a real session cookie: %s", rec.Code, rec.Body.String())
+	}
+}

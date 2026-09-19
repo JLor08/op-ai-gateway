@@ -35,8 +35,16 @@ several architectural decisions exist specifically to satisfy them.
   redacts sensitive headers. See [Security](cross-cutting/security-auth-rbac.md).
 - **Browser vs. program auth are separate and both supported.** Browsers use a
   server-side session cookie plus an `X-OP-CSRF` header on state-changing
-  requests; programs use bearer API tokens. `/v1/chat/completions` also accepts
-  the session; the other inference endpoints are bearer-only.
+  requests; programs use bearer API tokens. Inference endpoints accept three
+  auth legs, not a uniform one: a bearer token works on every inference
+  endpoint; the session cookie additionally works on `/v1/chat/completions`
+  only — the one inference endpoint a logged-in browser calls directly; and
+  the internal trusted-loopback header pair (nginx blanks it at the public
+  edge, so it is never reachable from a browser) additionally lets the
+  gateway's own portal-chat run executor call `/v1/chat/completions` and
+  `/v1/images/generations` as a token-less session principal. No inference
+  endpoint other than those two accepts the loopback pair, and none accepts
+  the session cookie other than `/v1/chat/completions`.
 - **The public listener and the mesh (agent) listener are separate enforcement
   surfaces** with independent TLS and authorization.
 
