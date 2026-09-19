@@ -1623,6 +1623,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
       expect(screen.getByTestId('count').textContent).toBe('4');
     });
+
+    // An image thread's request body carries no history at all, so the vision
+    // guard has nothing to protect and must not fire. Before this change it
+    // did, and it told the user that a model whose only purpose is images
+    // "does not support images" -- from the SECOND image turn onward, because
+    // that is when the replayed history first contains one.
+    it('regenerates in an image thread whose history contains generated images', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: models[0].id, kind: 'image' },
+            messages: [
+              { id: 'u1', role: 'user', content: 'a cat' },
+              { id: 'a1', role: 'assistant', content: imageContent, status: 'complete' },
+              { id: 'u2', role: 'user', content: 'a dog' },
+              { id: 'a2', role: 'assistant', content: imageContent, status: 'complete' },
+            ],
+          },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+      // The run starts and no refusal toast appears.
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
   });
 
   describe(`useChatStreaming isolation [${locale}]`, () => {

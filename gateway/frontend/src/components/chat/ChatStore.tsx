@@ -353,6 +353,14 @@ export function ChatStoreProvider({
   // above — an effect would lag by one passive-effect flush.
   const modelVisionCapableRef = useRef(modelVisionCapable);
   modelVisionCapableRef.current = modelVisionCapable;
+  // The thread's pinned kind ("" text | "image"), so the stable edit/
+  // regenerate callback can gate on it without closing over state. There is
+  // no `kind` React state (yet) to mirror the way the refs above mirror
+  // state -- the backend pins this in the persisted settings and nothing in
+  // the frontend reads it besides this ref; promoting it into real state is
+  // the next task's job. Set directly in activateChat (the one place the raw
+  // persisted content is available), the same way activeTitleRef above is.
+  const chatKindRef = useRef<'' | 'image'>('');
 
   // The run/SSE engine (FA-2): owns the per-chat run subscriptions + transcript
   // buffers behind a narrow interface. See useChatRuns.ts.
@@ -457,6 +465,13 @@ export function ChatStoreProvider({
       if (outgoing) chatBuffers.set(outgoing, messagesRef.current);
 
       const doc = normalizeDoc(chat.content);
+      // The pinned kind is not part of ChatSettings/normalizeDoc (promoting it
+      // into real settings/state is the next task's job); read it directly off
+      // the raw persisted content, following normalizeDoc's own per-field
+      // coercion-with-default idiom: anything other than the literal "image"
+      // defaults to "" (text), including a missing/malformed settings blob.
+      const rawSettings = (chat.content as { settings?: { kind?: unknown } } | null)?.settings;
+      chatKindRef.current = rawSettings?.kind === 'image' ? 'image' : '';
       skipNextSave();
       cancelPendingSave();
       setModel(doc.settings.model);
@@ -718,7 +733,22 @@ export function ChatStoreProvider({
       // process. Checking `history` (not the full messagesRef.current) matters
       // when regenerating/editing an EARLIER turn: truncation drops everything
       // after it, so a later turn's image is never resent and must not block.
-      if (!modelVisionCapableRef.current && historyHasImage(history)) {
+      //
+      // It is deliberately role-BLIND for a text thread: buildAPIHistory
+      // forwards every message's content verbatim, so an assistant's own
+      // generated image in a replayed history becomes a vision input just as a
+      // user's upload does, and refusing it on a non-vision model is correct.
+      //
+      // An IMAGE thread is exempt because its request body carries no history
+      // at all -- just {model, prompt, response_format} -- so there is no
+      // vision input to refuse. Without this exemption an image thread refused
+      // its own regenerate from the second turn onward, telling the user that a
+      // model whose only purpose is images does not support images.
+      if (
+        chatKindRef.current !== 'image' &&
+        !modelVisionCapableRef.current &&
+        historyHasImage(history)
+      ) {
         showErrorRef.current(tRef.current.chatImageModelUnsupported);
         return;
       }
