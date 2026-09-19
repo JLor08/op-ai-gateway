@@ -69,6 +69,61 @@ const (
 	msgMethodNotAllowed         = "method not allowed"
 )
 
+// loopbackPrincipal resolves the internal trusted-loopback header pair
+// (internalAuthHeaderName + internalUserHeaderName) into a bare, never-
+// elevated session principal, or reports false. It never writes to the
+// response and never returns a partial/zero-value success: ok is true only
+// when a real principal was resolved.
+//
+// One function backs BOTH authenticateWeb (below) and
+// authenticateInternalOrBearer (auth_internal_or_bearer.go) because the
+// header pair is actually read in THREE places in this package -- those two,
+// plus edgeGateInternalCaller's gate-exemption check (edge_scheme.go) -- and a
+// constant-time secret comparison duplicated across an auth boundary can
+// drift silently: one copy fixed and another left behind is exactly the class
+// of bug this kind of check must never have.
+//
+// edgeGateInternalCaller is deliberately NOT folded into this helper too, even
+// though it re-implements the same comparison: it only decides a gate
+// EXEMPTION and resolves no principal at all (no UserByID, no
+// sessionPrincipal). Sharing this function with it would either force
+// edgeGateInternalCaller to pay for a user lookup it has no use for, or force
+// this helper to grow a mode flag just to skip that lookup for one caller --
+// both worse than the one small comparison edgeGateInternalCaller already
+// duplicates on its own. Leave that third site alone; do not "finish" this
+// refactor by trying to fold it in too.
+//
+// Deliberately takes no http.ResponseWriter: it NEVER writes a response, on
+// success or failure, precisely so both callers can fall through to their own
+// next auth leg (cookie or bearer) after a false result without risking a
+// second, conflicting write.
+//
+// Fail-closed on three independent conditions, checked in order -- a non-
+// empty s.internalAuthSecret, a non-nil s.users, and a nil error from
+// UserByID (which also covers "user not found") -- any one of them failing
+// returns false with no side effect. The secret comparison is
+// subtle.ConstantTimeCompare, guarded by presented != "" (an empty header must
+// never be allowed to match an unconfigured/empty secret, which
+// ConstantTimeCompare alone would happily do since two empty byte slices
+// compare equal). The returned principal is sessionPrincipal(user, false):
+// never elevated, because a loopback caller is not an interactive session
+// that went through the System-Admin step-up, and there is no cookie here to
+// resolve elevation from.
+func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
+	if s.internalAuthSecret == "" || s.users == nil {
+		return auth.Token{}, false
+	}
+	presented := r.Header.Get(internalAuthHeaderName)
+	if presented == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) != 1 {
+		return auth.Token{}, false
+	}
+	user, err := s.users.UserByID(r.Context(), r.Header.Get(internalUserHeaderName))
+	if err != nil {
+		return auth.Token{}, false
+	}
+	return sessionPrincipal(user, false), true
+}
+
 // authenticateWeb resolves a principal. It first checks the internal trusted-
 // loopback header (before cookie/bearer): only the gateway calling its own
 // endpoints sets it, guarded by a per-process secret. Otherwise it resolves the
@@ -79,20 +134,11 @@ func (s *Server) authenticateWeb(w http.ResponseWriter, r *http.Request) (auth.T
 	// its own endpoints sets these headers, guarded by a per-process secret.
 	// Returns a bare session principal (ID==""), exactly as the browser cookie
 	// path does; the handler applies any X-OP-Run-As-Token and fails closed on
-	// error. Fail-closed: absent/incorrect secret, no lookup, or any lookup
-	// error (including not-found) falls through to normal auth without writing
-	// a response.
-	if s.internalAuthSecret != "" && s.users != nil {
-		if presented := r.Header.Get(internalAuthHeaderName); presented != "" &&
-			subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) == 1 {
-			if user, err := s.users.UserByID(r.Context(), r.Header.Get(internalUserHeaderName)); err == nil {
-				// Background/internal runs are never elevated: they are not an
-				// interactive session that went through the System-Admin
-				// step-up, and the request never carried a session cookie to
-				// resolve elevation from.
-				return sessionPrincipal(user, false), true
-			}
-		}
+	// error. See loopbackPrincipal for the fail-closed conditions -- a false
+	// result here writes nothing, so falling through to cookie/bearer below is
+	// always safe.
+	if token, ok := s.loopbackPrincipal(r); ok {
+		return token, true
 	}
 	if s.Account != nil {
 		if cookie, err := r.Cookie(sessionCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {

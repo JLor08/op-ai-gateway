@@ -4,7 +4,6 @@
 package gateway
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
@@ -26,21 +25,14 @@ import (
 // ladder.
 //
 // Order matters: the loopback branch runs FIRST because s.authenticate writes a
-// 401 before returning false. Fail-closed on each of its three conditions --
-// an absent configured secret, a nil user lookup, or any lookup error -- by
-// falling through WITHOUT writing a response.
+// 401 before returning false. loopbackPrincipal (auth.go, shared with
+// authenticateWeb) is fail-closed on each of its three conditions -- an
+// absent configured secret, a nil user lookup, or any lookup error -- and
+// never writes a response, so falling through to s.authenticate on a false
+// result is always safe.
 func (s *Server) authenticateInternalOrBearer(w http.ResponseWriter, r *http.Request) (auth.Token, bool) {
-	if s.internalAuthSecret != "" && s.users != nil {
-		if presented := r.Header.Get(internalAuthHeaderName); presented != "" &&
-			subtle.ConstantTimeCompare([]byte(presented), []byte(s.internalAuthSecret)) == 1 {
-			if user, err := s.users.UserByID(r.Context(), r.Header.Get(internalUserHeaderName)); err == nil {
-				// Never elevated: a background/internal run is not an
-				// interactive session that went through the System-Admin
-				// step-up, and the request carried no cookie to resolve
-				// elevation from.
-				return sessionPrincipal(user, false), true
-			}
-		}
+	if token, ok := s.loopbackPrincipal(r); ok {
+		return token, true
 	}
 	return s.authenticate(w, r)
 }
