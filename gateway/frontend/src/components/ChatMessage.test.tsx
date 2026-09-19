@@ -3,6 +3,7 @@
 
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Typography } from '@mui/material';
 import { ChatMessage } from './ChatMessage';
 import { messages, type Locale } from '../i18n';
 
@@ -420,7 +421,22 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(() =>
         fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage })),
       ).not.toThrow();
-      expect(screen.getByText(t.chatImageDownloadError)).toBeInTheDocument();
+      const alert = screen.getByText(t.chatImageDownloadError);
+      expect(alert).toBeInTheDocument();
+      // ...and it READS as a failure. This was hardcoded to the brand teal
+      // (var(--brand-accent)) -- the portal's accent colour -- while every
+      // other Typography role="alert" in the codebase is color="error". A
+      // failure message in the accent colour is a failure the eye does not
+      // register as one. Compared against a reference element rather than a
+      // literal colour, so a theme change moves both together.
+      render(
+        <Typography color="error" data-testid="error-reference">
+          reference
+        </Typography>,
+      );
+      expect(window.getComputedStyle(alert).color).toBe(
+        window.getComputedStyle(screen.getByTestId('error-reference')).color,
+      );
     });
   });
 }

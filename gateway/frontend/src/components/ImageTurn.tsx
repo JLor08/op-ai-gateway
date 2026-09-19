@@ -84,7 +84,7 @@ export function ImageTurn({
             </IconButton>
           </Tooltip>
           {failedIndex === index && (
-            <Typography role="alert" sx={{ color: 'var(--brand-accent)', fontSize: 12 }}>
+            <Typography role="alert" color="error" sx={{ fontSize: 12 }}>
               {t.chatImageDownloadError}
             </Typography>
           )}
