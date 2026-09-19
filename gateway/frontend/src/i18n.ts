@@ -524,6 +524,9 @@ const de = {
     'Unbekannt = keine Festlegung. MTP wird nicht neu erkannt — an einer bestehenden Zuordnung prüft es nichts. Dieser Chip ist rein informativ und hat keinen Einfluss auf die Server-Auswahl.',
   mappingVisionCapableUnknownHint:
     'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
+  mappingImageCapable: 'Bilderzeugung',
+  mappingImageCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Es gibt dafür keine automatische Erkennung — setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1154,6 +1157,7 @@ const de = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
+  capabilityImage: 'Bilderzeugung',
   // "Beobachtet", nicht "Unterstützt": Diese Zeile entsteht ausschließlich
   // aus echtem Traffic (llama.cpp hat mindestens einmal gedraftete Tokens
   // gemeldet), niemals aus einer Fähigkeits-Erklärung von Build oder
@@ -2860,6 +2864,9 @@ const en: PortalMessages = {
     'Unknown = no verdict on file. MTP is never re-detected — nothing probes it on an existing mapping. This chip is informational only: it never affects server selection.',
   mappingVisionCapableUnknownHint:
     'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
+  mappingImageCapable: 'Image generation',
+  mappingImageCapableUnknownHint:
+    'Unknown: whether this mapping generates images is not on file. There is no automated detection for it — set it to Yes to enable image generation for this model.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -3440,6 +3447,7 @@ const en: PortalMessages = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
+  capabilityImage: 'Image generation',
   // "Observed", not "supported": this row exists only because real traffic
   // produced it (llama.cpp reported at least one completion with drafted
   // tokens), never because a build or a model declared the trait -- see the

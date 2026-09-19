@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { messages } from './i18n';
+import { messages, type Locale } from './i18n';
 import {
   vramCardCheckLabelKey,
   vramFingerprintKinds,
@@ -2689,6 +2689,17 @@ describe('mapping capability i18n keys', () => {
     expect(messages.en.mappingIsMtpUnknownHint).toMatch(/never re-detected/);
     expect(messages.de.mappingIsMtpUnknownHint).toMatch(/nicht neu erkannt/);
   });
+});
+
+describe('mapping image capability i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the image capability keys in ${locale}`, () => {
+      const t = messages[locale];
+      expect(t.mappingImageCapable).toBeTruthy();
+      expect(t.mappingImageCapableUnknownHint).toBeTruthy();
+      expect(t.capabilityImage).toBeTruthy();
+    });
+  }
 });
 
 // Responses live-timings (issue #81 part 2, design D10): the shared

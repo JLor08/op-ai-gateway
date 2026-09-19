@@ -201,6 +201,8 @@ export function MappingForm({
   const [isMtp, setIsMtp] = useState<CapabilityChoice>(isMtpSeed);
   const [visionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'vision'));
   const [visionCapable, setVisionCapable] = useState<CapabilityChoice>(visionCapableSeed);
+  const [imageCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'image'));
+  const [imageCapable, setImageCapable] = useState<CapabilityChoice>(imageCapableSeed);
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -321,6 +323,7 @@ export function MappingForm({
     for (const control of [
       { capability: 'mtp', value: isMtp, seed: isMtpSeed },
       { capability: 'vision', value: visionCapable, seed: visionCapableSeed },
+      { capability: 'image', value: imageCapable, seed: imageCapableSeed },
     ] as const) {
       if (control.value === control.seed) continue;
       verdicts[control.capability] = control.value;
@@ -511,6 +514,22 @@ export function MappingForm({
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
           <option value="no">{t.mappingCapabilityNo}</option>
+        </SelectField>
+        {/* image has NO "no" option, unlike its two neighbours above:
+            reservedManualVerdicts refuses (image, no) because a manual no
+            outranks every automated source forever and would permanently
+            mask the sd-server capability writer once it ships. Its unknown
+            hint also does not promise a probe -- image has no automated
+            writer yet, so it says the operator decides. */}
+        <SelectField
+          id="mapping-image-capable"
+          label={t.mappingImageCapable}
+          value={imageCapable}
+          onChange={(e) => setImageCapable(e.target.value as CapabilityChoice)}
+          {...(imageCapable === '' ? { helperText: t.mappingImageCapableUnknownHint } : {})}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
         </SelectField>
         {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
             numeric metrics, not a capability, and ADR-039 is explicit that it
