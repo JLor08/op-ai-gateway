@@ -1440,6 +1440,68 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
     });
 
+    // renameChat is the FOURTH writer, and the only one that cannot simply
+    // refuse: it PUTs buildDoc() for the active chat directly, bypassing
+    // flushSave, and the user asked to change a TITLE -- a rename that
+    // silently does nothing is its own surprise. So it falls back to the
+    // branch it already has for every other chat and sends the SERVER's own
+    // stored content back with the new title. The rename happens; the
+    // unproven local transcript is not what gets written.
+    it('renames a stale chat by writing the SERVER document, never the local transcript', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      chatApi.spies.saveChat.mockClear();
+      chatApi.spies.chat.mockRejectedValue(new Error('refetch unavailable'));
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'draw a cat' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+
+      await act(async () => {
+        es.emit('done', {
+          status: 'completed',
+          kind: 'image',
+          content_parts: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
+        });
+      });
+      await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+      await screen.findByText(t.errorChatTranscriptStale);
+      // The local buffer now holds two turns the seeded server row does not,
+      // which is what makes the two documents distinguishable below.
+      expect(screen.getByTestId('count').textContent).toBe('2');
+
+      // The outage was transient -- the refetch works again by the time the
+      // user renames. (If it did not, saveChat would never be reached and the
+      // catch would surface the failure, which is loud rather than
+      // destructive; either way the stale buffer is not written.)
+      chatApi.spies.chat.mockImplementation(async (id: string) => {
+        const found = chatApi.rows.find((row) => row.id === id);
+        if (!found) throw new Error('chat not found');
+        return found;
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c1' }));
+
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1));
+      const [savedId, body] = chatApi.spies.saveChat.mock.calls[0];
+      expect(savedId).toBe('c1');
+      // The rename is NOT a silent no-op...
+      expect(body.title).toBe('Renamed');
+      // ...and the transcript it carries is the server's (no messages), not
+      // the two-turn local buffer.
+      expect((body.content as { messages: unknown[] }).messages).toHaveLength(0);
+    });
+
     // The other side of the same switch: an adopt that SUCCEEDS must leave
     // persistence working. Without this a fix that simply stopped saving
     // after every run would pass the test above and silently break autosave

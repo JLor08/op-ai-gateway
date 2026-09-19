@@ -553,6 +553,7 @@ export function ChatStoreProvider({
     skipNextSave,
     cancelPendingSave,
     setTranscriptStale,
+    isTranscriptStale,
     flushOnUnmount,
   } = persistence;
 
@@ -1190,8 +1191,21 @@ export function ChatStoreProvider({
         try {
           // The PUT contract requires title + content. Use the live document for
           // the active chat; otherwise fetch the target's content first.
+          //
+          // ...and NOT the live document when this client cannot vouch for it.
+          // A rename is a fourth writer: it PUTs buildDoc() directly and never
+          // touches flushSave, so the refusal the other three share does not
+          // reach it. But refusing the rename outright would be its own
+          // surprise -- the user asked to change a TITLE and would watch
+          // nothing happen -- so it falls back to the branch this function
+          // already has for every other chat and sends the SERVER's own stored
+          // content back with the new title. The transcript is then written
+          // unchanged (it is the server's own bytes) and the rename still
+          // renames. If that fetch fails too, saveChat is never reached and
+          // the catch below says so, which is loud rather than destructive.
+          const stale = isTranscriptStale(id);
           const content =
-            id === activeChatIdRef.current
+            id === activeChatIdRef.current && !stale
               ? buildDoc()
               : normalizeDoc((await apiRef.current.chat(id)).content);
           const saved = await apiRef.current.saveChat(id, { title: trimmed, content });
@@ -1209,7 +1223,7 @@ export function ChatStoreProvider({
         }
       })();
     },
-    [buildDoc],
+    [buildDoc, isTranscriptStale],
   );
 
   const removeImage = useCallback(

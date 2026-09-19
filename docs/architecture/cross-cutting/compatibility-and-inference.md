@@ -1016,16 +1016,26 @@ so the event can never claim a turn the store refused; it rides on
 `snapshot` as well as `done`, because a late subscriber inside the eviction
 grace is served the terminal state as a snapshot and never sees a `done`.
 
-**And the portal refuses to save a transcript it could not reconcile.** The
+**And the portal never PUTs a transcript it cannot vouch for.** The
 post-terminal canonical refetch marks the chat *unproven* before its request
-and clears the mark only once it has adopted the server's answer; while the
-mark stands, every save path (the debounced PUT, the `pagehide` keepalive, the
-unmount flush) refuses that chat and the user is told the tab has stopped
-persisting it. A refetch of an image document can easily outlast the 800 ms
-save debounce, so cancelling a pending save on failure would be too late —
-the refusal has to be armed before the request, not after it. The mark is
-lifted again when the chat is next activated straight from a freshly loaded
-server document.
+and clears the mark only once it has adopted the server's answer. While the
+mark stands, **no write may carry that chat's local transcript** — the
+invariant, deliberately stated rather than a list of the functions that
+currently honour it, because an enumeration goes stale the next time someone
+adds a writer. A writer satisfies it one of two ways: by refusing outright
+(the debounced PUT, the `pagehide` keepalive and the unmount flush all do,
+and the user is told the tab has stopped persisting the chat), or by
+re-deriving its document from the server (a rename must still be able to
+change the title, so it sends the server's own stored content back with the
+new one instead of the local buffer).
+
+A refetch of an image document can easily outlast the 800 ms save debounce,
+so cancelling a pending save on failure would be too late — the mark has to
+be armed before the request, not after it. Once set it stands for the rest of
+the session: the run stays in the client's registry as a terminal entry, so
+re-activating the chat prefers its streamed buffer over the freshly loaded
+document and does not re-prove anything. Only a reload, or deleting the chat,
+clears it, which is what both locales of the notice say.
 
 **`PUT /api/portal/chats/{id}` is refused while a run is active for that
 chat** — 409 `portal.chat_run_active`, the same sentinel the run-start endpoint

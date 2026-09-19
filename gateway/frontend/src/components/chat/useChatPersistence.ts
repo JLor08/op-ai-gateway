@@ -65,6 +65,13 @@ export type ChatPersistenceApi = {
   // too late by then. Cleared again by a successful adopt, by deleteChat, and
   // by activating a chat straight from a freshly loaded server document.
   setTranscriptStale: (chatId: string, stale: boolean) => void;
+  // Whether chatId carries that mark. Read by writers that live OUTSIDE this
+  // module and therefore cannot be refused from inside it — renameChat PUTs
+  // buildDoc() for the active chat directly, bypassing flushSave, so it has
+  // to ask. The invariant is "no write may carry an unproven local
+  // transcript", not "these N functions check a flag": a writer that cannot
+  // refuse must re-derive its document from the server instead.
+  isTranscriptStale: (chatId: string) => boolean;
   // Final best-effort flush on a real provider unmount (logout): cancels the
   // pending timer and, unless a run is live, fires a synchronous-dispatch
   // save for the active chat if it is dirty.
@@ -337,6 +344,8 @@ export function useChatPersistence(
     else staleChatsRef.current.delete(chatId);
   }, []);
 
+  const isTranscriptStale = useCallback((chatId: string) => staleChatsRef.current.has(chatId), []);
+
   // Final best-effort flush on a real provider unmount (logout — a
   // client-side state change, NOT a page reload, so this fires reliably
   // unlike the pagehide path). The caller (ChatStoreProvider) invokes this
@@ -363,6 +372,7 @@ export function useChatPersistence(
     skipNextSave,
     cancelPendingSave,
     setTranscriptStale,
+    isTranscriptStale,
     flushOnUnmount,
   };
 }
