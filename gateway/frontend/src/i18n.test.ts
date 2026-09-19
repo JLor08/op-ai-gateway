@@ -2814,6 +2814,10 @@ describe('chat generated-image i18n keys', () => {
       expect(t.chatGeneratedImage).toBeTruthy();
       // The generated-image alt must not reuse the ATTACHED-image string.
       expect(t.chatGeneratedImage).not.toBe(t.chatAttachedImage);
+      // A corrupted persisted data URL fails to decode, and the whole point
+      // of this feature is that the failure is not silent -- so there must
+      // be a distinct string to tell the user.
+      expect(t.chatImageDownloadError).toBeTruthy();
     });
   }
 });

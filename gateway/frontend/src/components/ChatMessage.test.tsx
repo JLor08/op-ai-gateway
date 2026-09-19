@@ -6,7 +6,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatMessage } from './ChatMessage';
 import { messages, type Locale } from '../i18n';
 
-afterEach(cleanup);
+// Captured once, before any test can have spied on it -- vitest's retry: 2
+// (vite.config.ts) reruns a failing test's body (including a fresh
+// vi.spyOn(document, 'createElement')) without an intervening restore unless
+// afterEach does it. Re-reading document.createElement INSIDE a test body
+// would then capture the previous attempt's still-installed spy instead of
+// the native function, and re-wrapping that spy's own mockImplementation to
+// call itself is a direct infinite recursion (seen as a real failure while
+// writing this file's anchor-attribute tests). Capturing the native function
+// here, once, and restoring mocks in afterEach, avoids both.
+const nativeCreateElement = document.createElement.bind(document);
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
@@ -249,6 +263,67 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(createObjectURL).toHaveBeenCalledTimes(1);
       expect(blobs[0].type).toBe('image/webp');
       expect(blobs[0].size).toBe(4); // "ABCD" base64-decodes to 4 bytes
+    });
+
+    // Pins the wiring from ChatMessage/ImageTurn through to downloadBinary's
+    // extensionFor, not just extensionFor in isolation: a mutation that makes
+    // extensionFor return the wrong extension (or a component that stops
+    // calling it) must fail here too, not just in downloadBinary's own test
+    // file. jpeg is used deliberately -- it is the one branch (renamed to
+    // jpg) a reader would not predict from the media type alone.
+    it("sets the downloaded anchor's filename from the image's own media type", () => {
+      let anchor: HTMLAnchorElement | undefined;
+      vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+        const el = nativeCreateElement(tag, options as ElementCreationOptions);
+        if (tag === 'a') anchor = el as HTMLAnchorElement;
+        return el;
+      });
+      vi.stubGlobal('URL', {
+        ...URL,
+        createObjectURL: vi.fn(() => 'blob:stub'),
+        revokeObjectURL: vi.fn(),
+      });
+
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AAAA' } }]}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+      expect(anchor?.download).toBe('generated-image-1.jpg');
+    });
+
+    // The shape matches but the payload doesn't decode -- a truncated or
+    // corrupted persisted transcript reaches exactly this. The download must
+    // not crash (downloadBinary runs inside this onClick, with no error
+    // boundary above it) and, since this whole feature exists to stop a
+    // failure from being silent, the user must be told.
+    it('tells the user when a generated image fails to download instead of failing silently', () => {
+      vi.stubGlobal('URL', {
+        ...URL,
+        createObjectURL: vi.fn(() => 'blob:stub'),
+        revokeObjectURL: vi.fn(),
+      });
+
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,not-valid-base64!!!' } },
+          ]}
+        />,
+      );
+
+      expect(() =>
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage })),
+      ).not.toThrow();
+      expect(screen.getByText(t.chatImageDownloadError)).toBeInTheDocument();
     });
   });
 }

@@ -9,11 +9,24 @@
 //
 // The media type is taken from the data URL's own prefix, which Task 7 fills
 // from the upstream response's output_format. Nothing here assumes PNG.
-export function downloadBinary(filename: string, dataUrl: string) {
+//
+// Returns false, without throwing, if the data URL doesn't decode -- either
+// its shape doesn't match (data:<mime>;base64,<payload>) or the payload
+// itself is not valid base64 (a truncated/corrupted persisted transcript
+// reaches exactly this: atob() throws a DOMException on it). This runs
+// inside an onClick with no error boundary above it, so an uncaught throw
+// here would surface as nothing at all -- the caller uses the boolean to
+// tell the user the download failed instead of it failing silently.
+export function downloadBinary(filename: string, dataUrl: string): boolean {
   const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
-  if (!match) return;
+  if (!match) return false;
   const [, mime, b64] = match;
-  const binary = atob(b64);
+  let binary: string;
+  try {
+    binary = atob(b64);
+  } catch {
+    return false;
+  }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
@@ -25,6 +38,7 @@ export function downloadBinary(filename: string, dataUrl: string) {
   } finally {
     URL.revokeObjectURL(url);
   }
+  return true;
 }
 
 // extensionFor maps a media type to a file extension for the download name. A

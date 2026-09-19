@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Box, IconButton, Tooltip } from '@mui/material';
+import { useState } from 'react';
+import { Box, IconButton, Tooltip, Typography } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import { downloadBinary, extensionFor } from './shared/downloadBinary';
 import type { Translation } from './shared/types';
@@ -29,6 +30,16 @@ export function ImageTurn({
   // the fallback for a transcript whose preceding user turn is gone (an old
   // transcript, or a regenerated turn whose prompt message was edited away).
   const alt = prompt || t.chatGeneratedImage;
+  // Tracks which image (by index) most recently failed to download -- a
+  // truncated/corrupted persisted data URL decodes to nothing. downloadBinary
+  // never throws for this, but it also must not fail silently: the whole
+  // point of this feature is that a failed download is visible, so an
+  // inline message is shown next to that image's own button rather than a
+  // global toast (which couldn't say which of several images failed, and
+  // would require ImageTurn to depend on ToastProvider context that its
+  // standalone-props tests, matching ChatMessage's own, don't provide).
+  // Cleared on the next successful download.
+  const [failedIndex, setFailedIndex] = useState<number | null>(null);
 
   return (
     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
@@ -63,14 +74,20 @@ export function ImageTurn({
             <IconButton
               size="small"
               aria-label={t.chatDownloadImage}
-              onClick={() =>
-                downloadBinary(`generated-image-${index + 1}.${extensionFor(url)}`, url)
-              }
+              onClick={() => {
+                const ok = downloadBinary(`generated-image-${index + 1}.${extensionFor(url)}`, url);
+                setFailedIndex(ok ? null : index);
+              }}
               sx={{ alignSelf: 'flex-end' }}
             >
               <DownloadIcon fontSize="small" />
             </IconButton>
           </Tooltip>
+          {failedIndex === index && (
+            <Typography role="alert" sx={{ color: 'var(--brand-accent)', fontSize: 12 }}>
+              {t.chatImageDownloadError}
+            </Typography>
+          )}
         </Box>
       ))}
     </Box>

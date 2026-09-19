@@ -197,6 +197,11 @@ const de = {
   chatAttachedImage: 'Angehängtes Bild',
   chatDownloadImage: 'Bild herunterladen',
   chatGeneratedImage: 'Erzeugtes Bild',
+  // Shown inline next to a generated image's download button when the saved
+  // transcript's data URL does not decode -- a truncated/corrupted persisted
+  // turn reaches exactly this. The whole point of this feature is to stop a
+  // download from failing silently, so the user is told, not just logged to.
+  chatImageDownloadError: 'Bild konnte nicht heruntergeladen werden.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -2599,6 +2604,7 @@ const en: PortalMessages = {
   chatAttachedImage: 'Attached image',
   chatDownloadImage: 'Download image',
   chatGeneratedImage: 'Generated image',
+  chatImageDownloadError: 'Could not download the image.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',

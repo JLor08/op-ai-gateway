@@ -178,6 +178,32 @@ function seedUnavailableModelChat() {
   });
 }
 
+// Seeds a persisted chat whose assistant turn already carries a generated
+// image, preceded by the user turn that asked for it -- exercising promptText
+// through the real component tree (Chat.tsx computing it from the previous
+// message, ChatStore loading it, ChatMessage/ImageTurn rendering it) rather
+// than as a literal prop handed directly to ChatMessage in isolation.
+function seedGeneratedImageChat() {
+  const stamp = '2026-07-19T12:00:00Z';
+  chatApi.rows.push({
+    id: 'c_image_seed',
+    title: '',
+    created_at: stamp,
+    updated_at: stamp,
+    content: {
+      settings: {},
+      messages: [
+        { id: 'm_prompt', role: 'user', content: 'a cat on a bicycle' },
+        {
+          id: 'm_image',
+          role: 'assistant',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }],
+        },
+      ],
+    },
+  });
+}
+
 function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
   return {
     id: 'tok_plain',
@@ -498,6 +524,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(modelSelect.value).toBe('');
       expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+    });
+  });
+
+  describe(`Chat: generated-image alt text comes from the prompt [${locale}]`, () => {
+    // ChatMessage.test.tsx pins this at the literal-prop level (promptText
+    // handed straight to ChatMessage); nothing there proves Chat.tsx actually
+    // computes and threads that prop through the real component tree. This
+    // renders a persisted thread through Chat + ChatStoreProvider end to end.
+    it("renders a generated assistant image whose alt text is the preceding user turn's prompt", async () => {
+      seedGeneratedImageChat();
+      renderChat();
+      await waitForChatReady();
+
+      const image = await screen.findByAltText('a cat on a bicycle');
+      expect(image).toHaveAttribute('src', 'data:image/png;base64,AAAA');
     });
   });
 
