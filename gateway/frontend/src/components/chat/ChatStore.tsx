@@ -250,8 +250,11 @@ export function ChatStoreProvider({
   // thread's FIRST send, and a live session (new chat -> pick an image model
   // -> send -> send again -> regenerate, no reload) must see it immediately.
   // Opaque string, never narrowed to the kinds this build knows, so an
-  // unfamiliar one survives the save round trip instead of being erased.
-  const [pinnedChatKind, setPinnedChatKind] = useState<string>(DEFAULTS.kind);
+  // unfamiliar one survives the save round trip instead of being erased. ""
+  // is text: the SETTING is optional (omitted for a text thread, mirroring
+  // the backend's omitempty) but the state is always a string, so nothing
+  // downstream has to handle undefined.
+  const [pinnedChatKind, setPinnedChatKind] = useState<string>('');
   // The backend's per-chat content cap, as SERVED on the chat listing
   // (ChatListResponse.max_content_bytes = portal.MaxChatContentBytes). 0 = not
   // served (an older gateway) = capacity unknown. Never hardcoded here: a
@@ -542,7 +545,7 @@ export function ChatStoreProvider({
       // loaded document. A setting activateChat does NOT seed reverts to its
       // default here and is then written over the stored value by the next
       // debounced save, because the PUT full-replaces the content blob.
-      setPinnedChatKind(doc.settings.kind);
+      setPinnedChatKind(doc.settings.kind ?? '');
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually

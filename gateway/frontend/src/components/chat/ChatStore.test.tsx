@@ -1741,6 +1741,40 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('chat-kind').textContent).toBe('image');
     });
 
+    // The mirror image of the round trip above, and of the backend's own
+    // TestPortalChat...TextStaysByteIdentical: `kind` is omitempty on BOTH
+    // sides. A text thread's stored settings must not gain the key just
+    // because the portal now knows about kinds -- every existing text chat in
+    // the system would otherwise have its blob reshaped on its next save, for
+    // a field that means nothing to it.
+    it('writes no kind key at all when saving a text thread', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: models[0].id },
+            messages: [
+              { id: 'u1', role: 'user', content: 'hello' },
+              { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+            ],
+          },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: Record<string, unknown> };
+      };
+      expect(Object.keys(saved.content.settings)).not.toContain('kind');
+    });
+
     // The THIRD of the three lockstep edits a new persisted setting needs in
     // useChatPersistence: the debounced effect's EXPLICIT dep array, which
     // sits under an eslint-disable for exhaustive-deps, so a missing dep is
@@ -1857,12 +1891,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     // The pagehide keepalive is capped near the browser's own keepalive body
     // ceiling, and a single inline base64 image is far past it -- so for every
-    // thread this feature creates the keepalive is dead. The cap stays (raising
-    // it would just make the browser drop the PUT), but the skip must not be
-    // silent, or the mechanism is invisible exactly where it never runs.
-    it('reports the pagehide keepalive skip for an oversized image document', async () => {
+    // thread this feature creates, the keepalive is the skipped branch. The cap
+    // stays (raising it would just move the failure to the browser dropping the
+    // PUT); what must hold is that the skip is not a LOSS: the chat stays dirty
+    // and the unlimited debounced save still persists the change.
+    it('leaves an oversized image document to the debounced save when the keepalive skips it', async () => {
       chatApi = makeChatApi(imageThread(bigImage));
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       renderProvider([], { models: imageModels });
       await waitForReady();
 
@@ -1871,17 +1905,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       act(() => {
         window.dispatchEvent(new Event('pagehide'));
       });
-
       expect(chatApi.spies.saveChatKeepalive).not.toHaveBeenCalled();
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('keepalive skipped'));
-      warn.mockRestore();
+
+      // The chat was left dirty, so the debounced save still lands the change.
+      // (Clearing the dirty flag on the skip would silently drop it instead.)
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { system_prompt?: string } };
+      };
+      expect(saved.content.settings.system_prompt).toBe('hi');
     });
 
     it('still fires the pagehide keepalive for a document inside the cap', async () => {
       // Negative control: the skip above is about SIZE, not about image
       // threads as such.
       chatApi = makeChatApi(imageThread(generatedImage));
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       renderProvider([], { models: imageModels });
       await waitForReady();
 
@@ -1891,8 +1929,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
 
       expect(chatApi.spies.saveChatKeepalive).toHaveBeenCalled();
-      expect(warn).not.toHaveBeenCalled();
-      warn.mockRestore();
     });
 
     // The thread's kind follows the THREAD, not the picked model. A text

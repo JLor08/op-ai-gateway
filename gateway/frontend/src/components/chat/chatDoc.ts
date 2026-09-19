@@ -112,7 +112,9 @@ export const DEFAULTS: ChatSettings = {
   run_as_token_id: '',
   server_override: '',
   server_override_force_unreachable: false,
-  kind: '',
+  // No `kind` key: a text thread's persisted settings must not carry one at
+  // all (see kindSetting below). DEFAULTS is written verbatim as a new chat's
+  // content, so a `kind: ''` here would put the key on every chat at creation.
 };
 
 // Attachment cap: keep persisted transcripts well under the storage quota.
@@ -143,6 +145,18 @@ export function lsRemove(key: string): void {
   } catch {
     /* best-effort */
   }
+}
+
+// The `kind` entry of a settings object, as a SPREADABLE fragment: present
+// only when the kind is non-empty. This mirrors the backend's
+// `json:"kind,omitempty"`, which exists so a text thread's persisted settings
+// stay byte-identical to what they were before image threads existed (the
+// backend has a test asserting the key never appears for one). Both writers
+// of a settings object -- normalizeDoc below, which renameChat PUTs verbatim
+// for a non-active chat, and buildDoc in useChatPersistence -- go through
+// this, so neither can reintroduce the key from the client side.
+export function kindSetting(kind: string | undefined): { kind?: string } {
+  return kind ? { kind } : {};
 }
 
 // Coerce an opaque `content` blob into a well-formed active-chat document,
@@ -177,8 +191,9 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       // full-replaces the stored blob with no merge — so a setting this
       // function drops is a setting the next autosave silently erases from
       // the server. Passed through as an opaque string (no narrowing to the
-      // kinds this build knows) for exactly the same reason.
-      kind: typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
+      // kinds this build knows) for exactly the same reason, and spread
+      // through kindSetting so an absent/empty one stays absent.
+      ...kindSetting(typeof s.kind === 'string' ? s.kind : DEFAULTS.kind),
     },
     messages,
   };
@@ -220,8 +235,7 @@ export function readLegacyDoc(): ActiveChatDoc | null {
       server_override: DEFAULTS.server_override,
       server_override_force_unreachable: DEFAULTS.server_override_force_unreachable,
       // A legacy single-conversation transcript predates image threads by
-      // definition, so it migrates as text.
-      kind: DEFAULTS.kind,
+      // definition, so it migrates as text -- i.e. with no kind key at all.
     },
     messages,
   };

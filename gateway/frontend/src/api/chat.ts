@@ -48,7 +48,14 @@ export type ChatSettings = {
   // build does not recognise must round-trip through load/save untouched. The
   // backend full-replaces this whole blob on every PUT with no merge, so a
   // field the frontend drops is a field the next autosave silently erases.
-  kind: string;
+  //
+  // OPTIONAL, and OMITTED (not written as "") for a text thread: the backend
+  // declares Kind last with `json:"kind,omitempty"` precisely so an existing
+  // text chat's persisted settings stay byte-identical, and it has a test
+  // asserting the key never appears for one. Writing `"kind":""` back on
+  // every save would give that property away from the client side. See
+  // kindSetting() in chatDoc.ts, which is how both writers honour it.
+  kind?: string;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
