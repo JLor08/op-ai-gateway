@@ -153,12 +153,15 @@ func TestModelsResponseVisionReadsTheVisionRowAndNoOther(t *testing.T) {
 
 // TestModelsResponseCapabilityReadFailureDegradesAndLogs: a failing bulk
 // capability read in the models listing must NOT fail the listing -- the
-// models still come back, but fail-CLOSED, with vision withheld from every
-// one of them (the fold AND-s a missing row in as false) -- and it must LOG.
-// This degrade is a gateway-wide, fail-closed outage of one feature: the
-// portal chat's image attach gates on ModelOption.vision, so it silently
-// disappears for every model while the page otherwise renders perfectly
-// normally. Unlogged, there is nothing at all to diagnose it from.
+// models still come back, but fail-CLOSED, with vision AND image withheld
+// from every one of them (the fold AND-s a missing row in as false for
+// both) -- and it must LOG. This degrade is a gateway-wide, fail-closed
+// outage of two features at once: the portal chat's image-ATTACH affordance
+// gates on ModelOption.vision (accepting an image), and its image-GENERATION
+// affordance gates on this Image flag (producing one) -- see
+// routing.CapabilityImage's doc comment on why the two are independent -- so
+// both silently disappear for every model while the page otherwise renders
+// perfectly normally. Unlogged, there is nothing at all to diagnose it from.
 func TestModelsResponseCapabilityReadFailureDegradesAndLogs(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
@@ -190,14 +193,18 @@ func TestModelsResponseCapabilityReadFailureDegradesAndLogs(t *testing.T) {
 		t.Fatalf("m1 image = true after a failed capability read, want false (fail-closed, same contract as vision)")
 	}
 	if !strings.Contains(logged, "capability read failed") || !strings.Contains(logged, "capability table unavailable") {
-		t.Fatalf("log output = %q, want a warning naming the failure -- withholding vision gateway-wide must leave a diagnostic trail", logged)
+		t.Fatalf("log output = %q, want a warning naming the failure -- withholding vision and image gateway-wide must leave a diagnostic trail", logged)
 	}
 }
 
 // TestModelsResponseVisionGroupAggregation: a group's vision flag is the AND of
 // its offerable members' vision flags — false if ANY offerable member is not
 // vision-capable, and false (fail-closed) for a group with an empty offerable
-// member set.
+// member set. TestModelsResponseImageGroupAggregation
+// (service_models_image_test.go) folds the SAME rule over the image flag --
+// groupVision/visionOn and groupImage/imageOn (service.go) are wired line for
+// line, so this rule holds identically for both, verified independently
+// there rather than assumed from this test passing.
 func TestModelsResponseVisionGroupAggregation(t *testing.T) {
 	ctx := context.Background()
 	rs := routing.NewMemoryStore()
