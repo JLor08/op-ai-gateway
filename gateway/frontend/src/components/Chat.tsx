@@ -18,6 +18,7 @@ import {
 import CloseIcon from '@mui/icons-material/Close';
 import AddPhotoAlternateIcon from '@mui/icons-material/AddPhotoAlternate';
 import type { Translation } from './shared/types';
+import type { ChatContent } from './shared/chatContent';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
@@ -32,6 +33,14 @@ function readSidebarCollapsed(): boolean {
   } catch {
     return false;
   }
+}
+
+// A generated image's alt text is the prompt that produced it: the text of
+// the user turn immediately preceding the assistant turn that rendered it.
+function textOf(content: ChatContent): string | undefined {
+  if (typeof content === 'string') return content;
+  const textPart = content.find((part) => part.type === 'text');
+  return textPart?.text;
 }
 
 // The chat transcript, settings, and stream driver live in ChatStoreProvider
@@ -276,12 +285,18 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             {c.messages.map((message, index) => {
               const handlers = c.handlersFor(message.id);
               const isLast = index === c.messages.length - 1;
+              const previous = index > 0 ? c.messages[index - 1] : undefined;
+              const promptText =
+                message.role === 'assistant' && previous?.role === 'user'
+                  ? textOf(previous.content)
+                  : undefined;
               return (
                 <ChatMessage
                   key={message.id}
                   t={t}
                   role={message.role}
                   content={message.content}
+                  promptText={promptText}
                   reasoning={message.reasoning}
                   reasoningMs={message.reasoningMs}
                   ttftMs={message.ttftMs}

@@ -12,6 +12,7 @@ import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent } from './shared/chatContent';
 import type { Translation } from './shared/types';
+import { ImageTurn } from './ImageTurn';
 
 function contentText(content: ChatContent): string {
   if (typeof content === 'string') return content;
@@ -42,6 +43,7 @@ function ChatMessageComponent({
   t,
   role,
   content,
+  promptText,
   reasoning,
   reasoningMs,
   streaming,
@@ -55,6 +57,10 @@ function ChatMessageComponent({
   t: Translation;
   role: 'user' | 'assistant';
   content: ChatContent;
+  // The preceding user turn's text, used as a generated image's alt text (the
+  // accessible name for "what was asked for" rather than a generic label).
+  // Only meaningful on the assistant branch.
+  promptText?: string;
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
@@ -69,6 +75,7 @@ function ChatMessageComponent({
   canRun?: boolean;
 }>) {
   const text = contentText(content);
+  const images = contentImages(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
   const [showRaw, setShowRaw] = useState(false);
@@ -239,6 +246,7 @@ function ChatMessageComponent({
             />
           )}
         </Box>
+        {images.length > 0 && <ImageTurn t={t} images={images} prompt={promptText} />}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (
             <Tooltip title={t.chatRegenerate}>
@@ -294,8 +302,6 @@ function ChatMessageComponent({
       </Box>
     );
   }
-
-  const images = contentImages(content);
 
   return (
     <Box

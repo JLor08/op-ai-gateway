@@ -135,5 +135,120 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // User bubble keeps its fixed-width block layout (no fit-content).
       expect(prompt).not.toHaveStyle({ width: 'fit-content' });
     });
+
+    it('renders a generated assistant image at full size with the prompt as its alt text', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat on a bicycle"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+        />,
+      );
+      const images = screen.getAllByRole('img');
+      expect(images).toHaveLength(1);
+      expect(images[0]).toHaveAttribute('src', 'data:image/png;base64,AAAA');
+      // The accessible name is the prompt, not "Angehängtes Bild": the alt text
+      // of a generated image is what it was asked to be.
+      expect(images[0]).toHaveAttribute('alt', 'a cat on a bicycle');
+      // NOT the 72x72 objectFit:cover upload thumbnail -- this is the artifact.
+      expect(images[0]).not.toHaveAttribute('width', '72');
+    });
+
+    it('renders one image and one download control per data item', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="two cats"
+          content={[
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+          ]}
+        />,
+      );
+      expect(screen.getAllByRole('img')).toHaveLength(2);
+      // data[] is plural by design -- the endpoint's own counter takes the
+      // billed quantity from the response because a partial failure makes n and
+      // data[] differ.
+      expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+    });
+
+    it('renders a revised prompt as ordinary text beside the image', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[
+            { type: 'text', text: 'a photorealistic cat, studio lighting' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+          ]}
+        />,
+      );
+      // The only substantive news this endpoint ever reports about a
+      // generation, and it needs no new part type to carry it.
+      expect(screen.getByText('a photorealistic cat, studio lighting')).toBeInTheDocument();
+      expect(screen.getAllByRole('img')).toHaveLength(1);
+    });
+
+    it('still renders a plain text assistant answer unchanged', () => {
+      render(<ChatMessage t={t} role="assistant" content={'**bold** answer'} />);
+      expect(screen.getByText('bold').tagName).toBe('STRONG');
+      expect(screen.queryAllByRole('img')).toHaveLength(0);
+    });
+
+    it('downloads an image as binary, not as a text file containing the data URL', () => {
+      const blobs: Blob[] = [];
+      const createObjectURL = vi.fn((b: Blob) => {
+        blobs.push(b);
+        return 'blob:stub';
+      });
+      vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      // The saved Blob must be the DECODED bytes with the reported media type.
+      // downloadText would have produced a text/plain Blob whose content is the
+      // literal "data:image/png;base64,AAAA" string -- a text file, not an image.
+      expect(blobs[0].type).toBe('image/png');
+      expect(blobs[0].size).toBe(3); // "AAAA" base64-decodes to 3 bytes
+    });
+
+    // Guards against a hardcoded 'image/png' passing the test above for the
+    // wrong reason (its fixture also happens to be png). sd-server's own
+    // output_format decides the media type, and it is not always png -- so
+    // the saved Blob's type must come from the data URL itself.
+    it('downloads an image using the media type reported by its own data URL, not a hardcoded png', () => {
+      const blobs: Blob[] = [];
+      const createObjectURL = vi.fn((b: Blob) => {
+        blobs.push(b);
+        return 'blob:stub';
+      });
+      vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+
+      render(
+        <ChatMessage
+          t={t}
+          role="assistant"
+          promptText="a cat"
+          content={[{ type: 'image_url', image_url: { url: 'data:image/webp;base64,QUJDRA==' } }]}
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      expect(blobs[0].type).toBe('image/webp');
+      expect(blobs[0].size).toBe(4); // "ABCD" base64-decodes to 4 bytes
+    });
   });
 }

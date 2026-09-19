@@ -2805,3 +2805,15 @@ describe('completion-error i18n keys reachable from the chat text path', () => {
     }
   });
 });
+
+describe('chat generated-image i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the generated-image keys in ${locale}`, () => {
+      const t = messages[locale];
+      expect(t.chatDownloadImage).toBeTruthy();
+      expect(t.chatGeneratedImage).toBeTruthy();
+      // The generated-image alt must not reuse the ATTACHED-image string.
+      expect(t.chatGeneratedImage).not.toBe(t.chatAttachedImage);
+    });
+  }
+});
