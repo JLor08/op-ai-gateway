@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
@@ -266,22 +267,42 @@ func (c *imagesDataCounter) bytesFed() int {
 	return c.bytesSeen
 }
 
-// handleOpenAIImages serves POST /v1/images/generations by relaying to a
-// natively OpenAI-shaped image backend. There is no translate path: the gateway
+// handleOpenAIImages serves POST /v1/images/generations (and its
+// /openai/v1/images/generations alias, server.go) by relaying to a natively
+// OpenAI-shaped image backend. There is no translate path: the gateway
 // proxies image requests and does not synthesize them, so an application that
 // does not serve this shape is simply not a candidate.
 //
-// The capability gate is what makes that true, and it runs inside the ONE
-// existing admission gate: the request declares
+// Auth: requireInternalOrBearerAnyScope admits a bearer token (every ordinary
+// API client) OR the internal trusted-loopback header pair (the portal-chat
+// run executor calling itself as a token-less session principal) --
+// DELIBERATELY not the browser session cookie. See
+// authenticateInternalOrBearer's own doc comment
+// (auth_internal_or_bearer.go) for why a logged-in browser must never reach
+// this endpoint directly.
+//
+// The capability gate is what makes the "not a candidate" claim above true,
+// and it runs inside the ONE existing admission gate: the request declares
 // RequiredCapabilities = [routing.CapabilityImage] and inferencePreflight ->
 // Resolve refuses a model without a yes verdict. No second admitPrincipal call
 // site is added here; there is exactly one in this package and its comment
 // records what broke when there were four.
+//
+// Run-as: exactly handleOpenAIChat's block, copied rather than shared because
+// the two handlers' surrounding code differs too much to factor out cleanly.
+// token.ID == "" only for the loopback principal (never a bearer principal,
+// whose id is always populated -- see authenticateInternalOrBearer), so this
+// only ever fires for the run executor's own loopback calls, exactly as it
+// does for chat. Without it an image turn started under a run-as token would
+// bill to the bare session instead, capture under the session user's own
+// capture flags instead of the token's, and skip the token's server-override
+// and model-override rules -- three attribution bugs a later task (the image
+// run executor) would otherwise hit on day one.
 func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	token, ok := s.requireAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
+	token, ok := s.requireInternalOrBearerAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
 	if !ok {
 		return
 	}
@@ -297,6 +318,26 @@ func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 	if err := validateImagesRequest(raw, model); err != nil {
 		writeRequestError(w, err)
 		return
+	}
+	if token.ID == "" { // loopback principal (not a bearer token): honor optional run-as, exactly as handleOpenAIChat
+		if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
+			if s.Portal == nil {
+				// Fail closed rather than silently fall back to the bare
+				// session principal: the caller explicitly asked to run as a
+				// specific token, and with no Portal there is no way to
+				// authorize it. Mirrors this package's other s.Portal == nil
+				// guards (agent_ca.go, agent_certificates.go, ...), which all
+				// refuse rather than proceed unauthorized.
+				writePortalTokenError(w, portal.ErrTokenForbidden)
+				return
+			}
+			runAs, rErr := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
+			if rErr != nil {
+				writePortalTokenError(w, rErr)
+				return
+			}
+			token = runAs
+		}
 	}
 	pf, handled := s.inferencePreflight(w, r, token, raw, inferenceShape{
 		apiFlavor:            apiFlavorImages,

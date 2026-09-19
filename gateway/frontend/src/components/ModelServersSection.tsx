@@ -177,6 +177,7 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   { capability: 'video', label: (t) => t.capabilityVideo },
   { capability: 'audio', label: (t) => t.capabilityAudio },
   { capability: 'tools', label: (t) => t.capabilityTools },
+  { capability: 'image', label: (t) => t.capabilityImage },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));

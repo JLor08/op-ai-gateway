@@ -30,7 +30,11 @@ func (s *Server) handlePortalChats(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_list_failed", "chat list failed", ""))
 			return
 		}
-		writeJSON(w, http.StatusOK, portal.ChatListResponse{Data: chats})
+		// MaxContentBytes rides along on the listing the chat view already
+		// fetches: the composer needs the cap to state an image thread's
+		// remaining capacity, and there is no GET on the chat-settings
+		// endpoint to carry it.
+		writeJSON(w, http.StatusOK, portal.ChatListResponse{Data: chats, MaxContentBytes: portal.MaxChatContentBytes})
 	case http.MethodPost:
 		raw, ok := readRawJSONUnlimited(w, r)
 		if !ok {
@@ -102,6 +106,23 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 		}
 		writeJSON(w, http.StatusOK, dto)
 	case http.MethodPut:
+		// The server owns the transcript tail while a run is live for this
+		// chat: SaveChat below writes the WHOLE document, so a save racing an
+		// active run would silently overwrite whatever the run has already
+		// committed (a checkpoint) or is about to commit (the terminal turn) --
+		// data loss whose window an image run stretches from seconds to
+		// minutes. Reuses the same sentinel the run-start endpoint returns for
+		// "already active" (ErrRunAlreadyActive), through THIS handler's own
+		// mapper (writePortalChatError) rather than reaching across to
+		// writePortalRunError -- every handler in this package calls only its
+		// own write*Error function, and the response is identical either way
+		// because the row lives once in sharedErrorMap (error_map.go), read by
+		// both mappers. Guarded like the DELETE case just below: nil ChatRuns
+		// (a Server built without one, as tests do) must not panic.
+		if s.ChatRuns != nil && s.ChatRuns.Get(token.UserID, id) != nil {
+			writePortalChatError(w, ErrRunAlreadyActive)
+			return
+		}
 		raw, ok := readRawJSONUnlimited(w, r)
 		if !ok {
 			return
@@ -144,10 +165,13 @@ var portalChatErrRows = []errRow{
 	{err: portal.ErrChatTitleInvalid, status: http.StatusBadRequest, code: "portal.chat_title_invalid", msg: "chat title is invalid"},
 }
 
-// writePortalChatError maps the chat service's error sentinels to HTTP
-// responses: not-found (missing or foreign, no leak) -> 404, title/size
-// validation -> 400, everything else (seal/open/cipher/store failures) -> 500.
-// The 500 arm never echoes chat content; only the error is logged.
+// writePortalChatError maps the chat service's error sentinels (plus, via
+// sharedErrorMap, ErrRunAlreadyActive -- not a chat-service error, but a
+// sentinel this handler's own PUT case passes it directly) to HTTP responses:
+// not-found (missing or foreign, no leak) -> 404, title/size validation ->
+// 400, an active run -> 409, everything else (seal/open/cipher/store
+// failures) -> 500. The 500 arm never echoes chat content; only the error is
+// logged.
 func writePortalChatError(w http.ResponseWriter, err error) {
 	if writeMappedError(w, err, portalChatErrRows, 0, "", "") {
 		return

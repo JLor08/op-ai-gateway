@@ -26,7 +26,7 @@ var (
 	// Mapped to 400.
 	ErrChatTitleInvalid = errors.New("portal.chat_title_invalid")
 	// ErrChatTooLarge is returned when the pre-seal content blob exceeds
-	// maxChatContentBytes. Mapped to 400.
+	// MaxChatContentBytes. Mapped to 400.
 	ErrChatTooLarge = errors.New("portal.chat_too_large")
 	// ErrChatCipherMissing is returned when a stored chat was sealed
 	// (KeyVersion > 0) but no cipher is configured to open it — a
@@ -39,8 +39,13 @@ var (
 const (
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
-	// maxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
-	maxChatContentBytes = 4 << 20
+	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
+	// Exported because the portal composer has to state the remaining capacity
+	// of an image thread BEFORE the user commits to a multi-minute generation,
+	// and it is served to the client on ChatListResponse rather than
+	// duplicated there -- a second copy in the frontend would drift from this
+	// one with nothing to catch it.
+	MaxChatContentBytes = 4 << 20
 )
 
 // ChatSummaryDTO is the list DTO: plaintext metadata only, never the content.
@@ -63,9 +68,18 @@ type ChatDTO struct {
 }
 
 // ChatListResponse wraps the summary list under a data key (mirrors the other
-// portal list endpoints).
+// portal list endpoints) plus the limits a client needs to stay inside it.
+//
+// MaxContentBytes is MaxChatContentBytes: the client cannot otherwise know it
+// (no other DTO carries it), and a client that hardcoded its own copy would
+// drift from this one silently -- the failure mode being a composer that
+// confidently states the wrong remaining capacity. It is NOT omitempty: a
+// missing field and a zero are the same thing on the wire, and the portal
+// reads zero as "capacity unknown" (no capacity line, no refusal), so an
+// accidental zero would disable the feature rather than break loudly.
 type ChatListResponse struct {
-	Data []ChatSummaryDTO `json:"data"`
+	Data            []ChatSummaryDTO `json:"data"`
+	MaxContentBytes int              `json:"max_content_bytes"`
 }
 
 // CreateChatRequest carries the initial title + opaque content on create.
@@ -203,9 +217,9 @@ func (s *Service) DeleteChat(ctx context.Context, owner auth.Token, id string) e
 
 // sealChat gzips the opaque content, then seals it when a cipher is configured
 // (KeyVersion capture.KeyVersion) or stores plain gzip in RAM-fallback mode
-// (nil cipher, KeyVersion 0). It caps the pre-seal content at maxChatContentBytes.
+// (nil cipher, KeyVersion 0). It caps the pre-seal content at MaxChatContentBytes.
 func (s *Service) sealChat(content json.RawMessage) (int, []byte, error) {
-	if len(content) > maxChatContentBytes {
+	if len(content) > MaxChatContentBytes {
 		return 0, nil, ErrChatTooLarge
 	}
 	var gz bytes.Buffer
@@ -299,6 +313,20 @@ type ChatRunSettings struct {
 	// if the resolver deems it unreachable/under maintenance. Always false
 	// whenever ServerOverride is "" — see the self-heal in PrepareChatRun.
 	ServerOverrideForceUnreachable bool `json:"server_override_force_unreachable,omitempty"`
+	// Kind pins what this thread's runs are: "" (text, the default and every
+	// pre-existing chat) or "image". It is established by the FIRST send and
+	// then forced by PrepareChatRun on every later send, because the composer's
+	// affordances follow the thread rather than the currently-picked model --
+	// see ADR-043 (b) in docs/architecture/09-architecture-decisions.md.
+	//
+	// It is a UI constraint, NOT an authorization: this struct is the POST
+	// body verbatim (chat_run_endpoints.go), so a client can submit any value
+	// on the first send. The routing capability gate remains the only
+	// authority on what the gateway will actually serve.
+	//
+	// Declared LAST and omitempty on purpose: that is what keeps an existing
+	// text chat's persisted settings byte-identical.
+	Kind string `json:"kind,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
@@ -353,6 +381,27 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	}
 	doc := parseChatDoc(content)
 
+	// hadPriorMessages is true once this chat has been through an earlier
+	// send -- which is exactly "has a kind already been pinned," including
+	// the pin of empty-string text. A chat's absent "kind" key in
+	// doc.Settings cannot by itself distinguish "never sent" from "pinned to
+	// text," because Kind is omitempty and both cases serialize the same way;
+	// message count breaks that tie. Captured BEFORE the append/replace
+	// immediately below so it reflects the chat as it was before THIS send,
+	// not after.
+	//
+	// Assumption: CreateChatRequest.Content is client-supplied opaque JSON,
+	// so a chat could in principle be created with messages already
+	// populated before any PrepareChatRun call ever runs -- in which case
+	// this flag would read true on what is logically the thread's first
+	// send, and the stored (absent) kind would be forced rather than the
+	// client's submitted one accepted. No current call site seeds messages
+	// on create (chat creation always starts from an empty messages array);
+	// if one ever does, this heuristic stops being safe and the pin would
+	// need an explicit "has run" marker instead of inferring one from
+	// message count.
+	hadPriorMessages := len(doc.Messages) > 0
+
 	if req.EditedHistory != nil {
 		doc.Messages = req.EditedHistory
 	} else if req.UserMessage != nil {
@@ -390,6 +439,27 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	req.Settings.ServerOverride = s.validateServerOverride(ctx, owner, req.Settings.ServerOverride)
 	if req.Settings.ServerOverride == "" {
 		req.Settings.ServerOverrideForceUnreachable = false
+	}
+
+	// The stored kind wins over whatever the client submitted. doc.Settings is
+	// about to be REPLACED wholesale by the submitted settings (below), so the
+	// pin has to be lifted out first or it is silently unpinned on every send.
+	//
+	// The force applies whenever hadPriorMessages -- UNCONDITIONALLY, even
+	// when stored.Kind is "" (text). A guard of `stored.Kind != ""` would only
+	// protect an established image pin: a text-pinned thread's second send
+	// could then submit "image" and flip the thread, silently discarding
+	// history for a run against the images endpoint. On a genuine first send
+	// (hadPriorMessages false) nothing is forced, so the client's submitted
+	// kind -- including "image" -- establishes the pin.
+	var stored struct {
+		Kind string `json:"kind"`
+	}
+	if len(doc.Settings) > 0 {
+		_ = json.Unmarshal(doc.Settings, &stored) // best-effort: a malformed blob leaves the kind unpinned, which is the pre-feature behaviour
+	}
+	if hadPriorMessages {
+		req.Settings.Kind = stored.Kind
 	}
 
 	settingsRaw, err := json.Marshal(req.Settings)
@@ -448,7 +518,7 @@ func deriveChatTitle(messages []json.RawMessage) string {
 		if json.Unmarshal(m, &pm) != nil || pm.Role != "user" {
 			continue
 		}
-		text := extractText(pm.Content)
+		text := MessageText(pm.Content)
 		text = strings.Join(strings.Fields(text), " ")
 		if text == "" {
 			return ""
@@ -462,9 +532,14 @@ func deriveChatTitle(messages []json.RawMessage) string {
 	return ""
 }
 
-// extractText pulls the text out of a message content that is either a JSON
+// MessageText pulls the text out of a message content that is either a JSON
 // string or an array of parts ([{type:"text",text:...}, ...]).
-func extractText(content json.RawMessage) string {
+//
+// Exported because the gateway's image-run executor needs the SAME extraction
+// to build the upstream prompt from the last user message. A third parser for
+// these two shapes (deriveChatTitle below is the first caller) would be a
+// second definition of what a message's text is, free to drift from this one.
+func MessageText(content json.RawMessage) string {
 	var s string
 	if json.Unmarshal(content, &s) == nil {
 		return s
@@ -494,6 +569,16 @@ type AssistantTurn struct {
 	// tokens/sec, present only once the turn completed. See issue #56.
 	CharsPerSecond  float64
 	TokensPerSecond float64
+	// ContentParts is a structured message content (an array of OpenAI-style
+	// content parts) for a turn whose output is not text -- an image run's
+	// generated image_url part. When it is non-EMPTY it is written as the
+	// message's `content` and Content is ignored; otherwise Content is written
+	// as before, byte for byte.
+	//
+	// The guard is on LENGTH, not on nil: json.Marshal turns a nil RawMessage
+	// into `null` but FAILS outright on a non-nil zero-length one
+	// ("unexpected end of JSON input"), which would break the terminal commit.
+	ContentParts json.RawMessage
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -535,10 +620,14 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 		}
 	}
 	msg := map[string]any{
-		"id":      id,
-		"role":    "assistant",
-		"content": turn.Content,
-		"status":  status,
+		"id":     id,
+		"role":   "assistant",
+		"status": status,
+	}
+	if len(turn.ContentParts) > 0 {
+		msg["content"] = turn.ContentParts
+	} else {
+		msg["content"] = turn.Content
 	}
 	if turn.Reasoning != "" {
 		msg["reasoning"] = turn.Reasoning

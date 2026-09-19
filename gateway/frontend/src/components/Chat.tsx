@@ -18,6 +18,7 @@ import {
 import CloseIcon from '@mui/icons-material/Close';
 import AddPhotoAlternateIcon from '@mui/icons-material/AddPhotoAlternate';
 import type { Translation } from './shared/types';
+import type { ChatContent } from './shared/chatContent';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
@@ -32,6 +33,14 @@ function readSidebarCollapsed(): boolean {
   } catch {
     return false;
   }
+}
+
+// A generated image's alt text is the prompt that produced it: the text of
+// the user turn immediately preceding the assistant turn that rendered it.
+function textOf(content: ChatContent): string | undefined {
+  if (typeof content === 'string') return content;
+  const textPart = content.find((part) => part.type === 'text');
+  return textPart?.text;
 }
 
 // The chat transcript, settings, and stream driver live in ChatStoreProvider
@@ -80,6 +89,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               ? `${t.chatModelLoadedOn}: ${option.loaded_on.join(', ')}`
               : t.chatModelLoaded,
         }));
+
+  // The THREAD's kind, not the picked model's capability: a text thread stays
+  // a text thread even if an image model is selected afterwards (the backend
+  // pins the kind at the first send and forces it from then on), and an image
+  // thread keeps its composer even while its model is momentarily unreachable.
+  const isImageThread = c.chatKind === 'image';
+
+  // Which capability the disabled attach button is about. The two are
+  // different: an image GENERATOR emits images and accepts none, while a
+  // non-vision model simply cannot read one. Saying "does not support images"
+  // on a generator told the user the opposite of the truth.
+  let attachTooltip: string = t.chatAttachImage;
+  if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
+  else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
 
   let modelHelperText: string | undefined;
   if (c.overrideModel !== '') {
@@ -276,18 +299,44 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             {c.messages.map((message, index) => {
               const handlers = c.handlersFor(message.id);
               const isLast = index === c.messages.length - 1;
+              const previous = index > 0 ? c.messages[index - 1] : undefined;
+              const promptText =
+                message.role === 'assistant' && previous?.role === 'user'
+                  ? textOf(previous.content)
+                  : undefined;
+              const rowStreaming = c.streaming && isLast && message.role === 'assistant';
               return (
                 <ChatMessage
                   key={message.id}
                   t={t}
                   role={message.role}
                   content={message.content}
+                  promptText={promptText}
                   reasoning={message.reasoning}
                   reasoningMs={message.reasoningMs}
                   ttftMs={message.ttftMs}
                   tps={message.tps}
                   tokensPerSecond={message.tokensPerSecond}
-                  streaming={c.streaming && isLast && message.role === 'assistant'}
+                  streaming={rowStreaming}
+                  // kind/elapsedMs are only ever consulted while `streaming`
+                  // is also true (ChatMessage's pending-render guard), so
+                  // gate them the SAME way: every other row keeps a stable
+                  // `undefined` across renders. runElapsedMs in particular
+                  // is recomputed on every provider render and is a
+                  // different float essentially every time -- passed
+                  // unconditionally, it would change on EVERY row's props on
+                  // every token delta and defeat ChatMessage's memo for the
+                  // whole transcript during any live run, not just the row
+                  // actually in flight.
+                  //
+                  // c.runKind, NEVER c.chatKind: this prop describes the RUN
+                  // in flight, and chatKind is the thread-level guess that
+                  // drives the composer. Substituting it renders the image
+                  // wait state over an entire text run in a tab whose pin is
+                  // stale -- pinned by Chat.test.tsx's "renders no image wait
+                  // state while the run itself reports a text kind".
+                  kind={rowStreaming ? c.runKind : undefined}
+                  elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   canRun={c.modelAvailable}
@@ -308,7 +357,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
           >
             <TextField
               id="chat-message"
-              label={t.messageLabel}
+              label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
+              helperText={isImageThread ? t.chatImageOnlyHint : undefined}
               multiline
               minRows={4}
               fullWidth
@@ -380,15 +430,12 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                 so getByLabelText(chatAttachImage) still resolves to the input alone.
                 The wrapping <span> lets the Tooltip work while the button is disabled
                 (streaming) without an MUI warning. */}
-              <Tooltip
-                title={!c.modelVisionCapable ? t.chatImageModelUnsupported : t.chatAttachImage}
-                describeChild
-              >
+              <Tooltip title={attachTooltip} describeChild>
                 <span>
                   <IconButton
                     component="label"
                     size="small"
-                    disabled={c.streaming || !c.modelVisionCapable}
+                    disabled={c.streaming || !c.modelVisionCapable || c.modelImageCapable}
                   >
                     <AddPhotoAlternateIcon fontSize="small" />
                     <Box
@@ -420,6 +467,23 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   </IconButton>
                 </span>
               </Tooltip>
+              {/* The remaining capacity of an image thread. Rendered only when
+                the gateway actually served the cap (imageCapacityLeft null =
+                unknown): a number the portal made up would be worse than
+                none. This is the one figure in the image flow that is exact
+                and known BEFORE the user commits to a multi-minute wait. */}
+              {isImageThread && c.imageCapacityLeft !== null && (
+                <Typography
+                  data-testid="chat-capacity"
+                  variant="body2"
+                  color={c.imageCapacityLeft <= 0 ? 'error' : undefined}
+                  sx={c.imageCapacityLeft > 0 ? { color: 'var(--muted)' } : undefined}
+                >
+                  {c.imageCapacityLeft <= 0
+                    ? t.chatCapacityExhausted
+                    : t.chatCapacityRemaining(c.imageCapacityLeft)}
+                </Typography>
+              )}
             </Stack>
             <Tooltip
               title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}

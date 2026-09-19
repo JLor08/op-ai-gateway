@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"strings"
@@ -29,6 +30,39 @@ func TestWritePortalRunError(t *testing.T) {
 		writePortalRunError(w, err)
 		if w.Code != want {
 			t.Fatalf("err %v -> %d, want %d", err, w.Code, want)
+		}
+	}
+
+	// Fix round, finding 5: portal.chat_too_large and portal.chat_run_limit
+	// are now what the frontend's errorLabelByCode maps (task 8), and this
+	// endpoint is the ONLY place that writes either literal to the wire --
+	// a status-code-only check above cannot catch a drift in the STRING, and
+	// an unpinned wire code is exactly the failure mode
+	// development-and-quality.md documents: a deleted errRow once made a 409
+	// answer 500 application.request_failed while the whole backend suite
+	// stayed green, because nothing asserted the code itself.
+	// portal.chat_run_active and mapping.capability_reserved already have
+	// their own literal pins elsewhere (TestStartRunCreatesRunAndConflicts,
+	// portal_mapping_capability_verdicts_test.go) and are not repeated here.
+	//
+	// Decoded and compared for EXACT equality, not strings.Contains: a code
+	// that grew an unwanted suffix ("portal.chat_run_limit_v2") would still
+	// contain the wanted substring, so Contains would not have caught the
+	// very drift this test exists to catch. (Caught by mutation testing this
+	// exact test before it was trusted -- see the task report.)
+	literalCodes := map[error]string{
+		portal.ErrChatTooLarge: "portal.chat_too_large",
+		ErrTooManyRuns:         "portal.chat_run_limit",
+	}
+	for err, code := range literalCodes {
+		w := httptest.NewRecorder()
+		writePortalRunError(w, err)
+		var body apierror.Body
+		if jsonErr := json.Unmarshal(w.Body.Bytes(), &body); jsonErr != nil {
+			t.Fatalf("err %v -> body %s did not decode: %v", err, w.Body.String(), jsonErr)
+		}
+		if body.Error.Code != code {
+			t.Fatalf("err %v -> code %q, want %q", err, body.Error.Code, code)
 		}
 	}
 }
@@ -400,4 +434,111 @@ func TestChatRunEventsForeignUserIs404(t *testing.T) {
 	if srv.ChatRuns.GetByID(owner.UserID, run.ID) == nil {
 		t.Fatal("owner lost access to their own run")
 	}
+}
+
+// TestStartRunResponseCarriesTheKind: the kind reaches the client on the 201 as
+// well as on the snapshot. Without it the sending tab renders the TEXT pending
+// state for the whole window between the 201 and the first snapshot -- the
+// 0-Zeichen counter, on the most common path.
+//
+// The run is started on a chat with NO prior messages, because that is the only
+// state in which the client's submitted kind establishes the pin:
+// PrepareChatRun forces the stored kind on every later send.
+func TestStartRunResponseCarriesTheKind(t *testing.T) {
+	srv, owner, _ := newRunTestServer(t)
+	fresh, err := srv.Portal.CreateChat(context.Background(), owner, portal.CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[]}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateChat: %v", err)
+	}
+	rec := startRunViaHandler(srv, fresh.ID,
+		`{"user_message":{"id":"u9","role":"user","content":"a cat"},"settings":{"model":"sd-turbo","kind":"image"}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		RunID     string `json:"run_id"`
+		Status    string `json:"status"`
+		Kind      string `json:"kind"`
+		ElapsedMs int64  `json:"elapsed_ms"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode 201: %v (%s)", err, rec.Body.String())
+	}
+	if got.Kind != "image" {
+		t.Fatalf("kind = %q on the 201, want image -- otherwise the sending tab "+
+			"renders the text pending state until the first snapshot", got.Kind)
+	}
+	if got.RunID == "" {
+		t.Fatal("run_id missing from the 201")
+	}
+	if got.ElapsedMs < 0 {
+		t.Fatalf("elapsed_ms = %d, want >= 0", got.ElapsedMs)
+	}
+	// The run itself carries the same kind, so the 201 cannot describe a turn
+	// the executor did not run.
+	if run := srv.ChatRuns.GetByID(owner.UserID, got.RunID); run == nil || run.kindValue() != "image" {
+		t.Fatalf("run kind not set from the prepared settings: %+v", run)
+	}
+}
+
+// TestStartRunResponseOmitsTheKindForATextRun is the no-op-invariant
+// counterpart: an ordinary text run's 201 is byte-identical to before this
+// feature, so nothing downstream starts seeing a "kind" it has to interpret.
+func TestStartRunResponseOmitsTheKindForATextRun(t *testing.T) {
+	srv, _, chatID := newRunTestServer(t)
+	rec := startRunViaHandler(srv, chatID, `{"user_message":"hi","settings":{"model":"qwen-coder"}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"kind"`) {
+		t.Fatalf("a text run's 201 must not carry a kind key: %s", rec.Body.String())
+	}
+}
+
+// TestActiveRunsCarryKindAndAge: the reopen path must be able to render the
+// image pending state with a true clock, so the active-runs list carries both
+// the kind and the same server-measured age the snapshot does. The age is read
+// through the run's own mutex AFTER ActiveForUser has released the registry
+// lock, keeping the documented lock order intact.
+func TestActiveRunsCarryKindAndAge(t *testing.T) {
+	// A REAL image run, held open by an upstream that never answers, so it is
+	// still listed while the assertions run. It used to be a text model under
+	// an image kind, with the note that what mattered was the kind the run
+	// carries rather than what the executor dispatches; the executor now
+	// dispatches on that kind, so such a run is refused as not image-capable
+	// and goes terminal at once -- exactly the "listed long enough" problem
+	// the old comment was avoiding, by the opposite route.
+	upstream, release := stalledImagesUpstream(t, "")
+	defer release()
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	if _, err := srv.startChatRun(owner, chatID, imageRunPrep()); err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	list := func(t *testing.T) []activeRunDTO {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "/api/portal/chats/runs/active", nil)
+		authBearer(r, "dev-secret")
+		w := httptest.NewRecorder()
+		srv.handlePortalChatItem(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("active: got %d body %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Data []activeRunDTO `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode active response: %v (body %s)", err, w.Body.String())
+		}
+		return resp.Data
+	}
+	if got := list(t); len(got) != 1 || got[0].Kind != "image" {
+		t.Fatalf("active list must carry the run's kind, got %+v", got)
+	}
+	// The age is measured by the server and grows on its own clock.
+	waitFor(t, func() bool {
+		got := list(t)
+		return len(got) == 1 && got[0].ElapsedMs > 0
+	})
 }

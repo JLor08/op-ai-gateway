@@ -43,6 +43,11 @@ var sharedErrorMap = []errRow{
 	{err: portal.ErrPathSuffixInvalid, status: http.StatusBadRequest, code: "application.path_suffix_invalid", msg: "path suffix must be a path, not a URL"},
 	{err: portal.ErrChatNotFound, status: http.StatusNotFound, code: "portal.chat_not_found", msg: "chat not found"},
 	{err: portal.ErrChatTooLarge, status: http.StatusBadRequest, code: "portal.chat_too_large", msg: "chat content is too large"},
+	// ErrRunAlreadyActive: writePortalRunError (run start) and
+	// writePortalChatError (PUT /chats/{id}, task 9) both refuse an
+	// already-active run identically -- 409 portal.chat_run_active -- so this
+	// is the row's single definition rather than one per mapper.
+	{err: ErrRunAlreadyActive, status: http.StatusConflict, code: "portal.chat_run_active", msg: "a run is already active for this chat"},
 	{err: account.ErrUserNotFound, status: http.StatusNotFound, code: "admin.user_not_found", msg: "user not found"},
 	{err: portal.ErrLimitValidation, status: http.StatusBadRequest, code: "limit.validation_failed", msg: "limit configuration is invalid"},
 	{err: portal.ErrGroupNameConflict, status: http.StatusConflict, code: "group.name_conflict", msg: "a group with this name already exists"},

@@ -15,6 +15,17 @@ export type ChatSummary = {
 
 export type Chat = ChatSummary & { content: unknown };
 
+// The chat listing plus the limits a client needs to stay inside them.
+export type ChatListResponse = {
+  data: ChatSummary[];
+  // The backend's pre-seal content cap (portal.MaxChatContentBytes). Served
+  // rather than duplicated here: a hardcoded copy would drift from the Go
+  // constant with nothing to catch it. OPTIONAL because a gateway older than
+  // this field simply omits it — the portal then treats the capacity as
+  // unknown (states no number, refuses no send) instead of guessing one.
+  max_content_bytes?: number;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -28,6 +39,23 @@ export type ChatSettings = {
   // server-side on every run (PrepareChatRun), same as the token's.
   server_override: string;
   server_override_force_unreachable: boolean;
+  // The thread's pinned kind: "" (text — the default and every pre-existing
+  // chat) or "image". Established by the FIRST send and then FORCED by the
+  // backend on every later send (PrepareChatRun), because the composer's
+  // affordances follow the THREAD, not the currently-picked model.
+  //
+  // Typed as a plain string rather than a closed union on purpose: a kind this
+  // build does not recognise must round-trip through load/save untouched. The
+  // backend full-replaces this whole blob on every PUT with no merge, so a
+  // field the frontend drops is a field the next autosave silently erases.
+  //
+  // OPTIONAL, and OMITTED (not written as "") for a text thread: the backend
+  // declares Kind last with `json:"kind,omitempty"` precisely so an existing
+  // text chat's persisted settings stay byte-identical, and it has a test
+  // asserting the key never appears for one. Writing `"kind":""` back on
+  // every save would give that property away from the client side. See
+  // kindSetting() in chatDoc.ts, which is how both writers honour it.
+  kind?: string;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
@@ -42,7 +70,27 @@ export type ChatContentDoc = {
 // (surviving client disconnects) and is subscribed to via SSE elsewhere (the
 // ChatStore); this transport layer only starts/cancels/lists runs.
 export type ChatRunStatus = 'running' | 'completed' | 'error' | 'canceled' | 'interrupted';
-export type ActiveChatRun = { chat_id: string; run_id: string; status: ChatRunStatus };
+export type ActiveChatRun = {
+  chat_id: string;
+  run_id: string;
+  status: ChatRunStatus;
+  // Present only for a run whose thread is pinned "image" (both omitempty on
+  // the wire, mirroring activeRunDTO in chat_run_endpoints.go): the run's
+  // kind and its server-measured age in ms. elapsed_ms is what lets a
+  // REOPENED browser anchor the composer's pending clock on the same true
+  // value the sending tab saw, rather than starting it over from zero (see
+  // useChatRuns' elapsedMsOf and ImagePendingTurn).
+  //
+  // BOTH ARE READ. The bootstrap replay passes them straight into the run
+  // engine (ChatStore's registerRunning + subscribeRun), where `kind` becomes
+  // RunState.kind — the run's OWN, post-force kind, which is what the
+  // in-flight turn renders from (ChatStore's runKind → ChatMessage's `kind`).
+  // The thread-level ChatSettings.kind (chatKind/pinnedChatKind) decides what
+  // the COMPOSER offers; this decides what the RUN is. They are two
+  // questions, and a stale client can answer the first one wrongly.
+  kind?: string;
+  elapsed_ms?: number;
+};
 export type StartChatRunBody = {
   user_message?: unknown;
   edited_history?: unknown[];
@@ -54,16 +102,38 @@ export type StartChatRunBody = {
     run_as_token_id: string;
     server_override: string;
     server_override_force_unreachable: boolean;
+    // Mirrors ChatSettings.kind above (this shape is the run POST body, which
+    // is a separate declaration of the same settings). On a thread's FIRST
+    // send this value establishes the pin; afterwards the backend ignores it
+    // in favour of the stored one.
+    kind: string;
   };
 };
-export type StartChatRunResponse = { run_id: string; chat_id: string; status: ChatRunStatus };
+export type StartChatRunResponse = {
+  run_id: string;
+  chat_id: string;
+  status: ChatRunStatus;
+  // Mirrors ActiveChatRun's kind/elapsed_ms above (see startRunResponse's own
+  // doc comment, chat_run_endpoints.go). elapsed_ms is ~0 here and, per its
+  // own omitempty, in practice absent from this response -- that absence
+  // says nothing, and the run engine's own default (0) is the true value for
+  // a run that has genuinely just started.
+  //
+  // `kind` IS READ, and this is the response it matters most on: every send,
+  // edit and regenerate passes it straight into subscribeRun (ChatStore), so
+  // the pending turn renders from the kind the executor will ACTUALLY run --
+  // the backend has already forced the thread's pinned kind onto it by this
+  // point, which the client's own chatKind guess can contradict.
+  kind?: string;
+  elapsed_ms?: number;
+};
 
 export function chatApi(fetcher: Fetcher) {
   return {
     // Persistent chat playground documents (see ChatSummary / Chat above). The
     // list is ordered newest-updated first; content is decrypted only on the
     // single-chat GET. Mirrors the token/preferences method shapes.
-    chats: () => request<{ data: ChatSummary[] }>(fetcher, '/api/portal/chats'),
+    chats: () => request<ChatListResponse>(fetcher, '/api/portal/chats'),
     createChat: (body: { title?: string; content?: unknown }) =>
       request<Chat>(fetcher, '/api/portal/chats', { method: 'POST', body }),
     chat: (id: string) => request<Chat>(fetcher, `/api/portal/chats/${encodeURIComponent(id)}`),

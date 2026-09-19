@@ -11,10 +11,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/store"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +135,36 @@ type runEvent struct {
 	Metrics   *runMetrics `json:"metrics,omitempty"`
 	Status    string      `json:"status,omitempty"`
 	Err       string      `json:"error,omitempty"`
+	// Kind and ElapsedMs are per-RUN facts, not per-event ones, so they ride on
+	// `snapshot` and `done` only -- exactly where Metrics already rides, and for
+	// the same reason: a delta describes the increment, a snapshot describes the
+	// run. The client anchors its own clock on the age a snapshot gave it and
+	// ticks locally between snapshots, so repeating either on every delta would
+	// add a per-token cost to every text run and buy nothing.
+	Kind      string `json:"kind,omitempty"`
+	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
+	// ContentParts is the turn's STRUCTURED content, exactly as
+	// CommitAssistant stored it (portal.AssistantTurn.ContentParts) -- the
+	// image run's one and only output. Content above is the streamed TEXT
+	// buffer, and an image run never writes a byte into it, so without this
+	// field the terminal event of a successful image run carries no content at
+	// all: the client sets the bubble to "" and its own
+	// empty-tail prune then deletes the turn it just generated, leaving the
+	// post-`done` canonical refetch as the ONLY thing between the user and a
+	// blank thread. The event now carries what was stored, so the refetch is an
+	// optimisation again rather than a load-bearing repair.
+	//
+	// It rides on `snapshot` and `done` only, like Kind/ElapsedMs and for the
+	// same reason -- and a late subscriber inside the eviction grace, which is
+	// served the terminal state as a `snapshot` and never sees a `done`, needs
+	// it just as much.
+	//
+	// STRICTLY WHAT WAS COMMITTED: finishRunWithParts clears it when
+	// CommitAssistant fails, so a turn the store refused (portal.chat_too_large
+	// above all) is not rendered as though it had been saved. json.RawMessage,
+	// not a decoded shape: this is the identical blob the transcript holds and
+	// this layer has no business re-encoding it.
+	ContentParts json.RawMessage `json:"content_parts,omitempty"`
 }
 
 type runMetrics struct {
@@ -157,22 +189,115 @@ type ChatRun struct {
 	ChatID string
 	UserID string
 
-	mu          sync.Mutex
-	status      string // running | completed | error | canceled
-	reasoning   strings.Builder
-	content     strings.Builder
-	metrics     runMetrics
-	errMsg      string
-	cancel      func()
-	subscribers map[chan runEvent]struct{}
-	endedAt     time.Time
+	// startedAt is the run's own start instant, set once at construction and
+	// never written again -- so it is safe to read under r.mu in
+	// snapshotLocked without a self-locking accessor. It exists because a
+	// client cannot compute an honest age: a reopened or second tab never saw
+	// the moment of Send, and every view must show the same true number.
+	startedAt time.Time
+
+	mu sync.Mutex
+	// kind mirrors the thread's pinned kind ("" for text, "image"), set by
+	// launchRun from the prepared settings. It is the SAME value that selects
+	// the request the executor makes, so the UI can never describe a turn the
+	// executor did not run.
+	//
+	// Guarded by mu and NOT grouped with the immutable identity fields above:
+	// the run is registered (and therefore reachable by GET runs/active and by
+	// a subscriber) from reserveRun onwards, which is strictly before
+	// launchRun writes this -- so the write genuinely races those readers
+	// unless it is synchronized. startedAt needs no such guard because it is
+	// written by the constructor, before any reference escapes.
+	kind      string
+	status    string // running | completed | error | canceled
+	reasoning strings.Builder
+	content   strings.Builder
+	// contentParts is the structured content the terminal commit ACTUALLY
+	// stored, set once by finish and nil for every run whose output was the
+	// streamed text buffer (and for every run whose commit failed). It is the
+	// run's own copy of what the transcript now holds, so a subscriber can be
+	// told the truth about an image turn without refetching the document --
+	// see runEvent.ContentParts.
+	contentParts json.RawMessage
+	metrics      runMetrics
+	errMsg       string
+	cancel       func()
+	subscribers  map[chan runEvent]struct{}
+	endedAt      time.Time
 }
 
+// newChatRun stamps startedAt from time.Now() directly rather than from the
+// service Clock most of this package's timestamps come from. A ChatRun has no
+// clock dependency today, and this instant is only ever used to MEASURE an
+// elapsed duration against a later time.Now() -- never persisted, compared with
+// a stored timestamp, or rendered as a date -- so a wall-clock reading is the
+// honest source and threading a Clock through for it would buy nothing.
 func newChatRun(id, chatID, userID string, cancel func()) *ChatRun {
 	return &ChatRun{
 		ID: id, ChatID: chatID, UserID: userID,
-		status: "running", cancel: cancel,
+		startedAt: time.Now(),
+		status:    "running", cancel: cancel,
 		subscribers: map[chan runEvent]struct{}{},
+	}
+}
+
+// setKind records the thread's pinned kind on the run. Called by launchRun
+// before the executor goroutine starts and before the 201 is written.
+func (r *ChatRun) setKind(kind string) {
+	r.mu.Lock()
+	r.kind = kind
+	r.mu.Unlock()
+}
+
+// kindValue reads the run's kind. Self-locking: never call it from a function
+// that already holds r.mu (use r.kind directly there).
+func (r *ChatRun) kindValue() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kind
+}
+
+// elapsedMsLocked is the run's server-measured age in milliseconds. Once the
+// run is terminal the age FREEZES at its duration: a finished run lingers in
+// the registry for runEvictionDelay, and a late subscriber must be told how
+// long the run took, not how long ago it started. The caller must hold r.mu
+// (startedAt is immutable, endedAt is not).
+func (r *ChatRun) elapsedMsLocked() int64 {
+	if !r.endedAt.IsZero() {
+		return r.endedAt.Sub(r.startedAt).Milliseconds()
+	}
+	return time.Since(r.startedAt).Milliseconds()
+}
+
+// elapsedMs is the run's server-measured age for a caller that holds no lock.
+// Self-locking: never call it from a function that already holds r.mu (use
+// elapsedMsLocked there).
+func (r *ChatRun) elapsedMs() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.elapsedMsLocked()
+}
+
+// listView returns the three run facts the active-runs DTO needs in ONE
+// acquisition of r.mu, so the row cannot report a still-running status beside
+// an age that froze between two separate reads. It takes only the run's own
+// lock and is called from handleActiveChatRuns AFTER ActiveForUser has released
+// the registry lock -- reg.mu and r.mu are never held at the same time.
+func (r *ChatRun) listView() (status, kind string, elapsedMs int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status, r.kind, r.elapsedMsLocked()
+}
+
+// cancelContext invokes the run's context cancel func under r.mu (the field is
+// mu-guarded) and never while holding it. Cancel funcs are idempotent, so
+// calling this on an already-cancelled or already-finished run is a no-op.
+func (r *ChatRun) cancelContext() {
+	r.mu.Lock()
+	cancel := r.cancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -181,6 +306,8 @@ func (r *ChatRun) snapshotLocked() runEvent {
 	return runEvent{
 		Event: "snapshot", Reasoning: r.reasoning.String(), Content: r.content.String(),
 		Metrics: &m, Status: r.status, Err: r.errMsg,
+		Kind: r.kind, ElapsedMs: r.elapsedMsLocked(),
+		ContentParts: r.contentParts,
 	}
 }
 
@@ -222,7 +349,12 @@ func (r *ChatRun) setMetrics(m runMetrics) {
 	r.mu.Unlock()
 }
 
-func (r *ChatRun) finish(status, errMsg string) {
+// finish marks the run terminal and fans out the `done` event. parts is the
+// structured content the terminal commit STORED (nil for a text run, and nil
+// for any run whose commit failed): it is recorded on the run under the SAME
+// acquisition of r.mu that flips the status, so no subscriber can ever be
+// served a snapshot whose status and content disagree.
+func (r *ChatRun) finish(status, errMsg string, parts json.RawMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.status != "running" {
@@ -230,6 +362,7 @@ func (r *ChatRun) finish(status, errMsg string) {
 	}
 	r.status = status
 	r.errMsg = errMsg
+	r.contentParts = parts
 	r.endedAt = time.Now()
 	term := r.snapshotLocked()
 	term.Event = "done"
@@ -391,12 +524,7 @@ func (reg *chatRunRegistry) cancelChat(userID, chatID string) bool {
 	if run == nil {
 		return false
 	}
-	run.mu.Lock()
-	cancel := run.cancel
-	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	run.cancelContext()
 	return true
 }
 
@@ -412,6 +540,85 @@ func compactHex(n int) string {
 // during a run. It is a package-level var (not const) so tests can shrink it to
 // force multiple checkpoint ticks within a run.
 var runCheckpointInterval = 3 * time.Second
+
+// chatRunKindImage is the one kind a run can have besides text ("") -- the
+// value portal.ChatRunSettings.Kind pins to the thread. Named here because the
+// gateway branches on it in more than one place.
+const chatRunKindImage = "image"
+
+// imageRunDeadline bounds an IMAGE run end to end. It exists because such a run
+// emits NOTHING between dispatch and its finished image: with no incremental
+// events, "this finishes or fails within N minutes" is the only honest thing
+// the UI can promise about the wait, and a promise has to be true. A package
+// var, not a const, so tests can shrink it -- mirroring runCheckpointInterval.
+var imageRunDeadline = 10 * time.Minute
+
+// runDeadlineFor returns the end-to-end bound for a run of this kind, and false
+// when the kind is UNBOUNDED.
+//
+// Only image runs are bounded. A text run streams deltas, so the user can see
+// for themselves that it is alive and the honesty argument above simply does
+// not apply to it -- while a ceiling would newly kill long generations from a
+// slow local model that complete today. Extending the bound to text would
+// therefore be a behaviour change to an existing, overwhelmingly common path,
+// and it needs its own decision rather than arriving as a side effect of the
+// image feature. Do not "simplify" this back into one global deadline.
+func runDeadlineFor(kind string) (time.Duration, bool) {
+	if kind == chatRunKindImage {
+		return imageRunDeadline, true
+	}
+	return 0, false
+}
+
+// runTimedOutMessage is the terminal error of a run its own deadline ended. A
+// CODE, not prose: the frontend maps it to a localized label (errorLabelByCode),
+// and it exists at all because the alternative -- the empty message a user
+// cancel carries -- would tell the user they pressed Stop when they pressed
+// nothing.
+const runTimedOutMessage = "gateway.chat_run_timeout"
+
+// chatRunCommitFailedMessage is finishRunWithParts' terminal code for a commit
+// failure it cannot name more specifically than "the store write failed" --
+// see commitFailureCode, which is the only place that returns it.
+const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
+
+// commitFailureIsChatGone reports whether a failed CommitAssistant's error
+// means the chat itself no longer exists, rather than that the write to an
+// existing chat failed. DELETE /chats/{id} cancels the chat's active run AND
+// removes its row in the same request (handlePortalChatItem), so a run that
+// was ALREADY ending "canceled" (from that same delete) can lose the race and
+// see exactly this. For that specific combination it is not a loss to
+// report: there is nothing left to persist FOR, and no one will ever read
+// this chat's transcript again, so the caller leaves the run's own status
+// unchanged rather than overriding it to "error" -- see the caller's own
+// comment for why the check is also conditioned on status == "canceled" and
+// not on this alone. store.ErrNotFound is the raw error every ChatByID
+// implementation returns for a missing row; portal.ErrChatNotFound is
+// writeAssistant's own mapping of the same fact when the row belongs to a
+// different user.
+func commitFailureIsChatGone(err error) bool {
+	return errors.Is(err, store.ErrNotFound) || errors.Is(err, portal.ErrChatNotFound)
+}
+
+// commitFailureCode maps a failed CommitAssistant's error (once
+// commitFailureIsChatGone has ruled out "the chat is gone") to the
+// run-terminal code finishRunWithParts substitutes for the status/message the
+// run was about to report. portal.ErrChatTooLarge is surfaced VERBATIM: it is
+// a named, actionable sentinel -- the frontend's label (errorChatTooLarge,
+// i18n.ts) tells the user that nothing was stored for this turn and to start a
+// new chat, which is a thread with the whole budget free. It deliberately does
+// NOT tell them to download the image: on this path the commit failed, so
+// finishRunWithParts withholds the parts from the terminal event and there is
+// no image on screen to save. An arbitrary store failure -- a driver error, a
+// marshal failure -- is something the user cannot act on and therefore
+// degrades to one generic, stable code rather than reaching the browser as a
+// raw Go error string.
+func commitFailureCode(err error) string {
+	if errors.Is(err, portal.ErrChatTooLarge) {
+		return portal.ErrChatTooLarge.Error()
+	}
+	return chatRunCommitFailedMessage
+}
 
 const runEvictionDelay = 30 * time.Second
 
@@ -433,6 +640,14 @@ func (r *ChatRun) statusValue() string {
 // nothing. It returns the reserved run and the context its executor will use.
 // On rejection the freshly-created context is cancelled and nil is returned.
 // The caller MUST either launchRun the reservation or releaseRun it.
+//
+// The context is deliberately UNBOUNDED here. A reservation predates
+// PrepareChatRun, so the run's kind -- the only thing that decides whether it
+// gets a deadline -- is not known yet, and guessing it at this point is exactly
+// the race that forced run.kind under a mutex. executeRun applies the bound
+// once the kind IS known (see runDeadlineFor). The returned cancel stays the
+// registry's: releaseRun, cancelChat and handleCancelChatRun all still need it,
+// and cancelling it also cancels the bounded child derived from it.
 func (s *Server) reserveRun(owner auth.Token, chatID string) (*ChatRun, context.Context, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	run, err := s.ChatRuns.add(owner.UserID, chatID, cancel)
@@ -443,8 +658,13 @@ func (s *Server) reserveRun(owner auth.Token, chatID string) (*ChatRun, context.
 	return run, ctx, nil
 }
 
-// launchRun starts the executor goroutine for a previously reserved run.
+// launchRun starts the executor goroutine for a previously reserved run. The
+// run's kind is stamped from the PREPARED settings (the pin PrepareChatRun
+// forces, never the client's submitted value) and BEFORE the goroutine starts,
+// so the 201 its caller then writes already describes the run the executor is
+// about to make.
 func (s *Server) launchRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
+	run.setKind(prep.Settings.Kind)
 	go s.executeRun(ctx, owner, run, prep)
 }
 
@@ -452,12 +672,7 @@ func (s *Server) launchRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 // the registry, fully freeing the slot so a retry is not wrongly rejected. Only
 // valid before launchRun starts the executor goroutine.
 func (s *Server) releaseRun(run *ChatRun) {
-	run.mu.Lock()
-	cancel := run.cancel
-	run.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+	run.cancelContext()
 	s.ChatRuns.remove(run)
 }
 
@@ -475,9 +690,38 @@ func (s *Server) startChatRun(owner auth.Token, chatID string, prep PrepareRunRe
 
 func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
 	defer func() {
+		// Release the reservation's context now that the run is terminal. Its
+		// cancel was previously only ever invoked on the release/cancel paths,
+		// never on the normal terminal one, so a bounded run would have kept
+		// its timer armed for the rest of the deadline. Everything that uses
+		// the context (the loopback request) is done by here, and the terminal
+		// commit no longer rides on it at all (see finishRun).
+		run.cancelContext()
 		// Evict after a grace period so late subscribers still see the terminal.
 		time.AfterFunc(runEvictionDelay, func() { s.ChatRuns.remove(run) })
 	}()
+
+	// The bound is applied HERE rather than in reserveRun because this is the
+	// first point at which the run's kind is known (it is the same value
+	// launchRun just stamped on the run). Deriving it from the reservation's
+	// context keeps cancellation intact -- Stop still cancels the parent, which
+	// cancels this -- and the deferred cancel releases the timer on every
+	// terminal path, including the ordinary success one.
+	if d, bounded := runDeadlineFor(prep.Settings.Kind); bounded {
+		var cancelDeadline context.CancelFunc
+		ctx, cancelDeadline = context.WithTimeout(ctx, d)
+		defer cancelDeadline()
+	}
+
+	// The image kind's executor is a different request against a different
+	// endpoint with a different response shape, and it shares none of the SSE
+	// machinery below (see chat_runs_images.go for why reusing any of it would
+	// be dishonest). Branching before the chat body is built keeps the text
+	// path byte-for-byte what it was.
+	if prep.Settings.Kind == chatRunKindImage {
+		s.executeImageRun(ctx, owner, run, prep)
+		return
+	}
 
 	body, err := buildChatCompletionsBody(prep)
 	if err != nil {
@@ -489,35 +733,18 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 		s.finishRun(ctx, owner, run, "error", err.Error())
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(csrfHeaderName, "1")
-	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
-	req.Header.Set(internalUserHeaderName, owner.UserID)
-	req.Header.Set(sessionHeaderName, run.ChatID)
-	if prep.Settings.RunAsTokenID != "" {
-		req.Header.Set(runAsHeaderName, prep.Settings.RunAsTokenID)
-	}
-	// Carry the chat's (self-healed, see portal.Service.PrepareChatRun) per-run
-	// server override over the loopback call as the same two headers the
-	// gateway's own applyServerOverride re-authorizes on every routed request
-	// (never trusting this value's provenance — see auth.go's doc on the two
-	// consts and applyServerOverride's doc in server.go). Precedence is
-	// TOKEN-FIRST: when the run-as token carries its own ServerOverride, that
-	// governs and this chat header is ignored (the chat UI locks its
-	// server-override controls to match); the chat header applies only when the
-	// run-as token has none. So sending it unconditionally here is safe.
-	if prep.Settings.ServerOverride != "" {
-		req.Header.Set(serverOverrideHeaderName, prep.Settings.ServerOverride)
-		if prep.Settings.ServerOverrideForceUnreachable {
-			req.Header.Set(serverOverrideForceHeaderName, "1")
-		} else {
-			req.Header.Set(serverOverrideForceHeaderName, "0")
-		}
-	}
+	s.setRunLoopbackHeaders(req, owner, run, prep)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
+			// A deadline is NOT a cancel, and reporting it as one would be the
+			// same silent conflation this feature refuses elsewhere: the user
+			// pressed nothing.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				s.finishRun(context.Background(), owner, run, "error", runTimedOutMessage)
+				return
+			}
 			s.finishRun(context.Background(), owner, run, "canceled", "")
 			return
 		}
@@ -526,11 +753,66 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		s.finishRun(ctx, owner, run, "error", "upstream status "+resp.Status)
+		// Bounded the same way relayImagesUpstreamError bounds an error body
+		// (images_handler.go): an error body has no reason to exceed it, and
+		// this is a non-200 -- not the ordinary streamed 200 consumeRunStream
+		// reads unbounded. upstreamErrorCode (chat_runs_images.go) pulls
+		// error.code out of the gateway's own envelope; every code either
+		// endpoint was built to return was previously discarded here in favor
+		// of the flat "upstream status ..." string.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
+		s.finishRun(ctx, owner, run, "error", upstreamErrorCode(body, resp.Status))
 		return
 	}
 
 	s.consumeRunStream(ctx, owner, run, resp)
+}
+
+// setRunLoopbackHeaders applies the header set EVERY loopback request a run
+// makes must carry, whichever endpoint it targets. Shared by the chat hop and
+// the images hop rather than copied: every header below is a property of "the
+// run executor is calling the gateway on the user's behalf", not of the
+// endpoint being called, and two copies would be two places for one of them to
+// go missing (the run-as header alone covers billing, capture flags, the
+// token's server override and its model override).
+//
+// The trusted-loopback pair authenticates the call as a token-less session
+// principal; /v1/images/generations admits it through the same
+// requireInternalOrBearerAnyScope leg /v1/chat/completions does.
+//
+// The session header is set to the chat id on both, and the extractor reads
+// that explicit override BEFORE its per-endpoint switch (session_extract.go),
+// so an image request is tagged as a chat session exactly like a chat one even
+// though /v1/images/generations has no session signal of its own.
+//
+// The chat's (self-healed, see portal.Service.PrepareChatRun) per-run server
+// override rides as the same two headers the gateway's own applyServerOverride
+// re-authorizes on every routed request (never trusting this value's
+// provenance — see auth.go's doc on the two consts and applyServerOverride's
+// doc in server.go). Precedence is TOKEN-FIRST: when the run-as token carries
+// its own ServerOverride, that governs and this chat header is ignored (the
+// chat UI locks its server-override controls to match); the chat header
+// applies only when the run-as token has none. So sending it unconditionally
+// here is safe. It matters on the images path too: that endpoint runs the same
+// inferencePreflight, so applyServerOverride reads these headers there as well,
+// and omitting them would silently ignore an image thread's own override.
+func (s *Server) setRunLoopbackHeaders(req *http.Request, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeaderName, "1")
+	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
+	req.Header.Set(internalUserHeaderName, owner.UserID)
+	req.Header.Set(sessionHeaderName, run.ChatID)
+	if prep.Settings.RunAsTokenID != "" {
+		req.Header.Set(runAsHeaderName, prep.Settings.RunAsTokenID)
+	}
+	if prep.Settings.ServerOverride != "" {
+		req.Header.Set(serverOverrideHeaderName, prep.Settings.ServerOverride)
+		if prep.Settings.ServerOverrideForceUnreachable {
+			req.Header.Set(serverOverrideForceHeaderName, "1")
+		} else {
+			req.Header.Set(serverOverrideForceHeaderName, "0")
+		}
+	}
 }
 
 // consumeRunStream reads the loopback SSE, publishing deltas, computing metrics,
@@ -604,9 +886,33 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if ctx.Err() != nil {
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			// The other half of the same conflation: once the upstream has
+			// answered 200 the deadline lands here, as a read error on a
+			// cancelled request, rather than on the Do above.
+			//
+			// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image
+			// kind is bounded (runDeadlineFor) and an image run never enters
+			// consumeRunStream -- it has no stream to consume -- while the
+			// reservation's context is a plain WithCancel over
+			// context.Background(), so no deadline reaches a text run from
+			// the HTTP request either. Bounding the text kind, or adding a
+			// future streaming kind that is bounded, makes this live again,
+			// and on that day the conflation it exists to prevent would
+			// otherwise return silently: a user who pressed nothing, told
+			// they pressed Stop.
+			//
+			// It therefore has NO test, and that is a consequence of the
+			// unreachability rather than a gap -- one cannot be written
+			// without first making the branch reachable. So: do not delete
+			// this as dead weight, and do not "fix" the missing coverage. The
+			// live equivalent is the body-read branch in chat_runs_images.go,
+			// pinned by TestRunDeadlineMidResponseIsNotACancelEither.
+			status, errMsg = "error", runTimedOutMessage
+		case ctx.Err() != nil:
 			status, errMsg = "canceled", ""
-		} else {
+		default:
 			status, errMsg = "error", err.Error()
 		}
 	}
@@ -655,6 +961,34 @@ func (r *ChatRun) currentMetrics() runMetrics {
 // terminal. The persisted status uses the transcript vocabulary
 // (complete/error/canceled).
 func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string) {
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, nil)
+}
+
+// finishRunWithParts is finishRun for a run whose output is NOT the streamed
+// text buffer: an image run commits its generated image(s) as the turn's
+// structured content instead (portal.AssistantTurn.ContentParts, which is
+// written as the message's `content` when it is non-empty). parts is nil for
+// every text run and on every failing image run, which is byte-for-byte the
+// behaviour finishRun had before this parameter existed.
+//
+// The parts also ride on the run's TERMINAL EVENT, but only once the commit
+// has actually succeeded -- see runEvent.ContentParts and `committed` below.
+// That is what lets the browser render the stored image from the `done` it is
+// already handed, instead of depending on a refetch of the whole
+// (multi-megabyte) document to discover a turn the event told it nothing about.
+//
+// Keeping ONE commit function rather than a second one for images is what
+// keeps the retire/finish/log bookkeeping below single-sourced: a run's
+// terminal step is the same step whatever it produced.
+func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string, parts json.RawMessage) {
+	// The commit must outlive the deadline that ended the run: this is called
+	// with the run's OWN ctx on every failing path (the two
+	// request-construction failures, the Do failure and the non-200 on the
+	// text path; all of them on the image path, which has a single terminal
+	// call site), so on a timeout the ctx is ALREADY expired and the commit
+	// below would be cancelled before it wrote -- losing the turn instead of
+	// recording why it ended. Same idiom as benchmark_vram_runner.go:236.
+	commitCtx := context.WithoutCancel(ctx)
 	reasoning, content := run.buffered()
 	m := run.currentMetrics()
 	persistStatus := map[string]string{"completed": "complete", "error": "error", "canceled": "canceled"}[status]
@@ -662,16 +996,49 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 		persistStatus = "complete"
 	}
 	// A failed terminal commit leaves the trailing assistant message stuck at
-	// "pending", so a later restart would infer a false "interrupted". Log it
-	// (control flow is unchanged — the run still finishes) so the failure is not
-	// silently swallowed.
-	if err := s.Portal.CommitAssistant(ctx, owner, run.ChatID, portal.AssistantTurn{
+	// "pending" (or, on the memory/store paths that never wrote one, leaves no
+	// turn at all) -- so a later restart would infer a false "interrupted", and
+	// the browser would be told a turn succeeded that was never durably saved.
+	// That was tolerable while every turn was a few KB of text; an inline image
+	// routinely approaches the chat store's whole-document cap
+	// (MaxChatContentBytes, portal/service_chats.go), so this is no longer a
+	// theoretical failure mode. Log it (still worth knowing about) AND override
+	// the run's own terminal status/message to "error" with a mapped code, so
+	// the browser is told the truth regardless of what status the run was about
+	// to report -- UNLESS status is ALREADY "canceled" and the chat itself is
+	// simply gone (commitFailureIsChatGone): DELETE /chats/{id} cancels this
+	// run and removes its row in the same request, and a canceled run's
+	// commit can lose that race. That specific combination is not a loss to
+	// report -- the chat is gone, so the run's own "canceled" (from the
+	// delete's own cancellation) stands unchanged.
+	//
+	// The status check matters: the invariant this task exists to establish
+	// is that a "completed" run never survives a failed store write, and a
+	// DELETE landing AFTER the stream ended but BEFORE the commit runs would
+	// otherwise hit commitFailureIsChatGone too, for a run that was NOT
+	// canceled -- reporting success with nothing stored, the exact defect
+	// this task closes. "canceled" is therefore load-bearing, not merely a
+	// hint at why the error occurred.
+	//
+	// committed is what the terminal event may claim was STORED. It starts as
+	// the parts this call was asked to persist and is cleared the moment the
+	// write fails, so the browser is never handed an image to render for a
+	// turn the store refused -- that is the "rendered and then vanished on
+	// reload" loss in its other direction, and it is precisely the case
+	// (portal.chat_too_large) where the user is told to start a new chat.
+	committed := parts
+	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
+		ContentParts: parts,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
+		committed = nil
+		if status != "canceled" || !commitFailureIsChatGone(err) {
+			status, errMsg = "error", commitFailureCode(err)
+		}
 	}
-	run.finish(status, errMsg)
+	run.finish(status, errMsg, committed)
 	// Free the per-chat/cap slot immediately on terminal so the chat's next turn
 	// (and the user's next chat) is not blocked during the 30s eviction grace;
 	// the run stays reachable by id for late terminal snapshots (see retire).

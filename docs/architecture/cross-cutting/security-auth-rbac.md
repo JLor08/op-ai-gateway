@@ -12,16 +12,21 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`) |
+| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
-token — see [§7](#7-request-authentication-decision-flow). Every other
-inference endpoint (`/v1/responses`, `/v1/messages`,
-`/v1/messages/count_tokens`, `/v1/images/generations`, and the `/v0/models`,
-`/openai/v1/models`, `/anthropic/v1/models` model-listing endpoints) is
-**bearer-only**: no session cookie is accepted there at all.
+token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`
+(and its `/openai/v1/` alias) accepts **either** the internal trusted-loopback
+pair **or** a bearer token, but never a portal session cookie: it is reachable
+by the gateway's own background executor over loopback, never by a logged-in
+browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
+`internal/gateway/auth_internal_or_bearer.go`). Every remaining inference
+endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
+`/v0/models`, `/openai/v1/models`, `/anthropic/v1/models` model-listing
+endpoints) is **bearer-only**: no session cookie and no loopback pair is
+accepted there at all.
 
 ## 2. Local password authentication
 
@@ -212,13 +217,33 @@ flowchart TD
     N -- "session + optional\nX-OP-Run-As-Token" --> O["AuthorizeRunAsToken\n(ownership + active + scope)"]
     N -- pass --> L
 
-    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\n/v1/images/generations,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
+    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
     P -- pass --> L
+
+    D -- "/v1/images/generations\n(/openai/v1/... alias)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
+    R -- no --> T{"Authorization: Bearer present?"}
+    T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
+    T -- no --> X2
+    S --> V{"requireInternalOrBearerAnyScope:\ngateway:use OR llm:invoke"}
+    U --> V
+    V -- "loopback + optional\nX-OP-Run-As-Token" --> O
+    V -- pass --> L
 
     D -- "/api/agent/v1/*" --> Q["Agent bearer secret\nvs agent_tokens\n(separate token universe)"]
     Q -- pass --> L
 ```
+
+Note that `/v1/images/generations` resolves its principal through
+`authenticateInternalOrBearer` (`auth_internal_or_bearer.go`) rather than
+through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
+duplicated: both entry points call the same `loopbackPrincipal`
+(`internal/gateway/auth.go`), so the constant-time secret comparison and its
+fail-closed conditions (no configured secret, no user lookup, unknown user)
+exist exactly once and cannot drift apart. What differs is only what each one
+falls back to when that check does not match — and this endpoint deliberately
+has **no session-cookie branch at all**, never node E/H/M's path.
 
 Two authorization helpers sit behind the session/bearer resolution and are
 worth naming explicitly because they differ in an easy-to-miss way:

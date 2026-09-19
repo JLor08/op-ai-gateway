@@ -16,6 +16,9 @@ import {
   type SetStateAction,
 } from 'react';
 import type { Chat, ChatRunStatus, PortalApi } from '../../api';
+import type { ChatContent, ChatContentPart } from '../shared/chatContent';
+import { formatChatRunErrorCode } from '../shared/format';
+import type { Translation } from '../shared/types';
 import {
   messageStatusForRun,
   metricsOf,
@@ -27,24 +30,96 @@ import {
 
 // A live run subscription for one chat. `es` is the open EventSource (null once
 // terminal / after close). Keyed by chatId in runsRef.
-type RunState = { runId: string; status: ChatRunStatus; es: EventSource | null };
+type RunState = {
+  runId: string;
+  status: ChatRunStatus;
+  es: EventSource | null;
+  // The run's kind ("" text | "image"), as reported by the run itself (the
+  // 201, an active-runs listing entry, or an SSE snapshot/done) -- NEVER
+  // derived from the thread's own settings-level chatKind. This is the
+  // AUTHORITATIVE, post-force value: PrepareChatRun forces the thread's
+  // pinned kind server-side on every send after the first, and the 201/
+  // snapshot report what the executor will actually run, not what the
+  // client asked for (see startRunResponse's doc comment,
+  // chat_run_endpoints.go:28-32). A client-side "is this thread's first
+  // send" guess (chatKind) can be WRONG when the client's own transcript
+  // view is stale relative to the server's -- a second tab still holding
+  // messages = [] after another tab's first send falls through to the
+  // picked model and would pin the wrong kind locally, or a send whose 201
+  // was lost leaves the optimistic pin behind after the rollback. Reading
+  // the run's OWN reported kind instead makes "the pending render matches
+  // what the executor is actually running" unconditional rather than
+  // conditional on the client's transcript being fresh: streaming (below)
+  // only turns true once THIS field is already populated, from the very
+  // same 201/listing-entry/reopen-path call that supplies it (see
+  // markRunning's two call sites, in openStream).
+  kind: string;
+  // The run's server-measured age: the ms value from its own last
+  // snapshot/done/201/active-runs-listing payload ("serverMs"), paired with
+  // the performance.now() reading taken the instant THIS client read it
+  // ("anchor") -- EXCEPT on the reopen path below, where registerRunning's
+  // anchor is taken before an awaited doc fetch and openStream's replacement
+  // anchor is taken after it, so that one pairing is briefly off by the
+  // fetch's own duration; it self-corrects on the run's first SSE snapshot,
+  // which re-anchors from a value and a timestamp both taken together, on
+  // this same client, at that later instant. elapsedMsOf below interpolates
+  // from this single pair between snapshots -- anchoring on the SERVER's own
+  // measurement, never on the local moment of Send, is what lets a reopened
+  // tab and the sending tab agree on the same true elapsed time. Re-anchored
+  // (a fresh serverMs + a fresh anchor) whenever a newer snapshot/done
+  // arrives; frozen from the terminal one on.
+  age: { serverMs: number; anchor: number };
+};
 
 // Shapes of the named SSE payloads the run endpoint emits (metrics keys are
 // snake_case on the wire; mapped to the camelCase message fields below).
+// `kind`/`elapsed_ms` ride on snapshot/done only (never delta -- see the
+// backend's own runEvent doc comment, chat_runs.go).
 type SnapshotPayload = {
   reasoning?: string;
   content?: string;
   metrics?: RunMetricsPayload;
   status?: ChatRunStatus;
   error?: string;
+  kind?: string;
+  elapsed_ms?: number;
+  // The turn's STRUCTURED content, exactly as the backend committed it
+  // (runEvent.ContentParts, chat_runs.go). `content` above is the run's
+  // streamed TEXT buffer and an image run never writes a byte into it, so
+  // before this field existed the terminal event of a successful image run
+  // carried no content at all — the bubble was set to '', finishRun's own
+  // empty-tail prune deleted it, and only the post-`done` refetch of the whole
+  // multi-megabyte document put it back. Absent on every text run, and absent
+  // on ANY run whose commit failed: the backend clears it rather than letting
+  // the event claim a turn the store refused.
+  content_parts?: ChatContentPart[];
 };
 type DeltaPayload = { reasoning?: string; content?: string };
+
+// The content a snapshot/done event says the turn HAS. The two shapes are not
+// alternatives the client may choose between: `content_parts` is what the
+// transcript holds for a structured (image) turn, `content` is the streamed
+// text for every other one, and exactly one of them is ever non-empty. An
+// empty array is treated as absent so it can never shadow the text buffer.
+function contentOf(payload: SnapshotPayload): ChatContent {
+  const parts = payload.content_parts;
+  if (Array.isArray(parts) && parts.length > 0) return parts;
+  return payload.content ?? '';
+}
 
 // Invoked whenever a chat's run reaches a terminal state (completed / error /
 // canceled / interrupted). The provider wires persistence's dirty-clearing
 // through this — it REPLACES the direct dirtyRef write formerly inline in
 // finishRun, so the run engine never reaches into persistence's bookkeeping.
 export type RunTerminalHandler = (chatId: string) => void;
+
+// Invoked around the post-terminal canonical refetch (adoptCanonicalTranscript)
+// with whether this chat's local transcript is KNOWN to match the server's
+// committed one: false while the refetch is in flight and after it fails, true
+// once it has been adopted. The provider wires persistence's save suppression
+// through it — see useChatPersistence.setTranscriptStale for why a failed
+// refetch must block the save rather than merely cancel a pending one.
+export type TranscriptStaleHandler = (chatId: string, stale: boolean) => void;
 
 export type ChatRunsApi = {
   // Chats with a live server run (any chat, not just the active one). Mirrors
@@ -60,6 +135,19 @@ export type ChatRunsApi = {
   statusOf: (chatId: string) => ChatRunStatus | undefined;
   // The live run's id for chatId, or undefined when it is not running.
   runIdIfRunning: (chatId: string) => string | undefined;
+  // chatId's live run's own reported kind ("" text | "image"), or undefined
+  // when chatId has no registry entry at all. See RunState's `kind` field
+  // for why this is read from the run itself, never derived from the
+  // thread's own settings-level kind.
+  kindOf: (chatId: string) => string | undefined;
+  // chatId's live run's CURRENT elapsed ms, interpolated from its last known
+  // server anchor to "now" (performance.now()) at call time. Undefined only
+  // when chatId has NO registry entry at all (never run, or forgotten) --
+  // a run that has gone terminal but is still lingering in the registry (the
+  // eviction grace) returns its frozen final value here, not undefined. See
+  // RunState's `age` field for why this anchors on the server's own
+  // measurement rather than the local moment of Send.
+  elapsedMsOf: (chatId: string) => number | undefined;
   // Per-chat transcript buffers: a background chat's streamed deltas land
   // here (not in the visible `messages`), and it is also the seed source for
   // (re)activating a chat. Exposed as the live Map itself (stable identity
@@ -67,10 +155,15 @@ export type ChatRunsApi = {
   buffers: Map<string, ChatUiMessage[]>;
   // Register a run's metadata WITHOUT opening its EventSource yet (bootstrap
   // replay registers every active run before the active chat's transcript is
-  // loaded, so interrupted-detection never falsely fires for it).
-  registerRunning: (chatId: string, runId: string) => void;
-  // Open (or reopen) the SSE subscription for a chat's run.
-  subscribe: (chatId: string, runId: string) => void;
+  // loaded, so interrupted-detection never falsely fires for it). `kind` and
+  // `elapsedMs` seed RunState's fields of the same name (from activeRunDTO
+  // for a bootstrap replay); omit both for a run that has genuinely just
+  // started, where "" / 0 are the true values.
+  registerRunning: (chatId: string, runId: string, kind?: string, elapsedMs?: number) => void;
+  // Open (or reopen) the SSE subscription for a chat's run. `kind`/`elapsedMs`
+  // seed RunState exactly like registerRunning's, until the stream's own
+  // first snapshot supplies fresher ones.
+  subscribe: (chatId: string, runId: string, kind?: string, elapsedMs?: number) => void;
   // Close a chat's EventSource and drop its run + buffer bookkeeping.
   forget: (chatId: string) => void;
   // Close every open EventSource without otherwise touching state (provider
@@ -79,6 +172,10 @@ export type ChatRunsApi = {
   // Register the terminal callback (the provider registers exactly one, at
   // render time, wiring persistence's dirty-clearing).
   onTerminal: (cb: RunTerminalHandler) => void;
+  // Register the transcript-staleness callback (exactly one, same shape as
+  // onTerminal above), wiring persistence's save suppression to the
+  // post-terminal canonical refetch. See TranscriptStaleHandler.
+  onTranscriptStale: (cb: TranscriptStaleHandler) => void;
 };
 
 export function useChatRuns(
@@ -88,6 +185,11 @@ export function useChatRuns(
   setMessages: Dispatch<SetStateAction<ChatUiMessage[]>>,
   onRefreshRef: RefObject<() => void | Promise<void>>,
   showErrorRef: RefObject<(message: string) => void>,
+  // Used ONLY to localize a terminal run's error CODE (formatChatRunErrorCode)
+  // before it reaches the toast -- every other string in this file is
+  // either already a translated caller-supplied value or a raw wire code
+  // this module has no business rendering untranslated.
+  tRef: RefObject<Translation>,
 ): ChatRunsApi {
   // Per-chat run subscriptions, keyed by chatId. The source of truth for "is
   // this chat running" (runningChatIds mirrors it for rendering). Entries are
@@ -99,6 +201,7 @@ export function useChatRuns(
   const chatBuffersRef = useRef<Map<string, ChatUiMessage[]>>(new Map());
   const [runningChatIds, setRunningChatIds] = useState<Set<string>>(new Set());
   const onTerminalRef = useRef<RunTerminalHandler | null>(null);
+  const onTranscriptStaleRef = useRef<TranscriptStaleHandler | null>(null);
 
   // Add/remove a chat from the running set (source of truth is runsRef; this
   // mirror drives rendering + the derived active-chat `streaming` flag).
@@ -167,15 +270,25 @@ export function useChatRuns(
       const run = runsRef.current.get(chatId);
       if (run) {
         run.es?.close();
-        runsRef.current.set(chatId, { runId: run.runId, status, es: null });
+        // Spread (not a fresh literal): `age` carries over as-is, so the
+        // clock FREEZES at whatever it last was (the terminal snapshot/done's
+        // own elapsed_ms, applied below in the snapshot/done listeners before
+        // this is called) rather than being re-derived from a fresh
+        // performance.now() that would make it start ticking again.
+        runsRef.current.set(chatId, { ...run, status, es: null });
       }
       const msgStatus = messageStatusForRun(status);
       updateChatMessages(chatId, (prev) => {
         if (prev.length === 0) return prev;
         const last = prev.at(-1)!;
         if (last.role !== 'assistant') return prev;
-        const empty =
-          (typeof last.content === 'string' ? last.content.length === 0 : true) && !last.reasoning;
+        // "Empty" means the run wrote nothing into this bubble. Length is the
+        // right test for BOTH shapes -- a string's characters and a content
+        // array's parts -- and `typeof content === 'string' ? … : true` was
+        // not: it called every structured content empty, so an image turn's
+        // bubble was deleted the moment it arrived. pruneEmptyAssistantTail
+        // (chatDoc.ts) already tests length, and this now agrees with it.
+        const empty = last.content.length === 0 && !last.reasoning;
         if (empty) return prev.slice(0, -1);
         const copy = prev.slice();
         copy[copy.length - 1] = { ...last, status: msgStatus };
@@ -187,10 +300,15 @@ export function useChatRuns(
       // the canonical adopt (below) can re-dirty via the `messages` state
       // change without the stream-end flushSave racing ahead of it.
       onTerminalRef.current?.(chatId);
-      if (error) showErrorRef.current(error);
+      // error is a WIRE CODE (runTimedOutMessage, ErrChatTooLarge.Error(),
+      // ...), not prose -- localize it through errorLabelByCode before it
+      // reaches the toast, or every chat-run code this task just mapped
+      // would still show up as raw English (see format.ts's own doc comment
+      // on formatChatRunErrorCode).
+      if (error) showErrorRef.current(formatChatRunErrorCode(error, tRef.current));
       void onRefreshRef.current();
     },
-    [updateChatMessages, markRunning, showErrorRef, onRefreshRef],
+    [updateChatMessages, markRunning, showErrorRef, onRefreshRef, tRef],
   );
 
   // Review follow-up #A: after a run's `done`, the backend has ALREADY committed
@@ -198,36 +316,67 @@ export function useChatRuns(
   // adopt it into this chat's buffer (and the visible `messages` when active) so
   // the buffer becomes authoritative — any later save is idempotent and a
   // reopen/interrupted check reads the server's transcript, never the
-  // FE-generated one. Best-effort: a failed refetch leaves the buffer as-is; a
-  // doc without a committed turn is left alone (never wipe streamed content the
-  // server has not persisted). Guarded against a run that started meanwhile:
-  // only adopt while THIS run is still the chat's (terminal) entry.
+  // FE-generated one. A doc without a committed turn is left alone (never wipe
+  // streamed content the server has not persisted). Guarded against a run that
+  // started meanwhile: only adopt while THIS run is still the chat's (terminal)
+  // entry.
+  //
+  // WHILE THE REFETCH IS IN FLIGHT, AND FOREVER AFTER IT FAILS, THE CHAT IS
+  // MARKED STALE AND MUST NOT BE SAVED. A refetch is not a formality here: it
+  // downloads the whole document, which for an image thread is megabytes, and
+  // it is exactly the request most likely to fail or to outlast the 800 ms
+  // save debounce. Until it has been adopted, this client cannot claim its own
+  // buffer is what the server holds — and a PUT of that buffer full-replaces
+  // the stored document with no merge, so guessing costs the user a committed
+  // turn. Marking BEFORE the await rather than only in the catch is what makes
+  // this race-free: a failure that lands after the debounce already fired
+  // would be too late to cancel anything.
   const adoptCanonicalTranscript = useCallback(
     async (chatId: string, runId: string) => {
+      onTranscriptStaleRef.current?.(chatId, true);
       let full: Chat;
       try {
         full = await apiRef.current.chat(chatId);
       } catch {
+        // Loud, not silent: the run itself succeeded and the turn IS on the
+        // server, but this tab can no longer prove its copy matches — and it
+        // has just stopped saving this chat, which the user is entitled to
+        // know about before they keep typing into it.
+        showErrorRef.current(tRef.current.errorChatTranscriptStale);
         return;
       }
       const entry = runsRef.current.get(chatId);
+      // A newer run owns this chat now, so ITS adopt cycle owns the stale mark
+      // as well — leave the mark exactly as that cycle set it.
       if (entry?.runId !== runId || entry?.status === 'running') return;
       const canonical = normalizeDoc(full.content).messages;
-      if (canonical.length === 0) return;
-      chatBuffersRef.current.set(chatId, canonical);
-      if (chatId === activeChatIdRef.current) {
-        messagesRef.current = canonical;
-        setMessages(canonical);
+      if (canonical.length > 0) {
+        chatBuffersRef.current.set(chatId, canonical);
+        if (chatId === activeChatIdRef.current) {
+          messagesRef.current = canonical;
+          setMessages(canonical);
+        }
       }
+      // Reached only with the server's own answer in hand: either the buffer
+      // IS that answer now, or the server holds no transcript at all, in which
+      // case the local one is AHEAD of it rather than behind and must stay
+      // saveable.
+      onTranscriptStaleRef.current?.(chatId, false);
     },
-    [apiRef, activeChatIdRef, messagesRef, setMessages],
+    [apiRef, activeChatIdRef, messagesRef, setMessages, showErrorRef, tRef],
   );
 
   // Register a run's metadata WITHOUT opening its EventSource (bootstrap
   // replay, and the reopen path below before its transcript is seeded).
   const registerRunning = useCallback(
-    (chatId: string, runId: string) => {
-      runsRef.current.set(chatId, { runId, status: 'running', es: null });
+    (chatId: string, runId: string, kind = '', elapsedMs = 0) => {
+      runsRef.current.set(chatId, {
+        runId,
+        status: 'running',
+        es: null,
+        kind,
+        age: { serverMs: elapsedMs, anchor: performance.now() },
+      });
       markRunning(chatId, true);
     },
     [markRunning],
@@ -247,7 +396,7 @@ export function useChatRuns(
   // doc, then open the stream — otherwise the snapshot would fabricate a lone
   // assistant bubble on an empty base and, on switch, mask the real transcript.
   const subscribe = useCallback(
-    (chatId: string, runId: string) => {
+    (chatId: string, runId: string, kind = '', elapsedMs = 0) => {
       runsRef.current.get(chatId)?.es?.close();
 
       // Open the EventSource and wire the run listeners. Assumes the chat's
@@ -256,7 +405,20 @@ export function useChatRuns(
         const es = new EventSource(
           `/api/portal/chats/${encodeURIComponent(chatId)}/runs/${encodeURIComponent(runId)}/events`,
         );
-        runsRef.current.set(chatId, { runId, status: 'running', es });
+        // Seed kind/age from THIS call's own arguments (the 201's, or
+        // activeRunDTO's for a bootstrap replay) -- never from any entry
+        // already in runsRef, which could belong to an unrelated PRIOR run
+        // this same chat once had. markRunning below is what flips
+        // `streaming`, so by the time any consumer can observe streaming ===
+        // true for this chat, kind/age are already this call's authoritative
+        // values, not the client's own guess.
+        runsRef.current.set(chatId, {
+          runId,
+          status: 'running',
+          es,
+          kind,
+          age: { serverMs: elapsedMs, anchor: performance.now() },
+        });
         markRunning(chatId, true);
 
         es.addEventListener('snapshot', (e) => {
@@ -265,9 +427,24 @@ export function useChatRuns(
           writeAssistant(chatId, (m) => ({
             ...m,
             reasoning: snap.reasoning ?? '',
-            content: snap.content ?? '',
+            content: contentOf(snap),
             ...metricsOf(snap.metrics),
           }));
+          // Re-anchor from this snapshot's OWN kind/elapsed_ms before any
+          // terminal handling below (finishRun copies the run's CURRENT
+          // state verbatim, so it must already be the frozen, final one by
+          // the time it runs).
+          const run = runsRef.current.get(chatId);
+          if (run) {
+            runsRef.current.set(chatId, {
+              ...run,
+              kind: snap.kind ?? run.kind,
+              age:
+                typeof snap.elapsed_ms === 'number'
+                  ? { serverMs: snap.elapsed_ms, anchor: performance.now() }
+                  : run.age,
+            });
+          }
           // A late subscriber (reopen/reconnect just after a run finished) gets
           // the terminal state as a `snapshot` (status completed/error/canceled)
           // and then the stream closes with no `done` to follow. Finalize here
@@ -293,9 +470,23 @@ export function useChatRuns(
           writeAssistant(chatId, (m) => ({
             ...m,
             reasoning: term.reasoning ?? '',
-            content: term.content ?? '',
+            content: contentOf(term),
             ...metricsOf(term.metrics),
           }));
+          // Re-anchor from the terminal event's own kind/elapsed_ms BEFORE
+          // finishRun: from here on the age must read as the run's real,
+          // frozen duration -- not the running age from the last snapshot.
+          const run = runsRef.current.get(chatId);
+          if (run) {
+            runsRef.current.set(chatId, {
+              ...run,
+              kind: term.kind ?? run.kind,
+              age:
+                typeof term.elapsed_ms === 'number'
+                  ? { serverMs: term.elapsed_ms, anchor: performance.now() }
+                  : run.age,
+            });
+          }
           finishRun(chatId, term.status ?? 'completed', term.error);
           // Adopt the server-committed transcript (server ids + status) so the
           // buffer is canonical and never clobbered by the FE copy (follow-up #A).
@@ -319,7 +510,7 @@ export function useChatRuns(
       // Register its run metadata NOW (so switching to it treats it as running,
       // not interrupted), then seed its buffer from the server doc BEFORE
       // opening the stream. Best-effort: on a fetch failure just open the stream.
-      registerRunning(chatId, runId);
+      registerRunning(chatId, runId, kind, elapsedMs);
       void (async () => {
         let docMessages: ChatUiMessage[] | null = null;
         try {
@@ -369,6 +560,36 @@ export function useChatRuns(
     const run = runsRef.current.get(chatId);
     return run?.status === 'running' ? run.runId : undefined;
   }, []);
+  // chatId's live run's current elapsed ms: its last known server anchor,
+  // interpolated to "now" by the performance.now() gap since it was taken.
+  // Called at render time (not itself reactive), so a caller that wants this
+  // to keep ticking on screen re-derives it every render, same as `now =
+  // Date.now()` in ActiveRequestsPanel -- the difference here is only WHICH
+  // clock anchors the value (see RunState's doc comment on `age`).
+  //
+  // Once the run is TERMINAL, `age.serverMs` already IS its final duration
+  // (the snapshot/done listener re-anchored it from the terminal event's own
+  // elapsed_ms), so it is returned verbatim, with NO further
+  // performance.now() gap added. Without this guard a chat left open past a
+  // run's completion would silently grow this value on every unrelated
+  // re-render (typing, switching models, ...) even though nothing is
+  // rendering it right now -- exactly the re-derived-after-terminal drift
+  // constraint 3 forbids, just one call deeper than where it would be
+  // visible. A late subscriber inside the run's eviction grace must be told
+  // how long the run TOOK, not how long ago the registry last touched it.
+  const elapsedMsOf = useCallback((chatId: string): number | undefined => {
+    const run = runsRef.current.get(chatId);
+    if (!run) return undefined;
+    if (run.status !== 'running') return run.age.serverMs;
+    return run.age.serverMs + (performance.now() - run.age.anchor);
+  }, []);
+  // chatId's live run's own reported kind, or undefined with no registry
+  // entry at all. See RunState's `kind` field for why this is the
+  // authoritative source for "what kind of run is this" -- never the
+  // thread's own settings-level chatKind.
+  const kindOf = useCallback((chatId: string): string | undefined => {
+    return runsRef.current.get(chatId)?.kind;
+  }, []);
 
   // Close a chat's EventSource and drop its run/buffer bookkeeping (deleteChat;
   // the backend DELETE also cancels the server-side run).
@@ -378,6 +599,10 @@ export function useChatRuns(
       runsRef.current.delete(chatId);
       chatBuffersRef.current.delete(chatId);
       markRunning(chatId, false);
+      // The chat is gone (deleteChat), so there is no transcript left to be
+      // stale about — and leaving a mark behind would outlive its subject and
+      // block a future chat that reused the id.
+      onTranscriptStaleRef.current?.(chatId, false);
     },
     [markRunning],
   );
@@ -390,16 +615,23 @@ export function useChatRuns(
     onTerminalRef.current = cb;
   }, []);
 
+  const onTranscriptStale = useCallback((cb: TranscriptStaleHandler) => {
+    onTranscriptStaleRef.current = cb;
+  }, []);
+
   return {
     runningChatIds,
     isRunning,
     statusOf,
     runIdIfRunning,
+    kindOf,
+    elapsedMsOf,
     buffers: chatBuffersRef.current,
     registerRunning,
     subscribe,
     forget,
     closeAll,
     onTerminal,
+    onTranscriptStale,
   };
 }

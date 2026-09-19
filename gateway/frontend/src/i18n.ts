@@ -188,13 +188,50 @@ const de = {
   chatModelUnavailable: 'Modell derzeit nicht verfügbar',
   chatModelLoaded: 'Geladen (sofort verfügbar)',
   chatModelLoadedOn: 'Geladen auf',
-  chatImageModelUnsupported: 'Dieses Modell unterstützt keine Bilder.',
+  // Gates image INPUT (attaching an image to a prompt). It must not say "does
+  // not support images": generating images and accepting them are ORTHOGONAL
+  // capabilities, aggregated separately by the backend, so a model that
+  // generates images may or may not also read them. On one that generates and
+  // does not read, the old wording told the user that a model whose only
+  // purpose is images does not support images. chatImageGeneratorNoInput below
+  // is the image-model case -- it applies whether or not that model is also
+  // vision-capable, because an image RUN carries no input image either way.
+  chatImageModelUnsupported: 'Dieses Modell kann keine Bilder als Eingabe verarbeiten.',
+  chatImageGeneratorNoInput:
+    'Dieses Modell erzeugt Bilder und nimmt selbst keine Bilder als Eingabe entgegen.',
+  // The composer of an image thread: the prompt field's label, the hint under
+  // it, and the remaining-capacity line. The capacity is the one number in
+  // this feature that is exact and known BEFORE the user commits to a
+  // multi-minute generation, so it is stated up front rather than after.
+  chatImagePromptLabel: 'Bildprompt',
+  chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  // The composer during an image run's wait (ADR-043 (d)): the pending label
+  // and the static "nothing more is coming" sentence -- ImagePendingTurn's
+  // only two announced strings (its clock is aria-hidden). Deliberately NOT
+  // "Bild wird erzeugt": between dispatch and terminal the request may still
+  // be queued for admission or waiting on a model load, during which "is
+  // being generated" is false, while "waiting for image" holds for the
+  // whole span and keeps the clock's referent unambiguous -- the wait, not
+  // the work.
+  chatImageRunPending: 'Warte auf Bild',
+  chatImageNoIntermediateNews:
+    'Keine Zwischenmeldungen – das Bild erscheint fertig oder gar nicht.',
+  chatCapacityRemaining: (count: number) => `Platz für etwa noch ${count} Bild(er) in diesem Chat.`,
+  chatCapacityExhausted:
+    'Dieser Chat hat keinen Platz mehr für ein weiteres Bild. Lade die vorhandenen Bilder herunter und beginne einen neuen Chat.',
   chatRegenerate: 'Neu generieren',
   chatEdit: 'Bearbeiten',
   chatSave: 'Speichern',
   chatCancel: 'Abbrechen',
   chatAttachImage: 'Bild anhängen',
   chatAttachedImage: 'Angehängtes Bild',
+  chatDownloadImage: 'Bild herunterladen',
+  chatGeneratedImage: 'Erzeugtes Bild',
+  // Shown inline next to a generated image's download button when the saved
+  // transcript's data URL does not decode -- a truncated/corrupted persisted
+  // turn reaches exactly this. The whole point of this feature is to stop a
+  // download from failing silently, so the user is told, not just logged to.
+  chatImageDownloadError: 'Bild konnte nicht heruntergeladen werden.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -524,6 +561,9 @@ const de = {
     'Unbekannt = keine Festlegung. MTP wird nicht neu erkannt — an einer bestehenden Zuordnung prüft es nichts. Dieser Chip ist rein informativ und hat keinen Einfluss auf die Server-Auswahl.',
   mappingVisionCapableUnknownHint:
     'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
+  mappingImageCapable: 'Bilderzeugung',
+  mappingImageCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Es gibt dafür keine automatische Erkennung — setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1154,6 +1194,7 @@ const de = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
+  capabilityImage: 'Bilderzeugung',
   // "Beobachtet", nicht "Unterstützt": Diese Zeile entsteht ausschließlich
   // aus echtem Traffic (llama.cpp hat mindestens einmal gedraftete Tokens
   // gemeldet), niemals aus einer Fähigkeits-Erklärung von Build oder
@@ -1284,6 +1325,64 @@ const de = {
     'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
   errorRuntimeSpecServerBenchmarking:
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
+  // Portal chat image generation (task 8): the chat run lifecycle's own
+  // codes, the mapping capability-form refusal, and the four images.* codes
+  // now reachable from a chat run. See format.ts's errorLabelByCode for the
+  // exact wire codes each key answers.
+  // Kein „Laden Sie das Bild herunter“: Auf beiden Wegen, die diesen Code
+  // auslösen, wurde nichts gespeichert – der Lauf hält die Bildteile beim
+  // fehlgeschlagenen Commit zurück (finishRunWithParts), es steht also auch
+  // nichts zum Sichern auf dem Bildschirm.
+  errorChatTooLarge:
+    'Der Chat ist zu groß zum Speichern – dieser Beitrag wurde nicht gespeichert. Starten Sie einen neuen Chat und versuchen Sie es erneut.',
+  // Der Lauf war erfolgreich und der Beitrag liegt auf dem Server, aber dieser
+  // Tab konnte den maßgeblichen Stand nicht nachladen. Er speichert diesen
+  // Chat deshalb nicht mehr (ein PUT würde den Serverstand vollständig
+  // ersetzen), bis er neu geladen wird.
+  errorChatTranscriptStale:
+    'Der gespeicherte Verlauf dieses Chats konnte nicht geladen werden. Ihre Antwort ist auf dem Server, dieser Tab speichert den Chat aber bis zum Neuladen nicht mehr.',
+  errorChatRunActive:
+    'Für diesen Chat läuft bereits eine Antwort. Bitte warten Sie, bis sie fertig ist.',
+  errorChatRunLimit:
+    'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
+  errorMappingCapabilityReserved:
+    '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
+  errorChatRunTimeout:
+    'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
+  errorChatRunNoImage: 'Es wurde kein Bild erzeugt. Bitte versuchen Sie es erneut.',
+  errorChatRunImageFormatUnknown:
+    'Das Format des erzeugten Bildes konnte nicht bestimmt werden. Bitte versuchen Sie es erneut.',
+  errorChatRunImageResponseUnreadable:
+    'Die Antwort der Bilderzeugung konnte nicht gelesen werden. Bitte versuchen Sie es erneut.',
+  errorChatRunCommitFailed:
+    'Die Antwort konnte nicht gespeichert werden. Bitte versuchen Sie es erneut.',
+  errorImagesPromptRequired:
+    'Für die Bilderzeugung wird ein Text-Prompt benötigt. Bitte geben Sie eine Beschreibung ein.',
+  errorImagesStreamUnsupported: 'Die Bilderzeugung unterstützt kein Streaming.',
+  errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
+  errorImagesUpstreamError:
+    'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Fix round, finding 1: the nine codes completionErrorResponse /
+  // completionErrorCode can now surface from a chat run's own text path
+  // (see format.ts's own comment on this block for why).
+  errorRoutingNoHealthyHost:
+    'Für dieses Modell ist derzeit kein Server verfügbar. Versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
+  errorRoutingNoModelRoute:
+    'Für dieses Modell ist kein Server eingerichtet. Bitte wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorRoutingModelNotCapable:
+    'Dieses Modell unterstützt die angeforderte Funktion nicht. Versuchen Sie ein anderes Modell.',
+  errorRoutingAdmissionQueueFull:
+    'Der Server ist derzeit überlastet. Bitte versuchen Sie es in Kürze erneut.',
+  errorRoutingAdmissionQueueTimeout:
+    'Die Anfrage hat zu lange auf freie Kapazität gewartet und wurde abgebrochen. Bitte versuchen Sie es erneut.',
+  errorProviderUnavailable:
+    'Der Modell-Server ist derzeit nicht verfügbar. Bitte versuchen Sie es in Kürze erneut.',
+  errorProviderTimeout:
+    'Der Modell-Server hat zu lange für eine Antwort gebraucht. Bitte versuchen Sie es erneut.',
+  errorProviderInvalidResponse:
+    'Der Modell-Server hat eine Antwort geliefert, die das Gateway nicht verarbeiten konnte.',
+  errorModelNotAllowed:
+    'Dieses Token darf das ausgewählte Modell nicht verwenden. Wählen Sie ein anderes Modell, oder bitten Sie eine Administratorin oder einen Administrator um Zugriff.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -2536,13 +2635,25 @@ const en: PortalMessages = {
   chatModelUnavailable: 'Model currently unavailable',
   chatModelLoaded: 'Loaded (available immediately)',
   chatModelLoadedOn: 'Loaded on',
-  chatImageModelUnsupported: 'This model does not support images.',
+  chatImageModelUnsupported: 'This model cannot process images as input.',
+  chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
+  chatImagePromptLabel: 'Image prompt',
+  chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatImageRunPending: 'Waiting for image',
+  chatImageNoIntermediateNews:
+    'No intermediate updates – the image arrives finished or not at all.',
+  chatCapacityRemaining: (count: number) => `Room for about ${count} more image(s) in this chat.`,
+  chatCapacityExhausted:
+    'This chat has no room for another image. Download the images you have and start a new chat.',
   chatRegenerate: 'Regenerate',
   chatEdit: 'Edit',
   chatSave: 'Save',
   chatCancel: 'Cancel',
   chatAttachImage: 'Attach image',
   chatAttachedImage: 'Attached image',
+  chatDownloadImage: 'Download image',
+  chatGeneratedImage: 'Generated image',
+  chatImageDownloadError: 'Could not download the image.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',
@@ -2860,6 +2971,9 @@ const en: PortalMessages = {
     'Unknown = no verdict on file. MTP is never re-detected — nothing probes it on an existing mapping. This chip is informational only: it never affects server selection.',
   mappingVisionCapableUnknownHint:
     'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
+  mappingImageCapable: 'Image generation',
+  mappingImageCapableUnknownHint:
+    'Unknown: whether this mapping generates images is not on file. There is no automated detection for it — set it to Yes to enable image generation for this model.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -3440,6 +3554,7 @@ const en: PortalMessages = {
   capabilityVideo: 'Video',
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
+  capabilityImage: 'Image generation',
   // "Observed", not "supported": this row exists only because real traffic
   // produced it (llama.cpp reported at least one completion with drafted
   // tokens), never because a build or a model declared the trait -- see the
@@ -3555,6 +3670,54 @@ const en: PortalMessages = {
     "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
+  // Portal chat image generation (task 8): the chat run lifecycle's own
+  // codes, the mapping capability-form refusal, and the four images.* codes
+  // now reachable from a chat run. See format.ts's errorLabelByCode for the
+  // exact wire codes each key answers.
+  // NOT "download the image": on both paths that raise this code nothing was
+  // stored, and the run withholds the image parts from its terminal event
+  // when the commit failed (finishRunWithParts), so there is nothing on
+  // screen to save either.
+  errorChatTooLarge:
+    'The chat is too large to save, so this turn was not stored. Start a new chat and try again.',
+  // The run itself succeeded and the turn IS on the server, but this tab
+  // could not fetch the authoritative copy back. It therefore stops saving
+  // this chat (a PUT full-replaces the stored document) until it is reloaded.
+  errorChatTranscriptStale:
+    "This chat's saved history could not be loaded. Your response is on the server, but this tab will not save the chat again until you reload.",
+  errorChatRunActive: 'A response is already running for this chat. Please wait until it finishes.',
+  errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
+  errorMappingCapabilityReserved:
+    '"live_progress" cannot be set to "no", and "speculation_observed" accepts no manual verdict at all — an empty verdict resets either.',
+  errorChatRunTimeout: 'This response took too long and was stopped. Please try again.',
+  errorChatRunNoImage: 'No image was generated. Please try again.',
+  errorChatRunImageFormatUnknown:
+    "The generated image's format could not be determined. Please try again.",
+  errorChatRunImageResponseUnreadable:
+    'The image generation response could not be read. Please try again.',
+  errorChatRunCommitFailed: 'The response could not be saved. Please try again.',
+  errorImagesPromptRequired: 'Image generation needs a text prompt. Please enter a description.',
+  errorImagesStreamUnsupported: 'Image generation does not support streaming.',
+  errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
+  errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
+  // Fix round, finding 1: the nine codes completionErrorResponse /
+  // completionErrorCode can now surface from a chat run's own text path
+  // (see format.ts's own comment on this block for why).
+  errorRoutingNoHealthyHost:
+    'No server is currently available for this model. Try again in a moment, or contact an administrator if this continues.',
+  errorRoutingNoModelRoute:
+    'This model has no server configured to handle it. Please contact an administrator.',
+  errorRoutingModelNotCapable:
+    'This model does not support what was requested. Try a different model.',
+  errorRoutingAdmissionQueueFull: 'The server is overloaded right now. Please try again shortly.',
+  errorRoutingAdmissionQueueTimeout:
+    'The request waited too long for free capacity and was stopped. Please try again.',
+  errorProviderUnavailable: 'The model server is unavailable right now. Please try again shortly.',
+  errorProviderTimeout: 'The model server took too long to respond. Please try again.',
+  errorProviderInvalidResponse:
+    'The model server returned a response the gateway could not understand.',
+  errorModelNotAllowed:
+    'This token is not allowed to use the selected model. Choose a different model, or ask an administrator for access.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",

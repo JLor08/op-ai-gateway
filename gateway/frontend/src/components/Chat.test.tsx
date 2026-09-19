@@ -69,7 +69,14 @@ function makeChatApi() {
   const rows: ChatRow[] = [];
   const stamp = () => new Date(Date.UTC(2026, 6, 17, 12, seq)).toISOString();
   const api = {
-    chats: vi.fn(async () => ({ data: rows.map(({ content: _content, ...rest }) => rest) })),
+    // max_content_bytes mirrors the real listing (portal.MaxChatContentBytes,
+    // served on ChatListResponse): the composer's capacity line and the
+    // capacity refusal are driven by it, and a mock that omitted it would
+    // leave the portal in its "capacity unknown" state.
+    chats: vi.fn(async () => ({
+      data: rows.map(({ content: _content, ...rest }) => rest),
+      max_content_bytes: 4 * 1024 * 1024,
+    })),
     createChat: vi.fn(async (body: { title?: string; content?: unknown }) => {
       seq += 1;
       const row: ChatRow = {
@@ -176,6 +183,69 @@ function seedUnavailableModelChat() {
     updated_at: stamp,
     content: { settings: { model: 'unavailable-model' }, messages: [] },
   });
+}
+
+// Seeds a persisted chat whose assistant turn already carries a generated
+// image, preceded by the user turn that asked for it -- exercising promptText
+// through the real component tree (Chat.tsx computing it from the previous
+// message, ChatStore loading it, ChatMessage/ImageTurn rendering it) rather
+// than as a literal prop handed directly to ChatMessage in isolation.
+function seedGeneratedImageChat() {
+  const stamp = '2026-07-19T12:00:00Z';
+  chatApi.rows.push({
+    id: 'c_image_seed',
+    title: '',
+    created_at: stamp,
+    updated_at: stamp,
+    content: {
+      settings: {},
+      messages: [
+        { id: 'm_prompt', role: 'user', content: 'a cat on a bicycle' },
+        {
+          id: 'm_image',
+          role: 'assistant',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }],
+        },
+      ],
+    },
+  });
+}
+
+// Seeds a pinned image thread that already holds an image large enough that a
+// deliberately shrunken content cap cannot hold another one -- the state in
+// which the composer must say the chat is FULL rather than quote a number.
+function seedFullImageChat() {
+  const stamp = '2026-07-20T12:00:00Z';
+  chatApi.rows.push({
+    id: 'c_image_full',
+    title: '',
+    created_at: stamp,
+    updated_at: stamp,
+    content: {
+      settings: { model: 'sd-turbo', kind: 'image' },
+      messages: [
+        { id: 'm_prompt', role: 'user', content: 'a cat on a bicycle' },
+        {
+          id: 'm_image',
+          role: 'assistant',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${'A'.repeat(200_000)}` },
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+// Serves a different content cap than the default 4 MiB from the chat listing.
+function serveContentCap(maxContentBytes: number) {
+  chatApi.spies.chats.mockImplementation(async () => ({
+    data: chatApi.rows.map(({ content: _content, ...rest }) => rest),
+    max_content_bytes: maxContentBytes,
+  }));
 }
 
 function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
@@ -501,6 +571,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`Chat: generated-image alt text comes from the prompt [${locale}]`, () => {
+    // ChatMessage.test.tsx pins this at the literal-prop level (promptText
+    // handed straight to ChatMessage); nothing there proves Chat.tsx actually
+    // computes and threads that prop through the real component tree. This
+    // renders a persisted thread through Chat + ChatStoreProvider end to end.
+    it("renders a generated assistant image whose alt text is the preceding user turn's prompt", async () => {
+      seedGeneratedImageChat();
+      renderChat();
+      await waitForChatReady();
+
+      const image = await screen.findByAltText('a cat on a bicycle');
+      expect(image).toHaveAttribute('src', 'data:image/png;base64,AAAA');
+    });
+  });
+
   describe(`Chat: loaded-state of the selected model [${locale}]`, () => {
     it('shows a green loaded dot BEFORE the name once a loaded model is selected', async () => {
       const loaded: ModelOption[] = [
@@ -616,6 +701,264 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       const banner = await screen.findByRole('alert');
       expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
+    });
+  });
+
+  describe(`Chat: the composer of an image thread [${locale}]`, () => {
+    // The same shape as nonVisionModels above, with `image: true` and NO
+    // `vision` key: an image GENERATOR accepts no image INPUT, and the two are
+    // different capabilities (the backend AND-aggregates each separately).
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    it('labels the prompt field as an image prompt for an image-capable model', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      // ...and the text-thread label is gone, not merely shadowed.
+      expect(screen.queryByLabelText(t.messageLabel)).not.toBeInTheDocument();
+      // The field's hint says what the thread will accept, not just what the
+      // field is called.
+      expect(screen.getByText(t.chatImageOnlyHint)).toBeInTheDocument();
+    });
+
+    it('keeps the ordinary message label for a model that does not generate images', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.getByLabelText(t.messageLabel)).toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatImagePromptLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageOnlyHint)).not.toBeInTheDocument();
+    });
+
+    it('sends the image kind in the started run settings', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat on a bicycle' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.kind).toBe('image');
+    });
+
+    it('disables the attach button for an image model that is not vision-capable', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // An image GENERATOR has no reason to accept an image INPUT, and the two
+      // are different capabilities. The tooltip must say which one it means.
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    });
+
+    it('disables the attach button for an image model that IS vision-capable too', async () => {
+      // The load-bearing case: a non-vision image model already had attach
+      // disabled by the vision gate alone, so only a model that is BOTH
+      // proves the image gate exists. An image thread's request body carries
+      // no history and no attachment, so offering the attach button on it
+      // would offer something the run silently drops.
+      renderChat(tokens, [{ ...imageModels[0], vision: true }]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    });
+
+    it('explains the disabled attach button with the image-GENERATOR string, not the input one', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      fireEvent.mouseOver(screen.getByRole('button', { name: t.chatAttachImage }));
+
+      const tip = await screen.findByRole('tooltip');
+      expect(tip).toHaveTextContent(t.chatImageGeneratorNoInput);
+      expect(tip).not.toHaveTextContent(t.chatImageModelUnsupported);
+    });
+
+    it('clears an attachment when switching to an image-generating model', async () => {
+      // The generator here is ALSO vision-capable, so the pre-existing
+      // vision-based clear would not fire: without the image-generator clause
+      // the attachment would survive into an image run, whose request body
+      // carries no attachment at all — a silent drop after the send.
+      renderChat(tokens, [
+        {
+          id: 'vision-model',
+          display_name: 'vision-model',
+          flavors: ['openai'],
+          loading_on_count: 0,
+          vision: true,
+        },
+        { ...imageModels[0], vision: true },
+      ]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'vision-model');
+
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      fireEvent.change(fileInput, {
+        target: { files: [new File(['x'], 'a.jpg', { type: 'image/jpeg' })] },
+      });
+      await screen.findByAltText(t.chatAttachedImage);
+
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      await waitFor(() =>
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument(),
+      );
+      const banner = await screen.findByRole('alert');
+      expect(banner).toHaveTextContent(t.chatImageGeneratorNoInput);
+    });
+
+    it('states how many more images fit, rather than that the chat is full', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // The one number in this feature that is exact and known BEFORE the user
+      // commits to a multi-minute wait -- so the assertion is on the STRING,
+      // not merely on the element existing. A brand-new thread against the
+      // served 4 MiB cap has no image yet to measure, so the per-image cost is
+      // chatCapacity.ts's fallback estimate (1.5 MB), which leaves room for 2.
+      // If that constant is retuned this expectation moves with it, which is
+      // correct: the number the user is shown is a deliberate output.
+      const line = screen.getByTestId('chat-capacity');
+      expect(line).toHaveTextContent(t.chatCapacityRemaining(2));
+      expect(line).not.toHaveTextContent(t.chatCapacityExhausted);
+    });
+
+    it('says the chat is full when it can no longer hold an image', async () => {
+      // The other branch of the same line. Without a case that renders it, the
+      // whole ternary could be replaced by a bare "this chat is full" and a
+      // brand-new empty thread would say so permanently.
+      seedFullImageChat();
+      serveContentCap(300_000);
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+
+      const line = screen.getByTestId('chat-capacity');
+      expect(line).toHaveTextContent(t.chatCapacityExhausted);
+      expect(line).not.toHaveTextContent(t.chatCapacityRemaining(0));
+    });
+
+    it('shows no capacity line for a text thread', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+
+    it('shows no capacity line when the server served no cap', async () => {
+      // A gateway older than the served max_content_bytes: the portal must say
+      // nothing rather than state a number it made up.
+      serveContentCap(0);
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`Chat: the pending row follows the RUN's kind, not the thread's [${locale}]`, () => {
+    // Whole-branch review, finding 4. Chat.tsx is the ONLY wiring site that
+    // decides which kind ChatMessage renders the in-flight turn from, and
+    // nothing pinned it: replacing `c.runKind` with `c.chatKind` there --
+    // precisely the defect an earlier fix round closed -- left the whole
+    // suite green. runKind is well covered inside the store; the prop that
+    // carries it into the view was not covered at all.
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    async function sendImagePrompt() {
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat on a bicycle' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      // A running snapshot is what materialises the in-flight assistant row
+      // (ensureAssistant); until one arrives the transcript's last message is
+      // the user turn and no row is `rowStreaming` at all. It carries no
+      // `kind` on purpose, so the kind under test stays the one the 201
+      // reported -- which is the value Chat.tsx is wired to.
+      await act(async () => {
+        FakeEventSource.instances[0].emit('snapshot', { status: 'running', elapsed_ms: 1000 });
+      });
+    }
+
+    it('renders the image wait state while the run itself reports the image kind', async () => {
+      // The positive control. Without it the negative test below could pass
+      // for the trivial reason that this tree never renders the wait state.
+      chatApi.spies.startChatRun.mockImplementation(async (chatId: string) => ({
+        run_id: 'run_1',
+        chat_id: chatId,
+        status: 'running' as const,
+        kind: 'image',
+      }));
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await sendImagePrompt();
+
+      expect(await screen.findByText(t.chatImageRunPending)).toBeInTheDocument();
+      expect(screen.getByText(t.chatImageNoIntermediateNews)).toBeInTheDocument();
+    });
+
+    it('renders no image wait state while the run itself reports a text kind', async () => {
+      // The stale-pin case. This client pins `image` locally on its first
+      // send (the picked model generates images), but the SERVER has already
+      // pinned this thread to text -- another tab sent a text turn first --
+      // and forces that kind onto every later run, so the 201 reports "".
+      // With c.chatKind here the composer's guess wins and the user watches
+      // an image wait state, with no character counter and no streamed text,
+      // over an entire text generation.
+      chatApi.spies.startChatRun.mockImplementation(async (chatId: string) => ({
+        run_id: 'run_1',
+        chat_id: chatId,
+        status: 'running' as const,
+        kind: '',
+      }));
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await sendImagePrompt();
+
+      // The thread's own kind really is `image` -- the composer is showing
+      // its image affordances -- so the assertion below is about the RUN, not
+      // about the thread having failed to pin.
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      // ...and the row really is streaming, so "nothing rendered" is not the
+      // reason the wait state is absent.
+      expect(await screen.findByRole('button', { name: t.chatStop })).toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageRunPending)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageNoIntermediateNews)).not.toBeInTheDocument();
     });
   });
 
