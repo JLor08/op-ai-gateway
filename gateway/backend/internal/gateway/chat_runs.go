@@ -956,7 +956,7 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// the browser would be told a turn succeeded that was never durably saved.
 	// That was tolerable while every turn was a few KB of text; an inline image
 	// routinely approaches the chat store's whole-document cap
-	// (maxChatContentBytes, portal/service_chats.go), so this is no longer a
+	// (MaxChatContentBytes, portal/service_chats.go), so this is no longer a
 	// theoretical failure mode. Log it (still worth knowing about) AND override
 	// the run's own terminal status/message to "error" with a mapped code, so
 	// the browser is told the truth regardless of what status the run was about

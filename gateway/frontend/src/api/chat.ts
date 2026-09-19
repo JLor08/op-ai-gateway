@@ -15,6 +15,17 @@ export type ChatSummary = {
 
 export type Chat = ChatSummary & { content: unknown };
 
+// The chat listing plus the limits a client needs to stay inside them.
+export type ChatListResponse = {
+  data: ChatSummary[];
+  // The backend's pre-seal content cap (portal.MaxChatContentBytes). Served
+  // rather than duplicated here: a hardcoded copy would drift from the Go
+  // constant with nothing to catch it. OPTIONAL because a gateway older than
+  // this field simply omits it — the portal then treats the capacity as
+  // unknown (states no number, refuses no send) instead of guessing one.
+  max_content_bytes?: number;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -28,6 +39,16 @@ export type ChatSettings = {
   // server-side on every run (PrepareChatRun), same as the token's.
   server_override: string;
   server_override_force_unreachable: boolean;
+  // The thread's pinned kind: "" (text — the default and every pre-existing
+  // chat) or "image". Established by the FIRST send and then FORCED by the
+  // backend on every later send (PrepareChatRun), because the composer's
+  // affordances follow the THREAD, not the currently-picked model.
+  //
+  // Typed as a plain string rather than a closed union on purpose: a kind this
+  // build does not recognise must round-trip through load/save untouched. The
+  // backend full-replaces this whole blob on every PUT with no merge, so a
+  // field the frontend drops is a field the next autosave silently erases.
+  kind: string;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
@@ -54,6 +75,11 @@ export type StartChatRunBody = {
     run_as_token_id: string;
     server_override: string;
     server_override_force_unreachable: boolean;
+    // Mirrors ChatSettings.kind above (this shape is the run POST body, which
+    // is a separate declaration of the same settings). On a thread's FIRST
+    // send this value establishes the pin; afterwards the backend ignores it
+    // in favour of the stored one.
+    kind: string;
   };
 };
 export type StartChatRunResponse = { run_id: string; chat_id: string; status: ChatRunStatus };
@@ -63,7 +89,7 @@ export function chatApi(fetcher: Fetcher) {
     // Persistent chat playground documents (see ChatSummary / Chat above). The
     // list is ordered newest-updated first; content is decrypted only on the
     // single-chat GET. Mirrors the token/preferences method shapes.
-    chats: () => request<{ data: ChatSummary[] }>(fetcher, '/api/portal/chats'),
+    chats: () => request<ChatListResponse>(fetcher, '/api/portal/chats'),
     createChat: (body: { title?: string; content?: unknown }) =>
       request<Chat>(fetcher, '/api/portal/chats', { method: 'POST', body }),
     chat: (id: string) => request<Chat>(fetcher, `/api/portal/chats/${encodeURIComponent(id)}`),

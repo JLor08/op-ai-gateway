@@ -112,6 +112,7 @@ export const DEFAULTS: ChatSettings = {
   run_as_token_id: '',
   server_override: '',
   server_override_force_unreachable: false,
+  kind: '',
 };
 
 // Attachment cap: keep persisted transcripts well under the storage quota.
@@ -170,6 +171,14 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
         typeof s.server_override_force_unreachable === 'boolean'
           ? s.server_override_force_unreachable
           : DEFAULTS.server_override_force_unreachable,
+      // The thread's pinned kind. It MUST be loaded here even though nothing
+      // in normalizeDoc's own output interprets it: the save path rebuilds
+      // `settings` from the state this seeds, and the backend's PUT
+      // full-replaces the stored blob with no merge — so a setting this
+      // function drops is a setting the next autosave silently erases from
+      // the server. Passed through as an opaque string (no narrowing to the
+      // kinds this build knows) for exactly the same reason.
+      kind: typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
     },
     messages,
   };
@@ -210,6 +219,9 @@ export function readLegacyDoc(): ActiveChatDoc | null {
       run_as_token_id: runAsToken,
       server_override: DEFAULTS.server_override,
       server_override_force_unreachable: DEFAULTS.server_override_force_unreachable,
+      // A legacy single-conversation transcript predates image threads by
+      // definition, so it migrates as text.
+      kind: DEFAULTS.kind,
     },
     messages,
   };

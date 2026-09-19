@@ -69,7 +69,14 @@ function makeChatApi() {
   const rows: ChatRow[] = [];
   const stamp = () => new Date(Date.UTC(2026, 6, 17, 12, seq)).toISOString();
   const api = {
-    chats: vi.fn(async () => ({ data: rows.map(({ content: _content, ...rest }) => rest) })),
+    // max_content_bytes mirrors the real listing (portal.MaxChatContentBytes,
+    // served on ChatListResponse): the composer's capacity line and the
+    // capacity refusal are driven by it, and a mock that omitted it would
+    // leave the portal in its "capacity unknown" state.
+    chats: vi.fn(async () => ({
+      data: rows.map(({ content: _content, ...rest }) => rest),
+      max_content_bytes: 4 * 1024 * 1024,
+    })),
     createChat: vi.fn(async (body: { title?: string; content?: unknown }) => {
       seq += 1;
       const row: ChatRow = {
@@ -657,6 +664,161 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       const banner = await screen.findByRole('alert');
       expect(banner).toHaveTextContent(t.chatImageModelUnsupported);
+    });
+  });
+
+  describe(`Chat: the composer of an image thread [${locale}]`, () => {
+    // The same shape as nonVisionModels above, with `image: true` and NO
+    // `vision` key: an image GENERATOR accepts no image INPUT, and the two are
+    // different capabilities (the backend AND-aggregates each separately).
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    it('labels the prompt field as an image prompt for an image-capable model', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      // ...and the text-thread label is gone, not merely shadowed.
+      expect(screen.queryByLabelText(t.messageLabel)).not.toBeInTheDocument();
+    });
+
+    it('keeps the ordinary message label for a model that does not generate images', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.getByLabelText(t.messageLabel)).toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatImagePromptLabel)).not.toBeInTheDocument();
+    });
+
+    it('sends the image kind in the started run settings', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat on a bicycle' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.kind).toBe('image');
+    });
+
+    it('disables the attach button for an image model that is not vision-capable', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // An image GENERATOR has no reason to accept an image INPUT, and the two
+      // are different capabilities. The tooltip must say which one it means.
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    });
+
+    it('disables the attach button for an image model that IS vision-capable too', async () => {
+      // The load-bearing case: a non-vision image model already had attach
+      // disabled by the vision gate alone, so only a model that is BOTH
+      // proves the image gate exists. An image thread's request body carries
+      // no history and no attachment, so offering the attach button on it
+      // would offer something the run silently drops.
+      renderChat(tokens, [{ ...imageModels[0], vision: true }]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+    });
+
+    it('explains the disabled attach button with the image-GENERATOR string, not the input one', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      fireEvent.mouseOver(screen.getByRole('button', { name: t.chatAttachImage }));
+
+      const tip = await screen.findByRole('tooltip');
+      expect(tip).toHaveTextContent(t.chatImageGeneratorNoInput);
+      expect(tip).not.toHaveTextContent(t.chatImageModelUnsupported);
+    });
+
+    it('clears an attachment when switching to an image-generating model', async () => {
+      // The generator here is ALSO vision-capable, so the pre-existing
+      // vision-based clear would not fire: without the image-generator clause
+      // the attachment would survive into an image run, whose request body
+      // carries no attachment at all — a silent drop after the send.
+      renderChat(tokens, [
+        {
+          id: 'vision-model',
+          display_name: 'vision-model',
+          flavors: ['openai'],
+          loading_on_count: 0,
+          vision: true,
+        },
+        { ...imageModels[0], vision: true },
+      ]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'vision-model');
+
+      const fileInput = screen.getByLabelText(t.chatAttachImage);
+      fireEvent.change(fileInput, {
+        target: { files: [new File(['x'], 'a.jpg', { type: 'image/jpeg' })] },
+      });
+      await screen.findByAltText(t.chatAttachedImage);
+
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      await waitFor(() =>
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument(),
+      );
+      const banner = await screen.findByRole('alert');
+      expect(banner).toHaveTextContent(t.chatImageGeneratorNoInput);
+    });
+
+    it('shows the remaining capacity for an image thread', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      // The one number in this feature that is exact and known BEFORE the user
+      // commits to a multi-minute wait.
+      expect(screen.getByTestId('chat-capacity')).toBeInTheDocument();
+    });
+
+    it('shows no capacity line for a text thread', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+
+      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+
+    it('shows no capacity line when the server served no cap', async () => {
+      // A gateway older than the served max_content_bytes: the portal must say
+      // nothing rather than state a number it made up.
+      chatApi.spies.chats.mockImplementation(async () => ({
+        data: chatApi.rows.map(({ content: _content, ...rest }) => rest),
+        max_content_bytes: 0,
+      }));
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
     });
   });
 

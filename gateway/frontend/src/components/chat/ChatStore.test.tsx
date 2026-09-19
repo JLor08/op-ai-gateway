@@ -80,12 +80,18 @@ type ChatRow = {
   updated_at: string;
   content: unknown;
 };
-function makeChatApi(seed: ChatRow[] = []) {
+// maxContentBytes is the cap the real listing serves (portal.MaxChatContentBytes
+// on ChatListResponse); a test shrinks it to drive the composer's capacity
+// refusal without building a multi-megabyte fixture.
+function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
   let seq = 0;
   const rows: ChatRow[] = [...seed];
   const stamp = () => new Date(Date.UTC(2026, 6, 17, 12, seq)).toISOString();
   const spies = {
-    chats: vi.fn(async () => ({ data: rows.map(({ content: _content, ...rest }) => rest) })),
+    chats: vi.fn(async () => ({
+      data: rows.map(({ content: _content, ...rest }) => rest),
+      max_content_bytes: maxContentBytes,
+    })),
     createChat: vi.fn(async (body: { title?: string; content?: unknown }) => {
       seq += 1;
       const row: ChatRow = {
@@ -156,6 +162,11 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="chats">{c.chats.map((ch) => `${ch.id}:${ch.title}`).join('|')}</span>
       <span data-testid="model">{c.model}</span>
       <span data-testid="model-available">{String(c.modelAvailable)}</span>
+      <span data-testid="chat-kind">{c.chatKind}</span>
+      <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
+      <span data-testid="image-capacity">
+        {c.imageCapacityLeft === null ? 'unknown' : String(c.imageCapacityLeft)}
+      </span>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
       <span data-testid="override-model">{c.overrideModel}</span>
       <span data-testid="override-locks">{String(c.overrideLocksModel)}</span>
@@ -253,7 +264,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           </ChatStoreProvider>
         </ToastProvider>,
       );
-    return { onRefresh, rerenderWithModels };
+    return { onRefresh, rerenderWithModels, unmount: view.unmount };
   }
 
   // The provider opens/creates a chat asynchronously on mount; wait for that to
@@ -1655,6 +1666,336 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The run starts and no refusal toast appears.
       await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
       expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
+  });
+
+  describe(`ChatStoreProvider image-thread kind and capacity [${locale}]`, () => {
+    // An image GENERATOR; never vision-capable (a generated image is output,
+    // not input), so `vision` is deliberately absent -> modelVisionCapable
+    // derives false, exactly as it does in production.
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+    const generatedImage = [
+      { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,AAAA' } },
+    ];
+    // A generated image big enough that a shrunken cap provably cannot hold a
+    // second one (the capacity estimate is the largest image the thread has
+    // actually produced -- see shared/chatCapacity.ts).
+    const bigImage = [
+      {
+        type: 'image_url' as const,
+        image_url: { url: `data:image/png;base64,${'A'.repeat(200_000)}` },
+      },
+    ];
+    const imageThread = (content: unknown[]): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: { model: imageModels[0].id, kind: 'image' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'a cat' },
+            { id: 'a1', role: 'assistant', content, status: 'complete' },
+          ],
+        },
+      },
+    ];
+
+    // INHERITED DEFECT 1 (traced in Task 12's review): buildDoc() rebuilds
+    // `settings` from React state and carried no `kind`, and SaveChat
+    // FULL-REPLACES the opaque content blob with no merge -- so the first
+    // autosave after the backend pinned the thread silently erased the pin,
+    // and the next send's PrepareChatRun read an empty stored kind and re-pinned
+    // the thread to text, permanently. The server-side pin is defeated in
+    // practice until the kind round-trips through save AND reload.
+    it('persists the pinned image kind across a save and a reload', async () => {
+      chatApi = makeChatApi(imageThread(generatedImage));
+      const { unmount } = renderProvider([], { models: imageModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+
+      // Any settings edit schedules the debounced save; the document it PUTs
+      // must still carry the pin.
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { kind?: string } };
+      };
+      expect(saved.content.settings.kind).toBe('image');
+
+      // ...and a reload reads it back out of the saved document. Without this
+      // half the pin could round-trip through the PUT and still be lost on the
+      // next load (normalizeDoc drops what it does not know about).
+      unmount();
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+    });
+
+    // The THIRD of the three lockstep edits a new persisted setting needs in
+    // useChatPersistence: the debounced effect's EXPLICIT dep array, which
+    // sits under an eslint-disable for exhaustive-deps, so a missing dep is
+    // silent -- the setting simply never schedules a save. Every other route
+    // to a kind change also changes `model` or `messages` and would therefore
+    // pass without the dep; this isolates it, using the one real-world trigger
+    // that does not: the models catalogue is reloaded (onRefresh does that
+    // after every run) and now reports the SAME picked model as image-capable.
+    it('schedules a save when the thread kind is the only thing that changed', async () => {
+      const flipModels = (image: boolean): ModelOption[] => [
+        {
+          id: 'flip-model',
+          display_name: 'flip-model',
+          flavors: ['openai'],
+          loading_on_count: 0,
+          image,
+        },
+      ];
+      const { rerenderWithModels } = renderProvider([], { models: flipModels(false) });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'set-model-alt' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+      chatApi.spies.saveChat.mockClear();
+
+      rerenderWithModels(flipModels(true));
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { kind?: string } };
+      };
+      expect(saved.content.settings.kind).toBe('image');
+    });
+
+    // INHERITED DEFECT 2 (traced in Task 12's review): the kind was read once,
+    // in activateChat, so in a LIVE session -- new chat, pick an image model,
+    // send, send again, regenerate, no reload -- it was still "" and Task 12's
+    // kind-aware guard did nothing. Only a reloaded thread benefited.
+    it('tracks the thread kind through a whole live session with no reload', async () => {
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+
+      // The real backend COMMITS the canonical transcript before it emits
+      // `done`, and the store refetches it right after (adoptCanonicalTranscript).
+      // Mirror that here, or the refetch would replace the live transcript
+      // with this fake row's older copy.
+      const commitTurns = (turns: unknown[]) => {
+        chatApi.rows[0].content = {
+          settings: { model: imageModels[0].id, kind: 'image' },
+          messages: turns,
+        };
+      };
+
+      // 1. Pick the image model on a brand-new chat. Until the thread is
+      //    pinned, the composer's kind follows the picked model.
+      fireEvent.click(screen.getByRole('button', { name: 'set-model-alt' }));
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+
+      // 2. First send establishes the pin (server-side, and here).
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a cat' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(
+        (chatApi.spies.startChatRun.mock.calls[0][1] as { settings: { kind?: string } }).settings
+          .kind,
+      ).toBe('image');
+      commitTurns([
+        { id: 'u1', role: 'user', content: 'a cat' },
+        { id: 'a1', role: 'assistant', content: generatedImage, status: 'complete' },
+      ]);
+      await act(async () => {
+        FakeEventSource.instances.at(-1)!.emit('done', {
+          content: generatedImage,
+          status: 'completed',
+        });
+      });
+
+      // 3. Second send on the SAME thread, still no reload: the transcript is
+      //    no longer empty, so the kind must now come from the thread's pin
+      //    rather than from the model -- and it must still be "image".
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(2));
+      expect(
+        (chatApi.spies.startChatRun.mock.calls[1][1] as { settings: { kind?: string } }).settings
+          .kind,
+      ).toBe('image');
+      commitTurns([
+        { id: 'u1', role: 'user', content: 'a cat' },
+        { id: 'a1', role: 'assistant', content: generatedImage, status: 'complete' },
+        { id: 'u2', role: 'user', content: 'a dog' },
+        { id: 'a2', role: 'assistant', content: generatedImage, status: 'complete' },
+      ]);
+      await act(async () => {
+        FakeEventSource.instances.at(-1)!.emit('done', {
+          content: generatedImage,
+          status: 'completed',
+        });
+      });
+
+      // 4. Regenerate the last turn. Its REPLAYED history is [u1, a1, u2] and
+      //    a1 is a generated image, so the role-blind vision guard fires
+      //    unless the thread is known to be an image thread -- which, in a
+      //    live session, it only is if the kind is real state.
+      await waitFor(() => expect(screen.getByTestId('count').textContent).toBe('4'));
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(3));
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
+
+    // The pagehide keepalive is capped near the browser's own keepalive body
+    // ceiling, and a single inline base64 image is far past it -- so for every
+    // thread this feature creates the keepalive is dead. The cap stays (raising
+    // it would just make the browser drop the PUT), but the skip must not be
+    // silent, or the mechanism is invisible exactly where it never runs.
+    it('reports the pagehide keepalive skip for an oversized image document', async () => {
+      chatApi = makeChatApi(imageThread(bigImage));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+
+      // Dirty the chat, then navigate away before the debounce fires.
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      act(() => {
+        window.dispatchEvent(new Event('pagehide'));
+      });
+
+      expect(chatApi.spies.saveChatKeepalive).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('keepalive skipped'));
+      warn.mockRestore();
+    });
+
+    it('still fires the pagehide keepalive for a document inside the cap', async () => {
+      // Negative control: the skip above is about SIZE, not about image
+      // threads as such.
+      chatApi = makeChatApi(imageThread(generatedImage));
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      act(() => {
+        window.dispatchEvent(new Event('pagehide'));
+      });
+
+      expect(chatApi.spies.saveChatKeepalive).toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    // The thread's kind follows the THREAD, not the picked model. A text
+    // thread that already has history has been pinned to text server-side
+    // (PrepareChatRun forces the stored kind on every send after the first),
+    // so picking an image model in it must not turn its composer -- or the
+    // kind it submits -- into an image one.
+    it('keeps an existing text thread text even when an image model is picked', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: imageModels[0].id },
+            messages: [
+              { id: 'u1', role: 'user', content: 'hello' },
+              { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+            ],
+          },
+        },
+      ]);
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'more' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(
+        (chatApi.spies.startChatRun.mock.calls[0][1] as { settings: { kind?: string } }).settings
+          .kind,
+      ).toBe('');
+    });
+
+    it('refuses to send when the transcript has no room for another image', async () => {
+      // A thread already within one image of the served cap: the remaining
+      // capacity is exact and known NOW, so spending minutes of upstream CPU
+      // on an artifact we can already prove we cannot store is pure waste.
+      chatApi = makeChatApi(imageThread(bigImage), 300_000);
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+      await waitFor(() => expect(screen.getByTestId('image-capacity').textContent).toBe('0'));
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+      expect(await screen.findByText(t.chatCapacityExhausted)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // The composer is left untouched -- nothing was sent, nothing dropped.
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('sends normally while the transcript still has room for another image', async () => {
+      // Negative control for the refusal above: same thread, the real cap.
+      chatApi = makeChatApi(imageThread(bigImage));
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+      await waitFor(() =>
+        expect(screen.getByTestId('image-capacity').textContent).not.toBe('unknown'),
+      );
+      expect(Number(screen.getByTestId('image-capacity').textContent)).toBeGreaterThan(0);
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(screen.queryByText(t.chatCapacityExhausted)).toBeNull();
+    });
+
+    it('reports an unknown capacity (and refuses nothing) when the server serves no cap', async () => {
+      chatApi = makeChatApi(imageThread(bigImage), 0);
+      renderProvider([], { models: imageModels });
+      await waitForReady();
+
+      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+    });
+
+    it('leaves a text thread without a capacity number at all', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: models[0].id }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
     });
   });
 

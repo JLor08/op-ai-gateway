@@ -188,7 +188,23 @@ const de = {
   chatModelUnavailable: 'Modell derzeit nicht verfügbar',
   chatModelLoaded: 'Geladen (sofort verfügbar)',
   chatModelLoadedOn: 'Geladen auf',
-  chatImageModelUnsupported: 'Dieses Modell unterstützt keine Bilder.',
+  // Gates image INPUT (attaching an image to a prompt). It must not say "does
+  // not support images": an image-GENERATING model is never vision-capable, so
+  // on such a model the old wording told the user that a model whose only
+  // purpose is images does not support them. chatImageGeneratorNoInput below
+  // is the image-model case.
+  chatImageModelUnsupported: 'Dieses Modell kann keine Bilder als Eingabe verarbeiten.',
+  chatImageGeneratorNoInput:
+    'Dieses Modell erzeugt Bilder und nimmt selbst keine Bilder als Eingabe entgegen.',
+  // The composer of an image thread: the prompt field's label, the hint under
+  // it, and the remaining-capacity line. The capacity is the one number in
+  // this feature that is exact and known BEFORE the user commits to a
+  // multi-minute generation, so it is stated up front rather than after.
+  chatImagePromptLabel: 'Bildprompt',
+  chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  chatCapacityRemaining: (count: number) => `Platz für etwa noch ${count} Bild(er) in diesem Chat.`,
+  chatCapacityExhausted:
+    'Dieser Chat hat keinen Platz mehr für ein weiteres Bild. Lade die vorhandenen Bilder herunter und beginne einen neuen Chat.',
   chatRegenerate: 'Neu generieren',
   chatEdit: 'Bearbeiten',
   chatSave: 'Speichern',
@@ -2595,7 +2611,13 @@ const en: PortalMessages = {
   chatModelUnavailable: 'Model currently unavailable',
   chatModelLoaded: 'Loaded (available immediately)',
   chatModelLoadedOn: 'Loaded on',
-  chatImageModelUnsupported: 'This model does not support images.',
+  chatImageModelUnsupported: 'This model cannot process images as input.',
+  chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
+  chatImagePromptLabel: 'Image prompt',
+  chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatCapacityRemaining: (count: number) => `Room for about ${count} more image(s) in this chat.`,
+  chatCapacityExhausted:
+    'This chat has no room for another image. Download the images you have and start a new chat.',
   chatRegenerate: 'Regenerate',
   chatEdit: 'Edit',
   chatSave: 'Save',

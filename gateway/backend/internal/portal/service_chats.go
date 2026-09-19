@@ -26,7 +26,7 @@ var (
 	// Mapped to 400.
 	ErrChatTitleInvalid = errors.New("portal.chat_title_invalid")
 	// ErrChatTooLarge is returned when the pre-seal content blob exceeds
-	// maxChatContentBytes. Mapped to 400.
+	// MaxChatContentBytes. Mapped to 400.
 	ErrChatTooLarge = errors.New("portal.chat_too_large")
 	// ErrChatCipherMissing is returned when a stored chat was sealed
 	// (KeyVersion > 0) but no cipher is configured to open it — a
@@ -39,8 +39,13 @@ var (
 const (
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
-	// maxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
-	maxChatContentBytes = 4 << 20
+	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
+	// Exported because the portal composer has to state the remaining capacity
+	// of an image thread BEFORE the user commits to a multi-minute generation,
+	// and it is served to the client on ChatListResponse rather than
+	// duplicated there -- a second copy in the frontend would drift from this
+	// one with nothing to catch it.
+	MaxChatContentBytes = 4 << 20
 )
 
 // ChatSummaryDTO is the list DTO: plaintext metadata only, never the content.
@@ -63,9 +68,18 @@ type ChatDTO struct {
 }
 
 // ChatListResponse wraps the summary list under a data key (mirrors the other
-// portal list endpoints).
+// portal list endpoints) plus the limits a client needs to stay inside it.
+//
+// MaxContentBytes is MaxChatContentBytes: the client cannot otherwise know it
+// (no other DTO carries it), and a client that hardcoded its own copy would
+// drift from this one silently -- the failure mode being a composer that
+// confidently states the wrong remaining capacity. It is NOT omitempty: a
+// missing field and a zero are the same thing on the wire, and the portal
+// reads zero as "capacity unknown" (no capacity line, no refusal), so an
+// accidental zero would disable the feature rather than break loudly.
 type ChatListResponse struct {
-	Data []ChatSummaryDTO `json:"data"`
+	Data            []ChatSummaryDTO `json:"data"`
+	MaxContentBytes int              `json:"max_content_bytes"`
 }
 
 // CreateChatRequest carries the initial title + opaque content on create.
@@ -203,9 +217,9 @@ func (s *Service) DeleteChat(ctx context.Context, owner auth.Token, id string) e
 
 // sealChat gzips the opaque content, then seals it when a cipher is configured
 // (KeyVersion capture.KeyVersion) or stores plain gzip in RAM-fallback mode
-// (nil cipher, KeyVersion 0). It caps the pre-seal content at maxChatContentBytes.
+// (nil cipher, KeyVersion 0). It caps the pre-seal content at MaxChatContentBytes.
 func (s *Service) sealChat(content json.RawMessage) (int, []byte, error) {
-	if len(content) > maxChatContentBytes {
+	if len(content) > MaxChatContentBytes {
 		return 0, nil, ErrChatTooLarge
 	}
 	var gz bytes.Buffer

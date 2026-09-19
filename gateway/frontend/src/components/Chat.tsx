@@ -90,6 +90,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               : t.chatModelLoaded,
         }));
 
+  // The THREAD's kind, not the picked model's capability: a text thread stays
+  // a text thread even if an image model is selected afterwards (the backend
+  // pins the kind at the first send and forces it from then on), and an image
+  // thread keeps its composer even while its model is momentarily unreachable.
+  const isImageThread = c.chatKind === 'image';
+
+  // Which capability the disabled attach button is about. The two are
+  // different: an image GENERATOR emits images and accepts none, while a
+  // non-vision model simply cannot read one. Saying "does not support images"
+  // on a generator told the user the opposite of the truth.
+  let attachTooltip: string = t.chatAttachImage;
+  if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
+  else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
+
   let modelHelperText: string | undefined;
   if (c.overrideModel !== '') {
     modelHelperText = `${t.chatModelFromToken}: ${c.overrideModel}`;
@@ -323,7 +337,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
           >
             <TextField
               id="chat-message"
-              label={t.messageLabel}
+              label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
+              helperText={isImageThread ? t.chatImageOnlyHint : undefined}
               multiline
               minRows={4}
               fullWidth
@@ -395,15 +410,12 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                 so getByLabelText(chatAttachImage) still resolves to the input alone.
                 The wrapping <span> lets the Tooltip work while the button is disabled
                 (streaming) without an MUI warning. */}
-              <Tooltip
-                title={!c.modelVisionCapable ? t.chatImageModelUnsupported : t.chatAttachImage}
-                describeChild
-              >
+              <Tooltip title={attachTooltip} describeChild>
                 <span>
                   <IconButton
                     component="label"
                     size="small"
-                    disabled={c.streaming || !c.modelVisionCapable}
+                    disabled={c.streaming || !c.modelVisionCapable || c.modelImageCapable}
                   >
                     <AddPhotoAlternateIcon fontSize="small" />
                     <Box
@@ -435,6 +447,23 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   </IconButton>
                 </span>
               </Tooltip>
+              {/* The remaining capacity of an image thread. Rendered only when
+                the gateway actually served the cap (imageCapacityLeft null =
+                unknown): a number the portal made up would be worse than
+                none. This is the one figure in the image flow that is exact
+                and known BEFORE the user commits to a multi-minute wait. */}
+              {isImageThread && c.imageCapacityLeft !== null && (
+                <Typography
+                  data-testid="chat-capacity"
+                  variant="body2"
+                  color={c.imageCapacityLeft <= 0 ? 'error' : undefined}
+                  sx={c.imageCapacityLeft > 0 ? { color: 'var(--muted)' } : undefined}
+                >
+                  {c.imageCapacityLeft <= 0
+                    ? t.chatCapacityExhausted
+                    : t.chatCapacityRemaining(c.imageCapacityLeft)}
+                </Typography>
+              )}
             </Stack>
             <Tooltip
               title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}

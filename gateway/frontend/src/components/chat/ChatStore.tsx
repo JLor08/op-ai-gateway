@@ -28,6 +28,7 @@ import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
 import type { ChatContent } from '../shared/chatContent';
 import { prepareImageDataUrl, ImageAttachError } from '../shared/imageAttach';
+import { imagesLeft } from '../shared/chatCapacity';
 import {
   ACTIVE_ID_KEY,
   DEFAULTS,
@@ -113,6 +114,24 @@ export type ChatStore = {
   // chat's image-attach gate (button disabled, send blocked, images cleared
   // on switch to a non-capable model).
   modelVisionCapable: boolean;
+  // Whether the effective model GENERATES images. Independent of
+  // modelVisionCapable, which is whether it ACCEPTS them. Gates only what the
+  // composer NEWLY OFFERS (the image-prompt affordances on an unpinned
+  // thread, and the attach button, which an image run has no use for) — never
+  // what an existing thread DOES: that is chatKind's job.
+  modelImageCapable: boolean;
+  // The THREAD's kind: "" (text) or "image". Pinned by the backend at the
+  // thread's first send and authoritative from then on; while the thread is
+  // still empty it follows the picked model, because that is what the next
+  // send will pin it to. Render composer affordances off THIS, not off
+  // modelImageCapable — a text thread stays a text thread even if the user
+  // later picks an image model.
+  chatKind: string;
+  // How many more generated images this chat is expected to hold before it
+  // hits the backend's content cap, or null when that is unknown (a text
+  // thread, or a gateway that serves no max_content_bytes). null means
+  // "unknown" and must never be read as zero.
+  imageCapacityLeft: number | null;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -226,6 +245,20 @@ export function ChatStoreProvider({
   // server-override picker renders at all and its option list.
   const manageableServers = useMemo(() => servers ?? [], [servers]);
 
+  // The THREAD's pinned kind as last loaded/established ("" text | "image").
+  // Real state, not a value read once at load: the pin is established by the
+  // thread's FIRST send, and a live session (new chat -> pick an image model
+  // -> send -> send again -> regenerate, no reload) must see it immediately.
+  // Opaque string, never narrowed to the kinds this build knows, so an
+  // unfamiliar one survives the save round trip instead of being erased.
+  const [pinnedChatKind, setPinnedChatKind] = useState<string>(DEFAULTS.kind);
+  // The backend's per-chat content cap, as SERVED on the chat listing
+  // (ChatListResponse.max_content_bytes = portal.MaxChatContentBytes). 0 = not
+  // served (an older gateway) = capacity unknown. Never hardcoded here: a
+  // second copy of the Go constant would drift from it silently, and the
+  // failure mode is a capacity line stating the wrong number.
+  const [maxContentBytes, setMaxContentBytes] = useState(0);
+
   // The chat list + which one is active.
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -307,6 +340,32 @@ export function ChatStoreProvider({
   // backend already AND-aggregates this into ModelOption.vision).
   const modelVisionCapable =
     chatModels.find((option) => option.id === effectiveModel)?.vision ?? false;
+  // Whether the effective model GENERATES images (drives the image-thread
+  // composer). Independent of modelVisionCapable, which is whether it ACCEPTS
+  // them; the backend AND-aggregates both into ModelOption.
+  const modelImageCapable =
+    chatModels.find((option) => option.id === effectiveModel)?.image ?? false;
+
+  // The thread's kind. Once the thread has a transcript the backend has
+  // already pinned it (PrepareChatRun forces the stored kind on every send
+  // after the first), so the pin wins and the currently-picked model is
+  // irrelevant. While the thread is still empty there is no pin yet and the
+  // next send will establish one from the picked model, so the composer shows
+  // that prospective kind.
+  //
+  // Note the synthetic model option injected for a picked-but-uncatalogued
+  // model carries no capability fields and therefore derives image === false.
+  // That is deliberate and harmless: the PINNED kind is the thread's truth,
+  // and this derivation only applies while the thread has no history at all.
+  const chatKind = messages.length > 0 ? pinnedChatKind : modelImageCapable ? 'image' : '';
+
+  // Remaining room for generated images, computed only for an image thread:
+  // measuring the transcript means serialising it, and a text thread neither
+  // shows the number nor is gated on it. null = unknown (see the store type).
+  const imageCapacityLeft = useMemo(
+    () => (chatKind === 'image' ? imagesLeft(messages, maxContentBytes) : null),
+    [chatKind, messages, maxContentBytes],
+  );
 
   // Refs mirror the latest state so the stable callbacks below (send / edit /
   // regenerate / save) can read current values without being re-created every
@@ -353,14 +412,17 @@ export function ChatStoreProvider({
   // above — an effect would lag by one passive-effect flush.
   const modelVisionCapableRef = useRef(modelVisionCapable);
   modelVisionCapableRef.current = modelVisionCapable;
-  // The thread's pinned kind ("" text | "image"), so the stable edit/
-  // regenerate callback can gate on it without closing over state. There is
-  // no `kind` React state (yet) to mirror the way the refs above mirror
-  // state -- the backend pins this in the persisted settings and nothing in
-  // the frontend reads it besides this ref; promoting it into real state is
-  // the next task's job. Set directly in activateChat (the one place the raw
-  // persisted content is available), the same way activeTitleRef above is.
-  const chatKindRef = useRef<'' | 'image'>('');
+  // Mirror the thread's kind so the stable send/edit/regenerate callbacks and
+  // buildDoc (which read via refs, not props) always see the latest value.
+  // Direct render-time assignment, like modelAvailableRef/modelVisionCapableRef
+  // above — an effect would lag by one passive-effect flush, and this ref used
+  // to be written only in activateChat, which made it permanently stale for
+  // every thread pinned during the current session.
+  const chatKindRef = useRef<string>(chatKind);
+  chatKindRef.current = chatKind;
+  // Likewise the remaining image capacity, for send()'s refusal.
+  const imageCapacityLeftRef = useRef<number | null>(imageCapacityLeft);
+  imageCapacityLeftRef.current = imageCapacityLeft;
 
   // The run/SSE engine (FA-2): owns the per-chat run subscriptions + transcript
   // buffers behind a narrow interface. See useChatRuns.ts.
@@ -405,6 +467,7 @@ export function ChatStoreProvider({
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
+      chatKindRef,
       activeTitleRef,
       apiRef,
       showErrorRef,
@@ -420,6 +483,7 @@ export function ChatStoreProvider({
       selectedTokenId,
       serverOverride,
       serverOverrideForceUnreachable,
+      kind: chatKind,
     },
     isRunning,
     setChats,
@@ -465,13 +529,6 @@ export function ChatStoreProvider({
       if (outgoing) chatBuffers.set(outgoing, messagesRef.current);
 
       const doc = normalizeDoc(chat.content);
-      // The pinned kind is not part of ChatSettings/normalizeDoc (promoting it
-      // into real settings/state is the next task's job); read it directly off
-      // the raw persisted content, following normalizeDoc's own per-field
-      // coercion-with-default idiom: anything other than the literal "image"
-      // defaults to "" (text), including a missing/malformed settings blob.
-      const rawSettings = (chat.content as { settings?: { kind?: unknown } } | null)?.settings;
-      chatKindRef.current = rawSettings?.kind === 'image' ? 'image' : '';
       skipNextSave();
       cancelPendingSave();
       setModel(doc.settings.model);
@@ -481,6 +538,11 @@ export function ChatStoreProvider({
       setSelectedTokenId(doc.settings.run_as_token_id);
       setServerOverride(doc.settings.server_override);
       setServerOverrideForceUnreachable(doc.settings.server_override_force_unreachable);
+      // The thread's pinned kind, like every other setting: seeded from the
+      // loaded document. A setting activateChat does NOT seed reverts to its
+      // default here and is then written over the stored value by the next
+      // debounced save, because the PUT full-replaces the content blob.
+      setPinnedChatKind(doc.settings.kind);
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually
@@ -528,6 +590,10 @@ export function ChatStoreProvider({
       run_as_token_id: selectedTokenIdRef.current,
       server_override: serverOverrideRef.current,
       server_override_force_unreachable: serverOverrideForceUnreachableRef.current,
+      // On the thread's FIRST send this establishes the pin; on every later
+      // send the backend ignores it and forces the stored one, so sending the
+      // thread's own kind is both correct and a no-op there.
+      kind: chatKindRef.current,
     }),
     [],
   );
@@ -556,6 +622,11 @@ export function ChatStoreProvider({
         const list = await apiRef.current.chats();
         if (cancelled) return;
         const data = Array.isArray(list?.data) ? list.data : [];
+        // The served content cap (portal.MaxChatContentBytes). Absent on a
+        // gateway older than the field -> stays 0 -> capacity unknown, which
+        // shows no number and refuses no send. Guessing one instead would be
+        // the very drift this is served to avoid.
+        if (typeof list?.max_content_bytes === 'number') setMaxContentBytes(list.max_content_bytes);
         // Fetch the still-running server runs (Task 3.4) and REGISTER their
         // metadata into the run engine WITHOUT opening an EventSource yet.
         // Registering first keeps the opened chat's interrupted-detection
@@ -648,17 +719,30 @@ export function ChatStoreProvider({
     return () => clearInterval(id);
   }, [modelAvailable, effectiveModel]);
 
-  // Clear a composer attachment that the (newly) effective model can no
-  // longer process — e.g. switching from a vision-capable model to one that
-  // is not, with an image still attached. Runs whenever modelVisionCapable
-  // flips; a no-op while there is nothing attached.
+  // Clear a composer attachment the (newly) effective model will not use —
+  // e.g. switching from a vision-capable model to one that is not, with an
+  // image still attached. Runs whenever either capability flips; a no-op
+  // while there is nothing attached.
+  //
+  // The image-GENERATOR case is not the same refusal: such a model may well
+  // be vision-capable too, so the vision check below would let the attachment
+  // through — and the run would then drop it in silence, because an image
+  // run's request body is {model, prompt, response_format} with no history
+  // and no attachment at all. It is checked first, and says so in its own
+  // words.
   useEffect(() => {
-    if (images.length > 0 && !modelVisionCapable) {
+    if (images.length === 0) return;
+    if (modelImageCapable) {
+      setImages([]);
+      showError(t.chatImageGeneratorNoInput);
+      return;
+    }
+    if (!modelVisionCapable) {
       setImages([]);
       showError(t.chatImageModelUnsupported);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelVisionCapable]);
+  }, [modelVisionCapable, modelImageCapable]);
 
   // Reset a stale run-as selection: onRefresh reloads `tokens` after every
   // stream, and a chat may persist a run-as token that was later
@@ -869,6 +953,24 @@ export function ChatStoreProvider({
       showErrorRef.current(tRef.current.chatImageModelUnsupported);
       return;
     }
+    // Refuse an image send whose result this chat provably cannot store,
+    // BEFORE anything is mutated or sent. An image generation costs minutes of
+    // upstream CPU and produces a multi-megabyte artifact; the remaining
+    // capacity is the one number in this feature that is exact and known
+    // BEFORE the user commits. Spending the wait to then fail the save (the
+    // run "completes" and the turn is dropped) is the failure this prevents.
+    // A null capacity is UNKNOWN, not zero -- it must refuse nothing.
+    const capacityLeft = imageCapacityLeftRef.current;
+    if (chatKindRef.current === 'image' && capacityLeft !== null && capacityLeft <= 0) {
+      showErrorRef.current(tRef.current.chatCapacityExhausted);
+      return;
+    }
+    // This send pins the thread's kind server-side when the thread is still
+    // empty (PrepareChatRun accepts the client's kind only on a genuine first
+    // send). Record the same pin here, in the same batch as the optimistic
+    // user bubble: from the next render on, `messages` is non-empty and the
+    // thread's kind comes from the pin rather than from the picked model.
+    if (messagesRef.current.length === 0) setPinnedChatKind(chatKindRef.current);
 
     let content: ChatContent = text;
     if (images.length > 0) {
@@ -1104,6 +1206,9 @@ export function ChatStoreProvider({
     overrideLocksModel,
     modelAvailable,
     modelVisionCapable,
+    modelImageCapable,
+    chatKind,
+    imageCapacityLeft,
     chats,
     activeChatId,
     chatsLoading,

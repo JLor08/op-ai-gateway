@@ -30,7 +30,11 @@ func (s *Server) handlePortalChats(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_list_failed", "chat list failed", ""))
 			return
 		}
-		writeJSON(w, http.StatusOK, portal.ChatListResponse{Data: chats})
+		// MaxContentBytes rides along on the listing the chat view already
+		// fetches: the composer needs the cap to state an image thread's
+		// remaining capacity, and there is no GET on the chat-settings
+		// endpoint to carry it.
+		writeJSON(w, http.StatusOK, portal.ChatListResponse{Data: chats, MaxContentBytes: portal.MaxChatContentBytes})
 	case http.MethodPost:
 		raw, ok := readRawJSONUnlimited(w, r)
 		if !ok {

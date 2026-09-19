@@ -293,3 +293,28 @@ func TestPortalChatsTitleTooLongRejected(t *testing.T) {
 		t.Fatalf("create long-title status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+// The chat list carries the pre-seal content cap so the portal composer can
+// state the remaining capacity instead of hardcoding its own copy of
+// MaxChatContentBytes (which would drift from the Go constant silently). A
+// zero here would make the portal treat the capacity as unknown, and nothing
+// else in the suite would notice.
+func TestPortalChatsListCarriesMaxContentBytes(t *testing.T) {
+	srv, dir := newChatTestServer(t)
+	seedLoginUser(t, dir, "usr_cap", "cap@example.test", "password-1", "user")
+	cookie := loginCookie(t, srv, "cap@example.test", "password-1")
+
+	rec := chatRequest(t, srv, cookie, http.MethodGet, "/api/portal/chats", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		MaxContentBytes int `json:"max_content_bytes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v (%s)", err, rec.Body.String())
+	}
+	if list.MaxContentBytes != portal.MaxChatContentBytes {
+		t.Fatalf("max_content_bytes = %d, want %d", list.MaxContentBytes, portal.MaxChatContentBytes)
+	}
+}

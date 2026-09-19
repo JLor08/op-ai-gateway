@@ -182,7 +182,7 @@ func TestServiceChatTitleTooLongRejected(t *testing.T) {
 func TestServiceChatContentTooLargeRejected(t *testing.T) {
 	ctx := context.Background()
 	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
-	big := make([]byte, maxChatContentBytes+1)
+	big := make([]byte, MaxChatContentBytes+1)
 	for i := range big {
 		big[i] = 'a'
 	}

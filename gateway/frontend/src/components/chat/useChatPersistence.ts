@@ -67,6 +67,13 @@ export function useChatPersistence(
     selectedTokenIdRef: RefObject<string>;
     serverOverrideRef: RefObject<string>;
     serverOverrideForceUnreachableRef: RefObject<boolean>;
+    // The active thread's pinned kind ("" text | "image"). Read here because
+    // buildDoc has to write it back: the backend's PUT full-replaces the
+    // opaque content blob with NO merge, so any setting missing from buildDoc
+    // is erased from the stored document on the very next autosave — which is
+    // exactly how the server-side kind pin was being destroyed before it was
+    // threaded through here.
+    chatKindRef: RefObject<string>;
     activeTitleRef: RefObject<string>;
     apiRef: RefObject<Pick<PortalApi, 'saveChat' | 'saveChatKeepalive'>>;
     showErrorRef: RefObject<(message: string) => void>;
@@ -83,6 +90,11 @@ export function useChatPersistence(
     selectedTokenId: string;
     serverOverride: string;
     serverOverrideForceUnreachable: boolean;
+    // A NEW PERSISTED SETTING NEEDS THREE LOCKSTEP EDITS IN THIS FILE: this
+    // type, the destructure below, and the debounced effect's EXPLICIT dep
+    // array (it sits under an eslint-disable for exhaustive-deps, so a missed
+    // dep is silent — the setting simply never schedules a save).
+    kind: string;
   },
   // Synchronous, always-current "is this chat's run live" check (see
   // useChatRuns.ts); injected so persistence never reaches into the run
@@ -100,6 +112,7 @@ export function useChatPersistence(
     selectedTokenIdRef,
     serverOverrideRef,
     serverOverrideForceUnreachableRef,
+    chatKindRef,
     activeTitleRef,
     apiRef,
     showErrorRef,
@@ -115,6 +128,7 @@ export function useChatPersistence(
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
+    kind,
   } = state;
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -135,6 +149,7 @@ export function useChatPersistence(
         run_as_token_id: selectedTokenIdRef.current,
         server_override: serverOverrideRef.current,
         server_override_force_unreachable: serverOverrideForceUnreachableRef.current,
+        kind: chatKindRef.current,
       },
       messages: pruneEmptyAssistantTail(messagesRef.current),
     }),
@@ -146,6 +161,7 @@ export function useChatPersistence(
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
+      chatKindRef,
       messagesRef,
     ],
   );
@@ -208,6 +224,7 @@ export function useChatPersistence(
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
+    kind,
     activeChatId,
     flushSave,
   ]);
@@ -225,7 +242,24 @@ export function useChatPersistence(
       // Server owns the transcript while a run is live — skip the keepalive PUT.
       if (isRunning(id)) return;
       const payload = { title: activeTitleRef.current, content: buildDoc() };
-      if (JSON.stringify(payload).length > 60000) return;
+      if (JSON.stringify(payload).length > 60000) {
+        // The cap stays: it is the real keepalive body ceiling (~64 KB), and
+        // raising it would just make the browser drop the PUT instead. But a
+        // silent `return` hid the whole mechanism from every image thread,
+        // where a single inline base64 image is far past 60 KB — so the skip
+        // is reported rather than swallowed.
+        //
+        // Not a user-facing toast: the page is on its way out (or entering the
+        // bfcache), and this is almost never a loss — the debounced save has
+        // no such cap and is the path that actually persists an image turn.
+        // Only an edit made inside the last ~800ms is at risk, and the chat
+        // stays marked dirty, so the unmount flush or the next change retries.
+        console.warn(
+          `[chat] pagehide keepalive skipped for ${id}: document exceeds the keepalive body cap; ` +
+            'the debounced save remains the persistence path (chat left dirty for retry)',
+        );
+        return;
+      }
       apiRef.current.saveChatKeepalive(id, payload);
       dirtyRef.current = false;
     };

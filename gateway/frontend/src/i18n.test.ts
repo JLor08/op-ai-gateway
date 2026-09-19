@@ -766,6 +766,46 @@ describe('capacity-benchmark i18n keys', () => {
   });
 });
 
+describe('image-thread composer i18n keys', () => {
+  const keys = [
+    'chatImagePromptLabel',
+    'chatImageOnlyHint',
+    'chatCapacityExhausted',
+    'chatImageGeneratorNoInput',
+  ] as const;
+
+  it('defines the composer keys in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('interpolates the remaining-capacity count', () => {
+    expect(messages.de.chatCapacityRemaining(3)).toContain('3');
+    expect(messages.en.chatCapacityRemaining(3)).toContain('3');
+    expect(messages.en.chatCapacityRemaining(3)).not.toContain('{count}');
+    expect(messages.de.chatCapacityRemaining(3)).not.toContain('{count}');
+  });
+
+  it('keeps the image-INPUT refusal distinct from the image-GENERATOR one', () => {
+    // chatImageModelUnsupported gates image INPUT. An image-generating model is
+    // never vision-capable, so the old wording ("does not support images") told
+    // the user that a model whose only purpose is images does not support them.
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].chatImageModelUnsupported).not.toBe(
+        messages[locale].chatImageGeneratorNoInput,
+      );
+    }
+    expect(messages.en.chatImageModelUnsupported).toContain('input');
+    expect(messages.de.chatImageModelUnsupported).toContain('Eingabe');
+    expect(messages.en.chatImageGeneratorNoInput).toContain('generates images');
+    expect(messages.de.chatImageGeneratorNoInput).toContain('erzeugt Bilder');
+  });
+});
+
 describe('loaded-model i18n keys', () => {
   it('defines the loaded-model table/chat/application keys in de and en', () => {
     const keys = [
