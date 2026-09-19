@@ -2052,12 +2052,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			}
 			capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 			if capErr != nil {
-				// LOUDLY: this degrade withholds vision from EVERY model in
-				// the listing gateway-wide (the fold below AND-s a missing
-				// row in as false), which the portal renders as a perfectly
-				// normal page whose image-attach affordance is simply gone
-				// -- a fail-closed outage with no diagnostic trail unless it
-				// is logged. Every sibling best-effort read in this package
+				// LOUDLY: this degrade withholds BOTH vision and image from
+				// EVERY model in the listing gateway-wide (the fold below
+				// AND-s a missing row in as false for each), which the
+				// portal renders as a perfectly normal page whose image-
+				// ATTACH affordance (gated on vision) and image-GENERATION
+				// affordance (gated on image) are simply both gone -- a
+				// fail-closed outage with no diagnostic trail unless it is
+				// logged. Every sibling best-effort read in this package
 				// logs for exactly that reason.
 				slog.Warn("portal: models-listing capability read failed; vision and image withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)

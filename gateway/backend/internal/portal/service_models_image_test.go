@@ -18,6 +18,14 @@ import (
 // also INDEPENDENT of vision -- a generator that accepts no image input is
 // image=true, vision=false, and conflating the two is the specific error
 // routing.CapabilityImage's doc comment warns about.
+//
+// The "sd" case below is also what pins the fail-closed SEED: its single
+// mapping's image=yes row only folds to true because the accumulator starts
+// true on that model's first view and is then ANDed down, never up --
+// starting from Go's zero-value false would leave every sole-mapping model
+// false regardless of its row, and this is the case that would catch that
+// (TestModelsResponseImageAndAcrossMappings below cannot: its two mappings
+// include an explicit "no", so it lands on false with or without the seed).
 func TestModelsResponseImageFlag(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
@@ -68,9 +76,14 @@ func TestModelsResponseImageFlag(t *testing.T) {
 	}
 }
 
-// A model offered by TWO mappings is image-capable only when BOTH say yes.
-// This is the fail-closed half, and it works only because the accumulator is
-// seeded to true on a model's first view and then only ever ANDed down.
+// A model offered by TWO mappings is image-capable only when BOTH say yes:
+// with one mapping's row an explicit image=no, the AND-fold pins the model
+// false regardless of the other mapping's verdict. This is the two-mapping
+// AND itself, not the fail-closed seed's necessity -- with one mapping
+// already false, the fold lands on false whether the accumulator starts at
+// the seeded true or at Go's zero-value false. TestModelsResponseImageFlag's
+// "sd" case (above) is the one that pins the seed, where a single
+// yes-verdict mapping needs it to reach true at all.
 func TestModelsResponseImageAndAcrossMappings(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
