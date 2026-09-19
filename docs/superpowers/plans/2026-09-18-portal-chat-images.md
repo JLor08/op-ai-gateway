@@ -2121,6 +2121,19 @@ Check `srv.startChatRun`'s and `run.statusValue()`'s exact signatures in
 use both, and `startChatRun` is the test-facing entry point that takes a
 `PrepareRunResult`.
 
+*(Corrected during execution, three defects in the above.* **One:** neither
+prescribed test passes a `History`, so the prompt is empty and the endpoint
+answers `400 images.prompt_required` — which made the commit test fail and,
+worse, made the zero-`data[]` test pass on the **right status for the wrong
+reason**. Pass a user message, and assert the exact terminal code rather than
+the status alone. **Two:** `relayImages` collides with an existing
+`(s *Server) relayImages` and will not compile; name the new functions
+something else. **Three:** the header list below omits the **server-override
+pair**. The images path runs the same `inferencePreflight`, so
+`applyServerOverride` reads those headers there too, and leaving them off
+silently ignores an image thread's server override — send them through one
+shared helper with the chat hop.)*
+
 - [ ] **Step 2: Run to verify failure**, then build `chat_runs_images.go` with:
   - `buildImagesBody(prep PrepareRunResult) ([]byte, error)` — `{model, prompt, response_format:"b64_json"}`, where the prompt is the **last user message's text**, extracted the way `extractText` (`service_chats.go:465-484`) already does for titles (it handles both the string and `[{type:"text"}]` shapes).
   - `relayImages(ctx, ...)` — POST to `s.selfBaseURL+"/v1/images/generations"` with the same header set `executeRun` builds today (`:492-496`: content type, CSRF, the loopback pair, the session header, and the run-as header when set), read the whole body, decode `imagesResponse`, build the parts.
@@ -2149,7 +2162,20 @@ they are one user-visible outcome: the chat says what actually happened.
 - Produces: a terminal run whose `error` carries a mapped code when the commit
   failed; and `errorLabelByCode` entries for `portal.chat_too_large`,
   `portal.chat_run_active`, `portal.chat_run_limit`,
-  `mapping.capability_reserved`, plus the timeout code from Task 6.
+  `mapping.capability_reserved`, the timeout code from Task 6
+  (`gateway.chat_run_timeout`), the two codes Task 7 introduced
+  (`gateway.chat_run_no_image`, `gateway.chat_run_image_format_unknown`), and
+  the four `images.*` codes Task 7 made reachable from the chat
+  (`images.prompt_required`, `images.stream_unsupported`,
+  `images.response_format_unsupported`, `images.upstream_error`).
+
+**This task's priority rose during execution.** Task 7 confirmed that a
+too-large image turn is a **silent success today**: `ErrChatTooLarge` is only
+logged, and the run still finishes `completed` with no turn at all. An image
+turn is the first payload in this system that routinely approaches the 4 MiB
+cap, so the sharpest open defect in the feature is the one this task closes.
+Treat the loud-commit-failure half as the primary deliverable, not the error
+map.
 
 **The three constraints on an `errorLabelByCode` entry** are enforced by
 `shared/format.test.ts`: the code must match
