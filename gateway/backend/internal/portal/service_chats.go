@@ -299,6 +299,20 @@ type ChatRunSettings struct {
 	// if the resolver deems it unreachable/under maintenance. Always false
 	// whenever ServerOverride is "" — see the self-heal in PrepareChatRun.
 	ServerOverrideForceUnreachable bool `json:"server_override_force_unreachable,omitempty"`
+	// Kind pins what this thread's runs are: "" (text, the default and every
+	// pre-existing chat) or "image". It is established by the FIRST send and
+	// then forced by PrepareChatRun on every later send, because the composer's
+	// affordances follow the thread rather than the currently-picked model --
+	// see the spec's "the kind is pinned to the thread at first send".
+	//
+	// It is a UI constraint, NOT an authorization: this struct is the POST
+	// body verbatim (chat_run_endpoints.go), so a client can submit any value
+	// on the first send. The routing capability gate remains the only
+	// authority on what the gateway will actually serve.
+	//
+	// Declared LAST and omitempty on purpose: that is what keeps an existing
+	// text chat's persisted settings byte-identical.
+	Kind string `json:"kind,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
@@ -353,6 +367,27 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	}
 	doc := parseChatDoc(content)
 
+	// hadPriorMessages is true once this chat has been through an earlier
+	// send -- which is exactly "has a kind already been pinned," including
+	// the pin of empty-string text. A chat's absent "kind" key in
+	// doc.Settings cannot by itself distinguish "never sent" from "pinned to
+	// text," because Kind is omitempty and both cases serialize the same way;
+	// message count breaks that tie. Captured BEFORE the append/replace
+	// immediately below so it reflects the chat as it was before THIS send,
+	// not after.
+	//
+	// Assumption: CreateChatRequest.Content is client-supplied opaque JSON,
+	// so a chat could in principle be created with messages already
+	// populated before any PrepareChatRun call ever runs -- in which case
+	// this flag would read true on what is logically the thread's first
+	// send, and the stored (absent) kind would be forced rather than the
+	// client's submitted one accepted. No current call site seeds messages
+	// on create (chat creation always starts from an empty messages array);
+	// if one ever does, this heuristic stops being safe and the pin would
+	// need an explicit "has run" marker instead of inferring one from
+	// message count.
+	hadPriorMessages := len(doc.Messages) > 0
+
 	if req.EditedHistory != nil {
 		doc.Messages = req.EditedHistory
 	} else if req.UserMessage != nil {
@@ -390,6 +425,27 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	req.Settings.ServerOverride = s.validateServerOverride(ctx, owner, req.Settings.ServerOverride)
 	if req.Settings.ServerOverride == "" {
 		req.Settings.ServerOverrideForceUnreachable = false
+	}
+
+	// The stored kind wins over whatever the client submitted. doc.Settings is
+	// about to be REPLACED wholesale by the submitted settings (below), so the
+	// pin has to be lifted out first or it is silently unpinned on every send.
+	//
+	// The force applies whenever hadPriorMessages -- UNCONDITIONALLY, even
+	// when stored.Kind is "" (text). A guard of `stored.Kind != ""` would only
+	// protect an established image pin: a text-pinned thread's second send
+	// could then submit "image" and flip the thread, silently discarding
+	// history for a run against the images endpoint. On a genuine first send
+	// (hadPriorMessages false) nothing is forced, so the client's submitted
+	// kind -- including "image" -- establishes the pin.
+	var stored struct {
+		Kind string `json:"kind"`
+	}
+	if len(doc.Settings) > 0 {
+		_ = json.Unmarshal(doc.Settings, &stored) // best-effort: a malformed blob leaves the kind unpinned, which is the pre-feature behaviour
+	}
+	if hadPriorMessages {
+		req.Settings.Kind = stored.Kind
 	}
 
 	settingsRaw, err := json.Marshal(req.Settings)
