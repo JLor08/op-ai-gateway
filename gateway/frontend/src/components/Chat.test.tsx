@@ -881,6 +881,87 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`Chat: the pending row follows the RUN's kind, not the thread's [${locale}]`, () => {
+    // Whole-branch review, finding 4. Chat.tsx is the ONLY wiring site that
+    // decides which kind ChatMessage renders the in-flight turn from, and
+    // nothing pinned it: replacing `c.runKind` with `c.chatKind` there --
+    // precisely the defect an earlier fix round closed -- left the whole
+    // suite green. runKind is well covered inside the store; the prop that
+    // carries it into the view was not covered at all.
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    async function sendImagePrompt() {
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat on a bicycle' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      // A running snapshot is what materialises the in-flight assistant row
+      // (ensureAssistant); until one arrives the transcript's last message is
+      // the user turn and no row is `rowStreaming` at all. It carries no
+      // `kind` on purpose, so the kind under test stays the one the 201
+      // reported -- which is the value Chat.tsx is wired to.
+      await act(async () => {
+        FakeEventSource.instances[0].emit('snapshot', { status: 'running', elapsed_ms: 1000 });
+      });
+    }
+
+    it('renders the image wait state while the run itself reports the image kind', async () => {
+      // The positive control. Without it the negative test below could pass
+      // for the trivial reason that this tree never renders the wait state.
+      chatApi.spies.startChatRun.mockImplementation(async (chatId: string) => ({
+        run_id: 'run_1',
+        chat_id: chatId,
+        status: 'running' as const,
+        kind: 'image',
+      }));
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await sendImagePrompt();
+
+      expect(await screen.findByText(t.chatImageRunPending)).toBeInTheDocument();
+      expect(screen.getByText(t.chatImageNoIntermediateNews)).toBeInTheDocument();
+    });
+
+    it('renders no image wait state while the run itself reports a text kind', async () => {
+      // The stale-pin case. This client pins `image` locally on its first
+      // send (the picked model generates images), but the SERVER has already
+      // pinned this thread to text -- another tab sent a text turn first --
+      // and forces that kind onto every later run, so the 201 reports "".
+      // With c.chatKind here the composer's guess wins and the user watches
+      // an image wait state, with no character counter and no streamed text,
+      // over an entire text generation.
+      chatApi.spies.startChatRun.mockImplementation(async (chatId: string) => ({
+        run_id: 'run_1',
+        chat_id: chatId,
+        status: 'running' as const,
+        kind: '',
+      }));
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await sendImagePrompt();
+
+      // The thread's own kind really is `image` -- the composer is showing
+      // its image affordances -- so the assertion below is about the RUN, not
+      // about the thread having failed to pin.
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      // ...and the row really is streaming, so "nothing rendered" is not the
+      // reason the wait state is absent.
+      expect(await screen.findByRole('button', { name: t.chatStop })).toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageRunPending)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageNoIntermediateNews)).not.toBeInTheDocument();
+    });
+  });
+
   describe(`Chat: server override picker (Task 6) [${locale}]`, () => {
     it('hides the whole control when the caller manages zero servers', async () => {
       renderChat(tokens, models, []);

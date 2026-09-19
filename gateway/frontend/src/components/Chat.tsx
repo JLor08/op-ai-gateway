@@ -328,6 +328,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // every token delta and defeat ChatMessage's memo for the
                   // whole transcript during any live run, not just the row
                   // actually in flight.
+                  //
+                  // c.runKind, NEVER c.chatKind: this prop describes the RUN
+                  // in flight, and chatKind is the thread-level guess that
+                  // drives the composer. Substituting it renders the image
+                  // wait state over an entire text run in a tab whose pin is
+                  // stale -- pinned by Chat.test.tsx's "renders no image wait
+                  // state while the run itself reports a text kind".
                   kind={rowStreaming ? c.runKind : undefined}
                   elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
