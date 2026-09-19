@@ -6,6 +6,8 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/auth"
+	"strings"
 	"testing"
 )
 
@@ -110,5 +112,58 @@ func TestInternalOrBearerFallsThroughWhenUsersIsNil(t *testing.T) {
 
 	if _, ok := s.authenticateInternalOrBearer(w, r); ok {
 		t.Fatal("a nil user lookup must not authenticate")
+	}
+}
+
+// THE 403 BODY IS PART OF THE SHIPPED CONTRACT. /v1/images/generations went
+// through requireAnyScope on every release before this branch, so its
+// insufficient-scope body must stay byte-identical: same code, same status
+// and the same "insufficient token scope" prose. This asserts the two
+// helpers' responses against each other rather than against a literal, so it
+// keeps failing if either side is reworded -- and the sibling literal
+// assertion below keeps it from passing vacuously should BOTH be changed to
+// the same new wording.
+func TestInternalOrBearerScopeRefusalMatchesRequireAnyScopeByteForByte(t *testing.T) {
+	tokens := auth.NewTokenStore()
+	tokens.AddPlainToken(auth.Token{ID: "tok_1", UserID: "usr_1", Active: true, Scopes: []string{"gateway:use"}}, "secret")
+	s := &Server{
+		internalAuthSecret: "s3cret",
+		users:              fakeUserLookup{"usr_1": {ID: "usr_1", DisplayName: "Ann", Role: "user"}},
+		Tokens:             tokens,
+	}
+
+	// The loopback leg authenticates, then fails the scope check: a loopback
+	// principal for a plain "user" is never elevated, so it cannot carry
+	// "system".
+	loopback := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	loopback.Header.Set(internalAuthHeaderName, "s3cret")
+	loopback.Header.Set(internalUserHeaderName, "usr_1")
+	gotW := httptest.NewRecorder()
+	if _, ok := s.requireInternalOrBearerAnyScope(gotW, loopback, "system"); ok {
+		t.Fatal("a non-elevated loopback principal must not satisfy the system scope")
+	}
+
+	// The same refusal from the helper this endpoint used before the branch.
+	bearer := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	bearer.Header.Set("Authorization", "Bearer secret")
+	wantW := httptest.NewRecorder()
+	if _, ok := s.requireAnyScope(wantW, bearer, "system"); ok {
+		t.Fatal("a gateway:use bearer must not satisfy the system scope")
+	}
+
+	if gotW.Code != wantW.Code {
+		t.Fatalf("status = %d, want requireAnyScope's %d", gotW.Code, wantW.Code)
+	}
+	if gotW.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", gotW.Code)
+	}
+	if gotW.Body.String() != wantW.Body.String() {
+		t.Fatalf("body = %q, want requireAnyScope's %q", gotW.Body.String(), wantW.Body.String())
+	}
+	// The literal the pre-branch endpoint shipped, pinned so the pair above
+	// cannot be satisfied by renaming both at once.
+	const want = `{"error":{"code":"auth.insufficient_scope","message":"insufficient token scope"}}`
+	if strings.TrimSpace(gotW.Body.String()) != want {
+		t.Fatalf("body = %q, want the shipped literal %q", strings.TrimSpace(gotW.Body.String()), want)
 	}
 }

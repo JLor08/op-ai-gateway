@@ -39,15 +39,25 @@ func (s *Server) authenticateInternalOrBearer(w http.ResponseWriter, r *http.Req
 
 // requireInternalOrBearerAnyScope resolves a principal via
 // authenticateInternalOrBearer and requires at least one of the given scopes.
-// The scope check is identical to requireAnyScope's and requireWebAnyScope's;
-// only the authentication legs differ.
+// The scope check is identical to requireAnyScope's -- byte for byte, down to
+// the message -- and only the authentication legs differ.
+//
+// The message is requireAnyScope's "insufficient token scope", NOT
+// requireWebAnyScope's "insufficient scope", and the difference is not
+// cosmetic: /v1/images/generations answered requireAnyScope's 403 on every
+// release before this one, so any other wording would be a silent
+// response-body change for every existing API client of a shipped endpoint.
+// The two wordings for one code across the require*Scope and requireWeb*Scope
+// families predate this endpoint; normalizing them is a repository-wide
+// decision that would move /v1/chat/completions and /v1/responses, and is
+// deliberately not made here.
 func (s *Server) requireInternalOrBearerAnyScope(w http.ResponseWriter, r *http.Request, scopes ...string) (auth.Token, bool) {
 	token, ok := s.authenticateInternalOrBearer(w, r)
 	if !ok {
 		return auth.Token{}, false
 	}
 	if !hasAnyScope(token, scopes) {
-		writeJSON(w, http.StatusForbidden, apierror.Response("auth.insufficient_scope", "insufficient scope", ""))
+		writeJSON(w, http.StatusForbidden, apierror.Response("auth.insufficient_scope", "insufficient token scope", ""))
 		return auth.Token{}, false
 	}
 	return token, true
