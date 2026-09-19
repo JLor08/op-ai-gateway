@@ -1502,13 +1502,35 @@ opened and re-impose it:
 	if len(doc.Settings) > 0 {
 		_ = json.Unmarshal(doc.Settings, &stored) // best-effort: a malformed blob leaves the kind unpinned, which is the pre-feature behaviour
 	}
-	if stored.Kind != "" {
+	if hadPriorMessages {
+		// Force UNCONDITIONALLY on a later send, including back to the empty
+		// (text) kind. Guarding on `stored.Kind != ""` cannot pin TEXT: the
+		// field is omitempty, so a text thread stores no `kind` key at all and
+		// reads back as "" -- indistinguishable from a thread that was never
+		// sent. A client submitting {"kind":"image"} on the second send would
+		// then flip the thread, and its next turn would go to the images
+		// endpoint, which carries no history, silently discarding the
+		// conversation. hadPriorMessages is captured from doc.Messages BEFORE
+		// the append/replace above: the pin is established by the FIRST send,
+		// so "has this thread been sent before?" is exactly the question.
 		req.Settings.Kind = stored.Kind
 	}
 ```
 
 Place it immediately above `settingsRaw, err := json.Marshal(req.Settings)` so
 the relationship is local and obvious.
+
+**Caveat to document in the code.** `CreateChatRequest.Content` is
+client-supplied opaque JSON, so a chat created with messages already in it
+would have its first send treated as a later one and forced to text. No
+current call site does that — chat creation seeds `messages: []` — but the
+assumption belongs in the comment so the next reader can evaluate it rather
+than rediscover it.
+
+**Rejected: writing an explicit `"text"` kind on first send.** It would make
+the stored data self-describing and the logic trivial, but it writes a new key
+into every text chat's settings for the overwhelmingly common case, and the
+whole document is one blob that every save rewrites. One boolean is cheaper.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 

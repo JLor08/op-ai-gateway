@@ -387,6 +387,17 @@ The pin must be read from the stored document **before** the overwrite and
 re-imposed on the submitted settings — a first send establishes it, and every
 later send has it forced back regardless of what was submitted.
 
+**"Regardless of what was submitted" includes the empty case, and that is not
+free.** Because the field is `omitempty`, a text thread stores no `kind` key
+and reads back as `""` — indistinguishable from a thread that has never been
+sent. So a condition like "re-impose the stored kind when it is non-empty"
+pins `image` but cannot pin `text`, and a client submitting `{"kind":"image"}`
+on a second send flips the thread; its next turn then goes to the images
+endpoint, which carries no history, silently discarding the conversation.
+Distinguishing the two cases needs a separate signal for "has this thread been
+sent before" — the presence of messages in the stored document, captured
+before this function appends to it.
+
 This also corrects a misreading in an earlier draft of this spec: the
 `ServerOverride` self-heal is **not** an example of distrusting storage,
 because nothing here reads storage. It re-validates the value the *client
