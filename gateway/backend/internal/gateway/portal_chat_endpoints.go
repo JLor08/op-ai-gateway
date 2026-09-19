@@ -107,12 +107,16 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 		// active run would silently overwrite whatever the run has already
 		// committed (a checkpoint) or is about to commit (the terminal turn) --
 		// data loss whose window an image run stretches from seconds to
-		// minutes. Reuses the same sentinel/response the run-start endpoint
-		// already emits for "already active" (portalRunErrRows) rather than a
-		// second way to say it. Guarded like the DELETE case just below: nil
-		// ChatRuns (a Server built without one, as tests do) must not panic.
+		// minutes. Reuses the same sentinel the run-start endpoint returns for
+		// "already active" (ErrRunAlreadyActive), through THIS handler's own
+		// mapper (writePortalChatError) rather than reaching across to
+		// writePortalRunError -- every handler in this package calls only its
+		// own write*Error function, and the response is identical either way
+		// because the row lives once in sharedErrorMap (error_map.go), read by
+		// both mappers. Guarded like the DELETE case just below: nil ChatRuns
+		// (a Server built without one, as tests do) must not panic.
 		if s.ChatRuns != nil && s.ChatRuns.Get(token.UserID, id) != nil {
-			writePortalRunError(w, ErrRunAlreadyActive)
+			writePortalChatError(w, ErrRunAlreadyActive)
 			return
 		}
 		raw, ok := readRawJSONUnlimited(w, r)
@@ -157,10 +161,13 @@ var portalChatErrRows = []errRow{
 	{err: portal.ErrChatTitleInvalid, status: http.StatusBadRequest, code: "portal.chat_title_invalid", msg: "chat title is invalid"},
 }
 
-// writePortalChatError maps the chat service's error sentinels to HTTP
-// responses: not-found (missing or foreign, no leak) -> 404, title/size
-// validation -> 400, everything else (seal/open/cipher/store failures) -> 500.
-// The 500 arm never echoes chat content; only the error is logged.
+// writePortalChatError maps the chat service's error sentinels (plus, via
+// sharedErrorMap, ErrRunAlreadyActive -- not a chat-service error, but a
+// sentinel this handler's own PUT case passes it directly) to HTTP responses:
+// not-found (missing or foreign, no leak) -> 404, title/size validation ->
+// 400, an active run -> 409, everything else (seal/open/cipher/store
+// failures) -> 500. The 500 arm never echoes chat content; only the error is
+// logged.
 func writePortalChatError(w http.ResponseWriter, err error) {
 	if writeMappedError(w, err, portalChatErrRows, 0, "", "") {
 		return

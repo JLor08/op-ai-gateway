@@ -54,13 +54,15 @@ type activeRunDTO struct {
 // portalRunErrRows are writePortalRunError's mapper-specific rows (checked
 // before sharedErrorMap); portal.ErrChatNotFound and portal.ErrChatTooLarge
 // map identically in writePortalChatError and live in sharedErrorMap
-// instead. store.ErrNotFound maps to a different code in other mappers, so
-// it must stay here (mirroring the original combined
+// instead. ErrRunAlreadyActive lives there too now (task 9: PUT /chats/{id}
+// -- via writePortalChatError -- refuses identically while a run is active,
+// so the single definition belongs where both mappers read it, not in this
+// mapper-specific table). store.ErrNotFound maps to a different code in
+// other mappers, so it must stay here (mirroring the original combined
 // portal.ErrChatNotFound/store.ErrNotFound case: both still resolve to the
 // same portal.chat_not_found response, one via the shared row, one via this
 // one).
 var portalRunErrRows = []errRow{
-	{err: ErrRunAlreadyActive, status: http.StatusConflict, code: "portal.chat_run_active", msg: "a run is already active for this chat"},
 	{err: ErrTooManyRuns, status: http.StatusTooManyRequests, code: "portal.chat_run_limit", msg: "too many concurrent runs"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: "portal.chat_not_found", msg: "chat not found"},
 }
