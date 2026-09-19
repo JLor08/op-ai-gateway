@@ -386,13 +386,51 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         <ChatMessage
           t={t}
           role="assistant"
+          turnId="msg_a1b2"
           promptText="a cat"
           content={[{ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AAAA' } }]}
         />,
       );
       fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
 
-      expect(anchor?.download).toBe('generated-image-1.jpg');
+      // The turn id is in the name too: the index alone restarts at 1 in
+      // every turn, so two image turns in one conversation offered the same
+      // `generated-image-1.jpg` for two different images.
+      expect(anchor?.download).toBe('generated-image-msg_a1b2-1.jpg');
+    });
+
+    // The collision itself, at the component boundary: the same index in two
+    // different turns must not produce the same file name. (Chat.test.tsx
+    // pins the wiring that supplies the id from the transcript.)
+    it("names two turns' first images differently", () => {
+      const names: string[] = [];
+      vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+        const el = nativeCreateElement(tag, options as ElementCreationOptions);
+        if (tag === 'a') {
+          const anchorEl = el as HTMLAnchorElement;
+          anchorEl.click = () => names.push(anchorEl.download);
+        }
+        return el;
+      });
+      vi.stubGlobal('URL', {
+        ...URL,
+        createObjectURL: vi.fn(() => 'blob:stub'),
+        revokeObjectURL: vi.fn(),
+      });
+
+      const content = [
+        { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,AAAA' } },
+      ];
+      const { unmount } = render(
+        <ChatMessage t={t} role="assistant" turnId="msg_first" content={content} />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+      unmount();
+      render(<ChatMessage t={t} role="assistant" turnId="msg_second" content={content} />);
+      fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+      expect(names).toHaveLength(2);
+      expect(names[0]).not.toBe(names[1]);
     });
 
     // The shape matches but the payload doesn't decode -- a truncated or

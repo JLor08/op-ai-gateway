@@ -44,6 +44,7 @@ function ChatMessageComponent({
   t,
   role,
   content,
+  turnId,
   promptText,
   reasoning,
   reasoningMs,
@@ -60,6 +61,13 @@ function ChatMessageComponent({
   t: Translation;
   role: 'user' | 'assistant';
   content: ChatContent;
+  // This row's transcript message id (`ChatUiMessage.id`), the same value the
+  // Chat container already keys the row by. Passed down purely so a generated
+  // image's DOWNLOAD NAME can be turn-unique — see ImageTurn's
+  // downloadNameFor. Optional only because the standalone-props tests in this
+  // component's own suite predate it; Chat.tsx, the single production call
+  // site, always supplies it.
+  turnId?: string;
   // The preceding user turn's text, used as a generated image's alt text (the
   // accessible name for "what was asked for" rather than a generic label).
   // Only meaningful on the assistant branch.
@@ -278,7 +286,9 @@ function ChatMessageComponent({
             />
           )}
         </Box>
-        {images.length > 0 && <ImageTurn t={t} images={images} prompt={promptText} />}
+        {images.length > 0 && (
+          <ImageTurn t={t} images={images} prompt={promptText} turnId={turnId ?? ''} />
+        )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (
             <Tooltip title={t.chatRegenerate}>

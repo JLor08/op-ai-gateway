@@ -311,6 +311,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   t={t}
                   role={message.role}
                   content={message.content}
+                  turnId={message.id}
                   promptText={promptText}
                   reasoning={message.reasoning}
                   reasoningMs={message.reasoningMs}

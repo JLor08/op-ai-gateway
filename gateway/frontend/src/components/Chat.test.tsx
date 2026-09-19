@@ -17,6 +17,10 @@ import type {
   StartChatRunBody,
 } from '../api';
 
+// Captured before any spy is installed, so a mocked createElement can build a
+// real element without recursing into itself.
+const nativeCreateElement = document.createElement.bind(document);
+
 // vision: true so the pre-existing image-retention/attach tests below (which
 // predate the vision-capability gate) keep exercising attach + send unchanged;
 // the "Chat: vision gating" describe block below covers the non-capable path.
@@ -583,6 +587,45 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       const image = await screen.findByAltText('a cat on a bicycle');
       expect(image).toHaveAttribute('src', 'data:image/png;base64,AAAA');
+    });
+
+    // The same argument one prop over: ChatMessage.test.tsx pins that a turn
+    // id produces a turn-unique download name, but nothing there proves
+    // Chat.tsx actually supplies one. Without it every turn falls back to the
+    // bare positional name and two image turns collide again.
+    it("names the download from the TURN's own id, threaded from the transcript", async () => {
+      seedGeneratedImageChat();
+      let anchor: HTMLAnchorElement | undefined;
+      // Restored in the finally below: this suite's afterEach unstubs globals
+      // but does not restore spies, and a surviving createElement spy
+      // recurses into itself on the next test that installs one.
+      const createElement = vi
+        .spyOn(document, 'createElement')
+        .mockImplementation((tag: string, options?: unknown) => {
+          const el = nativeCreateElement(tag, options as ElementCreationOptions);
+          if (tag === 'a') {
+            anchor = el as HTMLAnchorElement;
+            // jsdom cannot navigate to the blob: URL downloadBinary builds.
+            anchor.click = () => {};
+          }
+          return el;
+        });
+      try {
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:stub'),
+          revokeObjectURL: vi.fn(),
+        });
+        renderChat();
+        await waitForChatReady();
+        await screen.findByAltText('a cat on a bicycle');
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        expect(anchor?.download).toBe('generated-image-m_image-1.png');
+      } finally {
+        createElement.mockRestore();
+      }
     });
   });
 
