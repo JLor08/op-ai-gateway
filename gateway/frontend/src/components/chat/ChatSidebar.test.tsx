@@ -41,6 +41,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelVisionCapable: true,
     modelImageCapable: false,
     chatKind: '',
+    runKind: undefined,
     runElapsedMs: undefined,
     imageCapacityLeft: null,
     chats: [

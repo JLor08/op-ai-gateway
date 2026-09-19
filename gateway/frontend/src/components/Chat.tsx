@@ -304,6 +304,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                 message.role === 'assistant' && previous?.role === 'user'
                   ? textOf(previous.content)
                   : undefined;
+              const rowStreaming = c.streaming && isLast && message.role === 'assistant';
               return (
                 <ChatMessage
                   key={message.id}
@@ -316,9 +317,19 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   ttftMs={message.ttftMs}
                   tps={message.tps}
                   tokensPerSecond={message.tokensPerSecond}
-                  streaming={c.streaming && isLast && message.role === 'assistant'}
-                  kind={c.chatKind}
-                  elapsedMs={c.runElapsedMs}
+                  streaming={rowStreaming}
+                  // kind/elapsedMs are only ever consulted while `streaming`
+                  // is also true (ChatMessage's pending-render guard), so
+                  // gate them the SAME way: every other row keeps a stable
+                  // `undefined` across renders. runElapsedMs in particular
+                  // is recomputed on every provider render and is a
+                  // different float essentially every time -- passed
+                  // unconditionally, it would change on EVERY row's props on
+                  // every token delta and defeat ChatMessage's memo for the
+                  // whole transcript during any live run, not just the row
+                  // actually in flight.
+                  kind={rowStreaming ? c.runKind : undefined}
+                  elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   canRun={c.modelAvailable}

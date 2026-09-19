@@ -828,6 +828,36 @@ describe('image-run pending composer i18n keys', () => {
     expect(messages.de.chatImageRunPending).not.toContain('wird erzeugt');
     expect(messages.en.chatImageRunPending).not.toContain('being generated');
   });
+
+  // The ONE thing this design forbids outright: /v1/images/generations
+  // reports neither a percentage nor a remaining-time estimate, so stating
+  // either would assert a measurement that does not exist. Checked against
+  // FORBIDDEN PATTERNS on the strings' own values -- not by asserting the
+  // rendered node equals messages.xx.chatImageNoIntermediateNews itself
+  // (what ChatMessage.test.tsx's wiring test does), which is tautological
+  // and would stay green even if both locales were rewritten to
+  // "Progress: 50% - about 2 minutes remaining." / its German equivalent.
+  it('never states a percentage, a progress word, a remaining-time estimate, or any digit', () => {
+    const forbidden = [
+      /%/,
+      /\bprogress\b/i,
+      /fortschritt/i,
+      /\bremaining\b/i,
+      /verbleibend/i,
+      /\bpercent/i,
+      /prozent/i,
+      /\beta\b/i,
+      /\d/,
+    ];
+    for (const locale of ['de', 'en'] as const) {
+      for (const key of keys) {
+        const value = messages[locale][key];
+        for (const pattern of forbidden) {
+          expect(value).not.toMatch(pattern);
+        }
+      }
+    }
+  });
 });
 
 describe('loaded-model i18n keys', () => {

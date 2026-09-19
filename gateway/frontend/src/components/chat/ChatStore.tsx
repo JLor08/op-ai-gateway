@@ -127,12 +127,37 @@ export type ChatStore = {
   // modelImageCapable — a text thread stays a text thread even if the user
   // later picks an image model.
   chatKind: string;
+  // The active chat's LIVE RUN's own reported kind ("" text | "image"),
+  // read from useChatRuns' kindOf -- deliberately NOT chatKind above.
+  // chatKind is the client's own "is this thread's first send" guess
+  // (messagesRef.current.length === 0) and can disagree with the server's
+  // (len(doc.Messages) > 0): a second tab whose transcript view is stale
+  // after another tab's first send would still guess from the picked model
+  // and could pin the wrong kind locally, and a client whose optimistic pin
+  // survived a rolled-back send carries the same staleness. PrepareChatRun
+  // forces the thread's real, pinned kind server-side on every send after
+  // the first, and the run's own reports (the 201 / an active-runs entry /
+  // an SSE snapshot) are that authoritative, post-force value -- exactly
+  // what the executor is actually running. Undefined only when the active
+  // chat has no run-registry entry at all.
+  //
+  // Chat.tsx passes this to ChatMessage ONLY for the row that is actually
+  // streaming right now, the same gate as the `streaming` prop itself:
+  // passing it to every row unconditionally would hand every ChatMessage a
+  // prop that changes with `streaming`'s own churn and defeat its memo for
+  // rows that are not the one in flight.
+  runKind: string | undefined;
   // The active chat's live run elapsed ms, anchored on the run's own last
   // server-reported measurement and interpolated to "now" at render time
-  // (see useChatRuns' elapsedMsOf). Undefined when the active chat has no
-  // live run. ChatMessage only reads this while it is ALSO told the chat is
-  // streaming (Chat.tsx gates that per-row already), so passing it here
-  // unconditionally is harmless for a text run or a finished chat.
+  // (see useChatRuns' elapsedMsOf). Undefined only when the active chat has
+  // NO run-registry entry at all (never run, or forgotten) -- a run that has
+  // gone terminal but is still lingering in the registry (the eviction
+  // grace) returns its frozen final value here, not undefined. Gated into
+  // ChatMessage exactly like runKind above, and for the same reason: this
+  // value is recomputed on every render and would otherwise be a "different
+  // float essentially every time", defeating ChatMessage's memo for the
+  // WHOLE transcript on every token delta of any live run, not just the row
+  // in flight.
   runElapsedMs: number | undefined;
   // How many more generated images this chat is expected to hold before it
   // hits the backend's content cap, or null when that is unknown (a text
@@ -450,6 +475,7 @@ export function ChatStoreProvider({
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
+    kindOf,
     elapsedMsOf,
     buffers: chatBuffers,
     registerRunning,
@@ -464,13 +490,24 @@ export function ChatStoreProvider({
   // still progress and keep their own entry in runningChatIds.
   const streaming = activeChatId ? runningChatIds.has(activeChatId) : false;
 
-  // The active chat's live run elapsed ms (undefined with no live run),
-  // recomputed at every render from its server anchor -- ChatMessage's own
-  // ImagePendingTurn does the per-second ticking locally, so this need not be
-  // (and for an image run, mostly ISN'T: it emits no incremental events to
-  // re-render on). Read via elapsedMsOf, not a separate piece of state, for
-  // the same reason chatKind above is read from settings rather than
-  // reconstructed here: one source per fact.
+  // The active chat's LIVE RUN's own reported kind and elapsed ms (both
+  // undefined with no registry entry at all), recomputed at every render.
+  // Deliberately NOT chatKind: chatKind is the client's own "is this thread's
+  // first send" guess and can be stale relative to the server's view (a
+  // second tab still holding messages = [] after another tab's first send,
+  // or a client whose optimistic pin survived a rolled-back send) --
+  // PrepareChatRun forces the thread's real pinned kind server-side on every
+  // send after the first, and runKind is read from that authoritative,
+  // post-force value (the 201 / an active-runs entry / an SSE snapshot),
+  // never re-derived from settings. `streaming` above cannot be true for
+  // this chat before kindOf/elapsedMsOf are already populated for it --
+  // markRunning(true) is called only from inside the same openStream() call
+  // that seeds them (useChatRuns.ts) -- so gating a render on `streaming` and
+  // reading `runKind` together is safe with no window where they disagree.
+  // ChatMessage's own ImagePendingTurn does the per-second ticking locally
+  // (an image run emits no incremental events to re-render THIS on), so
+  // runElapsedMs need not tick here.
+  const runKind = activeChatId ? kindOf(activeChatId) : undefined;
   const runElapsedMs = activeChatId ? elapsedMsOf(activeChatId) : undefined;
 
   // The persistence layer (FA-2): owns buildDoc/flushSave, the debounced-save
@@ -660,7 +697,8 @@ export function ChatStoreProvider({
           const active = await apiRef.current.activeChatRuns();
           if (cancelled) return;
           activeRuns = active.data;
-          for (const run of activeRuns) registerRunning(run.chat_id, run.run_id, run.elapsed_ms);
+          for (const run of activeRuns)
+            registerRunning(run.chat_id, run.run_id, run.kind, run.elapsed_ms);
         } catch {
           /* best-effort: no active-run replay */
         }
@@ -693,7 +731,8 @@ export function ChatStoreProvider({
         // its snapshot updates the already-shown trailing assistant; a background
         // running chat is seeded from its server doc inside subscribeRun before
         // its snapshot is applied.
-        for (const run of activeRuns) subscribeRun(run.chat_id, run.run_id, run.elapsed_ms);
+        for (const run of activeRuns)
+          subscribeRun(run.chat_id, run.run_id, run.kind, run.elapsed_ms);
       } catch (err) {
         if (!cancelled) showErrorRef.current(formatPortalError(err, tRef.current));
       } finally {
@@ -865,7 +904,7 @@ export function ChatStoreProvider({
           edited_history: history.map((m) => ({ ...m })),
           settings: currentSettings(),
         });
-        subscribeRun(chatId, res.run_id, res.elapsed_ms);
+        subscribeRun(chatId, res.run_id, res.kind, res.elapsed_ms);
       } catch (err) {
         showErrorRef.current(formatPortalError(err, tRef.current));
       }
@@ -1013,7 +1052,7 @@ export function ChatStoreProvider({
         user_message: content,
         settings: currentSettings(),
       });
-      subscribeRun(chatId, res.run_id, res.elapsed_ms);
+      subscribeRun(chatId, res.run_id, res.kind, res.elapsed_ms);
     } catch (err) {
       showErrorRef.current(formatPortalError(err, tRef.current));
       const rolledBack = messagesRef.current.filter((m) => m.id !== userMessage.id);
@@ -1228,6 +1267,7 @@ export function ChatStoreProvider({
     modelVisionCapable,
     modelImageCapable,
     chatKind,
+    runKind,
     runElapsedMs,
     imageCapacityLeft,
     chats,

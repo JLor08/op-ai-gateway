@@ -115,13 +115,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
     });
 
-    it('hides the clock from assistive technology', () => {
+    it('hides the clock from assistive technology, but not the label or sentence', () => {
       render(
         <ChatMessage t={t} role="assistant" content="" streaming kind="image" elapsedMs={5_000} />,
       );
       // The transcript is an aria-live log; a ticking number would be announced
       // once a second and make the thread unusable with a screen reader.
       expect(screen.getByText('5s').closest('[aria-hidden="true"]')).not.toBeNull();
+      // The POSITIVE half: a mutation that hides the whole bubble (or the
+      // label specifically) would also pass the assertion above, and is the
+      // failure mode that makes this state useless to a screen-reader user
+      // -- the label and sentence must still be announced.
+      expect(screen.getByText(t.chatImageRunPending).closest('[aria-hidden="true"]')).toBeNull();
     });
 
     it('ticks the clock once a second from the server anchor', async () => {
@@ -149,10 +154,17 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     it('leaves the text pending state exactly as it was', () => {
       render(<ChatMessage t={t} role="assistant" content="" streaming reasoning="thinking" />);
-      // No kind prop: the existing counter must be untouched, because this is
-      // the overwhelmingly common case.
-      expect(screen.getByText(new RegExp(t.chatReasoningActive))).toBeInTheDocument();
-      expect(screen.getByText(new RegExp(t.chatCharsUnit))).toBeInTheDocument();
+      // No kind prop: the existing summary must be untouched byte-for-byte,
+      // because this is the overwhelmingly common path. Asserted as the
+      // exact rendered string, not a regex built from t.chatReasoningActive
+      // -- that string's literal "..." is itself a regex wildcard matching
+      // ANY three characters, so /Denkt .../ (or /Thinking .../) would still
+      // match a changed separator or trailing text, and a second, separate
+      // regex for chatCharsUnit would still pass even if the character
+      // count itself were deleted from between them.
+      expect(
+        screen.getByText(`${t.chatReasoningActive} · ${'thinking'.length} ${t.chatCharsUnit}`),
+      ).toBeInTheDocument();
     });
 
     it('does not show the image pending state once an image has arrived, even while still streaming', () => {

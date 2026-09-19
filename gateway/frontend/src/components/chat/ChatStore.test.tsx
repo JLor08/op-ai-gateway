@@ -163,6 +163,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model">{c.model}</span>
       <span data-testid="model-available">{String(c.modelAvailable)}</span>
       <span data-testid="chat-kind">{c.chatKind}</span>
+      <span data-testid="run-kind">{c.runKind ?? ''}</span>
       <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
       <span data-testid="image-capacity">
@@ -1049,7 +1050,49 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
-  describe(`ChatStoreProvider run-elapsed anchor (Task 14) [${locale}]`, () => {
+  describe(`ChatStoreProvider run kind + elapsed anchor (Task 14) [${locale}]`, () => {
+    // Review round 2, Finding 1: the client's "is this thread's first send"
+    // guess (chatKind, derived from messagesRef.current.length === 0) can
+    // disagree with the server's authoritative one (PrepareChatRun, keyed on
+    // len(doc.Messages) > 0) whenever the client's transcript view is stale
+    // -- a second tab still holding messages = [] after another tab's first
+    // send would guess from the picked model and could pin the WRONG kind
+    // locally. runKind must come from the run's own report (here simulated
+    // via the snapshot's `kind`), never from chatKind, so the pending
+    // render always matches what the executor is actually running. This
+    // forces the disagreement directly: chatKind stays '' (a text thread,
+    // by the store's own reckoning) while the run's own snapshot reports
+    // 'image' -- runKind must follow the run, not the thread setting.
+    it("reads the run's own reported kind, not the thread's chatKind, so a stale client view cannot mislabel the pending render", async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+
+      await act(async () => {
+        es.emit('snapshot', { status: 'running', kind: 'image', elapsed_ms: 0 });
+      });
+
+      expect(screen.getByTestId('run-kind').textContent).toBe('image');
+      // chatKind is a DIFFERENT fact (the thread's own settings-level pin)
+      // and must stay whatever it already was -- it is deliberately not
+      // re-derived from the run.
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+    });
+
     // /v1/images/generations refuses `stream`, so an image run's SSE stream
     // carries exactly ONE snapshot near the start and then nothing until
     // `done` -- tens of seconds to minutes later. The composer's pending
