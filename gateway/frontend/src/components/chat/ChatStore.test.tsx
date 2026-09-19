@@ -14,6 +14,7 @@ import {
   type ChatStore,
 } from './ChatStore';
 import { ToastProvider } from '../shared/ToastProvider';
+import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
 import type { ActiveChatRun, ModelOption, PortalToken, ServerModelOption } from '../../api';
 
@@ -485,6 +486,75 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect.objectContaining({ title: 'Renamed' }),
         ),
       );
+    });
+
+    // renameChat writes the new title OPTIMISTICALLY and is the one writer of
+    // the four with no client-side run gate, so this branch's own 409 on
+    // PUT /chats/{id} while a run is active lands squarely on it: without the
+    // rollback the toast says the rename failed while the sidebar goes on
+    // showing the new name until the next reload silently reverts it.
+    //
+    // The run is a REAL one (send -> FakeEventSource), not a stubbed flag:
+    // it is also what keeps the debounced autosave from firing (the save
+    // effect skips a chat with a live run), so the only saveChat in this test
+    // is the rename's own.
+    it('rolls the optimistic title back when a rename is refused during a run', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c_seed',
+          title: 'Seed',
+          created_at: '2026-07-17T10:00:00Z',
+          updated_at: '2026-07-17T10:00:00Z',
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      chatApi.spies.saveChat.mockClear();
+      chatApi.spies.saveChat.mockRejectedValue(
+        new PortalApiError(409, 'portal.chat_run_active', 'a run is active for this chat'),
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c_seed' }));
+
+      // The refusal is reported...
+      await screen.findByText(`portal.chat_run_active: ${t.errorChatRunActive}`);
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1));
+      // ...and the sidebar shows the title the server still holds, not the
+      // one it rejected.
+      expect(screen.getByTestId('chats').textContent).toContain('c_seed:Seed');
+      expect(screen.getByTestId('chats').textContent).not.toContain('c_seed:Renamed');
+    });
+
+    // The rollback is not conditioned on the status code. A 404 (the chat was
+    // deleted in another tab) leaves exactly the same wrong title on screen,
+    // and a rule that reverted only 409s would be a distinction nothing
+    // downstream could act on.
+    it('rolls the optimistic title back on a NON-409 failure too', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c_seed',
+          title: 'Seed',
+          created_at: '2026-07-17T10:00:00Z',
+          updated_at: '2026-07-17T10:00:00Z',
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      chatApi.spies.saveChat.mockRejectedValue(
+        new PortalApiError(404, 'portal.chat_not_found', 'chat not found'),
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c_seed' }));
+
+      await screen.findByText(`portal.chat_not_found: ${t.errorChatNotFound}`);
+      await waitFor(() => expect(screen.getByTestId('chats').textContent).toContain('c_seed:Seed'));
+      expect(screen.getByTestId('chats').textContent).not.toContain('c_seed:Renamed');
     });
 
     it('debounced-saves the active chat after a settings change', async () => {

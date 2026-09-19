@@ -1050,6 +1050,16 @@ second already-open view never learns a run started; the exposure window is the
 run's duration, which an image run stretches from seconds to minutes, and what
 it clobbers is a just-committed image.
 
+**A rename is the one writer that reaches that 409 with no client-side gate,
+so it rolls its optimistic title back.** `renameChat` sets the new title in
+the sidebar before the PUT and never consults `isRunning`, so a rename during
+a run shows a failure toast next to a title that still looks applied — and
+stays that way until a reload silently reverts it. The rollback restores the
+previous title (and the active-title ref) on **every** failure code, not only
+409: a rename refused with 404 because the chat was deleted in another tab
+leaves exactly the same lie on screen, and "which codes revert" is a
+distinction nothing downstream could act on.
+
 **`GET /api/portal/chats` carries `max_content_bytes`.** The composer has to
 state an image thread's remaining capacity *before* the user commits to a
 multi-minute generation, and `portal.MaxChatContentBytes` is a Go constant that

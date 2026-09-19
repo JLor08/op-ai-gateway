@@ -1185,6 +1185,12 @@ export function ChatStoreProvider({
     (id: string, title: string) => {
       const trimmed = title.trim();
       if (!trimmed) return;
+      // Captured BEFORE the optimistic write, so the catch below can put both
+      // back. `previousTitle` is undefined only for an id that is not in the
+      // list at all, in which case the optimistic map below is a no-op too and
+      // there is nothing to roll back.
+      const previousTitle = chatsRef.current.find((chat) => chat.id === id)?.title;
+      const previousActiveTitle = activeTitleRef.current;
       setChats((prev) => prev.map((chat) => (chat.id === id ? { ...chat, title: trimmed } : chat)));
       if (id === activeChatIdRef.current) activeTitleRef.current = trimmed;
       void (async () => {
@@ -1219,6 +1225,30 @@ export function ChatStoreProvider({
             ),
           );
         } catch (err) {
+          // Roll the optimistic title back. Without this the sidebar keeps
+          // showing a name the server rejected until the next reload, when it
+          // silently reverts -- a toast saying "that failed" next to a title
+          // that looks like it succeeded. The one writer of the four with no
+          // client-side run gate, so the 409 this branch added to
+          // PUT /chats/{id} while a run is active reaches it by design.
+          //
+          // On EVERY failure code, not just 409: a rename refused for any
+          // reason (404 on a chat deleted in another tab, a 5xx, the content
+          // fetch above throwing before saveChat is even reached) leaves the
+          // same lie on screen, and "which codes revert" is a distinction
+          // nothing downstream could act on.
+          //
+          // activeTitleRef is restored to what it held BEFORE this call
+          // rather than to previousTitle: the two are the same for the active
+          // chat, and for a rename of a NON-active chat the ref was never
+          // written, so restoring its own captured value is the no-op it
+          // should be.
+          if (previousTitle !== undefined) {
+            setChats((prev) =>
+              prev.map((chat) => (chat.id === id ? { ...chat, title: previousTitle } : chat)),
+            );
+          }
+          activeTitleRef.current = previousActiveTitle;
           showErrorRef.current(formatPortalError(err, tRef.current));
         }
       })();
