@@ -1189,10 +1189,17 @@ export function ChatStoreProvider({
       // back. `previousTitle` is undefined only for an id that is not in the
       // list at all, in which case the optimistic map below is a no-op too and
       // there is nothing to roll back.
+      //
+      // `activeIdAtWrite` is captured too, and it is the load-bearing one: it
+      // is what lets the catch tell "the ref still belongs to the chat I wrote
+      // it for" from "the user has since moved on", which the ids alone at
+      // catch time cannot express. See the catch.
       const previousTitle = chatsRef.current.find((chat) => chat.id === id)?.title;
+      const activeIdAtWrite = activeChatIdRef.current;
+      const wroteActiveTitle = id === activeIdAtWrite;
       const previousActiveTitle = activeTitleRef.current;
       setChats((prev) => prev.map((chat) => (chat.id === id ? { ...chat, title: trimmed } : chat)));
-      if (id === activeChatIdRef.current) activeTitleRef.current = trimmed;
+      if (wroteActiveTitle) activeTitleRef.current = trimmed;
       void (async () => {
         try {
           // The PUT contract requires title + content. Use the live document for
@@ -1238,17 +1245,45 @@ export function ChatStoreProvider({
           // same lie on screen, and "which codes revert" is a distinction
           // nothing downstream could act on.
           //
-          // activeTitleRef is restored to what it held BEFORE this call
-          // rather than to previousTitle: the two are the same for the active
-          // chat, and for a rename of a NON-active chat the ref was never
-          // written, so restoring its own captured value is the no-op it
-          // should be.
+          // THE REF IS NOT THIS CHAT'S TITLE. `activeTitleRef` is the title
+          // the debounced autosave PUTs for whatever chat is active RIGHT
+          // NOW, and "right now" is after an await that the user spent doing
+          // whatever they liked -- including switching chats. An
+          // unconditional restore here therefore writes one chat's old title
+          // into another chat's ref, and the next autosave persists the
+          // rename the server just refused onto a chat nobody renamed, with
+          // no toast about it: rename Alpha, click over to Beta, watch the
+          // 409 this rollback exists for, and Beta is saved as "Alpha".
+          //
+          // So the restore undoes the write above only when the ref still
+          // belongs to the chat that write was for: this call wrote it
+          // (`wroteActiveTitle`) AND the active chat has not changed since
+          // (`activeChatIdRef.current === activeIdAtWrite`). Both conditions
+          // are needed, and each rules out a different hazard:
+          //
+          //   - not written, still same active chat -- a rename of a
+          //     NON-active chat. The ref is some other chat's title and was
+          //     never ours to touch.
+          //   - written, active chat changed -- the Alpha/Beta case above.
+          //     `activateChat` already set the ref to the NEW chat's own
+          //     title (it writes activeChatIdRef and activeTitleRef in the
+          //     same breath), so there is nothing to repair and everything to
+          //     break.
+          //   - not written, active chat changed TO the renamed one -- the
+          //     mirror image: `previousActiveTitle` is the title of a chat
+          //     that is no longer active, and `activateChat` has again
+          //     already set the ref correctly.
+          //
+          // The list row (above) has no such problem: it is keyed by id, so
+          // it is always safe to put back.
           if (previousTitle !== undefined) {
             setChats((prev) =>
               prev.map((chat) => (chat.id === id ? { ...chat, title: previousTitle } : chat)),
             );
           }
-          activeTitleRef.current = previousActiveTitle;
+          if (wroteActiveTitle && activeChatIdRef.current === activeIdAtWrite) {
+            activeTitleRef.current = previousActiveTitle;
+          }
           showErrorRef.current(formatPortalError(err, tRef.current));
         }
       })();

@@ -530,6 +530,136 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('chats').textContent).not.toContain('c_seed:Renamed');
     });
 
+    // The rollback's SECOND half is not the chat's title -- `activeTitleRef`
+    // is the title the debounced autosave PUTs for whatever chat is active
+    // right now, and "right now" is after an await the user can spend
+    // switching chats. Restoring it unconditionally therefore writes the
+    // renamed chat's old title into a DIFFERENT chat's ref, and the next
+    // autosave persists a rename nobody asked for, silently and with no
+    // toast for the chat it lands on.
+    //
+    // Reproduced exactly as a user would: rename Alpha, click over to Beta,
+    // and only then let Alpha's PUT fail with the 409 this rollback exists
+    // for. The PUT is held open with a manual deferred so the chat switch is
+    // deterministically inside the window rather than raced into it.
+    it("does not write the renamed chat's old title into the ref of a chat the user switched to", async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c_alpha',
+          title: 'Alpha',
+          created_at: T2,
+          updated_at: T2,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+        {
+          id: 'c_beta',
+          title: 'Beta',
+          created_at: T1,
+          updated_at: T1,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c_alpha'));
+
+      const workingSave = chatApi.spies.saveChat.getMockImplementation()!;
+      let failRename: (err: unknown) => void = () => {};
+      chatApi.spies.saveChat.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            failRename = reject;
+          }),
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c_alpha' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1));
+
+      // The user moves on while that PUT is still open.
+      fireEvent.click(screen.getByRole('button', { name: 'select-c_beta' }));
+      await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c_beta'));
+
+      // Restore a working save BEFORE the failure, so the autosave below is
+      // observable; the already-pending promise is rejected through its own
+      // captured reject.
+      chatApi.spies.saveChat.mockImplementation(workingSave);
+      failRename(new PortalApiError(409, 'portal.chat_run_active', 'a run is active'));
+
+      await screen.findByText(`portal.chat_run_active: ${t.errorChatRunActive}`);
+      // Alpha's row is rolled back, exactly as when no switch happened.
+      expect(screen.getByTestId('chats').textContent).toContain('c_alpha:Alpha');
+      expect(screen.getByTestId('chats').textContent).not.toContain('c_alpha:Renamed');
+
+      // The real assertion: the next autosave must still be Beta's own
+      // title. `activeTitleRef` is only observable through what flushSave
+      // PUTs, which is also the exact mechanism that made the defect a
+      // SILENT, persisted one.
+      chatApi.spies.saveChat.mockClear();
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 2500 });
+      const [savedId, body] = chatApi.spies.saveChat.mock.calls.at(-1)!;
+      expect(savedId).toBe('c_beta');
+      expect(body.title).toBe('Beta');
+    });
+
+    // The mirror image of the case above, and the reason the guard needs BOTH
+    // of its conditions rather than only "is the renamed chat active now".
+    // Here the rename targets a chat that is NOT active, so the ref was never
+    // written -- and then the user opens that very chat, which makes it
+    // active before the failure lands. A guard that only asked "is this chat
+    // active now?" would answer yes and restore a title belonging to the chat
+    // the user LEFT.
+    it("does not write a departed chat's title into the ref when the user opens the renamed chat", async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c_alpha',
+          title: 'Alpha',
+          created_at: T2,
+          updated_at: T2,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+        {
+          id: 'c_beta',
+          title: 'Beta',
+          created_at: T1,
+          updated_at: T1,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c_alpha'));
+
+      const workingSave = chatApi.spies.saveChat.getMockImplementation()!;
+      let failRename: (err: unknown) => void = () => {};
+      chatApi.spies.saveChat.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            failRename = reject;
+          }),
+      );
+
+      // Beta is NOT the active chat, so this rename never touches the ref.
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c_beta' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(screen.getByRole('button', { name: 'select-c_beta' }));
+      await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c_beta'));
+
+      chatApi.spies.saveChat.mockImplementation(workingSave);
+      failRename(new PortalApiError(409, 'portal.chat_run_active', 'a run is active'));
+
+      await screen.findByText(`portal.chat_run_active: ${t.errorChatRunActive}`);
+      expect(screen.getByTestId('chats').textContent).toContain('c_beta:Beta');
+
+      chatApi.spies.saveChat.mockClear();
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 2500 });
+      const [savedId, body] = chatApi.spies.saveChat.mock.calls.at(-1)!;
+      expect(savedId).toBe('c_beta');
+      expect(body.title).toBe('Beta');
+    });
+
     // The rollback is not conditioned on the status code. A 404 (the chat was
     // deleted in another tab) leaves exactly the same wrong title on screen,
     // and a rule that reverted only 409s would be a distinction nothing
