@@ -835,3 +835,119 @@ func TestImageRunUserCancelStaysACancel(t *testing.T) {
 		t.Fatalf("cancel error = %q, want empty -- a non-empty message is what a TIMEOUT looks like", got)
 	}
 }
+
+// TestImageRunDoneEventCarriesTheCommittedImageParts is the fix for the
+// whole-branch review's finding 1/2, and it lives in the SEAM two separately
+// reviewed tasks left between them.
+//
+// The run's `content` buffer is the STREAMED TEXT one. An image run never
+// writes a byte into it -- its whole output is the structured content the
+// terminal commit stores -- so before content_parts existed the terminal event
+// of a perfectly successful image run carried no content at all. The browser
+// dutifully set the bubble to "" and its own empty-tail prune then deleted the
+// turn the run had just generated and persisted; only the post-`done` refetch
+// of the whole (multi-megabyte) document put it back, and when THAT failed the
+// portal saved the pruned transcript over the server's good one.
+//
+// So the assertion is two-sided on purpose: Content must still be empty (this
+// is not a regression that started stuffing the text buffer) AND ContentParts
+// must carry exactly what the transcript now holds.
+func TestImageRunDoneEventCarriesTheCommittedImageParts(t *testing.T) {
+	// The whole body is written as the first chunk and the handler then stalls,
+	// so the run is reliably still `running` when we subscribe and the `done`
+	// below is genuinely observed over the stream rather than reconstructed
+	// from a late snapshot.
+	upstream, release := stalledImagesUpstream(t, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
+	defer release()
+
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	snap, ch, unsub := run.subscribe()
+	defer unsub()
+	if snap.Status != "running" {
+		t.Fatalf("run status = %q before release, want running -- the stalled upstream must still be holding it", snap.Status)
+	}
+	release()
+
+	var done runEvent
+	for ev := range ch {
+		if ev.Event == "done" {
+			done = ev
+		}
+	}
+	if done.Event != "done" {
+		t.Fatal("the stream closed without a done event")
+	}
+	if done.Status != "completed" {
+		t.Fatalf("done.Status = %q (err %q), want completed", done.Status, done.Err)
+	}
+	if done.Content != "" {
+		t.Fatalf("done.Content = %q, want empty -- an image run streams no text and must not fabricate any", done.Content)
+	}
+	if !strings.Contains(string(done.ContentParts), `data:image/png;base64,AA==`) {
+		t.Fatalf("done.ContentParts = %s, want the committed image part", done.ContentParts)
+	}
+	// ...and what it carries is what was STORED, not a second rendering of it.
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stored.Content), string(done.ContentParts)) {
+		t.Fatalf("done.ContentParts = %s is not what the transcript holds: %s", done.ContentParts, stored.Content)
+	}
+}
+
+// A LATE subscriber -- one that reconnects inside the 30s eviction grace --
+// is served the terminal state as a `snapshot` and never sees a `done` at
+// all (subscribe closes the channel for an already-terminal run). It has
+// exactly the same need for the committed content, so the parts ride on
+// snapshotLocked rather than being bolted onto the done event.
+func TestImageRunTerminalSnapshotCarriesTheCommittedImageParts(t *testing.T) {
+	upstream, _ := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
+
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	snap, _, unsub := run.subscribe()
+	unsub()
+	if snap.Status != "completed" {
+		t.Fatalf("snapshot status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	if !strings.Contains(string(snap.ContentParts), `data:image/png;base64,AA==`) {
+		t.Fatalf("terminal snapshot ContentParts = %s, want the committed image part", snap.ContentParts)
+	}
+}
+
+// The counterpart invariant, and the one finding 3's wording depends on: the
+// terminal event may only claim what the store ACCEPTED. portal.ErrChatTooLarge
+// is the case that matters -- the image was generated and the commit refused --
+// and handing the browser the parts anyway would recreate "rendered, then
+// vanished on reload" in its other direction, with the error label telling the
+// user to download an image that is about to disappear.
+func TestImageRunTerminalEventWithholdsPartsWhenTheCommitFailed(t *testing.T) {
+	upstream, _ := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
+
+	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	srv.Portal = &commitFailingPortal{API: srv.Portal, err: portal.ErrChatTooLarge}
+	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+
+	snap, _, unsub := run.subscribe()
+	unsub()
+	if snap.Status != "error" || snap.Err != "portal.chat_too_large" {
+		t.Fatalf("terminal = (%q, %q), want (error, portal.chat_too_large)", snap.Status, snap.Err)
+	}
+	if len(snap.ContentParts) != 0 {
+		t.Fatalf("ContentParts = %s, want none -- nothing was stored, so the event must claim nothing", snap.ContentParts)
+	}
+}

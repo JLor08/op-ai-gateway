@@ -143,6 +143,28 @@ type runEvent struct {
 	// add a per-token cost to every text run and buy nothing.
 	Kind      string `json:"kind,omitempty"`
 	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
+	// ContentParts is the turn's STRUCTURED content, exactly as
+	// CommitAssistant stored it (portal.AssistantTurn.ContentParts) -- the
+	// image run's one and only output. Content above is the streamed TEXT
+	// buffer, and an image run never writes a byte into it, so without this
+	// field the terminal event of a successful image run carries no content at
+	// all: the client sets the bubble to "" and its own
+	// empty-tail prune then deletes the turn it just generated, leaving the
+	// post-`done` canonical refetch as the ONLY thing between the user and a
+	// blank thread. The event now carries what was stored, so the refetch is an
+	// optimisation again rather than a load-bearing repair.
+	//
+	// It rides on `snapshot` and `done` only, like Kind/ElapsedMs and for the
+	// same reason -- and a late subscriber inside the eviction grace, which is
+	// served the terminal state as a `snapshot` and never sees a `done`, needs
+	// it just as much.
+	//
+	// STRICTLY WHAT WAS COMMITTED: finishRunWithParts clears it when
+	// CommitAssistant fails, so a turn the store refused (portal.chat_too_large
+	// above all) is not rendered as though it had been saved. json.RawMessage,
+	// not a decoded shape: this is the identical blob the transcript holds and
+	// this layer has no business re-encoding it.
+	ContentParts json.RawMessage `json:"content_parts,omitempty"`
 }
 
 type runMetrics struct {
@@ -186,15 +208,22 @@ type ChatRun struct {
 	// launchRun writes this -- so the write genuinely races those readers
 	// unless it is synchronized. startedAt needs no such guard because it is
 	// written by the constructor, before any reference escapes.
-	kind        string
-	status      string // running | completed | error | canceled
-	reasoning   strings.Builder
-	content     strings.Builder
-	metrics     runMetrics
-	errMsg      string
-	cancel      func()
-	subscribers map[chan runEvent]struct{}
-	endedAt     time.Time
+	kind      string
+	status    string // running | completed | error | canceled
+	reasoning strings.Builder
+	content   strings.Builder
+	// contentParts is the structured content the terminal commit ACTUALLY
+	// stored, set once by finish and nil for every run whose output was the
+	// streamed text buffer (and for every run whose commit failed). It is the
+	// run's own copy of what the transcript now holds, so a subscriber can be
+	// told the truth about an image turn without refetching the document --
+	// see runEvent.ContentParts.
+	contentParts json.RawMessage
+	metrics      runMetrics
+	errMsg       string
+	cancel       func()
+	subscribers  map[chan runEvent]struct{}
+	endedAt      time.Time
 }
 
 // newChatRun stamps startedAt from time.Now() directly rather than from the
@@ -278,6 +307,7 @@ func (r *ChatRun) snapshotLocked() runEvent {
 		Event: "snapshot", Reasoning: r.reasoning.String(), Content: r.content.String(),
 		Metrics: &m, Status: r.status, Err: r.errMsg,
 		Kind: r.kind, ElapsedMs: r.elapsedMsLocked(),
+		ContentParts: r.contentParts,
 	}
 }
 
@@ -319,7 +349,12 @@ func (r *ChatRun) setMetrics(m runMetrics) {
 	r.mu.Unlock()
 }
 
-func (r *ChatRun) finish(status, errMsg string) {
+// finish marks the run terminal and fans out the `done` event. parts is the
+// structured content the terminal commit STORED (nil for a text run, and nil
+// for any run whose commit failed): it is recorded on the run under the SAME
+// acquisition of r.mu that flips the status, so no subscriber can ever be
+// served a snapshot whose status and content disagree.
+func (r *ChatRun) finish(status, errMsg string, parts json.RawMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.status != "running" {
@@ -327,6 +362,7 @@ func (r *ChatRun) finish(status, errMsg string) {
 	}
 	r.status = status
 	r.errMsg = errMsg
+	r.contentParts = parts
 	r.endedAt = time.Now()
 	term := r.snapshotLocked()
 	term.Event = "done"
@@ -568,10 +604,13 @@ func commitFailureIsChatGone(err error) bool {
 // commitFailureIsChatGone has ruled out "the chat is gone") to the
 // run-terminal code finishRunWithParts substitutes for the status/message the
 // run was about to report. portal.ErrChatTooLarge is surfaced VERBATIM: it is
-// a named, actionable sentinel (the frontend's label tells the user to
-// download the image on screen and start a new chat, per its own doc comment
-// in service_chats.go), unlike an arbitrary store failure -- a driver error, a
-// marshal failure -- which the user cannot act on and which therefore
+// a named, actionable sentinel -- the frontend's label (errorChatTooLarge,
+// i18n.ts) tells the user that nothing was stored for this turn and to start a
+// new chat, which is a thread with the whole budget free. It deliberately does
+// NOT tell them to download the image: on this path the commit failed, so
+// finishRunWithParts withholds the parts from the terminal event and there is
+// no image on screen to save. An arbitrary store failure -- a driver error, a
+// marshal failure -- is something the user cannot act on and therefore
 // degrades to one generic, stable code rather than reaching the browser as a
 // raw Go error string.
 func commitFailureCode(err error) string {
@@ -932,6 +971,12 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 // every text run and on every failing image run, which is byte-for-byte the
 // behaviour finishRun had before this parameter existed.
 //
+// The parts also ride on the run's TERMINAL EVENT, but only once the commit
+// has actually succeeded -- see runEvent.ContentParts and `committed` below.
+// That is what lets the browser render the stored image from the `done` it is
+// already handed, instead of depending on a refetch of the whole
+// (multi-megabyte) document to discover a turn the event told it nothing about.
+//
 // Keeping ONE commit function rather than a second one for images is what
 // keeps the retire/finish/log bookkeeping below single-sourced: a run's
 // terminal step is the same step whatever it produced.
@@ -974,17 +1019,26 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// canceled -- reporting success with nothing stored, the exact defect
 	// this task closes. "canceled" is therefore load-bearing, not merely a
 	// hint at why the error occurred.
+	//
+	// committed is what the terminal event may claim was STORED. It starts as
+	// the parts this call was asked to persist and is cleared the moment the
+	// write fails, so the browser is never handed an image to render for a
+	// turn the store refused -- that is the "rendered and then vanished on
+	// reload" loss in its other direction, and it is precisely the case
+	// (portal.chat_too_large) where the user is told to start a new chat.
+	committed := parts
 	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 		ContentParts: parts,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
+		committed = nil
 		if status != "canceled" || !commitFailureIsChatGone(err) {
 			status, errMsg = "error", commitFailureCode(err)
 		}
 	}
-	run.finish(status, errMsg)
+	run.finish(status, errMsg, committed)
 	// Free the per-chat/cap slot immediately on terminal so the chat's next turn
 	// (and the user's next chat) is not blocked during the 30s eviction grace;
 	// the run stays reachable by id for late terminal snapshots (see retire).

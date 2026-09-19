@@ -2864,13 +2864,28 @@ describe('portal chat image generation error i18n keys', () => {
     }
   });
 
-  // errorChatTooLarge is the one that matters most: the user's image exists
-  // on screen and cannot be stored, so the message must actually tell them
-  // what to do (download it, start a new chat) rather than just naming the
-  // failure.
+  // errorChatTooLarge is the one that matters most, and the advice it gives
+  // has to match what actually happened. On BOTH paths that raise this code
+  // the write was refused and nothing was stored -- and the run withholds the
+  // image parts from its terminal event when the commit fails
+  // (finishRunWithParts, chat_runs.go), so there is no image on screen either.
+  // The message therefore says nothing was saved and names the one action
+  // that helps, a new chat; it must NOT tell the user to download something
+  // that is not there.
   it('tells the user what to do about a too-large chat, in both locales', () => {
     expect(messages.de.errorChatTooLarge).toContain('neuen Chat');
     expect(messages.en.errorChatTooLarge).toContain('new chat');
+    expect(messages.de.errorChatTooLarge).not.toMatch(/herunterladen|Download/i);
+    expect(messages.en.errorChatTooLarge).not.toMatch(/download/i);
+  });
+
+  // The failed-canonical-refetch notice (whole-branch review, finding 1/2):
+  // the run succeeded and the turn IS on the server, but this tab stops
+  // saving the chat, and a silent stop is the failure mode the refusal exists
+  // to prevent in the first place.
+  it('defines the stale-transcript notice in both locales', () => {
+    expect(messages.de.errorChatTranscriptStale.length).toBeGreaterThan(0);
+    expect(messages.en.errorChatTranscriptStale.length).toBeGreaterThan(0);
   });
 });
 

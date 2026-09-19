@@ -51,6 +51,20 @@ export type ChatPersistenceApi = {
   // next change (used when discarding the active chat's pending save outside
   // a load — e.g. deleteChat).
   cancelPendingSave: () => void;
+  // Mark (or clear) a chat whose LOCAL transcript is not known to match the
+  // server's committed one, which blocks every save path below for that chat.
+  //
+  // It exists because a PUT full-replaces the stored content blob with no
+  // merge: saving a transcript this client cannot vouch for does not risk a
+  // conflict, it destroys whatever the server holds that the client is
+  // missing. The one producer is the run engine's post-terminal canonical
+  // refetch (useChatRuns' adoptCanonicalTranscript), which marks BEFORE its
+  // await and clears only once it has adopted the server's own answer — a
+  // refetch of a multi-megabyte image document can easily outlast the 800 ms
+  // debounce, so cancelling a pending save in the failure handler would be
+  // too late by then. Cleared again by a successful adopt, by deleteChat, and
+  // by activating a chat straight from a freshly loaded server document.
+  setTranscriptStale: (chatId: string, stale: boolean) => void;
   // Final best-effort flush on a real provider unmount (logout): cancels the
   // pending timer and, unless a run is live, fires a synchronous-dispatch
   // save for the active chat if it is dirty.
@@ -138,6 +152,13 @@ export function useChatPersistence(
   // effect ignores the load-induced state changes (we must not immediately
   // re-save freshly-loaded content).
   const skipSaveRef = useRef(false);
+  // Chats whose local transcript is not known to match the server's committed
+  // one; every save path below refuses them. Per-CHAT rather than a single
+  // flag because the run engine adopts background chats too, and
+  // activateChat can seed a chat from its buffer rather than from the server
+  // doc — so a background chat's unproven buffer must still be refused once
+  // it becomes the active one. See setTranscriptStale in the API type above.
+  const staleChatsRef = useRef<Set<string>>(new Set());
 
   // Build the opaque content document from the current active-chat state.
   const buildDoc = useCallback(
@@ -181,6 +202,10 @@ export function useChatPersistence(
     // The server owns the transcript tail while a run is live — never PUT over
     // it (would clobber the just-committed / in-flight assistant turn).
     if (isRunning(id)) return;
+    // ...and never PUT a transcript this client cannot vouch for. dirty is
+    // deliberately LEFT SET: the content still needs saving, just not from
+    // this copy, so the next save after the chat is reloaded picks it up.
+    if (staleChatsRef.current.has(id)) return;
     dirtyRef.current = false;
     try {
       const saved = await apiRef.current.saveChat(id, {
@@ -213,6 +238,9 @@ export function useChatPersistence(
     }
     dirtyRef.current = true;
     if (isRunning(activeChatId)) return;
+    // No staleChatsRef check here on purpose: the timer's only action is
+    // flushSave, which refuses a stale chat itself, and a second copy of the
+    // rule here would be one no test could distinguish from its absence.
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       void flushSave();
@@ -244,6 +272,9 @@ export function useChatPersistence(
       if (!id || !dirtyRef.current) return;
       // Server owns the transcript while a run is live — skip the keepalive PUT.
       if (isRunning(id)) return;
+      // Same refusal as flushSave: an unproven buffer must not be written,
+      // and least of all by the one path whose failure is invisible.
+      if (staleChatsRef.current.has(id)) return;
       const payload = { title: activeTitleRef.current, content: buildDoc() };
       // Skipped, and deliberately silently. For EVERY image thread this is the
       // taken branch (a single inline base64 image is far past 60 KB), so the
@@ -301,6 +332,11 @@ export function useChatPersistence(
     dirtyRef.current = false;
   }, []);
 
+  const setTranscriptStale = useCallback((chatId: string, stale: boolean) => {
+    if (stale) staleChatsRef.current.add(chatId);
+    else staleChatsRef.current.delete(chatId);
+  }, []);
+
   // Final best-effort flush on a real provider unmount (logout — a
   // client-side state change, NOT a page reload, so this fires reliably
   // unlike the pagehide path). The caller (ChatStoreProvider) invokes this
@@ -312,7 +348,7 @@ export function useChatPersistence(
       saveTimerRef.current = null;
     }
     const id = activeChatIdRef.current;
-    if (id && dirtyRef.current && !isRunning(id)) {
+    if (id && dirtyRef.current && !isRunning(id) && !staleChatsRef.current.has(id)) {
       dirtyRef.current = false;
       void apiRef.current
         .saveChat(id, { title: activeTitleRef.current, content: buildDoc() })
@@ -326,6 +362,7 @@ export function useChatPersistence(
     clearDirty,
     skipNextSave,
     cancelPendingSave,
+    setTranscriptStale,
     flushOnUnmount,
   };
 }

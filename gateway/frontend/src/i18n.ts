@@ -1329,8 +1329,18 @@ const de = {
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
   // exact wire codes each key answers.
+  // Kein „Laden Sie das Bild herunter“: Auf beiden Wegen, die diesen Code
+  // auslösen, wurde nichts gespeichert – der Lauf hält die Bildteile beim
+  // fehlgeschlagenen Commit zurück (finishRunWithParts), es steht also auch
+  // nichts zum Sichern auf dem Bildschirm.
   errorChatTooLarge:
-    'Der Chat ist zu groß zum Speichern. Laden Sie das Bild herunter und starten Sie einen neuen Chat.',
+    'Der Chat ist zu groß zum Speichern – dieser Beitrag wurde nicht gespeichert. Starten Sie einen neuen Chat und versuchen Sie es erneut.',
+  // Der Lauf war erfolgreich und der Beitrag liegt auf dem Server, aber dieser
+  // Tab konnte den maßgeblichen Stand nicht nachladen. Er speichert diesen
+  // Chat deshalb nicht mehr (ein PUT würde den Serverstand vollständig
+  // ersetzen), bis er neu geladen wird.
+  errorChatTranscriptStale:
+    'Der gespeicherte Verlauf dieses Chats konnte nicht geladen werden. Ihre Antwort ist auf dem Server, dieser Tab speichert den Chat aber bis zum Neuladen nicht mehr.',
   errorChatRunActive:
     'Für diesen Chat läuft bereits eine Antwort. Bitte warten Sie, bis sie fertig ist.',
   errorChatRunLimit:
@@ -3664,7 +3674,17 @@ const en: PortalMessages = {
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
   // exact wire codes each key answers.
-  errorChatTooLarge: 'The chat is too large to save. Download the image and start a new chat.',
+  // NOT "download the image": on both paths that raise this code nothing was
+  // stored, and the run withholds the image parts from its terminal event
+  // when the commit failed (finishRunWithParts), so there is nothing on
+  // screen to save either.
+  errorChatTooLarge:
+    'The chat is too large to save, so this turn was not stored. Start a new chat and try again.',
+  // The run itself succeeded and the turn IS on the server, but this tab
+  // could not fetch the authoritative copy back. It therefore stops saving
+  // this chat (a PUT full-replaces the stored document) until it is reloaded.
+  errorChatTranscriptStale:
+    "This chat's saved history could not be loaded. Your response is on the server, but this tab will not save the chat again until you reload.",
   errorChatRunActive: 'A response is already running for this chat. Please wait until it finishes.',
   errorChatRunLimit: 'Too many responses are running at once. Please wait for one to finish.',
   errorMappingCapabilityReserved:

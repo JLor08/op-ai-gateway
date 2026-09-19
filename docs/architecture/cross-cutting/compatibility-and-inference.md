@@ -947,9 +947,13 @@ while every turn was a few KB of text; an inline image routinely approaches
 and then vanished on reload with only a log line behind it. A commit failure
 now overrides whatever terminal the run was about to report:
 `portal.chat_too_large` is surfaced **verbatim**, being a named and actionable
-condition (download the image on screen, start a new chat), while any other
-store failure degrades to one stable `gateway.chat_run_commit_failed` rather
-than reaching a portal bubble as a raw Go error string. **One exception:** a
+condition — nothing was stored for this turn, so the one thing that helps is a
+new chat, which starts with the whole budget free. It deliberately does **not**
+tell the user to download the image: the commit failed, so the terminal event
+carries no content parts (below) and there is nothing on screen to save. Any
+other store failure degrades to one stable `gateway.chat_run_commit_failed`
+rather than reaching a portal bubble as a raw Go error string. **One
+exception:** a
 run already ending `canceled` whose chat is simply *gone* keeps its own status,
 because `DELETE /chats/{id}` cancels that chat's run and removes its row in the
 same request and there is nothing left to persist for. The `canceled` half of
@@ -996,6 +1000,32 @@ than from the request's `n` (§3.4). That is the same shape an *uploaded* vision
 image already has (§11), so history construction feeds a generated image back
 as a vision input on the next turn with no extra code, and the transcript
 renderer already understood it.
+
+**The run's terminal event carries what was committed, and only that.** The
+SSE `snapshot`/`done` events carry a `content_parts` field alongside `content`.
+`content` is the run's streamed **text** buffer, and an image run never writes
+a byte into it, so without `content_parts` the terminal event of a perfectly
+successful image run carries **no content at all** — the browser sets the
+bubble to `""`, its own empty-tail prune (correctly, by its own rule) deletes
+the turn, and only the post-`done` refetch of the whole multi-megabyte
+document puts it back. That made a best-effort optimisation the single thing
+standing between the user and a blank thread, and a failed refetch followed by
+the portal's ordinary debounced save then wrote the pruned transcript over the
+server's good one. The field is set **only when `CommitAssistant` succeeded**,
+so the event can never claim a turn the store refused; it rides on
+`snapshot` as well as `done`, because a late subscriber inside the eviction
+grace is served the terminal state as a snapshot and never sees a `done`.
+
+**And the portal refuses to save a transcript it could not reconcile.** The
+post-terminal canonical refetch marks the chat *unproven* before its request
+and clears the mark only once it has adopted the server's answer; while the
+mark stands, every save path (the debounced PUT, the `pagehide` keepalive, the
+unmount flush) refuses that chat and the user is told the tab has stopped
+persisting it. A refetch of an image document can easily outlast the 800 ms
+save debounce, so cancelling a pending save on failure would be too late —
+the refusal has to be armed before the request, not after it. The mark is
+lifted again when the chat is next activated straight from a freshly loaded
+server document.
 
 **`PUT /api/portal/chats/{id}` is refused while a run is active for that
 chat** — 409 `portal.chat_run_active`, the same sentinel the run-start endpoint

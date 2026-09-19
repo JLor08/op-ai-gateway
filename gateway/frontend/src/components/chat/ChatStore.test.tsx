@@ -156,6 +156,19 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="count">{c.messages.length}</span>
       <span data-testid="streaming">{String(c.streaming)}</span>
       <span data-testid="last">{lastText}</span>
+      {/* The last turn's STRUCTURED content, as "type:detail" per part (empty
+          for a plain string). `last` above can only ever show text, so without
+          this a test about an image turn can assert that a bubble EXISTS but
+          not that it holds the generated image. */}
+      <span data-testid="last-parts">
+        {Array.isArray(last?.content)
+          ? last.content
+              .map((p) =>
+                p.type === 'image_url' ? `image_url:${p.image_url.url}` : `text:${p.text}`,
+              )
+              .join('|')
+          : ''}
+      </span>
       <span data-testid="last-status">{last?.status ?? ''}</span>
       <span data-testid="loading">{String(c.chatsLoading)}</span>
       <span data-testid="active">{c.activeChatId ?? ''}</span>
@@ -1213,6 +1226,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // bubble was deleted the instant `done` arrived, even though generation
     // and persistence both succeeded.
     //
+    // THE PAYLOAD BELOW IS THE REAL WIRE SHAPE, and that is the whole point.
+    // This test used to emit `content: [{type:'image_url',...}]`, which the
+    // backend cannot produce: `content` is the run's streamed TEXT buffer and
+    // is a Go string. The real terminal event of an image run carries its
+    // structured content under `content_parts` (runEvent.ContentParts,
+    // chat_runs.go) -- and before that field existed it carried NO content at
+    // all, so the prune fix this test guards was never on a path the product
+    // reached. Emitting the shape the backend actually sends is what makes it
+    // load-bearing.
+    //
     // Both tests below force the post-`done` canonical refetch
     // (adoptCanonicalTranscript) to fail. That refetch unconditionally
     // replaces the whole buffer with whatever the server doc holds, so a
@@ -1242,15 +1265,27 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const es = FakeEventSource.instances[0];
 
       await act(async () => {
+        // Byte-for-byte what the backend emits for a successful image run: the
+        // terminal status, the per-run facts, NO `content` (the text buffer is
+        // empty and omitempty drops it), and the committed parts under
+        // `content_parts`.
         es.emit('done', {
-          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
           status: 'completed',
+          kind: 'image',
+          elapsed_ms: 42_000,
+          content_parts: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
         });
       });
 
       await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
       // user turn + the assistant bubble holding the generated image.
       expect(screen.getByTestId('count').textContent).toBe('2');
+      // ...and the bubble holds the IMAGE, not an empty string that merely
+      // survived the prune. Without the content_parts read in useChatRuns the
+      // count above can still be 2 for a bubble that renders nothing.
+      expect(screen.getByTestId('last-parts').textContent).toBe(
+        'image_url:data:image/png;base64,AA==',
+      );
     });
 
     // The regression guard: the prune must keep doing its actual job on the
@@ -1283,6 +1318,166 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
       // Only the user turn remains -- the empty assistant bubble was pruned.
       expect(screen.getByTestId('count').textContent).toBe('1');
+    });
+  });
+
+  describe(`ChatStoreProvider never saves a transcript it could not reconcile [${locale}]`, () => {
+    // The second half of the whole-branch review's finding 1/2. The
+    // post-`done` canonical refetch is best-effort by design, but its failure
+    // used to be swallowed AND followed, ~800 ms later, by a debounced PUT of
+    // the local buffer -- and a PUT full-replaces the stored content blob with
+    // no merge. So a refetch that failed (it downloads the whole document,
+    // which for an image thread is megabytes) made the portal overwrite the
+    // server's committed turn with a transcript that did not contain it.
+    //
+    // The refusal is armed BEFORE the await, not in the catch: a refetch can
+    // easily outlast the 800 ms debounce, and by the time its rejection lands
+    // there would be nothing left to cancel. So the test advances well past
+    // the debounce with the rejection still pending, and only then rejects.
+    it('saves nothing after a failed canonical refetch, and says so', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderProvider();
+        await waitForReady();
+        chatApi.spies.saveChat.mockClear();
+        let failRefetch: (() => void) | undefined;
+        chatApi.spies.chat.mockImplementation(
+          () =>
+            new Promise((_resolve, reject) => {
+              failRefetch = () => reject(new Error('refetch unavailable'));
+            }),
+        );
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'draw a cat' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        const es = FakeEventSource.instances[0];
+
+        await act(async () => {
+          es.emit('done', {
+            status: 'completed',
+            kind: 'image',
+            content_parts: [
+              { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+            ],
+          });
+        });
+        await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+
+        // Well past SAVE_DEBOUNCE_MS while the refetch is still in flight.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5000);
+        });
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+
+        // ...and still nothing once it actually fails.
+        await act(async () => {
+          failRefetch?.();
+          await vi.advanceTimersByTimeAsync(5000);
+        });
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        // The image is still on screen (the terminal event carried it), so the
+        // thread looks healthy -- which is exactly why the user has to be told
+        // that this tab has stopped persisting it.
+        expect(screen.getByTestId('last-parts').textContent).toBe(
+          'image_url:data:image/png;base64,AA==',
+        );
+        expect(await screen.findByText(t.errorChatTranscriptStale)).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // flushSave is not the only writer: the pagehide keepalive and the
+    // unmount flush each PUT directly, bypassing it. Three doors on the same
+    // room, so the refusal has to be on all three -- and the two quiet ones
+    // are the worse ones to get wrong, because a keepalive PUT's outcome is
+    // invisible on the client side by construction.
+    it('writes nothing on pagehide or unmount either, after a failed canonical refetch', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      const { unmount } = renderProvider();
+      await waitForReady();
+      chatApi.spies.saveChat.mockClear();
+      chatApi.spies.saveChatKeepalive.mockClear();
+      chatApi.spies.chat.mockRejectedValue(new Error('refetch unavailable'));
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+
+      await act(async () => {
+        es.emit('done', { status: 'completed', content: 'an answer' });
+      });
+      await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+      await screen.findByText(t.errorChatTranscriptStale);
+
+      await act(async () => {
+        window.dispatchEvent(new Event('pagehide'));
+      });
+      expect(chatApi.spies.saveChatKeepalive).not.toHaveBeenCalled();
+
+      await act(async () => {
+        unmount();
+      });
+      expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+    });
+
+    // The other side of the same switch: an adopt that SUCCEEDS must leave
+    // persistence working. Without this a fix that simply stopped saving
+    // after every run would pass the test above and silently break autosave
+    // for every chat.
+    it('saves again once the canonical refetch succeeds', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        renderProvider();
+        await waitForReady();
+        chatApi.spies.saveChat.mockClear();
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        const es = FakeEventSource.instances[0];
+
+        await act(async () => {
+          es.emit('done', { status: 'completed', content: 'an answer' });
+        });
+        await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+
+        fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2000);
+        });
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled());
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

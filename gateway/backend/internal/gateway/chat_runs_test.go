@@ -125,7 +125,7 @@ func TestActiveForUserRunningOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Finish c2's run: it stays in the registry (not yet evicted) but is terminal.
-	finished.finish("completed", "")
+	finished.finish("completed", "", nil)
 	if got := reg.Get("u1", "c2"); got != finished {
 		t.Fatal("finished run should still be registered until eviction")
 	}
@@ -218,7 +218,7 @@ func TestRunSubscribeSnapshotThenDelta(t *testing.T) {
 	if ev.Content != "llo" {
 		t.Fatalf("bad delta: %+v", ev)
 	}
-	run.finish("completed", "")
+	run.finish("completed", "", nil)
 	term := <-ch
 	if term.Status != "completed" {
 		t.Fatalf("bad terminal: %+v", term)
@@ -736,7 +736,7 @@ func TestRunAgeIsFrozenOnceTerminal(t *testing.T) {
 	before := time.Now()
 	run := newChatRun("run_age", "c1", "u1", func() {})
 	time.Sleep(duration)
-	run.finish("completed", "")
+	run.finish("completed", "", nil)
 	ceiling := time.Since(before).Milliseconds() + 1
 
 	first, _, unsub := run.subscribe()
@@ -781,7 +781,7 @@ func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
 	if strings.Contains(string(raw), "elapsed_ms") || strings.Contains(string(raw), `"kind"`) {
 		t.Fatalf("delta wire frame must carry neither kind nor elapsed_ms: %s", raw)
 	}
-	run.finish("completed", "")
+	run.finish("completed", "", nil)
 	term := <-ch
 	if term.Kind != "image" {
 		t.Fatalf("done kind = %q, want image", term.Kind)
@@ -1150,8 +1150,8 @@ func TestFinishRunCommitFailureEndsTheRunAsError(t *testing.T) {
 
 // TestFinishRunCommitFailureSurfacesChatTooLarge is the over-cap case task 7
 // confirmed as a silent success: portal.ErrChatTooLarge is a named,
-// actionable sentinel (the frontend's label tells the user to download the
-// image already on screen and start a new chat), so it must be surfaced
+// actionable sentinel (the frontend's label tells the user that nothing was
+// stored for this turn and to start a new chat), so it must be surfaced
 // VERBATIM rather than degraded to the generic commitFailureCode.
 func TestFinishRunCommitFailureSurfacesChatTooLarge(t *testing.T) {
 	srv, owner, chatID := newRunTestServer(t)

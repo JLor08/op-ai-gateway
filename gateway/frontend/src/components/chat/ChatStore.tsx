@@ -483,6 +483,7 @@ export function ChatStoreProvider({
     forget: forgetRun,
     closeAll: closeAllRuns,
     onTerminal,
+    onTranscriptStale,
   } = runs;
 
   // The active chat's streaming flag. A run is bound to a chat, not to "the UI",
@@ -545,8 +546,15 @@ export function ChatStoreProvider({
     isRunning,
     setChats,
   );
-  const { buildDoc, flushSave, clearDirty, skipNextSave, cancelPendingSave, flushOnUnmount } =
-    persistence;
+  const {
+    buildDoc,
+    flushSave,
+    clearDirty,
+    skipNextSave,
+    cancelPendingSave,
+    setTranscriptStale,
+    flushOnUnmount,
+  } = persistence;
 
   // Wire persistence's dirty-clearing into the run engine's terminal callback
   // (replaces a direct dirtyRef write formerly inline in finishRun). Cheap ref
@@ -555,6 +563,12 @@ export function ChatStoreProvider({
   onTerminal((chatId) => {
     if (chatId === activeChatIdRef.current) clearDirty();
   });
+  // ...and persistence's save suppression into the run engine's canonical
+  // refetch. NOT gated on the active chat: the engine adopts background chats
+  // too, and activateChat prefers a chat's streamed buffer over the freshly
+  // loaded doc, so an unproven background buffer would otherwise become the
+  // active transcript and be PUT over the server's good copy.
+  onTranscriptStale(setTranscriptStale);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -607,10 +621,14 @@ export function ChatStoreProvider({
       // server doc. At bootstrap a run's metadata is registered before any
       // snapshot has streamed in, so the buffer is empty/absent and the doc wins.
       const buffered = chatBuffers.get(chat.id);
-      let seed =
-        buffered && buffered.length > 0 && runStatusOf(chat.id) !== undefined
-          ? buffered
-          : doc.messages;
+      const streamed =
+        buffered && buffered.length > 0 && runStatusOf(chat.id) !== undefined ? buffered : null;
+      let seed = streamed ?? doc.messages;
+      // Seeding from `chat.content` is the one moment this client KNOWS its
+      // transcript is the server's, so it is where a stale mark left by a
+      // failed canonical refetch is lifted. Seeding from the buffer proves
+      // nothing and therefore lifts nothing.
+      if (!streamed) setTranscriptStale(chat.id, false);
       // Interrupted detection (Task 3.4): a trailing `pending` assistant with no
       // active run was cut off — a gateway restart lost the run from the registry.
       // Keep the partial output but mark it interrupted. A chat WITH an active run
@@ -630,7 +648,7 @@ export function ChatStoreProvider({
       activeTitleRef.current = chat.title ?? '';
       lsSet(ACTIVE_ID_KEY, chat.id);
     },
-    [chatBuffers, runStatusOf, skipNextSave, cancelPendingSave],
+    [chatBuffers, runStatusOf, skipNextSave, cancelPendingSave, setTranscriptStale],
   );
 
   // The current per-chat generation settings sent when starting a run. The model

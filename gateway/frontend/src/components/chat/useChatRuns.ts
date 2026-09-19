@@ -16,6 +16,7 @@ import {
   type SetStateAction,
 } from 'react';
 import type { Chat, ChatRunStatus, PortalApi } from '../../api';
+import type { ChatContent, ChatContentPart } from '../shared/chatContent';
 import { formatChatRunErrorCode } from '../shared/format';
 import type { Translation } from '../shared/types';
 import {
@@ -82,14 +83,43 @@ type SnapshotPayload = {
   error?: string;
   kind?: string;
   elapsed_ms?: number;
+  // The turn's STRUCTURED content, exactly as the backend committed it
+  // (runEvent.ContentParts, chat_runs.go). `content` above is the run's
+  // streamed TEXT buffer and an image run never writes a byte into it, so
+  // before this field existed the terminal event of a successful image run
+  // carried no content at all — the bubble was set to '', finishRun's own
+  // empty-tail prune deleted it, and only the post-`done` refetch of the whole
+  // multi-megabyte document put it back. Absent on every text run, and absent
+  // on ANY run whose commit failed: the backend clears it rather than letting
+  // the event claim a turn the store refused.
+  content_parts?: ChatContentPart[];
 };
 type DeltaPayload = { reasoning?: string; content?: string };
+
+// The content a snapshot/done event says the turn HAS. The two shapes are not
+// alternatives the client may choose between: `content_parts` is what the
+// transcript holds for a structured (image) turn, `content` is the streamed
+// text for every other one, and exactly one of them is ever non-empty. An
+// empty array is treated as absent so it can never shadow the text buffer.
+function contentOf(payload: SnapshotPayload): ChatContent {
+  const parts = payload.content_parts;
+  if (Array.isArray(parts) && parts.length > 0) return parts;
+  return payload.content ?? '';
+}
 
 // Invoked whenever a chat's run reaches a terminal state (completed / error /
 // canceled / interrupted). The provider wires persistence's dirty-clearing
 // through this — it REPLACES the direct dirtyRef write formerly inline in
 // finishRun, so the run engine never reaches into persistence's bookkeeping.
 export type RunTerminalHandler = (chatId: string) => void;
+
+// Invoked around the post-terminal canonical refetch (adoptCanonicalTranscript)
+// with whether this chat's local transcript is KNOWN to match the server's
+// committed one: false while the refetch is in flight and after it fails, true
+// once it has been adopted. The provider wires persistence's save suppression
+// through it — see useChatPersistence.setTranscriptStale for why a failed
+// refetch must block the save rather than merely cancel a pending one.
+export type TranscriptStaleHandler = (chatId: string, stale: boolean) => void;
 
 export type ChatRunsApi = {
   // Chats with a live server run (any chat, not just the active one). Mirrors
@@ -142,6 +172,10 @@ export type ChatRunsApi = {
   // Register the terminal callback (the provider registers exactly one, at
   // render time, wiring persistence's dirty-clearing).
   onTerminal: (cb: RunTerminalHandler) => void;
+  // Register the transcript-staleness callback (exactly one, same shape as
+  // onTerminal above), wiring persistence's save suppression to the
+  // post-terminal canonical refetch. See TranscriptStaleHandler.
+  onTranscriptStale: (cb: TranscriptStaleHandler) => void;
 };
 
 export function useChatRuns(
@@ -167,6 +201,7 @@ export function useChatRuns(
   const chatBuffersRef = useRef<Map<string, ChatUiMessage[]>>(new Map());
   const [runningChatIds, setRunningChatIds] = useState<Set<string>>(new Set());
   const onTerminalRef = useRef<RunTerminalHandler | null>(null);
+  const onTranscriptStaleRef = useRef<TranscriptStaleHandler | null>(null);
 
   // Add/remove a chat from the running set (source of truth is runsRef; this
   // mirror drives rendering + the derived active-chat `streaming` flag).
@@ -281,29 +316,54 @@ export function useChatRuns(
   // adopt it into this chat's buffer (and the visible `messages` when active) so
   // the buffer becomes authoritative — any later save is idempotent and a
   // reopen/interrupted check reads the server's transcript, never the
-  // FE-generated one. Best-effort: a failed refetch leaves the buffer as-is; a
-  // doc without a committed turn is left alone (never wipe streamed content the
-  // server has not persisted). Guarded against a run that started meanwhile:
-  // only adopt while THIS run is still the chat's (terminal) entry.
+  // FE-generated one. A doc without a committed turn is left alone (never wipe
+  // streamed content the server has not persisted). Guarded against a run that
+  // started meanwhile: only adopt while THIS run is still the chat's (terminal)
+  // entry.
+  //
+  // WHILE THE REFETCH IS IN FLIGHT, AND FOREVER AFTER IT FAILS, THE CHAT IS
+  // MARKED STALE AND MUST NOT BE SAVED. A refetch is not a formality here: it
+  // downloads the whole document, which for an image thread is megabytes, and
+  // it is exactly the request most likely to fail or to outlast the 800 ms
+  // save debounce. Until it has been adopted, this client cannot claim its own
+  // buffer is what the server holds — and a PUT of that buffer full-replaces
+  // the stored document with no merge, so guessing costs the user a committed
+  // turn. Marking BEFORE the await rather than only in the catch is what makes
+  // this race-free: a failure that lands after the debounce already fired
+  // would be too late to cancel anything.
   const adoptCanonicalTranscript = useCallback(
     async (chatId: string, runId: string) => {
+      onTranscriptStaleRef.current?.(chatId, true);
       let full: Chat;
       try {
         full = await apiRef.current.chat(chatId);
       } catch {
+        // Loud, not silent: the run itself succeeded and the turn IS on the
+        // server, but this tab can no longer prove its copy matches — and it
+        // has just stopped saving this chat, which the user is entitled to
+        // know about before they keep typing into it.
+        showErrorRef.current(tRef.current.errorChatTranscriptStale);
         return;
       }
       const entry = runsRef.current.get(chatId);
+      // A newer run owns this chat now, so ITS adopt cycle owns the stale mark
+      // as well — leave the mark exactly as that cycle set it.
       if (entry?.runId !== runId || entry?.status === 'running') return;
       const canonical = normalizeDoc(full.content).messages;
-      if (canonical.length === 0) return;
-      chatBuffersRef.current.set(chatId, canonical);
-      if (chatId === activeChatIdRef.current) {
-        messagesRef.current = canonical;
-        setMessages(canonical);
+      if (canonical.length > 0) {
+        chatBuffersRef.current.set(chatId, canonical);
+        if (chatId === activeChatIdRef.current) {
+          messagesRef.current = canonical;
+          setMessages(canonical);
+        }
       }
+      // Reached only with the server's own answer in hand: either the buffer
+      // IS that answer now, or the server holds no transcript at all, in which
+      // case the local one is AHEAD of it rather than behind and must stay
+      // saveable.
+      onTranscriptStaleRef.current?.(chatId, false);
     },
-    [apiRef, activeChatIdRef, messagesRef, setMessages],
+    [apiRef, activeChatIdRef, messagesRef, setMessages, showErrorRef, tRef],
   );
 
   // Register a run's metadata WITHOUT opening its EventSource (bootstrap
@@ -367,7 +427,7 @@ export function useChatRuns(
           writeAssistant(chatId, (m) => ({
             ...m,
             reasoning: snap.reasoning ?? '',
-            content: snap.content ?? '',
+            content: contentOf(snap),
             ...metricsOf(snap.metrics),
           }));
           // Re-anchor from this snapshot's OWN kind/elapsed_ms before any
@@ -410,7 +470,7 @@ export function useChatRuns(
           writeAssistant(chatId, (m) => ({
             ...m,
             reasoning: term.reasoning ?? '',
-            content: term.content ?? '',
+            content: contentOf(term),
             ...metricsOf(term.metrics),
           }));
           // Re-anchor from the terminal event's own kind/elapsed_ms BEFORE
@@ -539,6 +599,10 @@ export function useChatRuns(
       runsRef.current.delete(chatId);
       chatBuffersRef.current.delete(chatId);
       markRunning(chatId, false);
+      // The chat is gone (deleteChat), so there is no transcript left to be
+      // stale about — and leaving a mark behind would outlive its subject and
+      // block a future chat that reused the id.
+      onTranscriptStaleRef.current?.(chatId, false);
     },
     [markRunning],
   );
@@ -549,6 +613,10 @@ export function useChatRuns(
 
   const onTerminal = useCallback((cb: RunTerminalHandler) => {
     onTerminalRef.current = cb;
+  }, []);
+
+  const onTranscriptStale = useCallback((cb: TranscriptStaleHandler) => {
+    onTranscriptStaleRef.current = cb;
   }, []);
 
   return {
@@ -564,5 +632,6 @@ export function useChatRuns(
     forget,
     closeAll,
     onTerminal,
+    onTranscriptStale,
   };
 }
