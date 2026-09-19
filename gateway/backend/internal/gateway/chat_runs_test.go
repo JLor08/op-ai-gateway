@@ -760,17 +760,19 @@ func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
 // TestRunDeadlineIsDistinguishableFromACancel: a deadline must NOT masquerade
 // as a user cancel -- the user pressed nothing.
 func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
-	restore := runDeadline
-	runDeadline = 10 * time.Millisecond
-	t.Cleanup(func() { runDeadline = restore })
+	restore := imageRunDeadline
+	imageRunDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { imageRunDeadline = restore })
 
 	// A provider that never produces anything, so the deadline is what ends the
 	// run. pacedStreamer with a gap far beyond the deadline is the existing fake
-	// for "slow upstream" (server_stream_timeout_test.go).
+	// for "slow upstream" (server_stream_timeout_test.go). The MODEL is the
+	// harness's mapped text model -- only the KIND selects the bound, and an
+	// unrouted image model would 404 before the deadline could fire.
 	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
 	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
 		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
 	})
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -795,14 +797,14 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 // also reported "canceled" with an empty message. The provider below emits one
 // delta well before the deadline, so the run is mid-stream when it fires.
 func TestRunDeadlineMidStreamIsNotACancelEither(t *testing.T) {
-	restore := runDeadline
-	runDeadline = 150 * time.Millisecond
-	t.Cleanup(func() { runDeadline = restore })
+	restore := imageRunDeadline
+	imageRunDeadline = 150 * time.Millisecond
+	t.Cleanup(func() { imageRunDeadline = restore })
 
 	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 20, gap: 30 * time.Millisecond})
 	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
 		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
 	})
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -849,14 +851,14 @@ func TestUserCancelStaysACancelUnderADeadline(t *testing.T) {
 // the terminal CommitAssistant would be cancelled by the very timeout that
 // ended the run -- losing the turn instead of recording why it ended.
 func TestTimedOutRunStillCommitsItsTurn(t *testing.T) {
-	restore := runDeadline
-	runDeadline = 10 * time.Millisecond
-	t.Cleanup(func() { runDeadline = restore })
+	restore := imageRunDeadline
+	imageRunDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { imageRunDeadline = restore })
 
 	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 1, gap: time.Minute})
 	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
 		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-		Settings: portal.ChatRunSettings{Model: "qwen-coder"},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
 	})
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -950,5 +952,55 @@ func TestFinishRunCommitDoesNotInheritAnExpiredContext(t *testing.T) {
 	}
 	if got := run.statusValue(); got != "error" {
 		t.Fatalf("status = %q, want error", got)
+	}
+}
+
+// TestTextRunIsNotBoundedByTheImageDeadline is the no-op invariant for the
+// existing, overwhelmingly common path: only an image run is bounded. The
+// image deadline below is shrunk to a tenth of the time this text run takes,
+// so a run that inherited it would die mid-stream as a timeout; a text run
+// must still complete, exactly as it does today.
+//
+// The bound exists because an image run emits nothing between dispatch and its
+// finished image. A text run streams deltas, so its liveness is visible, and a
+// ceiling would newly kill long generations from a slow local model that
+// succeed today -- a behaviour change to someone else's feature, needing its
+// own decision.
+func TestTextRunIsNotBoundedByTheImageDeadline(t *testing.T) {
+	restore := imageRunDeadline
+	imageRunDeadline = 10 * time.Millisecond
+	t.Cleanup(func() { imageRunDeadline = restore })
+
+	// ~100ms of streaming, ten times the image deadline.
+	srv, owner, chatID := newRunTestServerWithProvider(t, pacedStreamer{n: 5, gap: 20 * time.Millisecond})
+	run, err := srv.startChatRun(owner, chatID, PrepareRunResult{
+		History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Settings: portal.ChatRunSettings{Model: "qwen-coder"}, // kind "" == text
+	})
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("status = %q, want completed -- a text run must not inherit the image bound", got)
+	}
+	snap, _, unsub := run.subscribe()
+	defer unsub()
+	if snap.Err != "" {
+		t.Fatalf("error = %q, want empty", snap.Err)
+	}
+}
+
+// TestRunDeadlineForOnlyBoundsImages states the rule directly, so a future
+// change that folds the two kinds back into one global deadline fails here
+// with the reason attached rather than only in a timing-dependent test.
+func TestRunDeadlineForOnlyBoundsImages(t *testing.T) {
+	if d, bounded := runDeadlineFor("image"); !bounded || d != imageRunDeadline {
+		t.Fatalf("image run: got (%v, %v), want (%v, true)", d, bounded, imageRunDeadline)
+	}
+	for _, kind := range []string{"", "text", "unknown"} {
+		if d, bounded := runDeadlineFor(kind); bounded || d != 0 {
+			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image runs are bounded", kind, d, bounded)
+		}
 	}
 }
