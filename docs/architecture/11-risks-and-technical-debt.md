@@ -156,6 +156,16 @@ hidden.
   `gateway.New` default-construct an instance `cmd/gateway` never sees, so a
   correct `Retain` runs against the wrong object and prunes nothing, with
   everything compiling and the prune apparently running.
+- **`npm test` does not type-check, so a green frontend suite says nothing
+  about the build.** `npm test` is `vitest run`; only `npm run build` runs
+  `tsc`, which is why CI runs both
+  ([Development Tooling & Quality Gates
+  §5](cross-cutting/development-and-quality.md)). The failure this hides is not
+  exotic: a test helper typed as a wide store or props object — `ChatStore`'s
+  `makeStore` in `ChatSidebar.test.tsx` enumerates every field with no cast —
+  stops compiling the moment that type gains a field, while the suite it
+  belongs to still passes. Any change that widens such a type must be verified
+  with `npm run build`, not with `npm test`.
 
 ## 11.4 Deliberate design acceptances
 
