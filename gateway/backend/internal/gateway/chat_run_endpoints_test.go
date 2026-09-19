@@ -452,6 +452,12 @@ func TestStartRunResponseCarriesTheKind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateChat: %v", err)
 	}
+	// "image" stays a literal HERE and only here: this is the request BODY a
+	// client sends, so it must pin the wire value independently of the Go
+	// constant. Interpolating chatRunKindImage would make the test agree with
+	// whatever the constant became, which is the one thing a wire assertion
+	// must not do. Every other occurrence in this package's run tests reads
+	// the constant.
 	rec := startRunViaHandler(srv, fresh.ID,
 		`{"user_message":{"id":"u9","role":"user","content":"a cat"},"settings":{"model":"sd-turbo","kind":"image"}}`)
 	if rec.Code != http.StatusCreated {
@@ -466,7 +472,7 @@ func TestStartRunResponseCarriesTheKind(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode 201: %v (%s)", err, rec.Body.String())
 	}
-	if got.Kind != "image" {
+	if got.Kind != chatRunKindImage {
 		t.Fatalf("kind = %q on the 201, want image -- otherwise the sending tab "+
 			"renders the text pending state until the first snapshot", got.Kind)
 	}
@@ -478,7 +484,7 @@ func TestStartRunResponseCarriesTheKind(t *testing.T) {
 	}
 	// The run itself carries the same kind, so the 201 cannot describe a turn
 	// the executor did not run.
-	if run := srv.ChatRuns.GetByID(owner.UserID, got.RunID); run == nil || run.kindValue() != "image" {
+	if run := srv.ChatRuns.GetByID(owner.UserID, got.RunID); run == nil || run.kindValue() != chatRunKindImage {
 		t.Fatalf("run kind not set from the prepared settings: %+v", run)
 	}
 }
@@ -533,7 +539,7 @@ func TestActiveRunsCarryKindAndAge(t *testing.T) {
 		}
 		return resp.Data
 	}
-	if got := list(t); len(got) != 1 || got[0].Kind != "image" {
+	if got := list(t); len(got) != 1 || got[0].Kind != chatRunKindImage {
 		t.Fatalf("active list must carry the run's kind, got %+v", got)
 	}
 	// The age is measured by the server and grows on its own clock.

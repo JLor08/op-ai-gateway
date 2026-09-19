@@ -776,10 +776,10 @@ func TestRunAgeIsFrozenOnceTerminal(t *testing.T) {
 // redundant and (on a text run) a per-token cost.
 func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
 	run := newChatRun("run_kind", "c1", "u1", func() {})
-	run.setKind("image")
+	run.setKind(chatRunKindImage)
 	snap, ch, unsub := run.subscribe()
 	defer unsub()
-	if snap.Kind != "image" {
+	if snap.Kind != chatRunKindImage {
 		t.Fatalf("snapshot kind = %q, want image", snap.Kind)
 	}
 	run.publish(sseDeltaEvent{Content: "x"})
@@ -796,7 +796,7 @@ func TestRunKindIsOnSnapshotAndDoneButNeverOnDelta(t *testing.T) {
 	}
 	run.finish("completed", "", nil)
 	term := <-ch
-	if term.Kind != "image" {
+	if term.Kind != chatRunKindImage {
 		t.Fatalf("done kind = %q, want image", term.Kind)
 	}
 }
@@ -1062,7 +1062,7 @@ func TestTextRunIsNotBoundedByTheImageDeadline(t *testing.T) {
 // change that folds the two kinds back into one global deadline fails here
 // with the reason attached rather than only in a timing-dependent test.
 func TestRunDeadlineForOnlyBoundsImages(t *testing.T) {
-	if d, bounded := runDeadlineFor("image"); !bounded || d != imageRunDeadline {
+	if d, bounded := runDeadlineFor(chatRunKindImage); !bounded || d != imageRunDeadline {
 		t.Fatalf("image run: got (%v, %v), want (%v, true)", d, bounded, imageRunDeadline)
 	}
 	for _, kind := range []string{"", "text", "unknown"} {
@@ -1098,7 +1098,7 @@ func TestRunKindWriteIsSynchronizedWithItsReaders(t *testing.T) {
 		<-barrier
 		srv.launchRun(ctx, owner, run, PrepareRunResult{
 			History:  []portal.ChatAPIMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
-			Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: "image"},
+			Settings: portal.ChatRunSettings{Model: "qwen-coder", Kind: chatRunKindImage},
 		})
 	}()
 	go func() {
@@ -1112,7 +1112,7 @@ func TestRunKindWriteIsSynchronizedWithItsReaders(t *testing.T) {
 	wg.Wait()
 
 	waitFor(t, func() bool { return run.statusValue() != "running" })
-	if got := run.kindValue(); got != "image" {
+	if got := run.kindValue(); got != chatRunKindImage {
 		t.Fatalf("kind = %q after the concurrent window, want image", got)
 	}
 }
