@@ -754,6 +754,17 @@ bearer-only, so an image run cannot authenticate at all today.
 
   Task 7's executor depends on this: without it the loopback hop 401s.
 
+**Superseded during execution:** this task originally prescribed copying
+`authenticateWeb`'s loopback block into the new helper, for side-by-side
+readability. A task review raised that as an Important finding — two copies of
+a constant-time comparison on an auth boundary, with nothing keeping them
+equal — and the project owner ruled for extraction. The shared helper is
+`func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool)` in
+`auth.go`, called from `authenticateWeb` and from the new leg. It takes no
+`ResponseWriter`, because never writing a response is what lets both callers
+fall through to their next leg. `edgeGateInternalCaller` stays separate: it
+only performs the comparison for a gate exemption and resolves no principal.
+
 **Why not `requireWebAnyScope`.** That is a one-line change and grants strictly
 more: it would also admit the **browser session cookie**, making
 `/v1/images/generations` directly reachable from a logged-in browser and
