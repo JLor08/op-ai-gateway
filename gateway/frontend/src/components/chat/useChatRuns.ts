@@ -181,8 +181,13 @@ export function useChatRuns(
         if (prev.length === 0) return prev;
         const last = prev.at(-1)!;
         if (last.role !== 'assistant') return prev;
-        const empty =
-          (typeof last.content === 'string' ? last.content.length === 0 : true) && !last.reasoning;
+        // "Empty" means the run wrote nothing into this bubble. Length is the
+        // right test for BOTH shapes -- a string's characters and a content
+        // array's parts -- and `typeof content === 'string' ? … : true` was
+        // not: it called every structured content empty, so an image turn's
+        // bubble was deleted the moment it arrived. pruneEmptyAssistantTail
+        // (chatDoc.ts) already tests length, and this now agrees with it.
+        const empty = last.content.length === 0 && !last.reasoning;
         if (empty) return prev.slice(0, -1);
         const copy = prev.slice();
         copy[copy.length - 1] = { ...last, status: msgStatus };

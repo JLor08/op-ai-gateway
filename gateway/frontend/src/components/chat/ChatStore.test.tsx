@@ -1037,6 +1037,88 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ChatStoreProvider finishRun keeps structured content (Task 10) [${locale}]`, () => {
+    // finishRun's terminal prune exists to drop a bubble a run never wrote
+    // anything into. Its predicate used to be
+    //   (typeof last.content === 'string' ? last.content.length === 0 : true)
+    // -- so ANY non-string content counted as empty. An image turn's content
+    // is an ARRAY of parts, so a one-image turn was called empty and its
+    // bubble was deleted the instant `done` arrived, even though generation
+    // and persistence both succeeded.
+    //
+    // Both tests below force the post-`done` canonical refetch
+    // (adoptCanonicalTranscript) to fail. That refetch unconditionally
+    // replaces the whole buffer with whatever the server doc holds, so a
+    // succeeding refetch here would silently overwrite finishRun's own edit
+    // and mask either direction of a broken predicate: it could put a wrongly
+    // deleted bubble back (masking test 1 against a broken fix) or reinstate
+    // an already-pruned bubble (masking test 2 against a fix that stopped
+    // pruning). Rejecting it pins each assertion to finishRun's own buffer
+    // edit, which is the thing under test.
+    it('keeps an assistant bubble whose content is a structured image array', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      chatApi.spies.chat.mockRejectedValue(new Error('refetch unavailable'));
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'draw a cat' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+
+      await act(async () => {
+        es.emit('done', {
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
+          status: 'completed',
+        });
+      });
+
+      await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+      // user turn + the assistant bubble holding the generated image.
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    // The regression guard: the prune must keep doing its actual job on the
+    // shape it was written for. A fix that simply stops pruning (e.g. always
+    // keeping the tail) would pass the test above and break every run that
+    // errors/cancels before writing anything.
+    it('still prunes an assistant bubble with an empty string and no reasoning', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+      ]);
+      renderProvider();
+      await waitForReady();
+      chatApi.spies.chat.mockRejectedValue(new Error('refetch unavailable'));
+
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hello' } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+
+      await act(async () => {
+        es.emit('done', { content: '', status: 'completed' });
+      });
+
+      await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+      // Only the user turn remains -- the empty assistant bubble was pruned.
+      expect(screen.getByTestId('count').textContent).toBe('1');
+    });
+  });
+
   describe(`ChatStoreProvider stop/cancel + delete (Task 3.5) [${locale}]`, () => {
     it("stop cancels the active chat's run", async () => {
       chatApi = makeChatApi([
