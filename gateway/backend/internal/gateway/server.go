@@ -410,11 +410,13 @@ type Server struct {
 	agentDNSVal string
 	agentDNSExp time.Time
 	// internalAuthSecret and users back the internal trusted-loopback auth
-	// branch, duplicated in authenticateWeb (auth.go, for /v1/chat/completions
-	// and every Portal/Admin/System route) and authenticateInternalOrBearer
-	// (auth_internal_or_bearer.go, for /v1/images/generations only).
-	// internalAuthSecret empty disables the branch entirely (fail-closed) in
-	// both.
+	// branch. The branch itself lives in ONE place, loopbackPrincipal
+	// (auth.go); its two callers are authenticateWeb (auth.go, for
+	// /v1/chat/completions and every Portal/Admin/System route) and
+	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
+	// /v1/images/generations only), which differ in what they fall back to and
+	// in nothing else. internalAuthSecret empty disables the branch entirely
+	// (fail-closed) for both, because the check is the same code.
 	internalAuthSecret string
 	users              userLookup
 	// ChatRuns is the in-memory background chat-run registry (chat_runs.go).

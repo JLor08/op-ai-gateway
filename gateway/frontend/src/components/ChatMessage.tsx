@@ -67,11 +67,16 @@ function ChatMessageComponent({
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
-  // The active THREAD's kind ("" text | "image", ChatStore's chatKind) --
-  // not this message's own history, since a thread's kind is pinned for its
-  // whole life. Only meaningful together with `streaming`: it selects the
-  // image-run pending render below for the one turn that is both streaming
-  // and imageless. Absent on every call site that predates image threads.
+  // The kind of the RUN this row is streaming ("" text | "image") --
+  // ChatStore's runKind, read from the run's own reports (its 201, an
+  // active-runs entry, an SSE snapshot), NOT the thread-level chatKind.
+  // The distinction is the whole point: chatKind is the client's guess at
+  // what the composer should offer and can be stale, while this is what the
+  // executor is actually running, and rendering the image wait state over a
+  // text run is exactly what the stale value produces. Only meaningful
+  // together with `streaming`: it selects the image-run pending render below
+  // for the one turn that is both streaming and imageless. Absent on every
+  // call site that predates image threads.
   kind?: string;
   // The active run's server-anchored elapsed ms (ChatStore's runElapsedMs),
   // passed through untouched -- see ImagePendingTurn for how it is

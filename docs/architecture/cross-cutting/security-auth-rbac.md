@@ -235,10 +235,15 @@ flowchart TD
     Q -- pass --> L
 ```
 
-Note that `/v1/images/generations` re-checks `X-OP-Internal-Auth` on its own
-(`authenticateInternalOrBearer`, `auth_internal_or_bearer.go`) rather than
-sharing node B/C above: it is a separate function from `authenticateWeb`, and
-deliberately has no session-cookie branch at all — never node E/H/M's path.
+Note that `/v1/images/generations` resolves its principal through
+`authenticateInternalOrBearer` (`auth_internal_or_bearer.go`) rather than
+through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
+duplicated: both entry points call the same `loopbackPrincipal`
+(`internal/gateway/auth.go`), so the constant-time secret comparison and its
+fail-closed conditions (no configured secret, no user lookup, unknown user)
+exist exactly once and cannot drift apart. What differs is only what each one
+falls back to when that check does not match — and this endpoint deliberately
+has **no session-cookie branch at all**, never node E/H/M's path.
 
 Two authorization helpers sit behind the session/bearer resolution and are
 worth naming explicitly because they differ in an easy-to-miss way:

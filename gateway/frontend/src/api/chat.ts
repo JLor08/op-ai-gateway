@@ -79,12 +79,15 @@ export type ActiveChatRun = {
   // kind and its server-measured age in ms. elapsed_ms is what lets a
   // REOPENED browser anchor the composer's pending clock on the same true
   // value the sending tab saw, rather than starting it over from zero (see
-  // useChatRuns' elapsedMsOf and ImagePendingTurn). `kind` is carried here
-  // for wire fidelity with the backend DTO; the frontend renders the
-  // composer's kind from the thread's own pinned ChatSettings.kind
-  // (chatKind/pinnedChatKind in ChatStore, landed by the previous task)
-  // rather than from this per-run copy, so there is exactly one place that
-  // decides "what kind of thread is this".
+  // useChatRuns' elapsedMsOf and ImagePendingTurn).
+  //
+  // BOTH ARE READ. The bootstrap replay passes them straight into the run
+  // engine (ChatStore's registerRunning + subscribeRun), where `kind` becomes
+  // RunState.kind — the run's OWN, post-force kind, which is what the
+  // in-flight turn renders from (ChatStore's runKind → ChatMessage's `kind`).
+  // The thread-level ChatSettings.kind (chatKind/pinnedChatKind) decides what
+  // the COMPOSER offers; this decides what the RUN is. They are two
+  // questions, and a stale client can answer the first one wrongly.
   kind?: string;
   elapsed_ms?: number;
 };
@@ -113,8 +116,14 @@ export type StartChatRunResponse = {
   // Mirrors ActiveChatRun's kind/elapsed_ms above (see startRunResponse's own
   // doc comment, chat_run_endpoints.go). elapsed_ms is ~0 here and, per its
   // own omitempty, in practice absent from this response -- that absence
-  // says nothing. Kept unread by the frontend for the same reason as
-  // ActiveChatRun.kind above: chatKind already owns that decision.
+  // says nothing, and the run engine's own default (0) is the true value for
+  // a run that has genuinely just started.
+  //
+  // `kind` IS READ, and this is the response it matters most on: every send,
+  // edit and regenerate passes it straight into subscribeRun (ChatStore), so
+  // the pending turn renders from the kind the executor will ACTUALLY run --
+  // the backend has already forced the thread's pinned kind onto it by this
+  // point, which the client's own chatKind guess can contradict.
   kind?: string;
   elapsed_ms?: number;
 };

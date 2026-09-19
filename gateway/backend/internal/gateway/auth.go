@@ -31,7 +31,10 @@ const (
 	// serverOverrideHeaderName / serverOverrideForceHeaderName carry a per-request
 	// server-override (Feature: server_override). They are set ONLY by the
 	// gateway's own background chat-run executor calling itself over the internal
-	// trusted-loopback path (see authenticateWeb) — an external client can never
+	// trusted-loopback path — loopbackPrincipal below, which BOTH entry points
+	// the executor can reach go through: authenticateWeb (/v1/chat/completions,
+	// the text kind) and authenticateInternalOrBearer
+	// (/v1/images/generations, the image kind). An external client can never
 	// inject them because nginx blanks both at the public edge (deploy/nginx/*.conf,
 	// deploy/k8s/nginx-configmap.yaml), mirroring internalAuthHeaderName/
 	// internalUserHeaderName. See applyServerOverride (server.go) for the actual
