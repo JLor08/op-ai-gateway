@@ -463,8 +463,26 @@ func TestChatRunEventsForeignUserIs404(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("foreign subscribe: expected 404, got %d body %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "portal.chat_run_not_found") {
-		t.Fatalf("expected chat_run_not_found, got %s", w.Body.String())
+	// Decoded and compared for exact equality, the same shape as the other
+	// two code assertions in this file -- not because this one was ever
+	// claimed as a pin (it was not, and it predates this feature), but
+	// because it is the third instance of that shape in a file where the
+	// other two are now decode-and-compare, and it asserts a code in the
+	// same portal.chat_run_* family. One weak assertion between two strong
+	// ones is what makes the next reader copy the wrong one.
+	//
+	// This is also the ONLY assertion of portal.chat_run_not_found anywhere
+	// in the backend, so nothing else would catch the code drifting. Note
+	// that handleCancelChatRun writes the same code from its own 404
+	// (chat_run_endpoints.go) and has no code assertion at all; that gap is
+	// not closed here.
+	var notFound apierror.Body
+	if err := json.Unmarshal(w.Body.Bytes(), &notFound); err != nil {
+		t.Fatalf("404 body %s did not decode: %v", w.Body.String(), err)
+	}
+	if notFound.Error.Code != "portal.chat_run_not_found" {
+		t.Fatalf("foreign-subscribe code = %q, want %q (body = %s)",
+			notFound.Error.Code, "portal.chat_run_not_found", w.Body.String())
 	}
 	// The owner is still allowed (sanity: the run really exists).
 	if srv.ChatRuns.GetByID(owner.UserID, run.ID) == nil {
