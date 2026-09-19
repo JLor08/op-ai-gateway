@@ -118,7 +118,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI Chat Completions | `/v1/chat/completions`, `/openai/v1/chat/completions` | `handleOpenAIChat` | `requireWebAnyScope` (session cookie **or** bearer) | none — always translated |
 | OpenAI Responses (Codex) | `/v1/responses`, `/openai/v1/responses` | `handleOpenAIResponses` | `requireAnyScope` (bearer only) | `Target.ResponsesMode` (§6) |
 | Anthropic Messages (Claude Code) | `/v1/messages`, `/anthropic/v1/messages` | `handleAnthropicMessages` | `requireAnyScope` (bearer only) | `Target.MessagesMode` (§6) |
-| OpenAI Images generations | `/v1/images/generations`, `/openai/v1/images/generations` | `handleOpenAIImages` | `requireAnyScope` (bearer only) | **always** — there is no translate path (§3.4) |
+| OpenAI Images generations | `/v1/images/generations`, `/openai/v1/images/generations` | `handleOpenAIImages` | `requireInternalOrBearerAnyScope` (bearer or internal loopback — never a session cookie) | **always** — there is no translate path (§3.4) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -839,16 +839,25 @@ from the browser. Instead:
    `authenticateWeb`, `internal/gateway/auth.go`, and blanked by nginx at the
    public edge so an external client can never inject them), plus the same
    `X-OP-CSRF` header a direct browser call would need.
-3. `/v1/chat/completions` is the one inference endpoint reachable through this
-   session-authenticated path at all (`requireWebAnyScope` →
-   `authenticateWeb`); `/v1/responses` and `/v1/messages` authenticate as
-   **bearer-only** (`requireAnyScope` → `authenticate` → `LookupBearer`, which
-   always yields a populated token id). That is a property of their auth wiring,
-   not of the headers they carry: the run-as header (`X-OP-Run-As-Token`) is
-   honoured only in `handleOpenAIChat` — the chat-completions path — so it does
-   not reach those two at all, and `applyServerOverride` runs from
-   `inferencePreflight` (`internal/gateway/inference_handlers.go`), which **all
-   three** flavors call, so `server_override` is not distinctive of them either.
+3. `/v1/chat/completions` and `/v1/images/generations` are the only two
+   inference endpoints reachable through a token-less, session-shaped
+   principal — chat completions via `requireWebAnyScope` → `authenticateWeb`
+   (session cookie, internal loopback, or bearer), images via
+   `requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`
+   (`auth_internal_or_bearer.go`, `authenticateWeb` minus its cookie branch:
+   internal loopback or bearer, **never** a session cookie). `/v1/responses`
+   and `/v1/messages` stay **bearer-only** (`requireAnyScope` →
+   `authenticate` → `LookupBearer`, which always yields a populated token id).
+   That populated-vs-empty token id — not the headers a request happens to
+   carry — is what actually gates the run-as header (`X-OP-Run-As-Token`):
+   `handleOpenAIChat` and `handleOpenAIImages` both honour it, guarded on
+   `token.ID == ""`, so it can only ever act on a session-shaped principal
+   from one of those two endpoints; it structurally cannot reach
+   `/v1/responses` or `/v1/messages`, whose bearer-derived token id is never
+   empty. `applyServerOverride` runs from `inferencePreflight`
+   (`internal/gateway/inference_handlers.go`), which **all four** inference
+   flavors call (chat, responses, messages, images), so `server_override` is
+   not distinctive of any of them either.
 4. The executor relays the resulting SSE deltas into the chat's own live-run
    state, which the browser's `EventSource` streams to the UI — the browser
    itself never opens a fetch stream.
