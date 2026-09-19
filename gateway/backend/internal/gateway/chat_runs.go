@@ -549,15 +549,17 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 // commitFailureIsChatGone reports whether a failed CommitAssistant's error
 // means the chat itself no longer exists, rather than that the write to an
 // existing chat failed. DELETE /chats/{id} cancels the chat's active run AND
-// removes its row in the same request (handlePortalChatItem), so the run's
-// own terminal commit can lose that race against the deletion and see
-// exactly this. It is NOT a loss to report: there is nothing left to persist
-// FOR, and no one will ever read this chat's transcript again, so the
-// caller must leave the run's own status/message (typically "canceled", from
-// the delete's own cancellation) standing rather than overriding it to
-// "error". store.ErrNotFound is the raw error every ChatByID implementation
-// returns for a missing row; portal.ErrChatNotFound is writeAssistant's own
-// mapping of the same fact when the row belongs to a different user.
+// removes its row in the same request (handlePortalChatItem), so a run that
+// was ALREADY ending "canceled" (from that same delete) can lose the race and
+// see exactly this. For that specific combination it is not a loss to
+// report: there is nothing left to persist FOR, and no one will ever read
+// this chat's transcript again, so the caller leaves the run's own status
+// unchanged rather than overriding it to "error" -- see the caller's own
+// comment for why the check is also conditioned on status == "canceled" and
+// not on this alone. store.ErrNotFound is the raw error every ChatByID
+// implementation returns for a missing row; portal.ErrChatNotFound is
+// writeAssistant's own mapping of the same fact when the row belongs to a
+// different user.
 func commitFailureIsChatGone(err error) bool {
 	return errors.Is(err, store.ErrNotFound) || errors.Is(err, portal.ErrChatNotFound)
 }
@@ -958,18 +960,27 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// theoretical failure mode. Log it (still worth knowing about) AND override
 	// the run's own terminal status/message to "error" with a mapped code, so
 	// the browser is told the truth regardless of what status the run was about
-	// to report -- UNLESS the chat itself is simply gone (commitFailureIsChatGone):
-	// DELETE /chats/{id} cancels this run and removes its row in the same
-	// request, and this commit can lose that race. That is not a loss to
-	// report, so the run's own status (typically "canceled", from the
+	// to report -- UNLESS status is ALREADY "canceled" and the chat itself is
+	// simply gone (commitFailureIsChatGone): DELETE /chats/{id} cancels this
+	// run and removes its row in the same request, and a canceled run's
+	// commit can lose that race. That specific combination is not a loss to
+	// report -- the chat is gone, so the run's own "canceled" (from the
 	// delete's own cancellation) stands unchanged.
+	//
+	// The status check matters: the invariant this task exists to establish
+	// is that a "completed" run never survives a failed store write, and a
+	// DELETE landing AFTER the stream ended but BEFORE the commit runs would
+	// otherwise hit commitFailureIsChatGone too, for a run that was NOT
+	// canceled -- reporting success with nothing stored, the exact defect
+	// this task closes. "canceled" is therefore load-bearing, not merely a
+	// hint at why the error occurred.
 	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
 		ContentParts: parts,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
-		if !commitFailureIsChatGone(err) {
+		if status != "canceled" || !commitFailureIsChatGone(err) {
 			status, errMsg = "error", commitFailureCode(err)
 		}
 	}

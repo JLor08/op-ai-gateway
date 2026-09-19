@@ -144,9 +144,14 @@ func runError(t *testing.T, run *ChatRun) string {
 
 // capturedUpstream is what the stub upstream saw, handed back over a buffered
 // channel so the assertions run on the test's own goroutine (the handler runs
-// on the httptest server's).
+// on the httptest server's). path carries r.URL.Path so a test can assert
+// WHICH endpoint the request actually reached, not just that some request
+// arrived -- see TestImageRunServerOverrideReachesTheImagesHop, which needs
+// to distinguish a request that reached this stub's /v1/images/generations
+// from one that never left the chat hop.
 type capturedUpstream struct {
 	body []byte
+	path string
 }
 
 // imagesUpstream is a stub /v1/images/generations backend: it answers status
@@ -157,7 +162,7 @@ func imagesUpstream(t *testing.T, status int, body string) (*httptest.Server, <-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		select {
-		case seen <- capturedUpstream{body: raw}:
+		case seen <- capturedUpstream{body: raw, path: r.URL.Path}:
 		default:
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -733,7 +738,18 @@ func TestImageRunServerOverrideReachesTheImagesHop(t *testing.T) {
 		t.Fatalf("status = %q (err %q), want completed", got, runError(t, run2))
 	}
 	select {
-	case <-overrideSeen:
+	case got := <-overrideSeen:
+		// Mirrors TestImageRunAttributionFollowsTheRunAsToken's own ReqPath
+		// assertion, for the same reason: the image kind branches to a
+		// DIFFERENT request than the chat hop, so without this the "OVERRIDE
+		// upstream saw A request" check above would hold even for a request
+		// that never carried the images shape at all. Not vacuous TODAY --
+		// executeImageRun's branch happens before either hop is reached, so
+		// the chat hop is structurally unreachable for this run -- but the
+		// guard is what keeps that true if the branching ever moves.
+		if got.path != "/v1/images/generations" {
+			t.Fatalf("path = %q, want /v1/images/generations", got.path)
+		}
 	default:
 		t.Fatal("the OVERRIDE upstream never saw the request -- the server override did not reach the images hop")
 	}

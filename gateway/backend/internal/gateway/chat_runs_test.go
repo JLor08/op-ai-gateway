@@ -1202,6 +1202,35 @@ func TestFinishRunCommitFailureDoesNotOverrideACanceledRunWhenTheChatIsGone(t *t
 	}
 }
 
+// TestFinishRunCommitFailureOverridesACompletedRunEvenWhenTheChatIsGone is
+// fix-round finding 4: the carve-out above is conditioned on status ==
+// "canceled", not merely on commitFailureIsChatGone, and this is what proves
+// why. A DELETE can land AFTER the stream ended (status about to be
+// "completed") but BEFORE this commit runs, so the SAME store.ErrNotFound
+// race the canceled test above exercises can hit a run that was never
+// canceled at all. There the chat being gone really is nothing to report --
+// but here there IS real content that was never saved, and reporting
+// "completed" over it is exactly the silent-loss invariant this task exists
+// to close: a completed run must never survive a failed store write, whatever
+// the reason for that failure.
+func TestFinishRunCommitFailureOverridesACompletedRunEvenWhenTheChatIsGone(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+	srv.Portal = &commitFailingPortal{API: srv.Portal, err: store.ErrNotFound}
+
+	run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	srv.finishRun(context.Background(), owner, run, "completed", "")
+
+	if got := run.statusValue(); got != "error" {
+		t.Fatalf("status = %q, want error -- completed must not survive a failed store write, even when the store failure is that the chat is gone", got)
+	}
+	if got := runError(t, run); got != chatRunCommitFailedMessage {
+		t.Fatalf("error = %q, want the generic commit-failure code %q", got, chatRunCommitFailedMessage)
+	}
+}
+
 // TestExecuteRunKeepsTheUpstreamErrorCode is executeRun's non-200 branch: the
 // text path's counterpart to TestImageRunKeepsTheUpstreamErrorCode
 // (chat_runs_images_test.go). Before this the branch read no body at all, so

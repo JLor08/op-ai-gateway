@@ -147,6 +147,25 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'images.stream_unsupported': 'errorImagesStreamUnsupported',
   'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',
   'images.upstream_error': 'errorImagesUpstreamError',
+  // Task 8 fix round, finding 1: keeping the non-200 body (above) made the
+  // TEXT path's own upstream codes reach the chat toast for the first time
+  // too -- completionErrorResponse/completionErrorCode's nine codes
+  // (inference_complete.go), none of which were mapped, so a run that failed
+  // because no host was healthy started showing the literal string
+  // "routing.no_healthy_host" where it used to show "upstream status 503
+  // Service Unavailable". Same defect class as the images.* codes above, one
+  // hop over. model.not_allowed is the odd one out (inference_handlers.go's
+  // writeModelNotAllowed, not completionErrorResponse), but reaches the same
+  // loopback hop the same way.
+  'routing.no_healthy_host': 'errorRoutingNoHealthyHost',
+  'routing.no_model_route': 'errorRoutingNoModelRoute',
+  'routing.model_not_capable': 'errorRoutingModelNotCapable',
+  'routing.admission_queue_full': 'errorRoutingAdmissionQueueFull',
+  'routing.admission_queue_timeout': 'errorRoutingAdmissionQueueTimeout',
+  'provider.unavailable': 'errorProviderUnavailable',
+  'provider.timeout': 'errorProviderTimeout',
+  'provider.invalid_response': 'errorProviderInvalidResponse',
+  'model.not_allowed': 'errorModelNotAllowed',
 };
 
 export function formatPortalError(err: unknown, t: Translation): string {

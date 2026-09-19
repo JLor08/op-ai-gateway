@@ -302,6 +302,52 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ).toEqual(imagesWireCodes.slice().sort());
   });
 
+  /**
+   * Fix round, finding 1: keeping a non-200's body (Deliverable 2) made
+   * these nine codes reach the chat toast from the TEXT path for the first
+   * time -- previously the branch discarded the body entirely and showed a
+   * flat "upstream status ..." line, so nothing was unmapped because
+   * nothing reached the map. Read verbatim from Go:
+   * `completionErrorCode`/`completionErrorResponse` in
+   * `internal/gateway/inference_complete.go` build eight of the nine from
+   * the sentinels in `internal/routing/resolver.go` and
+   * `internal/provider/client.go`; `model.not_allowed` is the odd one out,
+   * written directly by `writeModelNotAllowed` in
+   * `internal/gateway/inference_handlers.go`, reachable from the same
+   * loopback hop.
+   */
+  const completionWireCodes = [
+    'routing.no_healthy_host',
+    'routing.no_model_route',
+    'routing.model_not_capable',
+    'routing.admission_queue_full',
+    'routing.admission_queue_timeout',
+    'provider.unavailable',
+    'provider.timeout',
+    'provider.invalid_response',
+    'model.not_allowed',
+  ] as const;
+
+  it('carries every completion-error code now reachable from the chat text path, by its exact wire string', () => {
+    for (const code of completionWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    expect(
+      entries
+        .filter(
+          ([code]) =>
+            code.startsWith('routing.') ||
+            code.startsWith('provider.') ||
+            code === 'model.not_allowed',
+        )
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(completionWireCodes.slice().sort());
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is

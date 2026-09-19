@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"strings"
@@ -29,6 +30,39 @@ func TestWritePortalRunError(t *testing.T) {
 		writePortalRunError(w, err)
 		if w.Code != want {
 			t.Fatalf("err %v -> %d, want %d", err, w.Code, want)
+		}
+	}
+
+	// Fix round, finding 5: portal.chat_too_large and portal.chat_run_limit
+	// are now what the frontend's errorLabelByCode maps (task 8), and this
+	// endpoint is the ONLY place that writes either literal to the wire --
+	// a status-code-only check above cannot catch a drift in the STRING, and
+	// an unpinned wire code is exactly the failure mode
+	// development-and-quality.md documents: a deleted errRow once made a 409
+	// answer 500 application.request_failed while the whole backend suite
+	// stayed green, because nothing asserted the code itself.
+	// portal.chat_run_active and mapping.capability_reserved already have
+	// their own literal pins elsewhere (TestStartRunCreatesRunAndConflicts,
+	// portal_mapping_capability_verdicts_test.go) and are not repeated here.
+	//
+	// Decoded and compared for EXACT equality, not strings.Contains: a code
+	// that grew an unwanted suffix ("portal.chat_run_limit_v2") would still
+	// contain the wanted substring, so Contains would not have caught the
+	// very drift this test exists to catch. (Caught by mutation testing this
+	// exact test before it was trusted -- see the task report.)
+	literalCodes := map[error]string{
+		portal.ErrChatTooLarge: "portal.chat_too_large",
+		ErrTooManyRuns:         "portal.chat_run_limit",
+	}
+	for err, code := range literalCodes {
+		w := httptest.NewRecorder()
+		writePortalRunError(w, err)
+		var body apierror.Body
+		if jsonErr := json.Unmarshal(w.Body.Bytes(), &body); jsonErr != nil {
+			t.Fatalf("err %v -> body %s did not decode: %v", err, w.Body.String(), jsonErr)
+		}
+		if body.Error.Code != code {
+			t.Fatalf("err %v -> code %q, want %q", err, body.Error.Code, code)
 		}
 	}
 }

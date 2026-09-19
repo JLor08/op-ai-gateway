@@ -2779,3 +2779,29 @@ describe('portal chat image generation error i18n keys', () => {
     expect(messages.en.errorChatTooLarge).toContain('new chat');
   });
 });
+
+// Fix round, finding 1: the nine completion-error codes (routing.*,
+// provider.*, model.not_allowed) reachable from the chat text path now that
+// a non-200 keeps its body. The wire codes are pinned in format.test.ts;
+// this only guards that both locales define a non-empty string for each key.
+describe('completion-error i18n keys reachable from the chat text path', () => {
+  it('defines the routing/provider/model-not-allowed error-code keys in de and en', () => {
+    const keys = [
+      'errorRoutingNoHealthyHost',
+      'errorRoutingNoModelRoute',
+      'errorRoutingModelNotCapable',
+      'errorRoutingAdmissionQueueFull',
+      'errorRoutingAdmissionQueueTimeout',
+      'errorProviderUnavailable',
+      'errorProviderTimeout',
+      'errorProviderInvalidResponse',
+      'errorModelNotAllowed',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});

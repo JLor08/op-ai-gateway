@@ -1299,7 +1299,7 @@ const de = {
   errorChatRunLimit:
     'Zu viele Antworten laufen gleichzeitig. Bitte warten Sie, bis eine davon fertig ist.',
   errorMappingCapabilityReserved:
-    '„live_progress" darf nicht auf „no" gesetzt werden, und „speculation_observed" akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
+    '„live_progress“ darf nicht auf „no“ gesetzt werden, und „speculation_observed“ akzeptiert keinen manuellen Wert – ein leerer Wert setzt beide zurück.',
   errorChatRunTimeout:
     'Diese Antwort hat zu lange gedauert und wurde abgebrochen. Bitte versuchen Sie es erneut.',
   errorChatRunNoImage: 'Es wurde kein Bild erzeugt. Bitte versuchen Sie es erneut.',
@@ -1315,6 +1315,27 @@ const de = {
   errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
   errorImagesUpstreamError:
     'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Fix round, finding 1: the nine codes completionErrorResponse /
+  // completionErrorCode can now surface from a chat run's own text path
+  // (see format.ts's own comment on this block for why).
+  errorRoutingNoHealthyHost:
+    'Für dieses Modell ist derzeit kein Server verfügbar. Versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
+  errorRoutingNoModelRoute:
+    'Für dieses Modell ist kein Server eingerichtet. Bitte wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorRoutingModelNotCapable:
+    'Dieses Modell unterstützt die angeforderte Funktion nicht. Versuchen Sie ein anderes Modell.',
+  errorRoutingAdmissionQueueFull:
+    'Der Server ist derzeit überlastet. Bitte versuchen Sie es in Kürze erneut.',
+  errorRoutingAdmissionQueueTimeout:
+    'Die Anfrage hat zu lange auf freie Kapazität gewartet und wurde abgebrochen. Bitte versuchen Sie es erneut.',
+  errorProviderUnavailable:
+    'Der Modell-Server ist derzeit nicht verfügbar. Bitte versuchen Sie es in Kürze erneut.',
+  errorProviderTimeout:
+    'Der Modell-Server hat zu lange für eine Antwort gebraucht. Bitte versuchen Sie es erneut.',
+  errorProviderInvalidResponse:
+    'Der Modell-Server hat eine Antwort geliefert, die das Gateway nicht verarbeiten konnte.',
+  errorModelNotAllowed:
+    'Dieses Token darf das ausgewählte Modell nicht verwenden. Wählen Sie ein anderes Modell, oder bitten Sie eine Administratorin oder einen Administrator um Zugriff.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     'Gateway-eigenes Token, mit dem der Reporting-Agent Telemetrie für diesen Server meldet.',
@@ -3610,6 +3631,24 @@ const en: PortalMessages = {
   errorImagesStreamUnsupported: 'Image generation does not support streaming.',
   errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
   errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
+  // Fix round, finding 1: the nine codes completionErrorResponse /
+  // completionErrorCode can now surface from a chat run's own text path
+  // (see format.ts's own comment on this block for why).
+  errorRoutingNoHealthyHost:
+    'No server is currently available for this model. Try again in a moment, or contact an administrator if this continues.',
+  errorRoutingNoModelRoute:
+    'This model has no server configured to handle it. Please contact an administrator.',
+  errorRoutingModelNotCapable:
+    'This model does not support what was requested. Try a different model.',
+  errorRoutingAdmissionQueueFull: 'The server is overloaded right now. Please try again shortly.',
+  errorRoutingAdmissionQueueTimeout:
+    'The request waited too long for free capacity and was stopped. Please try again.',
+  errorProviderUnavailable: 'The model server is unavailable right now. Please try again shortly.',
+  errorProviderTimeout: 'The model server took too long to respond. Please try again.',
+  errorProviderInvalidResponse:
+    'The model server returned a response the gateway could not understand.',
+  errorModelNotAllowed:
+    'This token is not allowed to use the selected model. Choose a different model, or ask an administrator for access.',
   agentToken: 'Server-Reporting-Agent',
   agentTokenIntro:
     "Gateway-owned token the reporting agent uses to report this server's telemetry.",
