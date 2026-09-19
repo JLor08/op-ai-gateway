@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/account"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
@@ -187,6 +188,96 @@ func TestPortalChatsOwnershipIsolationEndpoint(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &list)
 	if len(list.Data) != 0 {
 		t.Fatalf("B list = %#v, want empty", list.Data)
+	}
+}
+
+// TestPortalChatPutRefusedWhileRunActive closes the data-loss window a save
+// racing an active run opens: while the run registry holds a run for a chat,
+// PUT on that chat must be refused rather than overwrite whatever the run has
+// already committed (or is about to commit) to the transcript. The guard is
+// per (user, chat), not a blanket refusal: a run active on one chat must not
+// block a save on a different, idle chat, and a chat with no active run must
+// save exactly as before.
+func TestPortalChatPutRefusedWhileRunActive(t *testing.T) {
+	srv, dir := newChatTestServer(t)
+	seedLoginUser(t, dir, "usr_c", "c@example.test", "password-1", "user")
+	cookie := loginCookie(t, srv, "c@example.test", "password-1")
+	srv.ChatRuns = NewChatRunRegistry(5)
+
+	// Chat A gets the active run.
+	createA := chatRequest(t, srv, cookie, http.MethodPost, "/api/portal/chats",
+		`{"title":"A","content":{"messages":[{"role":"user","content":"hi"}]}}`)
+	if createA.Code != http.StatusCreated {
+		t.Fatalf("create A status = %d, body = %s", createA.Code, createA.Body.String())
+	}
+	var a struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(createA.Body.Bytes(), &a); err != nil {
+		t.Fatalf("unmarshal create A: %v", err)
+	}
+
+	// Chat B is an unrelated, idle chat for the same user.
+	createB := chatRequest(t, srv, cookie, http.MethodPost, "/api/portal/chats",
+		`{"title":"B","content":{"messages":[]}}`)
+	if createB.Code != http.StatusCreated {
+		t.Fatalf("create B status = %d, body = %s", createB.Code, createB.Body.String())
+	}
+	var b struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(createB.Body.Bytes(), &b); err != nil {
+		t.Fatalf("unmarshal create B: %v", err)
+	}
+
+	if _, err := srv.ChatRuns.start("usr_c", a.ID); err != nil {
+		t.Fatalf("start run on A: %v", err)
+	}
+
+	// PUT on A (the chat with the active run) is refused: 409, and the body's
+	// error code is EXACTLY portal.chat_run_active -- decoded and compared for
+	// equality, not with strings.Contains, which would also pass for a code
+	// that grew an unwanted suffix.
+	saveBody := `{"title":"Overwritten","content":{"messages":[]}}`
+	putA := chatRequest(t, srv, cookie, http.MethodPut, "/api/portal/chats/"+a.ID, saveBody)
+	if putA.Code != http.StatusConflict {
+		t.Fatalf("PUT on chat with active run = %d, want 409, body = %s", putA.Code, putA.Body.String())
+	}
+	var errBody apierror.Body
+	if err := json.Unmarshal(putA.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body: %v (%s)", err, putA.Body.String())
+	}
+	if errBody.Error.Code != "portal.chat_run_active" {
+		t.Fatalf("error code = %q, want exactly %q", errBody.Error.Code, "portal.chat_run_active")
+	}
+
+	// The refused PUT must not have touched chat A's transcript.
+	getA := chatRequest(t, srv, cookie, http.MethodGet, "/api/portal/chats/"+a.ID, "")
+	var gotA struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(getA.Body.Bytes(), &gotA); err != nil {
+		t.Fatalf("unmarshal get A: %v", err)
+	}
+	if string(gotA.Content) != `{"messages":[{"role":"user","content":"hi"}]}` {
+		t.Fatalf("chat A content after refused PUT = %s, want unchanged", gotA.Content)
+	}
+
+	// PUT on B succeeds: the run is active for A, not B, so the guard must not
+	// reject a save on an unrelated chat for the same user.
+	putB := chatRequest(t, srv, cookie, http.MethodPut, "/api/portal/chats/"+b.ID, saveBody)
+	if putB.Code != http.StatusOK {
+		t.Fatalf("PUT on idle chat B = %d, want 200, body = %s", putB.Code, putB.Body.String())
+	}
+	getB := chatRequest(t, srv, cookie, http.MethodGet, "/api/portal/chats/"+b.ID, "")
+	var gotB struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(getB.Body.Bytes(), &gotB); err != nil {
+		t.Fatalf("unmarshal get B: %v", err)
+	}
+	if string(gotB.Content) != `{"messages":[]}` {
+		t.Fatalf("chat B content after PUT = %s, want saved", gotB.Content)
 	}
 }
 

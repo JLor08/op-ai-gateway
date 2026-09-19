@@ -102,6 +102,19 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 		}
 		writeJSON(w, http.StatusOK, dto)
 	case http.MethodPut:
+		// The server owns the transcript tail while a run is live for this
+		// chat: SaveChat below writes the WHOLE document, so a save racing an
+		// active run would silently overwrite whatever the run has already
+		// committed (a checkpoint) or is about to commit (the terminal turn) --
+		// data loss whose window an image run stretches from seconds to
+		// minutes. Reuses the same sentinel/response the run-start endpoint
+		// already emits for "already active" (portalRunErrRows) rather than a
+		// second way to say it. Guarded like the DELETE case just below: nil
+		// ChatRuns (a Server built without one, as tests do) must not panic.
+		if s.ChatRuns != nil && s.ChatRuns.Get(token.UserID, id) != nil {
+			writePortalRunError(w, ErrRunAlreadyActive)
+			return
+		}
 		raw, ok := readRawJSONUnlimited(w, r)
 		if !ok {
 			return
