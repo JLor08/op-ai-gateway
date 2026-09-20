@@ -678,6 +678,9 @@ func memoryDeps(cfg config.Config) (gateway.ServerDeps, func() error, error) {
 	}, devToken); err != nil {
 		return gateway.ServerDeps{}, nil, err
 	}
+	if err := seedDevAdminGroup(context.Background(), directory, now, "usr_dev"); err != nil {
+		return gateway.ServerDeps{}, nil, err
+	}
 	// recorder is this driver's usage.Store: the memory driver has no
 	// usage_events table, so UsageAggregateSince is an honest no-op (quota/
 	// budget enforcement is a persistent-store feature by design).
@@ -1301,6 +1304,41 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 		}, auth.HashSecret(agentSecret)); err != nil {
 			return fmt.Errorf("seed agent token: %w", err)
 		}
+	}
+	return nil
+}
+
+// seedDevAdminGroup gives the memory-mode dev deployment one ADMIN-tier
+// group owned by ownerUserID (the dev user, "usr_dev"), mirroring what a
+// real operator ends up with after self-creating an admin group through the
+// product's own "createAdminGroup" flow (portal/service_user_groups.go):
+// the group is owned by them, and they are enrolled as its member. Ownership
+// alone already makes UserGroupDTO.CanManageUsers true for them (see
+// groupDTO's owner case), so no manager row is needed on top of it.
+//
+// Without this, a fresh `make dev` gateway seeds NO admin group at all: the
+// dev user's group landscape is empty, GET /api/portal/groups returns
+// {"admin":[]}, and the invite form's submit stays permanently disabled
+// (adminGroupMissing is true whenever no admin group can be auto-selected)
+// -- a brand-new deployment cannot invite anyone (issue #122).
+//
+// Mirrors seedDefaultServer's shape and idempotence: fixed IDs plus
+// tolerating store.ErrConflict make repeat calls (e.g. across process
+// restarts against the same store) safe.
+func seedDevAdminGroup(ctx context.Context, groups portal.GroupStore, now time.Time, ownerUserID string) error {
+	g := store.UserGroup{
+		ID:          "ugrp_dev_admin",
+		Tier:        store.GroupTierAdmin,
+		Name:        "Dev Admin Group",
+		OwnerUserID: ownerUserID,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := groups.CreateUserGroup(ctx, g); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed dev admin group: %w", err)
+	}
+	if err := groups.SetUserGroupMember(ctx, g.ID, ownerUserID, store.GroupStateMember, ""); err != nil {
+		return fmt.Errorf("seed dev admin group owner membership: %w", err)
 	}
 	return nil
 }
