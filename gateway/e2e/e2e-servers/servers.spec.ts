@@ -53,8 +53,8 @@ async function gotoGroups(page: Page): Promise<void> {
  * candidates fetch to land (a mount effect of ServerList, gated on the
  * caller being admin+) -- so the create-form's admin-group picker and the
  * edit-form's admin-groups editor render against a resolved candidate list
- * rather than racing an in-flight fetch (the exact race task-5-report calls
- * out for the ServerList unit tests).
+ * rather than racing an in-flight fetch -- the same race ServerList.test.tsx
+ * guards against by awaiting the candidates fetch before asserting.
  */
 async function gotoServers(page: Page): Promise<void> {
   const [resp] = await Promise.all([

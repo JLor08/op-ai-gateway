@@ -4,7 +4,10 @@
 import { type Fetcher, request } from './transport';
 import type { AdminGroupCandidate, UserRef } from './groups';
 
-// Resource Groups (Phase 1, spec: docs/superpowers/specs/2026-08-11-resource-groups-phase-1-design.md).
+// Resource groups (see docs/architecture/cross-cutting/security-auth-rbac.md
+// §12 -- the "Resource group" row of the authorization-reach table and the
+// "Resource groups bundle AI servers" paragraph; the admin-group linkage
+// mechanism itself is §10, "Admin-groups and delegated management").
 // A resource group is an admin-linked containment object over a set of
 // AI-servers -- managed like a server/service (admin-group linkage via the
 // can_manage_resources co-manager flag; no owner/delegate model of its own).
@@ -60,8 +63,13 @@ export type UpdateResourceGroupRequest = {
   status?: string;
 };
 
-// Resource Groups Phase 2 -- provisioning (spec:
-// docs/superpowers/specs/2026-08-12-resource-groups-phase-2-provisioning). A
+// Resource-group provisioning (see
+// docs/architecture/cross-cutting/security-auth-rbac.md §12, the "Resource
+// groups bundle AI servers" paragraph: resource_group_provisions controls
+// ROUTING ELIGIBILITY, gated by the resource_provisioning_enforce system
+// setting; the routing-side gate is
+// docs/architecture/cross-cutting/routing-and-model-selection.md §2,
+// filterProvisioned). A
 // resource group's "provisioned for" set: which principals (users/user
 // groups/admin groups/services) may use its member servers. Mirrors
 // portal.ResourceGroupProvisionDTO exactly (kind + target id/name).

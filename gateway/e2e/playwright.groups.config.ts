@@ -4,8 +4,11 @@
 import { defineConfig } from "@playwright/test";
 
 // Live end-to-end proof of the Benutzergruppen (user groups) feature
-// (spec: docs/superpowers/specs/2026-08-08-user-groups-design.md), driven
-// through the real UI against a REAL SQLITE-BACKED gateway -- NOT the default
+// (docs/architecture/cross-cutting/security-auth-rbac.md §10, "Admin-groups
+// and delegated management"; tables in
+// docs/architecture/reference/data-model.md, "Groups, projects, services &
+// resource groups"), driven through the real UI against a REAL
+// SQLITE-BACKED gateway -- NOT the default
 // memory mode. Memory mode does not enforce FK/cascade constraints and its
 // group store is the same in-memory mirror either way, but the design's core
 // guarantees (containment via real membership rows, cascade-on-remove, owner

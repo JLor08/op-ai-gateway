@@ -62,8 +62,10 @@ export const FAKEACME_DIRECTORY_URL = `http://${FAKEACME_ADDR}/directory`;
 // The sqlite driver is a real disk store, so every certificate private key
 // (leaf keys, the ACME account key, and — the one this suite actually
 // exercises — the internal CA's private key) is REJECTED without the
-// CERTIFICATE encryption key configured (see [[secret-at-rest-enc-plain-scheme]]
-// in the repo memory: sealed with a key / plaintext only in the volatile
+// CERTIFICATE encryption key configured (see
+// docs/architecture/cross-cutting/certificates-tls.md §9, "Certificate
+// encryption at rest", and security-auth-rbac.md §13 for the shared
+// enc:/plain: envelope: sealed with a key / plaintext only in the volatile
 // memory store / rejected on disk without a key). Certificates use their OWN
 // key with NO fallback to OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY, so setting the
 // capture key here would NOT help: without this variable, self_signed mode's

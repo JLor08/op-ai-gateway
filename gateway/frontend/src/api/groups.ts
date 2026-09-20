@@ -3,7 +3,9 @@
 
 import { type Fetcher, request } from './transport';
 
-// User groups (spec: docs/superpowers/specs/2026-08-08-user-groups-design.md).
+// User groups (see docs/architecture/cross-cutting/security-auth-rbac.md §10,
+// "Admin-groups and delegated management", and the "User group (any tier)" row
+// of the §12 authorization-reach table).
 // Three tiers form a strict hierarchy: system (system_admin only) -> admin
 // (owned by an admin/system_admin, member of a system group) -> user (owned by
 // any user, member of an admin group). Field names mirror portal.UserGroupDTO /

@@ -3,11 +3,15 @@
 
 import { defineConfig } from "@playwright/test";
 
-// Live end-to-end proof of Resource Groups (Phase 1, spec:
-// docs/superpowers/specs/2026-08-11-resource-groups-phase-1-design.md):
+// Live end-to-end proof of Resource Groups
+// (docs/architecture/cross-cutting/security-auth-rbac.md §12, the
+// resource-group row of the authorization-reach table and the **Resource
+// groups** paragraph; tables in docs/architecture/reference/data-model.md):
 // resource-group<->admin-group linkage + the group-scoped `can_manage_resources`
 // co-manager flag + server membership (the dual authorizeResourceGroup +
-// authorizeServer gate + same-system-group containment). Cloned from
+// authorizeServer gate + same-system-group containment -- neither the dual
+// gate nor the same-system-group rule is stated in docs/architecture yet;
+// see internal/portal/service_resource_groups.go). Cloned from
 // playwright.servers.config.ts / playwright.services.config.ts -- driven
 // through the real backend (partly UI, partly the raw JSON API -- see the
 // spec's own doc comment) against a REAL SQLITE-BACKED gateway (not the

@@ -44,7 +44,9 @@ export type RuntimeMatrixSpec = {
 const LABEL_MAX_PX = 160;
 
 // The store is a dumb pair table; canonicalisation (which id sorts first) is
-// entirely the portal's job -- see the task-21 brief. Comparing BOTH orders
+// entirely the portal's job
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §11.5).
+// Comparing BOTH orders
 // here means a pair that ever reaches this component non-canonical (e.g. a
 // future caller that forgot to sort) still renders as allowed, rather than
 // silently disagreeing with what the backend actually holds.

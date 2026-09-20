@@ -3,8 +3,11 @@
 
 import { defineConfig } from "@playwright/test";
 
-// Live end-to-end proof of the Projekte (Projects) feature (spec:
-// docs/superpowers/specs/2026-08-08-projects-design.md), driven through the
+// Live end-to-end proof of the Projekte (Projects) feature
+// (docs/architecture/cross-cutting/security-auth-rbac.md §12, the
+// **Projects** paragraph; tables in
+// docs/architecture/reference/data-model.md, "Groups, projects, services &
+// resource groups"), driven through the
 // real UI (+ a few raw API/bearer calls) against a REAL SQLITE-BACKED
 // gateway -- NOT the default memory mode. Mirrors playwright.groups.config.ts
 // / playwright.limits.config.ts (also sqlite + a bootstrap admin) rather than
@@ -15,13 +18,20 @@ import { defineConfig } from "@playwright/test";
 //      on delete) and the eligibility check backing the token-assign 403
 //      (portal.ErrProjectNotMember) are only genuinely exercised once writes
 //      go through the sqlite store with foreign_keys=ON.
-//   2. The project-scope widening this suite proves (design spec §8 --
-//      Service.applyUsageScope's ProjectIDs IN-list) reads real persisted
-//      usage_events rows via the store's UsageGroups/matchUsage path; the
+//   2. The project-scope widening this suite proves (the ProjectIDs IN-list
+//      in portal.Service.applyUsageScope, gateway/backend/internal/portal/
+//      service.go: a NON-admin, project-scoped usage query is widened from
+//      "own rows" to "every row of the caller's member projects", never
+//      wider -- this rule has NO home in docs/architecture today, and
+//      reference/api-surface.md still describes usage reads as own-or-
+//      admin-fleet-wide) reads real persisted usage_events rows via the
+//      store's UsageGroups/matchUsage path; the
 //      in-memory usage.Recorder used by driver=memory would make the
 //      cross-member "B sees the aggregate, a non-member sees zero rows"
 //      assertion far weaker (see
-//      [[memory-mode-e2e-misses-fk-and-usage-store-bugs]]).
+//      docs/architecture/cross-cutting/persistence.md §7, "What the memory
+//      driver must match by hand" -- especially the Playwright-fixture
+//      blockquote on hand-rolled cascades).
 // seedDefaultServerIfEmpty seeds the SAME mock server/app/mappings on a fresh
 // sqlite DB as memory mode does (qwen-coder / gpt-oss-20b), so the login-able
 // bootstrap admin + mock model routing work identically.

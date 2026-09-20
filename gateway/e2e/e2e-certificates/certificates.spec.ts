@@ -19,10 +19,13 @@ import {
   FAKEACME_DIRECTORY_URL
 } from "../playwright.certificates.config";
 
-// Live end-to-end proof of the TLS-certificate management feature (design:
-// docs/superpowers/specs/2026-08-12-certificates-p1-design.md, extended by
-// docs/superpowers/specs/2026-08-13-gateway-edge-tls-design.md for the
-// gateway's OWN edge/nginx certificate) in BOTH issuer modes, through the
+// Live end-to-end proof of the TLS-certificate management feature
+// (docs/architecture/cross-cutting/certificates-tls.md §1 "Two separate
+// enforcement surfaces" for the per-kind rows, §2 "Issuers" for both issuer
+// modes and §4 for the internal CA; §3 "The public edge" for the
+// edge-kind (gateway/nginx) certificate -- note docs/architecture reserves
+// the `gateway` kind for the MESH certificate, this suite drives `edge`) in
+// BOTH issuer modes, through the
 // real portal UI, against a REAL SQLITE-BACKED gateway + a standalone fake
 // ACME directory (e2e-certificates/fakeacme).
 //

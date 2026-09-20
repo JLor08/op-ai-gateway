@@ -32,8 +32,9 @@ const OTHER_MODEL = "gpt-oss-20b";
 const BASELINE_SG = "E2E-SVC-Base-System";
 const BASELINE_AG = "E2E-SVC-Base-Admin";
 
-// Admin-group permissions Phase C scenario (spec:
-// docs/superpowers/specs/2026-08-10-admin-group-permissions-phase-c-design.md)
+// Admin-group-delegated service management scenario
+// (docs/architecture/cross-cutting/security-auth-rbac.md §12, the
+// service-account row of the authorization-reach table)
 // naming, mirroring servers.spec.ts's own naming note: distinct,
 // non-substring-colliding names -- several helpers below locate a row via
 // `getByRole("row", { name: new RegExp(name) })`, a SUBSTRING match against
