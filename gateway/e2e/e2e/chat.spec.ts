@@ -3,16 +3,7 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import { messages } from "../../frontend/src/i18n";
-import { login } from "./helpers";
-
-// Chats now persist server-side and the newest is auto-opened on load, so each
-// test starts in a FRESH chat (via the sidebar's "Neuer Chat") to isolate its
-// transcript from any chat a prior test left on the shared (memory) gateway.
-async function openFreshChat(page: Page): Promise<void> {
-  await page.getByRole("link", { name: messages.de.chat }).click();
-  await page.getByRole("button", { name: messages.de.chatNewChat }).click();
-  await expect(page.locator('[data-role="assistant"]')).toHaveCount(0);
-}
+import { login, openFreshChat } from "./helpers";
 
 // The assistant/user turn of the CURRENT chat: use .last() so a stray earlier
 // bubble (shared gateway, async persistence) never trips strict-mode matching.
