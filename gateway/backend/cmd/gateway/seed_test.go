@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"op-ai-gateway/internal/usage"
 	"testing"
 	"time"
 )
@@ -129,5 +130,72 @@ func TestSeedDevAdminGroupGrantsDevPrincipalAManageableAdminGroup(t *testing.T) 
 	}
 	if len(reseeded.Admin) != 1 {
 		t.Fatalf("after reseed: landscape.Admin = %d groups, want exactly 1 (idempotence): %+v", len(reseeded.Admin), reseeded.Admin)
+	}
+}
+
+// modelVisionByID runs the exact call the portal's chat picker uses
+// (gateway/backend/internal/gateway/portal_model_endpoints.go's
+// handlePortalModels calls Service.Models for every non-admin-management
+// request) and returns each offered model's id -> vision flag. Asserting
+// through this call, rather than reading the capability row directly, is
+// what proves the fixture is actually visible on the path the frontend
+// reads -- an AND-fold bug between the row and the DTO would otherwise slip
+// past a row-level assertion.
+func modelVisionByID(ctx context.Context, t *testing.T, svc *portal.Service) map[string]bool {
+	t.Helper()
+	resp := svc.Models(ctx, auth.Token{UserID: "usr_dev", Scopes: []string{"gateway:use"}})
+	byID := make(map[string]bool, len(resp.Data))
+	for _, m := range resp.Data {
+		byID[m.ID] = m.Vision
+	}
+	return byID
+}
+
+// TestSeedDefaultServerMarksExactlyOneModelVisionCapable proves the fix for
+// chat.spec.ts's "chat remembers a sent image..." e2e failure: neither
+// dev-seeded model ever had a vision capability row, so GET
+// /api/portal/models reported vision=false for BOTH gpt-oss-20b and
+// qwen-coder (verified live against a running e2e gateway), and ChatStore's
+// own image-support guard then correctly refused any send with an attached
+// image -- a dev/e2e gateway could never exercise the image-attach path at
+// all.
+//
+// The seed marks gpt-oss-20b (and ONLY gpt-oss-20b) vision-capable via a
+// manual CapabilityRow -- a dev-fixture verdict about a model this same seed
+// already invents out of nothing, exactly like inventing the mock server and
+// application it belongs to; "manual" is the honest source because it is the
+// same path a real operator uses (the Model Servers UI's vision-capable
+// toggle), not a probe result. qwen-coder is deliberately left without one so
+// a dev gateway can still exercise the NON-vision path by hand (the attach
+// button's disabled state + tooltip, the clear-attachments-on-model-switch
+// effect, and the edit/regenerate history guard) -- seeding vision on every
+// model would make that half unreachable.
+func TestSeedDefaultServerMarksExactlyOneModelVisionCapable(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	rs := routing.NewMemoryStore()
+	if err := seedDefaultServer(ctx, rs, now, "", ""); err != nil {
+		t.Fatalf("seedDefaultServer: %v", err)
+	}
+	svc := portal.NewService(portal.ServiceDeps{
+		Usage: usage.NewRecorder(), Routes: rs, Clock: func() time.Time { return now },
+	})
+
+	byID := modelVisionByID(ctx, t, svc)
+	if !byID["gpt-oss-20b"] {
+		t.Fatalf("gpt-oss-20b vision (through Service.Models) = false, want true -- the dev fixture must mark exactly one seeded model vision-capable so the image-attach path is exercisable")
+	}
+	if byID["qwen-coder"] {
+		t.Fatalf("qwen-coder vision (through Service.Models) = true, want false -- the seed deliberately leaves ONE model non-vision-capable so the non-vision UI path stays reachable in a dev gateway")
+	}
+
+	// Idempotence: mirror seedDefaultServer's existing guarantee -- reseeding
+	// must not flip, duplicate, or otherwise disturb the verdict.
+	if err := seedDefaultServer(ctx, rs, now, "", ""); err != nil {
+		t.Fatalf("seedDefaultServer (second run): %v", err)
+	}
+	reseeded := modelVisionByID(ctx, t, svc)
+	if !reseeded["gpt-oss-20b"] || reseeded["qwen-coder"] {
+		t.Fatalf("after reseed: gpt-oss-20b vision=%v qwen-coder vision=%v, want true/false unchanged", reseeded["gpt-oss-20b"], reseeded["qwen-coder"])
 	}
 }

@@ -1294,6 +1294,24 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 			return fmt.Errorf("seed mapping %s: %w", mapping.ID, err)
 		}
 	}
+	// Dev/e2e fixture: mark gpt-oss-20b (and ONLY gpt-oss-20b) vision-capable.
+	// This whole mock server/application/model set is already invented for
+	// this fixture -- declaring what it can do is configuring the fixture,
+	// not claiming a measurement about something real, so there is nothing
+	// dishonest about it. Source is "manual" because that is genuinely the
+	// path this represents: the same Model Servers UI toggle a real operator
+	// uses, not a probe result. Deliberately one model, not both: qwen-coder
+	// is left without a vision row so a dev gateway can still exercise the
+	// NON-vision path by hand (the attach button's disabled state + tooltip,
+	// the clear-attachments-on-model-switch effect, and the edit/regenerate
+	// history guard) -- seeding vision everywhere would make that half
+	// unreachable without first un-seeding it.
+	if err := routes.UpsertMappingCapabilities(ctx, "map-gpt-oss-20b", []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+		Source: routing.CapabilitySourceManual, CheckedAt: now,
+	}}); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed gpt-oss-20b vision capability: %w", err)
+	}
 	if err := routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: server.ID, ReportedAt: now, LatencyMS: 100, ErrorRate: 0, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
 		return fmt.Errorf("seed telemetry: %w", err)
 	}

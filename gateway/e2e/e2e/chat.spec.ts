@@ -45,7 +45,13 @@ test("chat keeps its answer across a menu switch (background store)", async ({ p
 // the encrypted server chat store rather than localStorage.
 test("chat remembers a sent image and its answer across navigation and reload", async ({ page }) => {
   await login(page, "dev@example.test", "dev-secret");
-  await openFreshChat(page);
+  // Named explicitly (not the helper's default) because this test's own
+  // precondition is narrower than "a model is picked": of the two dev-seeded
+  // models, only gpt-oss-20b is marked vision-capable (main.go's
+  // seedDefaultServer) -- qwen-coder deliberately is not, so an attach with
+  // that one selected would be refused by ChatStore's own image-support
+  // guard. Naming it here documents that dependency in the test itself.
+  await openFreshChat(page, "gpt-oss-20b");
   await page.locator('input[type="file"]').setInputFiles({ name: "pic.png", mimeType: "image/png", buffer: TINY_PNG });
   // Wait for the composer preview (attach is async: validate + downscale via canvas).
   await expect(page.getByAltText(messages.de.chatAttachedImage)).toHaveCount(1);
