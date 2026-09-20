@@ -34,11 +34,17 @@ import { defineConfig } from "@playwright/test";
 // Memory mode on 127.0.0.1:8091 like every other suite (fresh gateway each
 // run; suites never run concurrently, so the shared port is fine). Memory mode
 // seeds the dev user dev@example.test / dev-secret as a system_admin with
-// totp_mode=off, and the dev bearer token `dev-secret` for the inference
-// calls. It does NOT seed any user groups (the migration-v44 "Standard"
-// system/admin pair is a SQL-driver artifact), so the suite creates the one
-// system + one admin group that CreateServer's mandatory admin_group_ids gate
-// requires.
+// totp_mode=off, the dev bearer token `dev-secret` for the inference calls,
+// and (main.go's seedDevAdminGroup, issue #122) its own one system + one
+// admin group, so a fresh dev gateway can invite a user at all. The suite
+// still creates its OWN system + admin group on top of that, rather than
+// leaning on the seed's -- staying self-contained is what lets it survive a
+// seed change instead of depending on the seed's exact shape (which is
+// exactly what broke it the one time the seed changed: the dev seed's pair
+// meant CreateServer's admin-group picker no longer had a single candidate
+// to auto-select). Because the seed's pair is now always present alongside
+// this suite's own, runtime.spec.ts selects its own group EXPLICITLY BY NAME
+// rather than relying on auto-select.
 
 // The agent's router port, and therefore the `server_agent` application's
 // Port: AgentRuntimeConfig derives router_listen from exactly that column

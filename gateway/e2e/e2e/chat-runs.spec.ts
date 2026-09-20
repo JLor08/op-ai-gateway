@@ -3,7 +3,7 @@
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import { messages } from "../../frontend/src/i18n";
-import { inviteUser, login, setPassword } from "./helpers";
+import { inviteUser, login, openFreshChat, selectChatModel, setPassword } from "./helpers";
 
 // Generation now runs SERVER-SIDE: the browser POSTs
 // /api/portal/chats/{id}/runs and subscribes to
@@ -37,14 +37,6 @@ async function freshChatUser(adminPage: Page, browser: Browser): Promise<Page> {
   return chatPage;
 }
 
-// Mirrors chat.spec.ts: each test opens a FRESH chat so its transcript never
-// collides with one left by a prior test on the shared (memory) gateway.
-async function openFreshChat(page: Page): Promise<void> {
-  await page.getByRole("link", { name: messages.de.chat }).click();
-  await page.getByRole("button", { name: messages.de.chatNewChat }).click();
-  await expect(page.locator('[data-role="assistant"]')).toHaveCount(0);
-}
-
 // The assistant/user turn of the CURRENT (active) chat only — background
 // chats' messages live in an off-screen buffer, not the DOM.
 const lastAssistant = (page: Page) => page.locator('[data-role="assistant"]').last();
@@ -63,8 +55,11 @@ test("two chats can run concurrently and each keeps its own answer", async ({ pa
   // Jump to a second, fresh chat right away — "Neuer Chat" is not gated on
   // the active chat's stream, so chat one's run keeps generating in the
   // background (its own EventSource + buffer) while chat two starts its own.
+  // Already in the chat view, so this is openFreshChat's body minus the nav
+  // click — including its model pick (a fresh chat starts with none selected).
   await chatPage.getByRole("button", { name: messages.de.chatNewChat }).click();
   await expect(chatPage.locator('[data-role="assistant"]')).toHaveCount(0);
+  await selectChatModel(chatPage);
 
   await chatPage.locator("#chat-message").fill("frage zwei");
   await chatPage.getByRole("button", { name: messages.de.send }).click();

@@ -162,9 +162,14 @@ async function enterSystemAdminMode(): Promise<void> {
 
 /**
  * Creates one user group through the portal API. Group management is fully
- * covered by e2e:groups and e2e:servers; here it is pure precondition —
- * CreateServer requires at least one admin group for every caller, and memory
- * mode seeds none (the "Standard" pair is a SQL-migration artifact). Doing it
+ * covered by e2e:groups and e2e:servers; here it is pure precondition --
+ * CreateServer requires at least one admin group for every caller. Memory
+ * mode's dev seed (main.go's seedDevAdminGroup, issue #122) now provides its
+ * own system+admin pair too, but this suite still creates its OWN rather
+ * than leaning on the seed's: staying self-contained is what let it survive
+ * that seed change at all (this suite depending on the seed's exact shape,
+ * rather than creating and then explicitly selecting its own group by name,
+ * is exactly what broke it the first time the seed changed). Doing it
  * through the raw API keeps this suite's UI steps on the area it actually
  * owns. Uses the elevated session (page.request), the same credential every
  * sibling suite uses for raw portal writes.
@@ -500,11 +505,45 @@ test("1 — an AI server and a server_agent application, created through the por
 
   // Domain 127.0.0.1: the gateway reaches the application at
   // server.Domain:app.Port (routing.ApplicationEndpoint), and app.Port is the
-  // port the agent's router binds. With exactly one admin-group candidate the
-  // picker auto-selects it and renders no field (AdminGroupPicker).
+  // port the agent's router binds.
   await page.getByRole("button", { name: t.serverCreate }).click();
   await page.locator("#server-name").fill(SERVER_NAME);
   await page.locator("#server-domain").fill("127.0.0.1");
+
+  // Admin-group linkage: select THIS SUITE'S OWN system + admin group
+  // explicitly BY NAME, never relying on there being exactly one candidate
+  // to auto-select. AdminGroupPicker (shared/AdminGroupPicker.tsx) skips a
+  // step only when it is unambiguous: its system-group SelectField renders
+  // only when the candidates span more than one distinct parent, and its
+  // admin-group field renders as a required MultiSelectField only when more
+  // than one candidate remains once narrowed to the chosen system group --
+  // otherwise each one auto-selects and renders NO field at all (a plain
+  // "System group: X" / "Admin group: Y" line instead). The dev seed now
+  // provides its own system+admin pair alongside whatever this suite
+  // creates (main.go's seedDevAdminGroup, issue #122), so neither step can
+  // be assumed to auto-select any more; that coupling is exactly what broke
+  // this suite once already, so both steps below are driven unconditionally
+  // by presence, never by assumption.
+  //
+  // The two steps are DIFFERENT widgets under the same combobox-then-option
+  // interaction: the system-group step is a MUI SelectField (TextField
+  // `select`, same as inviteUser's Role select in ../e2e/helpers.ts); the
+  // admin-group step, when it renders at all, is a MUI MultiSelectField
+  // (Autocomplete `multiple`) -- mirrors e2e-servers/servers.spec.ts's own
+  // createServer helper, which drives the identical pair of fields for the
+  // identical reason (its system_admin caller's candidates already span more
+  // than one system group there).
+  const systemGroupCombobox = page.getByRole("combobox", { name: t.serverAdminGroupSystemGroupLabel });
+  if ((await systemGroupCombobox.count()) > 0) {
+    await systemGroupCombobox.click();
+    await page.getByRole("option", { name: SYSTEM_GROUP, exact: true }).click();
+  }
+  const adminGroupCombobox = page.getByRole("combobox", { name: t.serverAdminGroupLabel });
+  if ((await adminGroupCombobox.count()) > 0) {
+    await adminGroupCombobox.click();
+    await page.getByRole("option", { name: ADMIN_GROUP, exact: true }).click();
+  }
+
   await page.getByRole("button", { name: t.serverCreate }).click();
   await expect(row(SERVER_NAME)).toBeVisible();
 

@@ -678,6 +678,9 @@ func memoryDeps(cfg config.Config) (gateway.ServerDeps, func() error, error) {
 	}, devToken); err != nil {
 		return gateway.ServerDeps{}, nil, err
 	}
+	if err := seedDevAdminGroup(context.Background(), directory, now, "usr_dev"); err != nil {
+		return gateway.ServerDeps{}, nil, err
+	}
 	// recorder is this driver's usage.Store: the memory driver has no
 	// usage_events table, so UsageAggregateSince is an honest no-op (quota/
 	// budget enforcement is a persistent-store feature by design).
@@ -1291,6 +1294,24 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 			return fmt.Errorf("seed mapping %s: %w", mapping.ID, err)
 		}
 	}
+	// Dev/e2e fixture: mark gpt-oss-20b (and ONLY gpt-oss-20b) vision-capable.
+	// This whole mock server/application/model set is already invented for
+	// this fixture -- declaring what it can do is configuring the fixture,
+	// not claiming a measurement about something real, so there is nothing
+	// dishonest about it. Source is "manual" because that is genuinely the
+	// path this represents: the same Model Servers UI toggle a real operator
+	// uses, not a probe result. Deliberately one model, not both: qwen-coder
+	// is left without a vision row so a dev gateway can still exercise the
+	// NON-vision path by hand (the attach button's disabled state + tooltip,
+	// the clear-attachments-on-model-switch effect, and the edit/regenerate
+	// history guard) -- seeding vision everywhere would make that half
+	// unreachable without first un-seeding it.
+	if err := routes.UpsertMappingCapabilities(ctx, "map-gpt-oss-20b", []routing.CapabilityRow{{
+		Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+		Source: routing.CapabilitySourceManual, CheckedAt: now,
+	}}); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed gpt-oss-20b vision capability: %w", err)
+	}
 	if err := routes.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: server.ID, ReportedAt: now, LatencyMS: 100, ErrorRate: 0, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
 		return fmt.Errorf("seed telemetry: %w", err)
 	}
@@ -1301,6 +1322,73 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 		}, auth.HashSecret(agentSecret)); err != nil {
 			return fmt.Errorf("seed agent token: %w", err)
 		}
+	}
+	return nil
+}
+
+// seedDevAdminGroup gives the memory-mode dev deployment one ADMIN-tier
+// group owned by ownerUserID (the dev user, "usr_dev"), matching exactly
+// what Service.createAdminGroup (portal/service_user_groups.go) produces
+// for a SELF-OWNED admin group -- not merely approximating it. That
+// function always resolves and REQUIRES a non-empty ParentGroupID pointing
+// at an EXISTING system-tier group the creator is a member of (auto-selected
+// only when the creator is a member of exactly one; ErrGroupParentInvalid
+// otherwise), and afterward enrolls ONLY the owner as the new admin group's
+// member. An admin group with no parent, or a parent that doesn't exist, is
+// therefore a shape the product itself can never produce through any UI
+// action -- a dev seed with that shape is a trap for the next person who
+// tests the group hierarchy, resource-group, service, or project admin-group
+// pickers against it, and would cost them time deciding whether it's a bug.
+//
+// So this seeds the system-tier group too (also owned by no one, like every
+// system group -- see createSystemGroup, which never sets OwnerUserID),
+// enrolls the dev user as ITS member (the precondition createAdminGroup's
+// auto-select needs), and only then creates the admin group with
+// ParentGroupID pointing at it. Ownership of the admin group alone already
+// makes UserGroupDTO.CanManageUsers true for the owner (see groupDTO's owner
+// case), so no separate manager row is needed on top of it -- createAdminGroup
+// doesn't add one either.
+//
+// Without this, a fresh `make dev` gateway seeds NO admin group at all: the
+// dev user's group landscape is empty, GET /api/portal/groups returns
+// {"admin":[]}, and the invite form's submit stays permanently disabled
+// (adminGroupMissing is true whenever no admin group can be auto-selected)
+// -- a brand-new deployment cannot invite anyone (issue #122).
+//
+// Mirrors seedDefaultServer's shape and idempotence: fixed IDs plus
+// tolerating store.ErrConflict make repeat calls (e.g. across process
+// restarts against the same store) safe, and SetUserGroupMember is
+// upsert-safe in the memory driver -- for both the system group's membership
+// row and the admin group's.
+func seedDevAdminGroup(ctx context.Context, groups portal.GroupStore, now time.Time, ownerUserID string) error {
+	sys := store.UserGroup{
+		ID:        "ugrp_dev_system",
+		Tier:      store.GroupTierSystem,
+		Name:      "Dev System Group",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := groups.CreateUserGroup(ctx, sys); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed dev system group: %w", err)
+	}
+	if err := groups.SetUserGroupMember(ctx, sys.ID, ownerUserID, store.GroupStateMember, ""); err != nil {
+		return fmt.Errorf("seed dev system group membership: %w", err)
+	}
+
+	g := store.UserGroup{
+		ID:            "ugrp_dev_admin",
+		Tier:          store.GroupTierAdmin,
+		Name:          "Dev Admin Group",
+		ParentGroupID: sys.ID,
+		OwnerUserID:   ownerUserID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := groups.CreateUserGroup(ctx, g); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed dev admin group: %w", err)
+	}
+	if err := groups.SetUserGroupMember(ctx, g.ID, ownerUserID, store.GroupStateMember, ""); err != nil {
+		return fmt.Errorf("seed dev admin group owner membership: %w", err)
 	}
 	return nil
 }
