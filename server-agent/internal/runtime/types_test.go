@@ -210,7 +210,8 @@ func TestSpecUnmarshalsTypeAndProbePaths(t *testing.T) {
 
 // TestParseConfigEmptyDocumentCollectionsAreNeverNil covers the
 // fully-empty document a server with no server_agent application yet
-// produces (task-7-report.md): every collection must still marshal as `[]`,
+// produces (docs/architecture/reference/api-surface.md §5.1, "a fully zeroed
+// document"): every collection must still marshal as `[]`,
 // never `null`, so an agent-side consumer never has to nil-check.
 func TestParseConfigEmptyDocumentCollectionsAreNeverNil(t *testing.T) {
 	const empty = `{"router_listen":0,"max_processes":0,"gpu_budgets":[],"specs":[],"coresident":[],"etag":"deadbeef"}`

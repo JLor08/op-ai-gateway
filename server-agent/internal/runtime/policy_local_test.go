@@ -804,8 +804,9 @@ func TestExpandPlaceholdersChildEnvExactSet(t *testing.T) {
 }
 
 // TestExpandPlaceholdersSpecEnvCannotOverridePathOrHome pins the decision
-// recorded in the Task 13 fix-round-1 report: a spec.Env key of PATH or HOME
-// is refused outright rather than silently overriding the agent-provided
+// recorded in docs/architecture/cross-cutting/agent-runtime-manager.md §3.2:
+// a spec.Env key of PATH or HOME is refused outright rather than silently
+// overriding the agent-provided
 // base (which previously produced two PATH= entries in the child env, with
 // os/exec resolving last-occurrence-wins -- letting a gateway-supplied PATH
 // win in the child).
@@ -1025,8 +1026,9 @@ func TestExpandPlaceholdersOmitsAbsentWindowsBase(t *testing.T) {
 	}
 }
 
-// TestExpandPlaceholdersNearMissErrors pins the corrected near-miss rule
-// from the Task 13 fix-round-2 findings: classification happens per
+// TestExpandPlaceholdersNearMissErrors pins the near-miss rule
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §3.2):
+// classification happens per
 // placeholder, on the ORIGINAL text, using a PREFIX match on the
 // upper-cased inner token -- never substring containment. This is the
 // "near-miss" half of the worked case table; the pass-through half is

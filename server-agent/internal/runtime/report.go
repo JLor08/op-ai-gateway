@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-// This file builds the agent's upward, file-mode report (design doc
-// docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md §10.2;
-// the shipped description of the same contract is
-// docs/architecture/cross-cutting/agent-runtime-manager.md §8.3) -- what the
-// file-mode driver sends to the gateway over POST
-// /api/agent/v1/runtime-report and the WS "runtime_report" frame, both via
-// the sender interfaces in internal/client.
+// This file builds the agent's upward, file-mode report
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §8.3 "The upward
+// report, and what it redacts") -- what the file-mode driver sends to the
+// gateway over POST /api/agent/v1/runtime-report and the WS "runtime_report"
+// frame, both via the sender interfaces in internal/client.
 //
 // REDACTION HAPPENS HERE, AND IT IS THE POINT OF THIS FILE. In file mode the
 // agent reads a local config the SERVER OPERATOR owns, which may legitimately
@@ -42,20 +40,22 @@ import (
 
 // envRedactedMask replaces every env value before a Config leaves this
 // process as a report. Three U+2022 BULLET characters, matching the
-// gateway's own defense-in-depth mask byte-for-byte (task-9-report.md) --
-// not that the two need to agree (the agent's mask never reaches the
-// gateway's re-masking path, since nothing plaintext survives this far) but
-// so a human reading either side's output sees the identical, recognizable
-// placeholder.
+// gateway's own defense-in-depth mask (docs/architecture/cross-cutting/agent-runtime-manager.md
+// §8.3; the gateway re-masks on ingest, see
+// docs/architecture/reference/api-surface.md §5.2) -- not that the two need
+// to agree (the agent's mask never reaches the gateway's re-masking path,
+// since nothing plaintext survives this far) but so a human reading either
+// side's output sees the identical, recognizable placeholder.
 const envRedactedMask = "•••"
 
 // Report is the agent's upward, file-mode status report: what local runtime
 // config this agent is currently running from, and whether the last attempt
 // to load it failed. Source is "file" when this server's runtime is
-// configured from a local file, "gateway" otherwise (task-9-report.md: this
-// exact string flips the gateway's RuntimeStatus.IsFileMode, which gates
-// whether it keeps pushing runtime_config WS frames at this agent -- an
-// agent that is not actually in file mode must never send "file" here).
+// configured from a local file, "gateway" otherwise
+// (docs/architecture/reference/api-surface.md §5.2: this exact string flips
+// the gateway into file mode, which suppresses further runtime_config WS
+// pushes at this agent -- an agent that is not actually in file mode must
+// never send "file" here).
 // Config is always a JSON object on the wire, even when parseErr is
 // non-empty and there is nothing meaningful to report (BuildReport then
 // marshals whatever zero-value Config it was given, which still renders as

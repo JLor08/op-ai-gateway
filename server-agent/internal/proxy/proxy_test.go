@@ -592,8 +592,9 @@ func TestCertHolderBindHostDerivation(t *testing.T) {
 	}
 }
 
-// TestDeriveBindHost proves the exported main.go-facing helper (I2,
-// task-18-fix-round-1.md): a real leaf on disk resolves to its IP SAN
+// TestDeriveBindHost proves the exported main.go-facing helper
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): a real
+// leaf on disk resolves to its IP SAN
 // (matching writeTestLeaf's 127.0.0.1/localhost pair, IP preferred over
 // DNS per bindHost's own order), and a directory with no loadable leaf at
 // all returns "" rather than erroring -- the caller's own signal to fall

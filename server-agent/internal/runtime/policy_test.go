@@ -71,7 +71,10 @@ func assertDecision(t *testing.T, name string, got, want Decision) {
 }
 
 // TestAdmit is table-driven over PolicySnapshot x Spec -> Decision, covering
-// every case task-12-brief.md lists. Each case asserts the FULL Decision
+// the admission rules in
+// docs/architecture/cross-cutting/agent-runtime-manager.md §5.2 "The three
+// gates" (matrix, process limit, per-GPU arithmetic) and §5.3's
+// unknown-VRAM precedence (case 11). Each case asserts the FULL Decision
 // (OK, Wait, Reason, Message, and the exact Evict slice in order) --
 // checking OK alone would pass against an implementation that evicts the
 // wrong process, the wrong number of them, or in the wrong order; leaving

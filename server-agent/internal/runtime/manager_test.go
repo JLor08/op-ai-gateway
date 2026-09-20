@@ -756,10 +756,9 @@ func TestManagerTransitionsCoalesce(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix round 1 (task-14-fix-round-1.md): C1, C2, C3, I1, I2, I3, I4 below are
-// each written to FAIL against the pre-fix code -- confirmed by running them
-// before applying the corresponding manager.go change; see
-// task-14-report.md's fix-round-1 appendix for the captured "red" output.
+// Fix round 1: C1, C2, C3, I1, I2, I3, I4 below are each written to FAIL
+// against the pre-fix code -- confirmed by running them before applying the
+// corresponding manager.go change.
 // I5's two tests are new COVERAGE for already-correct behavior (not bugs),
 // so they pass immediately, before and after this round's other changes.
 // ---------------------------------------------------------------------------
@@ -1171,7 +1170,8 @@ func TestManagerRejectsAgentOwnEnvNamespaceReference(t *testing.T) {
 // missing ${AGENT_ENV:...} variable must succeed on the very next
 // EnsureRunning call once the operator sets that variable on the agent
 // host -- WITHOUT requiring an unrelated Apply/ETag change to clear the
-// stuck state. See task-14-report.md's I6 section for the full reasoning.
+// stuck state. See docs/architecture/cross-cutting/agent-runtime-manager.md
+// §6 (final paragraph) for the full reasoning.
 // TestManagerNotPermittedRetriesOnNextRequestNotOnApply is I6's property,
 // updated for fix round 2 (R2-1) to account for notPermittedRetryInterval:
 // a request INSIDE the interval must still get the cached verdict (the
@@ -1571,8 +1571,7 @@ func TestManagerApplyDoesNotResetBackoffOnUnrelatedSpecChange(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // B6: Task 14's deferred concurrency residue, re-derived. Each test below
-// fails against the pre-fix manager; the pasted failures are in
-// task-22b-batch-b-report.md.
+// fails against the pre-fix manager.
 //
 // stubArgsStubborn is stubArgs plus -ignore-sigterm: the child keeps serving
 // /health after being signalled, so a test can actually look at manager state

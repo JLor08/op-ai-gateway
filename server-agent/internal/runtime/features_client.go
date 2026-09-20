@@ -2,7 +2,8 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // This file is the agent-side client for GET /api/agent/v1/features
-// (task-7-report.md): the gateway's declared feature-name set, which
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §7 "Feature
+// negotiation"): the gateway's declared feature-name set, which
 // Driver.featureActive intersects with this package's own
 // runtimeManagerFeature name. It follows the exact same
 // ETag-conditional-GET discipline as GatewaySource (config_client.go):
@@ -50,7 +51,8 @@ func NewFeaturesClient(gatewayURL, token string, client *http.Client) *FeaturesC
 }
 
 // featuresResponse mirrors the gateway's agentFeaturesDTO
-// ({"features":[...]}) -- no in-body etag field (task-7-report.md): the
+// ({"features":[...]}) -- no in-body etag field
+// (docs/architecture/reference/api-surface.md §5.1): the
 // etag lives ONLY in the ETag response header for this endpoint.
 type featuresResponse struct {
 	Features []string `json:"features"`

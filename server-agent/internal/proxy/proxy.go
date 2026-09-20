@@ -196,8 +196,9 @@ func (h *certHolder) bindHost() string {
 // carries no usable SAN.
 //
 // Exported for main.go, which needs the SAME derivation for the
-// agent-managed model runtime's router bind address (task-18-fix-round-1.md
-// I2): the runtime router lives in internal/runtime, which must not import
+// agent-managed model runtime's router bind address
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): the
+// runtime router lives in internal/runtime, which must not import
 // internal/proxy or internal/certfiles (archtest), so main.go -- which
 // already imports both -- resolves the default bind host here and threads
 // the resulting plain string into runtime.NewDriver instead.

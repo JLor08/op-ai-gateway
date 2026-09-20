@@ -2,9 +2,10 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // Manager owns every managed model-server process for one agent: it starts,
-// health-waits, drains, restarts (with crash backoff), and idle-unloads
-// them, and answers the router's admission question (design doc
-// docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md §6.3).
+// health-waits, drains, restarts (with crash backoff), and idle-unloads them
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §6 "Process
+// lifecycle"; drain in §5.4), and answers the router's admission question
+// (same file, §5 "Admission control").
 //
 // THE SERIALIZED OWNER (the one thing most likely to go wrong in a
 // concurrency-sensitive component like this): every piece of mutable state --
@@ -96,9 +97,11 @@ var (
 	notPermittedRetryInterval = 5 * time.Second
 )
 
-// Typed errors the router maps to HTTP (design doc §6.5). Stable identity
-// (errors.Is), stable wire code (Error() text) -- coding agents and the
-// portal depend on both never silently changing shape.
+// Typed errors the router maps to HTTP
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.3 "Stable
+// error codes"). Stable identity (errors.Is), stable wire code (Error()
+// text) -- coding agents and the portal depend on both never silently
+// changing shape.
 var (
 	ErrModelNotManaged  = errors.New("runtime.model_not_managed")
 	ErrStartFailed      = errors.New("runtime.start_failed")
@@ -106,7 +109,7 @@ var (
 	ErrAdmissionBlocked = errors.New("runtime.admission_blocked")
 	ErrNotPermitted     = errors.New("runtime.not_permitted")
 	// ErrManagerClosed is returned by EnsureRunning (and queued waiters) once
-	// Close has been called. Not one of the design doc's §6.5 wire codes --
+	// Close has been called. Not one of §4.3's wire codes --
 	// this can only happen during agent shutdown, a case the router does not
 	// need a distinct HTTP mapping for (the connection is going away with the
 	// whole process) -- but a stable sentinel is cheap and lets a caller
@@ -653,8 +656,9 @@ type ensureOutcome struct {
 
 // ensureWaiter is one queued EnsureRunning request. timer is non-nil only
 // when the spec's AdmissionWaitTimeoutSeconds is positive; 0 means "wait
-// until the caller's own ctx is done" (design doc §6.2), so no timer is
-// scheduled.
+// until the caller's own ctx is done"
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §5.4), so no
+// timer is scheduled.
 type ensureWaiter struct {
 	reply chan ensureOutcome
 	timer *time.Timer
@@ -1104,8 +1108,9 @@ func (o *owner) rebuildUpstreamIndex() {
 // the interval elapses, the next request falls through to the normal
 // queue+admitAndStart path and re-evaluates fully, self-clearing if the
 // underlying problem is fixed -- a rate limiter, not a return to
-// stickiness. See task-14-report.md's I6/R2-1 sections for the full
-// reasoning.
+// stickiness. See docs/architecture/cross-cutting/agent-runtime-manager.md
+// §6 (final paragraph) for the full reasoning, including the two endpoints
+// that were tried and rejected.
 func (o *owner) handleEnsure(c cmdEnsure) {
 	if o.closing {
 		c.reply <- ensureOutcome{err: ErrManagerClosed}
@@ -1218,8 +1223,8 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 // admission_wait_timeout_seconds promises. Draining is also the state where
 // the timer is most obviously still MEANINGFUL: a dying generation has been
 // DE-admitted, not admitted, so the request is once again waiting for a slot
-// -- precisely what design spec §4.1's "blocked by busy/pinned processes"
-// bound is for.
+// -- precisely what docs/architecture/cross-cutting/agent-runtime-manager.md
+// §5.4's busy-or-pinned queueing bound is for.
 //
 // The timer is left alone rather than cleared: whichever of
 // succeedPending/failPending later resolves this waiter calls cancelTimer,
@@ -1231,7 +1236,8 @@ func (o *owner) handleCancelEnsure(c cmdCancelEnsure) {
 // admission-wait bound (its timer is spent). That hole is not new -- I3's own
 // cancellation already produced it for the first-generation waiters -- and
 // the caller's request context still bounds the wait, which is exactly what
-// admission_wait_timeout_seconds == 0 means per design spec §4.1.
+// admission_wait_timeout_seconds == 0 means per
+// docs/architecture/cross-cutting/agent-runtime-manager.md §5.4.
 func (o *owner) handleWaiterTimeout(c cmdWaiterTimeout) {
 	st := o.specs[c.specID]
 	if st == nil {
@@ -2159,7 +2165,8 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 			// ... except for a spec the OPERATOR stopped (fix round 1, M3).
 			// This branch used to precede the Draining->Stopped normalization
 			// unconditionally, so a force-stop landing on a spec whose start
-			// had just timed out reported "backoff" -- design spec §7's
+			// had just timed out reported "backoff" --
+			// docs/architecture/cross-cutting/agent-runtime-manager.md §6's
 			// crash-loop WAIT -- for up to backoffCap (60s by default) on a
 			// spec the operator had explicitly stopped, in the portal's live
 			// status table. The wait was also a fiction: when the timer fired,

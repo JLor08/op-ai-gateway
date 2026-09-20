@@ -2,14 +2,15 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // Package runtime is the agent-side vocabulary for the agent-managed model
-// runtime: the wire mirror of the gateway's runtime-config document
-// (design doc docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md
-// §11; the shipped, field-by-field description of the same document is
-// docs/architecture/reference/api-surface.md §5.1), the
-// per-spec visible-load-lifecycle state machine (design doc §7), and the
-// admission policy (design doc §5) as pure functions over snapshots -- no
-// clocks, no I/O, no goroutines. Task 14 owns starting processes, opening
-// sockets, and reading files; this package only decides.
+// runtime: the wire mirror of the gateway's runtime-config document (the
+// shipped, field-by-field description is
+// docs/architecture/reference/api-surface.md §5.1), the per-spec
+// visible-load-lifecycle state machine
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §6 "Process
+// lifecycle"), and the admission policy (same file, §5 "Admission control";
+// the purity rule is §5.5 "One serialized owner") as pure functions over
+// snapshots -- no clocks, no I/O, no goroutines. Task 14 owns starting
+// processes, opening sockets, and reading files; this package only decides.
 //
 // NOTE for importers: this package's name shadows the standard library's
 // "runtime" package. That is harmless from inside this package, but a
@@ -330,7 +331,9 @@ func (c Config) AllowedPairs() map[[2]string]bool {
 	return allowed
 }
 
-// State is a Spec's visible load-lifecycle stage (design doc §7).
+// State is a Spec's visible load-lifecycle stage -- the nine-state wire
+// contract in docs/architecture/cross-cutting/agent-runtime-manager.md §6
+// "Process lifecycle".
 type State string
 
 const (
@@ -347,8 +350,9 @@ const (
 
 // LastError records the most recent failed start or crash for a spec. It is
 // cleared only by the NEXT SUCCESSFUL start, never merely by a state change
-// (design doc §7): a spec can be StateStopped and still show "last load
-// attempt failed, yesterday 14:32, exit code 1".
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §6): a spec can
+// be StateStopped and still show "last load attempt failed, yesterday 14:32,
+// exit code 1".
 //
 // JSON tags mirror sample.RuntimeErrorSample field-for-field (Task 18 is the
 // first caller to put this on the wire, via Driver.Status ->
@@ -408,8 +412,8 @@ type statusAlias Status
 
 // MarshalJSON normalizes a nil MeasuredVRAM to an empty JSON object ("{}")
 // instead of Go's default "null" for a nil map. A nil-versus-null defect on
-// a field the gateway parses has already been caught six times elsewhere on
-// this branch (task-18-brief.md); Status.MeasuredVRAM is nil on every spec
+// a field the gateway parses is an easy mistake to repeat across this
+// package's several JSON-facing types; Status.MeasuredVRAM is nil on every spec
 // that has never been measured (no measurer installed, or not yet running),
 // which is the common case, so this is not a corner this type can leave
 // unguarded.
