@@ -113,20 +113,50 @@ things this repository's conventions require and nothing else enforces:
 Deliberately **out of scope**: `http(s)` links (they fail for reasons that have
 nothing to do with the repository and would make the gate flaky); prose style,
 spelling and line length (this is not a markdown linter); and
-`docs/superpowers/` + `docs/implementation-status.md` as link *sources* — they
-are branch-local working documents that never reach `main`, so gating CI on
-them would gate it on scratch. Their headings are still collected, so links
-pointing *into* them are verified.
+`docs/superpowers/` + `docs/implementation-status.md` as link *sources* for the
+two checks above — they are branch-local working documents that never reach
+`main`, so gating reachability/anchor checks on them would gate CI on scratch.
+On a branch that carries them their headings are still collected, so a link
+on *that* branch pointing *into* them is still verified there — but on `main`,
+where it matters, neither path exists, so nothing is collected and a citation
+into either is **not** verified by these two checks at all. The guard below is
+what actually covers that case.
 
-`scripts/check-docs.test.sh` pins it: a miniature corpus in a throwaway git
-repository, one case per failure mode (broken link, wrong anchor, wrong
+**A fourth, narrower guard**: `docs/superpowers` and `docs/implementation-status`
+are forbidden **strings**, full stop, in every tracked (or about-to-be-tracked)
+file in the repository — not just markdown, and not just as a link target.
+Both name branch-local working documents (per `AGENTS.md`) that are real on a
+feature branch and gone from every commit that reaches `main`; a Go doc
+comment, a TypeScript comment or an operator-facing README that cites either
+path is not stale someday, it is already dangling on every branch that is not
+the one that happened to have the file open (issue #121 found dozens of these).
+The check is deliberately a flat grep plus a five-file allowlist —
+`AGENTS.md`, `CLAUDE.md`, this file, `scripts/check-docs.sh` and
+`scripts/check-docs.test.sh`, the only files that describe or test the rule
+itself — rather than a per-language parser: recognizing "this token denotes a
+path" needs real parsing in each of Go, TypeScript and Markdown, and would
+still trip over deliberately-constructed test fixtures (this file's own
+`check-docs.test.sh` cases among them). The same reasoning is why the SDD
+per-task report/brief files (`task-N-report.md` and similar, from a
+`server-agent`-side, gitignored planning workspace — never committed on any
+branch, so strictly worse than `docs/superpowers`) are **not** gated the same
+way: unlike the two literal paths above, "task-" followed by a number collides
+with ordinary prose already in this repository (review-round shorthand like
+"fix round 1, I3", section banners like "Task 9: file-mode runtime report
+ingest") in a way a flat grep cannot tell apart from a real citation without
+false positives. Those were found and repointed by hand during the same
+audit; nothing here re-checks that they stay gone.
+
+`scripts/check-docs.test.sh` pins all of it: a miniature corpus in a throwaway
+git repository, one case per failure mode (broken link, wrong anchor, wrong
 duplicate-heading suffix, unindexed architecture file, severed reachability
 path, dangling `$ref`, non-local `$ref`, duplicate key, bad indent, tab,
-unparsable line, multi-line flow) **and** one case per thing it must stay quiet
-about (links and headings inside fenced code blocks, links inside inline code,
-external URLs, branch-local scratch documents). CI runs the pins before the
-check, because a docs checker that reports success on a broken corpus is worse
-than no checker.
+unparsable line, multi-line flow, a forbidden string outside the allowlist)
+**and** one case per thing it must stay quiet about (links and headings inside
+fenced code blocks, links inside inline code, external URLs, branch-local
+scratch documents, the allowlisted files themselves saying the forbidden
+strings). CI runs the pins before the check, because a docs checker that
+reports success on a broken corpus is worse than no checker.
 
 ## 5. Continuous integration
 
