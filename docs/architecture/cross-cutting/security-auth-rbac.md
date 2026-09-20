@@ -732,8 +732,13 @@ every *mutating* principal-limit path re-checks its own principal inside
 consulted.** `PrincipalLimiter.Admit` resolves the config once per principal
 per cache window and returns *allow* the moment it is the zero
 `routing.LimitConfig`, which covers both "no `principal_limits` row" (the
-store's `ok=false`, kept as a negative cache entry) and "a row whose every
-field is zero". No rate bucket is touched and no `UsageAggregateSince` read is
+store reports `found=false` and the zero config is cached as that principal's
+entry, so a missing row costs one read per TTL window, not one per request)
+and "a row whose every field is zero". Do not read that `found` as
+`configFor`'s own second return, which means something different and narrower:
+a *store error*, which fails open for the single call and is deliberately
+never cached, so a transient blip cannot entrench a false "no limits" verdict
+for the rest of the window. No rate bucket is touched and no `UsageAggregateSince` read is
 issued on that path, so zero-config is a genuine short-circuit rather than
 four checks that each happen to pass — and that is what makes an all-zero PUT
 the supported way to *clear* limits, a stored all-zero row being behaviorally

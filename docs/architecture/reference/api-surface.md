@@ -667,7 +667,7 @@ message names the offending type.
 | `/api/portal/services`, `/services/{id}[/...]` | GET/POST, GET/PUT/DELETE + tokens/admin-groups | Service (service-account) CRUD, delegate-scoped token issuance |
 | `/api/portal/resource-groups`, `/resource-groups/{id}[/...]` | GET/POST, GET/PATCH/DELETE + servers/admin-groups/provisions/candidates | Resource-group CRUD, server membership, provisioning to users/groups/services |
 | `/api/portal/server-admin-group-candidates`, `/service-admin-group-candidates`, `/resource-group-admin-group-candidates`, `/admin-owner-candidates` | GET | Addable-candidate lists for the respective admin-group/owner pickers |
-| `/api/portal/admin/users/{id}/limits` | GET/PUT | **`admin`** (plus a manageable-user-set check for a non-`system` caller) | Per-user rate/quota/budget limit management — deliberately no self-service path |
+| `/api/portal/admin/users/{id}/limits` | GET/PUT | Per-user rate/quota/budget limit management — **`admin`** scope (plus a manageable-user-set check for a non-`system` caller), deliberately no self-service path. The PUT additionally re-checks `isAdmin` inside the service; see [Security §12](../cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization) |
 
 ### Feature flags / small read-only status
 

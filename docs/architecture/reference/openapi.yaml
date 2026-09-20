@@ -524,7 +524,9 @@ paths:
       summary: Delete a stored capture payload
       description: >
         Removes the capture blob only; the owning usage_events row is
-        untouched. Same owner-or-admin gate as the read, secret rows included.
+        untouched. Gated exactly like the read: owner-or-admin, and a capture
+        flagged `secret` is owner-only, so an admin cannot delete one it does
+        not own.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
