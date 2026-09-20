@@ -12,16 +12,21 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`) |
+| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
-token — see [§7](#7-request-authentication-decision-flow). Every other
-inference endpoint (`/v1/responses`, `/v1/messages`,
-`/v1/messages/count_tokens`, `/v1/images/generations`, and the `/v0/models`,
-`/openai/v1/models`, `/anthropic/v1/models` model-listing endpoints) is
-**bearer-only**: no session cookie is accepted there at all.
+token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`
+(and its `/openai/v1/` alias) accepts **either** the internal trusted-loopback
+pair **or** a bearer token, but never a portal session cookie: it is reachable
+by the gateway's own background executor over loopback, never by a logged-in
+browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
+`internal/gateway/auth_internal_or_bearer.go`). Every remaining inference
+endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
+`/v0/models`, `/openai/v1/models`, `/anthropic/v1/models` model-listing
+endpoints) is **bearer-only**: no session cookie and no loopback pair is
+accepted there at all.
 
 ## 2. Local password authentication
 
@@ -132,9 +137,23 @@ want a chat run to inherit a *specific stored API token's* limits, model
 overrides, project attribution, or server pin instead of the session's
 defaults. `X-OP-Run-As-Token` carries that token's **ID** (not its secret —
 the caller is already a CSRF-protected authenticated session, so this header
-is a capability *selector*, not a credential) on chat-completions requests —
-those handled by `handleOpenAIChat`, reached via both `/v1/chat/completions`
-(the path the loopback run executor actually posts to) and its `/openai/` alias.
+is a capability *selector*, not a credential) on the requests handled by
+`handleOpenAIChat` — `/v1/chat/completions` (the path the loopback run
+executor actually posts to) and its `/openai/` alias — **and, since the portal
+gained image turns, on `/v1/images/generations` and its `/openai/` alias
+too**: `handleOpenAIImages` (`internal/gateway/images_handler.go`) carries the
+identical block, guarded the identical way, so an image turn started under a
+run-as token bills, captures and routes under that token rather than under the
+bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
+shows both edges into `AuthorizeRunAsToken`; do not read this section as
+naming chat completions exclusively.
+
+The gate is the resolved principal's **token id being empty**, not the path and
+not the headers the request carries: `token.ID == ""` is true only for the
+loopback/session-shaped principal and never for a bearer principal, so the
+header structurally cannot act on `/v1/responses` or `/v1/messages`, whose
+bearer-derived id is always populated ([API Compatibility & Inference
+§12](compatibility-and-inference.md#12-in-portal-chat-playground)).
 
 `portal.Service.AuthorizeRunAsToken(ctx, principal, tokenID)` is the sole
 authorization point:
@@ -150,8 +169,10 @@ On success, the request proceeds as that token's `auth.Token` — its scopes,
 project, and server override, not the session's. This is the mechanism the gateway's own
 background chat-run executor uses when it calls back into itself over the
 internal trusted-loopback path (`X-OP-Internal-Auth`): it optionally attaches
-`X-OP-Run-As-Token` to run the executed chat step under a specific token's
-identity. If the run-as token itself carries a `ServerOverride`, that takes
+`X-OP-Run-As-Token` to run the executed step under a specific token's
+identity — on its images hop as well as its chat hop, since
+`setRunLoopbackHeaders` (`internal/gateway/chat_runs.go`) sets one header set
+for both. If the run-as token itself carries a `ServerOverride`, that takes
 precedence over any separately-configured chat server override — the
 run-as token's own settings always win.
 
@@ -212,13 +233,33 @@ flowchart TD
     N -- "session + optional\nX-OP-Run-As-Token" --> O["AuthorizeRunAsToken\n(ownership + active + scope)"]
     N -- pass --> L
 
-    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\n/v1/images/generations,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
+    D -- "/v1/responses, /v1/messages,\n/v1/messages/count_tokens,\nmodel-listing endpoints" --> P["Bearer ONLY\n(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
     P -- pass --> L
+
+    D -- "/v1/images/generations\n(/openai/v1/... alias)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
+    R -- no --> T{"Authorization: Bearer present?"}
+    T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
+    T -- no --> X2
+    S --> V{"requireInternalOrBearerAnyScope:\ngateway:use OR llm:invoke"}
+    U --> V
+    V -- "loopback + optional\nX-OP-Run-As-Token" --> O
+    V -- pass --> L
 
     D -- "/api/agent/v1/*" --> Q["Agent bearer secret\nvs agent_tokens\n(separate token universe)"]
     Q -- pass --> L
 ```
+
+Note that `/v1/images/generations` resolves its principal through
+`authenticateInternalOrBearer` (`auth_internal_or_bearer.go`) rather than
+through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
+duplicated: both entry points call the same `loopbackPrincipal`
+(`internal/gateway/auth.go`), so the constant-time secret comparison and its
+fail-closed conditions (no configured secret, no user lookup, unknown user)
+exist exactly once and cannot drift apart. What differs is only what each one
+falls back to when that check does not match — and this endpoint deliberately
+has **no session-cookie branch at all**, never node E/H/M's path.
 
 Two authorization helpers sit behind the session/bearer resolution and are
 worth naming explicitly because they differ in an easy-to-miss way:

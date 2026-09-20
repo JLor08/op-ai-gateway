@@ -54,8 +54,11 @@ negotiated by feature flag, so an agent without it behaves exactly as before.
 ## 4.5 Two auth modes, layered authorization
 
 Browsers authenticate with a **session cookie + CSRF header**; programs use
-**bearer API tokens**. `/v1/chat/completions` additionally accepts the session
-(the other inference endpoints are bearer-only). Authorization is layered:
+**bearer API tokens**. `/v1/chat/completions` additionally accepts the
+session; `/v1/images/generations` additionally accepts the internal
+trusted-loopback pair instead (the gateway's own background executor, never
+a browser); every other inference endpoint is bearer-only. Authorization is
+layered:
 roles `user < admin < system_admin`, plus delegated **admin groups**, **step-up**
 for sensitive system-admin actions, and scoping by **projects / user-groups /
 service accounts / resource-groups**. Secrets are never stored in plaintext.

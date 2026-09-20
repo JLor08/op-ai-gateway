@@ -128,6 +128,54 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'server_override.model_unavailable': 'errorServerOverrideModelUnavailable',
   'request.failed': 'errorRequestFailed',
   'request.invalid_response': 'errorRequestFailed',
+  // Portal chat image generation (task 8): the chat run lifecycle's own
+  // codes (chat_runs.go / chat_runs_images.go), the mapping capability-form
+  // refusal reachable from the operator form this feature added
+  // (portal_mapping_endpoints.go), and the four images.* codes -- previously
+  // reachable only from a direct API client -- now reachable from a chat run
+  // too (images_handler.go, relayed verbatim by upstreamErrorCode).
+  'portal.chat_too_large': 'errorChatTooLarge',
+  // The 404 every chat endpoint answers for a chat that is gone
+  // (portal.ErrChatNotFound / store.ErrNotFound, mapped in error_map.go,
+  // portal_chat_endpoints.go and chat_run_endpoints.go). Older than this
+  // feature, but it is the FOURTEENTH code of this group and the only one
+  // the block above left out, so a stale tab acting on a chat deleted
+  // elsewhere was the one chat failure that reached the toast as its raw
+  // wire code plus untranslated English. Every writer can raise it: save,
+  // send, rename and delete.
+  'portal.chat_not_found': 'errorChatNotFound',
+  'portal.chat_run_active': 'errorChatRunActive',
+  'portal.chat_run_limit': 'errorChatRunLimit',
+  'mapping.capability_reserved': 'errorMappingCapabilityReserved',
+  'gateway.chat_run_timeout': 'errorChatRunTimeout',
+  'gateway.chat_run_image_dispatch_failed': 'errorChatRunImageDispatchFailed',
+  'gateway.chat_run_no_image': 'errorChatRunNoImage',
+  'gateway.chat_run_image_format_unknown': 'errorChatRunImageFormatUnknown',
+  'gateway.chat_run_image_response_unreadable': 'errorChatRunImageResponseUnreadable',
+  'gateway.chat_run_commit_failed': 'errorChatRunCommitFailed',
+  'images.prompt_required': 'errorImagesPromptRequired',
+  'images.stream_unsupported': 'errorImagesStreamUnsupported',
+  'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',
+  'images.upstream_error': 'errorImagesUpstreamError',
+  // Task 8 fix round, finding 1: keeping the non-200 body (above) made the
+  // TEXT path's own upstream codes reach the chat toast for the first time
+  // too -- completionErrorResponse/completionErrorCode's nine codes
+  // (inference_complete.go), none of which were mapped, so a run that failed
+  // because no host was healthy started showing the literal string
+  // "routing.no_healthy_host" where it used to show "upstream status 503
+  // Service Unavailable". Same defect class as the images.* codes above, one
+  // hop over. model.not_allowed is the odd one out (inference_handlers.go's
+  // writeModelNotAllowed, not completionErrorResponse), but reaches the same
+  // loopback hop the same way.
+  'routing.no_healthy_host': 'errorRoutingNoHealthyHost',
+  'routing.no_model_route': 'errorRoutingNoModelRoute',
+  'routing.model_not_capable': 'errorRoutingModelNotCapable',
+  'routing.admission_queue_full': 'errorRoutingAdmissionQueueFull',
+  'routing.admission_queue_timeout': 'errorRoutingAdmissionQueueTimeout',
+  'provider.unavailable': 'errorProviderUnavailable',
+  'provider.timeout': 'errorProviderTimeout',
+  'provider.invalid_response': 'errorProviderInvalidResponse',
+  'model.not_allowed': 'errorModelNotAllowed',
 };
 
 export function formatPortalError(err: unknown, t: Translation): string {
@@ -136,6 +184,22 @@ export function formatPortalError(err: unknown, t: Translation): string {
     return `${err.code}: ${labelKey ? t[labelKey] : err.message}`;
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Maps a chat run's terminal error CODE (the SSE `done`/`snapshot` event's
+ * `error` field -- see useChatRuns.ts) to a localized, user-facing message.
+ *
+ * Unlike `formatPortalError`, a run carries no separate raw server message to
+ * fall back to: the code itself is the only signal (runTimedOutMessage,
+ * ErrChatTooLarge.Error(), ...). So an unmapped code -- forward
+ * compatibility with a future backend, or simply a gap in this map -- must
+ * degrade to the bare code rather than to nothing, exactly like the run-error
+ * toast read before any of errorLabelByCode's chat-run entries existed.
+ */
+export function formatChatRunErrorCode(code: string, t: Translation): string {
+  const labelKey = errorLabelByCode[code];
+  return labelKey ? t[labelKey] : code;
 }
 
 /**

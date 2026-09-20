@@ -263,6 +263,49 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(submitted[0]).not.toHaveProperty('vision_capable');
     });
 
+    it('sends the image verdict when the control is moved to yes', async () => {
+      const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+      await pickOption(t.mappingImageCapable, t.mappingCapabilityYes);
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0].capability_verdicts).toEqual({ image: 'yes' });
+    });
+
+    it('sends an empty image verdict when the control moves back to unknown', async () => {
+      const { submitted } = renderForm({
+        row: makeMapping({ capabilities: [capRow('image', 'yes')] }),
+      });
+      await pickOption(t.mappingImageCapable, t.mappingCapabilityUnknown);
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      // '' asks for the row to be DELETED, which is the only way back out of a
+      // `manual` verdict.
+      expect(submitted[0].capability_verdicts).toEqual({ image: '' });
+    });
+
+    it('does not offer a "no" option for image, because the backend refuses it', async () => {
+      renderForm({ row: makeMapping({ capabilities: [] }) });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.mappingImageCapable }));
+      expect(
+        await screen.findByRole('option', { name: t.mappingCapabilityUnknown }),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: t.mappingCapabilityYes })).toBeInTheDocument();
+      // reservedManualVerdicts refuses (image, no): a manual no outranks every
+      // automated source forever and would mask the sd-server writer when it
+      // ships. A control that always 400s is worse than an absent one.
+      expect(screen.queryByRole('option', { name: t.mappingCapabilityNo })).not.toBeInTheDocument();
+    });
+
+    it('shows an image unknown hint that does not promise a probe', async () => {
+      renderForm({ row: makeMapping({ capabilities: [] }) });
+      expect(screen.getByText(t.mappingImageCapableUnknownHint)).toBeInTheDocument();
+      // The vision hint may promise re-derivation; image has no automated
+      // writer yet, so its hint must not.
+      expect(t.mappingImageCapableUnknownHint).not.toBe(t.mappingVisionCapableUnknownHint);
+    });
+
     it('leaves metrics_locked a CHECKBOX', () => {
       // A policy flag over the numeric metrics, not a capability -- ADR-039 is
       // explicit that it does not guard the capability table any more, so it

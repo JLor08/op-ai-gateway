@@ -49,6 +49,21 @@ user's session without an API token — each chat turn runs as a server-side run
 whose executor calls the gateway's own `/v1/chat/completions` over loopback and
 streams the result to the browser via SSE (surviving page reloads/disconnects).
 
+**Amended by [ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (the image kind splits the loopback leg off the
+session leg).** The decision above is unchanged in substance and its two named
+bearer-only endpoints are still bearer-only. What it could not distinguish, because
+nothing needed the distinction yet, is that "the session" and "the internal
+trusted-loopback path" are two separate legs and an endpoint may admit the second
+without the first. `/v1/images/generations` does exactly that: the portal-chat run
+executor reaches it over loopback (`requireInternalOrBearerAnyScope` →
+`authenticateInternalOrBearer`, `internal/gateway/auth_internal_or_bearer.go`), while
+a logged-in browser cannot call it at all. So `/v1/chat/completions` remains the only
+inference endpoint reachable with a **session cookie**, and it is no longer the only
+one reachable over **loopback** — read the parenthesis above as naming a leg that
+ADR-043 later granted separately. See [Security, Authentication & Authorization
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)
+for the current three-leg table.
+
 ## ADR-007 — Secrets at rest: the `enc:`/`plain:` scheme
 **Decision:** decryptable secrets are sealed with a key, or held plaintext only in
 volatile RAM, or rejected on disk when no key is present; DTOs expose only `*_set`
@@ -1643,3 +1658,267 @@ count is scanned off the full byte stream regardless.
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [HTTP API Surface
 §1](reference/api-surface.md#1-inference--compatibility-endpoints).
+
+## ADR-043 — The portal image turn: the model is the affordance, the kind is pinned to the thread
+**Context:** [ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
+built `POST /v1/images/generations` and its capability gate, and nothing in the
+portal could reach it — the run executor spoke one URL, and the verdict that
+admits a model had no writer on any screen, so the endpoint served nothing and
+no operator could change that. Closing the gap is not one feature but a handful
+of decisions, each with a cheaper obvious answer that is wrong in a way no test
+would catch. **Two structural facts drive all of them.** The endpoint is
+buffered by construction — `stream: true` is refused outright
+([API Compatibility & Inference
+§3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations))
+— so a portal image turn emits **zero** incremental events across a wait
+measured in minutes. And the artifact has to land in a chat transcript that is
+one sealed document under a hard 4 MiB ceiling, which images, and essentially
+nothing else, can exhaust.
+
+**(a) The picked model is the ONLY affordance, and a model whose `image`
+verdict is `yes` makes every turn in that thread an image turn.** No mode
+toggle, no "generate an image" button, no sniffing the prompt for intent. This
+mirrors how `vision` already works: `portal.ModelDTO.Vision` is AND-folded
+across a mapping's servers in `modelsResponse` and the attach control is
+enabled or not from that single flag; `image` folds identically and the
+composer follows it. One axis is the point — the composer can then never offer
+something the gate will refuse.
+
+**Rejected: a mode toggle.** A second, independent axis of user intent makes
+reachable a state the capability gate must then refuse **at the bottom of the
+stack, after the user has already committed a prompt**, and it forces a second
+question — what happens when the toggle is on and the model says no? — whose
+only good answer is to disable the toggle, which is this decision with extra
+steps.
+
+**Consequence: `vision` and `image` are one word apart and point in opposite
+directions, so the attach control stays gated on `vision` and its refusal had
+to be reworded.** An image *generator* has no reason to accept an image
+*input*, so an image-only thread whose mapping does not also declare `vision`
+correctly has attachment disabled — but the tooltip said "this model does not
+support images", about a model whose entire job is images. The generic string
+now names what it actually gates, image **input**, and an image-generating
+model gets its own sentence saying so explicitly
+([§11](cross-cutting/compatibility-and-inference.md#11-multimodal-images) exists
+to keep the two axes from being folded into one). **And the verdict
+finally has a writer:** ADR-042 (b) left `(image, yes)` writable on purpose for
+this, so the mapping form's capability write loop and the model-servers
+capability display both carry `image` now. `(image, no)` stays reserved — the
+UI writes the enabling verdict, never the refusing one.
+
+**(b) The thread's kind is PINNED at its first send, and it is a UI constraint
+— not an authorization.** (a) is a property of the **thread**; implemented
+naively it is a property of the **currently-picked model**, which the user may
+change between every turn. The gap is worse in the direction nobody expects.
+Switching an image thread to a **text** model trips the role-blind
+history-has-image guard and is refused — accidentally correct, and
+unexplained. Switching it to a **vision** model *lifts* that guard, and the
+thread's entire multi-megabyte image history is then POSTed to
+`/v1/chat/completions` as vision input: a real cost and privacy surprise, on a
+thread the rule called image-only. So the kind is persisted on
+`portal.ChatRunSettings` as a `kind` **string** (not an `image_only` boolean:
+the same value selects the request URL, and it extends to a future audio or
+speech kind without a second flag), `omitempty` so every pre-existing chat
+stays byte-identical on the wire, and the model picker filters to the thread's
+kind rather than the picker deciding the thread's.
+
+**The pin must be re-imposed server-side, and the obvious hook is not enough.**
+`PrepareChatRun` never reads the persisted settings blob — it **replaces** it
+wholesale with the settings submitted on this request — so a kind merely
+written into the stored document is silently unpinned by the next send. It is
+therefore lifted out of storage *before* that overwrite and forced back onto
+the submitted settings.
+
+**And the force cannot be conditioned on the stored kind being non-empty.**
+Because the field is `omitempty`, a text thread stores **no** `kind` key and
+reads back `""` — byte-indistinguishable from a thread that has never been
+sent. A `stored.Kind != ""` guard therefore pins `image` and **cannot pin
+`text`**: a client submitting `{"kind":"image"}` on a text thread's second send
+would flip it, and its next turn would go to an endpoint that carries no
+history at all, silently discarding the conversation. Distinguishing the two
+cases needs a separate signal for *has this thread been sent before* — the
+presence of messages in the stored document, captured **before** this send
+appends to it. The residual is named at the code: a chat created with messages
+already inside its client-supplied content would read as already-sent on what
+is logically its first send. No call site seeds messages on create today; the
+day one does, the heuristic has to become an explicit marker.
+
+**The pin is a UI constraint and nothing more, and that is a requirement rather
+than a nicety *because* the field is client-settable.** `startRunRequest.Settings`
+is `portal.ChatRunSettings` **verbatim**, so every field added to that struct
+becomes settable over the API the moment it exists — a first send can submit
+any kind. A thread pinned to `image` whose mapping later loses its `image`
+verdict (operator revoked, mapping changed) must fail the capability gate
+exactly as an unpinned request would. The pin decides what the **composer
+offers**; `Resolver.filterCapable` decides what the **gateway serves** and
+remains the only authority ([Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
+
+**(c) The image is stored INLINE in the sealed transcript, and the 4 MiB
+whole-document ceiling is accepted for v1 rather than worked around.** It is
+persisted as an OpenAI-style `image_url` content part carrying a `data:` URL —
+the identical shape an uploaded vision image already has, so history
+construction feeds it back as a vision input on the next turn for free and the
+existing renderer applies to it. This is policy-compliant rather than a hole in
+the no-persist rule: chat transcripts are already among what the capture
+encryption key seals ([Security, Authentication & Authorization
+§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)), so an inline
+image inherits that guarantee instead of escaping it.
+
+The cap (`portal.MaxChatContentBytes`) is measured against the **whole
+pre-gzip document**, so every image in a thread shares one budget for the
+thread's life and a busy thread runs out. That is accepted and **made loud**
+rather than lifted: a failed terminal commit now ends the run as an **error**
+instead of being logged while the run reports success
+([§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground)),
+which closes a silent data loss in which a too-large image turn rendered in the
+browser and then vanished on reload. Lifting the ceiling is issue #124 and is
+recorded in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+**Rejected: a separate blob store for v1.** It is the right end state and it is
+a schema change across three drivers, an owner-scoped serving endpoint, a
+delete cascade and a re-litigated sealing decision — none of which this feature
+needs in order to work. Filed as #124. — **Rejected: a server-side re-encode to
+fit the cap.** The client already downscales its **own uploads**; re-encoding
+what the *model produced* is a different act, because it silently degrades the
+artifact the user asked for. Upstream bytes are stored as-is, with a real
+binary download so the user can keep the original.
+
+**(d) The composer leads with the one number that is EXACT, and shows no
+progress at all.** Four independent composer designs all spent their effort on
+the single quantity nobody can bound — progress — and all four withheld the one
+that is exact and knowable *before the user commits*: the remaining transcript
+budget. So the composer states the room left in this chat, computed from the
+client's own document size against the served cap, and **Send refuses up front**
+when another image cannot fit. That is the repository's own rule applied one
+layer up: `validateImagesRequest` answers 400 to a `response_format` it cannot
+honour rather than relaying and mis-measuring, and spending minutes of
+diffusion CPU on an artifact we can already prove we cannot store is the same
+error. Every panel design surfaced the cap only *afterwards* — toasts, chips,
+download rescues — which is four recovery mechanisms for a failure that can
+simply be declined.
+
+**The cap is SERVED, never duplicated.** `MaxChatContentBytes` was package-
+private and no DTO carried it. A second `4 << 20` literal in TypeScript would
+drift from the Go constant with nothing to catch it, and the failure mode is a
+capacity line that confidently states the wrong number — the exact defect the
+line exists to prevent. It rides on `ChatListResponse.max_content_bytes`, on
+the listing the chat view already fetches, and it is deliberately **not**
+`omitempty`: a missing field and a zero are the same thing on the wire, and the
+portal reads zero as *capacity unknown* (no line, no refusal), so an accidental
+zero disables the feature instead of inventing a number.
+
+**During the wait, three elements, each backed by a value that exists:**
+liveness from the run's own server-reported status; an elapsed clock from the
+run's **server-measured** age, labelled as the wait rather than the work; and
+one static sentence stating that there are no intermediate messages — the image
+arrives finished or not at all. The age is measured by the server because a
+client cannot measure it honestly: a reopened or second tab never witnessed the
+moment of Send, and every view has to show the same true number. The clock is
+`aria-hidden`, because the transcript is an `aria-live` log and a
+once-per-second announcement would make the thread unusable with a screen
+reader.
+
+**The character counter is ABSENT, not zero.** An image run streams no text
+either, so reusing the text pending state would render "0 characters" from the
+first millisecond to the last — a *measured* zero where nothing was ever
+measured. The distinction is not invented here: `proxyNative` already hands a
+buffered relay a **nil** progress rather than an always-zero struct, for
+precisely this reason, and a progress bar, a percentage or an ETA over an
+endpoint that reports none of them would each be the same fabrication in a
+louder form.
+
+**(e) The run deadline applies to the IMAGE kind only.** A bound is what turns
+an open-ended wait into one the UI can make a true promise about, and without
+it the likeliest real failure is a user cancelling a run that would have
+succeeded. It is applied in `executeRun` — the first point at which the run's
+kind is known — as a child of the reservation's context, so Stop still cancels
+it and the ordinary terminal path releases the timer.
+
+**Bounding every run instead would be one branch fewer and a behaviour change
+to an existing, overwhelmingly common path.** A text run streams deltas, so the
+user can see for themselves that it is alive and the honesty argument does not
+apply to it; a process-wide ceiling would newly kill long generations from a
+slow local model that complete perfectly well today — a regression to an
+existing feature arriving as a side effect of the image feature. If the text
+kind should be bounded, that needs its own decision.
+
+**Two traps make this more than a one-line change, and both are recorded
+because both are silent and both would return under a refactor.**
+
+1. **A timeout must not be reported as a user cancel.** `executeRun` turned
+   *any* context error into the `canceled` terminal with an empty message, so a
+   firing deadline would be indistinguishable from the user pressing Stop — the
+   system telling someone who pressed nothing that they pressed it. A timeout
+   carries its own terminal code on both branches it can land on: before the
+   upstream answers, and mid-response once it has.
+2. **The terminal commit must not inherit the deadline that ended the run —
+   and must not therefore be unbounded.** The terminal step is called with the
+   run's own context on every failing path, so once that context carries a
+   deadline the `CommitAssistant` inside it is cancelled by the very timeout
+   that ended the run — losing the turn instead of recording why it ended. The
+   commit therefore runs on a context stripped of cancellation. Stripping
+   alone, though, buys the opposite failure: `run.finish` and
+   `chatRunRegistry.retire` both sit *below* the commit, so a store write that
+   never returns leaves the run `running` with nothing to evict it and Stop
+   unable to reach it — and, with `PUT /api/portal/chats/{id}` now refused
+   while a run is active ([API Compatibility & Inference
+   §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground)),
+   the chat unsaveable and unrenameable until a restart. So the context is
+   **stripped and then given a fresh bound of its own**,
+   `context.WithTimeout(context.WithoutCancel(ctx), chatRunCommitTimeout)`:
+   the run's expired deadline still cannot reach the commit, while a hang
+   becomes terminal instead of permanent. 30 s — two orders of magnitude above
+   a legitimate 4 MiB sealed write, 20x below `imageRunDeadline`, equal to
+   `runEvictionDelay`.
+
+   **And the commit is not the only write that can strand a run, so the bound
+   is applied at BOTH sites.** The periodic checkpoint
+   (`consumeRunStream`) writes to the same store on its own
+   `context.Background()`, and the `finish:` label **joins that goroutine
+   before** calling the terminal step — so a checkpoint that never returns
+   means the commit is never even entered and its bound cannot help. Bounding
+   only the commit would leave the wedge fully reachable. The checkpoint is
+   therefore bounded by the same `chatRunCommitTimeout`; its error is
+   discarded exactly as before, because a lost checkpoint is recoverable by
+   the next tick or by the commit.
+
+   **The polarity is the reverse of what this ADR's other bounds suggest:
+   TEXT is the exposed kind here, not image.** Only the text executor
+   checkpoints — `executeImageRun` makes one buffered request and has no
+   periodic write at all — so a hung store reaches a text run by two routes
+   and an image run by one. The bound applying to text runs is therefore
+   required rather than merely tolerated; a kilobyte text write that has not
+   returned in 30 s is already pathological, so nothing legitimate is cut
+   short ([§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
+
+**Rejected: reusing the streaming executor for the image kind.** It opens a
+scanner over a delta stream, drives the periodic checkpoint goroutine and
+computes TTFT, chars/s and tokens/s — every one of which assumes deltas that do
+not exist here. A checkpoint would write a `pending` assistant turn with empty
+content that the terminal commit then has to replace, and every rate it
+computed would be invented rather than measured. The two halves share the
+reservation, the deadline, the loopback header set and **one** terminal commit
+function, and nothing else. — **Rejected: `requireWebAnyScope` on the images
+endpoint.** A one-line change that grants strictly more than the feature needs:
+the browser never calls this endpoint, only the run executor does, and
+admitting the cookie leg would make `/v1/images/generations` directly reachable
+from a logged-in browser session — falsifying the auth ladder in
+[§2](02-constraints.md) as a side effect of a feature that never wanted it. The
+narrow loopback-or-bearer helper keeps the documented boundary literally true
+and still admits the executor ([Security, Authentication & Authorization
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)).
+→ [API Compatibility & Inference
+§3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
+[§11](cross-cutting/compatibility-and-inference.md#11-multimodal-images),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Security, Authentication & Authorization
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance),
+[§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest),
+[Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Constraints](02-constraints.md),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[HTTP API Surface](reference/api-surface.md#tokens-chats-usage).

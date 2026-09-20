@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { messages } from './i18n';
+import { messages, type Locale } from './i18n';
 import {
   vramCardCheckLabelKey,
   vramFingerprintKinds,
@@ -762,6 +762,100 @@ describe('capacity-benchmark i18n keys', () => {
     for (const k of keys) {
       expect(messages.de[k]).toBeTruthy();
       expect(messages.en[k]).toBeTruthy();
+    }
+  });
+});
+
+describe('image-thread composer i18n keys', () => {
+  const keys = [
+    'chatImagePromptLabel',
+    'chatImageOnlyHint',
+    'chatCapacityExhausted',
+    'chatImageGeneratorNoInput',
+  ] as const;
+
+  it('defines the composer keys in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  it('interpolates the remaining-capacity count', () => {
+    expect(messages.de.chatCapacityRemaining(3)).toContain('3');
+    expect(messages.en.chatCapacityRemaining(3)).toContain('3');
+    expect(messages.en.chatCapacityRemaining(3)).not.toContain('{count}');
+    expect(messages.de.chatCapacityRemaining(3)).not.toContain('{count}');
+  });
+
+  it('keeps the image-INPUT refusal distinct from the image-GENERATOR one', () => {
+    // chatImageModelUnsupported gates image INPUT, which is a capability
+    // ORTHOGONAL to generating images -- a model can carry either, both, or
+    // neither. On one that generates images without reading them, the old
+    // wording ("does not support images") told the user that a model whose
+    // only purpose is images does not support them.
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].chatImageModelUnsupported).not.toBe(
+        messages[locale].chatImageGeneratorNoInput,
+      );
+    }
+    expect(messages.en.chatImageModelUnsupported).toContain('input');
+    expect(messages.de.chatImageModelUnsupported).toContain('Eingabe');
+    expect(messages.en.chatImageGeneratorNoInput).toContain('generates images');
+    expect(messages.de.chatImageGeneratorNoInput).toContain('erzeugt Bilder');
+  });
+});
+
+describe('image-run pending composer i18n keys', () => {
+  const keys = ['chatImageRunPending', 'chatImageNoIntermediateNews'] as const;
+
+  it('defines the pending-composer keys in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // Deliberately not "the image is being generated": between dispatch and
+  // terminal the request may still be queued for admission or waiting on a
+  // model load, during which "is being generated" is false. The wording must
+  // describe the WAIT (true for the whole span), not the work.
+  it('describes the wait, not the (possibly not yet started) work', () => {
+    expect(messages.de.chatImageRunPending).not.toContain('wird erzeugt');
+    expect(messages.en.chatImageRunPending).not.toContain('being generated');
+  });
+
+  // The ONE thing this design forbids outright: /v1/images/generations
+  // reports neither a percentage nor a remaining-time estimate, so stating
+  // either would assert a measurement that does not exist. Checked against
+  // FORBIDDEN PATTERNS on the strings' own values -- not by asserting the
+  // rendered node equals messages.xx.chatImageNoIntermediateNews itself
+  // (what ChatMessage.test.tsx's wiring test does), which is tautological
+  // and would stay green even if both locales were rewritten to
+  // "Progress: 50% - about 2 minutes remaining." / its German equivalent.
+  it('never states a percentage, a progress word, a remaining-time estimate, or any digit', () => {
+    const forbidden = [
+      /%/,
+      /\bprogress\b/i,
+      /fortschritt/i,
+      /\bremaining\b/i,
+      /verbleibend/i,
+      /\bpercent/i,
+      /prozent/i,
+      /\beta\b/i,
+      /\d/,
+    ];
+    for (const locale of ['de', 'en'] as const) {
+      for (const key of keys) {
+        const value = messages[locale][key];
+        for (const pattern of forbidden) {
+          expect(value).not.toMatch(pattern);
+        }
+      }
     }
   });
 });
@@ -2691,6 +2785,17 @@ describe('mapping capability i18n keys', () => {
   });
 });
 
+describe('mapping image capability i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the image capability keys in ${locale}`, () => {
+      const t = messages[locale];
+      expect(t.mappingImageCapable).toBeTruthy();
+      expect(t.mappingImageCapableUnknownHint).toBeTruthy();
+      expect(t.capabilityImage).toBeTruthy();
+    });
+  }
+});
+
 // Responses live-timings (issue #81 part 2, design D10): the shared
 // API-variant block's own checkbox strings plus the three backend refusals
 // part 1 introduced. The codes are read verbatim from the Go errRow tables in
@@ -2727,4 +2832,101 @@ describe('responses live-timings i18n keys', () => {
       );
     }
   });
+});
+
+// Portal chat image generation (task 8): the chat run lifecycle's own error
+// codes, the mapping capability-form refusal, and the four images.* codes now
+// reachable from a chat run rather than only from a direct API client. The
+// wire codes themselves are pinned in format.test.ts; this only guards that
+// both locales define a non-empty string for each label key.
+describe('portal chat image generation error i18n keys', () => {
+  it('defines the chat-run, mapping and images error-code keys in de and en', () => {
+    const keys = [
+      'errorChatTooLarge',
+      'errorChatRunActive',
+      'errorChatRunLimit',
+      'errorMappingCapabilityReserved',
+      'errorChatRunTimeout',
+      'errorChatRunNoImage',
+      'errorChatRunImageFormatUnknown',
+      'errorChatRunImageResponseUnreadable',
+      'errorChatRunCommitFailed',
+      'errorImagesPromptRequired',
+      'errorImagesStreamUnsupported',
+      'errorImagesResponseFormatUnsupported',
+      'errorImagesUpstreamError',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+
+  // errorChatTooLarge is the one that matters most, and the advice it gives
+  // has to match what actually happened. On BOTH paths that raise this code
+  // the write was refused and nothing was stored -- and the run withholds the
+  // image parts from its terminal event when the commit fails
+  // (finishRunWithParts, chat_runs.go), so there is no image on screen either.
+  // The message therefore says nothing was saved and names the one action
+  // that helps, a new chat; it must NOT tell the user to download something
+  // that is not there.
+  it('tells the user what to do about a too-large chat, in both locales', () => {
+    expect(messages.de.errorChatTooLarge).toContain('neuen Chat');
+    expect(messages.en.errorChatTooLarge).toContain('new chat');
+    expect(messages.de.errorChatTooLarge).not.toMatch(/herunterladen|Download/i);
+    expect(messages.en.errorChatTooLarge).not.toMatch(/download/i);
+  });
+
+  // The failed-canonical-refetch notice (whole-branch review, finding 1/2):
+  // the run succeeded and the turn IS on the server, but this tab stops
+  // saving the chat, and a silent stop is the failure mode the refusal exists
+  // to prevent in the first place.
+  it('defines the stale-transcript notice in both locales', () => {
+    expect(messages.de.errorChatTranscriptStale.length).toBeGreaterThan(0);
+    expect(messages.en.errorChatTranscriptStale.length).toBeGreaterThan(0);
+  });
+});
+
+// Fix round, finding 1: the nine completion-error codes (routing.*,
+// provider.*, model.not_allowed) reachable from the chat text path now that
+// a non-200 keeps its body. The wire codes are pinned in format.test.ts;
+// this only guards that both locales define a non-empty string for each key.
+describe('completion-error i18n keys reachable from the chat text path', () => {
+  it('defines the routing/provider/model-not-allowed error-code keys in de and en', () => {
+    const keys = [
+      'errorRoutingNoHealthyHost',
+      'errorRoutingNoModelRoute',
+      'errorRoutingModelNotCapable',
+      'errorRoutingAdmissionQueueFull',
+      'errorRoutingAdmissionQueueTimeout',
+      'errorProviderUnavailable',
+      'errorProviderTimeout',
+      'errorProviderInvalidResponse',
+      'errorModelNotAllowed',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('chat generated-image i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has the generated-image keys in ${locale}`, () => {
+      const t = messages[locale];
+      expect(t.chatDownloadImage).toBeTruthy();
+      expect(t.chatGeneratedImage).toBeTruthy();
+      // The generated-image alt must not reuse the ATTACHED-image string.
+      expect(t.chatGeneratedImage).not.toBe(t.chatAttachedImage);
+      // A corrupted persisted data URL fails to decode, and the whole point
+      // of this feature is that the failure is not silent -- so there must
+      // be a distinct string to tell the user.
+      expect(t.chatImageDownloadError).toBeTruthy();
+    });
+  }
 });

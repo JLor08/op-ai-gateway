@@ -423,6 +423,15 @@ export type ModelOption = {
   // vision-capable (accepts image input). The backend AND-aggregates this
   // across all offering mappings/members (fail-closed).
   vision?: boolean;
+  // True when this model — and, for a group, EVERY offered member — GENERATES
+  // images (serves /v1/images/generations). Independent of `vision`, which is
+  // whether it ACCEPTS them: an image generator takes a prompt and emits an
+  // image, a vision model takes an image and emits text. Same fail-closed
+  // AND-aggregation in the backend (ModelDTO.Image).
+  //
+  // OPTIONAL, like `vision`: a fixture that omits it derives `image === false`,
+  // which is what keeps every pre-existing non-image test meaningful.
+  image?: boolean;
 };
 
 export type ModelServerRow = {

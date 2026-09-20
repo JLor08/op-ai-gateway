@@ -880,6 +880,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(labels).toEqual([t.capabilityAudio, 'thinking']);
     });
 
+    // Before this change an image row fell into the open-vocabulary bucket and
+    // rendered as a raw lowercase `image` chip. It now has a translated label
+    // and a fixed slot, so this test pins BOTH halves: the label appears and
+    // the raw capability name does not.
+    it('renders the image capability with a translated label, not as a raw chip', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('image', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityImage)).toBeInTheDocument();
+      expect(within(cell).queryByText('image')).not.toBeInTheDocument();
+      // Keyed by data-status, never by colour (house rule; this portal has no
+      // red), and "active" like every other determined capability.
+      expect(within(cell).getByText(t.capabilityImage)).toHaveAttribute('data-status', 'active');
+    });
+
+    it('renders no image chip for a missing row', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('vision', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText(t.capabilityImage)).not.toBeInTheDocument();
+    });
+
     // "mtp"/"live_progress" are rows in this SAME capabilities array now (they
     // share the model_mapping_capabilities table with vision/video/audio/
     // tools), but this table already has its OWN dedicated "MTP"/

@@ -12,6 +12,8 @@ import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent } from './shared/chatContent';
 import type { Translation } from './shared/types';
+import { ImageTurn } from './ImageTurn';
+import { ImagePendingTurn } from './ImagePendingTurn';
 
 function contentText(content: ChatContent): string {
   if (typeof content === 'string') return content;
@@ -42,9 +44,13 @@ function ChatMessageComponent({
   t,
   role,
   content,
+  turnId,
+  promptText,
   reasoning,
   reasoningMs,
   streaming,
+  kind,
+  elapsedMs,
   ttftMs,
   tps,
   tokensPerSecond,
@@ -55,9 +61,35 @@ function ChatMessageComponent({
   t: Translation;
   role: 'user' | 'assistant';
   content: ChatContent;
+  // This row's transcript message id (`ChatUiMessage.id`), the same value the
+  // Chat container already keys the row by. Passed down purely so a generated
+  // image's DOWNLOAD NAME can be turn-unique — see ImageTurn's
+  // downloadNameFor. Optional only because the standalone-props tests in this
+  // component's own suite predate it; Chat.tsx, the single production call
+  // site, always supplies it.
+  turnId?: string;
+  // The preceding user turn's text, used as a generated image's alt text (the
+  // accessible name for "what was asked for" rather than a generic label).
+  // Only meaningful on the assistant branch.
+  promptText?: string;
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
+  // The kind of the RUN this row is streaming ("" text | "image") --
+  // ChatStore's runKind, read from the run's own reports (its 201, an
+  // active-runs entry, an SSE snapshot), NOT the thread-level chatKind.
+  // The distinction is the whole point: chatKind is the client's guess at
+  // what the composer should offer and can be stale, while this is what the
+  // executor is actually running, and rendering the image wait state over a
+  // text run is exactly what the stale value produces. Only meaningful
+  // together with `streaming`: it selects the image-run pending render below
+  // for the one turn that is both streaming and imageless. Absent on every
+  // call site that predates image threads.
+  kind?: string;
+  // The active run's server-anchored elapsed ms (ChatStore's runElapsedMs),
+  // passed through untouched -- see ImagePendingTurn for how it is
+  // interpolated into a ticking display.
+  elapsedMs?: number;
   ttftMs?: number;
   tps?: number;
   tokensPerSecond?: number;
@@ -69,6 +101,7 @@ function ChatMessageComponent({
   canRun?: boolean;
 }>) {
   const text = contentText(content);
+  const images = contentImages(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
   const [showRaw, setShowRaw] = useState(false);
@@ -76,6 +109,20 @@ function ChatMessageComponent({
   const roleLabel = role === 'user' ? t.userRole : t.assistantRole;
 
   if (role === 'assistant') {
+    // An image run emits ZERO incremental events -- the endpoint refuses
+    // `stream` outright -- so there is nothing to count and the character
+    // counter below would read "0 Zeichen" for the WHOLE multi-minute wait.
+    // Three elements instead, each backed by a value that exists: liveness
+    // from the run's own server-reported status (streaming), an elapsed
+    // clock anchored on the server's own measurement, and one sentence
+    // stating that no intermediate news is coming (see ImagePendingTurn).
+    // `images.length === 0` keeps this from replacing an arriving image in
+    // the same render, and this check runs BEFORE showReasoning below is
+    // even computed, so the ordinary text-pending branch never sees it.
+    if (streaming && kind === 'image' && images.length === 0) {
+      return <ImagePendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
+    }
+
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
     let summary: string;
@@ -239,6 +286,9 @@ function ChatMessageComponent({
             />
           )}
         </Box>
+        {images.length > 0 && (
+          <ImageTurn t={t} images={images} prompt={promptText} turnId={turnId ?? ''} />
+        )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (
             <Tooltip title={t.chatRegenerate}>
@@ -294,8 +344,6 @@ function ChatMessageComponent({
       </Box>
     );
   }
-
-  const images = contentImages(content);
 
   return (
     <Box

@@ -136,7 +136,9 @@ Always-on engineering rules (details in the documents above):
 - Both auth modes stay supported side by side: session cookie + `X-OP-CSRF`
   for browsers, bearer tokens for programmatic clients. `/v1/chat/completions`
   additionally accepts the session (portal chat runs build on this via the
-  internal loopback path); `/v1/responses` and `/v1/messages` are bearer-only.
+  internal loopback path); `/v1/images/generations` additionally accepts the
+  internal loopback pair but **never** the session cookie; `/v1/responses`
+  and `/v1/messages` are bearer-only.
 - Keep compatibility mapping isolated in `internal/compat`; keep the internal
   inference model provider-neutral.
 - Keep all three store drivers (memory/sqlite/postgres) working; dialect

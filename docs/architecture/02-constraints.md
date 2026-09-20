@@ -33,10 +33,27 @@ several architectural decisions exist specifically to satisfy them.
 - **Prompts and responses are not persisted** except via the explicit, opt-in
   payload capture, which is either encrypted-at-rest or volatile-in-RAM and always
   redacts sensitive headers. See [Security](cross-cutting/security-auth-rbac.md).
+  The **portal chat transcript** is the one other store that holds prompt and
+  answer text, and it is user-initiated rather than an operator setting: a
+  thread the user chose to keep, sealed as one opaque blob by the same capture
+  encryption key
+  ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)). A
+  portal-generated image rides **inside** that blob as a content part, under
+  the transcript's own 4 MiB whole-document cap, so it inherits that sealing
+  rather than escaping it —
+  [ADR-043](09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (c).
 - **Browser vs. program auth are separate and both supported.** Browsers use a
   server-side session cookie plus an `X-OP-CSRF` header on state-changing
-  requests; programs use bearer API tokens. `/v1/chat/completions` also accepts
-  the session; the other inference endpoints are bearer-only.
+  requests; programs use bearer API tokens. Inference endpoints accept three
+  auth legs, not a uniform one: a bearer token works on every inference
+  endpoint; the session cookie additionally works on `/v1/chat/completions`
+  only — the one inference endpoint a logged-in browser calls directly; and
+  the internal trusted-loopback header pair (nginx blanks it at the public
+  edge, so it is never reachable from a browser) additionally lets the
+  gateway's own portal-chat run executor call `/v1/chat/completions` and
+  `/v1/images/generations` as a token-less session principal. No inference
+  endpoint other than those two accepts the loopback pair, and none accepts
+  the session cookie other than `/v1/chat/completions`.
 - **The public listener and the mesh (agent) listener are separate enforcement
   surfaces** with independent TLS and authorization.
 
