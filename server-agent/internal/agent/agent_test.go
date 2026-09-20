@@ -1138,7 +1138,9 @@ type runtimeWakePoster struct {
 func (p *runtimeWakePoster) RuntimeUpdates() <-chan json.RawMessage { return p.wake }
 
 // TestCollectOnceRuntimeNilOmitsRuntimesKey pins the no-op invariant this
-// whole feature depends on (task-18-brief.md): an Agent built with a nil
+// whole feature depends on
+// (docs/architecture/cross-cutting/telemetry-usage-observability.md §8.3.2,
+// the absent-vs-empty rules on "runtimes"): an Agent built with a nil
 // RuntimeDriver -- every pre-Task-18 test construction, and every agent
 // that never negotiates runtime_manager -- must produce a BYTE-IDENTICAL
 // telemetry sample to one built before this feature existed. The "runtimes"
@@ -1258,8 +1260,7 @@ func (s stubLoadedLister) Collect(context.Context) ([]string, error) {
 // unconditionally overwrite LoadedModels with an empty list, wiping a
 // non-runtime agent's REAL loaded-model set reported by its own
 // model-status scraper. This test fails against a version of collectOnce
-// that gates the override on "a.runtimeDriver != nil" alone (see
-// task-18-report.md's I3 fix log for the pasted failure).
+// that gates the override on "a.runtimeDriver != nil" alone.
 func TestCollectOnceInactiveRuntimeDriverDoesNotOverrideLoadedModels(t *testing.T) {
 	poster := &capturePoster{}
 	drv := newFakeRuntimeDriver() // Active() defaults to false -- never negotiated (yet)
@@ -2899,8 +2900,8 @@ func TestProbeRuntimeChildLiveProgressIgnoresContextCache(t *testing.T) {
 	}
 }
 
-// The following tests cover the resource-usage fix (issue #51/#52 follow-up,
-// task 4 report "Concerns" item 2): caching the STABLE half of an
+// The following tests cover the resource-usage fix (issue #51/#52
+// follow-up): caching the STABLE half of an
 // undetermined ("") verdict -- a 404, or a well-formed non-/props body --
 // while still retrying the TRANSIENT half (a connection refused, a timeout,
 // an unparseable body) every cycle. See probeRuntimeChildProps's

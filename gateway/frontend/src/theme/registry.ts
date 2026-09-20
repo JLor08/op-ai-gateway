@@ -64,7 +64,8 @@ export function resolveFavicon(id: string): string {
   return `${import.meta.env.BASE_URL}${(themes[id] ?? themes.default).favicon}`;
 }
 
-// --- External theme data (operator-deployed theme.json, see task-6 brief) ---
+// --- External theme data (operator-deployed theme.json; see
+// docs/architecture/cross-cutting/theming-and-i18n.md §3) ---
 //
 // An external theme is pure data served by the backend as `getPublicTheme()`'s
 // `data` field (see `../api`'s `ExternalThemeData`); it is never compiled into

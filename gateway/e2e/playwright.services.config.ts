@@ -3,9 +3,11 @@
 
 import { defineConfig } from "@playwright/test";
 
-// Live end-to-end proof of the Service Accounts (Phase 1) security
-// guarantees AND, additively, the admin-group permissions Phase C feature
-// (spec: docs/superpowers/specs/2026-08-10-admin-group-permissions-phase-c-design.md):
+// Live end-to-end proof of the Service Accounts security guarantees AND,
+// additively, of admin-group-delegated service management
+// (docs/architecture/cross-cutting/security-auth-rbac.md §12, the
+// service-account row of the authorization-reach table and the **Service
+// accounts** paragraph):
 // service<->admin-group linkage + the group-scoped `can_manage_services`
 // co-manager flag. SQLITE-BACKED (not the default memory mode): Phase C's
 // core guarantee (authorizeServiceRead/authorizeServiceSettings's group-

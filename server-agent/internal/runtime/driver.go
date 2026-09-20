@@ -11,8 +11,10 @@
 // schedule, a Status accessor and an Active accessor for the outgoing
 // telemetry sample, and a Close for shutdown.
 //
-// Sync's three steps (design doc
-// docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md §9/§10.2):
+// Sync's three steps (docs/architecture/cross-cutting/agent-runtime-manager.md:
+// §7 "Feature negotiation" for step 1, §8.1/§8.2 "The two configuration
+// sources" for step 2, and §4.6's every-sync StartRouter rule plus §8.1's
+// "applies when changed || !applied" and §8.3's upward report for step 3):
 //
 //  1. Re-check feature negotiation. runtime_manager can be revoked (or
 //     granted) by the gateway at any time -- FeaturesClient's own
@@ -25,7 +27,8 @@
 //  2. Load the desired config: source.Load(ctx), UNLESS pushed carries a
 //     real WS-delivered document and the source is a *GatewaySource, in
 //     which case ApplyPushed consumes it directly (zero extra round trip).
-//     A *FileSource ignores a pushed payload outright (spec §10.2: file
+//     A *FileSource ignores a pushed payload outright
+//     (docs/architecture/cross-cutting/agent-runtime-manager.md §8.2: file
 //     mode never consumes the gateway's document) -- pushed is simply not
 //     looked at on that path, exactly as if it were nil.
 //  3. Apply the config to the manager and (re)bind the router listener --
@@ -494,7 +497,8 @@ func (d *Driver) AppliedConfigETag() string {
 
 // load resolves the desired config for one Sync call: a non-empty pushed
 // payload on a *GatewaySource goes through ApplyPushed (zero extra round
-// trip); a *FileSource ignores pushed outright (spec §10.2); every other
+// trip); a *FileSource ignores pushed outright
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §8.2); every other
 // case (no payload, or a Source this package does not specifically
 // recognize) goes through the ordinary Load path.
 func (d *Driver) load(ctx context.Context, pushed json.RawMessage) (Config, bool, error) {
@@ -536,9 +540,10 @@ func (d *Driver) sendReport(ctx context.Context, cfg Config) {
 
 // ResendReport re-sends the current file-mode report unconditionally,
 // regardless of whether the local file has changed since the last Sync --
-// fix round 1, I5: design spec §10.2 requires a periodic resend as a
-// POST-transport backstop (the WS transport already gets this for free on
-// every reconnect, via WSSender's own cached-frame resend). Rather than
+// fix round 1, I5: docs/architecture/cross-cutting/agent-runtime-manager.md
+// §8.3 requires a periodic resend as a POST-transport backstop (the WS
+// transport already gets this for free on every reconnect, via WSSender's
+// own cached-frame resend). Rather than
 // teaching this Driver (or internal/agent) which transport is in use, the
 // caller (internal/agent) piggybacks this on its EXISTING system-report
 // ticker cadence -- exactly the same transport-agnostic mechanism the
@@ -546,9 +551,11 @@ func (d *Driver) sendReport(ctx context.Context, cfg Config) {
 // reconnect AND on that same ticker; the ticker is what covers POST). A
 // no-op when d.src is not a *FileSource (the report is a file-mode-only
 // concept), there is no reporter to send it to, or -- fix round 1 review 2
-// -- runtime_manager is not CURRENTLY negotiated active (Active()). Design
-// spec §10.2: the report is sent "only when the gateway declared
-// runtime_manager". Every other send path already has this gate for free
+// -- runtime_manager is not CURRENTLY negotiated active (Active()).
+// docs/architecture/cross-cutting/agent-runtime-manager.md §8.3: the report
+// is sent "only when the gateway declared runtime_manager" (and §7 on why a
+// consumer outside the sync cycle must gate on *active*, not on the driver
+// existing). Every other send path already has this gate for free
 // because sendReport is reached only from Sync's own feature-active
 // branch; ResendReport sits outside Sync entirely (it is called from
 // internal/agent's system-report ticker, not from a Sync cycle), so it
@@ -601,8 +608,10 @@ func (d *Driver) Transitions() <-chan struct{} {
 
 // StartRouter (re)binds the router-port listener to listen on d.bindHost,
 // tearing down any previous listener first. listen<=0 means "no
-// server_agent application configured for this server" (task-7-report.md:
-// an empty runtime-config document reports router_listen 0) -- the router
+// server_agent application configured for this server"
+// (docs/architecture/reference/api-surface.md §5.1: a server with no
+// server_agent application returns a fully zeroed document, router_listen 0)
+// -- the router
 // is simply not served in that case, and any previously bound listener is
 // torn down. Idempotent: calling it again with the SAME already-bound port
 // is a no-op, so Sync can call this unconditionally on every active cycle

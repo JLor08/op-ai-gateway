@@ -3,8 +3,10 @@
 
 import { defineConfig } from "@playwright/test";
 
-// Live end-to-end proof of the admin-group permissions Phase B feature
-// (spec: docs/superpowers/specs/2026-08-10-admin-group-permissions-phase-b-design.md):
+// Live end-to-end proof of admin-group-delegated server management
+// (docs/architecture/cross-cutting/security-auth-rbac.md §12, the
+// authorizeServer choke-point flowchart and the AI-server row of the
+// authorization-reach table):
 // server<->admin-group linkage + the group-scoped `can_manage_servers`
 // co-manager flag. Cloned from playwright.groups.config.ts -- driven through
 // the real UI against a REAL SQLITE-BACKED gateway (not the default memory

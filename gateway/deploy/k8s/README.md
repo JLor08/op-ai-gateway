@@ -11,7 +11,10 @@ This mirrors the Phase-2 docker-compose stack. Cross-reference the compose runbo
 `../README-netbird.md` for the shared concepts (enrollment, the persistent-identity
 rules, the System-Settings flow, the NetBird ACL, the sidecar-is-a-hard-dependency
 caveat). The code-level design is in
-`docs/superpowers/specs/2026-07-25-netbird-only-transport-design.md`.
+`docs/architecture/cross-cutting/networking-mesh.md` §6 (the `netbird_only`
+enforcement points), §8 (the mesh-bound agent listener) and §9 (the sidecar
+enrollment wrapper, which this pod runs too); the Kubernetes packaging itself is
+`docs/architecture/07-deployment-view.md` §7.3.
 
 ## What's in here
 
@@ -419,4 +422,6 @@ it as the ConfigMap's `locations.conf` key), which already includes the
 rule already forwards that path to `op-gateway-web` (the nginx-ingress controller has
 WebSocket support on by default). The one thing that actually gates it is the app-layer
 `netbird_only` setting, which 403s the agent route on the public listener while it is on
-— see `configmap.yaml`/README.md above and the design spec.
+— see `configmap.yaml`/README.md above and
+`docs/architecture/cross-cutting/networking-mesh.md` §6.1 (the public-mux gate) and §10
+(one registration table, two muxes).

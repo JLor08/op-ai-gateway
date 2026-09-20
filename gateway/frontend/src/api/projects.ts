@@ -5,7 +5,10 @@ import { type Fetcher, request } from './transport';
 import type { UserRef } from './groups';
 import type { PortalToken } from './tokens';
 
-// Projects (spec: docs/superpowers/specs/2026-08-08-projects-design.md). A
+// Projects (see docs/architecture/cross-cutting/security-auth-rbac.md §12,
+// the "Projects attribute usage, not access" paragraph and the Project row of
+// the authorization-reach table; the usage/cost group-by itself is
+// docs/architecture/cross-cutting/telemetry-usage-observability.md §8.4.2). A
 // project is a user-owned attribution object for API-token usage/cost
 // group-by. Field names mirror portal.ProjectDTO/-RefDTO/-MembersDTO/
 // -GroupRefDTO exactly, field-for-field (internal/portal/service_projects.go).

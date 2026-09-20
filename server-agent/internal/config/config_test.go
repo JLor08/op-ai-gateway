@@ -1167,8 +1167,9 @@ func TestRuntimeCachePathPrecedence(t *testing.T) {
 
 // TestRuntimeRouterBindHostPrecedence proves flag > env > file > empty
 // (the "let main.go derive a default" sentinel) for RuntimeRouterBindHost
-// (task-18-fix-round-1.md, I2): unlike RuntimeCachePath this is a plain
-// operator-supplied string, not a path anchored against the config file, so
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): unlike
+// RuntimeCachePath this is a plain operator-supplied string, not a path
+// anchored against the config file, so
 // there is no defaultRuntimeCachePath-style fallback to prove -- absent
 // entirely, it must simply stay "".
 func TestRuntimeRouterBindHostPrecedence(t *testing.T) {

@@ -950,12 +950,13 @@ func TestCreateProject_CreateCoupledGroupBlankNameRejected(t *testing.T) {
 	}
 }
 
-// TestCoupledProject_ManagementLocked is Task 3's test: membership/group/
+// TestCoupledProject_ManagementLocked proves: membership/group/
 // transfer mutations on a COUPLED project must reject with ErrProjectCoupled
 // (membership is derived from the coupled group, not managed directly),
-// while UpdateProject/DeleteProject stay allowed (not exercised here -- see
-// the Task 3 brief) and a NORMAL (uncoupled) project must NOT be locked
-// (regression).
+// while UpdateProject/DeleteProject stay allowed. UpdateProject on a coupled
+// project is exercised separately, by
+// TestUpdateProject_CoupledRenameAcrossDifferentOwnersAllowed below; a NORMAL
+// (uncoupled) project must NOT be locked (regression).
 func TestCoupledProject_MemberCountReflectsGroup(t *testing.T) {
 	e := newProjectTestEnv(t)
 	e.createUser("usr_owner", "user")

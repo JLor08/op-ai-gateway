@@ -726,7 +726,7 @@ func (s *Service) UpdateProject(ctx context.Context, principal auth.Token, id, n
 // check is then explicitly refused with ErrProjectForbidden rather than
 // silently succeeding. newOwnerID must be a CURRENT member of the project
 // (§5) -- this is the app-level guard that plugs the store's missing
-// owner-FK-on-update check (see the Task 2 report).
+// owner-FK-on-update check.
 func (s *Service) TransferProject(ctx context.Context, principal auth.Token, id, newOwnerID string) error {
 	p, err := s.authorizeProjectManage(ctx, principal, id)
 	if err != nil {

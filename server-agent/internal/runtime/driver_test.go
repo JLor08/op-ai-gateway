@@ -195,10 +195,8 @@ func (f *fakeReporter) last() json.RawMessage {
 // unreachable one falls back to the same cached, changed=false config.
 // Gating Apply on `changed` alone meant a restarted (or merely
 // gateway-unreachable-at-boot) agent would manage nothing and never bind
-// its router, for the rest of that process's life. See
-// task-18-fix-round-1.md's C1 fix log in task-18-report.md for the
-// before/after verification (this test fails against the pre-fix driver.go
-// from commit 838d779).
+// its router, for the rest of that process's life. This test fails against
+// the pre-fix driver.go from commit 838d779.
 func TestDriverSyncAppliesOnFirstSyncEvenWhenSourceReportsUnchanged(t *testing.T) {
 	mgr := &fakeManager{}
 	// RouterListen 0: this test exercises Apply, not StartRouter (which has

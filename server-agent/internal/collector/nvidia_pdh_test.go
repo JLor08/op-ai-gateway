@@ -6,9 +6,11 @@ package collector
 import "testing"
 
 // The instance names below are the shape observed on the operator's 3-GPU
-// Windows host (spec: `docs/superpowers/specs/windows-vram-measurer.md`), the
-// only place this grammar is documented at all -- Microsoft does not publish
-// it. `0x0_0x16026` is the real LUID that could not be resolved there.
+// Windows host (docs/architecture/cross-cutting/agent-runtime-manager.md §5.3,
+// step 1 of the PDH chain), which is where this grammar is written down --
+// Microsoft does not publish it. `0x0_0x16026` is the real LUID that could not
+// be resolved there; the same section records it under "Where the numbers in
+// the paragraphs above come from".
 const (
 	cannedPDHInstance     = "pid_4242_luid_0x0_0x16b6b_phys_0"
 	cannedPDHInstanceHigh = "pid_4242_luid_0x1_0xfeed_phys_0"

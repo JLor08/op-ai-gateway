@@ -11,7 +11,8 @@ process sees the `wt0` interface + the `100.x` NetBird IP and can bind its agent
 
 > **The runtime `netbird_only` switch (System Settings) turns the restriction on/off live.** This
 > compose stack provides the *capability* (the mesh-bound agent listener + the mesh route). The
-> code-level details are in `docs/superpowers/specs/2026-07-25-netbird-only-transport-design.md`.
+> code-level details are in `docs/architecture/cross-cutting/networking-mesh.md` §6 (NetBird-only
+> transport), §8 (the gateway's own agent listener) and §9 (the NetBird sidecar).
 
 ## 0. Prerequisites
 

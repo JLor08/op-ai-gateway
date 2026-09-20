@@ -213,8 +213,9 @@ type Config struct {
 	// process working directory, which for a service is typically "/".
 	RuntimeCachePath string
 	// RuntimeRouterBindHost is the operator-controlled bind address for the
-	// agent-managed model runtime's router port (task-18-fix-round-1.md
-	// I2): an empty string (the default) means "derive a default" -- main.go
+	// agent-managed model runtime's router port
+	// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): an
+	// empty string (the default) means "derive a default" -- main.go
 	// tries the agent's own mesh identity first (mirroring
 	// proxy.DeriveBindHost), then falls back to all interfaces, logging a
 	// Warn when it does. Same operator-only provenance as

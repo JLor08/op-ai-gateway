@@ -130,8 +130,8 @@ func TestFilterCapableRefusesOnStoreError(t *testing.T) {
 // (Resolve's `if len(candidates) == 0 && len(req.RequiredCapabilities) > 0`
 // check, immediately after filterCapable). Nothing else in the suite pins
 // it: deleting that check leaves every other test in this package green
-// (verified by hand -- see task-3-report.md's Finding 3 mutation log) while
-// silently turning a capability refusal back into an indistinguishable
+// (confirmed by deliberately removing the check and re-running the suite)
+// while silently turning a capability refusal back into an indistinguishable
 // "unknown model". This test exists so that regression is caught.
 func TestResolveReturnsModelNotCapableForIncapableSoleCandidate(t *testing.T) {
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
@@ -155,8 +155,9 @@ func TestResolveReturnsModelNotCapableForIncapableSoleCandidate(t *testing.T) {
 // existing `nil, false, nil`): coder-a (priority 0) has no image row at
 // all, coder-b (priority 1) is image-capable, and this test requires the
 // walk to reach coder-b rather than failing the whole group resolve on
-// coder-a's refusal. See task-3-report.md's Finding 3 mutation log for the
-// verified failure under that exact mutation.
+// coder-a's refusal. Confirmed by deliberately reverting eligibleCandidates
+// to return ErrModelNotCapable for an incapable member: this test fails
+// under that exact mutation.
 func TestGroupCapabilityGateSkipsIncapableFirstMemberForCapableSecond(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)

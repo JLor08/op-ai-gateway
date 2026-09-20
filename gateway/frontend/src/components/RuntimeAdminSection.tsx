@@ -820,8 +820,8 @@ function collectArgsWarnings(args: string[], listenPort: number, t: Translation)
 // server-agent/internal/runtime/policy_local.go's ExpandPlaceholders -- see
 // that file for the full rationale. Both an argument string and an env
 // value pass through the SAME agent-side check at process-start time (this
-// task's UI has no live-status view yet to surface a failure there -- see
-// the task-20 report's Deviation 2), so the portal form must refuse
+// task's UI has no live-status view yet to surface a failure there), so
+// the portal form must refuse
 // everything the agent would refuse and accept everything it would accept:
 //   - "${PORT}" (exact) -> valid, becomes the assigned port at start.
 //   - "${MODEL}" (exact) -> valid, becomes the mapping's app_model_name.
@@ -1645,7 +1645,8 @@ export function RuntimeAdminSection({
       const used = new Set(rows.map((r) => r.index));
       // Prefer the next telemetry-reported GPU not yet configured -- the
       // agent already told us its index AND its total VRAM, so the operator
-      // shouldn't have to look either up (see the task-21 brief).
+      // shouldn't have to look either up
+      // (docs/architecture/cross-cutting/agent-runtime-manager.md §11.5).
       const fromTelemetry = telemetryGpus.find((g) => !used.has(g.index));
       if (fromTelemetry) {
         return [

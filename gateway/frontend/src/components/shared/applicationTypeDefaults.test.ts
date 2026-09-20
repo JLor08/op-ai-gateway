@@ -38,7 +38,8 @@ describe('applicationTypeDefaults', () => {
   // server_agent's timeout default is 600000 (10 minutes), not the usual
   // 30000: it becomes a TOTAL request deadline that must cover a cold model
   // load, and 30s would fail every first request reproducibly (see the
-  // backend default in portal service_applications.go / the task-19 brief).
+  // backend default in portal service_applications.go and
+  // docs/architecture/cross-cutting/compatibility-and-inference.md §7.1).
   it('server_agent defaults llama-swap-shaped loaded models, passthrough modes, plus a 10-minute timeout', () => {
     expect(applicationTypeDefaults.server_agent).toEqual({
       port: 8081,

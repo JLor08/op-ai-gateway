@@ -801,8 +801,7 @@ func (s *Service) createUserGroup(ctx context.Context, principal auth.Token, nam
 
 // groupDTO computes the principal-relative view (MyRole/CanManage) of g,
 // plus its member/manager counts. Called once per group so N+1 store reads
-// are the cost of correctness over a raw list (acceptable at this scale —
-// see the Task 6 report for a documented performance note).
+// are the cost of correctness over a raw list (acceptable at this scale).
 func (s *Service) groupDTO(ctx context.Context, principal auth.Token, g store.UserGroup) UserGroupDTO {
 	dto := UserGroupDTO{
 		ID:            g.ID,

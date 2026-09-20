@@ -1302,8 +1302,9 @@ func TestTestNetbirdOverride(t *testing.T) {
 
 // TestTestNetbirdOverrideRescuesFreshSetup reproduces the exact "fresh setup"
 // state the codebase deliberately allows (validateNetbird permits
-// netbird_enabled=true with an empty url/token — see docs/implementation-status.md
-// "System Settings keeps ONLY the NetBird enable checkbox"): the module checkbox
+// netbird_enabled=true with an empty url/token -- enabled but not yet
+// configured, because System Settings lets an operator flip the NetBird
+// module checkbox on before saving a url/token): the module checkbox
 // is ON but NO url/token has been saved yet. Before the fix, TestNetbird gated on
 // NetbirdConfig's completeness check (which is false in this state) BEFORE
 // applying the override, so a valid override could never rescue an unconfigured

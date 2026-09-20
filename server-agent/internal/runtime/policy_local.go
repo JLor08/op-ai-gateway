@@ -1022,10 +1022,11 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 	sort.Strings(envKeys)
 
 	// Every baseEnvNames entry is agent-owned, not spec-negotiable: refuse
-	// outright rather than let a spec silently override one (see the
-	// PATH/HOME decision in the Task 13 fix-round-1 report, and baseEnvNames
-	// for why the reservation set IS the base set rather than a copy of it
-	// that can drift). This is checked unconditionally, even when the
+	// outright rather than let a spec silently override one (see
+	// docs/architecture/cross-cutting/agent-runtime-manager.md §3.2's
+	// PATH/HOME/etc. reservation, and baseEnvNames for why the reservation
+	// set IS the base set rather than a copy of it that can drift). This is
+	// checked unconditionally, even when the
 	// agent's own environment defines none of them, because the rule is
 	// about which party controls these keys, not about detecting an actual
 	// collision.

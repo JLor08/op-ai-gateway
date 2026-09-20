@@ -5,7 +5,7 @@
 # Docs consistency check. Run from anywhere:
 #   ./scripts/check-docs.sh          (or: make lint-docs / make lint)
 #
-# Five things the repository's conventions require but nothing enforced:
+# Six things the repository's conventions require but nothing enforced:
 #
 #   1. Every intra-repo markdown link resolves — the file, and where the link
 #      carries a "#anchor", the anchor too. Anchors are derived from the target
@@ -29,6 +29,20 @@
 #      made, in prose or anywhere else — a second copy of exactly that false
 #      claim survived check 4 in a different document, which is how this one
 #      earned its place.
+#   6. No TRACKED FILE anywhere in the repository contains the literal string
+#      "docs/superpowers" or "docs/implementation-status", outside a five-file
+#      allowlist. Both name branch-local working documents (AGENTS.md) that
+#      are real on a feature branch and gone from every commit that reaches
+#      main — a source comment, Go/TS doc comment or operator-facing README
+#      that cites either path is not stale someday, it is already dangling,
+#      on every branch that is not the one that happened to have the file
+#      open. This is a flat forbidden-string grep, not path resolution:
+#      recognizing "this token denotes a path" needs a per-language parser
+#      (Go comments, TS comments, Markdown prose, string literals) and would
+#      still trip over this script's own fixtures, which build these exact
+#      paths on purpose to test check 6 itself and the branch-local exclusion
+#      in checks 1-2. It found dozens of real sites the first time it ran
+#      (issue #121), across Go, TypeScript and Markdown alike.
 #
 # Deliberately out of scope:
 #   - http(s)/mailto links. They fail for reasons that have nothing to do with
@@ -37,10 +51,25 @@
 #     band if you want them audited.
 #   - Prose style, spelling, line length. This is a consistency check, not a
 #     markdown linter.
-#   - docs/superpowers/ and docs/implementation-status.md as link *sources*:
-#     AGENTS.md declares them branch-local working documents that never reach
-#     main, so gating CI on them would gate it on scratch. Their headings are
-#     still collected, so links pointing *into* them are still verified.
+#   - docs/superpowers/ and docs/implementation-status.md as link *sources*
+#     for checks 1-2: AGENTS.md declares them branch-local working documents
+#     that never reach main, so gating reachability/anchor checks on them
+#     would gate CI on scratch. On a branch that carries them their headings
+#     are still collected, so a link on THAT branch pointing *into* them is
+#     still verified there — but on main, where it matters, neither path
+#     exists, so nothing is collected and a citation into either is not
+#     verified by checks 1-2 at all. Check 6 is what actually covers the
+#     citation itself, repo-wide, not just from a markdown link.
+#   - A per-language parser for check 6, for the reason given at check 6
+#     above. A `task-N-report.md`-style citation into the gitignored SDD
+#     workspace (never committed on any branch, so strictly worse than
+#     docs/superpowers) is the same bug class but was judged NOT cheaply
+#     guardable the same way: "task-" followed by a number is ordinary
+#     English too (a review round, a ticket, a section label), so a flat
+#     grep for it throws false positives this repository already has in
+#     quantity (e.g. "fix round 1, I3", "Task 9: file-mode runtime report
+#     ingest" section banners) that a "docs/superpowers"-style literal never
+#     does. Caught by inventory and repointed by hand instead; not gated.
 #
 # Dependencies: bash, git, awk. Nothing else — the same footing as every other
 # script in scripts/. Its own negative cases are pinned by
@@ -686,6 +715,41 @@ AWK
   # shellcheck disable=SC2086  # one path per line, none with spaces
   if ! awk "$DOCFLAG_AWK" "$FLAG_NAMES" $(grep -Ev "$EXCLUDE_RE" "$MD_LIST"); then
     rc=1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6: docs/superpowers and docs/implementation-status are forbidden strings
+# ---------------------------------------------------------------------------
+# See item 6 in the header comment. A flat grep across every tracked file
+# PLUS every not-yet-staged one (--untracked, still honoring .gitignore --
+# the same "catch it before you even git add it" scope the INVENTORY
+# variable above uses, via --others, for checks 1-5), minus the five files
+# that describe or test this rule itself and therefore must say the strings
+# to do their job. A gitignored file (the SDD task-report class) is
+# correctly out of this scope either way -- it was never going to be
+# committed, tracked or not.
+echo "==> forbidden branch-local doc references"
+ALLOWLIST_RE='^(AGENTS\.md|CLAUDE\.md|docs/architecture/cross-cutting/development-and-quality\.md|scripts/check-docs\.sh|scripts/check-docs\.test\.sh):'
+FORBIDDEN_RAW="$TMPDIR_RUN/forbidden-raw"
+ggstatus=0
+git grep -n -I --untracked -e 'docs/superpowers' -e 'docs/implementation-status' -- . \
+  >"$FORBIDDEN_RAW" 2>"$TMPDIR_RUN/forbidden-err" || ggstatus=$?
+
+if [ "$ggstatus" -gt 1 ]; then
+  echo "  git grep failed unexpectedly:" >&2
+  sed 's/^/  /' "$TMPDIR_RUN/forbidden-err" >&2
+  rc=1
+else
+  FORBIDDEN_HITS="$TMPDIR_RUN/forbidden"
+  grep -Ev "$ALLOWLIST_RE" "$FORBIDDEN_RAW" >"$FORBIDDEN_HITS" || true
+  nallow=$(($(wc -l <"$FORBIDDEN_RAW") - $(wc -l <"$FORBIDDEN_HITS")))
+  if [ -s "$FORBIDDEN_HITS" ]; then
+    echo "  the following cite a branch-local working document by name -- already dangling on main:"
+    sed 's/^/  /' "$FORBIDDEN_HITS"
+    rc=1
+  else
+    echo "  no forbidden references outside the allowlist ($nallow allowlisted line(s))"
   fi
 fi
 

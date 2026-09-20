@@ -483,6 +483,61 @@ run
 expect "losing every flag registration fails loudly rather than passing vacuously" 1 \
   "no Go flag registrations found"
 
+# --------------------------------------------------------------------------
+# 6: docs/superpowers and docs/implementation-status are forbidden strings
+# --------------------------------------------------------------------------
+build
+run
+expect "the clean fixture has no forbidden references outside the allowlist" 0 \
+  "no forbidden references outside the allowlist"
+
+build
+printf '\nDesign details live in docs/superpowers/specs/whatever.md.\n' \
+  >>"$FIX/docs/architecture/01-introduction.md"
+run
+expect "a docs/superpowers citation outside the allowlist fails" 1 \
+  "docs/architecture/01-introduction.md" \
+  "cite a branch-local working document by name"
+
+build
+printf '\nHandoff notes: see docs/implementation-status.md for the rest.\n' \
+  >>"$FIX/docs/architecture/01-introduction.md"
+run
+expect "a docs/implementation-status citation outside the allowlist fails" 1 \
+  "docs/architecture/01-introduction.md" \
+  "cite a branch-local working document by name"
+
+build
+printf '// see docs/superpowers/plans/foo.md\n' >>"$FIX/server-agent/internal/config/config.go"
+run
+expect "the same citation in a Go comment fails too -- not just markdown" 1 \
+  "server-agent/internal/config/config.go" \
+  "cite a branch-local working document by name"
+
+build
+cat >"$FIX/AGENTS.md" <<'MD'
+# AGENTS
+
+docs/superpowers/ and docs/implementation-status.md are branch-local working
+documents that must not land in main.
+MD
+cat >"$FIX/CLAUDE.md" <<'MD'
+# CLAUDE
+
+See AGENTS.md; docs/superpowers/ and docs/implementation-status.md never
+reach main.
+MD
+run
+expect "the five-file allowlist may say the strings without failing" 0 \
+  "check-docs: OK" "!AGENTS.md" "!CLAUDE.md"
+
+build
+printf '\nNot cited here: docs/superpowers-lite is an unrelated name.\n' \
+  >>"$FIX/docs/architecture/01-introduction.md"
+run
+expect "a substring match still fires (this is a literal-string grep, not a whole-path match)" 1 \
+  "cite a branch-local working document by name"
+
 if [ "$fail" = 0 ]; then
   echo "all check-docs cases passed"
 else

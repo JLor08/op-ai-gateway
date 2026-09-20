@@ -33,8 +33,10 @@ func TestCompletionErrorMappingForCapabilityRefusal(t *testing.T) {
 // as a genuinely unmapped one, by design -- see resolver.go), so this same
 // fix is what stops a group-path capability refusal from reading as a 502
 // upstream outage. It does not give the group path its own
-// routing.model_not_capable code -- see task-3-report.md for that residual
-// gap.
+// routing.model_not_capable code -- that residual gap is recorded in
+// docs/architecture/11-risks-and-technical-debt.md (the all-chat-group 404
+// row) and docs/architecture/cross-cutting/routing-and-model-selection.md
+// §2.3.
 func TestCompletionStatusForRoutingRefusals(t *testing.T) {
 	if got := completionHTTPStatus(routing.ErrNoModelRoute); got != http.StatusNotFound {
 		t.Errorf("ErrNoModelRoute status = %d, want 404", got)

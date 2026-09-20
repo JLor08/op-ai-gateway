@@ -2,8 +2,9 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // This file is where the agent-managed model runtime gets its desired-state
-// document from (design doc docs/superpowers/specs/2026-08-25-agent-runtime-manager-design.md
-// §10.2): the gateway, over ETag-conditional GET with a disk fallback, or an
+// document from (docs/architecture/cross-cutting/agent-runtime-manager.md §8
+// "The two configuration sources", §8.1 gateway mode and §8.2 file mode): the
+// gateway, over ETag-conditional GET with a disk fallback, or an
 // operator-authored local file. Both implementations return the exact same
 // Config type ParseConfig already knows how to build and validate -- the
 // mode is a source switch, not a second parser or a second validation path.
@@ -40,7 +41,8 @@ const runtimeConfigPath = "/api/agent/v1/runtime-config"
 
 // Source is where the desired runtime config comes from. Both
 // implementations return the SAME document type -- the mode is a source
-// switch, not a second code path (spec §10.2).
+// switch, not a second code path
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §8).
 type Source interface {
 	// Load returns the current config. changed=false means "same as last
 	// Load" (ETag match / mtime unchanged). A transport error returns the
@@ -150,12 +152,14 @@ func loadCachedConfig(path string) (Config, bool) {
 // The etag this type tracks and sends as If-None-Match is Config.ETag
 // itself -- the wire document's own "etag" field -- rather than the HTTP
 // ETag response header: the two are guaranteed identical on the wire
-// (task-7-report.md), Config.ETag is the ONLY etag ApplyPushed's
-// WS-delivered document ever carries (a WS frame has no HTTP header at
-// all), and the gateway's own conditional-GET matching accepts an unquoted
-// value equally well as a quoted one. Using a single representation for
-// both origins is what keeps "one document, one reconciler" (spec §10.2)
-// true of the etag bookkeeping too, not just the parser.
+// (docs/architecture/reference/api-surface.md §5.1), Config.ETag is the ONLY
+// etag ApplyPushed's WS-delivered document ever carries (a WS frame has no
+// HTTP header at all), and the gateway's own conditional-GET matching
+// accepts an unquoted value equally well as a quoted one. Using a single
+// representation for both origins is what keeps "one document, one
+// reconciler" (docs/architecture/cross-cutting/agent-runtime-manager.md §8;
+// the etag half is §8.1's "one representation, three uses") true of the
+// etag bookkeeping too, not just the parser.
 type GatewaySource struct {
 	base  string // gatewayURL, trimmed of any trailing '/'
 	token string
@@ -369,9 +373,11 @@ func (s *GatewaySource) checkInsecureToken(cfg Config) {
 // lifetime, that an applied runtime config carries a per-spec API token
 // while the configured gateway URL is not https: on that transport the
 // decrypted token -- like the agent's own bearer credential already does --
-// crosses the gateway<->agent channel in clear (design doc §9: any non-off
-// token mode "requires or at minimum LOUDLY WARNS for an https gateway
-// URL"; security review I2). This is an agent-side LOG warning only -- it
+// crosses the gateway<->agent channel in clear
+// (docs/architecture/cross-cutting/agent-runtime-manager.md §3.2, "The
+// runtime-spec API token": any non-off token mode depends on an
+// operator-supplied https gateway URL, and the agent -- not the portal --
+// loudly warns; security review I2). This is an agent-side LOG warning only -- it
 // never blocks, refuses, or downgrades anything; the portal cannot make this
 // call at all, since it has no way to know the agent's own configured
 // gateway URL scheme.

@@ -25,7 +25,7 @@ const telemetryPath = "/api/agent/v1/telemetry"
 const systemReportPath = "/api/agent/v1/system-report"
 
 // runtimeReportPath is the gateway's file-mode agent-managed-runtime report
-// ingest route (task-9-report.md).
+// ingest route (docs/architecture/reference/api-surface.md §5.2).
 const runtimeReportPath = "/api/agent/v1/runtime-report"
 
 // maxAttempts bounds the number of POST tries per Post call.
