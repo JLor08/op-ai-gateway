@@ -158,13 +158,15 @@ func TestWriteLimitDeniedCostBudget(t *testing.T) {
 // already builds a full *Server (real routing/resolver, provider.NewMock()
 // upstream) with two routable models -- "qwen-coder" (translate path) and
 // "native-model" (native passthrough, ResponsesMode=passthrough). New(...)
-// always installs a default s.Limiter (backed by the routing.MemoryStore
-// those helpers use, which is a genuine no-op store -- see the "CARRY" note in
-// docs/superpowers/sdd/2026-08-08-principal-limits/progress.md); each test
-// below that needs the limiter to actually deny REPLACES srv.Limiter with one
-// backed by a fakePrincipalStore (from principal_limits_test.go) so the
-// exact-threshold behavior is deterministic and independent of the store
-// driver.
+// always installs a default s.Limiter, but that limiter cannot deny here: no
+// principal_limits row exists, so MemoryStore.PrincipalLimits returns no config
+// and Admit short-circuits on the zero LimitConfig -- and even with a row the
+// memory driver holds no usage_events, so every quota/budget aggregate reads
+// zero (docs/architecture/cross-cutting/telemetry-usage-observability.md
+// §8.4.5). Each test below that needs the limiter to actually deny REPLACES
+// srv.Limiter with one backed by a fakePrincipalStore (from
+// principal_limits_test.go) so the exact-threshold behavior is deterministic
+// and independent of the store driver.
 
 // TestPrincipalLimiterNoopIntegration is the no-op regression the design spec
 // (§10) requires: with NO principal_limits configured for anyone (the default

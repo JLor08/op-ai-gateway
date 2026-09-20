@@ -1115,8 +1115,7 @@ func TestSuccession_UserTier(t *testing.T) {
 	e.mustAddMembers(owner, ug.ID, "usr_mgr_a", "usr_mgr_b", "usr_member_a", "usr_member_b")
 	// Promote in "oldest first" order so store insertion order == the
 	// intended succession order (works around the memory store's manager
-	// listing not tracking created_at order the way the SQL store does —
-	// see the Task 6 report's "known concerns").
+	// listing not tracking created_at order the way the SQL store does).
 	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr_a", true, true, true, true, true); err != nil {
 		t.Fatal(err)
 	}

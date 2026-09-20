@@ -231,7 +231,8 @@ func CaptureRetentionDays(values map[string]string) int {
 
 // CaptureEnabled interprets the persisted capture_enabled system setting: a
 // global kill switch for NEW payload captures (existing captures stay
-// viewable/deletable regardless — see docs/superpowers/specs). Defaults to
+// viewable/deletable regardless: neither CaptureDetail nor DeleteCapture in
+// service_captures.go consults this setting). Defaults to
 // true (opt-out) when absent, blank, or unparseable; only an explicit
 // "false" turns capturing off. The gateway's ServerDeps.CaptureEnabled hook
 // and SystemSettingsView both read the setting through here.

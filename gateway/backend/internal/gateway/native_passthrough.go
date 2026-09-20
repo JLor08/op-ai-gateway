@@ -112,8 +112,7 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 // handler's resolve (the documented idempotent double-resolve — requires two
 // applications for one model with different endpoint modes), this reports the
 // native path while the provider actually called the translate path. Not
-// client-reachable in practice and only mislabels one column; see
-// docs/implementation-status.md.
+// client-reachable in practice and only mislabels one column.
 func upstreamPath(target routing.Target, apiFlavor string) string {
 	if target.Provider == "" {
 		return ""

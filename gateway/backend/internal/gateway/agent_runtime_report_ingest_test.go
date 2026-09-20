@@ -363,7 +363,7 @@ func TestHandleAgentRuntimeReportPOSTInvalidPayload(t *testing.T) {
 // level instead (TestIngestRuntimeReport, "unknown server").
 
 // TestIngestRuntimeReportDropsInjectedFields is the redaction-is-defense-in-
-// depth proof (Task 9 brief): even if a buggy/compromised agent sends the
+// depth proof: even if a buggy/compromised agent sends the
 // plaintext secret through some OTHER, unmodeled field, the canonical
 // re-marshal (a typed struct with a fixed field set) never round-trips an
 // unknown key -- and an env value under a KNOWN field is still masked.

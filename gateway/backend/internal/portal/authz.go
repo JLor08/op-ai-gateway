@@ -21,8 +21,7 @@ import (
 // near-identical ones per domain. The gateway's requireWebScope HTTP gate
 // already enforces the exact same scope requirement before any of these are
 // reached over HTTP in practice; this sentinel exists so a future internal
-// (non-HTTP) caller cannot bypass authorization entirely -- see
-// docs/superpowers/plans (PT-2 Part 2 / Part 2b). Mapped to 403 in
+// (non-HTTP) caller cannot bypass authorization entirely. Mapped to 403 in
 // sharedErrorMap (internal/gateway/error_map.go).
 // CodePrincipalForbidden is ErrPrincipalForbidden's API error code. It is
 // exported so the gateway's own pre-emptive 403 responses (written directly,

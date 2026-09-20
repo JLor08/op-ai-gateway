@@ -985,8 +985,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 // possible regardless of how a dependency became orphaned; only the
 // creation of a NEW dependency on server_agent semantics is gated. (An
 // earlier version of this method gated DELETE the same way as PUT; that was
-// a defect, not a deliberate symmetry — see the fix-round-1 note in the
-// task-5 report.)
+// a defect, not a deliberate symmetry.)
 func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string) error {
 	mapping, _, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
