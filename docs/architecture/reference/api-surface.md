@@ -89,7 +89,7 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 | `/api/portal/chats`, `/api/portal/chats/{id}[/runs...]` | GET/POST, GET/PUT/DELETE + run sub-paths | Portal built-in chat CRUD, run start/SSE events/cancel. The **listing** also carries `max_content_bytes` (`portal.MaxChatContentBytes`, the 4 MiB pre-seal cap on the whole chat document): the composer states an image thread's remaining capacity from it, and it is served rather than duplicated in the client because a second literal would drift silently — a zero or absent value reads as *capacity unknown*, not as zero capacity. **PUT is refused with 409 `portal.chat_run_active` while a run is active for that chat**, because it replaces the whole document and would overwrite what the run has checkpointed or is about to commit. A run's `201`, the active-runs rows and the `snapshot`/`done` SSE events carry the run's `kind` (`""` text, `"image"`) and a server-measured `elapsed_ms`; see [API Compatibility & Inference §12](../cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) |
 | `/api/portal/usage`, `/usage/stats`, `/usage/groups`, `/usage/timeseries`, `/usage/events` | GET | Own (or, with `admin` scope + `scope=all`, fleet-wide) usage analytics in various shapes |
 | `/api/portal/usage/active` | GET | Currently in-flight requests (own, or all with `admin` scope) |
-| `/api/portal/usage/captures/{id}` | GET | Read a captured request/response payload (capture must be enabled) |
+| `/api/portal/usage/captures/{id}` | GET/PATCH/DELETE | One request's captured payload, keyed by its **usage-event** id. **GET** returns the decrypted detail (both header/body pairs, the translated upstream exchange when the built-in translation ran, and `secret`/`can_toggle_secret`); **PATCH** `{"secret": bool}` sets or clears that capture's *secret* flag; **DELETE** drops the stored blob and leaves the `usage_events` row untouched. `capture_enabled` is **not** consulted here — it gates whether new captures are *written* on the inference path (`capturingEnabled`), so turning it off hides nothing already stored. What governs a read is the row itself: GET and DELETE are owner-**or**-`admin`, except that a `secret` row is strictly owner-only (an admin gets the same 404 as a stranger), while PATCH is owner-only always — which is exactly what `can_toggle_secret` reports. A missing row, an unauthorized principal and a gateway with no capture store wired are one indistinguishable answer, `404 capture.not_found`; a decrypt/parse failure is `500 capture.detail_failed`, never a 404, so a client must not read "gone" into it |
 | `/api/portal/benchmarks/active` | GET | Currently running benchmark jobs, visibility-filtered like server ownership |
 | `/api/portal/dashboard` | GET | Aggregated dashboard payload |
 
@@ -684,6 +684,31 @@ message names the offending type.
 |---|---|---|
 | `/api/usage` | Bearer, `gateway:use` | Legacy simple own-usage-by-user endpoint (bearer-only, superseded by `/api/portal/usage*`) |
 | `/api/admin/users`, `/api/admin/users/{id}` | Session-or-bearer, **`admin`** | Legacy top-level admin user list/detail (distinct from the portal-namespaced `/api/portal/admin/users/{id}/limits`) |
+
+### Authorization refusals across the portal surface
+
+Four different things answer "not allowed" on these routes, and they are not
+interchangeable — a client that cannot tell them apart retries the wrong one:
+
+| Code | Status | Raised by |
+|---|---|---|
+| `auth.insufficient_scope` | 403 | the HTTP-layer scope gate (`requireWebScope`/`requireScope`/`requireAnyScope`): the session or token does not carry the `gateway:use`/`admin`/`system` scope the route demands. Checked before the handler body runs, so this is what a caller short of a scope actually meets |
+| `<domain>.not_found` — `server.not_found`, `service.not_found`, `application.not_found`, `mapping.not_found`, `project.not_found`, … | **404** | object-level authorization inside `internal/portal.Service`: the caller has the scope, but the object is outside its ownership/delegation/admin-group set. Deliberately indistinguishable from "no such object" — the no-existence-leak rule stated at the top of this document |
+| `<domain>.forbidden` — `server.forbidden`, `service.forbidden`, `project.forbidden`, `group.forbidden`, `resource_group.forbidden` | 403 | the same per-domain authorization where there is nothing to hide: a **create** (`CreateServer`/`CreateService` for a principal managing no admin group, `createSystemGroup` for a non-`system` one) or a **field** the caller may not set on an object it already reaches (`UpdateServer` with `owner_ids` from a non-`admin`) |
+| `portal.principal_forbidden` | 403 | the domain-less backstop: one shared sentinel (`portal.ErrPrincipalForbidden`, message `not allowed`, mapped in `sharedErrorMap`) for the **fifteen** token-carrying mutating service methods that re-check the blanket scope themselves — `isAdmin` for `SetUserLimits`, `UserTokens`, `AddUserToAdminGroup`, `ReassignGroupsOwnedBy`; `isSystem` for `UpdateSystemSettings`, the NetBird writes (`SetServerNetbird`, `SetNetbirdNetwork`, `RotateNetbirdToken`, `CreateGatewaySetupKey`, `EnrollGatewaySidecar`, `TestNetbird`) and the certificate actions (`ReissueAllCertificates`, `ReissueEdgeCertificate`, `RenewCertificateNow`, `RotateCertificateCA`). They span unrelated domains, so none of the per-domain sentinels above fits them |
+
+`portal.principal_forbidden` is the one a client should expect **never** to
+see. Every route that reaches one of those fifteen methods already enforces
+the identical scope at the HTTP layer — `requireWebScope(…, "admin")` for the
+four `isAdmin` methods, `requireWebScope(…, "system")` for the eleven
+`isSystem` ones — so a caller without the scope is answered
+`auth.insufficient_scope` and never reaches the service at all. The sentinel
+exists so that a future **internal, non-HTTP** caller cannot bypass
+authorization entirely; receiving it over HTTP means the route gate and the
+service gate disagree, which is a gateway defect and not something a retry
+fixes. (The certificate, edge-certificate and system-settings handlers emit
+the same code as a literal, `portal.CodePrincipalForbidden`, because their
+error paths do not run through `sharedErrorMap` — same status, same string.)
 
 ## 4. System endpoints (`/api/system/*`)
 

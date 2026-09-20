@@ -2387,6 +2387,15 @@ memory/dev mode lives in the non-persistent `usage.Recorder`), so it returns a
 zero aggregate honestly: quota and budget enforcement is a
 persistent-store feature by design.
 
+All of that is the *configured* case. A principal with no limits never reaches
+any of it: `Admit` short-circuits on the zero `routing.LimitConfig` — no
+`principal_limits` row at all, or a row whose every field is zero — and allows
+before the rate bucket and before any aggregate read, so the inert default
+costs one cached config lookup and nothing else. See [Security, Authentication
+& Authorization
+§12](security-auth-rbac.md#12-delegated--resource-scoped-authorization) for
+that short-circuit and for who may set a limit in the first place.
+
 **Durable quota accounting comes from the usage_events ROW, not from
 `Limiter.Record`.** This seam is easy to miss because three different things
 count a request, at three different lifetimes:
