@@ -1327,12 +1327,27 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 }
 
 // seedDevAdminGroup gives the memory-mode dev deployment one ADMIN-tier
-// group owned by ownerUserID (the dev user, "usr_dev"), mirroring what a
-// real operator ends up with after self-creating an admin group through the
-// product's own "createAdminGroup" flow (portal/service_user_groups.go):
-// the group is owned by them, and they are enrolled as its member. Ownership
-// alone already makes UserGroupDTO.CanManageUsers true for them (see
-// groupDTO's owner case), so no manager row is needed on top of it.
+// group owned by ownerUserID (the dev user, "usr_dev"), matching exactly
+// what Service.createAdminGroup (portal/service_user_groups.go) produces
+// for a SELF-OWNED admin group -- not merely approximating it. That
+// function always resolves and REQUIRES a non-empty ParentGroupID pointing
+// at an EXISTING system-tier group the creator is a member of (auto-selected
+// only when the creator is a member of exactly one; ErrGroupParentInvalid
+// otherwise), and afterward enrolls ONLY the owner as the new admin group's
+// member. An admin group with no parent, or a parent that doesn't exist, is
+// therefore a shape the product itself can never produce through any UI
+// action -- a dev seed with that shape is a trap for the next person who
+// tests the group hierarchy, resource-group, service, or project admin-group
+// pickers against it, and would cost them time deciding whether it's a bug.
+//
+// So this seeds the system-tier group too (also owned by no one, like every
+// system group -- see createSystemGroup, which never sets OwnerUserID),
+// enrolls the dev user as ITS member (the precondition createAdminGroup's
+// auto-select needs), and only then creates the admin group with
+// ParentGroupID pointing at it. Ownership of the admin group alone already
+// makes UserGroupDTO.CanManageUsers true for the owner (see groupDTO's owner
+// case), so no separate manager row is needed on top of it -- createAdminGroup
+// doesn't add one either.
 //
 // Without this, a fresh `make dev` gateway seeds NO admin group at all: the
 // dev user's group landscape is empty, GET /api/portal/groups returns
@@ -1342,15 +1357,32 @@ func seedDefaultServer(ctx context.Context, routes routing.Store, now time.Time,
 //
 // Mirrors seedDefaultServer's shape and idempotence: fixed IDs plus
 // tolerating store.ErrConflict make repeat calls (e.g. across process
-// restarts against the same store) safe.
+// restarts against the same store) safe, and SetUserGroupMember is
+// upsert-safe in the memory driver -- for both the system group's membership
+// row and the admin group's.
 func seedDevAdminGroup(ctx context.Context, groups portal.GroupStore, now time.Time, ownerUserID string) error {
+	sys := store.UserGroup{
+		ID:        "ugrp_dev_system",
+		Tier:      store.GroupTierSystem,
+		Name:      "Dev System Group",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := groups.CreateUserGroup(ctx, sys); err != nil && !errors.Is(err, store.ErrConflict) {
+		return fmt.Errorf("seed dev system group: %w", err)
+	}
+	if err := groups.SetUserGroupMember(ctx, sys.ID, ownerUserID, store.GroupStateMember, ""); err != nil {
+		return fmt.Errorf("seed dev system group membership: %w", err)
+	}
+
 	g := store.UserGroup{
-		ID:          "ugrp_dev_admin",
-		Tier:        store.GroupTierAdmin,
-		Name:        "Dev Admin Group",
-		OwnerUserID: ownerUserID,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:            "ugrp_dev_admin",
+		Tier:          store.GroupTierAdmin,
+		Name:          "Dev Admin Group",
+		ParentGroupID: sys.ID,
+		OwnerUserID:   ownerUserID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	if err := groups.CreateUserGroup(ctx, g); err != nil && !errors.Is(err, store.ErrConflict) {
 		return fmt.Errorf("seed dev admin group: %w", err)

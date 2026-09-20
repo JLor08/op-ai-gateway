@@ -73,9 +73,22 @@ func TestSeedDefaultServerSeedsAgentToken(t *testing.T) {
 //
 // Asserts the PROPERTY through the same call the portal makes
 // (portal.Service.ListGroups), not the storage mechanism: the dev principal's
-// group landscape must hold exactly one admin-tier group, and that group's
-// CanManageUsers must be true for the dev principal -- the flag the invite
-// form's auto-select (and thus its submit-enabled state) depends on.
+// group landscape must hold exactly one system-tier group and exactly one
+// admin-tier group, the admin group's ParentGroupID must point at that
+// system group (an admin group with no/foreign parent is a shape
+// Service.createAdminGroup can never produce -- see seedDevAdminGroup's own
+// doc comment), and the admin group's CanManageUsers must be true for the
+// dev principal -- the flag the invite form's auto-select (and thus its
+// submit-enabled state) depends on.
+//
+// devPrincipal deliberately carries NO "system" scope: sessionPrincipal
+// (internal/gateway/auth.go) grants that only to a system_admin whose
+// session is currently ELEVATED, which a plain password login never is. Had
+// this test used a "system"-scoped principal, CanManageUsers would come out
+// true via groupDTO's isSystem fallback branch regardless of whether
+// ownership was ever actually wired -- proving nothing about the seed. Using
+// the real, non-elevated shape means CanManageUsers can only come from
+// groupDTO's OWNER branch, which is what this seed is supposed to establish.
 func TestSeedDevAdminGroupGrantsDevPrincipalAManageableAdminGroup(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
@@ -93,15 +106,16 @@ func TestSeedDevAdminGroupGrantsDevPrincipalAManageableAdminGroup(t *testing.T) 
 		Users: dir, Groups: dir, Routes: routing.NewMemoryStore(),
 		Clock: func() time.Time { return now },
 	})
-	devPrincipal := auth.Token{UserID: "usr_dev", Scopes: []string{"gateway:use", "admin", "system"}}
+	devPrincipal := auth.Token{UserID: "usr_dev", Scopes: []string{"gateway:use", "admin"}}
 
-	// Before the seed: this is the exact bug -- no admin group exists yet.
+	// Before the seed: this is the exact bug -- no system or admin group
+	// exists yet.
 	before, err := svc.ListGroups(ctx, devPrincipal)
 	if err != nil {
 		t.Fatalf("ListGroups (before seed): %v", err)
 	}
-	if len(before.Admin) != 0 {
-		t.Fatalf("before seedDevAdminGroup: landscape.Admin = %d groups, want 0 (setup assumption violated)", len(before.Admin))
+	if len(before.System) != 0 || len(before.Admin) != 0 {
+		t.Fatalf("before seedDevAdminGroup: landscape = %+v, want both System and Admin empty (setup assumption violated)", before)
 	}
 
 	if err := seedDevAdminGroup(ctx, dir, now, "usr_dev"); err != nil {
@@ -112,15 +126,21 @@ func TestSeedDevAdminGroupGrantsDevPrincipalAManageableAdminGroup(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ListGroups (after seed): %v", err)
 	}
+	if len(after.System) != 1 {
+		t.Fatalf("after seedDevAdminGroup: landscape.System = %d groups, want exactly 1 (createAdminGroup's self-owned path requires the creator to be a member of exactly one system group): %+v", len(after.System), after.System)
+	}
 	if len(after.Admin) != 1 {
 		t.Fatalf("after seedDevAdminGroup: landscape.Admin = %d groups, want exactly 1: %+v", len(after.Admin), after.Admin)
 	}
+	if got, want := after.Admin[0].ParentGroupID, after.System[0].ID; got == "" || got != want {
+		t.Fatalf("after seedDevAdminGroup: Admin[0].ParentGroupID = %q, want the seeded system group's id %q -- an orphaned/foreign-parented admin group is a shape createAdminGroup can never produce", got, want)
+	}
 	if !after.Admin[0].CanManageUsers {
-		t.Fatalf("after seedDevAdminGroup: landscape.Admin[0].CanManageUsers = false, want true (this is what the invite form's auto-select/submit-enabled state depends on)")
+		t.Fatalf("after seedDevAdminGroup: landscape.Admin[0].CanManageUsers = false, want true -- with no \"system\" scope on this principal, this can only come from group OWNERSHIP, which is what the invite form's auto-select/submit-enabled state depends on")
 	}
 
 	// Idempotence: mirror seedDefaultServer's guarantee that running the seed
-	// twice is safe and never creates a second group.
+	// twice is safe and never creates a second group of either tier.
 	if err := seedDevAdminGroup(ctx, dir, now, "usr_dev"); err != nil {
 		t.Fatalf("seedDevAdminGroup (second run): %v", err)
 	}
@@ -128,8 +148,8 @@ func TestSeedDevAdminGroupGrantsDevPrincipalAManageableAdminGroup(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ListGroups (after reseed): %v", err)
 	}
-	if len(reseeded.Admin) != 1 {
-		t.Fatalf("after reseed: landscape.Admin = %d groups, want exactly 1 (idempotence): %+v", len(reseeded.Admin), reseeded.Admin)
+	if len(reseeded.System) != 1 || len(reseeded.Admin) != 1 {
+		t.Fatalf("after reseed: landscape = %+v, want exactly 1 System and 1 Admin group (idempotence)", reseeded)
 	}
 }
 
