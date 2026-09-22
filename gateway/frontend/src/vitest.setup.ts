@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import { cleanup } from '@testing-library/react';
 import { afterEach } from 'vitest';
 
 // jsdom only implements HTMLCanvasElement.getContext when the optional native
@@ -44,6 +45,33 @@ if (!window.localStorage) {
 // mount, so a leaked mirror changes the FIRST render of the next test (seen
 // in CI: Activity's legacy activity.groupBy mirror from one test resurrected
 // grouping in the next). Isolate every test.
+// Testing Library's own auto-cleanup NEVER registers in this project, and the
+// reason is easy to miss: @testing-library/react's entry point installs it only
+// `if (typeof afterEach === 'function')` (node_modules/@testing-library/react/
+// dist/index.js:26) — a GLOBAL afterEach. Vitest's `globals` defaults to false
+// and vite.config.ts does not enable it, which is exactly why this file has to
+// import `afterEach` from 'vitest' above. So at the moment RTL is evaluated
+// there is no global hook to attach to, it silently skips auto-cleanup, and
+// every rendered tree stays mounted in the shared jsdom for the rest of the
+// file.
+//
+// That is not merely untidy. React defers a mounted root's passive-effect
+// flush to the scheduler, which under Node is `setImmediate` — a Node timer,
+// NOT a jsdom one, so it is not cancelled when Vitest tears the environment
+// down between files. The deferred callback's first statement reads
+// `window.event` (react-dom-client.development.js:17920), so an immediate that
+// survives teardown throws `ReferenceError: window is not defined` as an
+// UNCAUGHT exception. That fails the whole job with every test green, and
+// `retry` cannot rescue it because it is not a test that failed.
+//
+// Unmounting after every test removes the precondition: no root outlives its
+// test, so no passive-effect flush is left pending at teardown. Tests need not
+// call `cleanup()` themselves — many still do, which is harmless and
+// idempotent.
 afterEach(() => {
+  // Before the localStorage clear, not after: unmount effects may write to the
+  // mirror, and the next test must start with both an empty DOM and an empty
+  // store.
+  cleanup();
   window.localStorage.clear();
 });
