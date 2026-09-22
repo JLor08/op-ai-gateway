@@ -495,12 +495,39 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
   /api/portal/usage/captures/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Read a captured request/response payload (capture must be enabled)
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: string } }
+      summary: Read one captured request/response payload
+      description: >
+        Owner-or-admin, except that a capture flagged `secret` is owner-only.
+        A missing capture, an unauthorized principal and an unwired capture
+        store are one indistinguishable 404 `capture.not_found`.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [portal]
+      summary: Set or clear a capture's secret flag
+      description: >
+        Body `{"secret": bool}`. Owner-only — an admin who may read a
+        non-secret capture still cannot toggle it.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [portal]
+      summary: Delete a stored capture payload
+      description: >
+        Removes the capture blob only; the owning usage_events row is
+        untouched. Gated exactly like the read: owner-or-admin, and a capture
+        flagged `secret` is owner-only, so an admin cannot delete one it does
+        not own.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '404': { $ref: '#/components/responses/NotFound' }

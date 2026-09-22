@@ -694,9 +694,57 @@ behavior today.
 **Principal limits** (`principal_limits`; rate limit, request quota, token
 quota, cost budget — each an independent threshold/period pair) apply to
 exactly two principal types, `user` and `service`; there is no project- or
-token-level limit row. Setting them is admin-only wiring at the HTTP layer —
-the portal service functions themselves take no `auth.Token` and enforce
-nothing internally.
+token-level limit row. **The two are written through different surfaces with
+different gates, and neither is "HTTP-layer wiring over a service that
+enforces nothing".**
+
+- **User limits** ride one admin route, `GET/PUT
+  /api/portal/admin/users/{id}/limits`. `handlePortalAdminUserLimits`
+  requires the blanket `admin` scope at the HTTP layer and additionally
+  narrows a non-`system` caller to its `ManageableUserIDs` set — checked once,
+  before the method switch, so GET and PUT 404 identically on a target outside
+  it. There is deliberately no self-service path, not even for one's own
+  limits. Behind that gate the two service methods differ: the **read**,
+  `UserLimits(ctx, userID)`, takes no `auth.Token` and checks nothing, so its
+  route's gate really is its only gate; the **write**,
+  `SetUserLimits(ctx, principal, …)`, opens with `isAdmin(principal)` and
+  returns `ErrPrincipalForbidden` otherwise. Both checks stand, deliberately:
+  the HTTP gate is unchanged and is the only one a real request meets, and the
+  in-service check is defense in depth so a future internal (non-HTTP) caller
+  cannot write limits unauthorized. The check was *added* below the gate, not
+  moved out of it.
+- **Service limits** are not admin-gated at the HTTP layer at all. They ride
+  the optional `limits` field of `POST /api/portal/services` and
+  `PUT /api/portal/services/{id}`, whose handlers require only the
+  `gateway:use` baseline; `CreateService`/`UpdateService` both take the
+  `auth.Token` and authorize it themselves — `isSystem`, else, on create,
+  managing at least one admin group, and on update `authorizeServiceSettings`
+  (a full delegate of that service, or a manager of one of its admin groups).
+  An unauthorized update is the usual no-existence-leak `ErrServiceNotFound`;
+  an unauthorized create is `ErrServiceForbidden` (403 `service.forbidden`),
+  there being no object yet to hide.
+
+So the rule to carry away is the opposite of "enforces nothing internally":
+every *mutating* principal-limit path re-checks its own principal inside
+`portal.Service`, and only the user-limits **read** relies on its route alone.
+
+**A principal with no limits is not merely unlimited — it is never
+consulted.** `PrincipalLimiter.Admit` resolves the config once per principal
+per cache window and returns *allow* the moment it is the zero
+`routing.LimitConfig`, which covers both "no `principal_limits` row" (the
+store reports `found=false` and the zero config is cached as that principal's
+entry, so a missing row costs one read per TTL window, not one per request)
+and "a row whose every field is zero". Do not read that `found` as
+`configFor`'s own second return, which means something different and narrower:
+a *store error*, which fails open for the single call and is deliberately
+never cached, so a transient blip cannot entrench a false "no limits" verdict
+for the rest of the window. No rate bucket is touched and no `UsageAggregateSince` read is
+issued on that path, so zero-config is a genuine short-circuit rather than
+four checks that each happen to pass — and that is what makes an all-zero PUT
+the supported way to *clear* limits, a stored all-zero row being behaviorally
+identical to no row. What the memory driver can and cannot enforce once limits
+*are* set is a separate question, answered in [Telemetry, Usage Analytics &
+Observability §8.4.5](telemetry-usage-observability.md#845-cost-and-currency).
 
 ## 13. Secrets at rest
 
