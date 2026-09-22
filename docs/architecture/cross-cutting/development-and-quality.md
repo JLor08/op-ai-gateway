@@ -212,7 +212,18 @@ reports success on a broken corpus is worse than no checker.
   component changes — `App.test.tsx` carries cross-cutting guards (derived
   de/en i18n key parity, per-row table cell counts) that component-scoped
   runs miss. `npm run test:coverage` produces the lcov report the Sonar gate
-  imports.
+  imports. **Every test is unmounted for you, from `src/vitest.setup.ts` — do
+  not rely on Testing Library doing it.** RTL registers its own auto-cleanup
+  only when a *global* `afterEach` exists, and `globals` is off in
+  `vite.config.ts` (which is why the setup file imports `afterEach` from
+  `vitest`), so RTL silently skips it and the setup file calls `cleanup()`
+  instead. Leaving a tree mounted is not cosmetic: React defers a mounted
+  root's passive-effect flush to a Node `setImmediate`, which Vitest's
+  per-file environment teardown does not cancel, and the deferred callback
+  reads `window` — so a surviving root can fail the whole job with an uncaught
+  `ReferenceError` while every test passes, which `retry` cannot rescue
+  because no test failed. `src/vitest.setup.test.tsx` pins this as an ordered
+  pair of tests.
 - **Architecture tests**: dependency-rule tests in both Go modules
   (`internal/archtest`) and the frontend (`src/arch.test.ts`) run as part of
   the normal `go test` / `vitest` invocations — see
