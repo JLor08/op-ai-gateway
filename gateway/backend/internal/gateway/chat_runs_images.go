@@ -31,14 +31,26 @@ import (
 // commit then has to replace) and no rate that could be measured rather than
 // invented.
 
-// imagesResponse is the upstream body this relay consumes. The shape is taken
-// from the repository's own fixtures (images_handler_test.go):
+// imagesResponse is the upstream body this relay consumes:
 // {"created":1,"output_format":"png","data":[{"b64_json":"..."}]}.
 //
+// This shape was originally taken from the repository's own fixtures
+// (images_handler_test.go), which is a weak warrant, so it has since been
+// measured against a real stable-diffusion.cpp server (FLUX.1-dev-FP16 GGUF,
+// served as model `sd-cpp-local`; that build exposes no version endpoint).
+// The server volunteers `output_format` at the top level WITHOUT being asked
+// for it -- buildImagesBody sends only model/prompt/response_format -- and
+// omits `revised_prompt` entirely, which imagePartsFrom already handles by
+// emitting no text part.
+//
 // OutputFormat is what makes the data: URL's media type a REPORTED value
-// rather than an assumption. Hardcoding image/png would be a fabricated
-// measurement of the same class as a progress bar over an endpoint that
-// reports no progress.
+// rather than an assumption, and the measurement is what turns that from a
+// principle into a necessity: asked for `jpeg` and for `webp` the same server
+// answers `jpeg` and `webp`, and in all three cases the decoded bytes' magic
+// number agrees with the field. So the value is genuinely variable, and
+// hardcoding image/png would not merely be a fabricated measurement of the
+// same class as a progress bar over an endpoint that reports no progress --
+// it would be wrong for two formats this very server emits.
 //
 // Data is plural by design: imagesDataCounter's own doc comment
 // (images_handler.go) says the billed quantity comes from the RESPONSE

@@ -1027,6 +1027,14 @@ stay stated in the transcript, in the download's file name, and in every later
 request the part is carried into); and
 `gateway.chat_run_image_response_unreadable` (a 2xx body that could not be read
 or decoded, which previously reached the browser as Go's own decode message).
+That the field is there to be read was, until #130, warranted only by this
+repository's own fixtures; it has since been measured against a real
+stable-diffusion.cpp server (FLUX.1-dev-FP16 GGUF, model `sd-cpp-local`),
+which volunteers `output_format` at the top level although the request never
+asks for it. The same server answers `jpeg` and `webp` when asked for them,
+with the decoded bytes' magic number agreeing every time — so the field is
+genuinely variable and a hardcoded `image/png` would have been wrong, not
+merely unwarranted.
 
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
