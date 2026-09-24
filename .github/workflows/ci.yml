@@ -54,10 +54,25 @@ jobs:
         # package, so no two of them share the schema at once.
         env:
           OP_AI_GATEWAY_TEST_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/op_test?sslmode=disable
+        # -timeout: Go's default is 10 minutes PER PACKAGE, and internal/store
+        # normally takes ~151s of it while internal/gateway takes ~130s. That
+        # looks like ample headroom until a runner degrades: one observed run
+        # had the disk-heavy packages ~4x slower (internal/portal 6.6s -> 28.4s,
+        # cmd/gateway 24.7s -> 90.9s) while CPU-bound ones were unaffected, and
+        # internal/store crossed 600s and failed the job. Nothing had hung --
+        # Go's panic named a subtest that was 1s old, and a genuinely stuck one
+        # is named with its full elapsed time -- so the red carried no
+        # information about the commit. 25m keeps a 4x-degraded runner green and
+        # matches the figure development-and-quality.md already gives for the
+        # race leg. It does NOT slow a healthy run, and it does not mask a real
+        # hang in the store's Postgres setup: that path bounds itself in seconds
+        # (internal/store/postgres_testenv_test.go).
         run: |
           golangci-lint fmt --diff
           golangci-lint run
-          go test ./...
+          go test -timeout=25m ./...
+      # The server-agent module is left on the default: its slowest package is
+      # ~47s, so even a 4x-degraded runner stays an order of magnitude clear.
       - name: Format check + lint + test (server-agent)
         working-directory: server-agent
         run: |

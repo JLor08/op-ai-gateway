@@ -186,6 +186,18 @@ reports success on a broken corpus is worse than no checker.
   pass `-race`, so this bites only when someone adds a race leg — and the
   goroutine dump points squarely at `bcrypt.GenerateFromPassword`, not at a lock
   cycle. The honest fix is a cheaper test-only bcrypt cost for those seeds.
+  **CI now passes `-timeout=25m` for the backend module** for a second instance
+  of the same "deadline, not a hang" confusion: `internal/store` normally takes
+  ~151s and `internal/gateway` ~130s of the 600s default, which is ample until a
+  runner degrades — one observed run had the disk-heavy packages ~4x slower
+  (`internal/portal` 6.6s → 28.4s, `cmd/gateway` 24.7s → 90.9s) while CPU-bound
+  ones were unaffected, and `internal/store` crossed 600s. Read such a red as
+  the deadline unless the panic names a test whose printed elapsed time is
+  large: Go names the test that is *running* and prints how long it has been
+  running, so a genuinely stuck one shows the full elapsed (a deliberately
+  blocked subtest under `-timeout 30s` is reported as `(30s)`), while that run
+  named one `(1s)` old. `server-agent` stays on the default — its slowest
+  package is ~47s.
 - **Store conformance suite**
   (`gateway/backend/internal/store/conformance_test.go`): the store contract
   runs against the in-memory store and SQLite always, and against PostgreSQL
