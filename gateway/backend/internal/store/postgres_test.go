@@ -5,16 +5,14 @@ package store
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 )
 
 func TestOpenPostgresPingsAndMigrates(t *testing.T) {
-	dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres tests")
-	}
+	dsn := testPostgresDSN(t)
+	// This test already bounded itself; testPostgresDSN adds the lock_timeout
+	// the shared helper carries.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s, err := OpenPostgres(ctx, dsn)

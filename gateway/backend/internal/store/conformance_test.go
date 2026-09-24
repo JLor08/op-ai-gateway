@@ -8,7 +8,6 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -37,11 +36,10 @@ func forEachDialect(t *testing.T, run func(t *testing.T, s *SQLStore)) {
 		run(t, s)
 	})
 	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
-		if dsn == "" {
-			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
-		}
-		ctx := context.Background()
+		dsn := testPostgresDSN(t)
+		// Setup only -- run(t, s) below makes its own contexts and is not
+		// bounded by this one (postgres_testenv_test.go).
+		ctx := postgresSetupContext(t)
 		s, err := OpenPostgres(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
@@ -83,11 +81,8 @@ func forEachDialectMigratedTo(t *testing.T, maxVersion int, run func(t *testing.
 		run(t, s)
 	})
 	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
-		if dsn == "" {
-			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
-		}
-		ctx := context.Background()
+		dsn := testPostgresDSN(t)
+		ctx := postgresSetupContext(t)
 		s, err := OpenPostgres(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
