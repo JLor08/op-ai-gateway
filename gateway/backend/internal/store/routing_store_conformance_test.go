@@ -6,7 +6,6 @@ package store
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -72,11 +71,8 @@ func forEachRoutingStoreSeeded(t *testing.T, seedSQL func(t *testing.T, s *SQLSt
 	// instruction to set it -- "verify store changes with
 	// OP_AI_GATEWAY_TEST_POSTGRES_DSN set". CI sets it.
 	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("OP_AI_GATEWAY_TEST_POSTGRES_DSN")
-		if dsn == "" {
-			t.Skip("set OP_AI_GATEWAY_TEST_POSTGRES_DSN to run postgres conformance tests")
-		}
-		ctx := context.Background()
+		dsn := testPostgresDSN(t)
+		ctx := postgresSetupContext(t)
 		pgStore, err := OpenPostgres(ctx, dsn)
 		if err != nil {
 			t.Fatalf("open postgres: %v", err)
