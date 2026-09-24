@@ -113,9 +113,7 @@ func TestHandleSystemNetbirdEnrollSidecarNoKeyFile(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.key_file_not_configured") {
-		t.Fatalf("body missing code netbird.key_file_not_configured: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.key_file_not_configured")
 }
 
 // TestHandleSystemNetbirdEnrollSidecarScope: a gateway:use token is rejected 403,

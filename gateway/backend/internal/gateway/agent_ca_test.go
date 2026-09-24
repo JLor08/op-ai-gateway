@@ -103,9 +103,10 @@ func TestAgentCAEndpointReturns304And404Contracts(t *testing.T) {
 	missing := agentCATestServer(t, fakePortalAgentCA{err: portal.ErrCertificateNotFound})
 	rec = httptest.NewRecorder()
 	missing.ServeHTTP(rec, agentCARequest("ca-secret", ""))
-	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "certificate.ca_not_found") {
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("404 status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "certificate.ca_not_found")
 	if rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("404 Cache-Control=%q, want no-store", rec.Header().Get("Cache-Control"))
 	}
@@ -113,9 +114,10 @@ func TestAgentCAEndpointReturns304And404Contracts(t *testing.T) {
 	failed := agentCATestServer(t, fakePortalAgentCA{err: errors.New("secret store detail")})
 	rec = httptest.NewRecorder()
 	failed.ServeHTTP(rec, agentCARequest("ca-secret", ""))
-	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "certificate.ca_read_failed") || strings.Contains(rec.Body.String(), "secret store detail") {
+	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "secret store detail") {
 		t.Fatalf("500 status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "certificate.ca_read_failed")
 	if rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("500 Cache-Control=%q, want no-store", rec.Header().Get("Cache-Control"))
 	}

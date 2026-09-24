@@ -257,8 +257,10 @@ func TestOpenAIChatStreamIdleTimeoutFrameReachesClient(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	// Substring, deliberately: raw is a multi-frame SSE transcript rather
+	// than a single apierror body (see requireErrorCode's doc comment).
 	if !strings.Contains(string(raw), "provider.stream_idle_timeout") {
-		t.Fatalf("idle-timeout frame did not reach client over a real conn, body = %s", raw)
+		t.Fatalf("stream transcript missing the timeout frame: %s", raw)
 	}
 }
 

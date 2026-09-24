@@ -202,9 +202,10 @@ func TestAdminPatchSystemAdminRequiresSystemActor(t *testing.T) {
 	denied.AddCookie(adminCookie)
 	deniedRec := httptest.NewRecorder()
 	srv.ServeHTTP(deniedRec, denied)
-	if deniedRec.Code != http.StatusForbidden || !strings.Contains(deniedRec.Body.String(), "admin.system_admin_forbidden") {
-		t.Fatalf("plain admin promoting to system_admin should be 403 admin.system_admin_forbidden, got %d body=%s", deniedRec.Code, deniedRec.Body.String())
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("plain admin promoting to system_admin should be 403, got %d body=%s", deniedRec.Code, deniedRec.Body.String())
 	}
+	requireErrorCode(t, deniedRec.Body.String(), "admin.system_admin_forbidden")
 
 	// An ELEVATED system_admin can (promoting to system_admin requires the
 	// `system` scope, now conditional on System-Admin step-up mode).
@@ -512,9 +513,11 @@ func TestAdminUserItemOpsScopedToManageableUserIDs(t *testing.T) {
 
 	// usr_out is outside adminA's manageable set -> every sub-route 404s
 	// no-leak (the same code as a genuinely nonexistent user).
-	if rec := patch("usr_out", `{"display_name":"Renamed"}`); rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "admin.user_not_found") {
-		t.Fatalf("PATCH on an unmanageable target should 404 no-leak, got %d body=%s", rec.Code, rec.Body.String())
+	patchRec := patch("usr_out", `{"display_name":"Renamed"}`)
+	if patchRec.Code != http.StatusNotFound {
+		t.Fatalf("PATCH on an unmanageable target should 404 no-leak, got %d body=%s", patchRec.Code, patchRec.Body.String())
 	}
+	requireErrorCode(t, patchRec.Body.String(), "admin.user_not_found")
 	if rec := get("/api/admin/users/usr_out/tokens"); rec.Code != http.StatusNotFound {
 		t.Fatalf("GET tokens on an unmanageable target should 404, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -768,9 +771,10 @@ func TestAdminInviteMissingAdminGroupRejected(t *testing.T) {
 	sysCookie := loginAs(t, srv, "sys@example.test", "password-1")
 
 	rec := postInvite(t, srv, adminCookie, `{"email":"orphan@example.test","display_name":"Orphan","role":"user"}`)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "user.admin_group_required") {
-		t.Fatalf("missing admin group should be 400 user.admin_group_required, got %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing admin group should be 400, got %d %s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "user.admin_group_required")
 	if userEmailExists(t, srv, sysCookie, "orphan@example.test") {
 		t.Fatalf("no user should have been created without an admin group")
 	}
@@ -790,9 +794,10 @@ func TestAdminInviteForeignAdminGroupRejected(t *testing.T) {
 	sysCookie := loginAs(t, srv, "sys@example.test", "password-1")
 
 	rec := postInvite(t, srv, adminCookie, `{"email":"foreign@example.test","display_name":"Foreign","role":"user","admin_group_id":"ugrp_other"}`)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "user.admin_group_invalid") {
-		t.Fatalf("a foreign admin group should be 400 user.admin_group_invalid, got %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a foreign admin group should be 400, got %d %s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "user.admin_group_invalid")
 	if userEmailExists(t, srv, sysCookie, "foreign@example.test") {
 		t.Fatalf("no user should have been created for a foreign admin group")
 	}
@@ -813,9 +818,10 @@ func TestAdminInviteSystemAdminAnyGroup(t *testing.T) {
 
 	// mandatory even for system_admin.
 	miss := postInvite(t, srv, sysCookie, `{"email":"nog@example.test","display_name":"NoGroup","role":"user"}`)
-	if miss.Code != http.StatusBadRequest || !strings.Contains(miss.Body.String(), "user.admin_group_required") {
-		t.Fatalf("system_admin without a group should be 400 user.admin_group_required, got %d %s", miss.Code, miss.Body.String())
+	if miss.Code != http.StatusBadRequest {
+		t.Fatalf("system_admin without a group should be 400, got %d %s", miss.Code, miss.Body.String())
 	}
+	requireErrorCode(t, miss.Body.String(), "user.admin_group_required")
 	// any admin group is allowed.
 	rec := postInvite(t, srv, sysCookie, `{"email":"placed@example.test","display_name":"Placed","role":"user","admin_group_id":"ugrp_ag"}`)
 	if rec.Code != http.StatusCreated {

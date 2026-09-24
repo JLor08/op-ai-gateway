@@ -251,9 +251,7 @@ func TestRuntimeSubtreeShapesAllResolve(t *testing.T) {
 			if rec.Code != http.StatusNotFound {
 				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), portal.CodeServerNotFound) {
-				t.Fatalf("body = %s, want the %s code", rec.Body.String(), portal.CodeServerNotFound)
-			}
+			requireErrorCode(t, rec.Body.String(), "server.not_found")
 		})
 	}
 

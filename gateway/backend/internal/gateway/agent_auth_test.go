@@ -47,9 +47,10 @@ func TestAgentAuthMissingInvalidStoreErrorAndValidPrincipal(t *testing.T) {
 		srv := NewTestServer()
 		rec := httptest.NewRecorder()
 		_, ok := srv.authenticateAgent(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-		if ok || rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "auth.invalid_token") {
+		if ok || rec.Code != http.StatusUnauthorized {
 			t.Fatalf("ok=%v status=%d body=%s", ok, rec.Code, rec.Body.String())
 		}
+		requireErrorCode(t, rec.Body.String(), "auth.invalid_token")
 	})
 	t.Run("invalid", func(t *testing.T) {
 		srv := NewTestServer()
@@ -57,9 +58,10 @@ func TestAgentAuthMissingInvalidStoreErrorAndValidPrincipal(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer wrong")
 		rec := httptest.NewRecorder()
 		_, ok := srv.authenticateAgent(rec, req)
-		if ok || rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "auth.invalid_token") {
+		if ok || rec.Code != http.StatusUnauthorized {
 			t.Fatalf("ok=%v status=%d body=%s", ok, rec.Code, rec.Body.String())
 		}
+		requireErrorCode(t, rec.Body.String(), "auth.invalid_token")
 	})
 	t.Run("store error", func(t *testing.T) {
 		srv := NewTestServer()
@@ -68,9 +70,10 @@ func TestAgentAuthMissingInvalidStoreErrorAndValidPrincipal(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer anything")
 		rec := httptest.NewRecorder()
 		_, ok := srv.authenticateAgent(rec, req)
-		if ok || rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "agent.token_lookup_failed") {
+		if ok || rec.Code != http.StatusInternalServerError {
 			t.Fatalf("ok=%v status=%d body=%s", ok, rec.Code, rec.Body.String())
 		}
+		requireErrorCode(t, rec.Body.String(), "agent.token_lookup_failed")
 	})
 	t.Run("valid", func(t *testing.T) {
 		srv := NewTestServer()

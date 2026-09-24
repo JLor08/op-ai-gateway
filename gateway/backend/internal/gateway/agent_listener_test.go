@@ -15,7 +15,6 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
-	"strings"
 	"testing"
 	"time"
 )
@@ -153,9 +152,7 @@ func TestAgentStreamGateOnRejectsPublicUngatedOnAgentMux(t *testing.T) {
 		t.Fatalf("public listener status = %v, want 403", resp)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "netbird.only") {
-		t.Fatalf("public listener body = %s, want netbird.only", body)
-	}
+	requireErrorCode(t, string(body), "netbird.only")
 
 	// (b) The NetBird (agent) listener never runs the gate: an UNAUTHENTICATED probe
 	// reaches handleAgentStream's own auth prologue and gets 401 auth.invalid_token,
