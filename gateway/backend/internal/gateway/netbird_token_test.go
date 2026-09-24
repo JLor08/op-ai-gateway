@@ -233,9 +233,7 @@ func TestHandleSystemNetbirdRotateTokenAuthFailReturns502(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.auth_failed") {
-		t.Fatalf("body missing code netbird.auth_failed: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.auth_failed")
 	if strings.Contains(rec.Body.String(), "super-secret-token") || strings.Contains(rec.Body.String(), "nbp_new") {
 		t.Fatalf("rotate-failure response leaked a token: %s", rec.Body.String())
 	}
@@ -254,9 +252,7 @@ func TestHandleSystemNetbirdRotateTokenModuleDisabledReturns409(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.module_disabled") {
-		t.Fatalf("body missing code netbird.module_disabled: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.module_disabled")
 }
 
 // TestHandleSystemNetbirdTokenStatusModuleDisabled: the status endpoint never

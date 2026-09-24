@@ -159,9 +159,7 @@ func TestAgentCertificateEndpointAuthAndErrors(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404", rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "certificate.not_found") {
-			t.Fatalf("body = %s, want certificate.not_found", rec.Body.String())
-		}
+		requireErrorCode(t, rec.Body.String(), "certificate.not_found")
 	})
 	t.Run("cert key required", func(t *testing.T) {
 		srv := agentCertTestServer(t, &fakePortalAgentCert{err: portal.ErrCertKeyRequired})
@@ -170,9 +168,7 @@ func TestAgentCertificateEndpointAuthAndErrors(t *testing.T) {
 		if rec.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500", rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "system.cert_key_required") {
-			t.Fatalf("body = %s, want system.cert_key_required (the operator must learn which variable is missing)", rec.Body.String())
-		}
+		requireErrorCode(t, rec.Body.String(), "system.cert_key_required")
 	})
 	t.Run("opaque store error", func(t *testing.T) {
 		srv := agentCertTestServer(t, &fakePortalAgentCert{err: context.DeadlineExceeded})
@@ -212,9 +208,7 @@ func TestAgentCertificateEndpointNetbirdOnlyGate(t *testing.T) {
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403", rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "netbird.only") {
-			t.Fatalf("body = %s, want netbird.only", rec.Body.String())
-		}
+		requireErrorCode(t, rec.Body.String(), "netbird.only")
 	})
 	t.Run("no listener -> serves despite netbird_only", func(t *testing.T) {
 		fake := &fakePortalAgentCert{dto: dto, netbirdOnly: true}

@@ -247,9 +247,7 @@ func TestEdgeGateRefusesAPlainAPIRequestAndRedirectsAPortalGET(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("plaintext API POST = %d, want 403 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.https_required") {
-		t.Fatalf("body = %s, want the certificate.https_required code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.https_required")
 	if strings.Contains(rec.Body.String(), "served") {
 		t.Fatal("the gate must short-circuit BEFORE the mux -- the handler ran")
 	}
@@ -427,9 +425,7 @@ func TestEdgeGateRunsBeforeAuthentication(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("unauthenticated plaintext login = %d, want 403 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.https_required") {
-		t.Fatalf("body = %s, want certificate.https_required (not an auth error)", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.https_required")
 }
 
 // TestServeWithNotesOnlyRealExternalObservations wires the tracker to the actual
@@ -601,9 +597,7 @@ func TestSystemSettingsPUTGatesArmingOnAnObservation(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("arming without an observation = %d, want 400 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.edge_https_not_observed") {
-		t.Fatalf("body = %s, want the certificate.edge_https_not_observed code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.edge_https_not_observed")
 	if switchStored(false) {
 		t.Fatal("a refused arming attempt must not store the switch")
 	}
@@ -618,9 +612,7 @@ func TestSystemSettingsPUTGatesArmingOnAnObservation(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("arming over a plaintext hop = %d, want 400 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.edge_arm_requires_https") {
-		t.Fatalf("body = %s, want the certificate.edge_arm_requires_https code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.edge_arm_requires_https")
 	if switchStored(false) {
 		t.Fatal("an arming attempt refused for a plaintext hop must not store the switch")
 	}
@@ -648,9 +640,10 @@ func TestSystemSettingsPUTGatesArmingOnAnObservation(t *testing.T) {
 	// it is exactly what the armed gate refuses.)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, plainGateRequest(http.MethodPost, "/v1/chat/completions", "203.0.113.9:1"))
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "certificate.https_required") {
-		t.Fatalf("after arming, a plaintext API POST = %d %s, want 403 certificate.https_required", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("after arming, a plaintext API POST = %d %s, want 403", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "certificate.https_required")
 
 	// Disarming likewise takes effect immediately -- the direction that matters
 	// when an operator is trying to get back in.
@@ -914,7 +907,8 @@ func TestEdgeGateRefusalWarnIsThrottled(t *testing.T) {
 	// And the throttle must NEVER change the client-visible answer.
 	rec := httptest.NewRecorder()
 	s.ServeHTTP(rec, plainGateRequest(http.MethodPost, "/v1/chat/completions", "203.0.113.9:1"))
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "certificate.https_required") {
-		t.Fatalf("a throttled refusal = %d %s, want 403 certificate.https_required", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a throttled refusal = %d %s, want 403", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "certificate.https_required")
 }

@@ -203,9 +203,7 @@ func TestHandleSystemNetbirdGatewaySetupKeyAuthFailed(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.auth_failed") {
-		t.Fatalf("body missing code netbird.auth_failed: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.auth_failed")
 	// The admin token must NEVER appear in the error response body.
 	if strings.Contains(rec.Body.String(), "super-secret-token") {
 		t.Fatalf("error response leaked the admin token: %s", rec.Body.String())
@@ -224,7 +222,5 @@ func TestHandleSystemNetbirdGatewaySetupKeyModuleDisabled(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.module_disabled") {
-		t.Fatalf("body missing code netbird.module_disabled: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.module_disabled")
 }

@@ -64,8 +64,12 @@ func TestStreamProviderErrorCapturesErrorFrame(t *testing.T) {
 	if !strings.Contains(env.RespBody, "partial") {
 		t.Fatalf("partial delta not captured: %q", env.RespBody)
 	}
+	// A substring match is the RIGHT operator here: env.RespBody is an SSE
+	// transcript of several `data:` frames, not one apierror body, so there is
+	// no single error.code to compare. The assertion is "an error frame
+	// carrying this code appears in the stream".
 	if !strings.Contains(env.RespBody, "provider.unavailable") {
-		t.Fatalf("error frame not captured: %q", env.RespBody)
+		t.Fatalf("stream body missing the error frame: %s", env.RespBody)
 	}
 	if !strings.Contains(env.RespBody, "data: [DONE]") {
 		t.Fatalf("[DONE] not captured: %q", env.RespBody)

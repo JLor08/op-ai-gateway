@@ -174,12 +174,16 @@ func TestAdminUserLimitsScopedToManageableUserIDs(t *testing.T) {
 
 	// usr_out is outside adminA's manageable set -> both GET and PUT 404
 	// no-leak (the same code as a genuinely nonexistent user).
-	if rec := get("usr_out"); rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "admin.user_not_found") {
+	rec := get("usr_out")
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET limits on an unmanageable target should 404 no-leak, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := put("usr_out"); rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "admin.user_not_found") {
+	requireErrorCode(t, rec.Body.String(), "admin.user_not_found")
+	rec = put("usr_out")
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("PUT limits on an unmanageable target should 404 no-leak, got %d body=%s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "admin.user_not_found")
 
 	// usr_in IS inside adminA's manageable set (a member of AG, which adminA
 	// owns) -> both GET and PUT succeed.

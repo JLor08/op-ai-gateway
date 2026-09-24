@@ -400,9 +400,7 @@ func TestPortalTOTPDisableForbiddenWhenRequired(t *testing.T) {
 	if disableRec.Code != http.StatusConflict {
 		t.Fatalf("disable under totp_mode=required should be 409, got %d body=%s", disableRec.Code, disableRec.Body.String())
 	}
-	if !strings.Contains(disableRec.Body.String(), "auth.totp_disable_forbidden") {
-		t.Fatalf("expected auth.totp_disable_forbidden, got %s", disableRec.Body.String())
-	}
+	requireErrorCode(t, disableRec.Body.String(), "auth.totp_disable_forbidden")
 }
 
 // TestPortalTOTPDisableAllowedWhenOff confirms the FIX for a real dead-end:

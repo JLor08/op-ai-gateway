@@ -47,9 +47,7 @@ func TestImagesRefusesIncapableModel(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "routing.model_not_capable") {
-		t.Fatalf("body = %s, want the capability code, not an unknown-model code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
 	// The unit is endpoint identity, set on EVERY recordUsage call this path
 	// makes -- this refusal is relayImages' own resolve-failure branch
 	// (images_handler.go), which is otherwise untested for BillingUnit.
@@ -73,9 +71,7 @@ func TestImagesRejectsMissingPrompt(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "images.prompt_required") {
-		t.Fatalf("body = %s, want images.prompt_required", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "images.prompt_required")
 }
 
 // The routing model comes from our own mapping via the same tolerant JSON probe
@@ -92,9 +88,7 @@ func TestImagesRejectsMissingModel(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for a body with no model; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "images.model_required") {
-		t.Fatalf("body = %s, want images.model_required", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "images.model_required")
 }
 
 // The usage row carries the endpoint's own path. This exercises the REFUSAL
@@ -473,9 +467,7 @@ func TestImagesRejectsUnsupportedResponseFormat(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), imagesResponseFormatUnsupported) {
-		t.Fatalf("body = %s, want %s", rec.Body.String(), imagesResponseFormatUnsupported)
-	}
+	requireErrorCode(t, rec.Body.String(), "images.response_format_unsupported")
 }
 
 // A NON-STRING response_format must be rejected too. It used to slip through:
@@ -496,9 +488,7 @@ func TestImagesRejectsNonStringResponseFormat(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: status = %d, want 400; body = %s", body, rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), imagesResponseFormatUnsupported) {
-			t.Fatalf("%s: body = %s, want %s", body, rec.Body.String(), imagesResponseFormatUnsupported)
-		}
+		requireErrorCode(t, rec.Body.String(), "images.response_format_unsupported")
 	}
 }
 
@@ -517,9 +507,7 @@ func TestImagesRejectsStreamTrue(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), imagesStreamUnsupported) {
-		t.Fatalf("body = %s, want %s", rec.Body.String(), imagesStreamUnsupported)
-	}
+	requireErrorCode(t, rec.Body.String(), "images.stream_unsupported")
 
 	// stream:false and a non-boolean stream: the first must pass validation (it
 	// then hits the capability refusal, 404, like every other request in this
@@ -527,9 +515,13 @@ func TestImagesRejectsStreamTrue(t *testing.T) {
 	if got := postImages(t, NewTestServer(), `{"model":"qwen-coder","prompt":"a cat","stream":false}`); got.Code != http.StatusNotFound {
 		t.Fatalf("stream:false status = %d, want 404 (validation passed, routing refused); body = %s", got.Code, got.Body.String())
 	}
-	if got := postImages(t, NewTestServer(), `{"model":"qwen-coder","prompt":"a cat","stream":"true"}`); got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), imagesStreamUnsupported) {
-		t.Fatalf(`stream:"true" status = %d, body = %s, want 400 %s`, got.Code, got.Body.String(), imagesStreamUnsupported)
+	// Hoisted out of the if so requireErrorCode can still see `got`; the
+	// preceding `got` is scoped to its own if, so this declaration is new.
+	got := postImages(t, NewTestServer(), `{"model":"qwen-coder","prompt":"a cat","stream":"true"}`)
+	if got.Code != http.StatusBadRequest {
+		t.Fatalf(`stream:"true" status = %d, body = %s, want 400`, got.Code, got.Body.String())
 	}
+	requireErrorCode(t, got.Body.String(), "images.stream_unsupported")
 }
 
 // imagesDataCounter must count "b64_json" only when it is used as a JSON
@@ -807,9 +799,10 @@ func TestImagesRunAsTokenForbiddenForUnownedToken(t *testing.T) {
 	rec := postImagesWithHeaders(t, srv, "/v1/images/generations",
 		`{"model":"sd-turbo","prompt":"a cat"}`,
 		map[string]string{internalAuthHeaderName: "s3cret", internalUserHeaderName: "usr_dev", runAsHeaderName: "tok_other_img"})
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "portal.token_forbidden") {
-		t.Fatalf("run-as of unowned token should be 403 portal.token_forbidden, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("run-as of unowned token should be 403, got %d body=%s", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "portal.token_forbidden")
 	if upstreamCalled {
 		t.Fatal("upstream must never be called for a forbidden run-as token")
 	}
@@ -837,7 +830,8 @@ func TestImagesRunAsWithoutPortalIsRefused(t *testing.T) {
 
 	s.handleOpenAIImages(w, r)
 
-	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "portal.token_forbidden") {
-		t.Fatalf("status = %d body = %s, want 403 portal.token_forbidden", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s, want 403", w.Code, w.Body.String())
 	}
+	requireErrorCode(t, w.Body.String(), "portal.token_forbidden")
 }

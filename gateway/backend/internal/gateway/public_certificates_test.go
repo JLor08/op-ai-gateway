@@ -118,17 +118,19 @@ func TestPublicCertificateExportMaps409And404Exactly(t *testing.T) {
 	// Management off -> 409 not-managed.
 	off := publicCertExportServer(t, false, "pub.example.test", "pub.example.test", "public")
 	rec := pubCertGet(t, off, "/api/system/certificates/public/pub.example.test/key", pubCertSystemSecret)
-	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "certificate.public_not_managed") {
-		t.Fatalf("management off = %d body=%s, want 409 public_not_managed", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("management off = %d body=%s, want 409", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "certificate.public_not_managed")
 
 	// Managed name, but the stored row is kind=gateway (a collision): 404, never the
 	// mesh key.
 	collide := publicCertExportServer(t, true, "pub.example.test", "pub.example.test", "gateway")
 	key := pubCertGet(t, collide, "/api/system/certificates/public/pub.example.test/key", pubCertSystemSecret)
-	if key.Code != http.StatusNotFound || !strings.Contains(key.Body.String(), "certificate.not_found") {
-		t.Fatalf("kind=gateway collision key = %d body=%s, want 404 not_found (no key leak)", key.Code, key.Body.String())
+	if key.Code != http.StatusNotFound {
+		t.Fatalf("kind=gateway collision key = %d body=%s, want 404 (no key leak)", key.Code, key.Body.String())
 	}
+	requireErrorCode(t, key.Body.String(), "certificate.not_found")
 	if strings.Contains(key.Body.String(), "PUBLIC-KEY") {
 		t.Fatal("kind=gateway collision leaked key material")
 	}

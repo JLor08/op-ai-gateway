@@ -131,9 +131,7 @@ func TestNonStreamProviderErrorCapture(t *testing.T) {
 		t.Fatal("no capture saved on error path")
 	}
 	env := decryptCapture(t, saved.Blob)
-	if !strings.Contains(env.RespBody, "provider.unavailable") {
-		t.Fatalf("error body not captured: %q", env.RespBody)
-	}
+	requireErrorCode(t, env.RespBody, "provider.unavailable")
 	if env.RespBody != rec.Body.String() {
 		t.Fatalf("captured error body != client bytes")
 	}

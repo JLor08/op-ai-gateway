@@ -439,9 +439,7 @@ func TestRenewEndpointRejectsUnknownDomain(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.not_found") {
-		t.Fatalf("body = %s, want the certificate.not_found code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.not_found")
 
 	// A non-POST method is rejected.
 	rec = httptest.NewRecorder()
@@ -472,9 +470,7 @@ func TestServerCertificateOverrideEndpoint(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid override -> %d, want 400", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "cert.invalid") {
-		t.Fatalf("body = %s, want the cert.invalid code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "cert.invalid")
 
 	// An unknown server id is a 404 with no hint that it exists elsewhere.
 	rec = httptest.NewRecorder()
@@ -521,9 +517,7 @@ func TestServerHTTPSSwitchOverrideEndpoint(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid override -> %d, want 400", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "cert.invalid") {
-		t.Fatalf("body = %s, want the cert.invalid code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "cert.invalid")
 
 	// An unknown server id is a 404 with no hint that it exists elsewhere.
 	rec = httptest.NewRecorder()
@@ -624,9 +618,7 @@ func TestCertificateCARotateRequiresSelfSignedMode(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 in the acme mode (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "cert.invalid") {
-		t.Fatalf("body = %s, want the cert.invalid code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "cert.invalid")
 
 	// self_signed mode -> rotation succeeds.
 	enableSelfSignedForTest(t, srv)
@@ -679,9 +671,7 @@ func TestCertificateCARotateReturns409WhenReconcileHoldsTheLock(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("rotate while a reconcile pass holds the lock -> %d, want 409 (body %s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "certificate.reconcile_in_progress") {
-		t.Fatalf("body = %s, want the certificate.reconcile_in_progress code", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "certificate.reconcile_in_progress")
 
 	// Authorization runs BEFORE RotateCertificateCA is ever called -- the fake
 	// does not accidentally bypass it.
@@ -721,9 +711,7 @@ func TestCertificateCARotateReturns400WhenTheCertificateKeyIsMissing(t *testing.
 		t.Fatalf("rotate without a certificate encryption key -> %d, want 400 (body %s)", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "system.cert_key_required") {
-		t.Fatalf("body = %s, want the system.cert_key_required code", body)
-	}
+	requireErrorCode(t, body, "system.cert_key_required")
 	// The message must name the variable the operator has to set -- an opaque
 	// 500 was the whole reason for this mapping.
 	if !strings.Contains(body, "OP_AI_GATEWAY_CERT_ENCRYPTION_KEY") {

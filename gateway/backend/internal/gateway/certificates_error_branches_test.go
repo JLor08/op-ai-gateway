@@ -59,9 +59,7 @@ func TestHandleSystemCertificateRenewInvalidJSONReturns400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "request.invalid_json") {
-		t.Fatalf("body = %s, want request.invalid_json", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "request.invalid_json")
 }
 
 func TestHandleSystemCertificateRenewPrincipalForbiddenMapsTo403(t *testing.T) {
@@ -72,9 +70,7 @@ func TestHandleSystemCertificateRenewPrincipalForbiddenMapsTo403(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), portal.CodePrincipalForbidden) {
-		t.Fatalf("body = %s, want %s", rec.Body.String(), portal.CodePrincipalForbidden)
-	}
+	requireErrorCode(t, rec.Body.String(), "portal.principal_forbidden")
 }
 
 func TestHandlePortalServerCertificateInvalidJSONReturns400(t *testing.T) {
@@ -84,9 +80,7 @@ func TestHandlePortalServerCertificateInvalidJSONReturns400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "request.invalid_json") {
-		t.Fatalf("body = %s, want request.invalid_json", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "request.invalid_json")
 }
 
 func TestHandlePortalServerHTTPSSwitchOverrideInvalidJSONReturns400(t *testing.T) {
@@ -96,9 +90,7 @@ func TestHandlePortalServerHTTPSSwitchOverrideInvalidJSONReturns400(t *testing.T
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "request.invalid_json") {
-		t.Fatalf("body = %s, want request.invalid_json", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "request.invalid_json")
 }
 
 func TestHandleSystemCertificateReissueAllPrincipalForbiddenMapsTo403(t *testing.T) {
@@ -109,9 +101,7 @@ func TestHandleSystemCertificateReissueAllPrincipalForbiddenMapsTo403(t *testing
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), portal.CodePrincipalForbidden) {
-		t.Fatalf("body = %s, want %s", rec.Body.String(), portal.CodePrincipalForbidden)
-	}
+	requireErrorCode(t, rec.Body.String(), "portal.principal_forbidden")
 }
 
 func TestHandleSystemCertificateCARotatePrincipalForbiddenMapsTo403(t *testing.T) {
@@ -122,7 +112,5 @@ func TestHandleSystemCertificateCARotatePrincipalForbiddenMapsTo403(t *testing.T
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403, body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), portal.CodePrincipalForbidden) {
-		t.Fatalf("body = %s, want %s", rec.Body.String(), portal.CodePrincipalForbidden)
-	}
+	requireErrorCode(t, rec.Body.String(), "portal.principal_forbidden")
 }

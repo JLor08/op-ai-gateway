@@ -515,9 +515,10 @@ func TestCreateAdminGroupForAnotherOwnerInvalidCode(t *testing.T) {
 	// A non-existent/invalid owner -> 400 group.owner_invalid.
 	rec := doJSON(t, srv, cookie, http.MethodPost, "/api/portal/groups",
 		`{"tier":"admin","name":"AG","owner_user_id":"usr_missing"}`)
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "group.owner_invalid") {
-		t.Fatalf("invalid owner = %d %s, want 400 group.owner_invalid", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid owner = %d %s, want 400", rec.Code, rec.Body.String())
 	}
+	requireErrorCode(t, rec.Body.String(), "group.owner_invalid")
 }
 
 func TestAdminOwnerCandidatesEndpoint(t *testing.T) {

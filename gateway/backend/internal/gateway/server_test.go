@@ -2590,9 +2590,7 @@ func TestPortalTokenItemRejectsChatSessionID(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s chat-session = %d, want 400; body=%s", tc.method, rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "token.not_deletable") {
-			t.Fatalf("%s chat-session body = %s, want token.not_deletable", tc.method, rec.Body.String())
-		}
+		requireErrorCode(t, rec.Body.String(), "token.not_deletable")
 	}
 }
 
@@ -2667,9 +2665,7 @@ func TestPortalTokenRotateRejectsChatSessionID(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("rotate chat-session = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "portal.token_not_found") {
-		t.Fatalf("body = %s, want portal.token_not_found", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "portal.token_not_found")
 }
 
 func TestPortalUsageReturnsCurrentUserUsage(t *testing.T) {
@@ -5117,9 +5113,10 @@ func TestChatRunAsTokenForbiddenForUnownedToken(t *testing.T) {
 	req.AddCookie(cookie)
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
-	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "portal.token_forbidden") {
-		t.Fatalf("run-as of unowned token should be 403 portal.token_forbidden, got %d body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("run-as of unowned token should be 403, got %d body=%s", rr.Code, rr.Body.String())
 	}
+	requireErrorCode(t, rr.Body.String(), "portal.token_forbidden")
 	if events := srv.Usage.All(); len(events) != 0 {
 		t.Fatalf("forbidden run-as should record no usage, got %#v", events)
 	}

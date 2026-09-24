@@ -387,9 +387,7 @@ func TestSetupKeyGateNonManagedReturns409(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "netbird.peer_not_managed") {
-		t.Fatalf("body missing code netbird.peer_not_managed: %s", rec.Body.String())
-	}
+	requireErrorCode(t, rec.Body.String(), "netbird.peer_not_managed")
 }
 
 // TestHandlePortalNetbirdEnabled: the module-enabled flag is readable by any
