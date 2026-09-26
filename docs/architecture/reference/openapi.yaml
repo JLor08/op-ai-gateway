@@ -133,9 +133,11 @@ paths:
         modelled below); a portal session cookie is never accepted here.
         Always relayed to a natively image-shaped upstream; there is no
         translate fallback.
-        Admission is a per-mapping capability verdict, not an application
-        setting: a model without an `image` verdict of `yes` is refused with
-        404 `routing.model_not_capable`. Non-streaming only (a `stream: true`
+        Admission takes an application that declares the `openai_images` API
+        flavor (otherwise 404 `routing.no_model_route`) and a mapping whose
+        `image` verdict is `yes` (otherwise 404 `routing.model_not_capable`);
+        an agent-launched model's runtime spec must declare the flavor too
+        (otherwise 404 `routing.no_model_route`). Non-streaming only (a `stream: true`
         is refused with 400 `images.stream_unsupported`), and
         `response_format` must be `b64_json` or absent (400
         `images.response_format_unsupported` otherwise). Metered in images

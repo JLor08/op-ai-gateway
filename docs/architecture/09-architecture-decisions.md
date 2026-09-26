@@ -1008,7 +1008,7 @@ What the refusal costs is recorded rather than hidden, and it is **one
 configuration rather than a class**. A manual `"no"` only ever bought something
 where something else would otherwise SEND the parameters, and on the translate
 path that is `wantsLiveProgress`'s shape clause — `llama_cpp` and `vllm` only.
-Off that clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `custom`) the absence
+Off that clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `stable_diffusion_cpp`, `custom`) the absence
 of a row already means "do not send", so the pin was redundant; vLLM tolerates
 both parameters, so it has nothing to refuse; and for a `llama_cpp` upstream that
 genuinely refuses them the `/props` detector writes `"unsupported"` **itself** at
@@ -1553,7 +1553,10 @@ enablement path already works today with no schema change and no API change —
 `{"capability_verdicts":{"image":"yes"}}` on the mapping, a `manual` row,
 rank 3. That is a deliberate trade: an endpoint that serves nothing until an
 operator says which models generate images is strictly better than one that
-routes an image request to whatever chat model answered last.
+routes an image request to whatever chat model answered last. (Amended by
+[ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor):
+the verdict now serves images only on a route that also declares the
+`openai_images` flavor; see the amendment below.)
 
 **(b) `(image, no)` is RESERVED before its writer exists, and that costs
 nothing.** `reservedManualVerdicts` (`internal/portal/service_applications.go`)
@@ -1638,13 +1641,49 @@ declaring a pin stale would delete a chat client's pin. The gate sits in
 pin-*creating* writes are guarded on a non-empty required list instead, which
 needs no schema change and which #68/#69 inherit. — **A new runtime kind, an
 `images_mode` application column, and a wider `captureMaxBytes`**: each would
-have made an endpoint-shaped fact into a stored one. `sd-server` launches under
+have made an endpoint-shaped fact into a stored one. `sd-server` launched under
 the existing `custom` kind ([Agent-Managed Model Runtime
-§3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-custom));
+§3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp),
+since reversed by ADR-044);
 images has no per-application mode to read at all, which is why
 `endpointModeFor` deliberately has no case for it; and the capture cap stays
 1 MiB, so a large base64 response is captured truncated while the billable
 count is scanned off the full byte stream regardless.
+
+**Amended by [ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)
+(`openai_images` becomes a coarse flavor, and stable-diffusion.cpp a type of its
+own).** The capability gate, its fail-closed direction, (c), (e) and (f) stand
+unchanged. Five statements above no longer describe the code. The Context's
+"folds **every** `openai*` value to the coarse `openai`" and "It filters
+nothing": `NormalizeAPIFlavor` now folds `openai_images` to itself, and
+candidacy excludes an application that does not list it. The rejection of
+`openai_images` "as a gating fine API flavor" still holds for a *fine* flavor;
+what gates is a coarse one, which needed no per-endpoint column and no new
+filter case — the cost comparison above was against the fine shape.
+(b)'s "before its writer exists": `sdcpp_capabilities` now writes `(image, no)`
+for an external `stable_diffusion_cpp` application, and the reservation stands
+for exactly the reason (b) gives. And the rejected "new runtime kind": `sd-server`
+now launches under the runtime spec type `stable_diffusion_cpp`. And (a)'s
+"enablement path already works today", a `manual` `image: yes` verdict and
+nothing else: a verdict now serves images only on a route that declares
+`openai_images` — the application, and for an agent-launched child its runtime
+spec too — and a route without the flavor answers 404 `routing.no_model_route`,
+not `routing.model_not_capable`. Every image upstream is given the flavor
+explicitly, which the `stable_diffusion_cpp` type's default does, and no
+upgrade step adds it to a route that served images through `openai` before the
+split (ADR-044's consequence). The day-one cost changed shape with
+it: an external stable-diffusion.cpp application gets the flavor from its
+type's default and its `image` verdict from that probe, while an agent-launched
+one needs an operator for both. (d) is narrowed rather than closed — see
+ADR-044 (f). And the
+affinity premise of the Rejected "gating inside `affinityApplicationStale`"
+no longer holds for images: `AffinityKey.APIFlavor` is still coarse, but the
+coarse flavor of an image request is now `openai_images`, so its key never
+matches a chat client's and it could not delete a chat pin. Both affinity
+guards stay, keyed on the capability list, for a future capability-carrying
+endpoint that does share a coarse flavor with a text one; for images they are
+redundant, and the write guard only keeps image traffic pin-free
+([Routing & Model Selection §4](cross-cutting/routing-and-model-selection.md#4-route-affinity)).
 → [API Compatibility & Inference
 §3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
 [§13](cross-cutting/compatibility-and-inference.md#13-errors),
@@ -1682,7 +1721,12 @@ mirrors how `vision` already works: `portal.ModelDTO.Vision` is AND-folded
 across a mapping's servers in `modelsResponse` and the attach control is
 enabled or not from that single flag; `image` folds identically and the
 composer follows it. One axis is the point — the composer can then never offer
-something the gate will refuse.
+something the gate will refuse. (Amended by
+[ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)
+(f): the fold now also requires each mapping's route to declare
+`openai_images`, because once that flavor gates candidacy the verdict alone no
+longer makes the endpoint serve a model; that is what keeps this sentence
+true.)
 
 **Rejected: a mode toggle.** A second, independent axis of user intent makes
 reachable a state the capability gate must then refuse **at the bottom of the
@@ -1922,3 +1966,160 @@ and still admits the executor ([Security, Authentication & Authorization
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [HTTP API Surface](reference/api-surface.md#tokens-chats-usage).
+
+## ADR-044 — stable-diffusion.cpp is a first-class type, and `openai_images` is a coarse, opt-in flavor
+**Context:** [ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
+built `POST /v1/images/generations` on a capability gate and kept
+`openai_images` a label, because `NormalizeAPIFlavor` folded every `openai*`
+value into `openai`. That left one direction open: a mapping's `image` verdict
+switched images **on**, and nothing switched text **off**. Registering a
+stable-diffusion.cpp `sd-server` under a borrowed type was wrong in four ways,
+three of them measured against a real server: the stock `health_path` mode
+probes `/v1/health`, which it does not serve, so the application was
+unreachable after one cycle; the stock 30 s `timeout_ms` leaves too little
+headroom, because a 512x512 image measured about 17 s (about 20 s on the first
+request after idle) and the server's own limits permit far larger and slower
+generations; and `/v1/models` names the static placeholder `sd-cpp-local`,
+which the server does not dispatch on, so the mapping, the Runtime view and the
+Activity list all showed that placeholder. The fourth follows from the routing
+code rather than a measurement: the stock flavor pair made it a text
+candidate.
+
+**Decision (a): `openai_images` is a COARSE flavor, and it is opt-in
+everywhere.** `NormalizeAPIFlavor` tests the images prefix before the generic
+`openai` one, so the flavor folds to itself, and `applicationServesEndpoint`'s
+ordinary default branch then admits only an application that lists it — no new
+filter case, no endpoint mode, no schema change, since `api_flavors` already
+existed on applications and runtime specs. An empty list on save still
+becomes exactly `[openai, anthropic]`, and so does an absent one, except on an
+application update, which keeps the stored list. That is the migration-safety
+invariant, and it is load-bearing: an empty default that gained `openai_images`
+would make every existing text-only application a candidate for image requests
+it cannot serve
+([Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model)).
+
+**Consequence: an upgrade adds `openai_images` to no route, so image
+generation configured through an `openai` application stops until an operator
+ticks the flavor.** Serving images now takes the `openai_images` flavor as well
+as an `(image, yes)` verdict: on the application, and for an agent-launched
+child on its runtime spec too, since (b) holds the images relay to the spec's
+own list. Before the split an application could not declare `openai_images`,
+and the images endpoint folded images into `openai`, so an `(image, yes)`
+mapping on an `openai` application served images. After the upgrade that model
+answers 404 `routing.no_model_route` (or, for a token with the unknown-model
+redirect on, the request goes to that token's image-capable fallback) until
+the operator ticks `openai_images`
+on the application and, for an agent-launched child, on its launch spec; the
+application form and the launch-spec form both offer the flavor. No migration
+does this automatically. That is a decision, taken because no deployment
+configured image generation through an `openai` application. Every image
+upstream is therefore given the flavor explicitly, by the `stable_diffusion_cpp`
+application type's default or by the flavor checkbox; the launch-spec type sets
+no flavor, so an agent-launched child needs the checkbox unless its parent
+application lists only `openai_images`, which a new spec inherits.
+
+**(b) Flavor exclusion stays two-staged, and the images relay joins the second
+stage.** Candidacy filters on the application's flavors; a `server_agent`
+mapping's narrower spec flavors are enforceable only after resolution, by
+`targetServesFlavor`. That check ran only inside `tryProxyNative`, and the
+images relay calls `proxyNative` directly, so an agent-managed child whose spec
+lists only text would still have served an image request. The relay now applies
+the same conjunct and refuses with 404 `routing.no_model_route`. Like
+`tryProxyNative`'s check, the refusal is **not retried** against another
+application that could serve the model
+([API Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+The reverse direction gets a narrower check. The text translate dispatch,
+which every `/v1/chat/completions` request takes, read no spec flavors either,
+so an agent-managed child whose spec lists only `openai_images` would have
+been sent chat requests under a parent that keeps `openai` for its text
+children. That dispatch now refuses an **images-only** target (`openai_images`
+and neither text flavor) with the same 404, not retried either — and only
+that: a spec that keeps a text flavor is deliberately not held to its list
+there, because every such spec served chat completions before this flavor
+existed ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+**(c) `stable_diffusion_cpp` is an application type whose value is its
+defaults** — `model_sync` health, `/sdapi/v1/sd-models` with the
+`sdcpp_models` format, `timeout_ms` 600000, `["openai_images"]`, both
+coding-agent endpoint modes disabled. Three of them answer three of the traps
+above: `model_sync` the missing `/v1/health`, 600000 the timeout, and
+`["openai_images"]` the flavor pair. The fourth, the placeholder name, is
+answered by type-derived discovery (below), not by a field; the loaded-models
+path and format let the loaded probe parse the same listing, and the two
+coding-agent modes are disabled because the server serves neither endpoint.
+It dispatches to the shared OpenAI-compatible client, because the images relay
+is a native passthrough and the Ollama client cannot proxy natively. **Model
+discovery is derived from the type** (`provider.modelDiscoveryFor`) and reads
+`/sdapi/v1/sd-models`, which reports the real model. It is deliberately **not**
+derived from `loaded_models_path`: that field answers what is loaded right now
+and has a stock value for most types, and discovery read from it disabled every
+model that was merely not loaded — permanently, because reconcile never
+re-enables a mapping it already has. Discovery stays fail-closed, and shares
+only the name extraction with the loaded probe, so the two agree on a model's
+name by construction. **"Loaded" for this type means "the server answers"**,
+because the server's capability document carries no residency field; a
+`loaded_only` group cannot constrain an sd mapping
+([API Compatibility & Inference §8](cross-cutting/compatibility-and-inference.md#8-provider-clients)).
+
+**(d) The runtime spec type `stable_diffusion_cpp` reverses a recorded
+decision.** The runtime chapter chose `Type: "custom"` over a dedicated kind,
+because the kind would buy only auto-detection and a label. The kind was
+requested explicitly, and it now carries behaviour: whenever a spec's
+`health_path` is empty the backend picks it from the spec's effective type, and
+`/v1/models` for this kind removes the `/health` 404 that got every such child
+killed; the form moves an untouched field and shows `sd-server`'s own argument
+shape; and detection recognises the binary. `custom` with an explicit health
+path still works
+([Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp)).
+
+**(e) `sdcpp_capabilities` is the writer ADR-042 (b) reserved `(image, no)`
+for.** The gateway's health loop reads an external application's
+`/sdcpp/v1/capabilities`, whose `supported_modes` list is exhaustive, so it is
+the only source that answers `image` in both directions. It ranks 1 like every
+probe, so an operator's verdict always wins, and it uses the document's
+`model.stem` only to attribute a verdict to the mapping of that name — the stem
+is not stored. It cannot reach an agent-launched server, whose router passes
+only `/props` through per model, so such a mapping needs a manual `image: yes`
+([Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
+
+**(f) The portal listing carries `openai_images`, and `/v1/models` does not.**
+The listing kept only `anthropic` and `openai`, so an images-only model reached
+the chat with no flavors and no sd model was selectable at all. The listing's
+known set now includes `openai_images`, while the seed fallback stays
+text-only and `/v1/models` still asks for `openai` alone, so an external
+client's chat picker is unchanged. The listing's `image` now requires, besides
+the `image: yes` verdict, that the mapping's route declare `openai_images` —
+the application's flavors and, for an agent-launched model with a spec, the
+spec's — so a model the images endpoint would refuse is never an image model
+in the portal. The portal chat offers a model that carries `openai`, or
+`openai_images` together with `image: true` — the only images-only model the
+gate would serve. ADR-042 (d)'s gap therefore narrows:
+an images-only model on an application declaring only `openai_images` is no
+longer advertised to chat clients, but the per-flavor filter behind
+`/v1/models` and the listing's `flavors` field still read application flavors
+rather than a spec's (only the `image` flag reads the spec), and `/v1/models`
+still reads no capability row. Its second
+consumer, the unknown-model redirect, asks the offering with the request's
+required capabilities: for an images request a candidate must also carry
+`image` by the listing's own image fold (`ModelOffering.Capable`), so a
+fallback that generates images is taken and one the capability gate would
+refuse is skipped rather than turned into a `model_not_capable` about a model
+the client never named.
+
+**Rejected:** **discovery from `loaded_models_path`** — the consequence in (c)
+was measured, not predicted. — **`openai_images` in the empty default** — (a).
+— **An images endpoint mode** — the flavor already expresses "serves images, or
+not", and images have no translate fallback for a mode to choose. —
+**`openai_images` in the application form's default flavor list** — that list
+seeds every new application whatever its type, so every one would become an
+image candidate; the flavor is opt-in, set by the type's own defaults or by its
+checkbox, which nothing ticks by default.
+→ [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+[§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[API Compatibility & Inference
+§6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
+[§8](cross-cutting/compatibility-and-inference.md#8-provider-clients),
+[§9](cross-cutting/compatibility-and-inference.md#9-model-discovery),
+[Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[HTTP API Surface](reference/api-surface.md#application-type-api_flavors-and-loaded_models_format).

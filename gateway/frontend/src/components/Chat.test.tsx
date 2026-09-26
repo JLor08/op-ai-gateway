@@ -774,6 +774,56 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText(t.chatImageOnlyHint)).toBeInTheDocument();
     });
 
+    // An image model on an sd-server application carries ONLY the
+    // openai_images flavor -- its upstream serves no chat endpoint. It must
+    // still be selectable, and selecting it must make an image thread.
+    const imagesOnlyModels: ModelOption[] = [
+      {
+        id: 'flux1-dev',
+        display_name: 'flux1-dev',
+        flavors: ['openai_images'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    it('offers an images-only model and makes it an image thread', async () => {
+      renderChat(tokens, imagesOnlyModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'flux1-dev');
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+    });
+
+    // openai_images without an image:yes verdict is refused by the images
+    // gate and cannot be chatted with either (no openai flavor), so offering
+    // it produces a request that can only fail.
+    it('does not offer an images-flavored model the gate would refuse', async () => {
+      renderChat(tokens, [{ ...imagesOnlyModels[0], image: false }]);
+      await waitForChatReady();
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
+      expect(screen.queryByRole('option', { name: 'flux1-dev' })).not.toBeInTheDocument();
+    });
+
+    // Every model on a MIXED application ([openai, openai_images]) carries
+    // both flavors. One without an image verdict is still a text model: the
+    // openai flavor offers it, and it must make an ordinary TEXT thread -- the
+    // images flavor alone never takes precedence over openai.
+    it('offers a mixed-flavor model without an image verdict as a text model', async () => {
+      renderChat(tokens, [
+        {
+          id: 'mixed-text',
+          display_name: 'mixed-text',
+          flavors: ['openai', 'openai_images'],
+          loading_on_count: 0,
+          image: false,
+        },
+      ]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'mixed-text');
+      expect(screen.getByLabelText(t.messageLabel)).toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatImagePromptLabel)).not.toBeInTheDocument();
+    });
+
     it('keeps the ordinary message label for a model that does not generate images', async () => {
       renderChat();
       await waitForChatReady();

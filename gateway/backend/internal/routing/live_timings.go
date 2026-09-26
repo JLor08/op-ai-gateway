@@ -59,11 +59,13 @@ package routing
 // at all -- ask EffectiveRuntimeSpecType what actually serves), llama_swap and
 // litellm (both resolve a model to an arbitrary downstream that can be
 // api.openai.com, which answers 400 on an unrecognized body key), ollama, tgi,
-// custom, mock, and "" -- the empty spec type, which means "auto-detect from
-// the binary" and is a legitimate STORED value, so it has to be answered for
-// rather than assumed absent. That is all ten strings the two vocabularies
-// hold between them, minus the one member above. The default is OFF, so a kind
-// added later never opts in silently.
+// stable_diffusion_cpp (an image server -- /v1/responses, the one endpoint
+// this opt-in governs, does not even apply to it), custom, mock, and "" --
+// the empty spec type, which means "auto-detect from the binary" and is a
+// legitimate STORED value, so it has to be answered for rather than assumed
+// absent. That is all eleven strings the two vocabularies hold between them,
+// minus the one member above. The default is OFF, so a kind added later
+// never opts in silently.
 var liveTimingsCapableKinds = map[string]struct{}{
 	ProviderLlamaCPP: {},
 }

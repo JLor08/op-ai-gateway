@@ -571,6 +571,33 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   return { ...rest, admin_state: adminState };
 }
 
+// runtimeSpecHealthPathDefault decides two things in THIS form, both keyed on
+// the WRITABLE Type select alone (never on the read-only effective_type
+// echo, which is unknown until the backend resolves it): what the
+// health-path field DISPLAYS while untouched (its initial value, and the
+// target a type switch moves an untouched field to when the NEW type is
+// explicit) and the field's placeholder for an explicit type. On a FIRST
+// write, buildSpecBody sends '' instead of the displayed text whenever the
+// operator never typed into the field (healthPathEdited), so the backend's
+// OWN default decides -- deliberately NOT by comparing the field to this
+// function's answer for the CURRENT type, since a type switch can leave the
+// field showing a PRIOR type's default (see the Type select below) and that
+// would misread as an edit. The backend's default matters here because it is
+// keyed on the spec's EFFECTIVE type: under Auto this form cannot know what
+// `binary` will detect to (that detection is Go-only), so this function's
+// answer for Auto is necessarily a guess ('/health') that would be WRONG for
+// an Auto + sd-server-binary spec -- sending it verbatim pins the exact path
+// measured to 404 and gets the child killed. For the same reason a switch TO
+// Auto moves nothing, and Auto shows no placeholder. This function otherwise
+// mirrors runtimeSpecHealthPathDefault in
+// gateway/backend/internal/portal/service_runtime.go, the actual source of
+// truth: sd-server answers GET /health with 404 (measured), so its health
+// path defaults to /v1/models instead of the stock /health every other type
+// gets.
+function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
+  return type === 'stable_diffusion_cpp' ? '/v1/models' : '/health';
+}
+
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
@@ -677,10 +704,16 @@ function looksLikePastedCommandLine(arg: string): boolean {
 }
 
 // The port flag in the three spellings an operator writes it: alone (value on
-// the next line), "--port=50395", and "--port 50395" squeezed onto one line.
-// Only that EXACT name -- never "--rpc-port" or another "*-port", which name a
-// DIFFERENT endpoint that a spec may legitimately pin to a fixed number.
-const portFlagPattern = /^--?port(?:[=\s]+(\S+))?$/i;
+// the next line), "--port=50395", and "--port 50395" squeezed onto one line --
+// and sd-server's OWN listen flag,
+// "--listen-port", which names the exact same endpoint under a different
+// spelling (sd-server has no bare "--port" at all). Only those two EXACT
+// names -- never "--rpc-port" or another "*-port", which name a DIFFERENT
+// endpoint that a spec may legitimately pin to a fixed number. The separator
+// is "=" (optionally padded) or whitespace, written so that no quantifier
+// overlaps the value's \S+ -- a "[=\s]+" run would, and backtracks
+// super-linearly on a long run of "=".
+const portFlagPattern = /^--?(?:listen-)?port(?:(?:\s*=\s*|\s+)(\S+))?$/i;
 
 // A bare, in-range TCP port: what a hard-coded `--port` value looks like, and
 // what "${PORT}" deliberately is not.
@@ -2190,6 +2223,14 @@ export function RuntimeAdminSection({
   const [workDir, setWorkDir] = useState('');
   const [listenPort, setListenPort] = useState(0);
   const [healthPath, setHealthPath] = useState('/health');
+  // Whether the OPERATOR typed into the health-path field since the form was
+  // opened (create) or hydrated (edit) -- set only by the field's own
+  // onChange, never by a type switch moving the field to the new type's
+  // default (see the Type select below), so the two cannot be confused with
+  // each other. buildSpecBody reads this, not an equality check against the
+  // displayed default, to decide whether a first write is "untouched" (see
+  // there for why equality was wrong).
+  const [healthPathEdited, setHealthPathEdited] = useState(false);
   const [healthTimeoutSeconds, setHealthTimeoutSeconds] = useState(5);
   const [startupTimeoutSeconds, setStartupTimeoutSeconds] = useState(180);
   const [idleTimeoutSeconds, setIdleTimeoutSeconds] = useState(0);
@@ -2238,6 +2279,13 @@ export function RuntimeAdminSection({
   // write or keeps the stored value on a later one.
   const [specLiveTimings, setSpecLiveTimings] = useState<boolean | undefined>(undefined);
   const specLiveTimingsKind = runtimeSpecLiveTimingsKind(specType);
+  // Whether the save this form leads to is the spec's FIRST write: always on
+  // create, and on an edit of a mapping that has no spec row yet
+  // (`configured: false`). Edit is offered on every row, "Delete spec" keeps
+  // the mapping, and a failed create leaves a mapping without a spec to
+  // retry through Edit -- so `specMode` alone cannot tell. Captured when the
+  // form opens, from the same GET payload the fields are hydrated from.
+  const [specFirstWrite, setSpecFirstWrite] = useState(true);
 
   /**
    * The newest VRAM measurement this mapping has, for the per-GPU APPLY
@@ -2304,6 +2352,7 @@ export function RuntimeAdminSection({
     setWorkDir('');
     setListenPort(0);
     setHealthPath('/health');
+    setHealthPathEdited(false);
     setHealthTimeoutSeconds(5);
     setStartupTimeoutSeconds(180);
     setIdleTimeoutSeconds(0);
@@ -2334,6 +2383,7 @@ export function RuntimeAdminSection({
     setWorkDir(spec.work_dir);
     setListenPort(spec.listen_port);
     setHealthPath(spec.health_path || '/health');
+    setHealthPathEdited(false);
     setHealthTimeoutSeconds(spec.health_timeout_seconds || 5);
     setStartupTimeoutSeconds(spec.startup_timeout_seconds || 180);
     setIdleTimeoutSeconds(spec.idle_timeout_seconds);
@@ -2368,6 +2418,10 @@ export function RuntimeAdminSection({
     // and must not become one. Edit is ungated and reaches exactly that
     // document, and the write it leads to is a FIRST write.
     setSpecLiveTimings(spec.configured ? spec.responses_live_timings_enabled : undefined);
+    // The same zero-value argument for the health path: with no spec row the
+    // field shows this form's own fallback, not a stored value, so the save
+    // is judged as a first write (buildSpecBody).
+    setSpecFirstWrite(!spec.configured);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
   }
@@ -2376,10 +2430,28 @@ export function RuntimeAdminSection({
     setGatewayName('');
     setAppName('');
     resetSpecFields();
+    setSpecFirstWrite(true);
     // Snapshot from the parent application: a spec created for it starts out
     // agreeing with what the app already exposes, rather than a fresh
     // passthrough-only guess that the operator has to re-derive by hand.
-    setSpecApiFlavors([...application.api_flavors]);
+    // openai_images excepted: it is opt-in on the spec as everywhere else. A
+    // server_agent parent declares it for its image children, and copying it
+    // would make every new text model's spec admit image requests too. Only
+    // the operator ticks it here -- UNLESS the parent has no text flavor to
+    // fall back to: dropping openai_images from a parent whose flavors are
+    // exactly [openai_images] would open the form with every flavor unticked,
+    // and an untouched save on that state sends [], which the backend stores
+    // as [openai, anthropic] (the create default), not narrower -- so the
+    // child would serve nothing the operator could reach, with no warning.
+    // Excepting the exception only when a text flavor survives the filter
+    // keeps that trap closed while leaving the normal case untouched.
+    const parentFlavors = application.api_flavors;
+    const parentHasTextFlavor = parentFlavors.some((flavor) => flavor !== 'openai_images');
+    setSpecApiFlavors(
+      parentHasTextFlavor
+        ? parentFlavors.filter((flavor) => flavor !== 'openai_images')
+        : [...parentFlavors],
+    );
     setSpecResponsesMode(application.responses_mode);
     setSpecMessagesMode(application.messages_mode);
     setSpecMode('create');
@@ -2628,6 +2700,23 @@ export function RuntimeAdminSection({
       if (apiTokenCleared) apiToken = '';
       else if (apiTokenInput !== '') apiToken = apiTokenInput;
     }
+    const healthPathTrimmed = healthPath.trim();
+    // FIRST write only (a create, or an edit of a mapping with no spec yet --
+    // specFirstWrite): while the field is UNTOUCHED -- the operator never
+    // typed into it (healthPathEdited) -- send '' instead of its displayed
+    // text, so the backend's OWN default (keyed on the spec's EFFECTIVE type,
+    // resolved server-side -- auto-detected from `binary` under Auto, which
+    // this form cannot do) decides. "Untouched" is judged by that flag, not
+    // by comparing the field to runtimeSpecHealthPathDefault(specType): a
+    // Type switch moves an untouched field to the NEW type's default too
+    // (see the Type select below), so after picking an explicit type and
+    // switching back to Auto the field can display that explicit type's
+    // default while Auto's own default differs -- an equality check would
+    // then read it as "edited" and send it verbatim, pinning a path this
+    // form only guessed for whatever Auto detects `binary` to. An edit of a
+    // stored spec always sends the field as-is -- a stored explicit value
+    // must never be silently re-derived away from what it displays.
+    const healthPathForRequest = specFirstWrite && !healthPathEdited ? '' : healthPathTrimmed;
     return {
       enabled,
       binary: binary.trim(),
@@ -2635,7 +2724,7 @@ export function RuntimeAdminSection({
       env,
       work_dir: workDir.trim(),
       listen_port: listenPort,
-      health_path: healthPath.trim(),
+      health_path: healthPathForRequest,
       health_timeout_seconds: healthTimeoutSeconds,
       startup_timeout_seconds: startupTimeoutSeconds,
       idle_timeout_seconds: idleTimeoutSeconds,
@@ -3863,14 +3952,33 @@ export function RuntimeAdminSection({
               id="runtime-spec-type"
               label={t.runtimeSpecType}
               value={specType}
-              onChange={(e) => setSpecType(e.target.value as RuntimeSpec['type'])}
+              onChange={(e) => {
+                const next = e.target.value as RuntimeSpec['type'];
+                // Move an UNTOUCHED health path to the new type's default;
+                // leave an edited one alone. Mirrors migrateTypeFields'
+                // preservation contract on the application form. Only an
+                // explicit type has a known default: Auto's '/health' is a
+                // guess (the kind is detected from `binary` in Go), so a
+                // switch TO Auto moves nothing -- on an edit it would
+                // otherwise save '/health' over a stored '/v1/models'.
+                if (next !== '' && healthPath === runtimeSpecHealthPathDefault(specType)) {
+                  setHealthPath(runtimeSpecHealthPathDefault(next));
+                }
+                setSpecType(next);
+              }}
               sx={{ maxWidth: 340 }}
+              helperText={
+                specType === 'stable_diffusion_cpp'
+                  ? t.runtimeSpecTypeStableDiffusionCppNote
+                  : undefined
+              }
             >
               <option value="">{t.runtimeSpecTypeAuto}</option>
               <option value="vllm">{t.runtimeSpecTypeVllm}</option>
               <option value="llama_cpp">{t.runtimeSpecTypeLlamaCpp}</option>
               <option value="tgi">{t.runtimeSpecTypeTgi}</option>
               <option value="ollama">{t.runtimeSpecTypeOllama}</option>
+              <option value="stable_diffusion_cpp">{t.runtimeSpecTypeStableDiffusionCpp}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field
@@ -3935,7 +4043,9 @@ export function RuntimeAdminSection({
                       overflowX: 'auto',
                     }}
                   >
-                    {t.runtimeSpecArgsExample}
+                    {specType === 'stable_diffusion_cpp'
+                      ? t.runtimeSpecArgsExampleSdcpp
+                      : t.runtimeSpecArgsExample}
                   </Box>
                 </>
               }
@@ -3987,8 +4097,15 @@ export function RuntimeAdminSection({
               id="runtime-spec-health-path"
               label={t.runtimeSpecHealthPath}
               value={healthPath}
-              onChange={(e) => setHealthPath(e.target.value)}
-              placeholder="/health"
+              onChange={(e) => {
+                setHealthPath(e.target.value);
+                setHealthPathEdited(true);
+              }}
+              // An empty field is sent empty and the backend's default for
+              // the EFFECTIVE type decides, so the placeholder names that
+              // default only where this form knows it: for an explicit
+              // type. Under Auto it would be a guess, so there is none.
+              placeholder={specType === '' ? undefined : runtimeSpecHealthPathDefault(specType)}
             />
             <Field
               id="runtime-spec-health-timeout"

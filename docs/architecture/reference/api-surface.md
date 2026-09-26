@@ -43,16 +43,16 @@ Only requests that actually arrived on `agentMux` get `r.TLS` transport-hop repo
 
 ## 1. Inference / compatibility endpoints
 
-Client-facing, OpenAI/Anthropic/Codex/Claude-Code-compatible completion, image-generation and model-listing routes. All require **session-or-bearer**, **bearer-only**, or (for `/v1/images/generations` alone) **bearer-or-loopback** auth with scope `gateway:use` or `llm:invoke` (service tokens); see the table for which variant each path uses. `/v1/responses` and `/v1/messages` also attempt **native passthrough** first (proxying the raw body straight to an upstream that natively speaks Codex/Claude Code) before falling back to translation. `/v1/images/generations` is passthrough-**only** — it has no translate path, and admission to it is a per-mapping capability verdict rather than an application setting.
+Client-facing, OpenAI/Anthropic/Codex/Claude-Code-compatible completion, image-generation and model-listing routes. All require **session-or-bearer**, **bearer-only**, or (for `/v1/images/generations` alone) **bearer-or-loopback** auth with scope `gateway:use` or `llm:invoke` (service tokens); see the table for which variant each path uses. `/v1/responses` and `/v1/messages` also attempt **native passthrough** first (proxying the raw body straight to an upstream that natively speaks Codex/Claude Code) before falling back to translation. `/v1/images/generations` is passthrough-**only** — it has no translate path, and admission to it takes an application that declares the `openai_images` flavor and a mapping whose `image` capability verdict is `yes` — plus, for an agent-launched model, a runtime spec that declares the flavor too.
 
 | Path(s) | Method | Auth | Purpose |
 |---|---|---|---|
 | `/v1/chat/completions`, `/openai/v1/chat/completions` | POST | Session-or-bearer, `gateway:use`\|`llm:invoke` | OpenAI-compatible chat completions (streaming supported) |
 | `/v1/responses`, `/openai/v1/responses` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI Responses API (Codex); native passthrough when the target app supports it |
 | `/v1/messages`, `/anthropic/v1/messages` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | Anthropic Messages API (Claude Code); native passthrough when the target app supports it — the only path where Anthropic streaming works end-to-end |
-| `/v1/images/generations`, `/openai/v1/images/generations` | POST | Bearer-or-loopback, `gateway:use`\|`llm:invoke` | OpenAI-compatible image generation, relayed to a natively image-shaped upstream (`sd-server`). No translate path: a mapping without an `image` capability verdict of `yes` is refused with 404 `routing.model_not_capable`. Non-streaming only — a `stream: true` is refused with 400 `images.stream_unsupported`, and `response_format` must be `b64_json` or absent. Metered in images, not tokens |
+| `/v1/images/generations`, `/openai/v1/images/generations` | POST | Bearer-or-loopback, `gateway:use`\|`llm:invoke` | OpenAI-compatible image generation, relayed to a natively image-shaped upstream (`sd-server`). No translate path: only an application declaring `openai_images` is a candidate (otherwise 404 `routing.no_model_route`, also the answer when a resolved agent-launched child's spec excludes the flavor), and a mapping without an `image` capability verdict of `yes` is refused with 404 `routing.model_not_capable`. Non-streaming only — a `stream: true` is refused with 400 `images.stream_unsupported`, and `response_format` must be `b64_json` or absent. Metered in images, not tokens |
 | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | Anthropic token counting (utility call, no upstream inference, no billing) |
-| `/v1/models`, `/openai/v1/models` | GET | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI-shaped model listing; discovery is unfiltered by a service token's own allowlist, but IS filtered by resource-group provisioning visibility |
+| `/v1/models`, `/openai/v1/models` | GET | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI-shaped model listing of the models whose application declares the `openai` flavor — so a model on an application declaring only `openai_images` is not listed; discovery is unfiltered by a service token's own allowlist, but IS filtered by resource-group provisioning visibility |
 | `/anthropic/v1/models` | GET | Session-or-bearer, `gateway:use` | Anthropic-shaped model listing |
 | `/api/v0/models` | GET | Session-or-bearer, `gateway:use` | LM Studio-shaped model listing (emulated metadata only, e.g. `max_context_length`, for LM-Studio-aware clients such as opencode; actual chat still goes over `/v1/chat/completions`) |
 
@@ -159,7 +159,7 @@ request still passes every admission gate — are in
 
 | Path | Methods | Auth notes | Purpose |
 |---|---|---|---|
-| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller; each row also carries `loading_on_count` — servers that currently OFFER the model (the same conditions `offered_on_count` applies, so it never exceeds it) and whose managed spec is `starting` — gateway-injected from the volatile runtime-status registry (`?manage=1` too, where it is unfiltered like its sibling counts, while the plain listing applies the same resource-group filter its siblings do), registry-availability-gated only, **not** on `runtime_model_probe`; always `0` on a model-GROUP row (see [Agent-Managed Model Runtime §11.8](../cross-cutting/agent-runtime-manager.md#118-the-models-overviews-loading-count)) |
+| `/api/portal/models` | GET | `gateway:use` | Model catalog visible to the caller; each row's `flavors` lists the coarse flavors its applications declare, `openai_images` included (unlike `/v1/models`, which lists per flavor); its `image` is true only when the images endpoint would serve the model — every offering mapping carries an `image: yes` verdict and declares `openai_images` on its application and, for an agent-launched model with a spec, on the spec; and each row also carries `loading_on_count` — servers that currently OFFER the model (the same conditions `offered_on_count` applies, so it never exceeds it) and whose managed spec is `starting` — gateway-injected from the volatile runtime-status registry (`?manage=1` too, where it is unfiltered like its sibling counts, while the plain listing applies the same resource-group filter its siblings do), registry-availability-gated only, **not** on `runtime_model_probe`; always `0` on a model-GROUP row (see [Agent-Managed Model Runtime §11.8](../cross-cutting/agent-runtime-manager.md#118-the-models-overviews-loading-count)) |
 | `/api/portal/model-servers`, `/model-servers/events` | GET, GET (SSE) | `gateway:use` | Servers offering a given model + live benchmark/loaded state; for a `server_agent` mapping, also its live per-instance `state`/`active_requests`/`queue_depth`/`metrics_probe`/`context_probe` (gateway-injected from the volatile runtime-status registry, both on the plain GET and the SSE compute closure — `state` unconditionally, the other four only when the reporting agent declared `runtime_model_probe`); every row also carries `capabilities` — the mapping's DETERMINED capability rows (`model_mapping_capabilities`, migration 78), one object per row with `capability`, `verdict` (`"yes"`/`"no"` only), `source` and `checked_at`, alphabetical by capability and **always an array, never `null`**, empty when nothing has been determined; an absent entry is UNKNOWN, so a consumer must not read a missing capability as `"no"` beyond its own fail-closed intent. Three folded conveniences come from the same rows rather than from the mapping (which since migration 79 has no capability column to read): `is_mtp` and `vision_capable` (each `true` only for that capability's `"yes"` row — a missing row is NOT capable, the same fail-closed rule), and `live_progress_support` (`""`/`supported`/`unsupported`, always present, no `omitempty`, so "never determined" is an explicit `""` and not a missing key) with `live_progress_checked_at` (that row's own `checked_at`; omitted when never determined, and omitted rather than sent as a year-0001 timestamp). All of these are filled by the service from ONE batched capability read, so unlike the runtime-status fields above they need no gateway-injection seam and no `runtime_model_probe` gate; SSE push on load-state change. A failed capability read logs a warning and withholds these fields from the whole listing — every row then reads as nothing-determined — rather than failing the request |
 | `/api/portal/model-group-servers` | GET | `gateway:use` | Candidate servers for a model group, ranked by the group's **manual** traversal order + live per-mapping score (it does not model `member_order`, `loaded_only` or `min_tokens_per_second`, so such a group may be served in a different order than shown) |
 | `/api/portal/model-groups`, `/model-groups/{id}` | GET/POST, GET/PUT/DELETE | **`admin`** | Model-group CRUD (global-admin capability) |
@@ -168,6 +168,36 @@ request still passes every admission gate — are in
 | `/api/portal/applications/{id}` | GET/PATCH/DELETE | `gateway:use` + ownership | Application (inference backend) CRUD |
 | `/api/portal/mappings/{id}` | PATCH/DELETE | `gateway:use` + ownership | Model-mapping CRUD. The mapping DTO — here and on the create/list responses — carries `capabilities` in exactly the shape the model-servers rows use (`capability`, `verdict` `"yes"`/`"no"` only, `source`, `checked_at`), alphabetical and **always an array, never `null`**; an absent entry is UNKNOWN, which is the one thing the folded `is_mtp`/`vision_capable` booleans beside it cannot express (both fold a `"no"` row and a missing row to `false`). PATCH and POST both accept `capability_verdicts`, a map keyed by capability name and the authoritative per-capability field: `"yes"`/`"no"` writes a `manual` row when it differs from the STORED row (a missing row counts as different, which is what makes unknown → `"no"` a real transition rather than a silent no-op); `""` DELETES the row, returning the capability to unknown — the only way back out of a `manual` verdict, which outranks every probe and the vision benchmark for as long as it stands; an absent key states nothing, so a save made for an unrelated reason cannot touch a capability. It rides on this PATCH rather than on a DELETE of its own because the mapping form seeds once and never re-syncs, so a reset applied separately would be undone by the operator's next unrelated edit; the response is therefore post-write truth. The `is_mtp`/`vision_capable` booleans beside it are the LEGACY compatibility path and are compared against the two-state fold instead, so an unconditional `vision_capable: false` from a client that submits every field on every save writes nothing — which is deliberate, and is why they cannot state a negative or reach unknown. Any capability name may be RESET (the vocabulary is open) and names are trimmed; the one narrowing is keyed on the (name, verdict) PAIR rather than the name: `live_progress: "no"` and either verdict on `speculation_observed` may not be STATED, because a `manual` row outranks every probe permanently and a manual `live_progress: "no"` would silently disable the operator's own `responses_live_timings_enabled` switch on a different endpoint, with no way to repair it from the mapping form. `live_progress: "yes"` stays accepted on purpose — it is the only opt-in a `llama_swap`/`litellm`/`tgi`/`custom` mapping ever had for an exact mid-stream count on `/v1/chat/completions`, where the same verdict is read in both directions. Five rejections are `400`s: a blank name (`mapping.capability_name_required`), a value outside `"yes"`/`"no"`/`""` (`mapping.capability_verdict_invalid`, so a typo is refused rather than read as a reset), a reserved (name, verdict) pair (`mapping.capability_reserved` — the RESET `""` is never refused, so a row stored by an older build stays correctable), stating a capability whose `is_mtp`/`vision_capable` boolean the same request also sends (`mapping.capability_conflict`), and two keys that name the same capability once trimmed (`mapping.capability_duplicate` — the same conflict in another shape, refused rather than resolved, because both intents would reach one last-write-wins upsert and the verdict that landed would follow Go's map iteration order). Unlike the capability upsert on this path, which is best-effort, a failing delete fails the request |
 | `/api/portal/agent-binaries`, `/agent-binaries/{...}` | GET | `gateway:use` | List / download ServerAgent release binaries for manual install |
+
+#### Application `type`, `api_flavors` and `loaded_models_format`
+
+Three vocabularies on `ApplicationDTO`/`CreateApplicationRequest`/
+`UpdateApplicationRequest`:
+
+- **`type`**: `ollama` | `vllm` | `llama_cpp` | `llama_swap` | `litellm` |
+  `server_agent` | `stable_diffusion_cpp`. Anything else is refused as
+  `application.type_invalid` (400). `stable_diffusion_cpp` is an external
+  stable-diffusion.cpp `sd-server`; its model discovery reads
+  `/sdapi/v1/sd-models`, derived from the type, and its backend `timeout_ms`
+  default is 600000, like `server_agent`'s. The portal form's other defaults
+  for it (`model_sync`, `["openai_images"]`, both endpoint modes `disabled`, …)
+  are filled in by the form, not by the API
+  ([Routing & Model Selection §1](../cross-cutting/routing-and-model-selection.md#1-data-model)).
+- **`api_flavors`**: a subset of `["openai","anthropic","openai_images"]`, the
+  coarse flavors a request is matched against. On **create** an absent or
+  empty list becomes exactly `["openai","anthropic"]`. On **update** an absent
+  list keeps the stored one, and an empty list becomes
+  `["openai","anthropic"]`. The default applies only when a list is saved: a
+  list stored empty is read back empty, and such an application is a candidate
+  for no flavor at all. `openai_images` is never implied, so an
+  application serves images only when it names that flavor, and serves no text
+  when it names nothing else. An unrecognised value is refused as
+  `application.flavor_invalid` (400)
+  ([Compatibility & Inference §6](../cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+- **`loaded_models_format`**: `openai` | `llama_swap` | `llama_cpp` |
+  `litellm` | `sdcpp_models` | `auto` (or empty, also auto). `sdcpp_models`
+  parses stable-diffusion.cpp's `/sdapi/v1/sd-models`. Lenient by design: an
+  unrecognised value is stored as `auto` rather than refused.
 
 #### Agent-managed model runtime
 
@@ -425,9 +455,9 @@ than refusing it. See
 [agent-runtime-manager.md §3.3](../cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement).
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `type` (`""` | `"vllm"` |
-`"llama_cpp"` | `"tgi"` | `"ollama"` | `"custom"`, empty = auto-detect from
-`binary`) and the operator's own raw `metrics_path`/`context_probe_path`
-overrides (empty = use the resolved type's own default). The **GET**
+`"llama_cpp"` | `"tgi"` | `"ollama"` | `"stable_diffusion_cpp"` | `"custom"`,
+empty = auto-detect from `binary`) and the operator's own raw
+`metrics_path`/`context_probe_path` overrides (empty = use the resolved type's own default). The **GET**
 response additionally echoes three **read-only** fields —
 `effective_type`, `resolved_metrics_path`, `resolved_context_probe_path` —
 the outcome of `routing.EffectiveRuntimeSpecType` +
@@ -435,7 +465,7 @@ the outcome of `routing.EffectiveRuntimeSpecType` +
 relying on auto-detect can render what the agent will actually use without
 recomputing the per-type table itself; these three are never accepted on the
 PUT. `runtime_spec.type_invalid` (400) rejects a `type` that is neither empty
-(auto-detect) nor one of the five named kinds above, checked before any
+(auto-detect) nor one of the six named kinds above, checked before any
 mutation like every other spec validation rule. See [Agent-Managed Model
 Runtime
 §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
@@ -496,8 +526,11 @@ agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
 `SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
 and persisted* here, with the real refusal happening agent-side at process
 start. Defaults applied on
-zero/empty: `health_path` `/health`, `health_timeout_seconds` 5,
-`startup_timeout_seconds` 180. A duplicate GPU index is refused as a **whole-write
+zero/empty: `health_path` by the spec's **effective** type (the explicit
+`type`, else the one detected from `binary`): `/v1/models` for
+`stable_diffusion_cpp`, whose server answers `/health` with 404, else
+`/health`; `health_timeout_seconds` 5; `startup_timeout_seconds` 180. A
+duplicate GPU index is refused as a **whole-write
 failure, not deduped**, so no filled-in row is silently discarded.
 
 #### API-variant endpoint modes (`responses_mode` / `messages_mode`)
@@ -507,7 +540,8 @@ failure, not deduped**, so no filled-in row is silently discarded.
 `messages_mode` string pair (`disabled` | `translate` | `passthrough`), which
 replaced the two `native_responses`/`native_messages` booleans; the
 runtime-spec shapes additionally carry `api_flavors` (a subset of
-`["openai","anthropic"]`, the same shape the application DTO has always used).
+`["openai","anthropic","openai_images"]`, the same shape and vocabulary as the
+application DTO's).
 Full semantics — the effective-served rule, why a `server_agent` model's
 resolved spec is the sole authority for its own trio, and the dispatch-time
 404 — are in [Compatibility & Inference
@@ -517,10 +551,11 @@ and [Agent-Managed Model Runtime
 Wire notes a client must know:
 
 - **Create** (`CreateApplicationRequest`, `PutRuntimeSpecRequest`): an absent
-  or blank mode defaults to `passthrough`; an absent `api_flavors` on the
-  runtime-spec shape defaults to both flavors — the same "every supported
-  upstream now serves both endpoints" default the application side has always
-  used. An unrecognized mode or flavor is rejected before any write.
+  or blank mode defaults to `passthrough`; an absent or empty `api_flavors` on
+  the runtime-spec shape defaults to the two text flavors, `openai` and
+  `anthropic` (never `openai_images`) — the same "every supported upstream now
+  serves both endpoints" default the application side has always used. An
+  unrecognized mode or flavor is rejected before any write.
 - **Update** (`UpdateApplicationRequest`): the two modes are `*string`,
   keep-if-absent like every other pointer field on this DTO — but unlike a
   plain optional string there is no "clear to empty" for a three-state enum:
@@ -535,7 +570,11 @@ Wire notes a client must know:
   snapshot itself, once, when the create form is opened
   ([Agent-Managed Model Runtime
   §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows));
-  a direct API client gets no such convenience.
+  a direct API client gets no such convenience. That snapshot has one
+  exception: `openai_images` is left out of it, UNLESS the parent's flavors
+  are exactly `[openai_images]`, in which case it is snapshotted as is (see
+  §11.5 for why — dropping it there would leave the new spec unreachable by
+  any flavor an untouched save could produce).
 - **`responses_live_timings_enabled`** is a separate opt-in that rides the
   same two surfaces: it is a `bool` on `ApplicationDTO` and on
   `RuntimeSpecDTO`, and a `*bool` on `CreateApplicationRequest`,
@@ -629,7 +668,7 @@ New stable error codes:
 | `messages.endpoint_disabled` | 404 | the `/v1/messages` analogue |
 | `application.endpoint_mode_invalid` | 400 | `CreateApplicationRequest`/`UpdateApplicationRequest` carries an unrecognized `responses_mode`/`messages_mode` |
 | `runtime_spec.endpoint_mode_invalid` | 400 | `PutRuntimeSpecRequest` carries an unrecognized `responses_mode`/`messages_mode` |
-| `runtime_spec.flavor_invalid` | 400 | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic` |
+| `runtime_spec.flavor_invalid` | 400 | `PutRuntimeSpecRequest.api_flavors` carries a value other than `openai`/`anthropic`/`openai_images` |
 | `application.responses_live_timings_unsupported` | 400 | the request sent an incapable `type` alongside `responses_live_timings_enabled: true` — every create, whose `type` is always the request's own, and a `PATCH` that sends both. The message names the type |
 | `application.responses_live_timings_conflict` | 409 | a `PATCH` asserts `responses_live_timings_enabled: true`, sends no `type`, and the application's **stored** type cannot honour it: the request is well-formed and conflicts with the application's own state. The message names that stored type |
 | `runtime_spec.responses_live_timings_unsupported` | 400 | a spec `PUT` asserts `true` and its **effective** type — the explicit `type` when set, else detected from `binary` — cannot honour it. The message names the effective type, which may be one the caller never typed. There is no 409 on this surface: a spec `PUT` is a full document and always carries the type it is judged against |

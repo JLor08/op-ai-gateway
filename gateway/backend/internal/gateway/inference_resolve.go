@@ -6,15 +6,17 @@ package gateway
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 )
 
 // resolveTarget is the single seam through which every inference path
-// resolves a routing target (complete, tryProxyNative, beginStream), so the
+// resolves a routing target (the translate path's complete and beginStream,
+// through resolveTranslateTarget, plus tryProxyNative and relayImages), so the
 // last-used-model marker is recorded in exactly one place rather than at each
-// of those three call sites.
+// of those call sites.
 //
 // The marker is a property of an api_tokens row (the `last_used_model` column),
 // so it is written only for a principal that HAS such a row — i.e. one with a
@@ -63,6 +65,43 @@ func (s *Server) resolveTarget(ctx context.Context, token *auth.Token, req infer
 			// is left stale on purpose, so that second resolve still retries.
 			token.LastUsedModel = req.Model
 		}
+	}
+	return target, nil
+}
+
+// resolveTranslateTarget is resolveTarget for the text translate dispatch --
+// complete and beginStream, the two functions every /v1/chat/completions
+// request goes through, and every /v1/responses or /v1/messages request that
+// tryProxyNative handed back or never saw (a body whose model the routing
+// probe could not read) -- plus the one spec-flavor refusal that dispatch
+// makes: a resolved target that serves images only (targetIsImagesOnly) is
+// refused with routing.ErrNoModelRoute. Every request reaching it is a text
+// request (images has no translate path), so the refusal needs no flavor test
+// of its own. It is deliberately not the general effective-served rule; see
+// targetIsImagesOnly for why.
+//
+// Returning the sentinel, rather than answering here, is what makes the
+// refusal indistinguishable from candidacy's own no-route answer when this
+// was the model's only route: each caller's existing resolve-failure branch
+// writes it (404 routing.no_model_route), records the usage row against
+// routing.Target{} because no upstream was called, and -- in beginStream --
+// does both before any byte of a stream is written.
+//
+// The refusal is NOT retried against another application that could serve
+// the model, the same limitation targetServesFlavor's refusals carry in
+// tryProxyNative and relayImages. And, like theirs, it comes after
+// resolveTarget, so the token's last-used-model marker already names the
+// refused model.
+func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req inference.Request) (routing.Target, error) {
+	target, err := s.resolveTarget(r.Context(), token, req)
+	if err != nil {
+		return target, err
+	}
+	if targetIsImagesOnly(target) {
+		slog.Debug("inference request rejected: resolved target serves images only",
+			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
+			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
+		return routing.Target{}, routing.ErrNoModelRoute
 	}
 	return target, nil
 }

@@ -311,6 +311,40 @@ func (m *Multiplexer) dispatchProbeModelInfo(ctx context.Context, target routing
 	return nil, nil
 }
 
+var _ SdcppCapabilitiesProber = (*Multiplexer)(nil)
+
+// ProbeSdcppCapabilities routes the stable-diffusion.cpp capability probe to
+// the provider's client (like ProbeModelInfo), falling back to the fallback
+// client. Unlike ProbeModelInfo, a provider whose client does not implement
+// SdcppCapabilitiesProber yields (SdcppVerdicts{}, ErrUnavailable): an error
+// is what tells the caller there is no verdict to write, and a zero value
+// with a nil error would read as a successful probe that found nothing.
+func (m *Multiplexer) ProbeSdcppCapabilities(ctx context.Context, target routing.Target) (SdcppVerdicts, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProbeSdcppCapabilities")
+	defer span.End()
+	res, err := m.dispatchProbeSdcppCapabilities(ctx, target)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchProbeSdcppCapabilities(ctx context.Context, target routing.Target) (SdcppVerdicts, error) {
+	if m == nil {
+		return SdcppVerdicts{}, ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if p, ok := client.(SdcppCapabilitiesProber); ok {
+			return p.ProbeSdcppCapabilities(ctx, target)
+		}
+	}
+	if p, ok := m.fallback.(SdcppCapabilitiesProber); ok {
+		return p.ProbeSdcppCapabilities(ctx, target)
+	}
+	return SdcppVerdicts{}, ErrUnavailable
+}
+
 var _ MemoryProber = (*Multiplexer)(nil)
 
 // ProbeServerMemory routes the upstream saturation probe to the provider's client

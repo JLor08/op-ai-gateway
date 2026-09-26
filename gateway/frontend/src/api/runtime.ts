@@ -103,10 +103,10 @@ export interface RuntimeSpec {
   // and that is load-bearing -- see PutRuntimeSpecRequest.
   responses_live_timings_enabled: boolean;
   // Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
-  // "tgi" | "ollama" | "custom"); "" means auto-detect from `binary` --
-  // `effective_type` below is what that resolves to. Mirrors the Go
-  // RuntimeSpecDTO.Type / routing.RuntimeSpec.Type.
-  type: '' | 'vllm' | 'llama_cpp' | 'tgi' | 'ollama' | 'custom';
+  // "tgi" | "ollama" | "stable_diffusion_cpp" | "custom"); "" means
+  // auto-detect from `binary` -- `effective_type` below is what that
+  // resolves to. Mirrors the Go RuntimeSpecDTO.Type / routing.RuntimeSpec.Type.
+  type: '' | 'vllm' | 'llama_cpp' | 'tgi' | 'ollama' | 'stable_diffusion_cpp' | 'custom';
   // metrics_path / context_probe_path are the operator's raw overrides ("" =
   // use the type's default); see `resolved_metrics_path` /
   // `resolved_context_probe_path` below for what they actually resolve to.

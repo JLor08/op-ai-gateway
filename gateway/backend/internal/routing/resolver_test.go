@@ -1542,3 +1542,95 @@ func TestAffinitySessionMode(t *testing.T) {
 		}
 	})
 }
+
+// TestNormalizeAPIFlavorSeparatesImagesFromText pins the ORDER-SENSITIVE part
+// of NormalizeAPIFlavor. The function matches by prefix, and "openai_images"
+// starts with "openai", so a naive prefix chain folds images into text and
+// silently makes every text-serving application an image candidate.
+func TestNormalizeAPIFlavorSeparatesImagesFromText(t *testing.T) {
+	for _, tc := range []struct{ fine, wantCoarse string }{
+		{"openai_images", APIFlavorOpenAIImages},
+		{"openai_chat_completions", APIFlavorOpenAI},
+		{"openai_responses", APIFlavorOpenAI},
+		{"openai", APIFlavorOpenAI},
+		{"anthropic_messages", APIFlavorAnthropic},
+		{"anthropic", APIFlavorAnthropic},
+		{"  OpenAI_Images  ", APIFlavorOpenAIImages},
+		{"something_else", "something_else"},
+	} {
+		if got := NormalizeAPIFlavor(tc.fine); got != tc.wantCoarse {
+			t.Errorf("NormalizeAPIFlavor(%q) = %q, want %q", tc.fine, got, tc.wantCoarse)
+		}
+	}
+}
+
+// flavorExclusionStore seeds two applications that differ only in their
+// flavors, each with one mapping carrying an image=yes verdict, so that
+// candidacy's flavor check is the only thing that can tell them apart: an
+// images-only application ([openai_images], the stable_diffusion_cpp shape)
+// serving "img-model", and a text application ([openai]) serving "txt-model".
+func flavorExclusionStore(t *testing.T, now time.Time) *MemoryStore {
+	t.Helper()
+	ctx := context.Background()
+	store := NewMemoryStore()
+	for _, s := range []struct {
+		id, model string
+		flavors   []string
+	}{
+		{"img", "img-model", []string{APIFlavorOpenAIImages}},
+		{"txt", "txt-model", []string{APIFlavorOpenAI}},
+	} {
+		if err := store.CreateAIServer(ctx, AIServer{ID: "srv_" + s.id, Name: s.id, Domain: s.id + ".test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		if err := store.CreateApplication(ctx, Application{ID: "app_" + s.id, ServerID: "srv_" + s.id, Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: s.flavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: ServerStatusActive, ResponsesMode: EndpointModePassthrough, MessagesMode: EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+		if err := store.CreateMapping(ctx, ModelMapping{ID: "map_" + s.id, ApplicationID: "app_" + s.id, GatewayModelName: s.model, AppModelName: s.model, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+		if err := store.UpsertMappingCapabilities(ctx, "map_"+s.id, []CapabilityRow{{Capability: CapabilityImage, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now}}); err != nil {
+			t.Fatalf("UpsertMappingCapabilities: %v", err)
+		}
+		if err := store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv_" + s.id, ReportedAt: now, LatencyMS: 100, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertTelemetry: %v", err)
+		}
+	}
+	return store
+}
+
+// TestResolverKeepsImagesAndTextFlavorsApartAtCandidacy pins the flavor
+// exclusion at candidacy, in both directions. openai_images is a coarse flavor
+// of its own: an images-only application is a candidate for an image request
+// and for no text request, and a text application is a candidate for no image
+// request, whatever its image verdict. Both mappings carry image=yes, so the
+// capability gate cannot be what refuses.
+func TestResolverKeepsImagesAndTextFlavorsApartAtCandidacy(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	resolver := NewResolver(flavorExclusionStore(t, now), func() time.Time { return now }, nil)
+	token := auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true}
+	imageRequest := func(model string) inference.Request {
+		return inference.Request{Model: model, APIFlavor: "openai_images", RequiredCapabilities: []string{CapabilityImage}}
+	}
+
+	target, err := resolver.Resolve(ctx, token, imageRequest("img-model"))
+	if err != nil {
+		t.Fatalf("images request for the images-only application: %v, want it resolved", err)
+	}
+	if target.ServerID != "srv_img" {
+		t.Fatalf("target.ServerID = %q, want srv_img", target.ServerID)
+	}
+	for _, fine := range []string{"openai_chat_completions", "openai_responses"} {
+		if _, err := resolver.Resolve(ctx, token, inference.Request{Model: "img-model", APIFlavor: fine}); !errors.Is(err, ErrNoModelRoute) {
+			t.Errorf("%s request for the images-only application: error = %v, want ErrNoModelRoute", fine, err)
+		}
+	}
+
+	if _, err := resolver.Resolve(ctx, token, inference.Request{Model: "txt-model", APIFlavor: "openai_chat_completions"}); err != nil {
+		t.Fatalf("chat request for the text application: %v, want it resolved", err)
+	}
+	if _, err := resolver.Resolve(ctx, token, imageRequest("txt-model")); !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("images request for the text application: error = %v, want ErrNoModelRoute", err)
+	}
+}

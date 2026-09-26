@@ -92,7 +92,12 @@ func (w *modelWarmer) warmOnce(name string) {
 	defer cancel()
 
 	// Resolve candidates for the model. ActiveMappingsForModel filters by API flavor, so try
-	// each known flavor and take the first that yields a candidate (the load is flavor-agnostic).
+	// the two TEXT flavors and take the first that yields a candidate. openai_images is left
+	// out on purpose: the warm call below is a chat prompt, which a model that only generates
+	// images cannot answer, so an application declaring only openai_images is never asked.
+	// Candidacy judges a server_agent application by its own flavors, though, so a child
+	// whose runtime spec lists only openai_images can still arrive here under a parent that
+	// declares openai; textCandidates drops it by its effective flavors.
 	var cands []routing.MappingCandidate
 	for _, flavor := range []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic} {
 		got, err := s.Routes.ActiveMappingsForModel(ctx, name, flavor)
@@ -105,8 +110,9 @@ func (w *modelWarmer) warmOnce(name string) {
 			break
 		}
 	}
+	cands = w.textCandidates(ctx, cands)
 	if len(cands) == 0 {
-		return // nothing to warm (not a real model, or no active mapping)
+		return // nothing to warm (not a real model, no active mapping, or images only)
 	}
 	cand := w.pickCandidate(cands)
 	// The one benchmarkTarget built WITHOUT Server.benchmarkTargetFor: the
@@ -143,6 +149,25 @@ func (w *modelWarmer) warmOnce(name string) {
 	if _, _, err := s.streamOnce(ctx, streamer, target, req); err != nil {
 		slog.Debug("model warm: load stream failed", "model", name, "err", err)
 	}
+}
+
+// textCandidates drops the candidates that serve only images (Server.mappingIsImagesOnly),
+// keeping the order. A candidate whose spec cannot be read is dropped too: the warm is a
+// best-effort load-ahead, and a chat prompt to a child that may serve only images is the
+// one thing it must not send.
+func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.MappingCandidate) []routing.MappingCandidate {
+	out := cands[:0:0]
+	for _, c := range cands {
+		imagesOnly, err := w.srv.mappingIsImagesOnly(ctx, c.Application, c.Mapping.ID)
+		if err != nil {
+			slog.Debug("model warm: runtime spec read failed", "mapping_id", c.Mapping.ID, "err", err)
+			continue
+		}
+		if !imagesOnly {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // pickCandidate returns the first candidate whose application is currently reachable, else the

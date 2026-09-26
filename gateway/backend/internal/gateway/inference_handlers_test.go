@@ -16,19 +16,21 @@ import (
 // fakeOfferingPortal is a minimal portal.API stand-in (embeds a nil interface,
 // per the established internal/gateway test pattern — see
 // server_override_test.go) that serves one fixed ModelOffering. It also COUNTS
-// calls and records the flavor it was asked for, so the no-extra-work
-// invariant (a token without the redirect must never trigger the offering
-// lookup) is directly provable rather than inferred.
+// calls and records the flavor and the required capabilities it was asked
+// for, so the no-extra-work invariant (a token without the redirect must never
+// trigger the offering lookup) is directly provable rather than inferred.
 type fakeOfferingPortal struct {
 	portal.API
-	off    portal.ModelOffering
-	calls  int
-	flavor string
+	off      portal.ModelOffering
+	calls    int
+	flavor   string
+	required []string
 }
 
-func (f *fakeOfferingPortal) ModelOfferingFor(_ context.Context, _ auth.Token, flavor string) portal.ModelOffering {
+func (f *fakeOfferingPortal) ModelOfferingFor(_ context.Context, _ auth.Token, flavor string, required []string) portal.ModelOffering {
 	f.calls++
 	f.flavor = flavor
+	f.required = required
 	return f.off
 }
 
@@ -242,5 +244,30 @@ func TestPreflightRedirectSurvivesAServerWithoutAPortal(t *testing.T) {
 	}
 	if pf.Req.Model != "totally-unknown" {
 		t.Fatalf("effective model = %q, want the untouched totally-unknown", pf.Req.Model)
+	}
+}
+
+// TestPreflightRedirectsACapabilityCarryingRequestOnlyToACapableCandidate
+// proves the preflight hands the request's required capabilities to the
+// offering and takes only a candidate that carries them. The last-used model
+// here is callable for the images flavor but lacks the image capability, so
+// the fallback is taken instead.
+func TestPreflightRedirectsACapabilityCarryingRequestOnlyToACapableCandidate(t *testing.T) {
+	fp := &fakeOfferingPortal{off: offeringWithIncapable([]string{"image-model"}, []string{"text-model"})}
+	s := &Server{Portal: fp}
+	token := auth.Token{UnknownModelRedirect: true, LastUsedModel: "text-model", UnknownModelFallback: "image-model"}
+	pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil,
+		inferenceShape{model: "totally-unknown", apiFlavor: apiFlavorImages, endpoint: endpointImages, requiredCapabilities: []string{routing.CapabilityImage}})
+	if handled {
+		t.Fatal("preflight refused the request")
+	}
+	if pf.Req.Model != "image-model" {
+		t.Fatalf("effective model = %q, want image-model (text-model lacks the capability)", pf.Req.Model)
+	}
+	if fp.flavor != routing.APIFlavorOpenAIImages {
+		t.Fatalf("offering asked for flavor %q, want %q", fp.flavor, routing.APIFlavorOpenAIImages)
+	}
+	if len(fp.required) != 1 || fp.required[0] != routing.CapabilityImage {
+		t.Fatalf("offering asked for capabilities %v, want [%s]", fp.required, routing.CapabilityImage)
 	}
 }

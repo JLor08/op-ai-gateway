@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1107,4 +1108,142 @@ func TestCompleteStreamMemoizesTheRejectionPerMapping(t *testing.T) {
 // tests above stream.
 func streamTestRequest() inference.Request {
 	return inference.Request{Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}}}
+}
+
+// sdcppModelsBody is the real /sdapi/v1/sd-models body measured from a
+// stable-diffusion.cpp server.
+const sdcppModelsBody = `[{"config":null,"filename":"flux1-dev.safetensors","hash":"8888888888","model_name":"flux1-dev","sha256":"88","title":"flux1-dev"}]`
+
+// TestListModelsDiscoversStableDiffusionCppFromSdModels pins that discovery
+// for this type reads /sdapi/v1/sd-models, derived from the TYPE alone. The
+// upstream answers /v1/models too, with the placeholder a real sd-server
+// reports there, so a client asking the wrong endpoint still gets a
+// well-formed answer -- just the wrong name. Only the path assertion can tell.
+func TestListModelsDiscoversStableDiffusionCppFromSdModels(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"sd-cpp-local"}]}`))
+		case "/sdapi/v1/sd-models":
+			_, _ = w.Write([]byte(sdcppModelsBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{
+		Provider: routing.ProviderStableDiffusionCpp,
+		Endpoint: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("ListModels error = %v", err)
+	}
+	if !slices.Equal(got, []string{"flux1-dev"}) {
+		t.Fatalf("ListModels = %v, want [flux1-dev]", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(paths, []string{"/sdapi/v1/sd-models"}) {
+		t.Fatalf("requested %v, want exactly [/sdapi/v1/sd-models]", paths)
+	}
+}
+
+// TestListModelsKeepsV1ModelsForEveryOtherType is the regression guard for
+// every type that existed before stable_diffusion_cpp, plus the empty
+// provider: discovery is derived from the type, so each must still ask
+// /v1/models and read the OpenAI shape.
+func TestListModelsKeepsV1ModelsForEveryOtherType(t *testing.T) {
+	for _, typ := range []string{routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, ""} {
+		t.Run("type="+typ, func(t *testing.T) {
+			var mu sync.Mutex
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				gotPath = r.URL.Path
+				mu.Unlock()
+				_, _ = w.Write([]byte(`{"data":[{"id":"qwen-coder"}]}`))
+			}))
+			defer srv.Close()
+
+			got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: typ, Endpoint: srv.URL})
+			if err != nil {
+				t.Fatalf("ListModels error = %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if gotPath != "/v1/models" || !slices.Equal(got, []string{"qwen-coder"}) {
+				t.Fatalf("path = %q models = %v, want /v1/models [qwen-coder]", gotPath, got)
+			}
+		})
+	}
+}
+
+// TestListModelsStableDiffusionCppFailsClosed pins the contract
+// reconcileApplicationModels documents: a listing discovery cannot read must
+// be an ERROR, never an empty list, because an empty list tells reconcile the
+// upstream serves nothing and it disables every mapping. The loaded probe's
+// parser is deliberately tolerant the other way; discovery must not inherit
+// that.
+func TestListModelsStableDiffusionCppFailsClosed(t *testing.T) {
+	serve := func(t *testing.T, body string) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	for name, body := range map[string]string{
+		"html error page":            `<html><body>502 Bad Gateway</body></html>`,
+		"object instead of list":     `{"models":[]}`,
+		"entries without model_name": `[{"filename":"flux1-dev.safetensors"}]`,
+		"null instead of list":       `null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := serve(t, body)
+			got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: routing.ProviderStableDiffusionCpp, Endpoint: srv.URL})
+			if !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("ListModels = %v, %v; want ErrInvalidResponse", got, err)
+			}
+		})
+	}
+
+	// A genuinely empty list is not malformed: a server with no model loaded
+	// says exactly that, and reconcile should hear it.
+	t.Run("empty list is an answer", func(t *testing.T) {
+		srv := serve(t, `[]`)
+		got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: routing.ProviderStableDiffusionCpp, Endpoint: srv.URL})
+		if err != nil || len(got) != 0 {
+			t.Fatalf("ListModels = %v, %v; want [], nil", got, err)
+		}
+	})
+}
+
+// TestSdcppDiscoveryAndLoadedProbeAgree pins the invariant that makes both
+// read the same endpoint: a mapping counts as loaded only when the loaded
+// probe lists the very name discovery created it under. The padded name is
+// the case where a trim in one reader and not the other would silently break
+// it.
+func TestSdcppDiscoveryAndLoadedProbeAgree(t *testing.T) {
+	for _, body := range []string{sdcppModelsBody, `[{"model_name":"  flux1-dev  "}]`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		discovered, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: routing.ProviderStableDiffusionCpp, Endpoint: srv.URL})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("ListModels(%s) error = %v", body, err)
+		}
+		loaded := parseLoadedModels([]byte(body), "sdcpp_models")
+		if !slices.Equal(discovered, loaded) || !slices.Equal(loaded, []string{"flux1-dev"}) {
+			t.Fatalf("body %s: discovery %v, loaded probe %v; want both [flux1-dev]", body, discovered, loaded)
+		}
+	}
 }

@@ -5,7 +5,10 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/routing"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 )
@@ -256,5 +259,124 @@ func TestTriggerScheduledBenchmarkIdleGateDefers(t *testing.T) {
 	}
 	if srv.Benchmarks.ServerBusy(server.ID) {
 		t.Fatalf("ServerBusy = true after idle-gate defer, want false (reservation released)")
+	}
+}
+
+// schedFlavorFixture seeds a server with two applications for the images-only
+// skip:
+//
+//   - app-sd, an external stable-diffusion.cpp application whose flavors are
+//     [openai_images] alone, with one mapping (sd-ext);
+//   - app-agent, a server_agent application declaring both a text flavor and
+//     openai_images, with four children: agent-text (spec [openai]),
+//     agent-sd (spec [openai_images]), agent-nospec (no spec: the
+//     application's flavors stand) and agent-legacy (a spec stored as []).
+//
+// It returns the server and both applications.
+func schedFlavorFixture(t *testing.T, mem *routing.MemoryStore) (routing.AIServer, routing.Application, routing.Application) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	server := routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
+	if err := mem.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	sdApp := routing.Application{ID: "app-sd", ServerID: "srv1", Type: routing.ProviderStableDiffusionCpp, Port: 7860, Scheme: "http", TimeoutMS: 600000, APIFlavors: []string{routing.APIFlavorOpenAIImages}, Status: routing.ServerStatusActive, BenchmarkScheduleEnabled: true, CreatedAt: now, UpdatedAt: now}
+	agentApp := routing.Application{ID: "app-agent", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", TimeoutMS: 600000, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Status: routing.ServerStatusActive, BenchmarkScheduleEnabled: true, CreatedAt: now, UpdatedAt: now}
+	for _, app := range []routing.Application{sdApp, agentApp} {
+		if err := mem.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("CreateApplication %s: %v", app.ID, err)
+		}
+	}
+	mapping := func(appID, name string) {
+		t.Helper()
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map-" + name, ApplicationID: appID, GatewayModelName: name, AppModelName: name, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", name, err)
+		}
+	}
+	spec := func(name string, flavors []string) {
+		t.Helper()
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-" + name, MappingID: "map-" + name, Binary: "/opt/bin/server", Args: "[]", Env: "{}", APIFlavors: flavors, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", name, err)
+		}
+	}
+	mapping("app-sd", "sd-ext")
+	for _, name := range []string{"agent-text", "agent-sd", "agent-nospec", "agent-legacy"} {
+		mapping("app-agent", name)
+	}
+	spec("agent-text", []string{routing.APIFlavorOpenAI})
+	spec("agent-sd", []string{routing.APIFlavorOpenAIImages})
+	spec("agent-legacy", []string{})
+	return server, sdApp, agentApp
+}
+
+// A scheduled benchmark sends a chat prompt, which a mapping that serves only
+// images cannot answer: every scheduled run of it would fail. Such a mapping
+// is skipped, judged by its EFFECTIVE flavors with the resolver's precedence
+// (a server_agent child's spec wins, even an empty one; without a spec the
+// application's flavors stand), and every text-capable mapping beside it is
+// still benchmarked. An external stable-diffusion.cpp application has nothing
+// to benchmark at all, so no run is reserved for it.
+func TestTriggerScheduledBenchmarkSkipsImagesOnlyMappings(t *testing.T) {
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	server, sdApp, agentApp := schedFlavorFixture(t, mem)
+	prov := newColdLister(nil)
+	srv := &Server{Provider: prov, Routes: mem, Benchmarks: NewBenchmarkRegistry(), Active: newActiveRegistry(nil)}
+
+	if got := srv.TriggerScheduledBenchmark(ctx, server, sdApp); !got {
+		t.Fatalf("images-only application: TriggerScheduledBenchmark = false, want true (nothing to do)")
+	}
+	if srv.Benchmarks.ServerBusy(server.ID) {
+		t.Fatalf("images-only application: ServerBusy = true, want false (no run reserved)")
+	}
+	if got := prov.streamedModels(); len(got) != 0 {
+		t.Fatalf("images-only application: streamed %v, want no chat prompt at all", got)
+	}
+
+	if got := srv.TriggerScheduledBenchmark(ctx, server, agentApp); !got {
+		t.Fatalf("agent application: TriggerScheduledBenchmark = false, want true (a run should be launched)")
+	}
+	waitFor(t, func() bool { return !srv.Benchmarks.Status(server.ID).Running })
+	status := srv.Benchmarks.Status(server.ID)
+	var benchmarked []string
+	for _, res := range status.Results {
+		benchmarked = append(benchmarked, res.GatewayModelName)
+	}
+	sort.Strings(benchmarked)
+	if want := []string{"agent-legacy", "agent-nospec", "agent-text"}; !reflect.DeepEqual(benchmarked, want) {
+		t.Fatalf("benchmarked mappings = %v, want %v (agent-sd serves images only)", benchmarked, want)
+	}
+	for _, model := range prov.streamedModels() {
+		if model == "agent-sd" {
+			t.Fatalf("streamed a chat prompt to agent-sd, an images-only child: %v", prov.streamedModels())
+		}
+	}
+}
+
+// specReadFailingStore fails every runtime-spec read by mapping.
+type specReadFailingStore struct {
+	*routing.MemoryStore
+}
+
+func (specReadFailingStore) RuntimeSpecByMapping(context.Context, string) (routing.RuntimeSpec, bool, error) {
+	return routing.RuntimeSpec{}, false, errors.New("spec read down")
+}
+
+// A server_agent child whose spec cannot be read is skipped for this pass,
+// not benchmarked as though the application's flavors stood: the spec may
+// narrow it to images only. An ordinary application reads no spec, so its
+// mappings are benchmarked as before.
+func TestTriggerScheduledBenchmarkSkipsAMappingWhoseSpecReadFails(t *testing.T) {
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	server, _, agentApp := schedFlavorFixture(t, mem)
+	srv := &Server{Provider: newColdLister(nil), Routes: specReadFailingStore{mem}, Benchmarks: NewBenchmarkRegistry(), Active: newActiveRegistry(nil)}
+
+	if got := srv.TriggerScheduledBenchmark(ctx, server, agentApp); !got {
+		t.Fatalf("TriggerScheduledBenchmark = false, want true (nothing to do)")
+	}
+	if srv.Benchmarks.ServerBusy(server.ID) {
+		t.Fatalf("ServerBusy = true, want false: no child could be classified, so no run is reserved")
 	}
 }

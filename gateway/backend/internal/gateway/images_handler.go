@@ -22,12 +22,13 @@ import (
 	"time"
 )
 
-// apiFlavorImages is the images endpoint's flavor string. It folds to the coarse
-// "openai" through NormalizeAPIFlavor like every other openai* value (ADR-042),
-// which is exactly why it cannot carry the capability gate on its own -- the
-// gate keys on inference.Request.RequiredCapabilities instead. It exists for
-// labelling (usage rows, upstreamPath) and for its own sessionEndpoint case,
-// never for filtering.
+// apiFlavorImages is the images endpoint's flavor string. NormalizeAPIFlavor
+// folds it to itself, the coarse routing.APIFlavorOpenAIImages, so it DOES
+// filter: candidacy admits only an application that declares that flavor, the
+// relay's own targetServesFlavor check holds an agent-launched child's spec to
+// it, and it labels usage rows, upstreamPath and its own sessionEndpoint case.
+// What it cannot express is whether a MODEL generates images -- that is the
+// capability gate's job, keyed on inference.Request.RequiredCapabilities.
 const apiFlavorImages = "openai_images"
 
 // billingUnitFor returns usage.BillingUnitImage when apiFlavor identifies an
@@ -450,6 +451,46 @@ func validateImagesRequest(raw []byte, model string) error {
 	return nil
 }
 
+// recordImagesRoutingFailure writes the client-facing error response for a
+// terminal images routing failure and records its usage row, so relayImages'
+// two refusal sites -- an outright resolveTarget failure, and the post-resolve
+// effective-flavor conjunct -- cannot drift in what they bill or capture. It
+// is the extraction of what used to be relayImages' own resolve-failure
+// branch, VERBATIM: the row is recorded against routing.Target{} for BOTH
+// callers, exactly as the pre-extraction code already did for the resolve
+// failure it originally covered. This is deliberate, not an oversight -- there
+// is deliberately no target parameter here: neither caller ever reached
+// proxyNative (that is the whole point of both refusals), so no upstream call
+// was made either way, and a populated Host/RouteID/ProviderPath would claim
+// one that never happened. upstreamPath's own doc comment reserves "" for
+// exactly this case, and a non-empty Host would additionally make the energy
+// reconciler price this row and count it as a sibling in that server's
+// window -- for a call sd-server never received.
+func (s *Server) recordImagesRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, err error) {
+	id := nextRequestID()
+	capturing := s.capturingEnabled(token)
+	status := completionHTTPStatus(err)
+	code := completionErrorCode(err)
+	// Warn for an admission-queue rejection, mirroring tryProxyNative's own
+	// severity split for the same error pair; Debug for every other routing
+	// failure (no route, no healthy host, not capable), which is the
+	// ordinary, expected shape of this gate doing its job.
+	if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
+		slog.Warn("images request admission rejected", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status)
+	} else {
+		slog.Debug("images request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
+	}
+	body := writeCompletionErrorCaptured(w, err)
+	// BillingUnit is set here unconditionally (not via billingUnitFor):
+	// relayImages is an images-only function, so req.APIFlavor is always
+	// apiFlavorImages -- the unit is endpoint identity, set on EVERY
+	// recordUsage call this path makes, success and failure alike (see
+	// usageMeta's own doc comment). BillingQuantity is left at its zero
+	// value: nothing was produced by a routing failure. Target is always
+	// routing.Target{} -- see the doc comment above for why.
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
+}
+
 // relayImages resolves the routing target for an already-gated images request
 // and relays it via proxyNative. It follows tryProxyNative's resolve-then-relay
 // shape, minus the translate fallback: images has none, so unlike
@@ -462,27 +503,31 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 	start := time.Now()
 	target, err := s.resolveTarget(r.Context(), &token, req)
 	if err != nil {
-		id := nextRequestID()
-		capturing := s.capturingEnabled(token)
-		status := completionHTTPStatus(err)
-		code := completionErrorCode(err)
-		// Warn for an admission-queue rejection, mirroring tryProxyNative's own
-		// severity split for the same error pair; Debug for every other routing
-		// failure (no route, no healthy host, not capable), which is the
-		// ordinary, expected shape of this gate doing its job.
-		if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
-			slog.Warn("images request admission rejected", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status)
-		} else {
-			slog.Debug("images request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
-		}
-		body := writeCompletionErrorCaptured(w, err)
-		// BillingUnit is set here unconditionally (not via billingUnitFor):
-		// relayImages is an images-only function, so req.APIFlavor is always
-		// apiFlavorImages -- the unit is endpoint identity, set on EVERY
-		// recordUsage call this path makes, success and failure alike (see
-		// usageMeta's own doc comment). BillingQuantity is left at its zero
-		// value: nothing was produced by a resolve failure.
-		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
+		s.recordImagesRoutingFailure(w, r, token, req, raw, start, err)
+		return
+	}
+	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈
+	// APIFlavors AND the endpoint is not disabled. For a server_agent mapping
+	// the resolved runtime spec -- not the application -- is the authority for
+	// its model's flavors (targetFrom), and candidacy deliberately gated that
+	// app type on its coarser app-level flavors only. tryProxyNative enforces
+	// this for the coding-agent endpoints; relayImages reaches proxyNative
+	// directly, so without this an agent-managed child whose spec lists only
+	// text would still serve an image request.
+	if !targetServesFlavor(target, req.APIFlavor) {
+		// The refusal looks like candidacy's own no-route answer WHEN THIS WAS
+		// THE ONLY ROUTE for the model: same code, same status. It is NOT
+		// retried against a sibling application that might still serve the
+		// request -- the same limitation tryProxyNative's own equivalent check
+		// carries for the coding-agent endpoints (native_passthrough.go) -- so
+		// a model resolvable through more than one application can still be
+		// wrongly refused here if the candidate this resolve picked has a
+		// narrowing spec, even though another candidate would have served it.
+		// Tracked as a follow-up, out of scope for this check.
+		slog.Debug("images request rejected: resolved target's effective flavors exclude images",
+			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
+			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
+		s.recordImagesRoutingFailure(w, r, token, req, raw, start, routing.ErrNoModelRoute)
 		return
 	}
 	s.proxyNative(w, r, nativeRelay{

@@ -272,8 +272,17 @@ func seedPinnedAffinity(t *testing.T, mem *MemoryStore, key AffinityKey, appID, 
 // never joins the capability table, so it gates off its own keyed read. The
 // refusal is NON-DESTRUCTIVE: it falls through to the fresh-candidate path and
 // leaves the pin intact. Every other rejection in that function deletes the row,
-// and that would be wrong here -- AffinityKey.APIFlavor is coarse, so deleting
-// would destroy the pin of a chat client sharing that key.
+// and that would be wrong here -- AffinityKey.APIFlavor is coarse, so under a key
+// a capability-carrying request shares with a text endpoint, deleting would
+// destroy that endpoint's working pin.
+//
+// The pin is seeded under the images request's OWN key (coarse flavor
+// openai_images), because that is the only key Resolve looks up for it: a pin
+// under the chat key would never be found, and the test would pass without the
+// gate running at all. The resolver writes no such pin itself (see
+// TestImageResolveWritesNoAffinityPin), so the seed stands in for one that
+// exists anyway -- the gate is defence in depth for images, and the shared-key
+// case it was built for is a future capability-carrying endpoint's.
 func TestAffinityRefusesIncapableMappingWithoutDeletingThePin(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
@@ -284,7 +293,7 @@ func TestAffinityRefusesIncapableMappingWithoutDeletingThePin(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed map_b: %v", err)
 	}
-	key := AffinityKey{APITokenID: "tok_1", Model: "coder-a", APIFlavor: APIFlavorOpenAI, SessionID: "sess_1"}
+	key := AffinityKey{APITokenID: "tok_1", Model: "coder-a", APIFlavor: APIFlavorOpenAIImages, SessionID: "sess_1"}
 	seedPinnedAffinity(t, mem, key, "app_a", "srv_a", now)
 	store := &affinityGateStore{resolverStore: mem}
 	r := NewResolver(store, func() time.Time { return now }, nil)
@@ -355,9 +364,11 @@ func TestAffinityRefusesOnCapabilityReadError(t *testing.T) {
 	}
 }
 
-// The leak a read-side gate cannot fix: the affinity key is coarse, so an image
-// resolve writing a pin would repoint the chat client sharing that key at an
-// image server.
+// The leak a read-side gate cannot fix, for a request whose coarse flavor a text
+// endpoint shares: a pin it wrote would repoint that endpoint's client. An image
+// key is its own (openai_images) and cannot collide with a chat client's, so for
+// images the capability guard is what keeps them pin-free -- and it is keyed on
+// the capability list, so a future endpoint that DOES share a key inherits it.
 func TestImageResolveWritesNoAffinityPin(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
@@ -376,7 +387,7 @@ func TestImageResolveWritesNoAffinityPin(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if store.upserts != 0 {
-		t.Fatalf("affinity writes = %d, want 0: an image resolve must not pin under the coarse key", store.upserts)
+		t.Fatalf("affinity writes = %d, want 0: a capability-carrying resolve must not pin", store.upserts)
 	}
 }
 

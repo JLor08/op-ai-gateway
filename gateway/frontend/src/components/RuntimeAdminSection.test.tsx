@@ -910,6 +910,79 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     expect(created).toHaveLength(1);
   });
 
+  // The launch spec's own flavor authority must be able to carry
+  // openai_images too: the images relay refuses an agent-launched child whose
+  // spec does not declare it, whatever its parent application declares.
+  it('sends openai_images in the spec PUT body once its checkbox is ticked', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const images = screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages });
+    // Opt-in: the parent application does not declare it, so it starts unticked.
+    expect(images).not.toBeChecked();
+    fireEvent.click(images);
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd-server/sd-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic', 'openai_images']);
+  });
+
+  // openai_images is opt-in on the spec too. A server_agent parent declares
+  // it for its image children, and copying it into every new spec would make
+  // each new text model's spec admit image requests by default.
+  it('does not carry the parent application openai_images into a new spec', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic', 'openai_images'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(
+      screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
+    ).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+  });
+
+  // The opt-in exclusion above assumes a parent that ALSO offers a text
+  // flavor, so the operator has something left to tick for a fresh text
+  // model. Under a parent whose flavors are EXACTLY [openai_images] that
+  // assumption fails: dropping it would open a new spec with every flavor
+  // unticked, and an untouched save on that state sends [] -- which the
+  // backend stores as [openai, anthropic], not narrower. The child then
+  // serves nothing an operator can reach (not a text candidate, and the
+  // images relay refuses a spec without openai_images), with no warning.
+  // Inherit openai_images as-is when the parent has no text flavor to fall
+  // back to.
+  it('inherits openai_images into a new spec when the parent application is images-only', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai_images'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd-server/sd-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+  });
+
   it('defaults visible_devices_mode to env in the spec PUT body', async () => {
     const { putSpecs } = renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -1152,6 +1225,29 @@ describe('RuntimeAdminSection edit + delete', () => {
     expect(screen.getByRole('combobox', { name: t.applicationMessagesMode })).toHaveTextContent(
       t.applicationModePassthrough,
     );
+  });
+
+  it('shows a stored spec openai_images as ticked, and unticking it removes it from the PUT', async () => {
+    const spec = makeSpec({
+      configured: true,
+      mapping_id: 'map_1',
+      binary: '/opt/sd-server/sd-server',
+      api_flavors: ['openai', 'openai_images'],
+    });
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+    });
+
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    const images = await screen.findByRole('checkbox', { name: t.applicationFlavorOpenaiImages });
+    expect(images).toBeChecked();
+
+    fireEvent.click(images);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
   });
 });
 
@@ -1396,10 +1492,49 @@ describe('RuntimeAdminSection arguments field contract (hint + warnings)', () =>
     expect(warning.textContent).toContain('50395');
   });
 
+  // The flag and its value squeezed onto one line, in every separator the
+  // pattern accepts -- "=", "=" padded with spaces, and plain whitespace.
+  it.each([
+    '--port=50395',
+    '--port 50395',
+    '--port = 50395',
+    '--listen-port=7860',
+    '--listen-port 7860',
+  ])('warns about a hard-coded port written inline as %s', async (arg) => {
+    renderSection();
+    await openCreateForm();
+    setArgs(arg);
+
+    const warning = await screen.findByText(t.runtimeSpecArgsHardcodedPort, { exact: false });
+    expect(warning.textContent).toContain(arg.replace(/\D+/g, ' ').trim().split(' ').pop());
+  });
+
   it('does NOT warn when the port argument is ${PORT}', async () => {
     renderSection();
     await openCreateForm();
     setArgs('--port\n${PORT}');
+
+    expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
+  });
+
+  // sd-server's listen flag is --listen-port, not
+  // --port (it has no bare --port at all) -- the very flag this type's own
+  // argument example teaches. Missing it here would mean a hardcoded
+  // "--listen-port 7860" gets no warning, and the result is the same
+  // health-check-fails-forever kill this whole feature exists to prevent.
+  it("warns about a hard-coded --listen-port (sd-server's own listen flag)", async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--listen-port\n7860');
+
+    const warning = await screen.findByText(t.runtimeSpecArgsHardcodedPort, { exact: false });
+    expect(warning.textContent).toContain('7860');
+  });
+
+  it('does NOT warn when --listen-port is ${PORT}', async () => {
+    renderSection();
+    await openCreateForm();
+    setArgs('--listen-port\n${PORT}');
 
     expect(screen.queryByText(t.runtimeSpecArgsHardcodedPort, { exact: false })).toBeNull();
   });
@@ -6315,6 +6450,368 @@ describe('RuntimeAdminSection RuntimeSpec Type + probe-path overrides', () => {
     expect(putSpecs[0].body.type).toBe('llama_cpp');
     expect(putSpecs[0].body.metrics_path).toBe('/custom-metrics');
     expect(putSpecs[0].body.context_probe_path).toBe('/custom-props');
+  });
+});
+
+// sd-server answers GET /health with 404 (measured), and the agent kills a
+// child whose health path keeps failing, so selecting the type must move an
+// UNTOUCHED health path to the type's default -- and must leave an edited
+// one alone, the same preservation rule the application form applies on a
+// type switch.
+describe('RuntimeAdminSection stable_diffusion_cpp health path + args example', () => {
+  it('moves an untouched health path to /v1/models when stable_diffusion_cpp is selected', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/sd-server' },
+    });
+
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    // The DISPLAYED value is /v1/models (asserted above), but on CREATE an
+    // untouched default is sent as '' so the backend's own per-EFFECTIVE-type
+    // default decides -- which resolves to the
+    // same /v1/models here, since the type is explicit rather than detected.
+    expect(putSpecs[0].body.health_path).toBe('');
+    expect(putSpecs[0].body.type).toBe('stable_diffusion_cpp');
+  });
+
+  it('keeps an edited health path when stable_diffusion_cpp is selected', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
+      target: { value: '/ready' },
+    });
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/ready',
+    );
+  });
+
+  it('moves the health path back to /health when switching away from stable_diffusion_cpp untouched', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+  });
+
+  // Auto has no known default: the form cannot detect the kind from `binary`,
+  // so the '/health' it shows under Auto is a guess. Moving a real default
+  // onto that guess would, on an EDIT, save '/health' over a stored
+  // '/v1/models' and get an sd-server child killed by its own health check.
+  it('keeps /v1/models when an sd spec is switched to Auto on edit, and saves it', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/opt/sd/sd-server',
+          type: 'stable_diffusion_cpp',
+          health_path: '/v1/models',
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeAuto }));
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('');
+    expect(putSpecs[0].body.health_path).toBe('/v1/models');
+  });
+
+  // An empty field is sent empty and the backend's effective-type default
+  // decides, so the placeholder may name only a default this form knows:
+  // an explicit type's, and nothing under Auto.
+  it("shows the explicit type's default as the placeholder, and none under Auto", async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const healthPathField = () => screen.getByLabelText(t.runtimeSpecHealthPath);
+    expect(healthPathField()).not.toHaveAttribute('placeholder');
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+    expect(healthPathField()).toHaveAttribute('placeholder', '/v1/models');
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    expect(healthPathField()).toHaveAttribute('placeholder', '/health');
+  });
+
+  // The note is the type select's OWN helperText
+  // (wired the way every other SelectField/Field helperText in this form
+  // is), not a free-floating Typography -- so it must appear and disappear
+  // together with the select itself picking up/losing an
+  // aria-describedby, and it must be gone entirely for an incapable type,
+  // not just unstyled.
+  it('shows the sd-server note for stable_diffusion_cpp and not for llama_cpp', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(screen.queryByText(t.runtimeSpecTypeStableDiffusionCppNote)).not.toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+    expect(screen.getByText(t.runtimeSpecTypeStableDiffusionCppNote)).toBeInTheDocument();
+    const typeCombo = screen.getByRole('combobox', { name: t.runtimeSpecType });
+    const helperTextId = typeCombo.getAttribute('aria-describedby');
+    expect(helperTextId).toBeTruthy();
+    expect(document.getElementById(helperTextId as string)?.textContent).toBe(
+      t.runtimeSpecTypeStableDiffusionCppNote,
+    );
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+    expect(screen.queryByText(t.runtimeSpecTypeStableDiffusionCppNote)).not.toBeInTheDocument();
+  });
+
+  // The examples are multi-line by nature, and testing-library's default
+  // normalizer collapses whitespace -- compare the text node verbatim
+  // instead (mirrors the arguments-field-contract describe block above).
+  const verbatim = { normalizer: (s: string) => s };
+
+  it('shows the sd-server argument example when stable_diffusion_cpp is selected', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+
+    expect(screen.getByText(t.runtimeSpecArgsExample, verbatim)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecArgsExampleSdcpp, verbatim)).not.toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+
+    expect(screen.getByText(t.runtimeSpecArgsExampleSdcpp, verbatim)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecArgsExample, verbatim)).not.toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
+
+    expect(screen.getByText(t.runtimeSpecArgsExample, verbatim)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecArgsExampleSdcpp, verbatim)).not.toBeInTheDocument();
+  });
+});
+
+// On a spec's FIRST write -- a create, or an edit of a mapping that has no
+// spec yet (configured: false) -- an UNTOUCHED health path must not be sent
+// as the literal displayed text: the field's own default is a guess this
+// form makes from the WRITABLE Type select alone, and under Auto that guess
+// is always '/health', which is wrong (and lethal: the agent kills a child
+// whose health path keeps 404ing) for a spec that will auto-detect to
+// stable_diffusion_cpp from its binary. Sending '' instead lets the
+// backend's OWN default -- keyed on the spec's EFFECTIVE type, resolved
+// server-side -- decide. A later edit of a stored spec must still send the
+// field as-is: a stored explicit value must never be silently re-derived
+// away from what the form displays.
+describe('RuntimeAdminSection health path create/edit submission', () => {
+  it('sends health_path "" on create when Type is Auto, the binary is an sd-server, and the field is untouched', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    // Type stays at Auto; the health path field is never touched.
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('');
+    expect(putSpecs[0].body.health_path).toBe('');
+  });
+
+  it('sends the typed value on create when the health path was edited', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
+      target: { value: '/ready' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.health_path).toBe('/ready');
+  });
+
+  // Edit is offered on every row, "Delete spec" keeps the mapping, and a
+  // failed create leaves a mapping without a spec for the operator to retry
+  // through Edit. There the field shows the form's own fallback, not a stored
+  // value, so this save is a first write like a create.
+  it('sends health_path "" on a first write through EDIT (no spec yet) when Type is Auto, the binary is an sd-server, and the field is untouched', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('');
+    expect(putSpecs[0].body.health_path).toBe('');
+  });
+
+  it('sends the typed value on a first write through EDIT when the health path was edited', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
+      target: { value: '/ready' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.health_path).toBe('/ready');
+  });
+
+  it('sends the stored value as-is on an EDIT of a stored spec, never re-deriving it', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          health_path: '/health',
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.health_path).toBe('/health');
+  });
+
+  // "Untouched" must mean the operator never TYPED into the field, not that
+  // it happens to equal a displayed default -- a type switch moves the field
+  // programmatically too (F2's own preservation rule), and comparing by
+  // equality confuses that move with a real edit. Here Auto's default
+  // ('/health') and the field's actual content ('/v1/models', left in place
+  // by the switch back to Auto per F2) simply differ, so the old
+  // equality-based rule would send '/v1/models' verbatim on a first write --
+  // the exact path this binary may not answer under whatever Auto detects it
+  // to.
+  it('sends health_path "" on create after picking an explicit type and switching back to Auto, untouched', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeAuto }));
+    // F2: switching TO Auto never migrates the field -- Auto's own default is
+    // only a guess, so it is left showing the explicit type's default.
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/v1/models',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('');
+    expect(putSpecs[0].body.health_path).toBe('');
+  });
+
+  it('still sends a typed value on create after the same type switches, once the operator typed it', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
+      target: { value: '/ready' },
+    });
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeStableDiffusionCpp }),
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeAuto }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.health_path).toBe('/ready');
   });
 });
 

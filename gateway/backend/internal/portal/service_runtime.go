@@ -193,6 +193,22 @@ const (
 	defaultRuntimeSpecStartupTimeoutSeconds = 180
 )
 
+// runtimeSpecHealthPathDefault is the health path a spec gets when it names
+// none, by the spec's EFFECTIVE type (explicit, or detected from the binary).
+// sd-server answers GET /health with 404 (measured), and the agent kills a
+// child whose health path keeps failing once startup_timeout_seconds
+// elapses, so the stock default would make every sd-server spec that leaves
+// the field empty unusable. /v1/models is an unconditional 200 on that
+// server, registered only after the model has loaded, with no file-path
+// dependency (verified against leejet/stable-diffusion.cpp; see
+// docs/architecture/cross-cutting/agent-runtime-manager.md).
+func runtimeSpecHealthPathDefault(t routing.RuntimeSpecType) string {
+	if t == routing.RuntimeSpecTypeStableDiffusionCpp {
+		return "/v1/models"
+	}
+	return defaultRuntimeSpecHealthPath
+}
+
 // runtimeSpecEnvKeyPattern matches a shell-style environment variable name:
 // upper-case letters, digits, underscore, not starting with a digit. Values
 // are unrestricted (they legitimately carry ${AGENT_ENV:NAME}/${PORT}/${MODEL}
@@ -808,7 +824,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	healthPath := strings.TrimSpace(req.HealthPath)
 	if healthPath == "" {
-		healthPath = defaultRuntimeSpecHealthPath
+		healthPath = runtimeSpecHealthPathDefault(effectiveSpecKind)
 	}
 	healthTimeout := req.HealthTimeoutSeconds
 	if healthTimeout == 0 {
@@ -1129,16 +1145,17 @@ func validRuntimeAPITokenMode(s string) bool {
 }
 
 // validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
-// default and every pre-feature row's stored value) or one of the five
+// default and every pre-feature row's stored value) or one of the six
 // routing.RuntimeSpecType values. Unlike validRuntimeAPITokenMode, empty IS
 // accepted directly here (mirrors validVisibleDevicesMode) -- callers pass
 // req.Type through untouched, they don't normalize "" to a concrete value
 // first, because "" is itself a legitimate stored/wire value (auto), not a
-// default that collapses into one of the five kinds.
+// default that collapses into one of the six kinds.
 func validRuntimeSpecType(s string) bool {
 	switch routing.RuntimeSpecType(s) {
 	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
-		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama, routing.RuntimeSpecTypeCustom:
+		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama,
+		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeCustom:
 		return true
 	}
 	return false

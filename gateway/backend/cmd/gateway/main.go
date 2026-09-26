@@ -1263,6 +1263,10 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// ProviderServerAgent: the agent-managed runtime's router port speaks
 		// the OpenAI-compatible dialect, same as vllm/llama_cpp/llama_swap/litellm.
 		routing.ProviderServerAgent: openAICompatible,
+		// ProviderStableDiffusionCpp: sd-server speaks the OpenAI-compatible
+		// dialect too, and shares this client (not ollama's) so the images
+		// relay's native passthrough works -- see the constant's doc comment.
+		routing.ProviderStableDiffusionCpp: openAICompatible,
 	}, nil)
 }
 

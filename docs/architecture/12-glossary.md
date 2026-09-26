@@ -22,7 +22,7 @@ Domain and technical terms used throughout this documentation.
 | **Model override rule** | A per-token row `requested name -> {to, offer, hide_target}`: rewrite this requested name to `to`, optionally advertise the requested name in this token's listing (`offer`) and drop the target's own name from it (`hide_target`). |
 | **Unknown-model redirect** | A per-token opt-in: a requested model that does not apply is served by the token's last successfully routed model, then by a configured fallback, instead of failing. |
 | **Offered / callable / existing** | The three model sets kept apart per token: what a listing shows, what a direct request can actually route to, and what exists at all. |
-| **API flavor** | The client dialect: OpenAI-compatible, Anthropic-compatible, Codex (`/v1/responses`), or Claude Code (`/v1/messages`). |
+| **API flavor** | The client dialect: OpenAI-compatible, Anthropic-compatible, Codex (`/v1/responses`), Claude Code (`/v1/messages`), or OpenAI image generation (`/v1/images/generations`). Candidacy matches the request's **coarse** flavor — `openai`, `anthropic` or `openai_images` — against the ones an application declares. Saving an empty list stores `openai` + `anthropic`, never images; the default applies only on save, so an application whose list is stored empty is a candidate for no flavor at all. |
 | **Provider** | A backend client adapter (Ollama, OpenAI-compatible for vLLM/llama.cpp, or the mock). |
 | **Agent token** | A per-server bearer token authenticating the Server-Agent's telemetry/cert calls. |
 | **API token** | A user-created bearer token for calling the inference APIs. |

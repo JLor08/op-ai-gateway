@@ -5,13 +5,22 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+// imageServingFlavors is the flavor set of an application the images endpoint
+// routes to: openai_images must be declared, or the listing's Image is false
+// whatever the verdict (TestModelsImageRequiresTheImagesFlavor). The fixtures
+// below exercise the VERDICT fold, so they declare it.
+var imageServingFlavors = []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
 
 // The image flag is an AND across every offering mapping, fail-closed, exactly
 // like vision: a "no" row and a MISSING row both count as not capable. It is
@@ -35,7 +44,7 @@ func TestModelsResponseImageFlag(t *testing.T) {
 		if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateAIServer %s: %v", srvID, err)
 		}
-		if err := routeStore.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if err := routeStore.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: imageServingFlavors, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateApplication %s: %v", appID, err)
 		}
 		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -93,7 +102,7 @@ func TestModelsResponseImageAndAcrossMappings(t *testing.T) {
 		if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateAIServer %s: %v", srvID, err)
 		}
-		if err := routeStore.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if err := routeStore.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderVLLM, Port: 8000, Scheme: "https", APIFlavors: imageServingFlavors, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateApplication %s: %v", appID, err)
 		}
 		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -157,24 +166,23 @@ func offerModelImage(t *testing.T, rs *routing.MemoryStore, srvID, srvName, appI
 // (service_models_vision_test.go) exactly, over the image flag instead of
 // vision.
 //
-// It exists because groupImage/its assignment into imageOn (service.go, the
-// group-fold and group-entry-assignment sites beside groupVision/visionOn)
-// are a sibling dropped in alongside the vision ones, not a shared code path
-// -- a build that skipped either one would pass every EXISTING vision test
-// unchanged (they never look at Image) while leaving image silently false
-// for every model group, exactly the failure this task's brief warned about.
+// It exists because groupImage and its assignment into imageOn (service.go,
+// beside groupVision/visionOn) are their own call and their own assignment,
+// although both folds share groupCapabilityFlags -- a build that skipped
+// either one would pass every EXISTING vision test unchanged (they never look
+// at Image) while leaving image silently false for every model group.
 func TestModelsResponseImageGroupAggregation(t *testing.T) {
 	ctx := context.Background()
 	rs := routing.NewMemoryStore()
 	// img1: image-capable. img2: NOT image-capable.
-	offerModelImage(t, rs, "srv_img1", "ImgBox1", "app_img1", []string{routing.APIFlavorOpenAI}, "img1", "img1-up", true)
-	offerModelImage(t, rs, "srv_img2", "ImgBox2", "app_img2", []string{routing.APIFlavorOpenAI}, "img2", "img2-up", false)
+	offerModelImage(t, rs, "srv_img1", "ImgBox1", "app_img1", imageServingFlavors, "img1", "img1-up", true)
+	offerModelImage(t, rs, "srv_img2", "ImgBox2", "app_img2", imageServingFlavors, "img2", "img2-up", false)
 
 	// Mixed group {img1, img2} -> AND -> false.
 	offerGroup(t, rs, "grp_mixed_img", "mixed-image-group", "img1", "img2")
 	// Pure group {img3 only, image-capable} -> true.
 	offerGroup(t, rs, "grp_pure_img", "pure-image-group", "img3")
-	offerModelImage(t, rs, "srv_img3", "ImgBox3", "app_img3", []string{routing.APIFlavorOpenAI}, "img3", "img3-up", true)
+	offerModelImage(t, rs, "srv_img3", "ImgBox3", "app_img3", imageServingFlavors, "img3", "img3-up", true)
 	// Empty group (no offerable members) -> false (fail-closed) / absent.
 	offerGroup(t, rs, "grp_empty_img", "empty-image-group", "ghost-img")
 
@@ -219,8 +227,8 @@ func TestModelsResponseImageGroupAggregation(t *testing.T) {
 func TestModelsResponseImageAliasRedirect(t *testing.T) {
 	ctx := context.Background()
 	rs := routing.NewMemoryStore()
-	offerModelImage(t, rs, "srv_alias_cap", "AliasCapBox", "app_alias_cap", []string{routing.APIFlavorOpenAI}, "sd-capable", "sd-capable-up", true)
-	offerModelImage(t, rs, "srv_alias_non", "AliasNonBox", "app_alias_non", []string{routing.APIFlavorOpenAI}, "sd-noncapable", "sd-noncapable-up", false)
+	offerModelImage(t, rs, "srv_alias_cap", "AliasCapBox", "app_alias_cap", imageServingFlavors, "sd-capable", "sd-capable-up", true)
+	offerModelImage(t, rs, "srv_alias_non", "AliasNonBox", "app_alias_non", imageServingFlavors, "sd-noncapable", "sd-noncapable-up", false)
 
 	svc := offerSvc(rs, nil)
 	token := tokenWithRules(map[string]store.ModelOverrideRule{
@@ -243,5 +251,385 @@ func TestModelsResponseImageAliasRedirect(t *testing.T) {
 	}
 	if aliasNoncapable.Image {
 		t.Fatalf("alias-noncapable image = true, want false (its target sd-noncapable is not image-capable)")
+	}
+}
+
+// imagesOnlyListingService seeds one image-only model (an application whose
+// flavors are [openai_images] only, the stable-diffusion.cpp shape, with an
+// image=yes verdict) beside one ordinary text model, so every listing below
+// has something to list and something to leave out.
+func imagesOnlyListingService(t *testing.T) *Service {
+	t.Helper()
+	rs := routing.NewMemoryStore()
+	offerModelImage(t, rs, "srv_flux", "FluxBox", "app_flux", []string{routing.APIFlavorOpenAIImages}, "flux1-dev", "flux1-dev", true)
+	offerModel(t, rs, "srv_text", "TextBox", "app_text", []string{routing.APIFlavorOpenAI}, "qwen3-32b", "qwen3-32b", routing.ServerStatusActive)
+	return offerSvc(rs, nil)
+}
+
+// TestModelsListsAnImagesOnlyModelWithItsFlavor: the chat listing must carry
+// openai_images through. It used to keep only anthropic and openai, so an
+// images-only model reached the chat with no flavors at all and the picker,
+// which filters on flavor, could never offer it.
+func TestModelsListsAnImagesOnlyModelWithItsFlavor(t *testing.T) {
+	svc := imagesOnlyListingService(t)
+	byID := modelsByID(svc.Models(context.Background(), auth.Token{UserID: "usr_1"}))
+
+	flux, ok := byID["flux1-dev"]
+	if !ok {
+		t.Fatalf("flux1-dev missing from Models(): %#v", byID)
+	}
+	if !reflect.DeepEqual(flux.Flavors, []string{routing.APIFlavorOpenAIImages}) {
+		t.Fatalf("flux1-dev flavors = %#v, want exactly [openai_images]", flux.Flavors)
+	}
+	if !flux.Image {
+		t.Fatal("flux1-dev image = false, want true -- its mapping carries image=yes")
+	}
+}
+
+// TestModelsForFlavorOpenAIOmitsAnImagesOnlyModel: /v1/models is what an
+// external OpenAI client fills its CHAT picker from. An images-only model
+// listed there would be offered for chat and fail, so the per-flavor listing
+// must keep it out even though the chat listing now carries it.
+func TestModelsForFlavorOpenAIOmitsAnImagesOnlyModel(t *testing.T) {
+	svc := imagesOnlyListingService(t)
+	got := svc.ModelsForFlavor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorOpenAI)
+	if !reflect.DeepEqual(got, []string{"qwen3-32b"}) {
+		t.Fatalf("ModelsForFlavor(openai) = %#v, want [qwen3-32b] -- no images-only model", got)
+	}
+}
+
+// TestSeedModelsStayTextOnly: with no routing store the listing falls back to
+// the seed models, which are text models. openai_images is opt-in everywhere,
+// so the seeds must neither carry it in the chat listing nor answer for it in
+// the per-flavor listing or the redirect's offering.
+func TestSeedModelsStayTextOnly(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Usage: usage.NewRecorder()})
+	token := auth.Token{UserID: "usr_1"}
+
+	got := svc.Models(ctx, token)
+	if len(got.Data) != len(seedModelNames) {
+		t.Fatalf("seed listing = %#v, want %d seed models", got.Data, len(seedModelNames))
+	}
+	for _, m := range got.Data {
+		if !reflect.DeepEqual(m.Flavors, []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}) {
+			t.Fatalf("seed %s flavors = %#v, want exactly [anthropic openai]", m.ID, m.Flavors)
+		}
+	}
+	if images := svc.ModelsForFlavor(ctx, token, routing.APIFlavorOpenAIImages); len(images) != 0 {
+		t.Fatalf("ModelsForFlavor(openai_images) with no store = %#v, want none", images)
+	}
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAIImages, []string{routing.CapabilityImage})
+	if len(off.Callable) != 0 || len(off.Capable) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("ModelOfferingFor(openai_images) with no store = %#v, want every set empty", off)
+	}
+	// The seeds carry no capability: callable for a text flavor, never capable
+	// for a request that requires one.
+	text := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, []string{routing.CapabilityImage})
+	if len(text.Callable) == 0 || len(text.Capable) != 0 {
+		t.Fatalf("ModelOfferingFor(openai, [image]) with no store = %#v, want callable seeds and none capable", text)
+	}
+}
+
+// TestCallableModelNamesIncludesAnImagesOnlyModel: a token's model-valued
+// settings -- the catch-all override and each rule target on a user or service
+// token, and the unknown-model redirect's fallback -- may name an images-only
+// model. callableModelNames, which validates all of them, unions every flavor
+// the listing knows, and every consumer re-checks the flavor per request, so a
+// name valid only for images is still a valid setting. (A service's model
+// ALLOWLIST is a different check: validateServiceAllowedModels reads Models().)
+func TestCallableModelNamesIncludesAnImagesOnlyModel(t *testing.T) {
+	svc := imagesOnlyListingService(t)
+	callable := svc.callableModelNames(context.Background(), auth.Token{UserID: "usr_1"})
+	if _, ok := callable["flux1-dev"]; !ok {
+		t.Fatalf("callableModelNames = %#v, want it to contain flux1-dev", callable)
+	}
+	if _, ok := callable["qwen3-32b"]; !ok {
+		t.Fatalf("callableModelNames = %#v, want it to still contain qwen3-32b", callable)
+	}
+}
+
+// TestModelsImageRequiresTheImagesFlavor: the listing's Image means "the images
+// endpoint would serve this model", which takes the application's
+// openai_images flavor as well as the (image, yes) verdict -- candidacy refuses
+// an application that does not declare the flavor, however capable the
+// mapping. A text-flavored application with a manual image verdict therefore
+// lists Image false; the same application with openai_images added lists true.
+func TestModelsImageRequiresTheImagesFlavor(t *testing.T) {
+	rs := routing.NewMemoryStore()
+	offerModelImage(t, rs, "srv_txt", "TxtBox", "app_txt", []string{routing.APIFlavorOpenAI}, "text-only-flavor", "text-only-flavor", true)
+	offerModelImage(t, rs, "srv_mix", "MixBox", "app_mix", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, "mixed-flavors", "mixed-flavors", true)
+	byID := modelsByID(offerSvc(rs, nil).Models(context.Background(), auth.Token{UserID: "usr_1"}))
+
+	if byID["text-only-flavor"].Image {
+		t.Fatal("text-only-flavor image = true, want false -- its application does not declare openai_images, so the images endpoint never routes to it")
+	}
+	if !byID["mixed-flavors"].Image {
+		t.Fatal("mixed-flavors image = false, want true -- openai_images declared and image: yes")
+	}
+}
+
+// offerAgentModelImage seeds a server_agent application with the given flavors,
+// one mapping with an image=yes verdict and, when specFlavors is non-nil, a
+// runtime spec carrying specFlavors -- the spec is that model's own flavor
+// authority once resolved (routing.Resolver.targetFrom).
+func offerAgentModelImage(t *testing.T, rs *routing.MemoryStore, srvID, appID string, appFlavors, specFlavors []string, gateway string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := rs.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateAIServer %s: %v", srvID, err)
+	}
+	if err := rs.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIFlavors: appFlavors, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateApplication %s: %v", appID, err)
+	}
+	mappingID := appID + "_map"
+	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateMapping %s: %v", gateway, err)
+	}
+	if err := rs.UpsertMappingCapabilities(ctx, mappingID, []routing.CapabilityRow{{
+		Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes,
+		Source: routing.CapabilitySourceManual, CheckedAt: offeringTime,
+	}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
+	}
+	if specFlavors != nil {
+		if err := rs.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: appID + "_spec", MappingID: mappingID, Binary: "/opt/sd-server/sd-server", Args: "[]", Env: "{}", APIFlavors: specFlavors}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", mappingID, err)
+		}
+	}
+}
+
+// TestModelsImageOfAnAgentMappingNeedsTheFlavorAtBothStages: an agent-launched
+// model is served an image request only when candidacy admits its application
+// (the APPLICATION's flavors) AND the images relay admits its resolved spec
+// (the SPEC's flavors, targetServesFlavor). Image must say the same.
+func TestModelsImageOfAnAgentMappingNeedsTheFlavorAtBothStages(t *testing.T) {
+	both := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+	textOnly := []string{routing.APIFlavorOpenAI}
+	imagesOnly := []string{routing.APIFlavorOpenAIImages}
+	rs := routing.NewMemoryStore()
+	offerAgentModelImage(t, rs, "srv_a1", "app_a1", both, imagesOnly, "agent-both")
+	offerAgentModelImage(t, rs, "srv_a2", "app_a2", both, textOnly, "agent-spec-narrows")
+	offerAgentModelImage(t, rs, "srv_a3", "app_a3", textOnly, imagesOnly, "agent-app-lacks")
+	offerAgentModelImage(t, rs, "srv_a4", "app_a4", both, nil, "agent-no-spec")
+	byID := modelsByID(offerSvc(rs, nil).Models(context.Background(), auth.Token{UserID: "usr_1"}))
+
+	for name, want := range map[string]bool{
+		"agent-both":         true,  // application and spec both declare openai_images
+		"agent-spec-narrows": false, // the relay refuses: the spec excludes the flavor
+		"agent-app-lacks":    false, // candidacy refuses: the application lacks it
+		"agent-no-spec":      true,  // no spec: the application is the authority
+	} {
+		if got := byID[name].Image; got != want {
+			t.Errorf("%s image = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// specReadStore wraps a *routing.MemoryStore and instruments ONLY
+// RuntimeSpecsByApplication: it counts calls per application and, with err
+// set, fails them. Every other method is the embedded store's own.
+type specReadStore struct {
+	*routing.MemoryStore
+	err   error
+	calls map[string]int
+}
+
+func (s *specReadStore) RuntimeSpecsByApplication(ctx context.Context, appID string) ([]routing.RuntimeSpec, error) {
+	s.calls[appID]++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.MemoryStore.RuntimeSpecsByApplication(ctx, appID)
+}
+
+// TestModelsImageWithholdsAnAgentModelWhenItsSpecReadFails: a failed spec read
+// must not be read as "no spec" (which would fall back to the application's
+// flavors and report the model capable). It withholds image for that
+// application's models only -- an ordinary image model beside it is
+// unaffected, since its route has no spec to read -- and it logs.
+func TestModelsImageWithholdsAnAgentModelWhenItsSpecReadFails(t *testing.T) {
+	both := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+	rs := routing.NewMemoryStore()
+	offerAgentModelImage(t, rs, "srv_fail_agent", "app_fail_agent", both, both, "agent-image")
+	offerModelImage(t, rs, "srv_fail_plain", "PlainBox", "app_fail_plain", imageServingFlavors, "plain-image", "plain-image", true)
+	store := &specReadStore{MemoryStore: rs, err: errors.New("spec read down"), calls: map[string]int{}}
+
+	var byID map[string]ModelDTO
+	logged := captureSlog(t, func() {
+		byID = modelsByID(offerSvc(store, nil).Models(context.Background(), auth.Token{UserID: "usr_1"}))
+	})
+
+	if byID["agent-image"].Image {
+		t.Fatal("agent-image image = true, want false -- its spec could not be read, so the relay's flavor stage is unknown")
+	}
+	if !byID["plain-image"].Image {
+		t.Fatal("plain-image image = false, want true -- an ordinary application has no spec to read")
+	}
+	if !strings.Contains(logged, "runtime spec read failed") || !strings.Contains(logged, "app_fail_agent") {
+		t.Fatalf("log = %q, want the spec-read degrade logged with the application id", logged)
+	}
+}
+
+// TestModelsReadsEachAgentApplicationsSpecsOnce: the spec read is per
+// APPLICATION, not per mapping -- two mappings on one server_agent application
+// cost one RuntimeSpecsByApplication call, and both still get their own
+// spec's verdict.
+func TestModelsReadsEachAgentApplicationsSpecsOnce(t *testing.T) {
+	ctx := context.Background()
+	both := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+	rs := routing.NewMemoryStore()
+	offerAgentModelImage(t, rs, "srv_once", "app_once", both, both, "agent-one")
+	// A second mapping on the SAME application, with its own spec that
+	// excludes the images flavor.
+	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: "app_once_map2", ApplicationID: "app_once", GatewayModelName: "agent-two", AppModelName: "agent-two", Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateMapping agent-two: %v", err)
+	}
+	if err := rs.UpsertMappingCapabilities(ctx, "app_once_map2", []routing.CapabilityRow{{
+		Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes,
+		Source: routing.CapabilitySourceManual, CheckedAt: offeringTime,
+	}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities agent-two: %v", err)
+	}
+	if err := rs.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "app_once_spec2", MappingID: "app_once_map2", Binary: "/opt/sd-server/sd-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec agent-two: %v", err)
+	}
+	store := &specReadStore{MemoryStore: rs, calls: map[string]int{}}
+
+	byID := modelsByID(offerSvc(store, nil).Models(ctx, auth.Token{UserID: "usr_1"}))
+
+	if got := store.calls["app_once"]; got != 1 {
+		t.Fatalf("RuntimeSpecsByApplication(app_once) calls = %d, want exactly 1 for two mappings", got)
+	}
+	if !byID["agent-one"].Image {
+		t.Fatal("agent-one image = false, want true -- its spec declares openai_images")
+	}
+	if byID["agent-two"].Image {
+		t.Fatal("agent-two image = true, want false -- its own spec excludes openai_images")
+	}
+}
+
+// capableOfferingStore seeds one model per shape the image fold tells apart,
+// plus two groups, for the ModelOffering.Capable tests below.
+func capableOfferingStore(t *testing.T) *routing.MemoryStore {
+	t.Helper()
+	both := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+	textOnly := []string{routing.APIFlavorOpenAI}
+	imagesOnly := []string{routing.APIFlavorOpenAIImages}
+	rs := routing.NewMemoryStore()
+	offerModelImage(t, rs, "srv_plain", "PlainBox", "app_plain", both, "img-plain", "img-plain", true)
+	offerModelImage(t, rs, "srv_no", "NoBox", "app_no", both, "img-no", "img-no", false)
+	offerModelImage(t, rs, "srv_only", "OnlyBox", "app_only", imagesOnly, "img-only", "img-only", true)
+	offerModelImage(t, rs, "srv_txt", "TxtBox", "app_txt", textOnly, "text-flavor", "text-flavor", true)
+	offerAgentModelImage(t, rs, "srv_ab", "app_ab", both, imagesOnly, "agent-both")
+	offerAgentModelImage(t, rs, "srv_an", "app_an", both, textOnly, "agent-spec-narrows")
+	offerAgentModelImage(t, rs, "srv_ax", "app_ax", both, nil, "agent-no-spec")
+	offerGroup(t, rs, "grp_pure", "pure-image-group", "img-plain", "img-only")
+	offerGroup(t, rs, "grp_mixed", "mixed-image-group", "img-plain", "img-no")
+	return rs
+}
+
+// TestModelOfferingCapableIsTheListingsImageFold: the redirect's candidate set
+// for an images request is decided by the same fold as the listing's Image
+// flag -- verdict, the application's openai_images and, for an agent child,
+// the spec's -- never by a second rule. Every callable name is capable exactly
+// when the listing says Image, and the explicit expectations below pin each
+// shape so that agreement cannot come from both sides being wrong together.
+func TestModelOfferingCapableIsTheListingsImageFold(t *testing.T) {
+	ctx := context.Background()
+	svc := offerSvc(capableOfferingStore(t), nil)
+	token := auth.Token{UserID: "usr_1"}
+
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAIImages, []string{routing.CapabilityImage})
+	byID := modelsByID(svc.Models(ctx, token))
+
+	want := map[string]bool{
+		"img-plain":          true,
+		"img-no":             false, // callable for the flavor, but its verdict is no
+		"img-only":           true,  // an images-only application
+		"agent-both":         true,
+		"agent-spec-narrows": false, // candidacy admits the application, the relay refuses the spec
+		"agent-no-spec":      true,
+		"pure-image-group":   true,
+		"mixed-image-group":  false, // one member lacks the capability
+	}
+	for name, capable := range want {
+		if _, ok := off.Callable[name]; !ok {
+			t.Errorf("%s missing from Callable(openai_images): %#v", name, off.Callable)
+			continue
+		}
+		if _, got := off.Capable[name]; got != capable {
+			t.Errorf("%s capable = %v, want %v", name, got, capable)
+		}
+	}
+	for name := range off.Callable {
+		if _, got := off.Capable[name]; got != byID[name].Image {
+			t.Errorf("%s capable = %v, listing Image = %v -- the two must be one fold", name, got, byID[name].Image)
+		}
+	}
+	if _, ok := off.Capable["text-flavor"]; ok {
+		t.Error("text-flavor is capable, want not: its application does not declare openai_images")
+	}
+}
+
+// With no required capability, Capable is Callable: a text request's
+// candidates are exactly what they were before capabilities existed, and the
+// offering makes none of the image fold's reads.
+func TestModelOfferingWithoutRequiredCapabilitiesIsCallable(t *testing.T) {
+	svc := offerSvc(capableOfferingStore(t), nil)
+	off := svc.ModelOfferingFor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorOpenAIImages, nil)
+	if !reflect.DeepEqual(off.Capable, off.Callable) {
+		t.Fatalf("Capable = %#v, want Callable %#v", off.Capable, off.Callable)
+	}
+}
+
+// A required capability with no fold is carried by nothing, so nothing is a
+// candidate (fail-closed) -- while Callable and Existing are unaffected.
+func TestModelOfferingCapableIsEmptyForACapabilityWithoutAFold(t *testing.T) {
+	svc := offerSvc(capableOfferingStore(t), nil)
+	off := svc.ModelOfferingFor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorOpenAIImages, []string{"teleportation"})
+	if len(off.Capable) != 0 {
+		t.Fatalf("Capable = %#v, want empty for a capability without a fold", off.Capable)
+	}
+	if len(off.Callable) == 0 || len(off.Existing) == 0 {
+		t.Fatalf("Callable/Existing = %#v/%#v, want both populated", off.Callable, off.Existing)
+	}
+}
+
+// capabilityReadStore fails the batch capability read and counts it.
+type capabilityReadStore struct {
+	*routing.MemoryStore
+	err   error
+	calls int
+}
+
+func (s *capabilityReadStore) MappingCapabilitiesForMappings(ctx context.Context, ids []string) (map[string][]routing.CapabilityRow, error) {
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.MemoryStore.MappingCapabilitiesForMappings(ctx, ids)
+}
+
+// A failed capability read gives the all-or-nothing empty offering, so the
+// redirect declines instead of guessing which candidate generates images.
+// Without a required capability the read is never made at all.
+func TestModelOfferingIsEmptyWhenTheCapabilityReadFails(t *testing.T) {
+	ctx := context.Background()
+	store := &capabilityReadStore{MemoryStore: capableOfferingStore(t), err: errors.New("capability read down")}
+	svc := offerSvc(store, nil)
+	token := auth.Token{UserID: "usr_1"}
+
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAIImages, []string{routing.CapabilityImage})
+	if len(off.Callable) != 0 || len(off.Capable) != 0 || len(off.Existing) != 0 {
+		t.Fatalf("offering = %#v, want every set empty on a failed capability read", off)
+	}
+
+	store.calls = 0
+	if off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil); len(off.Callable) == 0 {
+		t.Fatalf("text offering = %#v, want it populated", off)
+	}
+	if store.calls != 0 {
+		t.Fatalf("capability reads = %d without a required capability, want 0", store.calls)
 	}
 }

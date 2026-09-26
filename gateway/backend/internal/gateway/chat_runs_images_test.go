@@ -41,6 +41,10 @@ import (
 // shape, for the same reason): a run-as attribution test has to seed a token
 // owned by the chat's user, and the directory is the only handle on the store
 // AuthorizeRunAsToken reads.
+//
+// APIFlavors carries APIFlavorOpenAIImages alongside APIFlavorOpenAI: since
+// NormalizeAPIFlavor no longer folds openai_images into openai, an application
+// must opt into the images flavor explicitly to be an image candidate at all.
 func newImageRunTestServer(t *testing.T, upstreamURL string) (*Server, *portal.MemoryDirectory, auth.Token, string) {
 	t.Helper()
 	cipher, err := capture.New(testCaptureKey)
@@ -74,7 +78,7 @@ func newImageRunTestServer(t *testing.T, upstreamURL string) (*Server, *portal.M
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo", Name: "SD Turbo Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo", ApplicationID: "app-sd-turbo", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -690,7 +694,7 @@ func TestImageRunServerOverrideReachesTheImagesHop(t *testing.T) {
 	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-alt", Name: "SD Alt Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: overrideUpstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnhealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := srv.Routes.CreateApplication(ctx, routing.Application{ID: "app-sd-alt", ServerID: "srv-sd-alt", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := srv.Routes.CreateApplication(ctx, routing.Application{ID: "app-sd-alt", ServerID: "srv-sd-alt", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-alt", ApplicationID: "app-sd-alt", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

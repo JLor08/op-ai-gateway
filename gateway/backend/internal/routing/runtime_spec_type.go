@@ -18,11 +18,12 @@ import (
 type RuntimeSpecType string
 
 const (
-	RuntimeSpecTypeVLLM     RuntimeSpecType = "vllm"
-	RuntimeSpecTypeLlamaCpp RuntimeSpecType = "llama_cpp"
-	RuntimeSpecTypeTGI      RuntimeSpecType = "tgi"
-	RuntimeSpecTypeOllama   RuntimeSpecType = "ollama"
-	RuntimeSpecTypeCustom   RuntimeSpecType = "custom"
+	RuntimeSpecTypeVLLM               RuntimeSpecType = "vllm"
+	RuntimeSpecTypeLlamaCpp           RuntimeSpecType = "llama_cpp"
+	RuntimeSpecTypeTGI                RuntimeSpecType = "tgi"
+	RuntimeSpecTypeOllama             RuntimeSpecType = "ollama"
+	RuntimeSpecTypeStableDiffusionCpp RuntimeSpecType = "stable_diffusion_cpp"
+	RuntimeSpecTypeCustom             RuntimeSpecType = "custom"
 )
 
 // defaultPrometheusMetricsPath is the Prometheus-style metrics path shared by every runtime
@@ -31,8 +32,10 @@ const defaultPrometheusMetricsPath = "/metrics"
 
 // DetectRuntimeSpecType infers the runtime server kind from the launched
 // binary's basename when no explicit RuntimeSpec.Type is set. It matches on
-// case-insensitive substrings, in the order below (first match wins), and
-// falls back to RuntimeSpecTypeCustom when nothing matches.
+// case-insensitive substrings -- vllm, llama-server/llama_cpp/llama.cpp,
+// text-generation-launcher/tgi, sd-server/stable-diffusion, ollama -- in the
+// order below (first match wins), and falls back to RuntimeSpecTypeCustom
+// when nothing matches.
 func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	name := strings.ToLower(filepath.Base(binary))
 
@@ -43,6 +46,8 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 		return RuntimeSpecTypeLlamaCpp
 	case strings.Contains(name, "text-generation-launcher"), strings.Contains(name, "tgi"):
 		return RuntimeSpecTypeTGI
+	case strings.Contains(name, "sd-server"), strings.Contains(name, "stable-diffusion"):
+		return RuntimeSpecTypeStableDiffusionCpp
 	case strings.Contains(name, "ollama"):
 		return RuntimeSpecTypeOllama
 	default:
@@ -88,6 +93,13 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// architecture-prefixed key (e.g. "llama.context_length"), per the
 		// same source's "Show Model Information" section.
 		defaultMetrics, defaultContext = "", "/api/show"
+	case RuntimeSpecTypeStableDiffusionCpp:
+		// Measured against a real sd-server: no Prometheus-style metrics
+		// endpoint of any kind, and no /props. Its capability document at
+		// /sdcpp/v1/capabilities carries no context-length field either, and
+		// an image model has no context window to probe, so there is nothing
+		// honest to default either path to.
+		defaultMetrics, defaultContext = "", ""
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""
 	default:

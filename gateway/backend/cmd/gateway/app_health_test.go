@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1118,6 +1119,459 @@ func TestRunAppHealthOnceCapabilityReadFailureWritesNothing(t *testing.T) {
 	got, _ := st.mappingOf("m1")
 	if got.ContextSize != 8192 {
 		t.Fatalf("ContextSize = %d, want 8192 (a capability-read failure must not stall the rest of the pass)", got.ContextSize)
+	}
+}
+
+// sdcppFakeProber is the file's fakeProber plus provider.SdcppCapabilitiesProber
+// -- the smallest addition that lets the stable_diffusion_cpp branch of the
+// probe pass be observed. Embedding keeps every capability the production
+// Multiplexer also has (Probe, LoadedModels, ProbeModelInfo), so a test here
+// sees the same assertions succeed or fail as production does; the existing
+// fakeProber is left untouched, so no existing test gains a capability it did
+// not have.
+type sdcppFakeProber struct {
+	*fakeProber
+	sdMu sync.Mutex
+	// sdVerdicts / sdErr answer ProbeSdcppCapabilities per endpoint. An
+	// endpoint with an error STILL returns its verdicts beside it, so a branch
+	// that ignored the error would write them -- which is what makes "an
+	// error writes nothing" observable rather than true by construction.
+	sdVerdicts map[string]provider.SdcppVerdicts
+	sdErr      map[string]error
+	// sdTargets records every target asked, in order; sdAuth the credential
+	// each call carried (provider.UpstreamAuthFrom), so a test can pin that
+	// the branch builds its auth context like the context-probe branch.
+	sdTargets []routing.Target
+	sdAuth    []provider.UpstreamAuth
+}
+
+var _ provider.SdcppCapabilitiesProber = (*sdcppFakeProber)(nil)
+
+func newSdcppFakeProber() *sdcppFakeProber {
+	return &sdcppFakeProber{
+		fakeProber: newFakeProber(),
+		sdVerdicts: map[string]provider.SdcppVerdicts{},
+		sdErr:      map[string]error{},
+	}
+}
+
+func (f *sdcppFakeProber) ProbeSdcppCapabilities(ctx context.Context, target routing.Target) (provider.SdcppVerdicts, error) {
+	f.sdMu.Lock()
+	defer f.sdMu.Unlock()
+	f.sdTargets = append(f.sdTargets, target)
+	a, _ := provider.UpstreamAuthFrom(ctx)
+	f.sdAuth = append(f.sdAuth, a)
+	return f.sdVerdicts[target.Endpoint], f.sdErr[target.Endpoint]
+}
+
+// sdcppCalls returns a copy of every target ProbeSdcppCapabilities was asked.
+func (f *sdcppFakeProber) sdcppCalls() []routing.Target {
+	f.sdMu.Lock()
+	defer f.sdMu.Unlock()
+	return append([]routing.Target(nil), f.sdTargets...)
+}
+
+// sdcppApp is an external stable-diffusion.cpp application as the portal
+// creates one: the type's /v1/models health path and NO ContextProbePath,
+// which is exactly why the capability probe cannot ride the context branch.
+func sdcppApp(id, serverID string, port int) routing.Application {
+	app := activeApp(id, serverID, port)
+	app.Type = routing.ProviderStableDiffusionCpp
+	app.HealthCheckPath = "/v1/models"
+	return app
+}
+
+// sdcppProbeRunner builds a runner over one stable_diffusion_cpp application
+// ("a1" on http://s1.local:8001) with the given mappings, whose capability
+// document answers v.
+func sdcppProbeRunner(t *testing.T, v provider.SdcppVerdicts, mappings ...routing.ModelMapping) (*appHealthRunner, *fakeHealthStore, *sdcppFakeProber) {
+	t.Helper()
+	shrinkRetryGap(t)
+	st := newHealthTestStore(sdcppApp("a1", "s1", 8001))
+	st.mappings = map[string][]routing.ModelMapping{"a1": mappings}
+	prober := newSdcppFakeProber()
+	prober.sdVerdicts["http://s1.local:8001"] = v
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+	return runner, st, prober
+}
+
+func sdcppMapping(id, appModel string) routing.ModelMapping {
+	return routing.ModelMapping{ID: id, ApplicationID: "a1", GatewayModelName: "g-" + id, AppModelName: appModel, Status: routing.ServerStatusActive}
+}
+
+// TestRunAppHealthOnceSdcppWritesImageVerdict is the branch's whole job: the
+// gateway derives an external sd-server's image verdict from the server's own
+// capability document, at rank 1 under source sdcpp_capabilities, so the
+// images gate stops needing a manual verdict for it.
+//
+// Both directions are asserted, because supported_modes is exhaustive and this
+// is the first source entitled to state image: no. The verdict names its model
+// (model.stem), so it lands ONLY on the mapping of that name: a sibling mapping
+// of another name must get no row at all -- asserted by presence, not by
+// verdict, since "unknown" is the absence of a row.
+func TestRunAppHealthOnceSdcppWritesImageVerdict(t *testing.T) {
+	for _, verdict := range []string{routing.CapabilityYes, routing.CapabilityNo} {
+		t.Run(verdict, func(t *testing.T) {
+			runner, st, prober := sdcppProbeRunner(t,
+				provider.SdcppVerdicts{Image: verdict, ModelStem: "flux1-dev"},
+				sdcppMapping("m1", "flux1-dev"), sdcppMapping("m2", "sd-other"))
+
+			runCapabilityCycle(runner)
+
+			st.assertCapability(t, "m1", routing.CapabilityImage, verdict, routing.CapabilitySourceSdcppCapabilities)
+			if row, ok := st.capabilityOf("m2", routing.CapabilityImage); ok {
+				t.Fatalf("m2 (AppModelName sd-other) got an image row %+v -- a verdict naming flux1-dev belongs to that mapping only", row)
+			}
+			if n := st.capabilityWriteCount(); n != 1 {
+				t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1", n)
+			}
+			calls := prober.sdcppCalls()
+			if len(calls) != 1 || calls[0].Provider != routing.ProviderStableDiffusionCpp || calls[0].Endpoint != "http://s1.local:8001" || calls[0].Timeout != time.Second {
+				t.Fatalf("sdcpp probe targets = %+v, want one {Provider:stable_diffusion_cpp Endpoint:http://s1.local:8001 Timeout:1s}", calls)
+			}
+			// Independent of ContextProbePath (empty for this type) and of the
+			// ModelInfoProber path: the /props probe never ran.
+			if n := prober.ctxProbeCallCount(); n != 0 {
+				t.Fatalf("ProbeModelInfo called %d times, want 0 -- the sd branch must not depend on the context probe", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSdcppNamelessVerdictReachesEveryActiveMapping is the
+// context branch's name rule, applied here: a document naming no model yields
+// a verdict with no stem, and a stable_diffusion_cpp application has exactly
+// one endpoint serving one model, so every ACTIVE mapping it owns is served
+// by the build that answered. A disabled mapping is not written.
+func TestRunAppHealthOnceSdcppNamelessVerdictReachesEveryActiveMapping(t *testing.T) {
+	disabled := sdcppMapping("m3", "sd-disabled")
+	disabled.Status = routing.ServerStatusDisabled
+	runner, st, _ := sdcppProbeRunner(t,
+		provider.SdcppVerdicts{Image: routing.CapabilityYes},
+		sdcppMapping("m1", "flux1-dev"), sdcppMapping("m2", "sd-other"), disabled)
+
+	runCapabilityCycle(runner)
+
+	for _, id := range []string{"m1", "m2"} {
+		st.assertCapability(t, id, routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+	}
+	if row, ok := st.capabilityOf("m3", routing.CapabilityImage); ok {
+		t.Fatalf("disabled m3 got an image row %+v, want none", row)
+	}
+	if n := st.capabilityWriteCount(); n != 2 {
+		t.Fatalf("UpsertMappingCapabilities called %d times, want 2", n)
+	}
+}
+
+// TestRunAppHealthOnceSdcppUnmatchedStemIsLoggedAtDebug: a verdict naming a
+// model that no active mapping of the application serves -- an sd-server whose
+// model.stem differs from the model_name discovery named the mapping by --
+// fails closed (no row), and one debug line names the app, the stem and the
+// verdict so the case is diagnosable. A matched verdict does not log it.
+func TestRunAppHealthOnceSdcppUnmatchedStemIsLoggedAtDebug(t *testing.T) {
+	const msg = "no active mapping serves the model it names"
+	for _, tc := range []struct {
+		name, stem string
+		wantLog    bool
+	}{
+		{"unmatched stem logs", "flux1-schnell", true},
+		{"matched stem does not", "flux1-dev", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			runner, st, _ := sdcppProbeRunner(t,
+				provider.SdcppVerdicts{Image: routing.CapabilityYes, ModelStem: tc.stem},
+				sdcppMapping("m1", "flux1-dev"))
+
+			runCapabilityCycle(runner)
+
+			out := buf.String()
+			if got := strings.Contains(out, msg); got != tc.wantLog {
+				t.Fatalf("log contains %q = %v, want %v; log:\n%s", msg, got, tc.wantLog, out)
+			}
+			if tc.wantLog {
+				for _, want := range []string{"app_id=a1", "model_stem=" + tc.stem, "image=yes"} {
+					if !strings.Contains(out, want) {
+						t.Fatalf("log lacks %q; log:\n%s", want, out)
+					}
+				}
+				if n := st.capabilityWriteCount(); n != 0 {
+					t.Fatalf("UpsertMappingCapabilities called %d times, want 0 -- an unmatched verdict writes nothing", n)
+				}
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSdcppDoesNotOverwriteAManualVerdict pins the operator's
+// precedence rule: a probe (rank 1) never overwrites a manual (rank 3)
+// verdict, in either direction. One case is a stored manual "no" against a
+// probe "yes"; the portal reserves (image, no) from new manual
+// writes, so the case an operator can actually produce today is the other
+// one -- a manual "yes" (the only enablement path before this probe existed)
+// against a probe "no" -- and both are pinned.
+//
+// Unfalsifiable by accident, as the /props sibling is: the verdict carries no
+// stem, so it also reaches a second mapping with nothing on file, and exactly
+// that one write must fire. A write count of zero alone would also pass if
+// the branch had stopped writing altogether.
+func TestRunAppHealthOnceSdcppDoesNotOverwriteAManualVerdict(t *testing.T) {
+	for _, tc := range []struct{ name, manual, probe string }{
+		{"manual no survives a probe yes", routing.CapabilityNo, routing.CapabilityYes},
+		{"manual yes survives a probe no", routing.CapabilityYes, routing.CapabilityNo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, _ := sdcppProbeRunner(t,
+				provider.SdcppVerdicts{Image: tc.probe},
+				sdcppMapping("m1", "flux1-dev"), sdcppMapping("m2", "sd-other"))
+			st.seedCapability("m1", routing.CapabilityImage, tc.manual, routing.CapabilitySourceManual)
+
+			runCapabilityCycle(runner)
+
+			st.assertCapability(t, "m1", routing.CapabilityImage, tc.manual, routing.CapabilitySourceManual)
+			st.assertCapability(t, "m2", routing.CapabilityImage, tc.probe, routing.CapabilitySourceSdcppCapabilities)
+			if n := st.capabilityWriteCount(); n != 1 {
+				t.Fatalf("UpsertMappingCapabilities called %d times, want exactly 1 (m2's first verdict)", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSdcppNeverAsksAnotherType pins that the capability
+// document is asked of stable_diffusion_cpp applications only: every other
+// type -- including a llama_cpp application WITH a context probe path and a
+// server_agent one, whose own passes run beside this one -- is never
+// asked. The sd application in the same store is the positive control: it is
+// asked exactly once, so a branch that asked nobody would fail here too.
+func TestRunAppHealthOnceSdcppNeverAsksAnotherType(t *testing.T) {
+	shrinkRetryGap(t)
+	apps := []routing.Application{sdcppApp("sd", "s1", 8000)}
+	for i, typ := range []string{
+		routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap,
+		routing.ProviderLiteLLM, routing.ProviderOllama, routing.ProviderServerAgent, routing.ProviderMock,
+	} {
+		app := activeApp("other-"+typ, "s1", 8100+i)
+		app.Type = typ
+		if typ == routing.ProviderLlamaCPP {
+			app.ContextProbePath = "/props"
+		}
+		apps = append(apps, app)
+	}
+	st := newHealthTestStore(apps...)
+	prober := newSdcppFakeProber()
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	calls := prober.sdcppCalls()
+	if len(calls) != 1 || calls[0].Provider != routing.ProviderStableDiffusionCpp || calls[0].Endpoint != "http://s1.local:8000" {
+		t.Fatalf("sdcpp probe targets = %+v, want exactly the one stable_diffusion_cpp application", calls)
+	}
+	if !prober.probedPath("/props") {
+		t.Fatalf("the llama_cpp application's context probe did not run -- the sd branch must not displace the context branch")
+	}
+}
+
+// TestRunAppHealthOnceSdcppProbeErrorWritesNothing: a failed probe -- here the
+// 404 an sd-server without the document answers -- states no verdict, so no
+// row may be written and nothing already on file may change. The fake hands a
+// "no" back beside the error, and the stored row is a same-rank "yes" the "no"
+// would be allowed to overwrite, so only the error guard stands between them.
+func TestRunAppHealthOnceSdcppProbeErrorWritesNothing(t *testing.T) {
+	runner, st, prober := sdcppProbeRunner(t, provider.SdcppVerdicts{Image: routing.CapabilityNo}, sdcppMapping("m1", "flux1-dev"))
+	prober.sdErr["http://s1.local:8001"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+	st.seedCapability("m1", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after a failed probe, want 0", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+}
+
+// TestRunAppHealthOnceSdcppFollowsTheAppCadence pins the branch's own schedule
+// key ("sdcpp:"+app.ID): with the clock standing still a second cycle does not
+// ask again, and once the application's interval has elapsed it does. A
+// branch sharing the health probe's key (app.ID) would never be due at all --
+// the health pass stamps that key first in the same cycle -- which
+// TestRunAppHealthOnceSdcppWritesImageVerdict would catch; this one catches a
+// branch with no schedule, asking on every cycle.
+func TestRunAppHealthOnceSdcppFollowsTheAppCadence(t *testing.T) {
+	runner, _, prober := sdcppProbeRunner(t, provider.SdcppVerdicts{Image: routing.CapabilityYes}, sdcppMapping("m1", "flux1-dev"))
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time { return current }
+	state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)}
+
+	runner.runOnce(context.Background(), state)
+	runner.runOnce(context.Background(), state)
+	if n := len(prober.sdcppCalls()); n != 1 {
+		t.Fatalf("sdcpp probe asked %d times over two cycles at one instant, want 1 -- it must follow the application's cadence", n)
+	}
+	if _, ok := state.lastProbed["sdcpp:a1"]; !ok {
+		t.Fatalf("lastProbed = %v, want an sdcpp:a1 entry", state.lastProbed)
+	}
+
+	current = current.Add(time.Duration(portal.MaxHealthCheckIntervalSeconds) * time.Second)
+	runner.runOnce(context.Background(), state)
+	if n := len(prober.sdcppCalls()); n != 2 {
+		t.Fatalf("sdcpp probe asked %d times after the interval elapsed, want 2", n)
+	}
+}
+
+// TestRunAppHealthOnceSdcppRetriesAVerdictThatReachedNoMapping: the capability
+// pass runs beside the same cycle's model_sync reconcile, which is what creates
+// an sd application's mapping in the first place. A verdict that finds no
+// active mapping to land on -- one naming a stem no mapping serves yet, or a
+// nameless one on an application with no active mapping -- therefore leaves
+// the cadence key unstamped, so the next cycle asks again instead of one full
+// interval later. The clock stands still here: the second cycle is due only
+// because the first did not stamp the key. Once the verdict has landed the key
+// is stamped as usual, and a third cycle at the same instant does not ask.
+func TestRunAppHealthOnceSdcppRetriesAVerdictThatReachedNoMapping(t *testing.T) {
+	for _, tc := range []struct{ name, stem string }{
+		{"named stem", "flux1-dev"},
+		{"nameless verdict", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober := sdcppProbeRunner(t, provider.SdcppVerdicts{Image: routing.CapabilityYes, ModelStem: tc.stem})
+			current := time.Unix(10_000, 0).UTC()
+			runner.now = func() time.Time { return current }
+			state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)}
+
+			runner.runOnce(context.Background(), state)
+			if n := st.capabilityWriteCount(); n != 0 {
+				t.Fatalf("UpsertMappingCapabilities called %d times with no mapping, want 0", n)
+			}
+			if _, ok := state.lastProbed["sdcpp:a1"]; ok {
+				t.Fatalf("lastProbed = %v, want no sdcpp:a1 stamp -- the verdict reached no mapping", state.lastProbed)
+			}
+
+			// The reconcile has created the mapping by the next cycle.
+			st.mu.Lock()
+			st.mappings["a1"] = []routing.ModelMapping{sdcppMapping("m1", "flux1-dev")}
+			st.mu.Unlock()
+			runner.runOnce(context.Background(), state)
+			st.assertCapability(t, "m1", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+
+			runner.runOnce(context.Background(), state)
+			if n := len(prober.sdcppCalls()); n != 2 {
+				t.Fatalf("sdcpp probe asked %d times over three cycles at one instant, want 2 -- a landed verdict is stamped", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSdcppCarriesTheAppCredential: the branch builds its auth
+// context exactly as the context-probe branch does, so an sd-server started
+// with an API key is asked with the application's own credential.
+func TestRunAppHealthOnceSdcppCarriesTheAppCredential(t *testing.T) {
+	shrinkRetryGap(t)
+	app := sdcppApp("a1", "s1", 8001)
+	app.APIToken = "plain:sd-tok"
+	app.APITokenHeader = "X-Api-Key"
+	st := newHealthTestStore(app)
+	prober := newSdcppFakeProber()
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	prober.sdMu.Lock()
+	defer prober.sdMu.Unlock()
+	if len(prober.sdAuth) != 1 || prober.sdAuth[0] != (provider.UpstreamAuth{Header: "X-Api-Key", Token: "sd-tok"}) {
+		t.Fatalf("sdcpp probe credentials = %+v, want one {Header:X-Api-Key Token:sd-tok}", prober.sdAuth)
+	}
+}
+
+// TestSdcppCapabilitiesPassE2EWritesImageVerdict drives the sd branch through
+// the REAL production chain -- providerClients' Multiplexer, its
+// OpenAI-compatible client, a MemoryStore -- against an httptest sd-server
+// serving the measured capability document. The fake-prober tests above
+// cannot see the one failure that matters most here: the branch type-asserts
+// r.prober to provider.SdcppCapabilitiesProber and SKIPS silently when that
+// fails, so a Multiplexer that stopped implementing it, or a providerClients
+// that stopped routing stable_diffusion_cpp to a client that does, would
+// leave every sd mapping without a verdict and every fake test green.
+func TestSdcppCapabilitiesPassE2EWritesImageVerdict(t *testing.T) {
+	shrinkRetryGap(t)
+	var paths []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path != "/sdcpp/v1/capabilities" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"current_mode":"img_gen","model":{"name":"flux1-dev.safetensors","stem":"flux1-dev"},"supported_modes":["img_gen"],"output_formats":["png","jpeg","webp"]}`))
+	}))
+	defer upstream.Close()
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	store := routing.NewMemoryStore()
+	if err := store.CreateAIServer(ctx, routing.AIServer{
+		ID: "s1", Name: "S1", Domain: u.Hostname(), Provider: routing.ProviderStableDiffusionCpp,
+		Endpoint: upstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	// always_reachable: the sd branch is independent of the health-check mode,
+	// so the only request the upstream sees is the capability document.
+	if err := store.CreateApplication(ctx, routing.Application{
+		ID: "a1", ServerID: "s1", Type: routing.ProviderStableDiffusionCpp, Port: port, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAIImages}, Priority: 1, Weight: 1,
+		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	if err := store.CreateMapping(ctx, routing.ModelMapping{
+		ID: "m1", ApplicationID: "a1", GatewayModelName: "flux", AppModelName: "flux1-dev",
+		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+
+	(&appHealthRunner{
+		store: store, prober: providerClients(0, false, nil), registry: gateway.NewAppHealthRegistry(nil),
+		settings: staticSettings(nil), probeTimeout: time.Second, now: func() time.Time { return now },
+	}).runOnce(ctx, &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	rows, err := store.MappingCapabilities(ctx, "m1")
+	if err != nil {
+		t.Fatalf("mapping capabilities: %v", err)
+	}
+	image, ok := routing.CapabilityRowsByName(rows)[routing.CapabilityImage]
+	if !ok || image.Verdict != routing.CapabilityYes || image.Source != routing.CapabilitySourceSdcppCapabilities || !image.CheckedAt.Equal(now) {
+		t.Fatalf("image row = %+v (present=%v), want yes/sdcpp_capabilities at %v", image, ok, now)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 1 || paths[0] != "/sdcpp/v1/capabilities" {
+		t.Fatalf("upstream paths = %v, want exactly [/sdcpp/v1/capabilities]", paths)
 	}
 }
 
@@ -2694,6 +3148,47 @@ func TestRunAppHealthOnceNetbirdOnlySkipsOffMeshLoadedAndContextProbe(t *testing
 	if got, _ := st.mappingOf("m1"); got.ContextSize != 0 {
 		t.Fatalf("m1 ContextSize = %d, want 0 (off-mesh -> no probe -> no write)", got.ContextSize)
 	}
+}
+
+// TestRunAppHealthOnceNetbirdOnlySkipsOffMeshSdcppProbe is the sibling of the
+// test above for the stable_diffusion_cpp capability pass: under netbird_only
+// an off-mesh server's sd application is never asked for its capability
+// document, so nothing dials it. The on-mesh server's sd application is the
+// positive control -- it IS asked, and gets its row -- so a branch that asked
+// nobody would fail here too. (Mutation guard: moving the sd branch out of the
+// `if r.prober != nil && !offMesh` block makes the off-mesh app asked.)
+func TestRunAppHealthOnceNetbirdOnlySkipsOffMeshSdcppProbe(t *testing.T) {
+	shrinkRetryGap(t)
+	st := &fakeHealthStore{
+		servers: []routing.AIServer{netbirdServer("s1", false), netbirdServer("s2", true)},
+		apps: map[string][]routing.Application{
+			"s1": {sdcppApp("a1", "s1", 8001)}, // off-mesh
+			"s2": {sdcppApp("a2", "s2", 8002)}, // on-mesh
+		},
+		settings: map[string]string{"netbird_only": "true"},
+		mappings: map[string][]routing.ModelMapping{
+			"a1": {{ID: "m1", ApplicationID: "a1", GatewayModelName: "g1", AppModelName: "flux1-dev", Status: routing.ServerStatusActive}},
+			"a2": {{ID: "m2", ApplicationID: "a2", GatewayModelName: "g2", AppModelName: "flux1-dev", Status: routing.ServerStatusActive}},
+		},
+	}
+	prober := newSdcppFakeProber()
+	for _, ep := range []string{"http://s1.local:8001", "http://s2.local:8002"} {
+		prober.sdVerdicts[ep] = provider.SdcppVerdicts{Image: routing.CapabilityYes, ModelStem: "flux1-dev"}
+	}
+
+	(&appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	calls := prober.sdcppCalls()
+	if len(calls) != 1 || calls[0].Endpoint != "http://s2.local:8002" {
+		t.Fatalf("sdcpp probe targets = %+v, want exactly the on-mesh application (off-mesh must never be dialed under netbird_only)", calls)
+	}
+	if row, ok := st.capabilityOf("m1", routing.CapabilityImage); ok {
+		t.Fatalf("off-mesh m1 got an image row %+v, want none", row)
+	}
+	st.assertCapability(t, "m2", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
 }
 
 // TestRunAppHealthOnceNetbirdOnlyExcludesAlwaysReachableOffMesh proves the

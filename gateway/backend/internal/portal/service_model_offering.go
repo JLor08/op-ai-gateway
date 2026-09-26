@@ -6,12 +6,14 @@ package portal
 import (
 	"context"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"strings"
 )
 
 // ModelOffering answers the questions the unknown-model redirect asks about a
-// requested model name, for ONE API flavor. The two sets are deliberately
-// distinct, and confusing them produces a wrong redirect.
+// requested model name, for ONE API flavor and the capabilities the request
+// requires. The sets are deliberately distinct, and confusing them produces a
+// wrong redirect.
 //
 // Callable is the ACCESS set: what this token can actually route to under its
 // real name, i.e. exactly the names a direct request can succeed with. It
@@ -52,11 +54,28 @@ import (
 // (the discovery endpoints), and asking THOSE is how you ask about the listing;
 // see the visibility matrix on Service.Models in service.go.
 //
+// Capable is Callable narrowed to the names that carry EVERY capability the
+// request requires, and it answers only the redirect's CANDIDATE question. A
+// request that requires a capability (today only /v1/images/generations, which
+// requires "image") is refused by the capability gate for a model without it,
+// so a LastUsedModel or fallback outside Capable would turn a legible "unknown
+// model" into a 404 model_not_capable about a model the client never named.
+// The flavor cannot answer this: Callable for openai_images holds every model
+// of an application that declares the flavor, verdict or not. Capable is judged
+// by the listing's own image fold (imageFlagsByName, groupCapabilityFlags), the
+// rule behind ModelDTO.Image, so a name is a candidate exactly when the portal
+// lists it as generating images. With no required capability Capable is
+// Callable itself. A required capability that has no fold makes Capable empty:
+// nothing is known to carry it, so nothing is a candidate. The requested-name
+// question never asks Capable: a callable name without the capability is the
+// client's own model, and its model_not_capable answer names it.
+//
 // One caller outside the redirect uses Callable: callableModelNames, the
 // configuration-time guard for every model-valued token setting — same
 // question ("can this name be routed to directly"), same answer.
 type ModelOffering struct {
 	Callable map[string]struct{} // names this token can actually route to
+	Capable  map[string]struct{} // the Callable names carrying every required capability
 	Existing map[string]struct{} // names that exist at all for that flavor
 }
 
@@ -118,18 +137,31 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 	}
 }
 
-// ModelOfferingFor answers the two questions the unknown-model redirect asks
-// about a requested name: can this token route to it, and does it exist at all.
-// Existing deliberately ignores per-token visibility and the listing switches —
-// only then can the redirect tell "no such model" from "not yours".
+// ModelOfferingFor answers the questions the unknown-model redirect asks: can
+// this token route to a name, does the name exist at all, and does it carry
+// every capability in required (see ModelOffering.Capable). Existing
+// deliberately ignores per-token visibility and the listing switches — only
+// then can the redirect tell "no such model" from "not yours".
 //
-// ALL OR NOTHING. On any store error BOTH sets come back empty; the function
-// never returns a half-built answer. A populated Callable beside an empty
-// Existing would tell the redirect that every name this token can use is
-// simultaneously unknown, and it would redirect all of them — then hand each
-// one a perfectly good candidate to go to. Because the caller cannot
-// distinguish a partial result from a real one, the only safe partial result
-// is none.
+// ALL OR NOTHING, for the mapping/visibility/group-overlay/capability-row
+// reads this function makes directly: on a store error from any of those,
+// EVERY set comes back empty, the function never returns a half-built
+// answer. A populated Callable beside an empty Existing would tell the
+// redirect that every name this token can use is simultaneously unknown, and
+// it would redirect all of them — then hand each one a perfectly good
+// candidate to go to. Because the caller cannot distinguish a partial result
+// from a real one, the only safe partial result is none.
+//
+// ONE EXCEPTION: the per-application runtime-spec read the capability fold
+// makes for a server_agent application (RuntimeSpecsByApplication, inside
+// capableNames -> runtimeSpecFlavorsForViews) does NOT push this function to
+// the all-or-nothing empty result on failure. It degrades PER APPLICATION
+// instead — it logs and drops only that application's mappings from Capable
+// (fail-closed, mirroring the listing's own image fold), leaving Callable
+// and Existing untouched and every other application's Capable entries
+// intact. Measured with a failing RuntimeSpecsByApplication for one
+// server_agent application among several mappings:
+// Callable={agent-image, plain-image}, Capable={plain-image}.
 //
 // This is deliberately NOT the fail-open that the listing does. ModelsForFlavor
 // falls back to seedModelNames on a store error and modelFlavorSets proceeds
@@ -144,11 +176,13 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // actually served.
 //
 // Cost: one mapping traversal (activeMappingViews) and one group-overlay load,
-// both shared between the two sets — this sits on the per-request path in the
-// redirect and Service caches nothing.
-func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string) ModelOffering {
+// both shared between the sets — this sits on the per-request path in the
+// redirect and Service caches nothing. A required capability adds the image
+// fold's own reads, the same the listing makes: one batch capability read and
+// one runtime-spec read per server_agent application.
+func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string, required []string) ModelOffering {
 	if s.routes == nil {
-		return seedModelOffering(flavor)
+		return seedModelOffering(flavor, required)
 	}
 	// One traversal feeds both sets: Existing needs the unfiltered views,
 	// Callable the resource-group-filtered ones, and the filter is a pure
@@ -188,32 +222,83 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// is what keeps Callable from drifting away from what the token really
 	// reaches.
 	_, preSuppress := flavorSetsFromViews(visible, &overlay, token)
+	callable := callableNamesForFlavor(preSuppress, flavor, overlay.visByLower)
+	capable, err := s.capableNames(ctx, callable, visible, overlay, required)
+	if err != nil {
+		return emptyModelOffering()
+	}
 	return ModelOffering{
-		Callable: callableNamesForFlavor(preSuppress, flavor, overlay.visByLower),
+		Callable: callable,
+		Capable:  capable,
 		Existing: existingNamesForFlavor(views, overlay, flavor),
 	}
 }
 
-// emptyModelOffering is the ALL-OR-NOTHING store-error result: both sets empty,
+// capableNames narrows callable to the names that carry every capability in
+// required (ModelOffering.Capable). It folds over the same token-filtered views
+// the listing folds over for this token (Models() reads visibleMappingViews),
+// with the listing's own rules: imageFlagsByName for a model name, and
+// groupCapabilityFlags over the group overlay for a group name. "image" is the
+// only capability a request requires today and the only one with a fold here;
+// any other makes the result empty (fail-closed). An error is a failed store
+// read, which the caller turns into the all-or-nothing empty offering.
+func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
+	if len(required) == 0 {
+		return callable, nil
+	}
+	for _, capability := range required {
+		if capability != routing.CapabilityImage {
+			return map[string]struct{}{}, nil
+		}
+	}
+	mappingIDs := make([]string, len(views))
+	for i, view := range views {
+		mappingIDs[i] = view.mapping.ID
+	}
+	capsByMapping, err := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
+	if err != nil {
+		return nil, err
+	}
+	specFlavors, specFailed := s.runtimeSpecFlavorsForViews(ctx, views)
+	flags := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), specFlavors, specFailed)
+	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views))
+	for name, flag := range groupCapabilityFlags(entries, flags) {
+		flags[name] = flag
+	}
+	out := make(map[string]struct{})
+	for name := range callable {
+		if flags[name] {
+			out[name] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// emptyModelOffering is the ALL-OR-NOTHING store-error result: every set empty,
 // never a half-built answer. See ModelOfferingFor for why the failure direction
 // is the opposite of the listing's fail-open.
 func emptyModelOffering() ModelOffering {
-	return ModelOffering{Callable: map[string]struct{}{}, Existing: map[string]struct{}{}}
+	return ModelOffering{Callable: map[string]struct{}{}, Capable: map[string]struct{}{}, Existing: map[string]struct{}{}}
 }
 
 // seedModelOffering is the unconfigured-routing-store fallback, the one place
-// where both sets agree with the listing by construction: it mirrors
-// ModelsForFlavor's seed models so both answers match what /v1/models actually
-// served. The seeds expose every known flavor, so each is both callable and
-// existing; an unknown flavor offers nothing at all.
-func seedModelOffering(flavor string) ModelOffering {
+// where the sets agree with the listing by construction: it mirrors
+// ModelsForFlavor's seed models so the answers match what /v1/models actually
+// served. The seeds expose the text flavors (seedAPIFlavors), so on those each
+// is both callable and existing; any other flavor, openai_images included,
+// offers nothing at all. The seeds carry no capability, so with a required
+// capability none of them is Capable.
+func seedModelOffering(flavor string, required []string) ModelOffering {
 	out := emptyModelOffering()
-	if !isKnownAPIFlavor(flavor) {
+	if !isSeedAPIFlavor(flavor) {
 		return out
 	}
 	for _, name := range seedModelNames {
 		out.Callable[name] = struct{}{}
 		out.Existing[name] = struct{}{}
+	}
+	if len(required) == 0 {
+		out.Capable = out.Callable
 	}
 	return out
 }

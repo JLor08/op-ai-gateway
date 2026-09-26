@@ -190,6 +190,65 @@ func TestRoutingStoreActiveMappingsForModel(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreActiveMappingsForModelKeepsImagesAndTextApart pins the
+// candidate query's flavor match on every backend, in both directions:
+// openai_images is a coarse flavor of its own, matched exactly, so an
+// images-only application ([openai_images]) is a candidate for openai_images
+// and not for openai, and a text application ([openai]) is a candidate for
+// openai and not for openai_images. On the SQL side the match is
+// applicationServesFlavor; on MemoryStore it is applicationHasAPIFlavor.
+func TestRoutingStoreActiveMappingsForModelKeepsImagesAndTextApart(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.local", Provider: routing.ProviderVLLM,
+			Endpoint: "http://srv1.local:8000", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		for i, app := range []struct {
+			id, model string
+			flavors   []string
+		}{
+			{"app_img", "img-model", []string{routing.APIFlavorOpenAIImages}},
+			{"app_txt", "txt-model", []string{routing.APIFlavorOpenAI}},
+		} {
+			if err := s.CreateApplication(ctx, routing.Application{
+				ID: app.id, ServerID: "srv1", Type: routing.ProviderVLLM, Port: 8000 + i, Scheme: "http",
+				APIFlavors: app.flavors, Priority: 1, Weight: 1, TimeoutMS: 30000, Status: routing.ServerStatusActive,
+				HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("create application %s: %v", app.id, err)
+			}
+			if err := s.CreateMapping(ctx, routing.ModelMapping{
+				ID: "map_" + app.id, ApplicationID: app.id, GatewayModelName: app.model, AppModelName: app.model,
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("create mapping for %s: %v", app.id, err)
+			}
+		}
+		for _, tc := range []struct {
+			model, flavor string
+			want          int
+		}{
+			{"img-model", routing.APIFlavorOpenAIImages, 1},
+			{"img-model", routing.APIFlavorOpenAI, 0},
+			{"txt-model", routing.APIFlavorOpenAI, 1},
+			{"txt-model", routing.APIFlavorOpenAIImages, 0},
+		} {
+			got, err := s.ActiveMappingsForModel(ctx, tc.model, tc.flavor)
+			if err != nil {
+				t.Fatalf("ActiveMappingsForModel(%s, %s): %v", tc.model, tc.flavor, err)
+			}
+			if len(got) != tc.want {
+				t.Errorf("ActiveMappingsForModel(%s, %s) = %d candidates, want %d", tc.model, tc.flavor, len(got), tc.want)
+			}
+		}
+	})
+}
+
 // TestRoutingStoreActiveMappingsForModelReadsCapabilityVerdicts (Task 4)
 // proves ActiveMappingsForModel's filtered join (SQL) and MemoryStore's
 // mirror apply the IDENTICAL three-state-to-string boundary conversion on
@@ -1961,6 +2020,7 @@ func TestCapabilityRankCaseMatchesGoRank(t *testing.T) {
 			routing.CapabilitySourceLegacy,
 			routing.CapabilitySourceOllamaAPIShow,
 			routing.CapabilitySourceLlamaCppTimings,
+			routing.CapabilitySourceSdcppCapabilities,
 			"",
 			"some-future-unknown-source",
 		} {

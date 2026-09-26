@@ -14,8 +14,9 @@ import (
 // redirect only ever sees what neither of them claimed.
 //
 // The chain: the token's last successfully routed model, but only while it is
-// still offered for this flavor; then the configured fallback, under the same
-// condition; then nothing, which leaves today's error untouched.
+// still offered for this flavor and carries every capability the request
+// requires; then the configured fallback, under the same condition; then
+// nothing, which leaves today's error untouched.
 //
 // "Does not apply" is deliberately narrow by default: only a name that does not
 // exist at all. A model that exists but this token may not use is a refusal,
@@ -58,11 +59,25 @@ func redirectUnknownModel(token auth.Token, requested string, off portal.ModelOf
 		if candidate == "" {
 			continue
 		}
-		if callableFor(token, off, candidate) {
+		if candidateFor(token, off, candidate) {
 			return candidate
 		}
 	}
 	return ""
+}
+
+// candidateFor is callableFor narrowed by the capabilities the request
+// requires (ModelOffering.Capable): a candidate the capability gate would
+// refuse fails the very next gate just as an allowlist-blocked one does, and
+// the client would get a 404 model_not_capable naming a model it never sent.
+// Only the candidate half asks it. A requested name that is callable but lacks
+// the capability keeps its model, since the refusal then names the client's
+// own model.
+func candidateFor(token auth.Token, off portal.ModelOffering, name string) bool {
+	if _, ok := off.Capable[name]; !ok {
+		return false
+	}
+	return callableFor(token, off, name)
 }
 
 // callableFor answers "can a direct request from THIS token for `name` succeed"

@@ -983,8 +983,9 @@ by shape, so tests pin both:
      is `Target.LiveProgressSpecType`; `Target.Provider` holds the literal
      `server_agent` there and is the wrong field to read;
   3. the request is the **Responses** flavor — the *fine* flavor, taken as a
-     parameter, because `Target.APIFlavor` is the coarse `openai`/`anthropic` one
-     and cannot tell `/v1/responses` from `/v1/chat/completions`;
+     parameter, because `Target.APIFlavor` is the coarse one (`openai`,
+     `anthropic` or `openai_images`) and cannot tell `/v1/responses` from
+     `/v1/chat/completions`;
   4. the request is **streaming** — a buffered body has no partial frames to
      time, and gets no live counter either;
   5. the stored live-progress verdict is not an explicit `"unsupported"`.
@@ -1186,9 +1187,9 @@ It cannot be a correctness gate on its own, because an application **type
 does not imply the upstream's request schema**. `server_agent` is not an
 inference server at all: what actually serves is whatever
 `routing.EffectiveRuntimeSpecType` resolves the child's launch spec to (`"" |
-vllm | llama_cpp | tgi | ollama | custom`, auto-detected from the launched
-binary's basename when the spec leaves `Type` at its pre-feature default
-`""`). So the shape clause tests a `server_agent` target against *that*
+vllm | llama_cpp | tgi | ollama | stable_diffusion_cpp | custom`, auto-detected
+from the launched binary's basename when the spec leaves `Type` at its
+pre-feature default `""`). So the shape clause tests a `server_agent` target against *that*
 resolved value (`Target.LiveProgressSpecType`, filled by `targetFrom` at no
 extra store cost), never against `Target.Provider` — which for a
 `server_agent` mapping is always the literal string `"server_agent"` and says
@@ -1659,12 +1660,14 @@ And the agent router's `GET`-only `/upstream/{model}/props` allowlist was
 Ollama child without it.
 
 **Persistence is one row per capability, with a provenance rank where the
-columns had a lock.** Every verdict either capability detector yields is a
+columns had a lock.** Every verdict a capability probe yields — off
+llama.cpp's `/props`, Ollama's `/api/show` or stable-diffusion.cpp's
+`/sdcpp/v1/capabilities` — is a
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
 §4](../reference/data-model.md#4-migration-history-81-migrations)). The four
-names the detector itself reads are `vision`/`video`/`audio`/`tools`; every
+names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
 upstream vocabulary needs no `cap_extra` array beside four real columns any
@@ -1672,11 +1675,11 @@ more. A verdict of `""` produces **no row at
 all**, and the absence of a row is what UNKNOWN means — which is why a partial
 answer (an older llama.cpp reporting `modalities` but no
 `chat_template_caps`) cannot clear a `tools` verdict a previous probe
-established: there is no empty verdict for it to write. There are **two
+established: there is no empty verdict for it to write. There are **three
 probe write paths**, each stamping the row's `source` with the probe that
 produced the document plus the observation time as `checked_at`, and naming
 them individually is the point — a rule about capability provenance has to be
-placed on both, or on the one that carries the risk, and that is a decision
+placed on all three, or on the ones that carry the risk, and that is a decision
 nobody can make from a count:
 
 - **The gateway's own `/props` pass** (`cmd/gateway/app_health.go`). The
@@ -1685,10 +1688,20 @@ nobody can make from a count:
   `PickModelLiveProgressSupport` on the `{model}` per-model branch,
   `info.Caps`/`info.LiveProgressSupport` directly on the single-probe branch
   — and hands both to `applyCapabilityWrite`, which goes
-  `probedCapabilityRows` → `routing.WritableCapabilityRows` →
+  `probedCapabilityRows` → `writeCapabilityRows` →
+  `routing.WritableCapabilityRows` →
   `routing.MappingStore.UpsertMappingCapabilities`. `probedCapabilityRows`
   **hard-codes** `source = llama_cpp_props`: this path can stamp nothing
-  else, because the gateway probes only llama.cpp's `/props`.
+  else, because the only document it reads is llama.cpp's `/props`.
+- **The gateway's own stable-diffusion.cpp pass** (`probeSdcppCapabilities`,
+  same file), for each active **external** `stable_diffusion_cpp`
+  application: `GET /sdcpp/v1/capabilities`, projected by
+  `sdcppCapabilityRows` into at most one `image` row with
+  `source = sdcpp_capabilities` — a real `no` when the exhaustive
+  `supported_modes` list lacks `img_gen` — and written through the same
+  `writeCapabilityRows`, so every guard below applies unchanged. Attribution
+  and the rest of its rules are in [Routing & Model Selection
+  §2.3](routing-and-model-selection.md#23-the-capability-gate).
 - **The agent's telemetry ingest**
   (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
   `runtimeSampleCapabilityRows`). It stamps whichever of
@@ -1696,9 +1709,9 @@ nobody can make from a count:
   the agent probes both kinds of child and only its report says which
   document a verdict came off.
 
-Both translate a live-progress verdict through the one
-`routing.LiveProgressCapabilityVerdict`, and both ask the one
-`routing.WritableCapabilityRows` — which is how the two cannot drift apart on
+The `/props` pass and the ingest both translate a live-progress verdict
+through the one `routing.LiveProgressCapabilityVerdict`, and all three ask the
+one `routing.WritableCapabilityRows` — which is how they cannot drift apart on
 the rules they share (`agent_ingest.go` names its sibling explicitly, and so
 does `probedCapabilityRows`).
 
@@ -1760,7 +1773,7 @@ alone. Four of the five cases therefore lose nothing:
 
 | upstream | did a manual `"no"` buy anything? |
 |---|---|
-| off the shape clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `custom`) | **no** — no row already means "do not send" |
+| off the shape clause (`llama_swap`, `litellm`, `tgi`, `ollama`, `stable_diffusion_cpp`, `custom`) | **no** — no row already means "do not send" |
 | `vllm` | **no** — it tolerates both parameters, so it has nothing to refuse |
 | `llama_cpp` that refuses, **with** a probe path | **no** — the `/props` detector writes `"unsupported"` itself, at rank 1 |
 | `llama_cpp` that refuses, **without** a probe path (the portal default) | **yes** — the only durable opt-out |
@@ -1898,13 +1911,14 @@ binary underneath the mapping. The full rule, including why an unrecognised
 source ranks as a probe rather than as a human, is
 [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped).
 
-**Both write paths write ONE row set, and share what matters rather than a
-guard list.** The runtimes cap and per-`spec_id`
+**The ingest side and the app-health side write ONE row set, and share what
+matters rather than a guard list.** The runtimes cap and per-`spec_id`
 ownership resolution with the same cross-server rejection exist ONLY on the
 ingest path, because that path alone is handed a wire-supplied `spec_id`
-with no other verification; `applyCapabilityWrite` needs neither guard,
-since app-health resolves the mapping itself by iterating its own
-applications rather than trusting a field an agent supplied. What the two
+with no other verification; app-health's `writeCapabilityRows` (behind both of
+its passes) needs neither guard, since app-health resolves the mapping itself
+by iterating its own applications rather than trusting a field an agent
+supplied. What the two
 DO genuinely share: best-effort so a write failure never rejects the sample
 (or, on the app-health side, the probe pass); the shared
 `WritableCapabilityRows` gate — the rank first, then compare-to-stored — so an

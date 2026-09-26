@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1044,13 +1045,20 @@ func performChatCompletionForModel(t *testing.T, handler http.Handler, token str
 func TestProviderClientsWireModelListerForEveryApplicationType(t *testing.T) {
 	mux := providerClients(0, false, nil)
 
+	var mu sync.Mutex
+	var gotPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath = r.URL.Path
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/models":
 			_, _ = w.Write([]byte(`{"data":[{"id":"m1"}]}`))
 		case "/api/tags":
 			_, _ = w.Write([]byte(`{"models":[{"name":"m1"}]}`))
+		case "/sdapi/v1/sd-models":
+			_, _ = w.Write([]byte(`[{"model_name":"m1"}]`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -1059,26 +1067,51 @@ func TestProviderClientsWireModelListerForEveryApplicationType(t *testing.T) {
 
 	// Every application type selectable in the drill-down UI must be wired to a
 	// functioning ModelLister so SyncApplicationModels works against a reachable
-	// upstream. Mock is exercised elsewhere; this guards the real client seam.
-	// server_agent (Task 10) dispatches through the same OpenAI-compatible
-	// client as vllm/llama_cpp/llama_swap/litellm -- the agent-managed
-	// runtime's router port speaks that dialect.
-	types := []string{
-		routing.ProviderOllama,
-		routing.ProviderVLLM,
-		routing.ProviderLlamaCPP,
-		routing.ProviderLlamaSwap,
-		routing.ProviderLiteLLM,
-		routing.ProviderServerAgent,
+	// upstream, AND to the client its dialect actually requires. The upstream
+	// above answers both /v1/models (OpenAI-compatible) and /api/tags (ollama)
+	// so that a merely-non-empty-result check cannot tell the two clients
+	// apart; wantPath below is the assertion that actually distinguishes them,
+	// by pinning which path each type's real client must hit. Mock is
+	// exercised elsewhere; this guards the real client seam.
+	// server_agent (Task 10) and stable_diffusion_cpp both dispatch through
+	// the same OpenAI-compatible client as vllm/llama_cpp/llama_swap/litellm --
+	// stable_diffusion_cpp must NOT be wired to the ollama client (the one
+	// type that does not implement provider.NativeProxyClient), and wantPath
+	// is what catches that if it ever regresses. stable_diffusion_cpp discovers
+	// from /sdapi/v1/sd-models, derived from its type in
+	// provider.modelDiscoveryFor, because its /v1/models reports only a
+	// placeholder.
+	tests := []struct {
+		providerType string
+		wantPath     string
+	}{
+		{routing.ProviderOllama, "/api/tags"},
+		{routing.ProviderVLLM, "/v1/models"},
+		{routing.ProviderLlamaCPP, "/v1/models"},
+		{routing.ProviderLlamaSwap, "/v1/models"},
+		{routing.ProviderLiteLLM, "/v1/models"},
+		{routing.ProviderServerAgent, "/v1/models"},
+		{routing.ProviderStableDiffusionCpp, "/sdapi/v1/sd-models"},
 	}
-	for _, providerType := range types {
-		t.Run(providerType, func(t *testing.T) {
-			models, err := mux.ListModels(context.Background(), routing.Target{Provider: providerType, Endpoint: upstream.URL})
+	for _, tc := range tests {
+		t.Run(tc.providerType, func(t *testing.T) {
+			mu.Lock()
+			gotPath = ""
+			mu.Unlock()
+
+			models, err := mux.ListModels(context.Background(), routing.Target{Provider: tc.providerType, Endpoint: upstream.URL})
 			if err != nil {
-				t.Fatalf("ListModels(%q) error = %v, want nil", providerType, err)
+				t.Fatalf("ListModels(%q) error = %v, want nil", tc.providerType, err)
 			}
 			if len(models) == 0 {
-				t.Fatalf("ListModels(%q) returned empty model list", providerType)
+				t.Fatalf("ListModels(%q) returned empty model list", tc.providerType)
+			}
+
+			mu.Lock()
+			path := gotPath
+			mu.Unlock()
+			if path != tc.wantPath {
+				t.Fatalf("ListModels(%q) hit %s, want %s (wrong client wired in the provider map)", tc.providerType, path, tc.wantPath)
 			}
 		})
 	}

@@ -84,7 +84,7 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
-	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, custom (or empty for auto)"},
+	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, stable_diffusion_cpp, custom (or empty for auto)"},
 	// The one row in this table with a dynamic message. The service wraps the
 	// sentinel with the offending EFFECTIVE kind (fmt.Errorf("%w: ...")), and
 	// naming it is the entire point of refusing the write instead of storing

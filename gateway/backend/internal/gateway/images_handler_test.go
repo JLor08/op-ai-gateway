@@ -120,6 +120,17 @@ func TestImagesUsageRowCarriesItsOwnPath(t *testing.T) {
 	if got.BillingUnit != usage.BillingUnitImage {
 		t.Fatalf("BillingUnit = %q on the refusal path, want %q", got.BillingUnit, usage.BillingUnitImage)
 	}
+	// This is the resolve-failure branch recordImagesRoutingFailure covers
+	// (relayImages' own resolveTarget error, routing.ErrModelNotCapable here) --
+	// pin HTTPStatus and Status too, so a later change to that shared helper
+	// cannot silently alter what it records for a plain resolve failure
+	// without a test noticing.
+	if got.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("HTTPStatus = %d, want %d", got.HTTPStatus, http.StatusNotFound)
+	}
+	if got.Status != "error" {
+		t.Fatalf("Status = %q, want %q", got.Status, "error")
+	}
 }
 
 // sd-server returns {"error": "<plain string>"}, not OpenAI's
@@ -173,6 +184,10 @@ func TestNormalizeImagesUnrecognisedBody(t *testing.T) {
 // of this helper: it is what lets TestImagesRelayNormalisesUpstreamErrorOverHTTP
 // prove the wiring end to end rather than only prove normalizeImagesUpstreamError
 // as a pure function.
+//
+// APIFlavors carries APIFlavorOpenAIImages alongside APIFlavorOpenAI: since
+// NormalizeAPIFlavor no longer folds openai_images into openai, an application
+// must opt into the images flavor explicitly to be an image candidate at all.
 func newImagesHTTPTestServer(t *testing.T, upstreamURL string) *Server {
 	t.Helper()
 	tokens := auth.NewTokenStore()
@@ -201,7 +216,7 @@ func newImagesHTTPTestServer(t *testing.T, upstreamURL string) *Server {
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-images", Name: "Image Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-images", ServerID: "srv-images", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-images", ServerID: "srv-images", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-images", ApplicationID: "app-images", GatewayModelName: "gw-image-model", AppModelName: "upstream-image-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -301,7 +316,7 @@ func newImageCapableTestServer(t *testing.T, upstreamURL string) *Server {
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo", Name: "SD Turbo Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo", ApplicationID: "app-sd-turbo", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -352,7 +367,7 @@ func newImageCapableLoopbackTestServer(t *testing.T, upstreamURL string) (*Serve
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo", Name: "SD Turbo Upstream", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: upstreamURL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo", ServerID: "srv-sd-turbo", Type: routing.ProviderVLLM, Port: port, Scheme: up.Scheme, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo", ApplicationID: "app-sd-turbo", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -616,7 +631,7 @@ func newImageCapableTestServerWithProvider(t *testing.T, prov provider.Client) *
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-sd-turbo-fake", Name: "SD Turbo Fake", Domain: "sd-turbo.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://sd-turbo.example.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo-fake", ServerID: "srv-sd-turbo-fake", Type: routing.ProviderVLLM, Port: 80, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-sd-turbo-fake", ServerID: "srv-sd-turbo-fake", Type: routing.ProviderVLLM, Port: 80, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-sd-turbo-fake", ApplicationID: "app-sd-turbo-fake", GatewayModelName: "sd-turbo", AppModelName: "sd-turbo", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -834,4 +849,253 @@ func TestImagesRunAsWithoutPortalIsRefused(t *testing.T) {
 		t.Fatalf("status = %d body = %s, want 403", w.Code, w.Body.String())
 	}
 	requireErrorCode(t, w.Body.String(), "portal.token_forbidden")
+}
+
+// newServerAgentImagesSpecTestServer seeds a server_agent application that
+// candidacy ADMITS for images (app-level flavors include openai_images, and
+// the mapping carries image:yes), whose mapping's runtime spec carries
+// specFlavors. The spec is the per-model authority for a server_agent mapping
+// (routing.Resolver.targetFrom), known only post-resolve -- so whether the
+// request is served is decided by the relay's effective-flavor check alone.
+func newServerAgentImagesSpecTestServer(t *testing.T, prov provider.Client, specFlavors []string) *Server {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin"]`, CreatedAt: now, UpdatedAt: now}, "dev-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	ctx := context.Background()
+	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-agent-images", Name: "Agent Images", Domain: "agent-images.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://agent-images.example.test:8081", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-agent-images", ServerID: "srv-agent-images", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 600000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-agent-images", ApplicationID: "app-agent-images", GatewayModelName: "flux1-dev", AppModelName: "flux1-dev", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := routeStore.UpsertMappingCapabilities(ctx, "route-agent-images", []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-images", MappingID: "route-agent-images", APIFlavors: specFlavors, ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModeDisabled, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-agent-images", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	return New(ServerDeps{
+		Tokens:   tokens,
+		Usage:    recorder,
+		Provider: prov,
+		Routes:   routeStore,
+		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+	})
+}
+
+// TestImagesRefusesServerAgentChildWhoseSpecExcludesImages covers the
+// agent-managed case. Candidacy gates a server_agent application on its own
+// app-level flavors, so a spec that narrows its model to text only is honoured
+// nowhere on the images path unless relayImages checks it -- tryProxyNative's
+// equivalent check is gated on the coding-agent endpoints, and relayImages
+// does not go through it. The refusal looks like candidacy's own no-route
+// answer when this was the ONLY route for the model, as it is here (same
+// code, same status) -- it is NOT retried against a sibling application that
+// might still serve the request, the same limitation tryProxyNative's own
+// equivalent check carries for the coding-agent endpoints; see relayImages'
+// comment at the flavor check for that follow-up.
+func TestImagesRefusesServerAgentChildWhoseSpecExcludesImages(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: `{"created":1,"data":[{"b64_json":"AA=="}]}`}
+	srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI})
+
+	rec := postImages(t, srv, `{"model":"flux1-dev","prompt":"a cat","n":1}`)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0 -- a text-only spec must never be sent an image request", prov.proxyCalls)
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 || events[0].ErrorCode != "routing.no_model_route" || events[0].BillingUnit != usage.BillingUnitImage {
+		t.Fatalf("usage events = %+v, want one routing.no_model_route error billed as image", events)
+	}
+	// This refusal never reaches proxyNative (proxyCalls == 0 above), so no
+	// upstream call was ever made -- the row must record that, the same way
+	// every other resolve-failure row on this path does. upstreamPath's own
+	// doc comment reserves "" for exactly this case, and a populated
+	// Host/RouteID/ProviderPath would both misreport a call that never
+	// happened and make the energy reconciler price + count this row against
+	// a server it never touched.
+	got := events[0]
+	if got.Host != "" || got.RouteID != "" || got.ProviderPath != "" {
+		t.Fatalf("usage row = %+v, want Host/RouteID/ProviderPath all empty -- no upstream call was ever made", got)
+	}
+	if got.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("HTTPStatus = %d, want %d", got.HTTPStatus, http.StatusNotFound)
+	}
+}
+
+// TestImagesServesServerAgentChildWhoseSpecIncludesImages is the positive
+// control for the test above: the same fixture with a spec that lists
+// openai_images is served. Without it, the refusal above could come from
+// anything in the fixture rather than from the flavor check.
+func TestImagesServesServerAgentChildWhoseSpecIncludesImages(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: `{"created":1,"data":[{"b64_json":"AA=="}]}`}
+	srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages})
+
+	rec := postImages(t, srv, `{"model":"flux1-dev","prompt":"a cat","n":1}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 {
+		t.Fatalf("ProxyNative calls = %d, want 1", prov.proxyCalls)
+	}
+}
+
+// newRedirectingTestServer builds an images server whose dev token is opted in
+// to the unknown-model redirect with the given LastUsedModel and fallback.
+// Three models are routable for an images request, one per shape the redirect
+// has to tell apart:
+//
+//   - qwen-coder (seedGatewayTestRoutes): its application declares
+//     openai_images beside the two text flavors, and the mapping carries NO
+//     image verdict -- callable for the images flavor, refused by the
+//     capability gate.
+//   - sd-turbo: the same mixed flavors, and an image=yes verdict.
+//   - flux1-dev: an images-only application ([openai_images]), image=yes --
+//     the stable-diffusion.cpp shape.
+func newRedirectingTestServer(t *testing.T, prov provider.Client, lastUsed, fallback string) *Server {
+	t.Helper()
+	tokens := auth.NewTokenStore()
+	directory := portal.NewMemoryDirectory(tokens)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	directory.AddUser(store.User{ID: "usr_dev", Email: "dev@example.test", DisplayName: "Dev User", Role: "admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{
+		ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive,
+		Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		UnknownModelRedirect: true, LastUsedModel: lastUsed, UnknownModelFallback: fallback,
+	}, "dev-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	seedGatewayTestRoutes(routeStore, now)
+	ctx := context.Background()
+	seedImageModel := func(id, gatewayModel string, flavors []string) {
+		t.Helper()
+		if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-" + id, Name: id, Domain: id + ".example.test", Provider: routing.ProviderVLLM, Endpoint: "http://" + id + ".example.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer %s: %v", id, err)
+		}
+		if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-" + id, ServerID: "srv-" + id, Type: routing.ProviderVLLM, Port: 80, Scheme: "http", APIFlavors: flavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication %s: %v", id, err)
+		}
+		if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-" + id, ApplicationID: "app-" + id, GatewayModelName: gatewayModel, AppModelName: gatewayModel, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", id, err)
+		}
+		if err := routeStore.UpsertMappingCapabilities(ctx, "route-"+id, []routing.CapabilityRow{{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes, Source: "manual", CheckedAt: now}}); err != nil {
+			t.Fatalf("UpsertMappingCapabilities %s: %v", id, err)
+		}
+		if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-" + id, ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertTelemetry %s: %v", id, err)
+		}
+	}
+	seedImageModel("sd-turbo", "sd-turbo", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages})
+	seedImageModel("flux", "flux1-dev", []string{routing.APIFlavorOpenAIImages})
+	return New(ServerDeps{
+		Tokens:   tokens,
+		Usage:    recorder,
+		Provider: prov,
+		Routes:   routeStore,
+		Portal:   portal.NewService(portal.ServiceDeps{Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore, Clock: func() time.Time { return now }, ModelLister: provider.NewMock()}),
+	})
+}
+
+// imagesRelayResponse is a minimal successful sd-server answer.
+const imagesRelayResponse = `{"created":1,"data":[{"b64_json":"AA=="}]}`
+
+// requireRedirectedImagesRequest asserts that an images request for an unknown
+// model was redirected to want and served there: 200, one upstream call, and a
+// usage row whose effective Model is want while RequestedModel keeps the
+// client's own name.
+func requireRedirectedImagesRequest(t *testing.T, srv *Server, prov *recordingProxyProvider, rec *httptest.ResponseRecorder, requested, want string) {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (redirected to %s); body = %s", rec.Code, want, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 {
+		t.Fatalf("ProxyNative calls = %d, want 1", prov.proxyCalls)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Model != want || got.RequestedModel != requested {
+		t.Fatalf("usage Model/RequestedModel = %q/%q, want %q/%q", got.Model, got.RequestedModel, want, requested)
+	}
+}
+
+// An images request for a name that does not exist is redirected when the
+// token's fallback is a model that carries the image capability: a client that
+// hardcodes dall-e-3 against a token dedicated to images is served by the
+// fallback, exactly as for a text request.
+func TestImagesRedirectsAnUnknownModelToAnImageCapableFallback(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: imagesRelayResponse}
+	srv := newRedirectingTestServer(t, prov, "", "sd-turbo")
+
+	rec := postImages(t, srv, `{"model":"dall-e-3","prompt":"a cat","n":1}`)
+
+	requireRedirectedImagesRequest(t, srv, prov, rec, "dall-e-3", "sd-turbo")
+}
+
+// The token's last-used model is the first candidate, and an images-only model
+// (whose application declares openai_images alone) qualifies like any other
+// image-capable model.
+func TestImagesRedirectsAnUnknownModelToAnImagesOnlyLastUsedModel(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: imagesRelayResponse}
+	srv := newRedirectingTestServer(t, prov, "flux1-dev", "sd-turbo")
+
+	rec := postImages(t, srv, `{"model":"dall-e-3","prompt":"a cat","n":1}`)
+
+	requireRedirectedImagesRequest(t, srv, prov, rec, "dall-e-3", "flux1-dev")
+}
+
+// A candidate that lacks the image capability is skipped, not taken: the chain
+// moves on to the next candidate. A token used for chat as well as images has a
+// text model as its last-used model most of the time; taking it would answer
+// 404 model_not_capable about a model the client never named.
+func TestImagesRedirectSkipsALastUsedModelWithoutTheImageCapability(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: imagesRelayResponse}
+	srv := newRedirectingTestServer(t, prov, "qwen-coder", "flux1-dev")
+
+	rec := postImages(t, srv, `{"model":"dall-e-3","prompt":"a cat","n":1}`)
+
+	requireRedirectedImagesRequest(t, srv, prov, rec, "dall-e-3", "flux1-dev")
+}
+
+// With no candidate that carries the image capability, the redirect declines
+// and the client gets the ordinary unknown-model answer for the name it sent.
+// The fallback here, qwen-coder, is callable for the images flavor (its
+// application declares openai_images) but has no image verdict, so the
+// capability gate would refuse it -- a 404 model_not_capable about a model the
+// client never named, which is the outcome callableFor's contract calls a
+// defect.
+func TestImagesDoesNotRedirectAnUnknownModelToAFallbackWithoutTheImageCapability(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: imagesRelayResponse}
+	srv := newRedirectingTestServer(t, prov, "", "qwen-coder")
+
+	rec := postImages(t, srv, `{"model":"no-such-model","prompt":"a cat","n":1}`)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+	if got := lastUsageEvent(t, srv).Model; got != "no-such-model" {
+		t.Fatalf("usage Model = %q, want the client's own no-such-model (no redirect)", got)
+	}
+	if prov.proxyCalls != 0 {
+		t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+	}
 }

@@ -2,15 +2,20 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { Checkbox, FormControlLabel, Typography } from '@mui/material';
+import type { Ref } from 'react';
 import { CheckboxGroup } from './CheckboxGroup';
 import { SelectField } from './SelectField';
 import type { EndpointMode } from '../../api';
 import { liveTimingsControlLayout, type LiveTimingsKind } from './liveTimings';
 import type { Translation } from './types';
 
-// The two base API-Varianten capability checkboxes. openai gates /v1/responses
-// (Codex) AND /v1/chat/completions; anthropic gates /v1/messages (Claude Code).
-const apiVariantFlavorOptions = ['openai', 'anthropic'];
+// The API-Varianten capability checkboxes. openai gates /v1/responses (Codex)
+// AND /v1/chat/completions; anthropic gates /v1/messages (Claude Code);
+// openai_images gates /v1/images/generations. The last is a coarse flavor of
+// its own with no endpoint-mode dropdown (images have no translate path to
+// choose), and it is opt-in: nothing here ticks it -- only the
+// stable_diffusion_cpp type default and an operator do.
+const apiVariantFlavorOptions = ['openai', 'anthropic', 'openai_images'];
 const endpointModeOptions: EndpointMode[] = ['disabled', 'translate', 'passthrough'];
 
 const endpointModeLabelByKey: Record<
@@ -27,8 +32,9 @@ function toggleFlavor(list: string[], flavor: string): string[] {
 }
 
 /**
- * The shared "API-Varianten" control block: the openai/anthropic capability
- * checkboxes plus one three-state endpoint-mode dropdown per coding-agent API.
+ * The shared "API-Varianten" control block: the openai/anthropic/openai_images
+ * capability checkboxes plus one three-state endpoint-mode dropdown per
+ * coding-agent API.
  * Both ApplicationSection and RuntimeAdminSection render it, so the two forms
  * stay identical (design §5.1).
  *
@@ -47,6 +53,8 @@ export function ApiVariantControls({
   onResponsesModeChange,
   onMessagesModeChange,
   onLiveTimingsChange,
+  flavorsError,
+  flavorsGroupRef,
 }: Readonly<{
   t: Translation;
   apiFlavors: string[];
@@ -63,6 +71,13 @@ export function ApiVariantControls({
   onResponsesModeChange: (mode: EndpointMode) => void;
   onMessagesModeChange: (mode: EndpointMode) => void;
   onLiveTimingsChange: (enabled: boolean) => void;
+  // A validation message for the flavor group, or undefined for none. The
+  // CALLER decides whether an empty selection is an error: the application
+  // form refuses it, the launch-spec form does not.
+  flavorsError?: string;
+  // The flavor group's fieldset, for a caller that moves focus to it when it
+  // refuses a save over the flavors (see CheckboxGroup's groupRef).
+  flavorsGroupRef?: Ref<HTMLFieldSetElement>;
 }>) {
   const openaiEnabled = apiFlavors.includes('openai');
   const anthropicEnabled = apiFlavors.includes('anthropic');
@@ -73,9 +88,14 @@ export function ApiVariantControls({
     <>
       <CheckboxGroup
         legend={t.applicationFlavors}
-        options={apiVariantFlavorOptions.map((f) => ({ value: f, label: f }))}
+        options={apiVariantFlavorOptions.map((f) => ({
+          value: f,
+          label: f === 'openai_images' ? t.applicationFlavorOpenaiImages : f,
+        }))}
         selected={apiFlavors}
         onToggle={(v) => onFlavorsChange(toggleFlavor(apiFlavors, v))}
+        error={flavorsError}
+        groupRef={flavorsGroupRef}
       />
       <SelectField
         id="application-responses-mode"

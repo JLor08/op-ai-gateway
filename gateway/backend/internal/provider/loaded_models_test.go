@@ -88,3 +88,23 @@ func TestFetchLoadedModels(t *testing.T) {
 		}
 	})
 }
+
+// TestParseLoadedModelsSdcpp uses the real /sdapi/v1/sd-models body measured
+// from a stable-diffusion.cpp server. It is the LOADED probe's reading of that
+// endpoint; discovery reads the same endpoint with a strict decoder (see
+// TestListModelsStableDiffusionCppFailsClosed) but the same name extraction.
+func TestParseLoadedModelsSdcpp(t *testing.T) {
+	body := []byte(`[{"config":null,"filename":"flux1-dev.safetensors","hash":"8888888888","model_name":"flux1-dev","sha256":"88","title":"flux1-dev"}]`)
+	got := parseLoadedModels(body, "sdcpp_models")
+	if len(got) != 1 || got[0] != "flux1-dev" {
+		t.Fatalf("parseLoadedModels = %v, want [flux1-dev]", got)
+	}
+
+	// Tolerance, matching this file's documented contract: an unexpected shape
+	// yields no models rather than an error, so a probe never breaks over one.
+	for _, junk := range []string{`{}`, `[]`, `not json`, `[{"filename":"x.safetensors"}]`} {
+		if got := parseLoadedModels([]byte(junk), "sdcpp_models"); len(got) != 0 {
+			t.Errorf("parseLoadedModels(%q) = %v, want empty", junk, got)
+		}
+	}
+}

@@ -70,6 +70,46 @@ func TestRuntimeSpecType_Effective(t *testing.T) {
 	}
 }
 
+// TestRuntimeSpecTypeStableDiffusionCpp covers detection from the binary when
+// the operator sets no type, and the per-kind probe paths. An sd-server
+// serves neither a Prometheus /metrics nor llama.cpp's /props, so both
+// defaults must be empty rather than inherited.
+func TestRuntimeSpecTypeStableDiffusionCpp(t *testing.T) {
+	for _, binary := range []string{"sd-server", "/opt/sd/sd-server", `C:\sd\sd-server.exe`, "stable-diffusion-server", "SD-Server"} {
+		if got := DetectRuntimeSpecType(binary); got != RuntimeSpecTypeStableDiffusionCpp {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", binary, got, RuntimeSpecTypeStableDiffusionCpp)
+		}
+	}
+	// Existing detections must not shift. The last two are near-miss
+	// negatives, guarding against an over-broad match: "whisper-server" ends
+	// in "server" but is not an "sd-server", and "sdkmanager" starts with
+	// "sd" but is not "sd-server"/"stable-diffusion" either. A mutation
+	// widening the match to Contains(name, "server") or Contains(name, "sd")
+	// must fail one of these two rows.
+	for binary, want := range map[string]RuntimeSpecType{
+		"/usr/bin/llama-server":    RuntimeSpecTypeLlamaCpp,
+		"/usr/bin/vllm":            RuntimeSpecTypeVLLM,
+		"text-generation-launcher": RuntimeSpecTypeTGI,
+		"/usr/local/bin/ollama":    RuntimeSpecTypeOllama,
+		"/usr/bin/something":       RuntimeSpecTypeCustom,
+		"/usr/bin/whisper-server":  RuntimeSpecTypeCustom,
+		"/opt/tools/sdkmanager":    RuntimeSpecTypeCustom,
+	} {
+		if got := DetectRuntimeSpecType(binary); got != want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", binary, got, want)
+		}
+	}
+
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeStableDiffusionCpp, "", "")
+	if metrics != "" || context != "" {
+		t.Fatalf("probe paths = (%q, %q), want both empty", metrics, context)
+	}
+	// An explicit override still wins, as for every other type.
+	if m, c := DeriveProbePaths(RuntimeSpecTypeStableDiffusionCpp, "/m", "/c"); m != "/m" || c != "/c" {
+		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
+	}
+}
+
 func TestRuntimeSpecType_DeriveProbePaths(t *testing.T) {
 	cases := []struct {
 		name            string
