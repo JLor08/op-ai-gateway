@@ -45,8 +45,18 @@ const applicationTypeOptions: ApplicationType[] = [
   'llama_swap',
   'litellm',
   'server_agent',
+  'stable_diffusion_cpp',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
+// Seeds a fresh create form's flavor checkboxes (openCreate always starts
+// from ollama or server_agent, never stable_diffusion_cpp -- see
+// managedRuntimeOnly below -- so this pair is that seed, not a master list of
+// every valid flavor). 'openai_images' is deliberately NOT added here: it is
+// opt-in everywhere, and seeding it would make every freshly created
+// application, of any type, an image candidate. An operator ticks its own
+// checkbox (ApiVariantControls), and stable_diffusion_cpp gets it from
+// applicationTypeDefaults.apiFlavors via handleTypeChange, the moment the
+// type select is switched to it.
 const applicationFlavorOptions = ['openai', 'anthropic'];
 
 // Three states, not two. The previous binary derivation rendered four
@@ -208,6 +218,22 @@ export function ApplicationSection({
   const [port, setPort] = useState(11434);
   const [scheme, setScheme] = useState<ApplicationScheme>('http');
   const [flavors, setFlavors] = useState<string[]>([...applicationFlavorOptions]);
+  // Whether the flavor group has been touched in this form session -- ticked
+  // or unticked, or a save refused over it. An empty selection is shown as an
+  // error only then, so an old row loaded with [] opens without one; the
+  // refusal itself (flavorsMissing, at submit) does not depend on it.
+  const [flavorsTouched, setFlavorsTouched] = useState(false);
+  // A refused save must be perceivable, not just a button that does nothing:
+  // each refusal moves focus to the flavor group, whose description is the
+  // reason. Counted rather than flagged so a second refusal refocuses, and
+  // applied in an effect so focus lands after the message has rendered and
+  // is wired to the group -- focusing first would announce the group without
+  // it.
+  const flavorsGroupRef = useRef<HTMLFieldSetElement>(null);
+  const [flavorRefusals, setFlavorRefusals] = useState(0);
+  useEffect(() => {
+    if (flavorRefusals > 0) flavorsGroupRef.current?.focus();
+  }, [flavorRefusals]);
   const [status, setStatus] = useState<ApplicationStatus>('active');
   const [priority, setPriority] = useState(0);
   const [weight, setWeight] = useState(0);
@@ -300,6 +326,7 @@ export function ApplicationSection({
     setPort(d.port);
     setScheme(d.scheme);
     setFlavors([...applicationFlavorOptions]);
+    setFlavorsTouched(false);
     setStatus('active');
     setPriority(0);
     setWeight(0);
@@ -338,6 +365,8 @@ export function ApplicationSection({
       loadedModelsFormat,
       contextProbePath,
       timeoutMs,
+      healthCheckMode: healthMode,
+      apiFlavors: flavors,
     });
     if (patch.port !== undefined) setPort(patch.port);
     if (patch.scheme !== undefined) setScheme(patch.scheme);
@@ -347,6 +376,8 @@ export function ApplicationSection({
     if (patch.loadedModelsFormat !== undefined) setLoadedModelsFormat(patch.loadedModelsFormat);
     if (patch.contextProbePath !== undefined) setContextProbePath(patch.contextProbePath);
     if (patch.timeoutMs !== undefined) setTimeoutMs(patch.timeoutMs);
+    if (patch.healthCheckMode !== undefined) setHealthMode(patch.healthCheckMode);
+    if (patch.apiFlavors !== undefined) setFlavors(patch.apiFlavors);
     setType(newType);
   }
 
@@ -355,6 +386,7 @@ export function ApplicationSection({
     setPort(app.port);
     setScheme(app.scheme);
     setFlavors([...app.api_flavors]);
+    setFlavorsTouched(false);
     setStatus(app.status);
     setPriority(app.priority);
     setWeight(app.weight);
@@ -459,8 +491,21 @@ export function ApplicationSection({
     };
   }
 
+  // An empty flavor list cannot be saved honestly: the backend stores [] as
+  // [openai, anthropic] (normalizeFlavors, the migration-safety default), so
+  // a form showing nothing ticked would save a text candidate -- on a
+  // stable_diffusion_cpp application, exactly the trap its type default
+  // exists to prevent. The save is refused and the reason shown instead.
+  function flavorsMissing(): boolean {
+    if (flavors.length > 0) return false;
+    setFlavorsTouched(true);
+    setFlavorRefusals((count) => count + 1);
+    return true;
+  }
+
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (flavorsMissing()) return;
     setBusy(true);
     try {
       const created = await api.createApplication(server.id, buildBody());
@@ -476,6 +521,7 @@ export function ApplicationSection({
   async function submitEdit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     if (typeof mode === 'string' || mode.kind !== 'edit') return;
+    if (flavorsMissing()) return;
     setBusy(true);
     try {
       const body: UpdateApplicationRequest = buildBody();
@@ -671,7 +717,7 @@ export function ApplicationSection({
     // Unlike serverAgentTaken this reads the SERVER dto, not the applications
     // list, so no fetch window opens it -- but the server dto is itself fetched
     // by the parent list and never refreshed here, so a PATCH that sets the flag
-    // afterwards leaves this form offering all six types. The 409 is still the
+    // afterwards leaves this form offering every type. The 409 is still the
     // enforcement; a test fires that path so the mapping is not dropped.
     const managedRuntimeOnlyCreate = managedRuntimeOnly && !editing;
     // A server_agent application's loaded-model discovery, load state and
@@ -682,17 +728,28 @@ export function ApplicationSection({
     // hold a stale value from an earlier non-agent type; buildBody forces the
     // same three to '' on save regardless of what is still showing.
     const probeFieldsDisabled = type === 'server_agent';
-    // One helperText slot, two reasons. They are co-reachable -- but only
-    // through the first-fetch window: on a settled managed server that already
-    // holds an agent application the create button is not rendered at all
-    // (see the list view below), so the create form cannot be opened; while
-    // that first fetch is in flight `applications` reads [] and the button is
-    // not loading-gated, so it can. Composed narrowest-first: "only server_agent
-    // is creatable here", then "and that one is taken" -- which together say
-    // the intersection is empty, exactly what the disabled options then show.
-    const typeReasons = [
+    // One helperText slot, two reasons and one note. The two reasons are
+    // co-reachable -- but only through the first-fetch window: on a settled
+    // managed server that already holds an agent application the create button
+    // is not rendered at all (see the list view below), so the create form
+    // cannot be opened; while that first fetch is in flight `applications`
+    // reads [] and the button is not loading-gated, so it can. Composed
+    // narrowest-first: "only server_agent is creatable here", then "and that
+    // one is taken" -- which together say the intersection is empty, exactly
+    // what the disabled options then show.
+    //
+    // The note comes last: it explains the SELECTED type rather than a
+    // disabled option. stable_diffusion_cpp's defaults diverge from every
+    // other type's on three fields (health mode, API flavors, timeout) because
+    // the stock values are reproducible failures for this server, not
+    // preferences -- see applicationTypeDefaults.ts. This is the only place
+    // that tells the operator so; the values themselves are silent. Riding the
+    // same slot is what gets it announced with the field (aria-describedby),
+    // as the launch-spec form's type note is.
+    const typeDescriptions = [
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
+      type === 'stable_diffusion_cpp' ? t.applicationTypeStableDiffusionCppNote : undefined,
     ].filter((reason): reason is string => reason !== undefined);
     // The scheme is the GATEWAY's field only while the application actually
     // takes part in the proxy on a server that runs one. In every other case --
@@ -761,7 +818,7 @@ export function ApplicationSection({
               // the rule, the reason for it and the remedy; the 409 toast
               // stays terse because it arrives after the fact and is already
               // prefixed with its raw error code.
-              helperText={typeReasons.length > 0 ? typeReasons.join(' ') : undefined}
+              helperText={typeDescriptions.length > 0 ? typeDescriptions.join(' ') : undefined}
             >
               {applicationTypeOptions.map((option) => (
                 <option
@@ -780,11 +837,11 @@ export function ApplicationSection({
                   // it. Overstating the reason is what invites the "fix" that
                   // reintroduces the blank field.
                   //
-                  // The managed_runtime_only half disables the complementary
-                  // five, and only while creating -- see managedRuntimeOnlyCreate
-                  // above. Same reasoning against filtering: openEdit seeds the
-                  // type from the row, and an edit is precisely where this gate
-                  // must not apply at all.
+                  // The managed_runtime_only half disables every type but
+                  // server_agent, and only while creating -- see
+                  // managedRuntimeOnlyCreate above. Same reasoning against
+                  // filtering: openEdit seeds the type from the row, and an
+                  // edit is precisely where this gate must not apply at all.
                   disabled={
                     (option === 'server_agent' && serverAgentTaken) ||
                     (managedRuntimeOnlyCreate && option !== 'server_agent')
@@ -872,7 +929,14 @@ export function ApplicationSection({
               messagesMode={messagesMode}
               liveTimings={liveTimings}
               liveTimingsKind={liveTimingsKind}
-              onFlavorsChange={setFlavors}
+              onFlavorsChange={(next) => {
+                setFlavors(next);
+                setFlavorsTouched(true);
+              }}
+              flavorsError={
+                flavorsTouched && flavors.length === 0 ? t.applicationFlavorsRequired : undefined
+              }
+              flavorsGroupRef={flavorsGroupRef}
               onResponsesModeChange={setResponsesMode}
               onMessagesModeChange={setMessagesMode}
               onLiveTimingsChange={setLiveTimings}
@@ -911,6 +975,7 @@ export function ApplicationSection({
                 <option value="llama_swap">{t.applicationLoadedFormatLlamaSwap}</option>
                 <option value="llama_cpp">{t.applicationLoadedFormatLlamaCpp}</option>
                 <option value="litellm">{t.applicationLoadedFormatLitellm}</option>
+                <option value="sdcpp_models">{t.applicationLoadedFormatSdcpp}</option>
               </SelectField>
             </Box>
             <Typography variant="caption" sx={{ color: 'text.secondary' }}>

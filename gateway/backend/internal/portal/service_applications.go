@@ -178,9 +178,9 @@ var (
 // reservedManualVerdicts are the (capability, verdict) pairs an operator may not
 // state, because a `manual` row is rank 3 -- above every automated source -- and
 // nothing re-derives one, so each of these would permanently override the only
-// writer entitled to establish it. For most entries that writer exists; for
-// (image, no) it does not yet, which is why this is the first entry added before
-// its writer.
+// writer entitled to establish it. (image, no) was the first entry added before
+// its writer existed; that writer is now the sdcpp_capabilities probe
+// (routing.CapabilitySourceSdcppCapabilities).
 //
 // It is keyed on the PAIR, not on the name, and that is the whole design. A
 // name-keyed list was the first cut and it was wrong: this row has TWO consumers
@@ -281,16 +281,23 @@ var reservedManualVerdicts = map[string]map[string]bool{
 		routing.CapabilityYes: true,
 		routing.CapabilityNo:  true,
 	},
-	// routing.CapabilityImage + CapabilityNo is reserved BEFORE its writer
-	// exists, which is unusual for this list and is bought at zero cost. Under
+	// routing.CapabilityImage + CapabilityNo was reserved BEFORE its writer
+	// existed, which was unusual for this list and bought at zero cost. Under
 	// ADR-042 an absent row already refuses, so an operator loses no
 	// expressiveness: "cannot generate images" is saying nothing. What it
 	// prevents is a permanent veto -- a manual row is rank 3, outranks every
-	// automated source, and nothing re-derives it, so a `no` written before the
-	// sd-server capability writer lands would outrank that writer forever
-	// against a genuinely capable model. Reserving now is cheaper than a later
-	// migration that has to find and clear such rows. (image, yes) stays
-	// writable: it is the operator's only enablement path until the writer ships.
+	// automated source, and nothing re-derives it, so a manual `no` would
+	// outrank the writer entitled to establish it forever, against a
+	// genuinely capable model. That writer is the gateway health loop's read
+	// of a stable_diffusion_cpp application's own /sdcpp/v1/capabilities
+	// (routing.CapabilitySourceSdcppCapabilities), the first source whose
+	// image "no" is real, because its supported_modes list is exhaustive
+	// (Ollama's declared-capability array, the only other probe that reports
+	// image at all, is not, so it can only say yes). (image, yes)
+	// stays writable: it is how an operator overrides that probe, and it is
+	// the only enablement path where the probe cannot reach -- an
+	// agent-launched sd-server, a server_agent mapping whose router passes
+	// only /props through.
 	routing.CapabilityImage: {routing.CapabilityNo: true},
 }
 
@@ -318,6 +325,13 @@ const (
 	// take minutes -- with the stock 30s default every cold start would
 	// reproducibly fail with 502 provider.timeout.
 	defaultServerAgentTimeoutMS = 600000
+	// defaultStableDiffusionTimeoutMS is the TimeoutMS default for
+	// ProviderStableDiffusionCpp, for the same reason as the server_agent
+	// value above: TimeoutMS is a TOTAL request deadline. A 512x512
+	// generation measured ~17s against a real sd-server, and that server's own
+	// reported limits permit 4096x4096, which is far slower. With the stock
+	// 30s default an ordinary image request fails as 502 provider.timeout.
+	defaultStableDiffusionTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -1407,6 +1421,8 @@ func normalizeLoadedModelsFormat(format string) string {
 		return "llama_cpp"
 	case "litellm":
 		return "litellm"
+	case "sdcpp_models":
+		return "sdcpp_models"
 	case "", "auto":
 		return strings.ToLower(strings.TrimSpace(format)) // "" or "auto"
 	default:
@@ -1459,6 +1475,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderLiteLLM, nil
 	case routing.ProviderServerAgent:
 		return routing.ProviderServerAgent, nil
+	case routing.ProviderStableDiffusionCpp:
+		return routing.ProviderStableDiffusionCpp, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -1741,7 +1759,7 @@ func normalizeFlavors(raw []string, errInvalid error) ([]string, error) {
 	for _, candidate := range raw {
 		flavor := strings.TrimSpace(candidate)
 		switch flavor {
-		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic:
+		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages:
 		default:
 			return nil, errInvalid
 		}
@@ -1794,23 +1812,33 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 	return nil
 }
 
+// applicationTimeoutDefaultFor is the TimeoutMS default for an application
+// type. Two types override the stock value because for them it is a
+// correctness matter rather than tuning: an agent-managed cold model load and
+// an image generation both routinely exceed 30s (see each constant's doc).
+func applicationTimeoutDefaultFor(appType string) int {
+	switch appType {
+	case routing.ProviderServerAgent:
+		return defaultServerAgentTimeoutMS
+	case routing.ProviderStableDiffusionCpp:
+		return defaultStableDiffusionTimeoutMS
+	default:
+		return defaultApplicationTimeoutMS
+	}
+}
+
 // normalizeApplicationTimeoutMS maps a zero TimeoutMS to the type-appropriate
-// default: defaultServerAgentTimeoutMS for a server_agent application (cold
-// model loads can take minutes -- see defaultServerAgentTimeoutMS), or
-// defaultApplicationTimeoutMS for every other type. A non-zero value is
-// always preserved as given. Both CreateApplication and UpdateApplication
-// call this -- UpdateApplication passes the application's own (already
-// mutated, if req.Type changed in the same request) type so that a PATCH
-// combining a retype to/from server_agent with timeout_ms:0 applies the
-// NEW type's default rather than a stale one.
+// default (see applicationTimeoutDefaultFor). A non-zero value is always
+// preserved as given. Both CreateApplication and UpdateApplication call this
+// -- UpdateApplication passes the application's own (already mutated, if
+// req.Type changed in the same request) type so that a PATCH combining a
+// retype to/from server_agent with timeout_ms:0 applies the NEW type's
+// default rather than a stale one.
 func normalizeApplicationTimeoutMS(appType string, timeoutMS int) int {
 	if timeoutMS != 0 {
 		return timeoutMS
 	}
-	if appType == routing.ProviderServerAgent {
-		return defaultServerAgentTimeoutMS
-	}
-	return defaultApplicationTimeoutMS
+	return applicationTimeoutDefaultFor(appType)
 }
 
 func normalizeApplicationAffinityTTLSeconds(affinityTTLSeconds int) int {

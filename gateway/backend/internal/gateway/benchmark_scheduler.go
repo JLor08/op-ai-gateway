@@ -49,6 +49,14 @@ func benchmarkDue(app routing.Application, lastRun map[string]time.Time, now tim
 // token (trusted internal caller), skips inactive + metrics_locked mappings, reuses the P3a
 // runner verbatim. Returns true if a run was launched OR one is already in progress OR there
 // was nothing to do; false only if the idle-gate deferred (so the caller retries next tick).
+//
+// It also skips a mapping that serves only images (mappingIsImagesOnly): the scheduled run
+// is a speed benchmark, a chat prompt, which such a mapping cannot answer, so every run of
+// it would fail. The test is by EFFECTIVE flavors (flavorsAreImagesOnly), never by the
+// application type: an external stable_diffusion_cpp application whose operator also ticked
+// openai is not images-only and is still benchmarked, and only an agent-launched sd-server
+// child whose spec lists exactly openai_images is skipped. A mapping whose spec cannot be
+// read is skipped for this pass rather than guessed at.
 func (s *Server) TriggerScheduledBenchmark(ctx context.Context, server routing.AIServer, app routing.Application) bool {
 	mappings, err := s.Routes.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -57,6 +65,9 @@ func (s *Server) TriggerScheduledBenchmark(ctx context.Context, server routing.A
 	targets := make([]benchmarkTarget, 0, len(mappings))
 	for _, m := range mappings {
 		if m.Status != routing.ServerStatusActive || m.MetricsLocked {
+			continue
+		}
+		if imagesOnly, err := s.mappingIsImagesOnly(ctx, app, m.ID); err != nil || imagesOnly {
 			continue
 		}
 		targets = append(targets, s.benchmarkTargetFor(ctx, server, app, m))

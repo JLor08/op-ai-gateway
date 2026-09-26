@@ -3083,6 +3083,81 @@ func liveTimingsSpecFixture(t *testing.T) (*Service, *routing.MemoryStore, routi
 	return svc, routeStore, app, newMapping
 }
 
+// TestPutRuntimeSpecAcceptsStableDiffusionCppType pins that an upsert typed
+// stable_diffusion_cpp is accepted like any other kind, and that both the
+// spec's own Type and its resolved EffectiveType echo it back.
+func TestPutRuntimeSpecAcceptsStableDiffusionCppType(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sd"), PutRuntimeSpecRequest{
+		Binary: "/usr/local/bin/sd-server",
+		Type:   string(routing.RuntimeSpecTypeStableDiffusionCpp),
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.Type != string(routing.RuntimeSpecTypeStableDiffusionCpp) {
+		t.Fatalf("type = %q, want %q", dto.Type, routing.RuntimeSpecTypeStableDiffusionCpp)
+	}
+	if dto.EffectiveType != string(routing.RuntimeSpecTypeStableDiffusionCpp) {
+		t.Fatalf("effective_type = %q, want %q", dto.EffectiveType, routing.RuntimeSpecTypeStableDiffusionCpp)
+	}
+}
+
+// TestPutRuntimeSpecDefaultsHealthPathPerType pins that an empty HealthPath
+// defaults by the spec's EFFECTIVE type (explicit, or detected from the
+// binary): the agent kills a child whose health path keeps failing once
+// startup_timeout_seconds elapses, and sd-server answers GET /health with
+// 404 (measured), so an sd spec that names no health path must not get the
+// stock /health default -- while every other type still does, and an
+// explicit value always wins regardless of type.
+func TestPutRuntimeSpecDefaultsHealthPathPerType(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	cases := []struct {
+		name string
+		req  PutRuntimeSpecRequest
+		want string
+	}{
+		{
+			name: "explicit-stable-diffusion-cpp",
+			req:  PutRuntimeSpecRequest{Binary: "/usr/local/bin/sd-server", Type: string(routing.RuntimeSpecTypeStableDiffusionCpp)},
+			want: "/v1/models",
+		},
+		{
+			name: "auto-detected-stable-diffusion-cpp",
+			req:  PutRuntimeSpecRequest{Binary: "/opt/sd/sd-server"},
+			want: "/v1/models",
+		},
+		{
+			name: "llama-cpp-keeps-stock-default",
+			req:  PutRuntimeSpecRequest{Binary: "/usr/local/bin/llama-server", Type: string(routing.RuntimeSpecTypeLlamaCpp)},
+			want: "/health",
+		},
+		{
+			name: "explicit-health-path-wins-on-stable-diffusion-cpp",
+			req: PutRuntimeSpecRequest{
+				Binary: "/usr/local/bin/sd-server", Type: string(routing.RuntimeSpecTypeStableDiffusionCpp),
+				HealthPath: "/",
+			},
+			want: "/",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping(tc.name), tc.req)
+			if err != nil {
+				t.Fatalf("PutRuntimeSpec: %v", err)
+			}
+			if dto.HealthPath != tc.want {
+				t.Fatalf("health_path = %q, want %q", dto.HealthPath, tc.want)
+			}
+		})
+	}
+}
+
 // TestPutRuntimeSpecResponsesLiveTimingsDefaultsFromTheSpecsOwnKind pins the
 // create default: a FIRST write (no existing spec row) that omits
 // responses_live_timings_enabled stores what the spec's own EFFECTIVE kind

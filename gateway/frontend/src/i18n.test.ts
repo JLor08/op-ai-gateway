@@ -2404,7 +2404,8 @@ describe('managed_runtime_only affordance i18n keys', () => {
     // The backend reads ManagedRuntimeOnly inside CreateApplication only;
     // UpdateApplication never reads it. The helper line is the one place an
     // operator can be told that, so it must say it -- otherwise the edit form
-    // offering all six types reads as a portal bug rather than as the rule.
+    // offering every application type reads as a portal bug rather than as
+    // the rule.
     // The 409's own string stays terse (formatPortalError prefixes it with the
     // raw error code); reusing it here would teach nothing.
     for (const m of [messages.de, messages.en]) {
@@ -2927,6 +2928,62 @@ describe('chat generated-image i18n keys', () => {
       // of this feature is that the failure is not silent -- so there must
       // be a distinct string to tell the user.
       expect(t.chatImageDownloadError).toBeTruthy();
+    });
+  }
+});
+
+// The stable-diffusion.cpp strings send the operator to controls on the form,
+// so they must name those controls by the labels the operator actually sees --
+// read from the label keys themselves, so relabelling a control fails here
+// instead of leaving a note that points at a control that no longer exists.
+describe('stable-diffusion.cpp strings name what the operator sees', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    const t = messages[locale];
+
+    it(`quotes the health check mode options by their labels in the application note (${locale})`, () => {
+      expect(t.applicationTypeStableDiffusionCppNote).toContain(t.applicationHealthModeModelSync);
+      expect(t.applicationTypeStableDiffusionCppNote).toContain(t.applicationHealthModePath);
+    });
+
+    // The note also shows on an edit, where the operator may have changed
+    // every one of these values, so it describes the type's defaults and not
+    // the form's current state.
+    it(`states defaults rather than current values in the application note (${locale})`, () => {
+      expect(t.applicationTypeStableDiffusionCppNote).toContain(
+        locale === 'de' ? 'standardmäßig' : 'defaults to',
+      );
+    });
+
+    it(`says which flavor boxes to tick, on the spec and on its parent, in the launch-spec note (${locale})`, () => {
+      expect(t.runtimeSpecTypeStableDiffusionCppNote).toContain(t.applicationFlavors);
+      expect(t.runtimeSpecTypeStableDiffusionCppNote).toContain(t.applicationFlavorOpenaiImages);
+      expect(t.runtimeSpecTypeStableDiffusionCppNote).toContain('server_agent');
+    });
+
+    it(`labels the openai_images box with the file's own term for image generation (${locale})`, () => {
+      expect(t.applicationFlavorOpenaiImages.toLowerCase()).toContain(
+        t.mappingImageCapable.toLowerCase(),
+      );
+    });
+
+    // The image verdict has two automatic sources, not one: the gateway's
+    // sdcpp_capabilities probe and the agent's Ollama /api/show probe.
+    it(`names both automatic image-verdict sources in the mapping hint (${locale})`, () => {
+      expect(t.mappingImageCapableUnknownHint).toContain('stable-diffusion.cpp');
+      expect(t.mappingImageCapableUnknownHint).toContain('Ollama');
+    });
+  }
+});
+
+// " -- " is how a code comment spells a dash. A user-facing string uses the
+// locale's own: " – " in German, " — " in English.
+describe('user-facing strings never use a double hyphen as a dash', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    it(`has no " -- " in any ${locale} string`, () => {
+      const offenders = Object.entries(messages[locale])
+        .filter(([, value]) => typeof value === 'string' && value.includes(' -- '))
+        .map(([key]) => key);
+      expect(offenders).toEqual([]);
     });
   }
 });

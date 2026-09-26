@@ -485,7 +485,9 @@ type inferenceShape struct {
 //     name is requested, never WHAT the token may reach, so its result then
 //     faces the allowlist (and every other gate) exactly as if the client had
 //     named it. Never terminal: with nothing usable to redirect to, the
-//     request keeps its model and fails exactly as it does today.
+//     request keeps its model and fails exactly as it does today. For a
+//     request that requires a capability, only a candidate carrying it is
+//     usable (see the call site).
 //  3. applyServerOverride (re-authorizes a token/header server pin) --
 //     TERMINAL on failure (403).
 //  4. modelAllowed (service-account model allowlist) -- TERMINAL on failure
@@ -508,8 +510,15 @@ func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, toke
 	// token this is a single boolean test. req.RequestedModel keeps the client's
 	// original wish either way — the usage events already carry it, so a
 	// redirect stays traceable afterwards.
+	//
+	// The offering is asked for the request's required capabilities too. Today
+	// only /v1/images/generations carries any (["image"]), and the capability
+	// gate refuses a model without them, so a candidate is taken only when it
+	// carries every one (ModelOffering.Capable): a LastUsedModel or fallback
+	// that lacks the image capability is skipped rather than turned into a 404
+	// model_not_capable about a model the client never named.
 	if token.UnknownModelRedirect && s.Portal != nil {
-		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor))
+		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor), shape.requiredCapabilities)
 		if to := redirectUnknownModel(token, req.Model, off); to != "" {
 			req.Model = to
 		}

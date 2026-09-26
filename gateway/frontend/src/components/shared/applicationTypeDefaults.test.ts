@@ -19,6 +19,8 @@ describe('applicationTypeDefaults', () => {
       loadedModelsFormat: 'llama_swap',
       contextProbePath: '/upstream/{model}/props',
       timeoutMs: 30000,
+      healthCheckMode: 'health_path',
+      apiFlavors: ['openai', 'anthropic'],
     });
   });
 
@@ -32,6 +34,8 @@ describe('applicationTypeDefaults', () => {
       loadedModelsFormat: 'auto',
       contextProbePath: '',
       timeoutMs: 30000,
+      healthCheckMode: 'health_path',
+      apiFlavors: ['openai', 'anthropic'],
     });
   });
 
@@ -50,6 +54,8 @@ describe('applicationTypeDefaults', () => {
       loadedModelsFormat: 'llama_swap',
       contextProbePath: '',
       timeoutMs: 600000,
+      healthCheckMode: 'health_path',
+      apiFlavors: ['openai', 'anthropic'],
     });
   });
 
@@ -104,5 +110,85 @@ describe('applicationTypeDefaults', () => {
     const current: TypeDefaults = { ...applicationTypeDefaults.ollama, timeoutMs: 45000 };
     const patch = migrateTypeFields('ollama', 'server_agent', current);
     expect(patch.timeoutMs).toBeUndefined(); // customized → kept, never clobbered to 600000
+  });
+
+  // apiFlavors is array-valued, and the live value migrateTypeFields is
+  // called with (ApplicationSection's `flavors` state) is never the SAME
+  // array instance as an applicationTypeDefaults entry -- it is rebuilt by
+  // every checkbox toggle. A naive `current[key] === oldDefaults[key]` would
+  // therefore always read "customized" for this one field, even right after
+  // a fresh, untouched create, and this migration would silently never fire
+  // for it. Build `current` the same way -- a fresh array holding the same
+  // values, not the same reference -- to pin that this is fixed.
+  it("migrates apiFlavors to the new type's default when current holds an equal-by-value, different-reference array", () => {
+    const current: TypeDefaults = {
+      ...applicationTypeDefaults.ollama,
+      apiFlavors: [...applicationTypeDefaults.ollama.apiFlavors],
+    };
+    const patch = migrateTypeFields('ollama', 'stable_diffusion_cpp', current);
+    expect(patch.apiFlavors).toEqual(['openai_images']);
+  });
+
+  // A positional comparison (current[i] === default[i]) is not enough:
+  // apiFlavors is a SET of enabled flavors, not a sequence, and
+  // ApiVariantControls' toggleFlavor removes a flavor with `filter` and
+  // re-adds it with `[...list, flavor]` -- so an operator who unchecks then
+  // rechecks the SAME flavor before switching type ends up with the same
+  // set in a different order (['anthropic', 'openai'] instead of
+  // ['openai', 'anthropic']). That must still read as "untouched" and
+  // migrate -- the alternative is a silent, order-dependent failure to
+  // switch away from a stock flavor pair, exactly what this field exists to
+  // prevent. Every array literal elsewhere in this file happens to already
+  // be in canonical order, which is why only a reordered array pins this.
+  it('migrates apiFlavors to the new type default when current holds the same set in a different order', () => {
+    const current: TypeDefaults = {
+      ...applicationTypeDefaults.ollama,
+      apiFlavors: ['anthropic', 'openai'],
+    };
+    const patch = migrateTypeFields('ollama', 'stable_diffusion_cpp', current);
+    expect(patch.apiFlavors).toEqual(['openai_images']);
+  });
+
+  it('migrates healthCheckMode to the new type default when untouched', () => {
+    const current = { ...applicationTypeDefaults.ollama };
+    const patch = migrateTypeFields('ollama', 'stable_diffusion_cpp', current);
+    expect(patch.healthCheckMode).toBe('model_sync');
+  });
+
+  it('preserves a customized apiFlavors and healthCheckMode across a type switch', () => {
+    const current: TypeDefaults = {
+      ...applicationTypeDefaults.ollama,
+      apiFlavors: ['anthropic'],
+      healthCheckMode: 'always_reachable',
+    };
+    const patch = migrateTypeFields('ollama', 'stable_diffusion_cpp', current);
+    expect(patch.apiFlavors).toBeUndefined();
+    expect(patch.healthCheckMode).toBeUndefined();
+  });
+});
+
+// Every field whose stock value would break stable_diffusion_cpp is
+// overridden.
+describe('stable_diffusion_cpp defaults', () => {
+  it('defaults away from every field whose stock value breaks this type', () => {
+    const d = applicationTypeDefaults.stable_diffusion_cpp;
+    // /v1/health does not exist on this server: health_path would take the
+    // application permanently unreachable.
+    expect(d.healthCheckMode).toBe('model_sync');
+    // The real model name lives here, not in /v1/models (a placeholder).
+    expect(d.loadedModelsPath).toBe('/sdapi/v1/sd-models');
+    expect(d.loadedModelsFormat).toBe('sdcpp_models');
+    // Images only: the coarse openai flavor would make it a text candidate.
+    expect(d.apiFlavors).toEqual(['openai_images']);
+    // A 512x512 generation measured ~17s; limits permit 4096x4096.
+    expect(d.timeoutMs).toBe(600000);
+    // The server serves no /props.
+    expect(d.contextProbePath).toBe('');
+  });
+
+  it('leaves every other type untouched', () => {
+    expect(applicationTypeDefaults.vllm.timeoutMs).toBe(30000);
+    expect(applicationTypeDefaults.vllm.apiFlavors).toEqual(['openai', 'anthropic']);
+    expect(applicationTypeDefaults.llama_cpp.contextProbePath).toBe('/props');
   });
 });

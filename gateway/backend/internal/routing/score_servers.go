@@ -18,8 +18,10 @@ type CandidateScore struct {
 	Available bool // viable (Score gate) AND under capacity (in-flight < max_concurrency)
 }
 
-// ScoreModelServers scores every server that offers `model` (across API flavors),
-// reusing the same Route/Score path as routing (shares scoringRoute with argmaxByScore).
+// ScoreModelServers scores every server that offers `model` (across every coarse API
+// flavor, openai_images included, so an images-only model is ranked too; a mapping
+// offered under several flavors is scored once), reusing the same Route/Score path as
+// routing (shares scoringRoute with argmaxByScore).
 // Available = the candidate passes the Score viability gate AND (MaxConcurrency == 0 OR
 // in-flight k < MaxConcurrency). Per-session swap-protection / reservation / affinity is
 // intentionally NOT applied: this is the GENERAL live order shown in the UI, not a
@@ -27,7 +29,7 @@ type CandidateScore struct {
 func (r *Resolver) ScoreModelServers(ctx context.Context, model string, now time.Time) ([]CandidateScore, error) {
 	seen := make(map[string]struct{})
 	out := make([]CandidateScore, 0)
-	for _, flavor := range []string{APIFlavorOpenAI, APIFlavorAnthropic} {
+	for _, flavor := range []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages} {
 		pool, err := r.store.ActiveMappingsForModel(ctx, model, flavor)
 		if err != nil {
 			return nil, err

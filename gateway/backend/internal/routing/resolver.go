@@ -605,10 +605,15 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		// The two PIN-CREATING writes -- this one and upsertGroupPin's -- are guarded
 		// on the capability list rather than on a flavor string, so the speech and
 		// multipart endpoints (#68/#69) inherit the guard. AffinityKey.APIFlavor is
-		// COARSE (NormalizeAPIFlavor above), so an unguarded image resolve would
-		// write its pin under the same key a chat client uses and repoint that
-		// client at an image server. The read-side gate (resolveAffinity) does not
-		// help here -- it is the WRITE that does the damage.
+		// COARSE (NormalizeAPIFlavor above), which is what the guard is for: a
+		// capability-carrying request whose coarse flavor coincides with a text
+		// endpoint's would, unguarded, write its pin under the key that endpoint's
+		// client uses and repoint that client at a server chosen for a capability
+		// it does not need. The read-side gate (resolveAffinity) does not help
+		// there -- it is the WRITE that does the damage. For IMAGES the guard is
+		// redundant: their coarse flavor is openai_images, their own, so an image
+		// key never matches a chat client's. It stays for the endpoints above,
+		// and because it keeps image traffic pin-free.
 		//
 		// This guard does NOT make every UpsertAffinity call site unreachable for a
 		// capability-carrying request: resolveAffinity's own in-place refresh (the
@@ -794,6 +799,11 @@ func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []Mapping
 func NormalizeAPIFlavor(apiFlavor string) string {
 	normalized := strings.ToLower(strings.TrimSpace(apiFlavor))
 	switch {
+	// BEFORE the generic "openai" prefix, deliberately: every fine images
+	// flavor also starts with "openai", so testing the generic prefix first
+	// would fold images into text and defeat the separation entirely.
+	case strings.HasPrefix(normalized, APIFlavorOpenAIImages):
+		return APIFlavorOpenAIImages
 	case strings.HasPrefix(normalized, "openai"):
 		return APIFlavorOpenAI
 	case strings.HasPrefix(normalized, "anthropic"):
@@ -940,9 +950,14 @@ func (r *Resolver) resolveAffinity(ctx context.Context, key AffinityKey, fineFla
 	// The refusal is NON-DESTRUCTIVE: it returns (Target{}, false, nil) and lets
 	// the caller fall through to the fresh-candidate path. Every other rejection
 	// in this function deletes the affinity row, and that would be wrong here:
-	// AffinityKey.APIFlavor is COARSE, so an image request declaring the pin
-	// stale would delete the chat client's pin. For the same reason the gate is
-	// not in affinityApplicationStale.
+	// AffinityKey.APIFlavor is COARSE, so under a key a capability-carrying
+	// request shares with a text endpoint, its refusal says nothing about the
+	// pin, and deleting would evict that endpoint's working pin. For the same
+	// reason the gate is not in affinityApplicationStale. For IMAGES this is
+	// redundant: their coarse flavor is openai_images, so an image key never
+	// matches a chat client's, and since no capability-carrying request writes a
+	// pin (Resolve, upsertGroupPin) there is no image pin for the gate to refuse.
+	// It stays for a future capability-carrying endpoint that does share a key.
 	//
 	// Placed BEFORE the LastUsedAt/UpdatedAt refresh below so a REFUSED request
 	// never touches the affinity row at all. This ordering does NOT make the
@@ -1645,8 +1660,10 @@ func (r *Resolver) groupPin(ctx context.Context, key AffinityKey, members []Grou
 //
 // It also mirrors the main pin's capability guard: a capability-carrying request
 // (required non-empty) never writes a pin here either, for the same reason -- key
-// is COARSE, so a group image resolve would repoint a chat client sharing that key
-// at an image server. See the guard in Resolve for the full rationale.
+// is COARSE, so a request sharing its coarse flavor with a text endpoint would
+// repoint that endpoint's client. For images the guard is redundant (their
+// coarse flavor, openai_images, keys them apart) and keeps them pin-free. See
+// the guard in Resolve for the full rationale.
 func (r *Resolver) upsertGroupPin(ctx context.Context, token auth.Token, key AffinityKey, name string, sel MappingCandidate, required []string, now time.Time) error {
 	if token.ID == "" || name == "" || sel.Application.AffinityTTLSeconds <= 0 || len(required) > 0 {
 		return nil

@@ -145,6 +145,31 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 	return ttft, usage, nil
 }
 
+// mappingIsImagesOnly reports whether a mapping's EFFECTIVE flavors are
+// images-only (flavorsAreImagesOnly), resolved with routing.Resolver.targetFrom's
+// precedence: for a server_agent application the mapping's runtime spec is the
+// authority whenever it has one, even one stored as [], and the application's
+// list stands otherwise. A background job that sends the mapping a chat prompt
+// asks it first, because such a mapping cannot answer one.
+//
+// Unlike benchmarkSpecFor it keeps "no spec" apart from a failed read: the
+// first means the application's flavors, the second means the answer is
+// unknown, which it reports as an error so the caller can skip rather than
+// guess.
+func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
+	flavors := app.APIFlavors
+	if app.Type == routing.ProviderServerAgent {
+		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			flavors = spec.APIFlavors
+		}
+	}
+	return flavorsAreImagesOnly(flavors), nil
+}
+
 // benchmarkSpecFor resolves the RuntimeSpec a benchmarkTarget should carry (its
 // .spec field) for later auth resolution via routing.SpecUpstreamAuth, mirroring
 // routing.Resolver.targetFrom's live-request rule: only a server_agent

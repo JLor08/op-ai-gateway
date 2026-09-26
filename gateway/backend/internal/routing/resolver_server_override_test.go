@@ -78,6 +78,12 @@ func TestServerOverrideForcesToServerBypassingProvisioningAndAffinity(t *testing
 
 // maintenanceOverrideStore seeds a single server/app/mapping offering qwen-coder with the
 // given server status + health status, mirroring singleCapCandidateStore.
+//
+// APIFlavors lists both APIFlavorOpenAI and APIFlavorOpenAIImages so this fixture also
+// serves the image-override tests in resolver_capability_gate_test.go (imagesReq):
+// NormalizeAPIFlavor no longer folds openai_images into openai, so serving images now
+// needs the explicit entry, same as any real image-serving application would carry. The
+// chat-flavor override tests sharing this fixture (openai_chat) are unaffected.
 func maintenanceOverrideStore(t *testing.T, now time.Time, status, health string) *MemoryStore {
 	t.Helper()
 	ctx := context.Background()
@@ -85,7 +91,7 @@ func maintenanceOverrideStore(t *testing.T, now time.Time, status, health string
 	if err := store.CreateAIServer(ctx, AIServer{ID: "srv_over", Name: "over", Domain: "over.test", Status: status, HealthStatus: health, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := store.CreateApplication(ctx, Application{ID: "app_over", ServerID: "srv_over", Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := store.CreateApplication(ctx, Application{ID: "app_over", ServerID: "srv_over", Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := store.CreateMapping(ctx, ModelMapping{ID: "map_over", ApplicationID: "app_over", GatewayModelName: "qwen-coder", AppModelName: "qwen2.5", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

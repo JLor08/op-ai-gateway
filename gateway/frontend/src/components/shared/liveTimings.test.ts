@@ -45,23 +45,33 @@ const allLiveTimingsKinds: readonly LiveTimingsKind[] = [
 // i18n strings and type comments that state the membership in prose only. Those
 // are the tests to point an editor at, not this one.
 //
-// The lists are typed against their unions, which guards exactly one
-// direction. REMOVING a member from ApplicationType or from RuntimeSpec['type']
-// is a compile error here, because the dropped literal stops being assignable
-// (measured: dropping 'llama_swap' yields TS2322 on the first list). ADDING one
-// is not -- the array simply omits it, tsc stays quiet and every case still
-// passes, so the list silently stops being exhaustive. A widened union means
-// editing these two lists by hand.
-const allApplicationTypes: ApplicationType[] = [
-  'ollama',
-  'vllm',
-  'llama_cpp',
-  'llama_swap',
-  'litellm',
-  'server_agent',
-];
+// Each list is the key set of a Record over its union, which guards BOTH
+// directions at compile time. REMOVING a member from ApplicationType or from
+// RuntimeSpec['type'] leaves an unknown key here, and ADDING one leaves a
+// required key missing; either fails tsc. A plain typed array guards only the
+// first direction: a new member is simply absent, tsc stays quiet and every
+// case still passes, so the list silently stops being exhaustive.
+const applicationTypeKeys: Record<ApplicationType, true> = {
+  ollama: true,
+  vllm: true,
+  llama_cpp: true,
+  llama_swap: true,
+  litellm: true,
+  server_agent: true,
+  stable_diffusion_cpp: true,
+};
+const allApplicationTypes = Object.keys(applicationTypeKeys) as ApplicationType[];
 
-const allSpecTypes: RuntimeSpec['type'][] = ['', 'vllm', 'llama_cpp', 'tgi', 'ollama', 'custom'];
+const specTypeKeys: Record<RuntimeSpec['type'], true> = {
+  '': true,
+  vllm: true,
+  llama_cpp: true,
+  tgi: true,
+  ollama: true,
+  stable_diffusion_cpp: true,
+  custom: true,
+};
+const allSpecTypes = Object.keys(specTypeKeys) as RuntimeSpec['type'][];
 
 describe('applicationLiveTimingsKind', () => {
   it('calls llama_cpp capable and every other DIRECT application type incapable', () => {

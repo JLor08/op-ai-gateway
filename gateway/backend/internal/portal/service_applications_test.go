@@ -7,11 +7,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -614,7 +621,7 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
@@ -2276,7 +2283,7 @@ func (f *fakeLister) auth() (header, token string, ok bool) {
 	return f.gotAuthHeader, f.gotAuthToken, f.gotAuthOK
 }
 
-func newServerTestServiceWithLister(t *testing.T, now time.Time, lister *fakeLister) (*Service, *routing.MemoryStore) {
+func newServerTestServiceWithLister(t *testing.T, now time.Time, lister provider.ModelLister) (*Service, *routing.MemoryStore) {
 	t.Helper()
 	dir := NewMemoryDirectory(auth.NewTokenStore())
 	for _, u := range []string{"usr_admin", "usr_owner", "usr_other"} {
@@ -3863,19 +3870,290 @@ func TestUpdateMappingConfigEditDoesNotRevertAConcurrentProbe(t *testing.T) {
 // asymmetric: it costs the operator nothing, because an ABSENT row already
 // refuses (ADR-042), so "this model cannot generate images" is fully expressed
 // by not writing a yes. And it prevents a permanent veto: a manual row is rank 3,
-// outranks every automated source and nothing re-derives it, so a `no` written
-// before the sd-server capability writer lands would outrank it forever against
-// a genuinely capable model.
+// outranks every automated source and nothing re-derives it, so a manual `no`
+// would outrank the sd-server capability probe (sdcpp_capabilities) forever
+// against a genuinely capable model.
 func TestImageNoIsAReservedManualVerdict(t *testing.T) {
 	if !reservedManualVerdict(routing.CapabilityImage, routing.CapabilityNo) {
 		t.Error("(image, no) must be reserved")
 	}
-	// yes stays writable -- it is the operator's day-one enablement path.
+	// yes stays writable -- it is how an operator overrides the probe, and the
+	// only enablement path where the probe cannot reach (an agent-launched
+	// sd-server).
 	if reservedManualVerdict(routing.CapabilityImage, routing.CapabilityYes) {
-		t.Error("(image, yes) must stay writable: it is the only enablement path until the writer lands")
+		t.Error("(image, yes) must stay writable: it is the only enablement path where the sdcpp_capabilities probe cannot reach")
 	}
 	// The reset is never refused, for any pair.
 	if reservedManualVerdict(routing.CapabilityImage, "") {
 		t.Error("the reset must never be refused")
+	}
+}
+
+// TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault guards the change's
+// migration safety. The empty-list default must stay exactly
+// [openai, anthropic]: if it ever gained openai_images, every existing
+// text-only application would become an image candidate.
+func TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault(t *testing.T) {
+	got, err := normalizeApplicationFlavors(nil)
+	if err != nil {
+		t.Fatalf("normalizeApplicationFlavors(nil) error = %v", err)
+	}
+	want := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("empty default = %v, want exactly %v (adding images here would make every text-only app an image candidate)", got, want)
+	}
+
+	got, err = normalizeApplicationFlavors([]string{routing.APIFlavorOpenAIImages})
+	if err != nil {
+		t.Fatalf("normalizeApplicationFlavors([images]) error = %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{routing.APIFlavorOpenAIImages}) {
+		t.Fatalf("images-only = %v, want [%s]", got, routing.APIFlavorOpenAIImages)
+	}
+
+	if _, err := normalizeApplicationFlavors([]string{"openai_pictures"}); !errors.Is(err, ErrApplicationFlavorInvalid) {
+		t.Fatalf("unknown flavor error = %v, want ErrApplicationFlavorInvalid", err)
+	}
+}
+
+// TestNormalizeApplicationTypeAcceptsStableDiffusionCpp also pins the timeout
+// default, because 30s is not a preference for this type but a reproducible
+// failure: a measured 512x512 generation takes ~17s and the server's own
+// limits allow 4096x4096.
+func TestNormalizeApplicationTypeAcceptsStableDiffusionCpp(t *testing.T) {
+	got, err := normalizeApplicationType("stable_diffusion_cpp")
+	if err != nil {
+		t.Fatalf("normalizeApplicationType(stable_diffusion_cpp) error = %v", err)
+	}
+	if got != routing.ProviderStableDiffusionCpp {
+		t.Fatalf("type = %q, want %q", got, routing.ProviderStableDiffusionCpp)
+	}
+	if want := defaultStableDiffusionTimeoutMS; applicationTimeoutDefaultFor(routing.ProviderStableDiffusionCpp) != want {
+		t.Fatalf("timeout default = %d, want %d", applicationTimeoutDefaultFor(routing.ProviderStableDiffusionCpp), want)
+	}
+	if applicationTimeoutDefaultFor(routing.ProviderVLLM) != defaultApplicationTimeoutMS {
+		t.Fatal("vllm's timeout default must be unchanged")
+	}
+}
+
+// recordingUpstream is a loopback upstream that serves fixed bodies by path
+// and records every path the gateway requests, so a test can prove which
+// endpoint discovery actually used.
+type recordingUpstream struct {
+	*httptest.Server
+	mu    sync.Mutex
+	paths []string
+}
+
+func newRecordingUpstream(t *testing.T, routes map[string]string) *recordingUpstream {
+	t.Helper()
+	u := &recordingUpstream{}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		u.paths = append(u.paths, r.URL.Path)
+		u.mu.Unlock()
+		body, ok := routes[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+func (u *recordingUpstream) requested() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.paths)
+}
+
+// realDiscovery is the production discovery stack in miniature: the
+// OpenAI-compatible client behind a Multiplexer keyed on application type,
+// as cmd/gateway's providerClients wires it.
+func realDiscovery(httpClient *http.Client) provider.ModelLister {
+	c := provider.NewOpenAICompatibleClient(httpClient)
+	return provider.NewMultiplexer(map[string]provider.Client{
+		routing.ProviderLlamaSwap:          c,
+		routing.ProviderStableDiffusionCpp: c,
+	}, nil)
+}
+
+// storedPointedAt loads the stored server and application rows and aims
+// copies of them at the upstream. reconcileApplicationModels builds the
+// discovery endpoint from the rows it is HANDED (routing.ApplicationEndpoint),
+// so this reaches a loopback listener without persisting an IP domain.
+func storedPointedAt(t *testing.T, routeStore *routing.MemoryStore, u *recordingUpstream, serverID, appID string) (routing.AIServer, routing.Application) {
+	t.Helper()
+	server, err := routeStore.AIServerByID(context.Background(), serverID)
+	if err != nil {
+		t.Fatalf("AIServerByID: %v", err)
+	}
+	app, err := routeStore.ApplicationByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	parsed, err := url.Parse(u.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split upstream host: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("upstream port: %v", err)
+	}
+	server.Domain, server.ServerPathSuffix = host, ""
+	app.Scheme, app.Port, app.ProxyListenPort, app.AppPathSuffix = "http", port, 0, ""
+	return server, app
+}
+
+// TestSyncApplicationModelsDiscoversStableDiffusionCppRealName drives the
+// production call site end to end: CreateApplication (which normalises the
+// loaded-models format), then the reconcile the model_sync health loop runs,
+// through the real client. The mapping must carry flux1-dev -- the name the
+// mapping form, the Runtime view and the Activity list all display -- not the
+// sd-cpp-local placeholder /v1/models reports.
+func TestSyncApplicationModelsDiscoversStableDiffusionCppRealName(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	upstream := newRecordingUpstream(t, map[string]string{
+		"/v1/models":          `{"data":[{"id":"sd-cpp-local"}]}`,
+		"/sdapi/v1/sd-models": `[{"config":null,"filename":"flux1-dev.safetensors","hash":"8888888888","model_name":"flux1-dev","sha256":"88","title":"flux1-dev"}]`,
+	})
+	svc, routeStore := newServerTestServiceWithLister(t, now, realDiscovery(upstream.Client()))
+	server := createTestServer(t, svc, "S", "s.example.test")
+	appDTO, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderStableDiffusionCpp, Port: 7860, Scheme: "http",
+		APIFlavors:         []string{routing.APIFlavorOpenAIImages},
+		HealthCheckMode:    routing.HealthCheckModeModelSync,
+		LoadedModelsPath:   "/sdapi/v1/sd-models",
+		LoadedModelsFormat: "sdcpp_models",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	routeServer, app := storedPointedAt(t, routeStore, upstream, server.ID, appDTO.ID)
+	if app.LoadedModelsFormat != "sdcpp_models" {
+		t.Fatalf("stored LoadedModelsFormat = %q, want sdcpp_models -- normalizeLoadedModelsFormat dropped it, so the loaded probe would never parse this shape", app.LoadedModelsFormat)
+	}
+
+	result, err := svc.SyncApplicationModelsForApp(context.Background(), routeServer, app)
+	if err != nil {
+		t.Fatalf("SyncApplicationModelsForApp: %v", err)
+	}
+	if result.Added != 1 || result.Disabled != 0 {
+		t.Fatalf("result = %#v, want added=1 disabled=0", result)
+	}
+	mappings, err := routeStore.MappingsByApplication(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("MappingsByApplication: %v", err)
+	}
+	if len(mappings) != 1 || mappings[0].AppModelName != "flux1-dev" {
+		t.Fatalf("mappings = %#v, want one mapping with AppModelName flux1-dev", mappings)
+	}
+	if got := upstream.requested(); !slices.Equal(got, []string{"/sdapi/v1/sd-models"}) {
+		t.Fatalf("requested %v, want exactly [/sdapi/v1/sd-models]", got)
+	}
+}
+
+// TestSyncApplicationModelsNeverDiscoversFromTheLoadedModelsPath guards the
+// defect this task was rebuilt over. llama_swap's stock loaded-models path
+// /running lists only the model currently swapped in; discovery read from it
+// would disable every other mapping, and -- because an existing mapping is
+// matched by name regardless of status -- never re-enable them. It syncs
+// twice: the second cycle runs against mappings that already exist, which is
+// where reading the loaded set would disable them. The path assertion is the
+// precise guard: no request may ever leave /v1/models.
+func TestSyncApplicationModelsNeverDiscoversFromTheLoadedModelsPath(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	upstream := newRecordingUpstream(t, map[string]string{
+		"/v1/models": `{"data":[{"id":"qwen"},{"id":"llama"},{"id":"gemma"}]}`,
+		"/running":   `{"running":[{"model":"qwen"}]}`,
+	})
+	svc, routeStore := newServerTestServiceWithLister(t, now, realDiscovery(upstream.Client()))
+	server := createTestServer(t, svc, "S", "s.example.test")
+	appDTO, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderLlamaSwap, Port: 8080, Scheme: "http",
+		LoadedModelsPath: "/running", LoadedModelsFormat: "llama_swap",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	routeServer, app := storedPointedAt(t, routeStore, upstream, server.ID, appDTO.ID)
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		result, err := svc.SyncApplicationModelsForApp(context.Background(), routeServer, app)
+		if err != nil {
+			t.Fatalf("cycle %d: SyncApplicationModelsForApp: %v", cycle, err)
+		}
+		if result.Disabled != 0 {
+			t.Fatalf("cycle %d: result = %#v, want disabled=0", cycle, result)
+		}
+	}
+	mappings, err := routeStore.MappingsByApplication(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("MappingsByApplication: %v", err)
+	}
+	if len(mappings) != 3 {
+		t.Fatalf("mappings = %d, want 3", len(mappings))
+	}
+	for _, m := range mappings {
+		if m.Status != routing.ServerStatusActive {
+			t.Fatalf("mapping %q status = %q, want active", m.AppModelName, m.Status)
+		}
+	}
+	for _, p := range upstream.requested() {
+		if p != "/v1/models" {
+			t.Fatalf("discovery requested %q; it must only ever ask /v1/models for llama_swap", p)
+		}
+	}
+}
+
+// TestSyncApplicationModelsStableDiffusionCppUnreadableListingChangesNothing
+// pins fail-closed at the call site: a 200 carrying something that is not the
+// model list (a reverse proxy's error page, say) must fail the sync and leave
+// every mapping as it was, exactly like a transport error.
+func TestSyncApplicationModelsStableDiffusionCppUnreadableListingChangesNothing(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	upstream := newRecordingUpstream(t, map[string]string{
+		"/sdapi/v1/sd-models": `<html><body>502 Bad Gateway</body></html>`,
+	})
+	svc, routeStore := newServerTestServiceWithLister(t, now, realDiscovery(upstream.Client()))
+	server := createTestServer(t, svc, "S", "s.example.test")
+	appDTO, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderStableDiffusionCpp, Port: 7860, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAIImages},
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := routeStore.CreateMapping(context.Background(), routing.ModelMapping{
+		ID: "map_seed", ApplicationID: appDTO.ID, GatewayModelName: "flux1-dev", AppModelName: "flux1-dev",
+		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed mapping: %v", err)
+	}
+	routeServer, app := storedPointedAt(t, routeStore, upstream, server.ID, appDTO.ID)
+
+	if _, err := svc.SyncApplicationModelsForApp(context.Background(), routeServer, app); !errors.Is(err, ErrApplicationSyncFailed) {
+		t.Fatalf("sync err = %v, want ErrApplicationSyncFailed", err)
+	}
+	mappings, err := routeStore.MappingsByApplication(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("MappingsByApplication: %v", err)
+	}
+	if len(mappings) != 1 || mappings[0].Status != routing.ServerStatusActive {
+		t.Fatalf("mappings changed despite an unreadable listing: %#v", mappings)
+	}
+}
+
+func TestNormalizeLoadedModelsFormatKeepsSdcppModels(t *testing.T) {
+	for _, in := range []string{"sdcpp_models", " SDCPP_MODELS "} {
+		if got := normalizeLoadedModelsFormat(in); got != "sdcpp_models" {
+			t.Fatalf("normalizeLoadedModelsFormat(%q) = %q, want sdcpp_models", in, got)
+		}
 	}
 }

@@ -164,3 +164,53 @@ func TestScoreModelServersUnknownModelReturnsEmpty(t *testing.T) {
 		t.Fatalf("len(scores) = %d, want 0 for an unknown model", len(scores))
 	}
 }
+
+// An images-only model -- served by an application declaring openai_images
+// alone, the stable-diffusion.cpp shape -- gets a live rank like any other.
+// Without the images flavor in the loop, ActiveMappingsForModel yields no
+// candidate for it, the model-servers view shows no rank and the model-group
+// view sorts the model as unavailable. A model whose application declares both
+// a text flavor and openai_images is still scored once per mapping, not once
+// per flavor.
+func TestScoreModelServersRanksAnImagesOnlyModel(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	for _, s := range []struct {
+		id      string
+		flavors []string
+	}{
+		{"img", []string{APIFlavorOpenAIImages}},
+		{"mixed", []string{APIFlavorOpenAI, APIFlavorOpenAIImages}},
+	} {
+		if err := store.CreateAIServer(ctx, AIServer{ID: "srv_" + s.id, Name: s.id, Domain: s.id + ".test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		if err := store.CreateApplication(ctx, Application{ID: "app_" + s.id, ServerID: "srv_" + s.id, Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: s.flavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+		if err := store.CreateMapping(ctx, ModelMapping{ID: "map_" + s.id, ApplicationID: "app_" + s.id, GatewayModelName: s.id + "-model", AppModelName: s.id, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+		if err := store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv_" + s.id, ReportedAt: now, LatencyMS: 100, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertTelemetry: %v", err)
+		}
+	}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+
+	scores, err := resolver.ScoreModelServers(ctx, "img-model", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers: %v", err)
+	}
+	if len(scores) != 1 || scores[0].MappingID != "map_img" || !scores[0].Available {
+		t.Fatalf("scores = %+v, want one available score for map_img", scores)
+	}
+
+	mixed, err := resolver.ScoreModelServers(ctx, "mixed-model", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers: %v", err)
+	}
+	if len(mixed) != 1 || mixed[0].MappingID != "map_mixed" {
+		t.Fatalf("scores = %+v, want exactly one score for map_mixed (deduplicated across flavors)", mixed)
+	}
+}

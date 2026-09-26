@@ -166,7 +166,7 @@ func TestHideTargetDropsTargetName(t *testing.T) {
 	}
 	// Hiding is a listing concern only: the target still EXISTS, so the redirect
 	// in Task 5 must not treat it as unknown.
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Existing["qwen3-32b"]; !ok {
 		t.Fatal("hidden target dropped from Existing")
 	}
@@ -227,7 +227,7 @@ func TestOfferedAliasOfHiddenTargetIsListed(t *testing.T) {
 		t.Fatal("hidden target listed under its own name")
 	}
 	// Existing ignores visibility: the hidden model still exists.
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Existing["qwen3-32b"]; !ok {
 		t.Fatal("hidden model missing from Existing")
 	}
@@ -260,7 +260,7 @@ func TestCallableSplitsHiddenFromLocked(t *testing.T) {
 			svc, rs := newOfferingTestService(t, offeringMapping{name: "qwen3-32b", flavors: []string{routing.APIFlavorOpenAI}})
 			offerVisibility(t, rs, "qwen3-32b", tc.visibility)
 			token := auth.Token{UserID: "usr_off"}
-			off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+			off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 			if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 				t.Fatalf("%s model still listed", tc.visibility)
 			}
@@ -286,7 +286,7 @@ func TestCallableDropsALockedGroupName(t *testing.T) {
 	)
 	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
 	offerVisibility(t, rs, "coder", "locked")
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Callable["coder"]; ok {
 		t.Fatal("locked group name is callable although a direct request for it is refused")
 	}
@@ -313,7 +313,7 @@ func TestCallableDropsALockedMemberButKeepsItsGroup(t *testing.T) {
 	)
 	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
 	offerVisibility(t, rs, "m1", "locked")
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Callable["m1"]; ok {
 		t.Fatal("locked member rode into Callable under its own name")
 	}
@@ -337,7 +337,7 @@ func TestCallableKeepsAHideTargetTarget(t *testing.T) {
 	if listed(t, svc, token, routing.APIFlavorOpenAI, "qwen3-32b") {
 		t.Fatal("hidden target still listed")
 	}
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Callable["qwen3-32b"]; !ok {
 		t.Fatal("hidden target dropped from Callable although it still routes")
 	}
@@ -355,7 +355,7 @@ func TestCallableIncludesAHiddenGroup(t *testing.T) {
 	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
 	offerVisibility(t, rs, "coder", "hidden")
 	token := auth.Token{UserID: "usr_off"}
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 	if listed(t, svc, token, routing.APIFlavorOpenAI, "coder") {
 		t.Fatal("hidden group still listed")
 	}
@@ -376,7 +376,7 @@ func TestCallableExcludesAnAliasName(t *testing.T) {
 	if !listed(t, svc, token, routing.APIFlavorOpenAI, "claude-x") {
 		t.Fatal("alias missing from the listing")
 	}
-	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, token, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Callable["claude-x"]; ok {
 		t.Fatal("alias leaked into Callable")
 	}
@@ -397,17 +397,17 @@ func TestOfferingExistingIncludesGroups(t *testing.T) {
 	)
 	offerGroup(t, rs, "grp_off", "coder", "m1", "m2")
 
-	openai := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	openai := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if _, ok := openai.Existing["coder"]; !ok {
 		t.Fatalf("group missing from Existing(openai): %#v", openai.Existing)
 	}
-	anthropic := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorAnthropic)
+	anthropic := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorAnthropic, nil)
 	if _, ok := anthropic.Existing["coder"]; !ok {
 		t.Fatalf("group missing from Existing(anthropic): %#v", anthropic.Existing)
 	}
 	// A hidden group is still a name that exists.
 	offerVisibility(t, rs, "coder", "hidden")
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Existing["coder"]; !ok {
 		t.Fatal("hidden group dropped from Existing")
 	}
@@ -470,7 +470,7 @@ func TestOfferingWithoutRulesIsUnchanged(t *testing.T) {
 				t.Fatalf("ModelsForFlavor(%s) = %#v, want %#v", flavor, got, expected)
 			}
 		}
-		callable := svc.ModelOfferingFor(ctx, token, flavor).Callable
+		callable := svc.ModelOfferingFor(ctx, token, flavor, nil).Callable
 		for _, name := range expected {
 			if _, ok := callable[name]; !ok {
 				t.Fatalf("listed %q is not callable for %s: Callable = %#v", name, flavor, callable)
@@ -510,7 +510,7 @@ func TestOfferingIsWhollyEmptyOnMappingStoreError(t *testing.T) {
 	offerModel(t, rs, "srv_e", "BoxE", "app_e", []string{routing.APIFlavorOpenAI}, "qwen3-32b", "qwen-up", routing.ServerStatusActive)
 
 	svc := offerSvc(gatewayAIServersErrStore{rs}, nil)
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	assertOfferingWhollyEmpty(t, off, "store error")
 }
 
@@ -538,7 +538,7 @@ func TestOfferingIsWhollyEmptyOnGroupOverlayError(t *testing.T) {
 	offerGroup(t, rs, "grp_e", "coder", "m1")
 
 	svc := offerSvc(groupErrStore{rs}, nil)
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	assertOfferingWhollyEmpty(t, off, "overlay error")
 	// The LISTING keeps its fail-open behaviour — this is a divergence of the
 	// offering lookup only, not a change to what /v1/models serves.
@@ -575,7 +575,7 @@ func TestOfferingNeverReturnsAPartialResult(t *testing.T) {
 	offerModel(t, rs, "srv_l2", "BoxL2", "app_l2", []string{routing.APIFlavorOpenAI}, "m2", "m2-up", routing.ServerStatusActive)
 
 	svc := offerSvc(&lateFailAIServersStore{MemoryStore: rs}, nil)
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if len(off.Callable) == 0 {
 		if len(off.Existing) != 0 {
 			t.Fatalf("empty Callable beside a populated Existing: %#v", off.Existing)
@@ -746,7 +746,7 @@ func TestOfferingReadsEachStoreTraversalOnce(t *testing.T) {
 
 	counted := &countingRoutingStore{MemoryStore: rs}
 	svc := offerSvc(counted, nil)
-	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI)
+	off := svc.ModelOfferingFor(ctx, auth.Token{UserID: "usr_off"}, routing.APIFlavorOpenAI, nil)
 	if _, ok := off.Existing["coder"]; !ok {
 		t.Fatalf("precondition: group missing from Existing: %#v", off.Existing)
 	}

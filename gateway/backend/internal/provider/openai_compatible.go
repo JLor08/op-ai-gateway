@@ -174,13 +174,75 @@ func toolCallsFrom(calls []openAIToolCall) []inference.ToolCall {
 	return out
 }
 
+// sdcppModelsPath is where stable-diffusion.cpp lists its real model. Its
+// /v1/models reports the static placeholder "sd-cpp-local" instead, which the
+// server does not dispatch on (it ignores the request's model field).
+const sdcppModelsPath = "/sdapi/v1/sd-models"
+
+// modelDiscoveryFor returns where an application type lists its models and
+// how to decode that listing. It is derived from the TYPE alone, never from
+// the application's LoadedModelsPath: that field answers "what is loaded
+// right now", has a stock value for most types (/props, /running), and
+// discovery read from it would disable every model that is merely not loaded
+// at the moment -- permanently, since reconcile never re-enables a mapping it
+// already has.
+func modelDiscoveryFor(providerType string) (path string, decode func(io.Reader) ([]string, error)) {
+	if strings.TrimSpace(providerType) == routing.ProviderStableDiffusionCpp {
+		return sdcppModelsPath, decodeSdcppModelList
+	}
+	return "/v1/models", decodeOpenAIModelList
+}
+
+// decodeOpenAIModelList decodes the OpenAI {"data":[{"id":...}]} listing.
+func decodeOpenAIModelList(r io.Reader) ([]string, error) {
+	var decoded struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(r).Decode(&decoded); err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(decoded.Data))
+	for _, m := range decoded.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
+	}
+	return models, nil
+}
+
+// decodeSdcppModelList decodes stable-diffusion.cpp's /sdapi/v1/sd-models. It
+// shares the name extraction with the loaded probe (sdcppLoadedModels), so
+// the two agree on a model's name by construction -- but not its tolerance:
+// discovery feeds reconcileApplicationModels, which disables every mapping
+// missing from the result, so a body it cannot read must be an error. A
+// non-empty list in which no entry names a model is a changed shape, not an
+// empty server -- and neither is a bare JSON `null`, which decodes to a nil
+// slice with no decode error and so must be rejected explicitly.
+func decodeSdcppModelList(r io.Reader) ([]string, error) {
+	var entries []any
+	if err := json.NewDecoder(r).Decode(&entries); err != nil {
+		return nil, err
+	}
+	if entries == nil {
+		return nil, errors.New("listing is null, not a list")
+	}
+	names := sdcppLoadedModels(entries)
+	if len(entries) > 0 && len(names) == 0 {
+		return nil, errors.New("no entry carries a model_name")
+	}
+	return names, nil
+}
+
 func (c *OpenAICompatibleClient) ListModels(ctx context.Context, target routing.Target) ([]string, error) {
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
 		defer cancel()
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, "/v1/models"), nil)
+	discoveryPath, decode := modelDiscoveryFor(target.Provider)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, discoveryPath), nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
@@ -196,19 +258,9 @@ func (c *OpenAICompatibleClient) ListModels(ctx context.Context, target routing.
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		return nil, unavailableStatus(httpResp.StatusCode)
 	}
-	var decoded struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(httpResp.Body).Decode(&decoded); err != nil {
+	models, err := decode(httpResp.Body)
+	if err != nil {
 		return nil, fmt.Errorf("%w: decode response: %v", ErrInvalidResponse, err)
-	}
-	models := make([]string, 0, len(decoded.Data))
-	for _, m := range decoded.Data {
-		if m.ID != "" {
-			models = append(models, m.ID)
-		}
 	}
 	return models, nil
 }

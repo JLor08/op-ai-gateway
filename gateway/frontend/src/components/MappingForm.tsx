@@ -515,12 +515,16 @@ export function MappingForm({
           <option value="yes">{t.mappingCapabilityYes}</option>
           <option value="no">{t.mappingCapabilityNo}</option>
         </SelectField>
-        {/* image has NO "no" option, unlike its two neighbours above:
+        {/* image offers NO "no" choice, unlike its two neighbours above:
             reservedManualVerdicts refuses (image, no) because a manual no
             outranks every automated source forever and would permanently
-            mask the sd-server capability writer once it ships. Its unknown
-            hint also does not promise a probe -- image has no automated
-            writer yet, so it says the operator decides. */}
+            mask the sd-server capability probe (sdcpp_capabilities), the
+            one writer entitled to state it. When that probe HAS stated it,
+            the option is rendered disabled so the control shows the stored
+            verdict -- a value without an option renders blank, which reads
+            as unknown -- while it still cannot be picked. The unknown hint
+            names where the probe reaches, and says the operator decides
+            everywhere else. */}
         <SelectField
           id="mapping-image-capable"
           label={t.mappingImageCapable}
@@ -530,6 +534,11 @@ export function MappingForm({
         >
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
+          {imageCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
         </SelectField>
         {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
             numeric metrics, not a capability, and ADR-039 is explicit that it

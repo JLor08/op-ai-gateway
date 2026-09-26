@@ -67,7 +67,9 @@ func fetchLoadedModels(ctx context.Context, httpClient *http.Client, target rout
 //   - "llama_swap" : {"running":[{"model":...}]} | {"models":[...]} | ["name", ...]
 //   - "llama_cpp"  : {"model":...} | {"model_path":"/…/x.gguf"} (single loaded model)
 //   - "litellm"    : {"healthy_endpoints":[{"model":...}]}     (LiteLLM /health — reachable deployments)
-//   - "" / "auto"  : try all of the above and union the results
+//   - "sdcpp_models": [{"model_name":...,"filename":...}]      (stable-diffusion.cpp /sdapi/v1/sd-models)
+//   - "" / "auto"  : try the four shapes above and union the results; sdcpp_models is not in
+//     the union because a bare array already means llama-swap
 func parseLoadedModels(body []byte, format string) []string {
 	var v any
 	if err := json.Unmarshal(body, &v); err != nil {
@@ -82,6 +84,8 @@ func parseLoadedModels(body []byte, format string) []string {
 		return dedupNonEmpty(llamaCppLoadedModels(v))
 	case "litellm":
 		return dedupNonEmpty(litellmLoadedModels(v))
+	case "sdcpp_models":
+		return dedupNonEmpty(sdcppLoadedModels(v))
 	default: // "" / "auto" / anything unknown -> tolerant union
 		all := append(openaiLoadedModels(v), llamaSwapLoadedModels(v)...)
 		all = append(all, llamaCppLoadedModels(v)...)
@@ -142,6 +146,39 @@ func litellmLoadedModels(v any) []string {
 		return nil
 	}
 	return modelNamesFromArray(arr) // reuses the existing model/id/name extractor
+}
+
+// sdcppLoadedModels extracts the model names from stable-diffusion.cpp's
+// /sdapi/v1/sd-models: [{"model_name":"flux1-dev","filename":"flux1-dev.safetensors"}].
+//
+// model_name, not filename: it is the name the operator recognises, and it is
+// what becomes the mapping's app_model_name. Carrying it is safe even though
+// the server ignores the request's `model` field entirely (measured: a real
+// name, a bogus name and an empty string all return byte-identical
+// responses) -- which is precisely what frees the gateway to carry a
+// meaningful name instead of the static `sd-cpp-local` that /v1/models
+// reports.
+//
+// It is the ONE definition of an sd model's name: the loaded probe
+// (parseLoadedModels) and model discovery (decodeSdcppModelList) both call
+// it, because a mapping reads as loaded only when the probe reports the very
+// name discovery created it under.
+func sdcppLoadedModels(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, entry := range arr {
+		obj, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, ok := obj["model_name"].(string); ok && strings.TrimSpace(name) != "" {
+			out = append(out, strings.TrimSpace(name))
+		}
+	}
+	return out
 }
 
 // modelNamesFromArray pulls model names from an array whose items are either

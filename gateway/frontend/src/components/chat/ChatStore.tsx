@@ -301,8 +301,19 @@ export function ChatStoreProvider({
 
   const { showError } = useToast();
 
+  // A model is offered when the chat can send it something the gateway will
+  // serve: a text request (the openai flavor), or an image request. An image
+  // request needs BOTH the openai_images flavor and an image verdict, because
+  // the images gate refuses a model without image: yes -- and an images-only
+  // model (an sd-server, whose upstream has no chat endpoint) without that
+  // verdict could only ever produce a request that fails.
   const chatModels = useMemo(
-    () => models.filter((option) => option.flavors.includes('openai')),
+    () =>
+      models.filter(
+        (option) =>
+          option.flavors.includes('openai') ||
+          (option.flavors.includes('openai_images') && option.image === true),
+      ),
     [models],
   );
   // The dropdown's option list. A non-empty `model` that is not (or no longer)

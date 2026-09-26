@@ -158,7 +158,7 @@ func TestCreateTokenRejectsLockedModelAsFallback(t *testing.T) {
 	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
 	offerVisibility(t, f.rs, "qwen3-32b", "locked")
 	// The rejection must be about callability, not about existence.
-	if _, ok := f.svc.ModelOfferingFor(ctx, f.owner, routing.APIFlavorOpenAI).Existing["qwen3-32b"]; !ok {
+	if _, ok := f.svc.ModelOfferingFor(ctx, f.owner, routing.APIFlavorOpenAI, nil).Existing["qwen3-32b"]; !ok {
 		t.Fatal("fixture broken: the locked model does not exist at all")
 	}
 	_, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{

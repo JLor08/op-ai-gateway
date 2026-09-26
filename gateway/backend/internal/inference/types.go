@@ -179,11 +179,14 @@ type Request struct {
 	// existing path -- and set by an endpoint handler from its own identity,
 	// never from the request body.
 	//
-	// This is the axis the capability gate keys on, deliberately instead of a new
-	// fine API flavor: NormalizeAPIFlavor folds any openai* flavor to the coarse
-	// "openai", so a flavor cannot refuse anything, while this list needs no
-	// store change at all (routing.Store already has
-	// MappingCapabilitiesForMappings). See ADR-042.
+	// This is the axis the capability gate keys on, deliberately instead of the
+	// API flavor. The flavor does filter at candidacy -- openai_images is a
+	// coarse flavor of its own, and an application that does not declare it is
+	// no images candidate -- but a flavor is a property of the route, not of the
+	// model: it cannot say whether the model behind that route generates images.
+	// This list asks the mapping's own verdict, and needs no store change at all
+	// (routing.Store already has MappingCapabilitiesForMappings). See ADR-042
+	// and ADR-044.
 	RequiredCapabilities []string `json:"-"`
 	Model                string   `json:"model"`
 	// RequestedModel is the model name exactly as the client sent it, before

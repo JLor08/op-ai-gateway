@@ -120,3 +120,55 @@ func TestModelWarmerNilSafe(t *testing.T) {
 	empty := &modelWarmer{} // srv == nil
 	empty.Warm(context.Background(), "anything")
 }
+
+// TestModelWarmerSkipsAnImagesOnlyAgentChild: the warm call is a chat prompt,
+// so a mapping that serves only images must never be warmed. Looping over the
+// text flavors keeps out an application that declares only openai_images, but
+// candidacy judges a server_agent application by its own flavors, so an
+// agent-launched sd-server child whose spec lists only openai_images still
+// arrives as a candidate under a parent that also declares openai. The warmer
+// skips it by its effective flavors, and warms a text sibling of the same name
+// instead when there is one.
+func TestModelWarmerSkipsAnImagesOnlyAgentChild(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	for i, srvID := range []string{"srv-sd", "srv-text"} {
+		if err := mem.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".example.test", Provider: routing.ProviderMock, Endpoint: "mock://" + srvID, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		appID := "app-" + srvID
+		if err := mem.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderServerAgent, Port: 8081 + i, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+	}
+	child := func(id, appID, gateway, upstream string, flavors []string) {
+		t.Helper()
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: appID, GatewayModelName: gateway, AppModelName: upstream, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", id, err)
+		}
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-" + id, MappingID: id, Binary: "/opt/bin/server", Args: "[]", Env: "{}", APIFlavors: flavors, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", id, err)
+		}
+	}
+	// "flux" exists only as an images-only child. "shared" exists as an
+	// images-only child (sorted first, map-a) and a text child (map-b).
+	child("map-flux", "app-srv-sd", "flux", "up-flux", []string{routing.APIFlavorOpenAIImages})
+	child("map-a-shared", "app-srv-sd", "shared", "up-shared-sd", []string{routing.APIFlavorOpenAIImages})
+	child("map-b-shared", "app-srv-text", "shared", "up-shared-text", []string{routing.APIFlavorOpenAI})
+
+	fake := newColdLister(nil)
+	w := newModelWarmer(&Server{Provider: fake, Routes: mem})
+
+	w.Warm(ctx, "flux")
+	waitWarmIdle(t, w, "flux")
+	if got := fake.streamedModels(); len(got) != 0 {
+		t.Fatalf("streamed = %v, want no chat prompt to an images-only child", got)
+	}
+
+	w.Warm(ctx, "shared")
+	waitWarmIdle(t, w, "shared")
+	if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-shared-text" {
+		t.Fatalf("streamed = %v, want exactly [up-shared-text] (the text sibling)", got)
+	}
+}

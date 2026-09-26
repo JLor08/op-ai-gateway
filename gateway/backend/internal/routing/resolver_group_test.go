@@ -47,6 +47,15 @@ func (w *fakeWarmer) Warm(_ context.Context, name string) { w.warmed = append(w.
 // seededGroupStore seeds two independent single-server members, coder-a (srv_a) and
 // coder-b (srv_b), each healthy with its own mapping. Distinct gateway model names so
 // each is an independent routing target; a group over them is defined by fakeGroups.
+//
+// APIFlavors deliberately lists both APIFlavorOpenAI and APIFlavorOpenAIImages: this
+// fixture is shared with resolver_capability_gate_test.go's image-routing tests
+// (imagesReq), which need these applications to actually serve openai_images now that
+// NormalizeAPIFlavor no longer folds it into APIFlavorOpenAI. Before that change the
+// single "openai" entry served images by accident (both flavors normalized the same);
+// now it must opt in explicitly, same as any other image-serving application would.
+// The chat-path tests sharing this fixture are unaffected: an extra served flavor
+// never narrows what a chat request (coarse "openai") can already reach.
 func seededGroupStore(t *testing.T, now time.Time) *MemoryStore {
 	t.Helper()
 	ctx := context.Background()
@@ -61,7 +70,7 @@ func seededGroupStore(t *testing.T, now time.Time) *MemoryStore {
 		if err := store.CreateAIServer(ctx, AIServer{ID: m.serverID, Name: m.serverID, Domain: m.serverID + ".test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateAIServer %s: %v", m.serverID, err)
 		}
-		if err := store.CreateApplication(ctx, Application{ID: m.appID, ServerID: m.serverID, Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		if err := store.CreateApplication(ctx, Application{ID: m.appID, ServerID: m.serverID, Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateApplication %s: %v", m.appID, err)
 		}
 		if err := store.CreateMapping(ctx, ModelMapping{ID: m.mappingID, ApplicationID: m.appID, GatewayModelName: m.gwName, AppModelName: m.gwName + "-up", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

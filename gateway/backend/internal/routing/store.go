@@ -22,6 +22,12 @@ const (
 	// VRAM rows, and co-residency rules live in RuntimeStore. Routing treats
 	// it like any other application type otherwise.
 	ProviderServerAgent = "server_agent"
+	// ProviderStableDiffusionCpp is an OpenAI-compatible stable-diffusion.cpp
+	// server (sd-server). It shares the OpenAI-compatible provider client, so
+	// the images relay's native passthrough works; ProviderOllama is the one
+	// type that must NOT be borrowed for this, since it is bound to its own
+	// client which does not implement provider.NativeProxyClient.
+	ProviderStableDiffusionCpp = "stable_diffusion_cpp"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -45,6 +51,16 @@ const (
 
 	APIFlavorOpenAI    = "openai"
 	APIFlavorAnthropic = "anthropic"
+	// APIFlavorOpenAIImages is a COARSE flavor of its own rather than a
+	// refinement of APIFlavorOpenAI, which is what lets an application serve
+	// images and not text (or the reverse) through applicationServesEndpoint's
+	// ordinary default branch — no per-endpoint mode, no new filter case.
+	//
+	// It is strictly OPT-IN: normalizeFlavors' empty-list default stays
+	// [openai, anthropic] exactly, because adding images there would make every
+	// existing text-only application a candidate for image requests it cannot
+	// serve.
+	APIFlavorOpenAIImages = "openai_images"
 
 	// PrincipalTypeService / PrincipalTypeUser are the two supported
 	// principal_limits owner kinds (Phase 2 of the service-accounts work):
@@ -531,7 +547,8 @@ type Application struct {
 	// llama-swap "/running", llama.cpp "/props", "/v1/models"). Empty = not tracked.
 	// LoadedModelsFormat selects the response parser: "" / "auto" (tolerant,
 	// multi-shape), "openai" (/v1/models data[].id), "llama_swap" (/running),
-	// "llama_cpp" (/props).
+	// "llama_cpp" (/props), "litellm" (LiteLLM /health), "sdcpp_models"
+	// (stable-diffusion.cpp /sdapi/v1/sd-models).
 	LoadedModelsPath   string
 	LoadedModelsFormat string
 	// ContextProbePath is an optional upstream path GET to learn context size
@@ -1180,13 +1197,40 @@ const (
 // with this source can only ever carry CapabilityYes: a CapabilityNo on it
 // could not have come from anywhere real, and would be a permanent false
 // claim ranked as a probe verdict.
+//
+// CapabilitySourceSdcppCapabilities names the fourth probe-rank source:
+// stable-diffusion.cpp's own capability document, GET /sdcpp/v1/capabilities,
+// which the gateway's health loop reads for a stable_diffusion_cpp
+// application and from whose supported_modes it derives the CapabilityImage
+// verdict (provider.SdcppCapabilitiesProber). It is named for the document it
+// read, exactly as the three above are and for the same reason. It too ranks
+// 1 through capabilitySourceRank's DEFAULT branch (no rank-table entry, and
+// none is wanted) -- never able to overwrite manual (3) or vision_benchmark
+// (2), always able to repair its own drift (1 vs 1).
+//
+// What sets it apart is narrower than direction in general -- llama_cpp_props
+// already writes a real "no" for vision, video, audio and tools -- and is
+// specific to CapabilityImage: it is the only source that answers IMAGE in
+// both directions. The only other probe that reports image at all is
+// ollama_api_show (Ollama's "image" capability name, carried as an implicit
+// yes), and that one cannot say no, because, as its paragraph above puts it,
+// "Ollama's capability array is not exhaustive, so the detector behind this
+// source can only ever produce 'yes' or nothing at all". supported_modes IS
+// exhaustive -- the server lists every mode it serves -- so a document whose
+// list lacks "img_gen" is a real CapabilityNo for image, not an absence. That
+// makes it the first writer entitled to establish (image, no), the pair the
+// portal's reservedManualVerdicts keeps out of an operator's hands so that a
+// rank-3 manual "no" cannot outrank it forever. A document with NO
+// supported_modes list at all is still no verdict: an absent list is not an
+// exhaustive one.
 const (
-	CapabilitySourceManual          = "manual"
-	CapabilitySourceVisionBenchmark = "vision_benchmark"
-	CapabilitySourceLlamaCppProps   = "llama_cpp_props"
-	CapabilitySourceOllamaAPIShow   = "ollama_api_show"
-	CapabilitySourceLlamaCppTimings = "llama_cpp_timings"
-	CapabilitySourceLegacy          = "legacy"
+	CapabilitySourceManual            = "manual"
+	CapabilitySourceVisionBenchmark   = "vision_benchmark"
+	CapabilitySourceLlamaCppProps     = "llama_cpp_props"
+	CapabilitySourceOllamaAPIShow     = "ollama_api_show"
+	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
+	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
+	CapabilitySourceLegacy            = "legacy"
 )
 
 // capabilitySourceRank orders a capability row's source into the strict,
@@ -1195,24 +1239,31 @@ const (
 // its own drift; two sources of the same rank negotiate nothing between
 // them.
 //
-//	3  CapabilitySourceManual          an operator's verdict.
-//	2  CapabilitySourceVisionBenchmark a real measurement -- an actual image
-//	                                   sent to the actual upstream, an actual
-//	                                   answer read back.
-//	1  CapabilitySourceLlamaCppProps,  a probe: re-reads the same document
-//	   CapabilitySourceOllamaAPIShow,  (llama.cpp's /props, Ollama's
-//	   CapabilitySourceLegacy,         /api/show) every time, reads the
-//	   CapabilitySourceLlamaCppTimings timings llama.cpp put on a completion
-//	   or any unrecognised source      it just served, or replays a migrated
-//	                                   heuristic. EVERY probe source ranks
-//	                                   here, and so does an unrecognised one
-//	                                   -- fail SAFE toward "treat it as a
-//	                                   probe" rather than silently handing an
-//	                                   unknown writer manual's immunity,
-//	                                   which is also why neither
-//	                                   ollama_api_show nor llama_cpp_timings
-//	                                   needs a case of its own below.
-//	0  no stored row at all            "unknown" -- see CapabilityRowsByName.
+//	3  CapabilitySourceManual             an operator's verdict.
+//	2  CapabilitySourceVisionBenchmark    a real measurement -- an actual
+//	                                      image sent to the actual
+//	                                      upstream, an actual answer read
+//	                                      back.
+//	1  CapabilitySourceLlamaCppProps,     a probe: re-reads the same
+//	   CapabilitySourceOllamaAPIShow,     document (llama.cpp's /props,
+//	   CapabilitySourceLegacy,            Ollama's /api/show,
+//	   CapabilitySourceLlamaCppTimings,   stable-diffusion.cpp's
+//	   CapabilitySourceSdcppCapabilities  /sdcpp/v1/capabilities) every
+//	   or any unrecognised source         time, reads the timings llama.cpp
+//	                                      put on a completion it just
+//	                                      served, or replays a migrated
+//	                                      heuristic. EVERY probe source
+//	                                      ranks here, and so does an
+//	                                      unrecognised one -- fail SAFE
+//	                                      toward "treat it as a probe"
+//	                                      rather than silently handing an
+//	                                      unknown writer manual's immunity,
+//	                                      which is also why none of
+//	                                      ollama_api_show, llama_cpp_timings
+//	                                      and sdcpp_capabilities needs a
+//	                                      case of its own below.
+//	0  no stored row at all               "unknown" -- see
+//	                                      CapabilityRowsByName.
 //
 // WritableCapabilityRows is the primary caller -- a write is permitted iff
 // rank(incoming) >= rank(current) -- but no longer the only one: since issue

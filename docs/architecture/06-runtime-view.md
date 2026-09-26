@@ -96,12 +96,20 @@ sequenceDiagram
 
     A->>GW: POST /api/portal/applications/{id}/sync-models
     GW->>PR: list upstream models
-    PR->>AI: GET /v1/models or /api/tags
+    PR->>AI: GET /v1/models, /sdapi/v1/sd-models or /api/tags
     AI-->>PR: model list
     PR-->>GW: models
     GW->>S: upsert model mappings for the application
     GW-->>A: updated mappings
 ```
+
+The listing endpoint is derived from the application's **type**, never from its
+`loaded_models_path`: `/api/tags` for `ollama`, `/sdapi/v1/sd-models` for
+`stable_diffusion_cpp` (whose `/v1/models` names only a placeholder), and
+`/v1/models` for every other OpenAI-compatible type; `mock` answers fixed
+names without a request. A body that is not JSON is an error that leaves every
+mapping unchanged; which JSON bodies also count as errors differs by decoder
+([API Compatibility & Inference §8](cross-cutting/compatibility-and-inference.md#8-provider-clients)).
 
 ## 6.5 Model-selection benchmark
 

@@ -364,7 +364,7 @@ func TestOfferingCallableAppliesTheProvisioningFilter(t *testing.T) {
 	e := newGroupTestEnv(t)
 	f := setupVisibilityFixture(e)
 
-	offV := e.svc.ModelOfferingFor(e.ctx, token("usr_v"), routing.APIFlavorOpenAI)
+	offV := e.svc.ModelOfferingFor(e.ctx, token("usr_v"), routing.APIFlavorOpenAI, nil)
 	if _, ok := offV.Callable[f.modelM]; ok {
 		t.Fatalf("Callable(usr_v) includes %s, want excluded (not provisioned into RG_VIS)", f.modelM)
 	}
@@ -376,7 +376,7 @@ func TestOfferingCallableAppliesTheProvisioningFilter(t *testing.T) {
 	}
 
 	// The provisioned caller reaches both.
-	offU := e.svc.ModelOfferingFor(e.ctx, token("usr_u"), routing.APIFlavorOpenAI)
+	offU := e.svc.ModelOfferingFor(e.ctx, token("usr_u"), routing.APIFlavorOpenAI, nil)
 	if _, ok := offU.Callable[f.modelM]; !ok {
 		t.Fatalf("Callable(usr_u) missing %s, want present (provisioned)", f.modelM)
 	}

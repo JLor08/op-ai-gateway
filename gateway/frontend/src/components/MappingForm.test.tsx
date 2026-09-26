@@ -293,17 +293,50 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).toBeInTheDocument();
       expect(screen.getByRole('option', { name: t.mappingCapabilityYes })).toBeInTheDocument();
       // reservedManualVerdicts refuses (image, no): a manual no outranks every
-      // automated source forever and would mask the sd-server writer when it
-      // ships. A control that always 400s is worse than an absent one.
+      // automated source forever and would mask the sd-server capability
+      // probe. A control that always 400s is worse than an absent one.
       expect(screen.queryByRole('option', { name: t.mappingCapabilityNo })).not.toBeInTheDocument();
     });
 
-    it('shows an image unknown hint that does not promise a probe', async () => {
+    it('shows an image unknown hint of its own', async () => {
       renderForm({ row: makeMapping({ capabilities: [] }) });
       expect(screen.getByText(t.mappingImageCapableUnknownHint)).toBeInTheDocument();
-      // The vision hint may promise re-derivation; image has no automated
-      // writer yet, so its hint must not.
+      // Image has its own automated writer (sd-server's capability document),
+      // reached for a different population than vision's /props probe, so the
+      // two hints must not share one text.
       expect(t.mappingImageCapableUnknownHint).not.toBe(t.mappingVisionCapableUnknownHint);
+    });
+
+    it("shows a probe's image no, without offering it as a choice", async () => {
+      // The sdcpp_capabilities probe is the one writer entitled to state
+      // image: no. The control must SHOW that verdict -- a Select whose value
+      // has no option renders blank, which reads as "nothing on file" -- while
+      // still never offering "no" as a pick, since the backend refuses a manual
+      // one.
+      const { submitted } = renderForm({
+        row: makeMapping({
+          capabilities: [
+            {
+              capability: 'image',
+              verdict: 'no',
+              source: 'sdcpp_capabilities',
+              checked_at: '2026-09-25T12:00:00Z',
+            },
+          ],
+        }),
+      });
+      const combo = screen.getByRole('combobox', { name: t.mappingImageCapable });
+      expect(combo.textContent).toBe(t.mappingCapabilityNo);
+
+      fireEvent.mouseDown(combo);
+      const no = await screen.findByRole('option', { name: t.mappingCapabilityNo });
+      expect(no).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      // Untouched, it is not sent: the probe's row stays the probe's.
+      await save();
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0]).not.toHaveProperty('capability_verdicts');
     });
 
     it('leaves metrics_locked a CHECKBOX', () => {

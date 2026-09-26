@@ -6,8 +6,20 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // 'server_agent' (agent-runtime-manager feature): the gateway routes to a
 // server-agent-managed router instead of a directly-configured upstream --
 // see api/runtime.ts for the per-mapping launch specs this type unlocks.
+// 'stable_diffusion_cpp': an image-generation server (stable-diffusion.cpp /
+// sd_server). The application form defaults its API flavors to the coarse
+// 'openai_images' alone, but that is a form default, not a property of the
+// type: the backend stores whatever flavors the operator ticks. See
+// applicationTypeDefaults.ts for why its stock defaults (health mode, API
+// flavors, timeout) would break it and are overridden per-type.
 export type ApplicationType =
-  'ollama' | 'vllm' | 'llama_cpp' | 'llama_swap' | 'litellm' | 'server_agent';
+  | 'ollama'
+  | 'vllm'
+  | 'llama_cpp'
+  | 'llama_swap'
+  | 'litellm'
+  | 'server_agent'
+  | 'stable_diffusion_cpp';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 

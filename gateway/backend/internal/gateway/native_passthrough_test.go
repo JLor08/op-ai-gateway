@@ -858,6 +858,23 @@ func TestAnthropicMessagesDisabledEndpointRejects(t *testing.T) {
 // per-model spec, only known post-resolve), so dispatch must.
 func newServerAgentSpecFlavorTestServer(t *testing.T, prov provider.Client, specFlavors []string) *Server {
 	t.Helper()
+	return newServerAgentSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, specFlavors, routing.EndpointModePassthrough)
+}
+
+// newServerAgentSpecTestServer is the fixture newServerAgentSpecFlavorTestServer
+// seeds, with the application's flavors and the spec's two endpoint modes
+// chosen by the caller: gateway model "gw-model" on one server_agent
+// application whose mapping carries a runtime spec with specFlavors and
+// ResponsesMode = MessagesMode = specMode.
+//
+// It also creates a second token, "override-secret", whose catch-all model
+// override is "gw-model". A /v1/responses or /v1/messages body whose model is
+// blank to the routing probe (sniffRoutingModel) skips tryProxyNative, and the
+// override then routes it to gw-model on the translate path -- the one way a
+// test can put a coding-agent request on the translate dispatch without
+// tryProxyNative's own flavor check having judged the target first.
+func newServerAgentSpecTestServer(t *testing.T, prov provider.Client, appFlavors, specFlavors []string, specMode routing.EndpointMode) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
@@ -865,22 +882,26 @@ func newServerAgentSpecFlavorTestServer(t *testing.T, prov provider.Client, spec
 	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_dev", UserID: "usr_dev", Name: "Dev Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin"]`, CreatedAt: now, UpdatedAt: now}, "dev-secret"); err != nil {
 		t.Fatalf("CreatePlainToken: %v", err)
 	}
+	if err := directory.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_override", UserID: "usr_dev", Name: "Override Token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now, ModelOverride: "gw-model"}, "override-secret"); err != nil {
+		t.Fatalf("CreatePlainToken(override): %v", err)
+	}
 	recorder := usage.NewRecorder()
 	routeStore := routing.NewMemoryStore()
 	ctx := context.Background()
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native-spec", Name: "Native Spec Upstream", Domain: "native-spec.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native-spec.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	// App-level flavors carry BOTH, so candidacy (the app-level fallback check in
-	// applicationServesEndpoint) admits the request regardless of which endpoint
+	// App-level flavors are the caller's, and every caller lists at least the
+	// flavors of the endpoints it tests, so candidacy (the app-level fallback
+	// check in applicationServesEndpoint) admits the request whichever endpoint
 	// is under test — the spec below is what narrows the effective flavor set.
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-spec", ServerID: "srv-native-spec", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-spec", ServerID: "srv-native-spec", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: appFlavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-native-spec", ApplicationID: "app-native-spec", GatewayModelName: "gw-model", AppModelName: "upstream-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateMapping: %v", err)
 	}
-	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-native-spec", MappingID: "route-native-spec", APIFlavors: specFlavors, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-native-spec", MappingID: "route-native-spec", APIFlavors: specFlavors, ResponsesMode: specMode, MessagesMode: specMode, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-native-spec", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
@@ -947,6 +968,311 @@ func TestServerAgentSpecFlavorNotServedRejectsResponses(t *testing.T) {
 	}
 	if prov.proxyCalls != 0 {
 		t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+	}
+}
+
+// countingTranslateProvider is recordingProxyProvider that also counts the
+// translate path's two provider calls, so a test can prove a refused request
+// reached no provider method at all.
+type countingTranslateProvider struct {
+	recordingProxyProvider
+	completeCalls int
+	streamCalls   int
+}
+
+func (p *countingTranslateProvider) Complete(ctx context.Context, target routing.Target, req inference.Request) (provider.Response, error) {
+	p.completeCalls++
+	return p.recordingProxyProvider.Complete(ctx, target, req)
+}
+
+func (p *countingTranslateProvider) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit provider.StreamEmit) error {
+	p.streamCalls++
+	return p.recordingProxyProvider.CompleteStream(ctx, target, req, emit)
+}
+
+// calls is every provider call the request made, translate or native.
+func (p *countingTranslateProvider) calls() int {
+	return p.completeCalls + p.streamCalls + p.proxyCalls
+}
+
+// serverAgentAllFlavors is the APPLICATION flavor list of the images-only
+// fixtures below: every coarse flavor, so candidacy admits text and image
+// requests alike and only the mapping's runtime spec decides what is served.
+var serverAgentAllFlavors = []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages}
+
+// postBearer sends body to path on srv as the token whose secret is secret.
+func postBearer(t *testing.T, srv *Server, secret, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// routingFailureShape blanks the fields of a usage row that differ between
+// two requests for different model names, leaving what a routing failure's
+// row is made of: its status, code, HTTP status, content type, paths and its
+// (absent) target attribution.
+func routingFailureShape(e usage.Event) usage.Event {
+	e.ID, e.Model, e.RequestedModel, e.ProviderModel = "", "", "", ""
+	e.LatencyMS = 0
+	e.CreatedAt = time.Time{}
+	return e
+}
+
+// TestTargetIsImagesOnly pins the predicate's rule on its own: images-only
+// means openai_images listed and neither text flavor; an empty list is not.
+func TestTargetIsImagesOnly(t *testing.T) {
+	cases := []struct {
+		flavors []string
+		want    bool
+	}{
+		{nil, false},
+		{[]string{}, false},
+		{[]string{routing.APIFlavorOpenAIImages}, true},
+		{[]string{routing.APIFlavorOpenAIImages, "custom"}, true},
+		{[]string{routing.APIFlavorOpenAI}, false},
+		{[]string{routing.APIFlavorAnthropic}, false},
+		{[]string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, false},
+		{[]string{routing.APIFlavorOpenAIImages, routing.APIFlavorAnthropic}, false},
+	}
+	for _, tc := range cases {
+		if got := targetIsImagesOnly(routing.Target{APIFlavors: tc.flavors}); got != tc.want {
+			t.Errorf("targetIsImagesOnly(%q) = %v, want %v", tc.flavors, got, tc.want)
+		}
+	}
+}
+
+// TestChatCompletionsRefusesImagesOnlyServerAgentChild covers the gap an
+// images-only runtime spec opens on the text translate path. Candidacy gates a
+// server_agent application on its own flavors, which here include openai, so
+// only the resolved spec says the child can do nothing but generate images;
+// /v1/chat/completions never goes through tryProxyNative, so without a check
+// at the translate dispatch the request would reach the upstream and fail
+// there. It must instead be refused exactly as candidacy refuses a model with
+// no route -- same code, same status, and a usage row recorded the same way --
+// and, for a stream, before any byte of the stream is written.
+func TestChatCompletionsRefusesImagesOnlyServerAgentChild(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		stream bool
+	}{
+		{"buffered", `{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`, false},
+		{"stream", `{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentAllFlavors, []string{routing.APIFlavorOpenAIImages}, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "dev-secret", "/v1/chat/completions", tc.body)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+			// The whole answer is the JSON error: no SSE header, no frame.
+			if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+				t.Fatalf("Content-Type = %q, want %q -- the refusal must come before the stream starts", ct, jsonContentType)
+			}
+			if strings.Contains(rec.Body.String(), "data:") {
+				t.Fatalf("body = %q, want no SSE frame", rec.Body.String())
+			}
+			if n := prov.calls(); n != 0 {
+				t.Fatalf("provider calls = %d (complete %d, stream %d, proxy %d), want 0 -- an images-only child must never be sent a text request",
+					n, prov.completeCalls, prov.streamCalls, prov.proxyCalls)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 {
+				t.Fatalf("usage events = %d, want exactly 1; events = %+v", len(events), events)
+			}
+			got := events[0]
+			if got.Status != "error" || got.ErrorCode != "routing.no_model_route" || got.HTTPStatus != http.StatusNotFound ||
+				got.ContentType != jsonContentType || got.ReqPath != "/v1/chat/completions" || got.Stream != tc.stream {
+				t.Fatalf("usage row = %+v, want an error row for routing.no_model_route, 404, %s, /v1/chat/completions, stream=%v",
+					got, jsonContentType, tc.stream)
+			}
+			// No upstream was called, and the row says so.
+			if got.Host != "" || got.RouteID != "" || got.Provider != "" || got.ProviderPath != "" || got.ServerName != "" {
+				t.Fatalf("usage row = %+v, want no Host/RouteID/Provider/ProviderPath/ServerName -- no upstream was ever called", got)
+			}
+
+			// And it is the SAME row the path records for a genuine routing
+			// failure: an unknown model through the same handler.
+			unknown := postBearer(t, srv, "dev-secret", "/v1/chat/completions", strings.Replace(tc.body, "gw-model", "no-such-model", 1))
+			if unknown.Code != http.StatusNotFound {
+				t.Fatalf("unknown model: status = %d, want 404; body = %s", unknown.Code, unknown.Body.String())
+			}
+			events = srv.Usage.All()
+			if len(events) != 2 {
+				t.Fatalf("usage events = %d, want 2 after the unknown-model request", len(events))
+			}
+			if refused, noRoute := routingFailureShape(events[0]), routingFailureShape(events[1]); refused != noRoute {
+				t.Fatalf("refusal row differs from the path's own no-route row:\n refused  = %+v\n no route = %+v", refused, noRoute)
+			}
+		})
+	}
+}
+
+// TestChatCompletionsServesServerAgentChildUnlessImagesOnly pins what the
+// images-only refusal above must NOT touch. On the text translate path the
+// only spec-flavor check is the images-only one: the general effective-served
+// rule is deliberately not enforced there, so a spec narrowed to anthropic,
+// and a legacy spec stored as [], still serve /v1/chat/completions as they
+// always have. [openai] (buffered and streamed) is the positive control for
+// the refusal's fixture.
+func TestChatCompletionsServesServerAgentChildUnlessImagesOnly(t *testing.T) {
+	cases := []struct {
+		name   string
+		spec   []string
+		stream bool
+	}{
+		{"openai", []string{routing.APIFlavorOpenAI}, false},
+		{"openai stream", []string{routing.APIFlavorOpenAI}, true},
+		{"anthropic only is still served: the general rule is not enforced here", []string{routing.APIFlavorAnthropic}, false},
+		{"empty legacy spec is still served", []string{}, false},
+		{"openai and openai_images", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentAllFlavors, tc.spec, routing.EndpointModeTranslate)
+			body := `{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`
+			if tc.stream {
+				body = `{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+			}
+
+			rec := postBearer(t, srv, "dev-secret", "/v1/chat/completions", body)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+			}
+			wantComplete, wantStream := 1, 0
+			if tc.stream {
+				wantComplete, wantStream = 0, 1
+			}
+			if prov.completeCalls != wantComplete || prov.streamCalls != wantStream || prov.proxyCalls != 0 {
+				t.Fatalf("calls: complete %d, stream %d, proxy %d; want complete %d, stream %d, proxy 0",
+					prov.completeCalls, prov.streamCalls, prov.proxyCalls, wantComplete, wantStream)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 || events[0].Status != "success" || events[0].RouteID != "route-native-spec" {
+				t.Fatalf("usage events = %+v, want one success row on route-native-spec", events)
+			}
+		})
+	}
+}
+
+// TestCodingAgentTranslateModeKeepsTheFullSpecFlavorRule records what a
+// translate-mode /v1/responses or /v1/messages request does with a narrowing
+// spec when tryProxyNative judges its target -- here, a body whose model the
+// routing probe reads and a resolve that succeeds. tryProxyNative runs
+// targetServesFlavor before the endpoint mode decides anything, so the FULL
+// effective-served rule applies to that target in translate mode as in
+// passthrough mode, and a spec without the endpoint's flavor answers the
+// endpoint's own disabled code without reaching the translate dispatch. An
+// images-only spec is one such spec. A request tryProxyNative does not judge
+// reaches the translate dispatch and is checked there only for images-only;
+// TestTranslateDispatchRefusesImagesOnlyChildForCodingAgentRequests pins that
+// side. The [openai] row is the positive control: the same translate-mode
+// fixture serves /v1/responses once the spec lists the flavor, through the
+// translate path and not natively.
+func TestCodingAgentTranslateModeKeepsTheFullSpecFlavorRule(t *testing.T) {
+	cases := []struct {
+		name       string
+		spec       []string
+		path       string
+		body       string
+		wantStatus int
+		wantCode   string // "" => served
+	}{
+		{"images-only spec, messages", []string{routing.APIFlavorOpenAIImages}, "/v1/messages", `{"model":"gw-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, http.StatusNotFound, "messages.endpoint_disabled"},
+		{"images-only spec, responses", []string{routing.APIFlavorOpenAIImages}, "/v1/responses", `{"model":"gw-model","input":"hi"}`, http.StatusNotFound, "responses.endpoint_disabled"},
+		{"anthropic-only spec, responses", []string{routing.APIFlavorAnthropic}, "/v1/responses", `{"model":"gw-model","input":"hi"}`, http.StatusNotFound, "responses.endpoint_disabled"},
+		{"openai spec, responses (control)", []string{routing.APIFlavorOpenAI}, "/v1/responses", `{"model":"gw-model","input":"hi"}`, http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentAllFlavors, tc.spec, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "dev-secret", tc.path, tc.body)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantCode == "" {
+				if prov.completeCalls != 1 || prov.proxyCalls != 0 {
+					t.Fatalf("calls: complete %d, proxy %d; want complete 1, proxy 0 (served by translation)", prov.completeCalls, prov.proxyCalls)
+				}
+				return
+			}
+			requireErrorCode(t, rec.Body.String(), tc.wantCode)
+			if n := prov.calls(); n != 0 {
+				t.Fatalf("provider calls = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestTranslateDispatchRefusesImagesOnlyChildForCodingAgentRequests proves the
+// images-only check sits at the translate dispatch every text request shares,
+// not in the chat handler. A /v1/responses or /v1/messages request reaches
+// that dispatch without tryProxyNative having judged its target whenever the
+// routing probe reads no model (here a blank model, which the token's
+// catch-all override then routes to gw-model) -- and also when the
+// translate path's own re-resolve lands on a different candidate than
+// tryProxyNative's did. Such a request is refused like the chat request is;
+// an [anthropic] spec on the same path is still served, because the general
+// rule is not enforced at this dispatch either.
+func TestTranslateDispatchRefusesImagesOnlyChildForCodingAgentRequests(t *testing.T) {
+	const (
+		responsesBody = `{"model":" ","input":"hi"}`
+		messagesBody  = `{"model":" ","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	)
+	cases := []struct {
+		name       string
+		spec       []string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{"images-only spec, responses buffered", []string{routing.APIFlavorOpenAIImages}, "/v1/responses", responsesBody, http.StatusNotFound},
+		{"images-only spec, messages stream", []string{routing.APIFlavorOpenAIImages}, "/v1/messages", messagesBody, http.StatusNotFound},
+		{"anthropic-only spec, responses buffered, still served", []string{routing.APIFlavorAnthropic}, "/v1/responses", responsesBody, http.StatusOK},
+		{"anthropic spec, messages stream (control)", []string{routing.APIFlavorAnthropic}, "/v1/messages", messagesBody, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentAllFlavors, tc.spec, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "override-secret", tc.path, tc.body)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus == http.StatusOK {
+				if prov.completeCalls+prov.streamCalls != 1 || prov.proxyCalls != 0 {
+					t.Fatalf("calls: complete %d, stream %d, proxy %d; want one translate call and no proxy call",
+						prov.completeCalls, prov.streamCalls, prov.proxyCalls)
+				}
+				return
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+			if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+				t.Fatalf("Content-Type = %q, want %q", ct, jsonContentType)
+			}
+			if n := prov.calls(); n != 0 {
+				t.Fatalf("provider calls = %d, want 0", n)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 || events[0].ErrorCode != "routing.no_model_route" || events[0].Host != "" || events[0].RouteID != "" {
+				t.Fatalf("usage events = %+v, want one routing.no_model_route row with no target attribution", events)
+			}
+		})
 	}
 }
 

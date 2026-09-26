@@ -6,6 +6,8 @@ package provider
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"testing"
@@ -151,6 +153,48 @@ func TestMultiplexerProbeReturnsUnavailableWithoutProber(t *testing.T) {
 	err := mux.Probe(context.Background(), routing.Target{Provider: routing.ProviderLlamaCPP}, "/v1/health")
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Probe error = %v, want ErrUnavailable", err)
+	}
+}
+
+// TestMultiplexerDispatchesSdcppCapabilitiesToOpenAICompatibleClient mirrors
+// providerClients: a stable_diffusion_cpp target must reach the ONE shared
+// OpenAI-compatible client's ProbeSdcppCapabilities -- which is what makes the
+// probe ride the outbound app transport -- while a provider whose client lacks
+// the capability answers ErrUnavailable and sends nothing.
+func TestMultiplexerDispatchesSdcppCapabilitiesToOpenAICompatibleClient(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		_, _ = w.Write([]byte(`{"supported_modes":["img_gen"],"model":{"stem":"flux1-dev"}}`))
+	}))
+	defer srv.Close()
+	shared := NewOpenAICompatibleClient(srv.Client())
+	mux := NewMultiplexer(map[string]Client{
+		routing.ProviderVLLM:               shared,
+		routing.ProviderStableDiffusionCpp: shared, // same instance, exactly as providerClients wires it
+		routing.ProviderOllama:             &recordingClient{},
+	}, nil)
+
+	got, err := mux.ProbeSdcppCapabilities(context.Background(), routing.Target{Provider: routing.ProviderStableDiffusionCpp, Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("ProbeSdcppCapabilities(stable_diffusion_cpp) returned %v", err)
+	}
+	if got.Image != routing.CapabilityYes || got.ModelStem != "flux1-dev" {
+		t.Fatalf("got %+v, want {Image:yes ModelStem:flux1-dev}", got)
+	}
+	if len(paths) != 1 || paths[0] != "/sdcpp/v1/capabilities" {
+		t.Fatalf("upstream paths = %v, want exactly [/sdcpp/v1/capabilities]", paths)
+	}
+
+	got, err = mux.ProbeSdcppCapabilities(context.Background(), routing.Target{Provider: routing.ProviderOllama, Endpoint: srv.URL})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ProbeSdcppCapabilities(ollama) error = %v, want ErrUnavailable -- a client without the capability has no verdict", err)
+	}
+	if got != (SdcppVerdicts{}) {
+		t.Fatalf("ProbeSdcppCapabilities(ollama) = %+v, want the zero value", got)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("upstream paths = %v, want no request for a client without the capability", paths)
 	}
 }
 

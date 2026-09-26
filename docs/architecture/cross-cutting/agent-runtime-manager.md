@@ -751,17 +751,19 @@ have emitted).
 
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
-A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` | `custom`;
-migration 75, `text not null default ''`) is what tells the gateway — and,
-through it, the agent — which conventions govern *this* child's metrics and
-context-window endpoints (design 2026-09-07). `""` (every pre-feature row) is
+A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
+`stable_diffusion_cpp` | `custom`; migration 75, `text not null default ''`) is
+what tells the gateway — and, through it, the agent — which conventions govern
+*this* child's metrics and context-window endpoints (design 2026-09-07), and,
+for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 (`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
 launched binary's basename, first match wins — `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
-`text-generation-launcher`/`tgi`, then `ollama` — and falls back to `custom`
-when nothing matches. `EffectiveRuntimeSpecType(spec)` resolves the type that
-actually governs a spec: the explicit `Type` when set, else the detected one.
+`text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
+`ollama` — and falls back to `custom` when nothing matches.
+`EffectiveRuntimeSpecType(spec)` resolves the type that actually governs a
+spec: the explicit `Type` when set, else the detected one.
 
 `DeriveProbePaths(type, metricsOverride, contextOverride)` turns a resolved
 type into the two endpoints the agent probes, an operator override always
@@ -773,6 +775,7 @@ winning **per field** over the type's own default:
 | `llama_cpp` | `/metrics` (Prometheus) | `/props` | `default_generation_settings.n_ctx` (falls back to a top-level `n_ctx`) |
 | `tgi` | `/metrics` (Prometheus; `tgi_batch_current_size`=active, `tgi_queue_size`=queue) | `/info` | `max_total_tokens` |
 | `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` — **POST**, body `{"model": "<the spec's model>"}` (see below) | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
+| `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -834,8 +837,9 @@ table itself. The portal's own `GET` additionally echoes **read-only**
 alongside the raw stored `type`/`metrics_path`/`context_probe_path`, so an
 operator relying on auto-detect can see the outcome without guessing, and one
 that types a raw override still sees the exact resolved string the agent will
-use. An invalid `type` (anything outside the five values above) is refused
-before any mutation as `runtime_spec.type_invalid` (400).
+use. An invalid `type` (anything that is neither empty nor one of the six named
+kinds above) is refused before any mutation as `runtime_spec.type_invalid`
+(400).
 
 What the resolved paths are actually *used for* — the per-child probe cycle
 itself, and the three sample fields it fills — is [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)
@@ -859,47 +863,86 @@ capacity benchmark, [Routing & Model Selection
 and was never surfaced in the application editor at all, for any application
 type.
 
-#### A worked `sd-server` launch under `custom`
+#### A worked `sd-server` launch under `stable_diffusion_cpp`
 
 stable-diffusion.cpp's `sd-server` (`leejet/stable-diffusion.cpp`) is the
-agent-managed runtime behind `POST /v1/images/generations` (see [API
-Compatibility & Inference](compatibility-and-inference.md)), and it is the
-first one this chapter documents that is not shaped like a chat/completions
-server. `RuntimeSpec` — `Binary` plus an opaque `Args` array, `Env`,
-`WorkDir`, `ListenPort` and the timeout fields above — expresses its launch,
-multi-file model weights included, with **no schema change**. This
-subsection is documentation only; it changes no code.
+image backend behind `POST /v1/images/generations` (see [API Compatibility &
+Inference](compatibility-and-inference.md#34-openai-images-generations)), and
+it is the first runtime this chapter documents that is not shaped like a
+chat/completions server. `RuntimeSpec` — `Binary` plus an opaque `Args` array,
+`Env`, `WorkDir`, `ListenPort` and the timeout fields above — expresses its
+launch, multi-file model weights included, with **no schema change**: a spec is
+1:1 per `ModelMapping`, so each mapping under the agent's router port launches
+its own process.
 
-**`Type: "custom"`, not a new `sd_cpp` kind.** `DeriveProbePaths`'s `custom`
-case (`routing/runtime_spec_type.go:91-92`) resolves both the metrics and the
-context-probe path to `""`, and that is exactly right here: `sd-server` has
-no Prometheus `/metrics` and no context-window axis to probe — an image
-model has neither. A dedicated `sd_cpp` kind would buy auto-detection from
-the binary name and a friendlier dropdown label, at the cost of a real edit
-surface — confirmed against this branch, not assumed: the constant and a
-`DetectRuntimeSpecType`/`DeriveProbePaths` case in `runtime_spec_type.go`
-itself; a `validRuntimeSpecType` case and its error string
-(`portal/service_runtime.go`, `gateway/portal_runtime_endpoints.go`); and a
-review of every other place that keys behavior off the resolved kind while
-assuming an LLM-shaped provider — the live-timings-capable set
-(`routing/live_timings.go`), the two live-progress kind resolutions
-(`routing/resolver.go`, `gateway/responses_live_timings.go`), the live-progress
-shape gate (`provider/live_progress.go`), the benchmark runner's live-progress
-lookup (`gateway/benchmark_runner.go`), and the agent's own capability probes
-(`server-agent/internal/collector/probe.go`) — nine backend files, before
-the frontend's type dropdown and its labels (`RuntimeAdminSection.tsx`,
-`i18n.ts`), the mirrored live-timings set (`components/shared/liveTimings.ts`)
-and the DTO's type union (`api/runtime.ts`) add four more. Thirteen files for
-auto-detection and a label, against none of that machinery having any use
-for an image backend today — `custom` with explicit paths is the shape that
-costs nothing, and the plan's "eight-plus files" estimate was, if anything,
-conservative.
+**A kind of its own, which reverses an earlier `custom`-only decision**
+([ADR-044](../09-architecture-decisions.md#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)
+(d)). That decision chose `Type: "custom"` over a dedicated kind because a new
+kind would touch thirteen files for auto-detection and a friendlier dropdown
+label, while `custom` with explicit paths cost nothing. The kind exists as
+`stable_diffusion_cpp` because it was requested explicitly, and because it does
+not carry only a label. It carries behaviour:
+
+- **A health path that works by default.** `sd-server` answers `GET /health`
+  with 404 (measured), and the agent kills a child whose health path keeps
+  failing once `startup_timeout_seconds` elapses, so the stock default made
+  every `sd-server` spec that left the field empty unusable, and an explicit
+  health path was the only way around it. Whenever a spec's
+  `health_path` is empty, the backend (`runtimeSpecHealthPathDefault`,
+  `internal/portal/service_runtime.go`) now picks it from the spec's
+  **effective** type — the explicit `type`, or the one detected from `binary` —
+  and stores `/v1/models` for `stable_diffusion_cpp`, `/health` for every other
+  kind.
+- **The form's argument guidance.** With the kind selected, the spec editor
+  shows `sd-server`'s own argument shape (`--listen-port ${PORT}`, literal
+  weight paths) and a note on the type field saying why; its hardcoded-port
+  warning recognises `--listen-port` as well as `--port`.
+- **Detection.** A binary whose basename contains `sd-server` or
+  `stable-diffusion` resolves to the kind under Type Auto.
+
+Both probe paths default to empty (the table above), exactly as `custom`'s do.
+Every other site that keys behaviour off the resolved kind — the
+live-timings-capable set, the two live-progress kind resolutions, the
+live-progress shape gate, the benchmark runner's live-progress lookup and the
+agent's own capability probes — was checked and treats the kind as neither
+live-timings- nor live-progress-capable, which is correct for an image server;
+none needed a change, and the agent needs none either.
+
+**How the form treats the health path**, because the form cannot see what the
+backend sees: under Auto the form does not know what `binary` will detect to
+(that detection is Go-only), so its own displayed default is a guess.
+
+- On a spec's **first write**, an untouched health-path field — one still
+  showing the current type's displayed default — is sent **empty**, so the
+  backend's effective-type default decides. A first write is a create, and
+  also an edit of a mapping that has no spec yet (`configured: false`),
+  where the field shows the form's own fallback rather than a stored value.
+  Edit reaches that state readily: it is offered on every row, deleting a
+  spec keeps its mapping, and a create whose spec write failed leaves a
+  mapping to retry through Edit. Type Auto with an `sd-server` binary
+  therefore gets `/v1/models` too, rather than the `/health` the form was
+  displaying.
+- A change of the type field to an **explicit** type, on create and on edit
+  alike, moves an untouched field (one still showing the previous type's
+  displayed default, Auto's `/health` included) to the new type's default, and
+  leaves an edited one alone. A change **to Auto** moves nothing: Auto's
+  `/health` is a guess, not a default, so the field keeps what it shows and an
+  `sd-server` spec switched to Auto on edit keeps `/v1/models`.
+- An empty field is sent empty, so the backend's effective-type default
+  decides; the field's placeholder names that default for an explicit type and
+  is blank under Auto.
+- On an **edit of a stored spec**, the field is sent exactly as displayed, so
+  the backend never re-derives a stored value: it changes only when the
+  operator edits it or a type change visibly moves it.
+
+`Type: "custom"` with an explicit `health_path` still works: the kind is a
+default, not a requirement.
 
 A representative spec:
 
 ```json
 {
-  "type": "custom",
+  "type": "stable_diffusion_cpp",
   "binary": "/opt/sd-server/sd-server",
   "args": [
     "--listen-port", "${PORT}",
@@ -908,42 +951,33 @@ A representative spec:
     "--clip_l", "/srv/models/sdxl/clip_l.safetensors",
     "--clip_g", "/srv/models/sdxl/clip_g.safetensors"
   ],
-  "health_path": "/",
   "startup_timeout_seconds": 300
 }
 ```
 
-What each obligation is, and why:
+It names no `health_path`, and is stored with `/v1/models`. What each remaining
+fact about this runtime is, and why:
 
-- **`health_path` must be set explicitly — `pollHealth` defaults it to
-  `/health`, which `sd-server` does not serve.**
-  `server-agent/internal/runtime/manager.go:1875-1877`:
-  `healthPath := spec.HealthPath; if healthPath == "" { healthPath =
-  "/health" }`. Leaving the field empty is not "auto-detect" for a `custom`
-  spec — the agent probes `/health`, gets a 404 from `sd-server` on every
-  cycle, and kills the process as unhealthy once
-  `startup_timeout_seconds` elapses.
-
-  This plan's earlier reconnaissance could not confirm `sd-server`'s actual
-  liveness route from upstream source and named `/` and `/v1/models` as
-  unverified candidates (issue #71's own reading). Verified now, directly
-  against `leejet/stable-diffusion.cpp` at commit `cc515a0` (2026-09-16, the
-  current `master`): `examples/server/main.cpp` constructs the model context
-  and only calls `svr.listen()` afterward — the listen port never opens
-  until the model has loaded — and `examples/server/routes_index.cpp`
+- **Why `/v1/models` is the health path.** The chosen path was verified
+  directly against `leejet/stable-diffusion.cpp` at commit `cc515a0`
+  (2026-09-16, the current `master`): `examples/server/main.cpp` constructs the
+  model context and only calls `svr.listen()` afterward — the listen port never
+  opens until the model has loaded — and `examples/server/routes_index.cpp`
   registers `svr.Get("/", ...)` unconditionally, with no auth check, which
   returns the bundled or placeholder page with an implicit `200` (the one
   exception is an operator who also passes `--serve-html-path` pointing at a
-  file that cannot be read, which 500s — avoid that flag, or point it at a
-  file that exists). The server's own `README.md` says the same thing in its
-  own words: "After the server starts successfully: the web UI is available
-  at `http://127.0.0.1:1234/`." `GET /v1/models`
-  (`examples/server/routes_openai.cpp:250`) is an equally unconditional
-  `200` and has no file-path dependency at all, and it is part of the
-  documented OpenAI-compatible surface (`examples/server/api.md`) rather
-  than the index page — the more future-proof choice if a later release
-  changes how `/` decides what to serve. Either is a valid `health_path`;
-  the example above uses `/`.
+  file that cannot be read, which 500s — avoid that flag, or point it at a file
+  that exists). The server's own `README.md` says the same thing in its own
+  words: "After the server starts successfully: the web UI is available at
+  `http://127.0.0.1:1234/`." `GET /v1/models`
+  (`examples/server/routes_openai.cpp:250`) is an equally unconditional `200`
+  and has no file-path dependency at all, and it is part of the documented
+  OpenAI-compatible surface (`examples/server/api.md`) rather than the index
+  page — the more future-proof choice if a later release changes how `/`
+  decides what to serve, and the reason it is the kind's default. `/` remains a
+  valid explicit `health_path`. What is not valid is the agent's own fallback:
+  `pollHealth` (`server-agent/internal/runtime/manager.go`) probes `/health`
+  for a spec that arrives with no health path at all.
 
 - **The weights path is written literally in `Args`; `${MODEL}` is not
   used.** `${MODEL}` resolves to `spec.UpstreamModel`
@@ -961,16 +995,18 @@ What each obligation is, and why:
 
 - **The timeout budget needs headroom well past the general 30 s
   default.** `defaultApplicationTimeoutMS = 30000`
-  (`gateway/backend/internal/portal/service_applications.go:308`) is the
-  application-level default for every type except `server_agent`, which
-  already defaults to `defaultServerAgentTimeoutMS = 600000` (same file,
-  line 320) for exactly this reason — see
-  [§12](#12-the-timeout-budget) for the full timeout table. That default
+  (`gateway/backend/internal/portal/service_applications.go`) is the
+  application-level default for every type except two, which default to
+  600000 for this reason: `server_agent` (`defaultServerAgentTimeoutMS`, the
+  parent of every agent-launched `sd-server`) and the external
+  `stable_diffusion_cpp` application type (`defaultStableDiffusionTimeoutMS`)
+  — see [§12](#12-the-timeout-budget) for the full timeout table. That default
   covers the *parent application*; an operator who lowers it, or who leaves
   a `startup_timeout_seconds` too tight for a multi-gigabyte checkpoint to
   load, reintroduces the 30 s failure mode the parent default exists to
   avoid. A real text-to-image request is seconds to low minutes of
-  inference on top of a cold model load that can itself take minutes.
+  inference (a 512x512 generation measured about 17 s) on top of a cold
+  model load that can itself take minutes.
 
 - **No authentication, wide-open CORS — run this behind the agent or a
   network boundary, never exposed directly.** Verified directly:
@@ -985,7 +1021,7 @@ What each obligation is, and why:
   produces a value `sd-server` never inspects. Its own default `listen_ip`
   is `127.0.0.1` — loopback-only — which already matches the one address
   this agent's own health probe ever dials
-  (`endpointFor`, `server-agent/internal/runtime/manager.go:487-489`, always
+  (`endpointFor`, `server-agent/internal/runtime/manager.go:490-492`, always
   `http://127.0.0.1:<port>`); leave `--listen-ip` unset rather than binding
   it to a routable address.
 
@@ -1001,9 +1037,46 @@ What each obligation is, and why:
   is nothing for this gateway's live-progress machinery to read from this
   runtime — that is a fact about `sd-server` as shipped, not a gap here.
 
-The obligations above were checked against `leejet/stable-diffusion.cpp` at
-commit `cc515a0` (`master`, 2026-09-16); a later `sd-server` release could in
-principle change any of them.
+- **An agent-launched `sd-server` serves images only when both flavor stages
+  admit it.** Candidacy gates on the parent `server_agent` application's
+  `api_flavors`, and the images relay then enforces the resolved spec's own
+  (`targetServesFlavor`, [API Compatibility & Inference
+  §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)),
+  so `openai_images` must be in both. A spec is **images-only** when its
+  flavors list `openai_images` and neither text flavor (`openai`,
+  `anthropic`); an empty list is not. Such a child receives no text request,
+  although its parent keeps `openai` for its text siblings:
+  `/v1/chat/completions` refuses it at the translate dispatch
+  (`targetIsImagesOnly`) with 404 `routing.no_model_route`, and `/v1/responses`
+  and `/v1/messages` refuse it too, ordinarily with their `*.endpoint_disabled`
+  404, because it lists neither endpoint's flavor. None of these refusals is
+  retried against another application. The gateway's own background chat
+  prompts skip it too: the benchmark scheduler and the model warmer judge a
+  mapping by its effective flavors ([Routing & Model Selection
+  §7](routing-and-model-selection.md#7-model-selection-metrics)). A run an
+  operator starts by hand — a benchmark, a load, a context or VRAM probe —
+  still sends it one, and that run reports the failure. A spec that keeps `openai` stays a text candidate its
+  upstream cannot serve, so an `sd-server` spec lists `openai_images` alone
+  ([API Compatibility & Inference
+  §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+  Both forms offer it as a third flavor checkbox,
+  `openai_images`, in the shared `ApiVariantControls`: tick it on the
+  `server_agent` application for candidacy and on each image spec for the
+  relay. It is opt-in, so neither form ticks it by default: a new spec's
+  create form starts from its parent application's flavors without
+  `openai_images`, and the spec type does not set flavors. The type field's
+  note for `stable_diffusion_cpp` says which boxes to tick.
+
+- **Its `image` verdict is manual.** The automatic `sdcpp_capabilities` probe
+  ([Routing & Model Selection §1](routing-and-model-selection.md#1-data-model))
+  reads an **external** `stable_diffusion_cpp` application's
+  `/sdcpp/v1/capabilities`. The agent's router passes only `/props` through per
+  model, so an agent-launched mapping gets no automatic verdict and needs a
+  manual `image: yes` before the images gate admits it.
+
+The facts above about `sd-server` itself were checked against
+`leejet/stable-diffusion.cpp` at commit `cc515a0` (`master`, 2026-09-16); a
+later `sd-server` release could in principle change any of them.
 
 ## 4. One router port per AI server
 
@@ -3431,7 +3504,7 @@ Three details there are load-bearing and must not be "simplified":
 On a server flagged `managed_runtime_only` the applications view steers the
 operator rather than letting them fail: a standing informational banner; the
 create button hidden once the server has its one `server_agent` application; the
-create form seeded to type `server_agent`; the other five types **disabled on
+create form seeded to type `server_agent`; every other type **disabled on
 that create form**, with the reason on the field; and an auto-drill into the
 single `server_agent` application the first time the list resolves. That drill
 **latches once per mount** on purpose — the 0→1 transition caused by the
@@ -3450,7 +3523,7 @@ than the one the affordance closes. The gate follows the backend's own scope or
 it is a defect. Unlike the `server_agent` gate above this one reads the *server*
 DTO rather than the applications list, so no fetch window opens it — but that
 DTO is fetched by the parent list and never refreshed here, so a `PATCH` that
-sets the flag afterwards still leaves the form offering all six types, and the
+sets the flag afterwards still leaves the form offering every type, and the
 409 remains the enforcement.
 
 **Two reasons share one `helperText` slot, and they are co-reachable — through
@@ -3464,7 +3537,9 @@ once. Composed narrowest-first ("only `server_agent` is creatable here", then
 what the then-fully-disabled option list shows. With one agent application that
 composed state is transient (the auto-drill fires on the same settle and
 replaces the form); with two — the pre-migration-68 duplicate case — it
-persists, which is the state the suite pins.
+persists, which is the state the suite pins. The same slot also carries the
+`stable_diffusion_cpp` note while that type is selected, after any reason, so
+the note is announced with the field as well.
 
 **The vanished create button says why, and stays hidden rather than becoming a
 disabled one.** Once the server holds its agent application the two backend
@@ -3928,8 +4003,9 @@ picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
 
 **Every launch spec also carries its own API-Varianten block** — the identical
-`openai`/`anthropic` flavor checkboxes and Codex/Claude-Code endpoint-mode
-dropdowns the application form shows, extracted into one shared component,
+`openai`/`anthropic`/`openai_images` flavor checkboxes and Codex/Claude-Code
+endpoint-mode dropdowns the application form shows, extracted into one shared
+component,
 `ApiVariantControls` (`gateway/frontend/src/components/shared/ApiVariantControls.tsx`),
 so the two forms cannot drift apart. `RuntimeAdminSection` renders it against
 `spec.api_flavors`/`responses_mode`/`messages_mode` (`PutRuntimeSpecRequest`
@@ -3987,11 +4063,20 @@ fields from the parent application's *current* values (`openCreate` in
 `RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/
 `messages_mode` into local form state) purely so a new spec starts out
 agreeing with what the application already exposes rather than a blank
-passthrough-only guess — this is a **frontend, form-open-time** convenience,
-not a backend default: the backend's own absent-field default is unconditionally
-`passthrough` for both modes and both flavors enabled
-(`PutRuntimeSpecRequest`, `internal/portal/service_runtime.go`), and it never
-reads the parent application to fill in a gap (pinned by
+passthrough-only guess. `openai_images` is left out of that snapshot **only
+when a text flavor survives the exclusion**: it is opt-in on the spec too, and
+a parent that declares it for its image children would otherwise hand it to
+every new text model's spec. Under a parent whose flavors are *exactly*
+`[openai_images]` the exclusion is skipped and `openai_images` is inherited
+as is, because dropping it there would leave every flavor unticked — an
+untouched save would then send `[]`, which the backend's own create default
+turns into `[openai, anthropic]` (the two text flavors, not narrower),
+leaving the new spec's child unreachable by any flavor an operator could use,
+with no warning. This is a **frontend, form-open-time** convenience, not a
+backend default: the backend's own absent-field default is unconditionally
+`passthrough` for both modes and both text flavors (`openai`, `anthropic`)
+enabled (`PutRuntimeSpecRequest`, `internal/portal/service_runtime.go`), and
+it never reads the parent application to fill in a gap (pinned by
 `TestPutRuntimeSpecDoesNotInheritAppModes`). A later edit to the application's
 own values therefore never propagates to an existing spec — only a **new**
 spec's create form picks up the application's current template — matching the
@@ -5426,7 +5511,7 @@ consistent if configured together.
 
 | Bound | Where | Default | Covers |
 |---|---|---|---|
-| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent` (30000 elsewhere) | **Total** request deadline, never reset by upstream activity. |
+| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent` and `stable_diffusion_cpp` (30000 elsewhere) | **Total** request deadline, never reset by upstream activity. |
 | `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s | Idle watchdog on streaming responses. |
 | `spec.admission_wait_timeout_seconds` | Agent, per spec | `0` = until the client disconnects | Queueing for a slot. |
 | `spec.startup_timeout_seconds` | Agent, per spec | 180 (floored at 30 when unset) | Process start until first green health probe. |

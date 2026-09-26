@@ -405,9 +405,23 @@ const de = {
     'Pro Server läuft genau ein Agent — deshalb ist nur eine server_agent-Anwendung möglich. Dieser Server hat bereits eine: bearbeiten oder löschen Sie diese, statt eine zweite anzulegen.',
   applicationTypeManagedRuntimeOnly:
     'Dieser Server akzeptiert nur agent-gesteuerte Anwendungen — beim Anlegen ist deshalb nur server_agent möglich; das Formular ist bereits darauf eingestellt. Die Beschränkung gilt ausschließlich fürs Anlegen: bestehende Anwendungen dieses Servers bleiben auf jeden Typ änderbar.',
+  // stable_diffusion_cpp's three diverging defaults (health mode, API
+  // flavors, timeout) explained where the operator can see them -- the
+  // values themselves are silent. See applicationTypeDefaults.ts.
+  applicationTypeStableDiffusionCppNote:
+    'stable-diffusion.cpp bedient nur Bildanfragen. Der Server bietet keinen /v1/health-Endpunkt, deshalb ist der Health-Check-Modus standardmäßig „Modell-Abgleich“ statt „Health-Pfad prüfen“; das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Bilderzeugung deutlich länger dauert als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_images“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
+  // Beschriftung des dritten Varianten-Kontrollkästchens. Anders als openai und
+  // anthropic nennt sie neben dem API-Wert auch den Zweck, weil der Wert allein
+  // nicht verrät, dass er die Bilderzeugung (/v1/images/generations) freischaltet.
+  applicationFlavorOpenaiImages: 'openai_images (Bilderzeugung)',
+  // Steht unter den Varianten-Kontrollkästchen, wenn keines angehakt ist.
+  // Eine leere Liste speichert das Backend als openai + anthropic -- das
+  // Formular würde also etwas anderes speichern, als es zeigt.
+  applicationFlavorsRequired:
+    'Mindestens eine API-Variante muss ausgewählt sein. Ohne Auswahl würde die Anwendung als openai + anthropic gespeichert.',
   applicationNativeNote:
     'Für jeden Coding-Agent-Endpunkt lässt sich der Modus wählen: Deaktiviert, Umwandlung ins interne Format (/v1/chat/completions) oder Durchreichen im Originalformat. Der Endpunkt wird nur bedient, wenn die passende API-Variante (openai bzw. anthropic) aktiviert ist.',
   // Der Live-Timings-Schalter im gemeinsamen API-Varianten-Block. Beide
@@ -439,6 +453,7 @@ const de = {
   applicationLoadedFormatLlamaSwap: 'llama-swap (/running)',
   applicationLoadedFormatLlamaCpp: 'llama.cpp (/props)',
   applicationLoadedFormatLitellm: 'LiteLLM (/health)',
+  applicationLoadedFormatSdcpp: 'stable-diffusion.cpp (/sdapi/v1/sd-models)',
   applicationContextProbePath: 'Kontext-Probe-Pfad',
   applicationContextProbePathHelp:
     '„{model}“ wird durch den Upstream-Modellnamen ersetzt (nur geladene Modelle).',
@@ -563,7 +578,7 @@ const de = {
     'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
   mappingImageCapable: 'Bilderzeugung',
   mappingImageCapableUnknownHint:
-    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Es gibt dafür keine automatische Erkennung — setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Automatisch erkannt wird das nur in zwei Fällen: bei einer stable-diffusion.cpp-Anwendung, die das Gateway direkt erreicht (mit dem nächsten Health-Check, rund 30 s), und bei einem Ollama-Modell, das der Server-Agent startet, sobald Ollama für dieses Modell die Fähigkeit „image“ meldet (dann nur als Ja). Überall sonst setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -585,6 +600,7 @@ const de = {
   runtimeSpecTypeLlamaCpp: 'llama.cpp',
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
+  runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
   runtimeSpecMetricsPathHelp: 'Leer = Standardpfad des erkannten/gewählten Typs verwenden.',
@@ -828,6 +844,10 @@ const de = {
   runtimeSpecArgsHint:
     'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsExampleSdcpp:
+    '--listen-port\n${PORT}\n--diffusion-model\n/srv/models/flux1-dev.safetensors\n--vae\n/srv/models/ae.safetensors\n--clip_l\n/srv/models/clip_l.safetensors\n--t5xxl\n/srv/models/t5xxl_fp16.safetensors',
+  runtimeSpecTypeStableDiffusionCppNote:
+    'sd-server lauscht auf --listen-port (Standard 1234), nicht auf --port. Gewichte sind wörtliche Dateipfade – ${MODEL} ist ein Modellname, kein Pfad. Der Health-Pfad ist standardmäßig /v1/models, weil der Server /health mit 404 beantwortet. Unter „API-Varianten“ hier nur „openai_images (Bilderzeugung)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_images (Bilderzeugung)“ ebenfalls angekreuzt sein.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2836,9 +2856,23 @@ const en: PortalMessages = {
     'Exactly one agent runs per server — so only one server_agent application is possible. This server already has one: edit or delete it instead of creating a second.',
   applicationTypeManagedRuntimeOnly:
     "This server only accepts agent-managed applications — so server_agent is the only type it can be created with, and the form is already set to it. The restriction applies to creating only: this server's existing applications stay editable to any type.",
+  // stable_diffusion_cpp's three diverging defaults (health mode, API
+  // flavors, timeout) explained where the operator can see them -- the
+  // values themselves are silent. See applicationTypeDefaults.ts.
+  applicationTypeStableDiffusionCppNote:
+    'stable-diffusion.cpp serves image requests only. The server exposes no /v1/health endpoint, so the health check mode defaults to "Model sync" instead of "Check health path"; the timeout defaults to 10 minutes instead of 30 seconds, because a generation takes far longer than a text reply; and the API flavor defaults to "openai_images" only, instead of openai/anthropic, so this server is never offered as a text candidate.',
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
+  // The third flavor checkbox's label. Unlike openai and anthropic it names
+  // the purpose next to the API value, because the value alone does not say
+  // that it enables image generation (/v1/images/generations).
+  applicationFlavorOpenaiImages: 'openai_images (image generation)',
+  // Shown under the flavor checkboxes when none is ticked. The backend stores
+  // an empty list as openai + anthropic, so the form would save something
+  // other than what it shows.
+  applicationFlavorsRequired:
+    'Select at least one API flavor. With none selected, the application would be saved as openai + anthropic.',
   applicationNativeNote:
     'Each coding-agent endpoint can be set to Disabled, Translate into the internal format (/v1/chat/completions), or Pass-through in its native format. The endpoint is only served when the matching API flavor (openai resp. anthropic) is enabled.',
   // The live-timings switch on the shared API-variant block. Both forms
@@ -2869,6 +2903,7 @@ const en: PortalMessages = {
   applicationLoadedFormatLlamaSwap: 'llama-swap (/running)',
   applicationLoadedFormatLlamaCpp: 'llama.cpp (/props)',
   applicationLoadedFormatLitellm: 'LiteLLM (/health)',
+  applicationLoadedFormatSdcpp: 'stable-diffusion.cpp (/sdapi/v1/sd-models)',
   applicationContextProbePath: 'Context probe path',
   applicationContextProbePathHelp:
     '"{model}" is replaced with the upstream model name (loaded models only).',
@@ -2984,7 +3019,7 @@ const en: PortalMessages = {
     'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
   mappingImageCapable: 'Image generation',
   mappingImageCapableUnknownHint:
-    'Unknown: whether this mapping generates images is not on file. There is no automated detection for it — set it to Yes to enable image generation for this model.',
+    'Unknown: whether this mapping generates images is not on file. It is detected automatically in two cases only: for a stable-diffusion.cpp application the gateway reaches directly (on the next health tick, about 30 s), and for an Ollama model the server agent launches, once Ollama declares its "image" capability for that model (then only ever as Yes). Anywhere else, set it to Yes to enable image generation for this model.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -3006,6 +3041,7 @@ const en: PortalMessages = {
   runtimeSpecTypeLlamaCpp: 'llama.cpp',
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
+  runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
   runtimeSpecMetricsPathHelp: "Empty = use the detected/selected type's default path.",
@@ -3227,6 +3263,10 @@ const en: PortalMessages = {
   runtimeSpecArgsHint:
     'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
+  runtimeSpecArgsExampleSdcpp:
+    '--listen-port\n${PORT}\n--diffusion-model\n/srv/models/flux1-dev.safetensors\n--vae\n/srv/models/ae.safetensors\n--clip_l\n/srv/models/clip_l.safetensors\n--t5xxl\n/srv/models/t5xxl_fp16.safetensors',
+  runtimeSpecTypeStableDiffusionCppNote:
+    'sd-server listens on --listen-port (default 1234), not --port. Weights are literal file paths — ${MODEL} is a model name, not a path. Its health path defaults to /v1/models, because the server answers /health with 404. Under "API flavors", tick only "openai_images (image generation)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_images (image generation)" ticked too.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:

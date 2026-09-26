@@ -4785,10 +4785,18 @@ func seedGatewayTestRoutes(routeStore *routing.MemoryStore, now time.Time) {
 	// "mock-host-comp" carries the application + active mapping the resolver
 	// actually routes completions through. The mapping id is "route_mock_qwen"
 	// so usage attribution (Target.RouteID) matches the existing expectation.
+	//
+	// APIFlavors also lists APIFlavorOpenAIImages: TestImagesRefusesIncapableModel
+	// needs qwen-coder to be an IMAGES candidate with no image capability row, to
+	// get ErrModelNotCapable rather than ErrNoModelRoute. Before NormalizeAPIFlavor
+	// separated openai_images from openai, this application served images by
+	// accident (both normalized to the same coarse flavor); now it must opt in
+	// explicitly, same as any other image-serving application would. No other
+	// test in this package asserts that qwen-coder must NOT serve images.
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "mock-host-comp", Name: "Mock Completion", Domain: "comp.example.test", Provider: routing.ProviderMock, Endpoint: "mock://comp", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app_mock_comp", ServerID: "mock-host-comp", Type: routing.ProviderMock, Port: 8100, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app_mock_comp", ServerID: "mock-host-comp", Type: routing.ProviderMock, Port: 8100, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		panic(err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route_mock_qwen", ApplicationID: "app_mock_comp", GatewayModelName: "qwen-coder", AppModelName: "qwen-coder", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

@@ -100,9 +100,11 @@ llama-swap, LiteLLM) reachable from every client protocol: a Claude Code session
 can be served by an Ollama-backed mapping, and a Codex session by a vLLM one,
 with no special-casing.
 
-`routing.NormalizeAPIFlavor` (`internal/routing/resolver.go`) reduces the three
-fine-grained `APIFlavor` strings to the two coarse buckets (`openai`,
-`anthropic`) that a `model_mapping`'s application declares support for — see
+`routing.NormalizeAPIFlavor` (`internal/routing/resolver.go`) reduces the four
+fine-grained `APIFlavor` strings (`openai_chat_completions`, `openai_responses`,
+`anthropic_messages`, `openai_images`) to the three coarse buckets (`openai`,
+`anthropic`, `openai_images`) that a `model_mapping`'s application declares
+support for (§6) — see
 [Routing & Model Selection](routing-and-model-selection.md) for how a mapping is
 selected. **The Codex/generic-OpenAI split is by ENDPOINT, not by flavor**:
 `/v1/chat/completions` and `/v1/responses` both normalize to `openai`, but they
@@ -209,21 +211,27 @@ when there are no tool calls) → one `tool_use` block per tool call, each with
 
 `POST /v1/images/generations` (`handleOpenAIImages`,
 `internal/gateway/images_handler.go`) relays to a natively OpenAI-shaped image
-backend — `sd-server` from `leejet/stable-diffusion.cpp`, launched under the
-agent's existing `custom` runtime kind ([Agent-Managed Model Runtime
-§3.4](agent-runtime-manager.md#a-worked-sd-server-launch-under-custom)). Four
-things separate it from every other endpoint in §3.
+backend — `sd-server` from `leejet/stable-diffusion.cpp`, registered either as
+an external application of type `stable_diffusion_cpp`
+([Routing & Model Selection §1](routing-and-model-selection.md#1-data-model))
+or launched by the agent under the runtime spec type of the same name
+([Agent-Managed Model Runtime
+§3.4](agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp)).
+Four things separate it from every other endpoint in §3.
 
-**1. There is NO translate path, and the capability gate is what makes that
-honest.** The gateway proxies image requests; it does not synthesize them. So
-unlike `/v1/responses` and `/v1/messages` — where `translate` is the safe
-fallback for a backend that cannot speak the native shape (§6) — an application
-that does not serve this shape must simply not be a candidate. The request
-therefore declares `RequiredCapabilities = ["image"]`, and `Resolver.Resolve`
-refuses a model that carries no `yes` verdict for it: 404
-`routing.model_not_capable` ([Routing & Model Selection
-§2.3](routing-and-model-selection.md#23-the-capability-gate)). The refusal
-needs no new gate of its own — the handler consumes the shared
+**1. There is NO translate path, and two gates make that honest.** The
+gateway proxies image requests; it does not synthesize them. So unlike
+`/v1/responses` and `/v1/messages` — where `translate` is the safe fallback for
+a backend that cannot speak the native shape (§6) — an application that does
+not serve this shape must simply not be a candidate. The first gate is the
+**application's**: the request's coarse flavor is `openai_images`, and only an
+application that lists that flavor is a candidate (§6 has the two stages, and
+the images relay's own post-resolve check for an agent-launched child). The
+second is the **model's**: the request declares
+`RequiredCapabilities = ["image"]`, and `Resolver.Resolve` refuses a model that
+carries no `yes` verdict for it: 404 `routing.model_not_capable` ([Routing &
+Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)).
+Neither refusal needs a gate of its own here — the handler consumes the shared
 `inferencePreflight` like every other endpoint, and adds **no** second
 `admitPrincipal` call site (there is exactly one in the package, deliberately).
 Consequently
@@ -305,32 +313,56 @@ bounded by `captureMaxBytes`, not by a wider cap.
 - **`Stream` is pinned `false` (and a client asking otherwise is refused up
   front, above), so this endpoint always takes `proxyNative`'s
   buffered-deadline branch — a *total* timeout, with no idle watchdog.** That
-  total is `target.Timeout`, i.e. the serving application's `timeout_ms`, a
-  value almost certainly tuned for chat. **An operator must raise it on an
-  image application**: a diffusion request producing several images at high
-  step counts can exceed a chat-shaped timeout while working perfectly, and
-  because there are no frames, `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` (§7) does
-  not apply and cannot rescue it. The pinning is correct for a single-JSON
+  total is `target.Timeout`, i.e. the serving application's `timeout_ms`.
+  The `stable_diffusion_cpp` and `server_agent` types both default it to
+  600000 ms (§7.1); on an application of any other type it is the stock
+  30000, a value tuned for chat, and **an operator must raise it** before
+  that application serves images: a diffusion request producing several
+  images at high step counts can exceed a chat-shaped timeout while working
+  perfectly, and because there are no frames,
+  `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` (§7) does not apply and cannot rescue
+  it. The pinning is correct for a single-JSON
   backend — there is nothing to stream, and a buffered response gets no live
   TTFT or tokens/sec row either (§6) — but it means the whole generation is
   governed by one number, and that number is the application's.
-- **Resolving an image request writes the token's last-used-model marker.**
-  `relayImages` goes through the shared `resolveTarget`, so an image model can
-  become the redirect target of a **later chat request** on the same token
-  under `UnknownModelRedirect` ([Routing & Model Selection
+- **Resolving an image request writes the token's last-used-model marker,
+  and an image request is redirected only onto an image-capable model.**
+  `relayImages` goes
+  through the shared `resolveTarget`, so an image model becomes the marker a
+  **later chat request**'s unknown-model redirect tries first under
+  `UnknownModelRedirect` ([Routing & Model Selection
   §2.1](routing-and-model-selection.md#21-per-token-model-resolution)). That
-  chat request then answers 404 `routing.model_not_capable` — legible, but
-  surprising unless expected, and it is one more reason the models-list gap in
+  redirect asks the `openai` offering, so it can pick the image model only
+  when the model's application also declares `openai`; an application
+  declaring only `openai_images` (the `stable_diffusion_cpp` default) keeps it
+  out. When it does pick it, nothing on the chat path requires a capability,
+  so the chat request is sent to that upstream — unless the model is an
+  agent-managed child whose spec is images-only, which the text translate path
+  refuses with 404 `routing.no_model_route` (§6) — one more reason the
+  models-list gap in
   [ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
-  (d) is worth closing.
+  (d) is worth closing. The images request's own redirect asks the
+  `openai_images` offering together with the request's required capability,
+  and takes a `LastUsedModel` or fallback only when that name carries `image`
+  by the portal listing's own image fold (`ModelOffering.Capable`, [Routing &
+  Model Selection
+  §2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)).
+  A candidate without it is skipped, so a client that hardcodes `dall-e-3`
+  against a token whose fallback generates images is served by the fallback,
+  and one whose candidates are all text models gets 404
+  `routing.no_model_route` for its own name — never a `model_not_capable`
+  about a model it did not send.
 
 **Session and affinity.** The endpoint has its own `sessionEndpoint` case and
 that case is deliberately empty: an OpenAI images request carries no
 `prompt_cache_key`, no `user` and no `metadata`, so there is no session signal
 to extract. Image requests also take **no** affinity pin at all, by an explicit
-write guard — see [Routing & Model Selection
-§4](routing-and-model-selection.md#4-route-affinity) for why the coarse
-affinity key makes that necessary.
+write guard on every capability-carrying request. Their affinity key could not
+collide with a chat client's anyway — the key hashes the coarse flavor, and
+`openai_images` is its own — so for images the guard only keeps image traffic
+pin-free; it exists for a future capability-carrying endpoint that shares a
+coarse flavor with a text one ([Routing & Model Selection
+§4](routing-and-model-selection.md#4-route-affinity)).
 
 **Payload capture is clipped in practice on this endpoint.** A base64 image
 inflates its raw bytes by roughly a third, so a single modest PNG already
@@ -438,12 +470,31 @@ responsesServed = ("openai"    ∈ APIFlavors) && ResponsesMode != disabled
 messagesServed  = ("anthropic" ∈ APIFlavors) && MessagesMode  != disabled
 ```
 
-**There is deliberately no third line for images.** `/v1/images/generations` has
-no `EndpointMode` column and no `imagesServed` rule: what admits an application
-to it is a **capability verdict on the mapping**, not a mode on the
-application, so `endpointModeFor` has no case for that flavor and never sees
-one (§3.4). That is not "falls through and is treated as translate" — there is
-no translate path for images at all.
+**Images have the flavor half of that rule and no mode half.**
+`openai_images` is a **coarse** flavor of its own, not a refinement of `openai`
+(`routing.APIFlavorOpenAIImages`): `NormalizeAPIFlavor` tests the images prefix
+before the generic `openai` one, because every fine images flavor also starts
+with `openai`, and `applicationServesEndpoint`'s ordinary default branch then
+admits only an application that lists it. So an application listing
+`openai_images` and not `openai` serves images and not text, and the reverse,
+with no filter case of its own. The flavor is **opt-in everywhere**: an empty
+`api_flavors` on save still becomes exactly `[openai, anthropic]`, on the
+application and on a runtime spec alike, and so does an absent one, except on
+an application update, which keeps the stored list. Were the empty default to gain
+`openai_images`, every existing text-only application would become a candidate
+for image requests it cannot serve. Every image upstream is therefore given
+the flavor explicitly, by the `stable_diffusion_cpp` application type's
+default or by the flavor checkbox. No upgrade step gives it to a route that served images
+through `openai` before the split: that model answers 404
+`routing.no_model_route` until the flavor is ticked on its application and,
+for an agent-managed child, on its runtime spec
+([ADR-044](../09-architecture-decisions.md#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)).
+What images lack is a mode: there is no `EndpointMode` column and no
+`imagesServed` rule, so `endpointModeFor` has no case for that flavor and
+never sees one (§3.4). That is not "falls through and is treated as
+translate" — there is no translate path for images at all — and
+a model within an admitted application is admitted by its **capability
+verdict**, not by a mode (§3.4).
 
 So an endpoint can be off two independent ways: the coarse `openai`/`anthropic`
 flavor is unchecked, or the flavor stays checked and the mode is set to
@@ -451,7 +502,12 @@ flavor is unchecked, or the flavor stays checked and the mode is set to
 `/v1/chat/completions` while refusing Codex's `/v1/responses` specifically.
 Unchecking a flavor does not force its stored mode to `disabled`; the
 effective rule already treats it as off, so re-checking the flavor restores
-whatever mode was last set.
+whatever mode was last set. Unchecking **every** flavor is refused by the
+application form, with a message at the flavor group and focus moved to it, so
+the refusal is announced rather than silent: an empty list is stored as
+`[openai, anthropic]`, so the form would save a text candidate while showing
+nothing ticked (`ApplicationSection`'s submit; the launch-spec form has no such
+refusal).
 
 **Two-tier enforcement**, because a `server_agent` application's authority
 only resolves per-model, after a candidate has already been picked:
@@ -472,7 +528,59 @@ only resolves per-model, after a candidate has already been picked:
    (`internal/gateway/native_passthrough.go`), described below. Once a
    `server_agent` mapping's runtime spec has been resolved, a per-model
    `disabled` mode is enforced right there, with a stable error code — the
-   only point in the request lifecycle where it is knowable.
+   only point in the request lifecycle where it is knowable. The spec's
+   **flavor** half is enforced at the same point by `targetServesFlavor`: a
+   coding-agent endpoint whose coarse flavor the resolved spec no longer lists
+   is treated as `disabled`. That check runs after the mode is read but before
+   the mode decides the dispatch, so it holds a `translate`-mode endpoint to
+   the full rule as well: a request it
+   finds lacking the flavor is refused with `*.endpoint_disabled` and never
+   reaches the translate path. That holds only for the target it judged; what
+   reaches the translate path unjudged is set out below.
+
+**The images relay applies the same flavor conjunct.** `relayImages`
+(`internal/gateway/images_handler.go`) calls `proxyNative` directly rather than
+through `tryProxyNative`, so it runs `targetServesFlavor` itself after
+resolution: an agent-launched child whose spec excludes `openai_images` is
+refused with 404 `routing.no_model_route`, the answer candidacy would have
+given had it been the model's only route. The usage row records no upstream,
+since none was called. **The refusal is not retried against another
+application** that could have served the model, which is the same limitation
+`tryProxyNative`'s check has for the coding-agent endpoints: a model reachable
+through several applications is refused when the resolve picked a candidate
+whose spec narrows the flavor, even though a sibling would have served it. An
+external application needs no such check, because its flavors are its
+candidacy.
+
+**The text translate path applies only an images-only check.** Every
+`/v1/chat/completions` request is dispatched by `complete`/`beginStream`
+(`internal/gateway/inference_complete.go`, `stream_session.go`) without ever
+going through `tryProxyNative`, and so is every `/v1/responses` or
+`/v1/messages` request `tryProxyNative` did not handle. It has already held
+most of those to the full rule; the ones it has not — a body whose `model` the
+routing probe could not read, a request its own resolve failed on, and one
+whose translate-path re-resolve lands on a different candidate — reach this
+path with the resolved spec unjudged, neither its flavors nor its per-model
+mode read. Both functions resolve through `resolveTranslateTarget`, which
+refuses exactly one kind of target: an **images-only** one, whose effective
+flavors list `openai_images` and neither `openai` nor `anthropic`
+(`targetIsImagesOnly`; an empty list is not images-only). The refusal is
+candidacy's own answer for a model with no route — 404
+`routing.no_model_route`, a usage row with no upstream, and, for a stream, no
+byte of the stream — and, like the relay's, it is **not retried** against
+another application. It never fires for an external application, whose
+images-only flavors already kept it out of text candidacy. **The general
+effective-served rule is not enforced on this path**: a spec that keeps a text
+flavor is not checked against its list, so a spec narrowed to `["anthropic"]`,
+or stored as `[]`, serves `/v1/chat/completions`, and serves those unjudged
+Responses and Messages requests too. That is how every spec served before
+`openai_images` existed, when this path read no spec flavors at all, and the
+portal chat still offers such models because its listing reads application
+flavors, so enforcing the rule here would silently stop working setups. Nor
+is the rule's mode half enforced here, since this path has never read the
+endpoint's mode: a spec whose Responses or Messages mode is `disabled` serves
+those unjudged requests as well. Both are recorded debt
+([Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 
 `tryProxyNative` (`internal/gateway/native_passthrough.go`) makes the
 dispatch-time decision:
@@ -666,7 +774,10 @@ whose causes are elsewhere than where they appear:
 
 Because `timeout_ms` is a total deadline, the **`server_agent` application type
 defaults it to 600000 ms (10 minutes)** instead of the stock 30000 — at 30000
-every cold managed-model load fails reproducibly.
+every cold managed-model load fails reproducibly. The **`stable_diffusion_cpp`**
+type defaults to the same 600000 ms for its own reason: an image request is one
+buffered call governed by this total alone (§3.4), a 512x512 generation
+measured about 17 s, and the server's own limits permit far larger ones.
 `normalizeApplicationTimeoutMS(appType, timeoutMS)` preserves any non-zero value
 and maps zero to the type's default, so the default is re-applied on a retype and
 when an update sends `timeout_ms: 0`; note the ordering dependency, that
@@ -698,15 +809,53 @@ applications serving large models, and raise `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`
 |---|---|---|---|---|---|
 | Mock | `mock.go` | echoes the request text | word-by-word chunks | canned Responses-shaped SSE | 2 fixed names |
 | Ollama | `ollama.go` | `POST /api/chat` | `POST /api/chat` (stream:true, NDJSON) | — | `GET /api/tags` |
-| OpenAI-compatible (vLLM, llama.cpp, llama-swap, LiteLLM) | `openai_compatible.go` | `POST /v1/chat/completions` | `POST /v1/chat/completions` (stream:true, SSE) | forwards raw body to `path` | `GET /v1/models` |
+| OpenAI-compatible (vLLM, llama.cpp, llama-swap, LiteLLM, the server agent, stable-diffusion.cpp) | `openai_compatible.go` | `POST /v1/chat/completions` | `POST /v1/chat/completions` (stream:true, SSE) | forwards raw body to `path` | `GET /v1/models`; `GET /sdapi/v1/sd-models` for `stable_diffusion_cpp` (below) |
 
 All three also implement `Prober` (reachability probe) and, where applicable,
 `LoadedModelLister`/`ModelInfoProber`/`MemoryProber`/`ModelUnloader` for the
 routing/capacity subsystems — out of this chapter's scope; see [Routing & Model
 Selection](routing-and-model-selection.md). One `OpenAICompatibleClient`
-instance is shared across vLLM, llama.cpp, llama-swap, and LiteLLM
-(`cmd/gateway/main.go`) since they all speak the same OpenAI HTTP dialect; only
-Ollama gets its own client for its distinct `/api/chat` NDJSON shape.
+instance is shared across vLLM, llama.cpp, llama-swap, LiteLLM, `server_agent`
+and `stable_diffusion_cpp` (`cmd/gateway/main.go`) since they all speak the same
+OpenAI HTTP dialect; only Ollama gets its own client for its distinct
+`/api/chat` NDJSON shape. `stable_diffusion_cpp` cannot borrow the Ollama client
+instead: that client does not implement `NativeProxyClient`, and the images
+relay is a native passthrough.
+
+**Upstream model discovery is derived from the application TYPE.**
+`ListModels` asks `provider.modelDiscoveryFor(type)` where to list and how to
+decode: `GET /sdapi/v1/sd-models` for `stable_diffusion_cpp`, `GET /v1/models`
+for every other OpenAI-compatible type. `sd-server`'s own `/v1/models` reports
+the static placeholder `sd-cpp-local`, which the server does not dispatch on
+(measured: a real name, a bogus name and an empty `model` return byte-identical
+responses), while `/sdapi/v1/sd-models` reports the real model — and
+`app_model_name` is what the mapping form, the Runtime view and the Activity
+list display. Discovery is **never** derived from `loaded_models_path`: that
+field answers "what is loaded right now" and has a stock value for most types
+(`/props`, `/running`), so discovery read from it would disable every model
+that is merely not loaded at the moment, and permanently, because reconcile
+matches an existing mapping by name regardless of its status and never
+re-enables one. **This type's** discovery also **fails closed**
+(`decodeSdcppModelList`): an unreadable body, a bare JSON `null`, or a
+non-empty list in which no entry names a model is an error, which leaves every
+mapping unchanged, whereas `[]` is a real answer and disables them all. The
+OpenAI decoder every other OpenAI-compatible type uses (`decodeOpenAIModelList`)
+is not that strict: a body that is not JSON is an error, but a JSON `null`, an
+object without `data`, or a `data` list whose entries carry no `id` decodes to
+an empty list without one, and reconcile then disables every mapping of the
+application. The loaded-models probe reads the same listing through the
+`sdcpp_models` format (the type's default `loaded_models_path` is
+`/sdapi/v1/sd-models`), and the two share the one function that extracts a
+model name, so a mapping's name and the probe's loaded name agree by
+construction — they must, because a mapping counts as loaded only when the
+probe lists that same name. The probe's parser stays tolerant in the opposite
+direction (an unreadable body reads as nothing loaded); discovery must not
+inherit that. **"Loaded" for this type means "the server answers"**: the
+server's capability document carries no residency field, and the listing names
+the model identically when idle and right after a generation (measured), so an
+sd mapping reads as loaded whenever its application is up, and a `loaded_only`
+model group cannot constrain one ([Routing & Model Selection
+§5](routing-and-model-selection.md#5-model-groups)).
 
 `provider.Multiplexer` (`internal/provider/multiplexer.go`) dispatches every
 call by `target.Provider` (never by `APIFlavor`), with **capability-dependent
@@ -735,7 +884,42 @@ resource-group provisioning visibility — the list is intentionally **not**
 filtered by a service token's model allowlist (discovery is unrestricted;
 invocation is gated separately, §3/§6). With no routing store configured, all
 three fall back to two fixed seed model names so a fresh/dev instance always
-answers something.
+answers something. The seeds are text models: they carry `anthropic` and
+`openai` and never `openai_images` (`seedAPIFlavors`, kept apart from the
+listing's own flavor set on purpose).
+
+**The portal listing's `image` means "the images endpoint would serve this
+model".** `modelsResponse` AND-folds it across the model's offering mappings,
+fail-closed, and a mapping counts only when it carries an `image` verdict of
+`yes` **and** its route passes both flavor stages (§6): its application
+declares `openai_images`, and — for a `server_agent` mapping that has a runtime
+spec — so does the spec (`viewServesImages`, `internal/portal/service.go`; the
+specs are read once per `server_agent` application in the listing, and a
+failed read counts as not serving). A verdict alone is not enough, because
+candidacy refuses an application without the flavor however capable the
+mapping is. A model group's `image` is the AND of its offerable members', and
+an offered alias carries its target's.
+
+**The portal listing carries `openai_images`; `/v1/models` deliberately does
+not.** Every listing keeps only the coarse flavors it knows
+(`knownAPIFlavors`: `anthropic`, `openai`, `openai_images`), so a model whose
+application declares only `openai_images` reaches the portal's model DTO with
+`flavors: ["openai_images"]` — which is what lets the portal chat offer it
+(§12). `/v1/models` asks for `openai` alone, so the same model is **not**
+listed there: that listing is what an external OpenAI client fills its *chat*
+picker from, and an images-only model offered for chat would fail. The
+per-flavor filter behind `/v1/models`, and every listing's `flavors` field,
+read the application's own `api_flavors`, never a `server_agent` spec's
+narrower set; only the portal listing's `image` flag reads the spec as well
+(above). `/api/v0/models` reads the portal
+listing unfiltered by flavor, so it lists an images-only model too.
+`callableModelNames`, the configuration-time guard on a token's model-valued
+settings (the catch-all override and each rule target on a user or service
+token, and the redirect's fallback), unions all three flavors, so any of them
+may name an images-only model: every consumer re-checks the flavor per
+request. A service's model **allowlist** is validated against the portal
+listing instead (`validateServiceAllowedModels`), which lists such a model
+too.
 
 **Per-token override aliases.** A token's model-override rules
 (`requested -> {to, offer, hide_target}`) are also a listing overlay
@@ -767,7 +951,8 @@ keep listing and reach apart are
 
 The portal's own **Models** view (`ModelList.tsx`) is the cross-flavor
 counterpart: each row's "APIs" column lists every flavor (`openai`,
-`anthropic`) the model is currently routable under, alongside its loaded state,
+`anthropic`, `openai_images`) the model is currently routable under, alongside
+its loaded state,
 offering servers, context size, and vision capability — one place to see, per
 gateway model name, everything §1–§9 of this chapter routes around.
 
@@ -877,6 +1062,21 @@ rather than inherited from the endpoint's tolerance of an absent value (§3.4).
 A run is registered before its kind is known (the reservation predates
 `PrepareChatRun`), which is why that field is mutex-guarded rather than one of
 the run's immutable identity fields.
+
+**The picker offers a model the gateway would serve.** `ChatStore`'s
+`chatModels` keeps a model that carries the `openai` flavor, or one that
+carries `openai_images` **and** `image: true`. The second clause is what makes
+an images-only model — one on an `sd-server` application that declares only
+`openai_images`, whose upstream has no chat endpoint and whose DTO therefore
+carries only that flavor (§9) — selectable at all. The `image` half keeps out
+an `openai_images` model the images gate would refuse, which could not be
+chatted with either: offering it could only produce a request that fails. And
+`image: true` is what makes the thread an image thread, for any model; the
+listing sets it only when the images endpoint would actually serve the model
+(§9), so a model with an `image: yes` verdict on an application that does not
+declare `openai_images` is offered as the text model it is, not as an image
+model every turn of which would 404. A saved model that is no longer listed
+still appears, as a synthetic trailing option.
 
 **`kind` and a server-measured `elapsed_ms` ride on every run shape a client
 reads**: the `201` from run start, each row of the active-runs listing, and the
@@ -1135,7 +1335,7 @@ Every inference error response uses the gateway-wide envelope
 | `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url`, and any non-string value (§3.4) |
 | `images.stream_unsupported` | 400 | an images request asking for a streamed response (`stream: true`, or a non-boolean `stream`); this endpoint is pinned to the buffered path (§3.4) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) |
-| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request |
+| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images relay answers when the resolved agent-launched child's spec excludes `openai_images`, and what the text translate path answers when that child's spec is images-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
 | `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |

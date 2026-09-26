@@ -77,15 +77,19 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 
 // targetServesFlavor reports whether target's effective APIFlavors (the resolved
 // application's, or — for a server_agent mapping — the resolved runtime spec's;
-// see targetFrom) includes the request's COARSE api flavor ("openai"/"anthropic").
+// see targetFrom) includes the request's COARSE api flavor ("openai",
+// "anthropic" or "openai_images").
 // This is the other half of the effective-served rule the docs promise (§6 /
 // ADR-033): "served iff flavor ∈ APIFlavors AND mode != disabled" — endpointModeFor
 // only ever reads the mode half. For an ORDINARY app this is a no-op check
 // (candidacy already excluded a flavor-less app before dispatch ever saw it — see
-// applicationServesEndpoint); for a server_agent app it is the ONLY place the
-// spec's (possibly narrower than the app's) flavor set is enforced, since
+// applicationServesEndpoint); for a server_agent app it is what enforces the
+// spec's (possibly narrower than the app's) flavor set in full, since
 // candidacy deliberately gates that app type on its own coarser, app-level
 // flavors only (the spec is the per-model authority, knowable only post-resolve).
+// Its two callers are tryProxyNative (the coding-agent endpoints) and
+// relayImages. The text translate dispatch does not call it: it applies only
+// the narrower targetIsImagesOnly below.
 func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 	coarse := routing.NormalizeAPIFlavor(apiFlavor)
 	for _, f := range target.APIFlavors {
@@ -94,6 +98,52 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 		}
 	}
 	return false
+}
+
+// targetIsImagesOnly reports whether target's effective APIFlavors (as for
+// targetServesFlavor) are images-only -- see flavorsAreImagesOnly.
+//
+// It is the one spec-flavor check the text translate dispatch makes (see
+// resolveTranslateTarget), and it is deliberately NARROWER than the general
+// effective-served rule targetServesFlavor answers (§6 / ADR-033). That
+// dispatch read no spec flavors at all before openai_images existed, so every
+// agent-managed child served /v1/chat/completions -- one whose spec was
+// narrowed to [anthropic], or stored as [], included -- and the portal chat
+// still offers such models, because its listing reads application flavors.
+// Holding that path to the general rule would silently stop those working
+// setups; refusing only a child that can do nothing but generate images closes
+// the gap the images flavor opened and leaves every spec that keeps a text
+// flavor, or is stored as [], serving chat completions (an empty list is never
+// images-only).
+//
+// For an ordinary application this never fires: its flavors are its
+// candidacy, so an application listing only openai_images is never a
+// candidate for a text request in the first place (applicationServesEndpoint).
+// Nor for a server_agent mapping without a spec, which resolves to the
+// application's flavors candidacy just admitted. Only a runtime spec can
+// narrow a text candidate down to images.
+func targetIsImagesOnly(target routing.Target) bool {
+	return flavorsAreImagesOnly(target.APIFlavors)
+}
+
+// flavorsAreImagesOnly reports whether a flavor list names openai_images and
+// neither text flavor (openai, anthropic). Naming openai_images is also what
+// makes the list non-empty, so an empty list is never images-only.
+//
+// It is targetIsImagesOnly's rule for a caller that has no resolved
+// routing.Target but a mapping's effective flavors (Server.mappingIsImagesOnly):
+// the background jobs that send a mapping a chat prompt of their own.
+func flavorsAreImagesOnly(flavors []string) bool {
+	images := false
+	for _, f := range flavors {
+		switch f {
+		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic:
+			return false
+		case routing.APIFlavorOpenAIImages:
+			images = true
+		}
+	}
+	return images
 }
 
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
@@ -183,12 +233,12 @@ func sniffRoutingModel(raw []byte) (model string, stream bool) {
 // this function must not blur: apiFlavor drives target-flavor/mode lookups
 // (endpointModeFor, targetServesFlavor), while endpoint is the
 // session-extraction discriminator forwarded to proxyNative unchanged. They
-// used to coincide (proxyNative derived one from the other), but
-// NormalizeAPIFlavor folds every openai* flavor — responses AND images — to
-// the same coarse "openai", so that derivation could no longer tell them
-// apart once a second native-only, non-translate endpoint existed. Passing
-// endpoint through explicitly is the smaller change against threading a new
-// inference chain into proxyNative.
+// used to coincide (proxyNative derived one from the other), but a flavor
+// does not identify an endpoint: "openai_responses" and
+// "openai_chat_completions" both normalize to the coarse "openai", so no
+// derivation from the flavor can tell every endpoint apart. Passing endpoint
+// through explicitly is the smaller change against threading a new inference
+// chain into proxyNative.
 func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *auth.Token, raw []byte, apiFlavor string, endpoint sessionEndpoint, pf preflight) bool {
 	start := time.Now()
 	req := pf.Req
@@ -233,9 +283,17 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
 	// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
 	// target no longer serves, treat it as disabled here — the one place a
-	// server_agent app's per-model spec flavor is enforceable (candidacy only
-	// checked the app-level flavor; see targetServesFlavor). A no-op for an
-	// ordinary app, whose flavor-less state already excluded it at candidacy.
+	// server_agent app's per-model spec flavor is enforceable for these two
+	// endpoints (candidacy only checked the app-level flavor; see
+	// targetServesFlavor). It runs BEFORE the mode decides anything, so it holds
+	// a translate-mode endpoint to the full rule too -- but only for the target
+	// it judged: a request it finds lacking its flavor never reaches the
+	// translate dispatch. What does reach that dispatch unjudged (a body whose
+	// model the routing probe could not read, a request whose resolve failed
+	// above, and every translate-path re-resolve) is checked there only by
+	// targetIsImagesOnly (resolveTranslateTarget), with neither this flavor
+	// check nor the mode read. A no-op for an ordinary app, whose flavor-less
+	// state already excluded it at candidacy.
 	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
 		mode = routing.EndpointModeDisabled
 	}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/gateway"
 	"op-ai-gateway/internal/portal"
@@ -57,13 +58,14 @@ type healthStore interface {
 	MappingsByApplication(ctx context.Context, applicationID string) ([]routing.ModelMapping, error)
 	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
 	// MappingCapabilities reads a mapping's stored capability rows -- the
-	// baseline applyCapabilityWrite judges a fresh probe result against, for
+	// baseline writeCapabilityRows judges a fresh probe result against, for
 	// both the operator's precedence rule and change detection. An absent
 	// capability is UNKNOWN and simply has no row.
 	MappingCapabilities(ctx context.Context, mappingID string) ([]routing.CapabilityRow, error)
 	// UpsertMappingCapabilities writes the capability rows this probe pass
 	// determined -- every verdict it reads off the same /props document,
-	// live-progress included. UNLIKE UpdateMappingContextProbe it carries no
+	// live-progress included, and the image verdict of a stable-diffusion.cpp
+	// capability document. UNLIKE UpdateMappingContextProbe it carries no
 	// metrics_locked guard; see its doc comment on the store interface
 	// (routing.MappingStore) for the full argument, and note it applies no
 	// precedence rule of its own -- this caller does, via
@@ -465,18 +467,34 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 // row, which is why it no longer has a writer or a compare-to-stored of its
 // own.
 //
+// It is the /props projection (probedCapabilityRows, source llama_cpp_props)
+// in front of writeCapabilityRows, which holds the write path itself and every
+// guard on it -- see there.
+func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, liveProgress string, at time.Time) {
+	r.writeCapabilityRows(ctx, mp, probedCapabilityRows(caps, liveProgress, at))
+}
+
+// writeCapabilityRows is this pass's one capability write path: it persists
+// the rows a probe of this loop determined for one mapping, after asking
+// routing.WritableCapabilityRows which of them may be written. Every probe
+// source this loop reads goes through it -- the /props probe
+// (applyCapabilityWrite) and the stable-diffusion.cpp capability document
+// (sdcppCapabilityRows) -- so the guards below hold for each without being
+// restated per source.
+//
 // Structurally identical to writeBackRuntimeCapabilities in
 // internal/gateway/agent_ingest.go -- read that function's doc for the full
 // reasoning behind every guard, all three of which this pass shares:
 //
 //   - PRECEDENCE: a probe never overwrites a row a human (manual) or a real
 //     measurement (vision_benchmark) established. This ~30s pass re-reads the
-//     same /props document forever; it must not be able to talk over the
-//     operator. The rule lives in routing.WritableCapabilityRows -- asked
-//     here rather than restated, so this pass and the telemetry write-back
-//     cannot drift apart on it. That shared helper is also what retired the
-//     old vision SYNC onto mp.VisionCapable: with one authoritative row per
-//     capability there is no second copy left to converge.
+//     same document (/props, or sd-server's capability document) forever; it
+//     must not be able to talk over the operator. The rule lives in
+//     routing.WritableCapabilityRows -- asked here rather than restated, so
+//     this pass and the telemetry write-back cannot drift apart on it. That
+//     shared helper is also what retired the old vision SYNC onto
+//     mp.VisionCapable: with one authoritative row per capability there is
+//     no second copy left to converge.
 //   - CHANGE DETECTION: an unchanged verdict issues no write, so a steady
 //     upstream costs nothing on this cadence.
 //   - NO metrics_locked gate: a capability is a property of the upstream
@@ -485,13 +503,12 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 //     note the table itself carries no such guard to gate against.
 //
 // Best-effort: a read or write failure is logged and the pass carries on.
-func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.ModelMapping, caps provider.Capabilities, liveProgress string, at time.Time) {
-	reported := probedCapabilityRows(caps, liveProgress, at)
+func (r *appHealthRunner) writeCapabilityRows(ctx context.Context, mp routing.ModelMapping, reported []routing.CapabilityRow) {
 	if len(reported) == 0 {
-		// This probe determined nothing at all -- no modalities, no
-		// chat_template_caps, no live-progress evidence. Returns before the
-		// store read, so a body that is not a llama.cpp /props document costs
-		// no round trip per mapping per cadence tick.
+		// This probe determined nothing at all -- for /props: no modalities,
+		// no chat_template_caps, no live-progress evidence. Returns before
+		// the store read, so a body that is not a llama.cpp /props document
+		// costs no round trip per mapping per cadence tick.
 		return
 	}
 	stored, err := r.store.MappingCapabilities(ctx, mp.ID)
@@ -562,6 +579,101 @@ func probedCapabilityRows(caps provider.Capabilities, liveProgress string, at ti
 	return out
 }
 
+// sdcppCapabilityRows projects ONE stable-diffusion.cpp capability document
+// onto the store's row shape: a single routing.CapabilityImage row attributed
+// to routing.CapabilitySourceSdcppCapabilities and stamped at, when the
+// document answered yes or no, and no row at all otherwise -- "unknown" is
+// the absence of a row, exactly as in probedCapabilityRows. Pure: no I/O.
+//
+// A "no" is a real verdict here, not an absence: supported_modes is
+// exhaustive (see provider.SdcppVerdicts), which is what entitles this
+// source, unlike the others, to establish image: no.
+func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.CapabilityRow {
+	if v.Image != routing.CapabilityYes && v.Image != routing.CapabilityNo {
+		return nil
+	}
+	return []routing.CapabilityRow{{
+		Capability: routing.CapabilityImage, Verdict: v.Image,
+		Source: routing.CapabilitySourceSdcppCapabilities, CheckedAt: at,
+	}}
+}
+
+// probeSdcppCapabilities is the stable_diffusion_cpp branch of the probe pass
+// for ONE application: it reads the sd-server's own capability document and
+// writes the image verdict it derives onto the application's active mappings.
+//
+// The target and the auth context are built exactly as the context-probe
+// branch builds them, so the request carries the application's own
+// credential and rides the same prober -- in production the Multiplexer,
+// whose OpenAI-compatible client runs on the outbound app transport.
+//
+// A failed probe (unreachable, a non-2xx such as the 404 of a server without
+// the document, an unreadable body) states nothing, so it is logged at debug
+// level and writes nothing; the next cadence tick asks again. Unlike the
+// /props probe there is no immediate retry: a failure clears nothing here, so
+// there is no flap for a retry to absorb.
+//
+// Attribution is the context branch's name rule. A verdict naming its model
+// (model.stem) reaches only the mapping whose AppModelName equals that stem --
+// model discovery names an sd mapping by /sdapi/v1/sd-models' model_name,
+// which equals the stem on the measured server. A named verdict that matches
+// no active mapping writes nothing and is logged at debug level, naming the
+// app, the stem and the verdict. A verdict naming no model
+// reaches every active mapping, because a stable_diffusion_cpp application
+// is one endpoint serving one model, so the build that answered serves every
+// mapping it owns.
+//
+// It returns unlanded = true when the document stated a verdict and no active
+// mapping received it, named or nameless. The caller then leaves this pass's
+// cadence key unstamped, so the next cycle asks again: the mapping is created
+// by the same cycle's model_sync reconcile, which runs beside this pass, and
+// a pass that lost that race would otherwise wait one full interval before
+// the new model's first verdict landed.
+func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.SdcppCapabilitiesProber) (unlanded bool) {
+	target := routing.Target{
+		Provider: app.Type,
+		Endpoint: routing.ApplicationEndpoint(server, app),
+		Timeout:  r.probeTimeout,
+	}
+	// Attach the app's per-app upstream credential to the probe (fail-open).
+	token, _ := capture.OpenSecret(r.cipher, app.APIToken)
+	pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
+	v, err := prober.ProbeSdcppCapabilities(pctx, target)
+	if err != nil {
+		slog.Debug("app health: sdcpp capabilities probe failed", "app_id", app.ID, "error", err)
+		return false
+	}
+	rows := sdcppCapabilityRows(v, r.now())
+	if len(rows) == 0 {
+		return false // the document stated no verdict: nothing to write, no store round trip
+	}
+	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
+	if err != nil {
+		log.Printf("app health: mappings for app %s failed: %v", app.ID, err)
+		return false
+	}
+	matched := false
+	for _, mp := range mappings {
+		if mp.Status != routing.ServerStatusActive {
+			continue
+		}
+		if v.ModelStem != "" && mp.AppModelName != v.ModelStem {
+			continue
+		}
+		matched = true
+		r.writeCapabilityRows(ctx, mp, rows)
+	}
+	if v.ModelStem != "" && !matched {
+		// Fails closed -- no row, so the images gate keeps refusing -- but
+		// silently would leave the case undiagnosable: most likely an
+		// sd-server whose model.stem differs from the /sdapi/v1/sd-models
+		// model_name that discovery named the mapping by.
+		slog.Debug("app health: sdcpp capability verdict dropped: no active mapping serves the model it names",
+			"app_id", app.ID, "model_stem", v.ModelStem, "image", v.Image)
+	}
+	return !matched
+}
+
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe
 // each active application whose per-application cadence is due (reusing the last
 // observed reachability otherwise), run the loaded-model + context-size probe
@@ -599,6 +711,10 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	reachable := make([]bool, len(active))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, appHealthProbeConcurrency)
+	// unstampSdcpp collects the sd capability keys whose verdict reached no
+	// mapping, written by the probe goroutines under unstampMu.
+	var unstampMu sync.Mutex
+	var unstampSdcpp []string
 	for i := range active {
 		app := active[i]
 		state.seen[app.ID] = true
@@ -893,7 +1009,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						// path), so a /props body carrying capability evidence
 						// but no model/model_path still yields this mapping's
 						// verdicts. Deliberately not gated on mp.MetricsLocked --
-						// see applyCapabilityWrite's doc; an unknown verdict
+						// see writeCapabilityRows' doc; an unknown verdict
 						// becomes no row, an unchanged one no write, and a human's
 						// or the benchmark's verdict is never overwritten.
 						r.applyCapabilityWrite(ctx, mp,
@@ -950,7 +1066,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 					// read as "unsupported"), an unchanged one issues no write on
 					// this ~30s cadence, and a verdict a human or the vision
 					// benchmark established is never overwritten. Deliberately
-					// not gated on mp.MetricsLocked -- see applyCapabilityWrite.
+					// not gated on mp.MetricsLocked -- see writeCapabilityRows.
 					//
 					// The name-matching rule, for both: a NAMELESS info reaches
 					// every mapping of this one-endpoint application, while a
@@ -973,8 +1089,61 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 				}
 			}(app, probePath)
 		}
+
+		// stable-diffusion.cpp capability pass: for every active
+		// stable_diffusion_cpp application, read the sd-server's own
+		// /sdcpp/v1/capabilities document and derive the image verdict from
+		// it (probeSdcppCapabilities). A separate branch from the context
+		// probe above because it depends on neither of that branch's gates:
+		// ContextProbePath is empty for this type, and the document is not a
+		// ModelInfo. It shares that branch's cadence (the application's
+		// effective interval) and wg+sem, under its own "sdcpp:"+id key,
+		// seen-marked for every such app so the cleanup keeps its last-probe
+		// time.
+		//
+		// It reaches an EXTERNAL sd-server only. An agent-launched sd-server
+		// is a server_agent mapping behind the agent's router, which passes
+		// only /props through per model, so its image verdict stays manual.
+		//
+		// A verdict that reached no active mapping clears its stamp again
+		// once the pass is over (unstampSdcpp, after wg.Wait), so the next
+		// cycle retries it -- see probeSdcppCapabilities.
+		if sdProber, ok := r.prober.(provider.SdcppCapabilitiesProber); ok {
+			for i := range active {
+				app := active[i]
+				if app.Type != routing.ProviderStableDiffusionCpp {
+					continue
+				}
+				key := "sdcpp:" + app.ID
+				state.seen[key] = true
+				eff := routing.EffectiveHealthCheckIntervalSeconds(app, cfg.systemSeconds, portal.MinHealthCheckIntervalSeconds, portal.MaxHealthCheckIntervalSeconds)
+				if eff < nextSeconds {
+					nextSeconds = eff
+				}
+				if last, ok := state.lastProbed[key]; ok && cfg.tNow.Sub(last) < time.Duration(eff)*time.Second {
+					continue
+				}
+				state.lastProbed[key] = cfg.tNow
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(app routing.Application, key string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if r.probeSdcppCapabilities(ctx, server, app, sdProber) {
+						unstampMu.Lock()
+						unstampSdcpp = append(unstampSdcpp, key)
+						unstampMu.Unlock()
+					}
+				}(app, key)
+			}
+		}
 	}
 	wg.Wait()
+	// Only now, with every probe goroutine done, is state.lastProbed safe to
+	// write from here again.
+	for _, key := range unstampSdcpp {
+		delete(state.lastProbed, key)
+	}
 
 	reachableCount := 0
 	for _, ok := range reachable {

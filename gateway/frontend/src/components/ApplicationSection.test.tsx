@@ -9,6 +9,7 @@ import { formatDate } from './shared/format';
 import { messages, type Locale } from '../i18n';
 import { PortalApiError } from '../api';
 import type {
+  ApplicationType,
   BenchmarkStatus,
   CreateApplicationRequest,
   CreateMappingRequest,
@@ -473,6 +474,101 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect((screen.getByLabelText(t.applicationContextProbePath) as HTMLInputElement).value).toBe(
         '/upstream/{model}/props',
       );
+    });
+
+    // stable_diffusion_cpp is the type whose stock health mode and API
+    // flavors are reproducible failures rather than preferences (see
+    // applicationTypeDefaults.ts) -- migrateTypeFields must carry ALL of its
+    // defaults, not just the pre-existing fields every other type already
+    // exercises above.
+    it('prefills stable_diffusion_cpp defaults (health mode, flavors, timeout) when the type changes', async () => {
+      const { created } = renderSection();
+      openCreate();
+      await selectType('stable_diffusion_cpp');
+      expect(screen.getByRole('combobox', { name: t.applicationHealthMode })).toHaveTextContent(
+        t.applicationHealthModeModelSync,
+      );
+      expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe(
+        '600000',
+      );
+      expect((screen.getByLabelText(t.applicationLoadedModelsPath) as HTMLInputElement).value).toBe(
+        '/sdapi/v1/sd-models',
+      );
+      // This is MUI's non-native Select (SelectField), not a real <select>: the
+      // underlying value is already 'sdcpp_models' the moment the type changes
+      // (migrateTypeFields), regardless of whether an <option> for it exists --
+      // so a plain value check can't catch a missing option. What an operator
+      // actually sees is the combobox's rendered text, and with no matching
+      // <option> that renders BLANK while the value silently stays
+      // 'sdcpp_models': the operator would see an empty format and could not
+      // reselect the right one from the dropdown either.
+      expect(
+        screen.getByRole('combobox', { name: t.applicationLoadedModelsFormat }),
+      ).toHaveTextContent(t.applicationLoadedFormatSdcpp);
+      // The type default ticks openai_images and unticks the two text
+      // flavors, so this server is never offered as a text candidate.
+      expect(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+      expect(screen.getByText(t.applicationTypeStableDiffusionCppNote)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].api_flavors).toEqual(['openai_images']);
+      expect(created[0].health_check_mode).toBe('model_sync');
+      expect(created[0].loaded_models_format).toBe('sdcpp_models');
+    });
+
+    // The note is the type field's own helperText, so aria-describedby
+    // announces it with the field on focus -- the way the launch-spec form's
+    // type note already works -- rather than a caption beside it that a screen
+    // reader reaches only by reading on.
+    it('announces the stable_diffusion_cpp note as the type field description', async () => {
+      renderSection();
+      openCreate();
+      const combo = () => screen.getByRole('combobox', { name: t.applicationType });
+      expect(combo()).not.toHaveAccessibleDescription();
+
+      await selectType('stable_diffusion_cpp');
+      expect(combo()).toHaveAccessibleDescription(t.applicationTypeStableDiffusionCppNote);
+
+      await selectType('vllm');
+      expect(combo()).not.toHaveAccessibleDescription();
+      expect(screen.queryByText(t.applicationTypeStableDiffusionCppNote)).not.toBeInTheDocument();
+    });
+
+    it('announces the note after a type-gate reason on the same field', async () => {
+      renderSection({
+        apps: [
+          makeApp({ id: 'app_sd', type: 'stable_diffusion_cpp' }),
+          makeApp({
+            id: 'app_agent',
+            type: 'server_agent',
+            port: 9100,
+            endpoint: 'https://s1.example.test:9100',
+          }),
+        ],
+      });
+      const sdRow = (await screen.findByText('https://s1.example.test:8000')).closest(
+        'tr',
+      ) as HTMLElement;
+      fireEvent.click(within(sdRow).getByRole('button', { name: t.applicationEdit }));
+
+      expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveAccessibleDescription(
+        `${t.applicationTypeServerAgentTaken} ${t.applicationTypeStableDiffusionCppNote}`,
+      );
+    });
+
+    it('preserves a customized flavor selection across a switch to stable_diffusion_cpp', async () => {
+      renderSection();
+      openCreate();
+      // Untick 'openai' first, so `flavors` no longer equals ollama's default
+      // (['openai', 'anthropic']) by value -- the switch must then leave it
+      // alone instead of replacing it with ['openai_images'].
+      fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+      await selectType('stable_diffusion_cpp');
+      expect(
+        screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
+      ).not.toBeChecked();
     });
   });
 
@@ -995,6 +1091,120 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // openai_images is the third flavor checkbox: opt-in, never ticked by
+  // default, so an operator can add it to any application -- a server_agent
+  // one included, whose agent-launched image child needs it for candidacy.
+  describe(`ApplicationSection openai_images flavor checkbox [${locale}]`, () => {
+    const imagesBox = () => screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages });
+
+    it('leaves openai_images unticked on a fresh create and sends it once ticked', async () => {
+      const { created } = renderSection();
+      openCreate();
+      expect(imagesBox()).not.toBeChecked();
+
+      fireEvent.click(imagesBox());
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].api_flavors).toEqual(['openai', 'anthropic', 'openai_images']);
+    });
+
+    it('shows a stored openai_images as ticked, and unticking it removes it', async () => {
+      const { updated } = renderSection({
+        apps: [makeApp({ id: 'app_1', api_flavors: ['openai', 'openai_images'] })],
+      });
+      await screen.findByText('https://s1.example.test:8000');
+      fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+      expect(imagesBox()).toBeChecked();
+
+      fireEvent.click(imagesBox());
+      fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+      await waitFor(() => expect(updated).toHaveLength(1));
+      expect(updated[0].body.api_flavors).toEqual(['openai']);
+    });
+  });
+
+  // An empty flavor list is not an honest save: the backend stores [] as
+  // [openai, anthropic], so a form showing nothing ticked would save a text
+  // candidate -- on a stable_diffusion_cpp application, the exact trap its
+  // type default exists to prevent. The application form refuses it.
+  describe(`ApplicationSection refuses a save with no flavor ticked [${locale}]`, () => {
+    const untickAll = () => {
+      for (const name of ['openai', 'anthropic']) {
+        fireEvent.click(screen.getByRole('checkbox', { name }));
+      }
+    };
+
+    it('does not create with every flavor unticked, and says why next to the flavors', async () => {
+      const { created } = renderSection();
+      openCreate();
+      untickAll();
+      expect(screen.getByText(t.applicationFlavorsRequired)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      // Give a submit that should not happen every chance to happen.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(created).toHaveLength(0);
+      expect(screen.getByText(t.applicationFlavorsRequired)).toBeInTheDocument();
+      // The message is announced with the flavor group it is about.
+      expect(screen.getByRole('group', { name: t.applicationFlavors })).toHaveAccessibleDescription(
+        t.applicationFlavorsRequired,
+      );
+    });
+
+    // Refusing silently is not enough: the button does nothing a screen reader
+    // or an operator scrolled away from the flavors can notice. Focus moves to
+    // the group, whose description is the reason.
+    it('moves focus to the flavor group when it refuses the save', async () => {
+      const { created } = renderSection();
+      openCreate();
+      untickAll();
+      const submit = screen.getByRole('button', { name: t.applicationCreate });
+      submit.focus();
+
+      fireEvent.click(submit);
+      const group = screen.getByRole('group', { name: t.applicationFlavors });
+      await waitFor(() => expect(group).toHaveFocus());
+      expect(group).toHaveAccessibleDescription(t.applicationFlavorsRequired);
+      expect(created).toHaveLength(0);
+    });
+
+    it('clears the message and creates once one flavor is ticked again', async () => {
+      const { created } = renderSection();
+      openCreate();
+      untickAll();
+      fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }));
+      expect(screen.queryByText(t.applicationFlavorsRequired)).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].api_flavors).toEqual(['openai_images']);
+    });
+
+    // The edit form seeds its flavors from the loaded application as-is, so an
+    // old row stored with [] opens with nothing ticked. It does not greet the
+    // operator with an error, but it does not save until something is ticked.
+    it('opens an old row with no flavors without the error, and refuses to save it until one is ticked', async () => {
+      const { updated } = renderSection({ apps: [makeApp({ id: 'app_1', api_flavors: [] })] });
+      await screen.findByText('https://s1.example.test:8000');
+      fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+      expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+      expect(screen.queryByText(t.applicationFlavorsRequired)).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(updated).toHaveLength(0);
+      expect(screen.getByText(t.applicationFlavorsRequired)).toBeInTheDocument();
+      // Here the message appears only now, on the refusal itself, so focus is
+      // what makes it perceivable.
+      expect(screen.getByRole('group', { name: t.applicationFlavors })).toHaveFocus();
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+      fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+      await waitFor(() => expect(updated).toHaveLength(1));
+      expect(updated[0].body.api_flavors).toEqual(['openai']);
+    });
+  });
+
   describe(`ApplicationSection metrics auto-update toggles [${locale}]`, () => {
     it('defaults both metrics toggles off, hides the interval field, and sends the defaults on create', async () => {
       const { created } = renderSection();
@@ -1416,15 +1626,27 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   // managed_runtime_only is the SECOND gate on this same control, and it is
   // CREATE-ONLY: the backend reads Server.ManagedRuntimeOnly inside
   // CreateApplication and nowhere else -- UpdateApplication never looks at it.
-  // So an edit on such a server must keep offering all six types; a portal that
+  // So an edit on such a server must keep offering every type; a portal that
   // disabled them there would refuse writes the backend accepts, silently.
   describe(`ApplicationSection managed_runtime_only type gate [${locale}]`, () => {
     const managedServer: PortalServer = { ...server, managed_runtime_only: true };
-    const allTypes = ['ollama', 'vllm', 'llama_cpp', 'llama_swap', 'litellm', 'server_agent'];
+    // The key set of a Record over ApplicationType, so a type added to the
+    // union without an entry here fails to compile instead of slipping out of
+    // every assertion below.
+    const typeKeys: Record<ApplicationType, true> = {
+      ollama: true,
+      vllm: true,
+      llama_cpp: true,
+      llama_swap: true,
+      litellm: true,
+      server_agent: true,
+      stable_diffusion_cpp: true,
+    };
+    const allTypes = Object.keys(typeKeys) as ApplicationType[];
     const refusedTypes = allTypes.filter((type) => type !== 'server_agent');
 
     // THE point of the change. A naive `managedRuntimeOnly` predicate (no
-    // `&& !editing`) turns this red: the five options come back aria-disabled
+    // `&& !editing`) turns this red: every other option comes back aria-disabled
     // and the field grows a description it must not have here.
     it('offers every type, and disables none, when EDITING on such a server', async () => {
       renderSection({ server: managedServer, apps: [makeApp({ id: 'app_vllm', type: 'vllm' })] });
@@ -1463,7 +1685,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(updated[0].body.type).toBe('ollama');
     });
 
-    it('disables the five types the backend refuses when CREATING on such a server', async () => {
+    it('disables every type the backend refuses when CREATING on such a server', async () => {
       renderSection({ server: managedServer, apps: [] });
       await screen.findByText(t.runtimeManagedOnlyBanner);
       openCreate();
@@ -1560,7 +1782,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(combo).toHaveTextContent('server_agent');
 
       // The two gates intersect to the empty set: nothing here is choosable, and
-      // the backend would refuse every one of the six.
+      // the backend would refuse every one of them.
       fireEvent.mouseDown(combo);
       for (const option of allTypes) {
         expect(await screen.findByRole('option', { name: option })).toHaveAttribute(
@@ -1573,7 +1795,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it('still renders the 409 when the server DTO was stale, and keeps the form open', async () => {
       // This gate reads `managed_runtime_only` off the server DTO the PARENT
       // fetched; ApplicationSection never refetches the server. A PATCH that
-      // sets the flag after that fetch leaves this form offering all six types
+      // sets the flag after that fetch leaves this form offering every type
       // and the backend is what refuses the write -- rendered here with the flag
       // absent, so the portal gate is open and only the 409 stands.
       const { fakeApi } = renderSection();

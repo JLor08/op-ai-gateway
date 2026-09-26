@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/theme"
 	"op-ai-gateway/internal/usage"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1610,9 +1611,10 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 //     (group-only) names, which a direct request cannot route to, plus the
 //     merely-hidden ones, which it can.
 //
-// Both flavors count: a name valid for only one of them is still a valid
-// setting, and every consumer re-checks the flavor per request. Groups share
-// the model namespace and are therefore included by the same lookup.
+// Every known flavor counts, openai_images included: a name valid for only one
+// of them is still a valid setting, and every consumer re-checks the flavor per
+// request. Groups share the model namespace and are therefore included by the
+// same lookup.
 //
 // The set is built ONCE per create/update and passed to each validator, rather
 // than rebuilt per entry: it costs one mapping traversal plus one group-overlay
@@ -1620,7 +1622,7 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
 	out := make(map[string]struct{})
 	for _, flavor := range knownAPIFlavors {
-		for name := range s.ModelOfferingFor(ctx, owner, flavor).Callable {
+		for name := range s.ModelOfferingFor(ctx, owner, flavor, nil).Callable {
 			out[name] = struct{}{}
 		}
 	}
@@ -2066,24 +2068,21 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				capsByMapping = nil
 			}
 			// The fold below asks each mapping exactly TWO capability questions
-			// (vision and image), so both rows are picked out here in one pass
-			// rather than by keying that mapping's whole row set by name inside
-			// the loop -- a map allocated per mapping to answer two lookups. A
-			// mapping with no such row is simply absent, which is what the fold
-			// reads as "not capable" (see below). There is no early break: it
-			// would stop at whichever of the two rows came first.
-			visionRows := make(map[string]routing.CapabilityRow, len(capsByMapping))
-			imageRows := make(map[string]routing.CapabilityRow, len(capsByMapping))
-			for mappingID, rows := range capsByMapping {
-				for _, row := range rows {
-					switch row.Capability {
-					case routing.CapabilityVision:
-						visionRows[mappingID] = row
-					case routing.CapabilityImage:
-						imageRows[mappingID] = row
-					}
-				}
-			}
+			// (vision and image), so both rows are picked out here, keyed by
+			// mapping id, rather than by keying that mapping's whole row set by
+			// name inside the loop -- a map allocated per mapping to answer two
+			// lookups. A mapping with no such row is simply absent, which is
+			// what the fold reads as "not capable" (see below).
+			visionRows := capabilityRowsFor(capsByMapping, routing.CapabilityVision)
+			// The image flag is imageFlagsByName, the one image fold the
+			// unknown-model redirect asks too (ModelOffering.Capable). Unlike
+			// vision it also takes the mapping's route: the verdict alone does
+			// not make the images endpoint serve a model, so a mapping whose
+			// application (or resolved spec) excludes openai_images ANDs in as
+			// false -- see viewServesImages, and runtimeSpecFlavorsForViews for
+			// the spec flavors of every agent-launched mapping.
+			specFlavors, specFailed := s.runtimeSpecFlavorsForViews(ctx, views)
+			imageOn := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), specFlavors, specFailed)
 			// Derive both the per-model flavor set and the loaded-state from a
 			// single pass over the active mapping views (one store round-trip).
 			flavors := make(map[string]map[string]struct{})
@@ -2104,23 +2103,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// see routing.CapabilityRow's doc-comment on why "unknown" is a row's
 			// absence rather than a third verdict.
 			visionOn := make(map[string]bool)
-			// imageOn: same AND-fold, same fail-closed seeding, for the "image"
-			// capability. Kept as a separate map rather than a struct so the
-			// group and alias plumbing below mirrors visionOn line for line.
-			imageOn := make(map[string]bool)
 			for _, view := range views {
 				name := view.mapping.GatewayModelName
 				if _, ok := flavors[name]; !ok {
 					flavors[name] = make(map[string]struct{})
 					visionOn[name] = true
-					imageOn[name] = true
 				}
 				if _, ok := offeredOn[name]; !ok {
 					offeredOn[name] = make(map[string]struct{})
 				}
 				offeredOn[name][view.server.Name] = struct{}{}
 				visionOn[name] = visionOn[name] && visionRows[view.mapping.ID].Verdict == routing.CapabilityYes
-				imageOn[name] = imageOn[name] && imageRows[view.mapping.ID].Verdict == routing.CapabilityYes
 				if cs := view.mapping.ContextSize; cs > 0 {
 					if cur, ok := contextSizeOn[name]; !ok || cs < cur {
 						contextSizeOn[name] = cs
@@ -2224,36 +2217,13 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 						groupContext[e.Name] = minContext
 					}
 				}
-				// A group's vision flag is the AND of its offerable members' vision
-				// flags (same fail-closed rule as a plain model); an EMPTY offerable
-				// member set is false (fail-closed — never claim vision on a group
-				// with nothing to serve it). Captured before suppression, mirroring
-				// groupOffered/groupContext.
-				groupVision := make(map[string]bool, len(entries))
-				for _, e := range entries {
-					all := len(e.OrderedOfferableMembers) > 0
-					for _, member := range e.OrderedOfferableMembers {
-						if !visionOn[member] {
-							all = false
-							break
-						}
-					}
-					groupVision[e.Name] = all
-				}
-				// A group's image flag mirrors groupVision line for line: the AND
-				// of its offerable members' image flags, false (fail-closed) for
-				// an empty offerable member set.
-				groupImage := make(map[string]bool, len(entries))
-				for _, e := range entries {
-					all := len(e.OrderedOfferableMembers) > 0
-					for _, member := range e.OrderedOfferableMembers {
-						if !imageOn[member] {
-							all = false
-							break
-						}
-					}
-					groupImage[e.Name] = all
-				}
+				// A group's vision and image flags are the AND of its offerable
+				// members' flags (same fail-closed rule as a plain model); an EMPTY
+				// offerable member set is false (fail-closed — never claim a
+				// capability on a group with nothing to serve it). Captured before
+				// suppression, mirroring groupOffered/groupContext.
+				groupVision := groupCapabilityFlags(entries, visionOn)
+				groupImage := groupCapabilityFlags(entries, imageOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2375,9 +2345,129 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 	}
 	out := make([]ModelDTO, 0, len(seedModelNames))
 	for _, name := range seedModelNames {
-		out = append(out, ModelDTO{ID: name, DisplayName: name, Flavors: allKnownFlavorsSorted(), Visibility: "shown"})
+		out = append(out, ModelDTO{ID: name, DisplayName: name, Flavors: seedFlavorsSorted(), Visibility: "shown"})
 	}
 	return ModelsResponse{Data: out}
+}
+
+// capabilityRowsFor picks one capability's row out of a batch capability read
+// (routing.Store.MappingCapabilitiesForMappings), keyed by mapping id. A
+// mapping without such a row is absent, which every fold reads as "not
+// capable".
+func capabilityRowsFor(capsByMapping map[string][]routing.CapabilityRow, capability string) map[string]routing.CapabilityRow {
+	out := make(map[string]routing.CapabilityRow, len(capsByMapping))
+	for mappingID, rows := range capsByMapping {
+		for _, row := range rows {
+			if row.Capability == capability {
+				out[mappingID] = row
+				break
+			}
+		}
+	}
+	return out
+}
+
+// imageFlagsByName is THE image fold: per gateway model name among views,
+// whether the images endpoint would serve it. It backs the listing's
+// ModelDTO.Image and the unknown-model redirect's ModelOffering.Capable, so the
+// two can never disagree about which model generates images.
+//
+// A name carries the image capability only when EVERY one of its mappings has
+// an image=yes verdict (imageRows, keyed by mapping id) AND would pass both
+// flavor stages of an image request (viewServesImages). It is fail-closed: a
+// "no" row and a MISSING row (never probed) both AND in as false -- see
+// routing.CapabilityRow on why "unknown" is a row's absence -- and a name
+// starts true on its first mapping and is only ever ANDed down, never up.
+// Image is independent of vision: a generator that accepts no image input is
+// image=true, vision=false.
+func imageFlagsByName(views []mappingView, imageRows map[string]routing.CapabilityRow, specFlavors map[string][]string, specFailed map[string]struct{}) map[string]bool {
+	out := make(map[string]bool)
+	for _, view := range views {
+		name := view.mapping.GatewayModelName
+		acc, seen := out[name]
+		if !seen {
+			acc = true
+		}
+		out[name] = acc && imageRows[view.mapping.ID].Verdict == routing.CapabilityYes &&
+			viewServesImages(view, specFlavors, specFailed)
+	}
+	return out
+}
+
+// groupCapabilityFlags is the group half of a per-name capability fold: each
+// group's flag is the AND of its offerable members' flags, and false
+// (fail-closed) for a group with no offerable member.
+func groupCapabilityFlags(entries []groupOverlayEntry, flags map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		all := len(e.OrderedOfferableMembers) > 0
+		for _, member := range e.OrderedOfferableMembers {
+			if !flags[member] {
+				all = false
+				break
+			}
+		}
+		out[e.Name] = all
+	}
+	return out
+}
+
+// viewServesImages reports whether an image request resolved to this mapping
+// would pass both flavor stages, so that the listing's Image never offers a
+// model the images endpoint refuses: CANDIDACY admits only an application that
+// declares openai_images (routing.applicationServesEndpoint), and for a
+// server_agent mapping with a runtime spec the images relay then holds the
+// spec's own flavors to it too (targetServesFlavor; the spec is the flavor
+// authority routing.Resolver.targetFrom resolves). A server_agent mapping with
+// no spec falls back to the application's flavors, exactly as targetFrom does.
+// An application whose spec read failed serves no images here (fail-closed).
+func viewServesImages(view mappingView, specFlavors map[string][]string, specFailed map[string]struct{}) bool {
+	if !slices.Contains(view.app.APIFlavors, routing.APIFlavorOpenAIImages) {
+		return false
+	}
+	if view.app.Type != routing.ProviderServerAgent {
+		return true
+	}
+	if _, failed := specFailed[view.app.ID]; failed {
+		return false
+	}
+	flavors, hasSpec := specFlavors[view.mapping.ID]
+	if !hasSpec {
+		return true
+	}
+	return slices.Contains(flavors, routing.APIFlavorOpenAIImages)
+}
+
+// runtimeSpecFlavorsForViews returns the runtime-spec APIFlavors of every
+// server_agent mapping among views that has a spec, keyed by mapping id. It
+// costs one RuntimeSpecsByApplication read per distinct server_agent
+// application -- at most one per server -- and none for a listing without
+// one. An application whose read fails is returned in failed rather than
+// guessed at, and logged, like the capability read's degrade.
+func (s *Service) runtimeSpecFlavorsForViews(ctx context.Context, views []mappingView) (flavors map[string][]string, failed map[string]struct{}) {
+	flavors = make(map[string][]string)
+	failed = make(map[string]struct{})
+	seen := make(map[string]struct{})
+	for _, view := range views {
+		if view.app.Type != routing.ProviderServerAgent {
+			continue
+		}
+		if _, done := seen[view.app.ID]; done {
+			continue
+		}
+		seen[view.app.ID] = struct{}{}
+		specs, err := s.routes.RuntimeSpecsByApplication(ctx, view.app.ID)
+		if err != nil {
+			slog.Warn("portal: models-listing runtime spec read failed; image withheld for the application's models",
+				"app_id", view.app.ID, "err", err)
+			failed[view.app.ID] = struct{}{}
+			continue
+		}
+		for _, spec := range specs {
+			flavors[spec.MappingID] = spec.APIFlavors
+		}
+	}
+	return flavors, failed
 }
 
 func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (string, []RouteDTO) {
@@ -3678,16 +3768,32 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 	return filterByAllowedServers(ctx, s.AllowedServerIDs, token, views, func(v mappingView) string { return v.server.ID }, false)
 }
 
-// knownAPIFlavors is the sorted set of API flavors the gateway exposes.
-var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}
+// knownAPIFlavors is the sorted set of coarse API flavors a model listing
+// carries: every flavor an application may declare, the images flavor
+// included. A listing keeps only these, so a flavor missing here is a flavor
+// no listing reports -- an images-only application's models would reach the
+// chat with no flavors at all. Carrying a flavor is not offering the model on
+// every surface: each per-flavor listing (ModelsForFlavor, i.e. /v1/models)
+// still asks for its OWN flavor, so an images-only model never appears in a
+// text listing.
+//
+// The seed fallback does not read this set; see seedAPIFlavors.
+var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+
+// seedAPIFlavors is the sorted set of flavors the seed models (the
+// unconfigured-routing-store fallback) expose. The seeds are TEXT models, and
+// openai_images is opt-in everywhere, so this is deliberately not
+// knownAPIFlavors: a seed that claimed images would be offered for image
+// requests it cannot serve.
+var seedAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}
 
 func isKnownAPIFlavor(flavor string) bool {
-	for _, known := range knownAPIFlavors {
-		if flavor == known {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(knownAPIFlavors, flavor)
+}
+
+// isSeedAPIFlavor reports whether the seed models are offered on flavor.
+func isSeedAPIFlavor(flavor string) bool {
+	return slices.Contains(seedAPIFlavors, flavor)
 }
 
 // modelFlavorSets maps each name this principal is OFFERED to the set of known
@@ -4039,8 +4145,9 @@ func sortedStringSet(set map[string]struct{}) []string {
 	return out
 }
 
-func allKnownFlavorsSorted() []string {
-	return append([]string(nil), knownAPIFlavors...)
+// seedFlavorsSorted returns a copy of seedAPIFlavors for one seed model's DTO.
+func seedFlavorsSorted() []string {
+	return append([]string(nil), seedAPIFlavors...)
 }
 
 // seedModelNames are the fallback models when no routing store is configured.
@@ -4049,8 +4156,8 @@ var seedModelNames = []string{"gpt-oss-20b", "qwen-coder"}
 // ModelsForFlavor returns the sorted gateway model names routable on the given
 // API flavor (whose application declares that flavor), filtered to the models
 // the given principal is allowed to see under resource-group provisioning
-// (Resource Groups Phase 2). Falls back to the seed models (which expose every
-// known flavor) when no routing store is configured.
+// (Resource Groups Phase 2). Falls back to the seed models (which expose the
+// text flavors, seedAPIFlavors) when no routing store is configured.
 func (s *Service) ModelsForFlavor(ctx context.Context, token auth.Token, flavor string) []string {
 	if s.routes != nil {
 		if sets, err := s.modelFlavorSets(ctx, token); err == nil {
@@ -4064,7 +4171,7 @@ func (s *Service) ModelsForFlavor(ctx context.Context, token auth.Token, flavor 
 			return ids
 		}
 	}
-	if isKnownAPIFlavor(flavor) {
+	if isSeedAPIFlavor(flavor) {
 		return append([]string(nil), seedModelNames...)
 	}
 	return []string{}

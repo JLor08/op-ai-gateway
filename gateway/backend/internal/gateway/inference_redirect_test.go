@@ -20,10 +20,23 @@ func nameSet(lists ...[]string) map[string]struct{} {
 }
 
 // offering builds the ORDINARY portal.ModelOffering, where nothing is
-// suppressed — so each test below reads as "these names are callable, these
-// exist".
+// suppressed and the request requires no capability — so each test below reads
+// as "these names are callable, these exist". With no required capability the
+// portal's Capable is Callable itself.
 func offering(callable, existing []string) portal.ModelOffering {
-	return portal.ModelOffering{Callable: nameSet(callable), Existing: nameSet(existing)}
+	return portal.ModelOffering{Callable: nameSet(callable), Capable: nameSet(callable), Existing: nameSet(existing)}
+}
+
+// offeringWithIncapable builds the offering of a request that requires a
+// capability: `capable` names carry it, `incapable` names are just as callable
+// and existing but lack it (for an images request, a model whose application
+// declares openai_images and whose mapping has no image=yes verdict).
+func offeringWithIncapable(capable, incapable []string) portal.ModelOffering {
+	return portal.ModelOffering{
+		Callable: nameSet(capable, incapable),
+		Capable:  nameSet(capable),
+		Existing: nameSet(capable, incapable),
+	}
 }
 
 // offeringWithLocked builds the model_settings "locked" shape: a GROUP-ONLY
@@ -35,6 +48,7 @@ func offering(callable, existing []string) portal.ModelOffering {
 func offeringWithLocked(callable, locked []string) portal.ModelOffering {
 	return portal.ModelOffering{
 		Callable: nameSet(callable),
+		Capable:  nameSet(callable),
 		Existing: nameSet(callable, locked),
 	}
 }
@@ -50,6 +64,7 @@ func offeringWithLocked(callable, locked []string) portal.ModelOffering {
 func offeringWithSuppressed(listed, suppressed []string) portal.ModelOffering {
 	return portal.ModelOffering{
 		Callable: nameSet(listed, suppressed),
+		Capable:  nameSet(listed, suppressed),
 		Existing: nameSet(listed, suppressed),
 	}
 }
@@ -282,8 +297,37 @@ func TestRedirectAllowlistIgnoredForAUserToken(t *testing.T) {
 	}
 }
 
+// A candidate that is callable but lacks a capability the request requires is
+// skipped, and the chain moves on: the capability gate would refuse it right
+// after, with a model_not_capable naming a model the client never sent.
+func TestRedirectSkipsALastUsedModelWithoutTheRequiredCapability(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, LastUsedModel: "text", UnknownModelFallback: "image"}
+	if got := redirectUnknownModel(tok, "nope", offeringWithIncapable([]string{"image"}, []string{"text"})); got != "image" {
+		t.Fatalf("redirect = %q, want image (the last-used model lacks the capability)", got)
+	}
+}
+
+// With no candidate that carries the required capability the redirect
+// declines, and the client gets the ordinary answer for its own model.
+func TestRedirectRejectsAFallbackWithoutTheRequiredCapability(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, UnknownModelFallback: "text"}
+	if got := redirectUnknownModel(tok, "nope", offeringWithIncapable(nil, []string{"text"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect: the only candidate lacks the capability", got)
+	}
+}
+
+// The requested-name half never asks Capable. A callable model without the
+// capability is the client's own choice, and the capability gate's refusal
+// names it; redirecting it away would hide which model the client asked for.
+func TestRedirectLeavesACallableRequestedModelWithoutTheCapabilityAlone(t *testing.T) {
+	tok := auth.Token{UnknownModelRedirect: true, UnknownModelRedirectBlocked: true, UnknownModelFallback: "image"}
+	if got := redirectUnknownModel(tok, "text", offeringWithIncapable([]string{"image"}, []string{"text"})); got != "" {
+		t.Fatalf("redirect = %q, want no redirect: the requested model is callable", got)
+	}
+}
+
 // TestRedirectDeclinesOnAnEmptyOffering pins the store-failure direction.
-// ModelOfferingFor returns two WHOLLY EMPTY sets on any store error (that is
+// ModelOfferingFor returns WHOLLY EMPTY sets on any store error (that is
 // deliberate — see its doc comment: the only safe partial result is none).
 // Empty sets mean every candidate looks unoffered, so the chain must run out
 // and decline: a store hiccup makes the client see today's ordinary error, it
