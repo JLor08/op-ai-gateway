@@ -10,10 +10,13 @@ import (
 // Feature is one named capability this agent binary ships. Behavior gates on
 // NAME EQUALITY against the gateway's declared set -- NEVER on version
 // compare: a version gate breaks under forks, backports, and custom builds,
-// while a name states plainly what the binary can actually do. A feature is
-// active only when BOTH this agent and the connected gateway declare its
-// name; an unknown name on either side is ignored -- that is forward
-// compatibility, not an error.
+// while a name states plainly what the binary can actually do. A feature
+// both sides declare is active only when BOTH this agent and the connected
+// gateway declare its name; an unknown name on either side is ignored --
+// that is forward compatibility, not an error. A name that states a fact
+// about one side alone need only be on that side's list, which is why the
+// gateway-only capability_source_sdcpp (gatewayFeatureCapabilitySourceSdcpp)
+// is read from the gateway's list and has no entry here.
 //
 // This side of the negotiation only DECLARES: FeatureNames() rides on every
 // telemetry sample as capabilities.features (capabilitiesJSON below). The

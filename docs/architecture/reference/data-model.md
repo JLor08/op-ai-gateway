@@ -656,19 +656,24 @@ plausible-looking validation rule would break the normal case:
   store repeats the same `rank(incoming) >= rank(current)` inside its upsert as
   a backstop for the check-then-act interleaving the writer cannot see (issue
   #79, [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
-  The two PROBE sources an agent reports are `llama_cpp_props` (a `GET` of
-  llama.cpp's `/props`) and, since #54, `ollama_api_show` (a `POST` of
-  Ollama's `/api/show`). The gateway's own passes write `llama_cpp_props` too,
-  plus two probe-ranked sources no agent may report: `llama_cpp_timings`
-  (read off a completion it relayed) and `sdcpp_capabilities` (a `GET` of an
-  external stable-diffusion.cpp server's `/sdcpp/v1/capabilities`, the only
-  source that answers `image` in both directions). The probing agent REPORTS
-  which of its two produced a verdict set rather than the gateway inferring
-  it, and the ingest boundary accepts
-  exactly those two from an agent — a sample claiming `manual` or
-  `vision_benchmark` writes nothing at all, since an agent has no standing to
-  put "an operator said so" in front of an operator or to lock a real
-  benchmark out of its own row
+  The three PROBE sources an agent reports are `llama_cpp_props` (a `GET` of
+  llama.cpp's `/props`), `ollama_api_show` (a `POST` of Ollama's `/api/show`,
+  since #54), and `sdcpp_capabilities` (a `GET` of an agent-launched
+  `stable_diffusion_cpp` child's own `/sdcpp/v1/capabilities`, since #154,
+  accepted for the `image` row only; the agent reports it only while the
+  gateway declares the agent feature `capability_source_sdcpp`, as the agent
+  last read it (up to about 30 s old), and the
+  ingest's acceptance does not depend on the feature). The gateway's own
+  passes write `llama_cpp_props` too, and, for an **external** `stable_diffusion_cpp`
+  application, `sdcpp_capabilities` directly — the only source that answers
+  `image` in both directions, whichever of its two producers wrote it — plus
+  one probe-ranked source no agent may report: `llama_cpp_timings` (read off
+  a completion it relayed). The probing agent REPORTS which of its three
+  produced a verdict set rather than the gateway inferring it, and the
+  ingest boundary accepts exactly those three from an agent — a sample
+  claiming `manual` or `vision_benchmark` writes nothing at all, since an
+  agent has no standing to put "an operator said so" in front of an operator
+  or to lock a real benchmark out of its own row
   ([Telemetry, Usage Analytics & Observability
   §8.4.3](../cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 - **No capability writer consults `metrics_locked` or touches

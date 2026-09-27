@@ -27,6 +27,7 @@ import (
 	// alias every importer that needs both should use.
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -163,7 +164,24 @@ import (
 // state, health/probe paths, model name) still takes effect in place with no
 // relaunch. PATCH, and the rule decides it: agent.Features gains no entry --
 // this is an observable runtime-behaviour change, not a negotiated capability.
-const Version = "0.7.3"
+//
+// 0.7.3 -> 0.7.4 is the single bump for the agent-sdcpp-capabilities branch
+// (issue #154): for a "stable_diffusion_cpp" child the capability probe now
+// reads stable-diffusion.cpp's own /sdcpp/v1/capabilities document instead
+// of /props, and reports the image verdict, "yes" or "no", under the new
+// sample.CapabilitySourceSdcppCapabilities source -- but only while the
+// gateway declares "capability_source_sdcpp". While it does not, such a
+// child is not probed at all, and a verdict cached while it did is not sent.
+// The agent asks at most once per gatewayFeatureRecheckInterval (30s) for all
+// such children together. The spec type also joined the capability cache
+// key, so a child whose type changes while it runs is probed again for the
+// document its new type names. PATCH, and the rule decides it: agent.Features
+// gains NO entry. The negotiation runs the other way, through the gateway's
+// declared feature list rather than the agent's, because it is the gateway
+// that must be able to accept the new source; nothing on the gateway side
+// waits on the agent. The same reasoning made #54's ollama_api_show source,
+// 0.7.0 -> 0.7.1, a PATCH.
+const Version = "0.7.4"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -346,6 +364,45 @@ type runtimeLogPoster interface {
 type runtimeLogPort interface {
 	SetLogWatch(raw json.RawMessage)
 	DrainLogFrames() []json.RawMessage
+}
+
+// gatewayFeatureSource is the gateway's declared feature set, as
+// runtimectl.FeaturesClient serves it (Fetch returns the last known-good set
+// on a transient failure, and an empty set for a gateway that predates the
+// endpoint).
+type gatewayFeatureSource interface {
+	Fetch(ctx context.Context) ([]string, error)
+}
+
+// gatewayFeatureCapabilitySourceSdcpp is the gateway-declared feature that
+// says the gateway's capability ingest accepts the sdcpp_capabilities
+// source (the gateway's capabilitySourceSdcppFeature). The agent sends that
+// source only when the gateway declares it: a gateway that knows the
+// stable_diffusion_cpp spec type but not the source would otherwise drop the
+// capability rows of every sample from such a child, with a warning each
+// time.
+const gatewayFeatureCapabilitySourceSdcpp = "capability_source_sdcpp"
+
+// gatewayFeatureRecheckInterval is how long gatewayDeclares answers from the
+// feature set it last fetched before it asks the gateway again. Every
+// stable_diffusion_cpp child in every collect cycle shares that one answer,
+// so the question costs at most one conditional GET per interval per agent,
+// however many sd children run, instead of one per child per collect cycle
+// (1s by default). The runtime driver reads the same endpoint for
+// runtime_manager at least every runtimePollInterval (60s), and sooner on a
+// wake. 30s is half that backstop: it adds at most two requests a minute per
+// agent, and a gateway upgrade or rollback reaches the capability probe on
+// the first collect cycle at least 30s after the agent last asked, so within
+// about 30s of the gateway serving it.
+const gatewayFeatureRecheckInterval = 30 * time.Second
+
+// gatewayFeatureMemo is one answer to "which features does the gateway
+// declare": the names, when they were fetched, and whether a fetch has
+// happened at all (the zero value has not).
+type gatewayFeatureMemo struct {
+	names     []string
+	fetchedAt time.Time
+	fetched   bool
 }
 
 var trustRefreshInterval = 15 * time.Minute
@@ -553,6 +610,22 @@ type Agent struct {
 	// probeRuntimeChildProps lazy-inits it.
 	runtimeCapabilityCache map[string]runtimeCapabilityEntry
 
+	// gatewayFeatures is the gateway's declared feature set, consulted by
+	// probeRuntimeChildProps before it sends a capability source that an
+	// older gateway would refuse (see gatewayDeclares); nil (every test
+	// construction that has nothing to say about it) reads as "declares
+	// nothing", the behaviour such a gateway expects.
+	gatewayFeatures gatewayFeatureSource
+	// gatewayFeatureMemo is the set gatewayDeclares last fetched from
+	// gatewayFeatures, shared by every child of every collect cycle until
+	// gatewayFeatureRecheckInterval has passed. Same single-goroutine access
+	// pattern as runtimeCapabilityCache -- no mutex needed.
+	gatewayFeatureMemo gatewayFeatureMemo
+	// now is the clock gatewayDeclares reads: time.Now from NewFromDeps, a
+	// fake in a test (the same seam as the WebSocket sender's clock). nil,
+	// in an Agent built as a struct literal, reads as time.Now.
+	now func() time.Time
+
 	// --- T3, live managed-process log streaming -------------------------
 	//
 	// All three are optional and derived by type assertion at construction,
@@ -585,8 +658,11 @@ func (a *Agent) SetCertProxyDriver(d certProxyDriver) {
 // CertSync/TrustSync are the Phase 2 certificate/trust syncers; ProxyDriver
 // is the cert_mode=proxy hook set; RuntimeDriver is the agent-managed model
 // runtime hook set (nil = feature absent, the no-op invariant -- see the
-// runtimeDriver interface doc above). See New's and SetCertProxyDriver's
-// docs above for the exact per-field disabled behavior each one preserves.
+// runtimeDriver interface doc above); GatewayFeatures is the gateway's
+// declared feature set (nil = the gateway declares nothing, so no capability
+// source a gateway must opt into is ever sent -- see gatewayDeclares). See
+// New's and SetCertProxyDriver's docs above for the exact per-field disabled
+// behavior each one preserves.
 type Deps struct {
 	Host          collector.HostCollector
 	GPUs          []collector.GPUCollector
@@ -599,6 +675,10 @@ type Deps struct {
 	TrustSync     trustSyncer
 	ProxyDriver   certProxyDriver
 	RuntimeDriver runtimeDriver
+	// GatewayFeatures carries the same typed-nil caveat as TrustSync: assign
+	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
+	// always is), never a possibly-nil concrete pointer.
+	GatewayFeatures gatewayFeatureSource
 }
 
 // New builds an Agent from the resolved config and its collectors/poster. The
@@ -647,18 +727,20 @@ func New(cfg config.Config, host collector.HostCollector, gpus []collector.GPUCo
 // setter for the proxy driver.
 func NewFromDeps(cfg config.Config, d Deps) *Agent {
 	a := &Agent{
-		cfg:           cfg,
-		host:          d.Host,
-		gpus:          d.GPUs,
-		scraper:       d.Scraper,
-		loaded:        d.Loaded,
-		power:         d.Power,
-		temp:          d.Temp,
-		poster:        d.Poster,
-		certSync:      d.CertSync,
-		trustSync:     d.TrustSync,
-		proxy:         d.ProxyDriver,
-		runtimeDriver: d.RuntimeDriver,
+		cfg:             cfg,
+		host:            d.Host,
+		gpus:            d.GPUs,
+		scraper:         d.Scraper,
+		loaded:          d.Loaded,
+		power:           d.Power,
+		temp:            d.Temp,
+		poster:          d.Poster,
+		certSync:        d.CertSync,
+		trustSync:       d.TrustSync,
+		proxy:           d.ProxyDriver,
+		runtimeDriver:   d.RuntimeDriver,
+		gatewayFeatures: d.GatewayFeatures,
+		now:             time.Now,
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -1105,8 +1187,8 @@ type runtimeCtxEntry struct {
 // runtimeCapabilityEntry is one cached capability-probe result: the PID it
 // was measured against (mirroring runtimeCtxEntry -- a restart, a changed
 // PID, forces a re-probe, since a new process generation may run a different
-// build), the MODEL it was probed with, the SOURCE naming which probe
-// produced it, and the verdict set itself: collector.PropsVerdicts, carrying
+// build), the spec TYPE and the MODEL it was probed with, the SOURCE naming
+// which probe produced it, and the verdict set itself: collector.PropsVerdicts, carrying
 // both the live-progress verdict ("supported", "unsupported", or --
 // deliberately -- "", see below) and, since #49-2, the capability verdicts
 // derived from that same document.
@@ -1127,20 +1209,28 @@ type runtimeCtxEntry struct {
 //
 // source is CACHED WITH the verdicts rather than re-derived from st.Type on
 // the hit path, and that is the whole point of naming it (#54): it records
-// which probe actually produced THESE bytes. Re-deriving it would let a
-// later Type edit relabel verdicts a different endpoint returned -- the
-// fabricated provenance the wire field exists to prevent.
+// which probe actually produced THESE bytes. The name comes from the branch
+// that ran, in one place, and the hit path reads it back rather than
+// restating that branch's condition.
 //
-// There is still no specType/path pair in the key, and the original reason
-// only half-survives task 5: collector.LiveProgressProbePath is a package
-// constant, so an edit to ContextProbePath genuinely has no bearing here,
-// but st.Type now DOES decide which document is read ("ollama" ->
-// /api/show, everything else -> /props). A Type edit on a RUNNING spec
-// therefore leaves this entry cached against the endpoint that was read --
-// stale, but still honestly attributed, because source travels with the
-// verdicts instead of being inferred from the new Type. Closing that too
-// means adding specType to the key; it is deliberately not part of this
-// change.
+// specType joined the key in #154. st.Type decides which document is read
+// ("ollama" -> /api/show, "stable_diffusion_cpp" ->
+// /sdcpp/v1/capabilities, everything else -> /props), and a Type change is
+// launch METADATA: the runtime manager applies it to a RUNNING child in
+// place, same PID (runtime.sameLaunchShape ignores Type). The case that
+// made it matter: a spec with no explicit type and an sd-server binary is
+// "custom" under a gateway that predates the stable_diffusion_cpp type and
+// "stable_diffusion_cpp" under one that knows it, so a gateway upgrade
+// retypes the running child. Without the type in the key, the /props 404
+// cached while the child was "custom" kept answering, and the sd document
+// was not read until the child restarted. A retyped child is now probed for
+// the document its new type names, which is the document a restart would
+// read too, since a Type edit does not change the binary. What a wrongly
+// set type costs is this pid's cached verdicts, replaced by whatever the new
+// type's document says (typically a conclusive 404 and an empty set); the
+// gateway keeps the rows it already stored, because an empty set writes no
+// row. The probe path needs no place in the key: all three paths are package
+// constants, and an edit to ContextProbePath has no bearing here.
 //
 // verdicts == (collector.PropsVerdicts{}) is a valid, cached entry here, not
 // a zero-value placeholder: it means the probe got a CONCLUSIVE non-answer
@@ -1159,6 +1249,7 @@ type runtimeCtxEntry struct {
 // ever established -- see probeRuntimeChildProps.
 type runtimeCapabilityEntry struct {
 	pid      int
+	specType string
 	model    string
 	source   string
 	verdicts collector.PropsVerdicts
@@ -1302,6 +1393,60 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 	return "ok"
 }
 
+// gatewayDeclares reports whether the gateway declares name, as of the last
+// time the agent asked. It asks at most once per
+// gatewayFeatureRecheckInterval and answers every other call, for every
+// child, from that answer (a.gatewayFeatureMemo), so a change on the gateway
+// -- an upgrade that starts declaring name, or a rollback that stops -- is
+// seen on the first call once the interval has passed, not sooner.
+//
+// A nil source (an agent built without one) reads as "not declared", and so
+// does an error returned by the source, so the agent falls back to the
+// behaviour an older gateway expects. The production
+// runtimectl.FeaturesClient returns no such error: it answers a failed
+// fetch with the last known-good set and a nil error. An answer read off an
+// error is remembered for the interval like any other, so a failing source
+// is not asked on every call either.
+//
+// The question is a gateway round trip made on the collect loop, so it is
+// bounded by collectTimeout like every per-child call there: a slow or
+// black-holed gateway must not stall the loop for the features client's own
+// HTTP timeout. A question cut short is not a failure for
+// runtimectl.FeaturesClient, whose Fetch answers it with the last known-good
+// set and a nil error.
+func (a *Agent) gatewayDeclares(ctx context.Context, name string) bool {
+	if a.gatewayFeatures == nil {
+		return false
+	}
+	now := a.clock()
+	if m := a.gatewayFeatureMemo; !m.fetched || now.Sub(m.fetchedAt) >= gatewayFeatureRecheckInterval {
+		a.gatewayFeatureMemo = gatewayFeatureMemo{names: a.fetchGatewayFeatures(ctx), fetchedAt: now, fetched: true}
+	}
+	return slices.Contains(a.gatewayFeatureMemo.names, name)
+}
+
+// fetchGatewayFeatures asks the gateway for its declared feature set once,
+// bounded by collectTimeout (see gatewayDeclares). An error reads as an empty
+// set.
+func (a *Agent) fetchGatewayFeatures(ctx context.Context) []string {
+	fctx, cancel := context.WithTimeout(ctx, collectTimeout)
+	defer cancel()
+	names, err := a.gatewayFeatures.Fetch(fctx)
+	if err != nil {
+		slog.Debug("gateway features fetch failed; treating every feature as not declared until the next check", "error", err)
+		return nil
+	}
+	return names
+}
+
+// clock is a.now, or time.Now for an Agent built without NewFromDeps.
+func (a *Agent) clock() time.Time {
+	if a.now == nil {
+		return time.Now()
+	}
+	return a.now()
+}
+
 // probeRuntimeChildProps fills rs.LiveProgressSupport and rs.Capabilities
 // with every verdict ONE document yields for st: the live-progress-
 // capability verdict, task 4's agent-side half of issue #51 (the gateway's
@@ -1315,8 +1460,9 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // was that a child is never asked a second time just to answer a second
 // question.
 //
-// WHICH document, and there are exactly two, is the only thing st.Type
-// decides here:
+// WHICH document is read, one of three, is what st.Type decides here (and,
+// for one of them, whether the gateway lets it be sent at all -- see the
+// gate below):
 //
 //   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
 //     {"model": st.Model} (#54). Ollama serves no /props at all, so probing
@@ -1325,21 +1471,58 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 //     -- its LiveProgress is ALWAYS "", because Ollama exposes no
 //     timings_per_token-style surface and an unknown must never become a
 //     denial (see ProbeOllamaVerdicts' own doc).
+//   - "stable_diffusion_cpp": collector.ProbeSdcppVerdicts GETs
+//     collector.SdcppCapabilitiesPath ("/sdcpp/v1/capabilities"). Its
+//     supported_modes list is exhaustive, so it answers the image
+//     capability as "yes" or "no" and nothing else; its LiveProgress is
+//     ALWAYS "", because sd-server has no timings surface.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
-// That second branch is deliberately unconditional -- it does not care what
-// st.Type is or whether st.ContextProbePath is even set -- and the reason it
-// must stay that way is unchanged by the ollama branch above:
-// routing.DeriveProbePaths gives a "custom"-typed spec no context path at
-// all, and "custom" is the type-detection FALLBACK, so a custom-typed
-// llama.cpp child -- exactly the case a type-based rule refuses -- would
-// never be probed for this capability if this half were type-gated too.
-// Only "ollama" is claimed by name; nothing else may be, or that fallback
-// loses its probe. One extra loopback request per child lifetime once a
-// verdict set is cached; there is no SSRF guard to apply to either path
-// (unlike MetricsPath/ContextProbePath, both are package constants, never
+// That last branch is deliberately a default, not a list of types -- it
+// names no type and does not care whether st.ContextProbePath is even set
+// -- and the reason it must stay that way is unchanged by the two named
+// branches above: routing.DeriveProbePaths gives a "custom"-typed spec no
+// context path at all, and "custom" is the type-detection FALLBACK, so a
+// custom-typed llama.cpp child -- exactly the case a type-based rule refuses
+// -- would never be probed for this capability if this half were type-gated
+// too. A type may therefore be claimed by name only when its binary serves
+// no /props, so that claiming it loses nothing a /props probe could have
+// found: Ollama serves none, and neither does sd-server. "custom" can never
+// be claimed, whatever binary it turns out to run, or that fallback loses
+// its probe. One extra loopback request per child lifetime once a verdict
+// set is cached; there is no SSRF guard to apply to any of the three paths
+// (unlike MetricsPath/ContextProbePath, all are package constants, never
 // operator/config-supplied).
+//
+// The gate: a gateway can know the stable_diffusion_cpp spec type and still
+// not accept the sdcpp_capabilities source, and it drops the capability rows
+// of every sample that names a source it does not accept. A
+// stable_diffusion_cpp child is therefore probed only while the gateway
+// declares gatewayFeatureCapabilitySourceSdcpp (gatewayDeclares: a nil
+// feature source, or an error returned by it, reads as "not declared"; the
+// production FeaturesClient answers a failed fetch with the last known-good
+// set instead). While it does not, NOTHING is probed and NOTHING is cached,
+// so a gateway upgrade takes effect without restarting the child. The
+// /props fallback is no substitute: sd-server serves no /props, so it would
+// say nothing anyway.
+//
+// The gateway's answer is memoized for gatewayFeatureRecheckInterval (30s)
+// and shared by every child, so the agent asks at most once per interval
+// however many sd children wait on the gate, and an upgrade is picked up on
+// the first collect cycle once that interval has passed since the last
+// question. The round trip that does happen runs on the collect loop, so
+// gatewayDeclares bounds it by collectTimeout, the same bound as the child
+// probe that may follow it.
+//
+// The gate is re-checked on a cache hit too, for an entry whose source is
+// sdcpp_capabilities: a verdict cached while the gateway declared the
+// source is not sent while it no longer does (a rollback), since that
+// gateway would drop the sample's capability rows with a warning every
+// cycle. The entry is kept and sent again once the gateway declares the
+// source again, without asking the child. Inside the memo's interval that
+// re-check costs nothing; no other source, and no other type, consults the
+// gateway at all.
 //
 // Caching policy -- STABLE vs TRANSIENT, not "determined" vs "undetermined":
 //
@@ -1349,9 +1532,10 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // declares no capability at all) re-asks for it once per collect cycle,
 // forever, for a question whose answer cannot change while that pid lives
 // -- a permanent per-cycle cost, not a one-time one. The fix caches on WHY
-// no verdict came back, using the probe's stable return (both
-// collector.ProbePropsVerdicts and collector.ProbeOllamaVerdicts answer to
-// one identical conclusive/transient contract):
+// no verdict came back, using the probe's stable return
+// (collector.ProbePropsVerdicts, collector.ProbeOllamaVerdicts and
+// collector.ProbeSdcppVerdicts all answer to one identical
+// conclusive/transient contract):
 //
 //   - STABLE (a real "supported"/"unsupported" verdict and/or real
 //     capability verdicts, OR a zero-value collector.PropsVerdicts{} that is
@@ -1359,9 +1543,9 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 //     llama.cpp /props document): that fact cannot change while st.PID's
 //     process keeps running, because the binary behind it does not change.
 //     Cache it -- zero value included -- in runtimeCapabilityCache, keyed
-//     and invalidated exactly like runtimeCtxCache (a changed st.PID or
+//     and invalidated like runtimeCtxCache (a changed st.PID, st.Type or
 //     st.Model re-arms the question -- see runtimeCapabilityEntry for why
-//     the model has to be in that key for an Ollama child), so this pid's
+//     the type and the model have to be in that key), so this pid's
 //     endpoint is asked at most once per generation, not once per cycle.
 //   - TRANSIENT (a connection refused, a timeout, or an unparseable/
 //     truncated body): the child may still be warming up, so the SAME
@@ -1393,17 +1577,33 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 // This never overwrites an already-cached value with a fabricated one:
 // rs.LiveProgressSupport and rs.Capabilities are only ever set from a
 // verdict set the probe (or a prior cache write) actually produced, and an
-// uncached probe leaves rs.LiveProgressSupport at its zero value ("") and
-// rs.Capabilities at its zero value (nil).
+// uncached probe, a stable_diffusion_cpp child the gate skips, or a cached
+// sdcpp_capabilities entry the gate withholds leaves rs.LiveProgressSupport
+// at its zero value ("") and rs.Capabilities at its zero value (nil).
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
 	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID &&
-		entry.model == st.Model {
+		entry.specType == st.Type && entry.model == st.Model {
 		// A cached verdict set means a prior probe on this exact
-		// (pid, model) generation already answered conclusively -- and
-		// entry.source names the probe that answered, never a fresh
-		// inference from the current st.Type.
+		// (pid, type, model) generation already answered conclusively --
+		// and entry.source names the probe that answered.
+		if entry.source == sample.CapabilitySourceSdcppCapabilities && !a.gatewayDeclares(ctx, gatewayFeatureCapabilitySourceSdcpp) {
+			// The gateway no longer accepts this source (a rollback). Send
+			// nothing and keep the entry, so the verdict goes out again,
+			// without asking the child, once the source is declared again.
+			slog.Debug("runtime capability verdict withheld: gateway no longer declares the sdcpp source", "spec_id", st.SpecID)
+			return
+		}
 		rs.LiveProgressSupport = entry.verdicts.LiveProgress
 		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps, entry.source)
+		return
+	}
+	if st.Type == "stable_diffusion_cpp" && !a.gatewayDeclares(ctx, gatewayFeatureCapabilitySourceSdcpp) {
+		// The gateway cannot accept this child's only document yet. Probe
+		// nothing and cache nothing, so a gateway upgrade is picked up once
+		// the gate's memo next asks, rather than after the child restarts.
+		// sd-server serves no /props, so the fallback document would say
+		// nothing anyway.
+		slog.Debug("runtime capability probe skipped: gateway does not declare the sdcpp source", "spec_id", st.SpecID)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
@@ -1412,10 +1612,14 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 		stable   bool
 		source   string
 	)
-	if st.Type == "ollama" {
+	switch st.Type {
+	case "ollama":
 		source = sample.CapabilitySourceOllamaAPIShow
 		verdicts, stable = collector.ProbeOllamaVerdicts(cctx, client, base, st.Model)
-	} else {
+	case "stable_diffusion_cpp":
+		source = sample.CapabilitySourceSdcppCapabilities
+		verdicts, stable = collector.ProbeSdcppVerdicts(cctx, client, base)
+	default:
 		source = sample.CapabilitySourceLlamaCppProps
 		verdicts, stable = collector.ProbePropsVerdicts(cctx, client, base)
 	}
@@ -1431,6 +1635,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	}
 	a.runtimeCapabilityCache[st.SpecID] = runtimeCapabilityEntry{
 		pid:      st.PID,
+		specType: st.Type,
 		model:    st.Model,
 		source:   source,
 		verdicts: verdicts,
@@ -1440,7 +1645,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type: each of the four named
+// RuntimeSample.Capabilities' wire pointer type: each of the five named
 // fields becomes one CapabilityVerdict entry keyed by its name, every Extra
 // name becomes a "yes" entry (a reported extra capability is a positive
 // assertion), and an empty ("" -- undetermined) field is skipped entirely
@@ -1459,7 +1664,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 // side the ingest folds this list into capability rows and keeps the FIRST
 // entry for a given name, dropping every later one -- so a name that appears
 // both as a structured field and in Extra resolves to the STRUCTURED answer.
-// The four named fields therefore go first and Extra after; swapping the two
+// The five named fields therefore go first and Extra after; swapping the two
 // blocks silently hands the open list the last word.
 //
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
@@ -1469,7 +1674,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
-	verdicts := make([]sample.CapabilityVerdict, 0, 4+len(c.Extra))
+	verdicts := make([]sample.CapabilityVerdict, 0, 5+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
@@ -1481,6 +1686,9 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	}
 	if c.Tools != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "tools", Verdict: c.Tools})
+	}
+	if c.Image != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "image", Verdict: c.Image})
 	}
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})

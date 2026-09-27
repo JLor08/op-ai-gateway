@@ -1067,12 +1067,26 @@ fact about this runtime is, and why:
   `openai_images`, and the spec type does not set flavors. The type field's
   note for `stable_diffusion_cpp` says which boxes to tick.
 
-- **Its `image` verdict is manual.** The automatic `sdcpp_capabilities` probe
-  ([Routing & Model Selection §1](routing-and-model-selection.md#1-data-model))
-  reads an **external** `stable_diffusion_cpp` application's
-  `/sdcpp/v1/capabilities`. The agent's router passes only `/props` through per
-  model, so an agent-launched mapping gets no automatic verdict and needs a
-  manual `image: yes` before the images gate admits it.
+- **Its `image` verdict is automatic too, read through the agent rather than
+  around it.** The gateway's health loop reaches only an **external**
+  `stable_diffusion_cpp` application's `/sdcpp/v1/capabilities` — the agent's
+  router passes only `/props` through per model, so the health loop cannot
+  reach an agent-launched child at all. Instead the agent's own per-type
+  capability probe reads that same document over its loopback connection to
+  the child and reports the verdict under the identical `sdcpp_capabilities`
+  source (§10; [Routing & Model Selection
+  §2.3](routing-and-model-selection.md#23-the-capability-gate)), but only
+  while the gateway declares the agent feature `capability_source_sdcpp` —
+  while it does not, the child is not probed at all and a verdict cached
+  earlier is not sent, and the agent re-asks the gateway at most every 30 s
+  (§10). **One limit remains: a
+  spec that has never run.** The images gate refuses a request for a mapping
+  without an `image: yes` verdict before the router could even start the
+  child to ask it, so an unpinned spec's first request has no document for
+  either reader to have read yet. Pin the spec, start it once so the
+  automatic path can run, or set the verdict by hand once (after which it is
+  stored, like any other verdict) — the manual path also remains the only one
+  for a gateway or agent build old enough to predate this source.
 
 The facts above about `sd-server` itself were checked against
 `leejet/stable-diffusion.cpp` at commit `cc515a0` (`master`, 2026-09-16); a
@@ -2295,8 +2309,15 @@ with every other command queued behind it.
 
 Gateway and agent negotiate by **named feature flags whose intersection decides
 behaviour** — never by comparing version numbers, which are fragile under forks
-and backports. A feature is active if and only if a string-equal name appears on
-both sides' lists.
+and backports. A flag both sides declare is active if and only if a string-equal
+name appears on both sides' lists. Not every flag is on both lists: a flag that
+states a fact about one side alone need only be declared by that side, and the
+other side reads it off that side's list without declaring it back (the gateway
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Four
+are on the agent's list only, for the gateway or the portal to read off the
+agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
+`runtime_upstream_props`); one, `capability_source_sdcpp`, is on the gateway's
+list only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -2320,7 +2341,13 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `Since: "0.5.0"`, `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`, and
 `runtime_upstream_props` ([§4.1](#41-control-routes),
-[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`.
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`
+— and, on the gateway's list alone, `capability_source_sdcpp`
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which has no
+`Since` because the agent's registry does not carry it. The gateway's own list is
+`runtime_manager`, `runtime_logs`, `runtime_config_ack` and
+`capability_source_sdcpp` (`gatewayAgentFeatures`,
+`internal/gateway/agent_features.go`).
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
 agent itself: the agent always honors whatever it receives — an explicit GPU
@@ -2439,6 +2466,27 @@ sent unconditionally, because feature-gating the send would silently skip the
 first connection of a freshly started agent, whose declared features are not yet
 known.
 
+`capability_source_sdcpp` is a third shape: a flag on the **gateway's** list
+only, checked by the agent, which does not declare it back. It states a fact
+about the gateway alone — its capability ingest accepts the `sdcpp_capabilities`
+source, for the `image` row only (`rowSource`; [Telemetry, Usage Analytics &
+Observability
+§8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+The agent reads it through the same `/features` client the runtime driver uses,
+before it probes a `stable_diffusion_cpp` child's `/sdcpp/v1/capabilities` and
+before it sends a verdict cached from one (`gatewayDeclares`, bounded by the
+collect timeout like every per-child call). It keeps the answer for 30 s,
+shared by every such child, so it asks at most twice a minute. While the name
+is missing it probes and caches nothing for that child and withholds what it
+had cached ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)),
+because a gateway that predates the source would void the capability pass of
+every such sample. The gateway is the side that must accept the source, so the
+gateway is the side that declares it. Nothing on the gateway waits on the agent
+for it: an agent that predates the probe never sends the source, a mapping it
+serves keeps whatever `image` verdict it had, and no gateway path has a
+fallback to choose — so an agent-side name would gate nothing, and
+`agent.Features` gained no entry for it.
+
 **Negotiation is continuous, not decided at boot.** The manager, config source
 and driver are constructed unconditionally with no startup-blocking probe, and
 every driver `Sync` re-decides whether the gateway currently declares the flag.
@@ -2529,6 +2577,16 @@ receives a `404`, reports no verdicts and therefore writes no rows at all.
 There is nothing to gate and nothing to wait for. Note also that
 `runtime_upstream_props`' own `Since` stayed `"0.7.0"`: a `Since` records the
 version a feature SHIPPED in, and it does not follow `Version`.
+
+**`0.7.3` → `0.7.4` (issue #154) is PATCH too, although a flag exists this
+time.** That change gave the agent a third capability probe
+(`/sdcpp/v1/capabilities` for a `stable_diffusion_cpp` child) and a third
+`source` value, and it is gated on a feature name, `capability_source_sdcpp`
+(§7) — but the name is on the **gateway's** list, not in `agent.Features`,
+which gained nothing. The rule counts entries in the agent's own registry, so
+it makes the bump PATCH, and what a flag is FOR agrees: the gateway is the side
+that must accept the new source, so the agent waits on the gateway's name, and
+nothing on the gateway waits on the agent.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -3151,7 +3209,7 @@ mirror). Three different cadences share the one collect cycle:
   Analytics &
   Observability §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
   **`st.Type` decides WHICH document this probe reads, and nothing else
-  about it** (since #54 there are exactly two):
+  about it** (since issue #154 there are exactly three):
 
   - `ollama` — `collector.ProbeOllamaVerdicts` **POSTs** `/api/show` with
     `{"model": st.Model}` and reads the `capabilities` array out of the
@@ -3161,17 +3219,32 @@ mirror). Three different cadences share the one collect cycle:
     capabilities **only** — its `LiveProgressSupport` is always `""`,
     because Ollama exposes no `timings_per_token`-style surface to have an
     opinion about and an unknown must never become a denial.
+  - `stable_diffusion_cpp` — `collector.ProbeSdcppVerdicts` GETs
+    `collector.SdcppCapabilitiesPath` (`/sdcpp/v1/capabilities`, issue #154).
+    `sd-server` serves no `/props` either, so this is the same recovery the
+    ollama branch above makes, for the same reason. Its `supported_modes`
+    list is exhaustive, so a list without `img_gen` is a real `"no"` for the
+    `image` capability rather than an absence, and a list holding it is a
+    `"yes"`; a document with no list, a body of the wrong shape, or a
+    conclusive refusal (`404`/`401`/`403`/`405`) yields no verdict at all.
+    Its `LiveProgressSupport` is always `""` too, because `sd-server` has no
+    timings surface of its own ([Agent-Managed Model Runtime
+    §3.4](#a-worked-sd-server-launch-under-stable_diffusion_cpp)). **This
+    branch alone is gated**, below.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
 
-  That second branch stays deliberately unconditional, and the ollama branch
-  above does not weaken the reason: `DeriveProbePaths` gives a
-  `custom`-typed spec no context path at all
+  That last branch stays deliberately unconditional, and neither named branch
+  above weakens the reason: `DeriveProbePaths` gives a `custom`-typed spec no
+  context path at all
   ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), so a
   *type-based* rule would never probe a `custom`-typed llama.cpp child for
   either capability, which is exactly the case this probe exists to recover.
-  Only `ollama` is claimed by name; nothing else may be, or that fallback
+  A type may be claimed by name only when its binary serves no `/props` at
+  all, so that claiming it loses nothing a `/props` probe could have found —
+  true of `ollama` and of `stable_diffusion_cpp`, and of nothing else; `custom`
+  can never be claimed, whatever binary it turns out to run, or that fallback
   loses its probe. Either way it is one extra loopback request per child
   lifetime once a verdict set is cached, on a path that is a package
   constant rather than operator/config-supplied, so there is no SSRF surface
@@ -3182,13 +3255,56 @@ mirror). Three different cadences share the one collect cycle:
   to cost one GET per verdict kind now costs one GET, period, per pid
   generation, however many verdicts the document yields.
 
+  **The gate: `stable_diffusion_cpp` is probed only while the gateway can
+  accept what it would report.** A gateway can know the `stable_diffusion_cpp`
+  spec type and still not accept the `sdcpp_capabilities` source, and it
+  drops the capability rows of every sample naming a source it does not
+  accept. So before taking this branch, `probeRuntimeChildProps` asks whether
+  the gateway declares the agent feature `gatewayFeatureCapabilitySourceSdcpp`
+  (`"capability_source_sdcpp"`, `a.gatewayDeclares`). A nil feature source,
+  or an error the source returns, reads as "not declared"; the production
+  `runtime.FeaturesClient` returns no such error — it answers a failed
+  fetch, and a question cut short by `collectTimeout`, with the last
+  known-good set (§7). While the gateway does not declare the name,
+  **nothing is probed and nothing is cached** for that child, so a gateway
+  upgrade takes effect without restarting the child; the `/props` fallback
+  is no substitute, since `sd-server` serves none.
+
+  **The answer is memoized, once per agent.** `gatewayDeclares` keeps the
+  feature set it last fetched, with the time it fetched it, and asks the
+  gateway again only once `gatewayFeatureRecheckInterval` (**30 s**) has
+  passed; every `stable_diffusion_cpp` child of every collect cycle reads the
+  same answer. Without the memo, a gateway that knows the
+  `stable_diffusion_cpp` type but not the source cost one authenticated
+  `GET /api/agent/v1/features` per sd child per collect cycle (1 s default),
+  for as long as that pairing lasted. 30 s is half the runtime driver's own
+  60 s backstop on the same endpoint (`runtimePollInterval`), so the gate adds
+  at most two requests a minute per agent however many sd children run. The
+  price is latency: a gateway upgrade, or a rollback, reaches the capability
+  probe on the first collect cycle once 30 s have passed since the agent last
+  asked — within about 30 s of the gateway serving it, not on the next
+  cycle. The round trip that does happen runs on the collect loop, so
+  `gatewayDeclares` bounds it by `collectTimeout`, the same bound as the
+  child probe that may follow it — the same reasoning that bounds every
+  other per-child call on this loop.
+
+  **The gate is re-checked on a cache hit, for an `sdcpp_capabilities`
+  entry.** A verdict cached while the gateway declared the name is not sent
+  while it no longer does — a gateway rolled back to a build without the
+  source would otherwise drop every such sample's capability rows with a
+  `Warn`, once per collect cycle, until the child restarted. The entry is
+  kept, and sent again once the gateway declares the name again, without
+  asking the child. Inside the memo's interval the re-check costs nothing; no
+  other source, and no other type, consults the gateway at all.
+
   **The branch also NAMES the probe it took, and the name rides the wire**
   as `capabilities.source` (`sample.Capabilities.Source`:
-  `llama_cpp_props` or `ollama_api_show`). The gateway stamps its capability
-  rows with what was reported rather than re-deriving the provenance from
-  the spec type it pushed itself — the wire carries a `spec_id` but no
-  runtime type, and an inferred provenance is the exact defect the row's
-  `source` column exists to prevent ([Telemetry, Usage Analytics &
+  `llama_cpp_props`, `ollama_api_show`, or `sdcpp_capabilities`). The gateway
+  stamps its capability rows with what was reported rather than re-deriving
+  the provenance from the spec type it pushed itself — the wire carries a
+  `spec_id` but no runtime type, and an inferred provenance is the exact
+  defect the row's `source` column exists to prevent ([Telemetry, Usage
+  Analytics &
   Observability
   §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
   The assignment sits INSIDE each branch, so the condition that picks the
@@ -3196,14 +3312,14 @@ mirror). Three different cadences share the one collect cycle:
   copy to drift.
 
   The caching rule distinguishes **why** no verdict came back, not merely
-  whether one did. A cache keyed by `(SpecID, PID, Model)`, like the context
-  cache, stores the whole verdict set
+  whether one did. A cache keyed by `(SpecID, PID, Type, Model)`, like the
+  context cache, stores the whole verdict set
   (`collector.PropsVerdicts{LiveProgress, Caps}`
   — `LiveProgress` one of `"supported"`/`"unsupported"`/a deliberate `""`;
-  `Caps` the four capability verdicts plus `Extra`) **and the source that
-  produced it** only once the probe's
-  answer is *stable*: a real `/props` or `/api/show` document, any other
-  well-formed body
+  `Caps` the five capability verdicts (issue #154 added `Image`) plus
+  `Extra`) **and the source that produced it** only once the probe's
+  answer is *stable*: a real `/props`, `/api/show`, or
+  `/sdcpp/v1/capabilities` document, any other well-formed body
   that simply is not that document, or one of exactly four conclusive
   refusals — **404** (no such route on this build), **401** or **403** (the
   route is behind an api key this probe cannot supply), **405** (the route
@@ -3244,24 +3360,34 @@ mirror). Three different cadences share the one collect cycle:
   comparison costs it nothing — a llama.cpp child's model cannot change
   without a restart, which already re-arms the question through the PID.
 
-  **`Type` is deliberately NOT in this key, and the asymmetry with the
-  context cache is a decision rather than an oversight.** `Type` now decides
-  which document is read, so an edit to a RUNNING spec's `Type` does leave
-  this entry cached against the endpoint that was actually read. Adding
-  `Type` to the key would make that re-probe — and make things worse: the
-  running process is still the OLD binary until a restart, so re-probing a
-  spec whose type was corrected to `ollama` would POST `/api/show` at a
-  still-running `llama-server`, collect its `404`, and cache an EMPTY verdict
-  set over correct data. The stale-but-cached verdicts are the accurate ones
-  in the common direction, and they stay honestly attributed because the
-  source travels WITH them instead of being re-derived from the current
-  `Type`. The context cache can afford the opposite choice for a concrete
-  reason: it **never caches a failure**, so a re-probe that meets a `404`
-  leaves no entry and simply retries next cycle — the worst case is a
-  temporarily missing number. This cache caches a conclusive non-answer on
-  purpose, which is exactly what stops the per-cycle re-probing above, so
-  here the same re-probe would write an EMPTY verdict set over correct data
-  and keep it for the rest of the PID's life.
+  **`Type` joined this key in issue #154, as it already sits in the context
+  cache's.** `Type` decides which document is read, and a `Type` edit is
+  launch **metadata**: the reconciliation applies it to a RUNNING child in
+  place, same PID (`sameLaunchShape` ignores it, §5.6). The case that forced
+  it: a spec with no explicit type and an `sd-server` binary is `custom`
+  under a gateway that predates the `stable_diffusion_cpp` type — detection
+  fell back to `custom` there — and `stable_diffusion_cpp` under one that
+  knows it, so upgrading the gateway retypes the running child. With `Type`
+  outside the key, the `/props` `404` cached while the child was `custom`
+  kept answering, and `/sdcpp/v1/capabilities` was not read until the child
+  restarted. A retyped child is now probed for the document its new type
+  names.
+
+  **Do not take `Type` back out on the argument that a re-probe after a type
+  correction reads the still-running OLD binary and caches an empty verdict
+  set over correct data; it does not hold.** An edit that changes the binary
+  is launch-affecting: the child drains
+  (`StateDraining`, which this probe skips, since it runs only for
+  `StateRunning`) and comes back with a new PID, which re-arms the question
+  anyway. An edit that changes only `Type` leaves the binary as it was, so
+  the re-probe reads exactly what a restart would read. What a wrongly set
+  type costs is this PID's cached verdicts, replaced by whatever the new
+  type's document says — typically a conclusive `404` and an empty set. The
+  gateway keeps the rows it already stored, because an empty set writes no
+  row (`writeBackOneRuntimeCapabilities` returns before any store call). The
+  source still travels WITH the verdicts, so a hit reads the name of the
+  probe that actually answered rather than restating that branch's
+  condition.
 
   **An api-key-protected child's verdict is recovered at the gateway edge,
   not by teaching this probe a credential (issue #58, closed).**

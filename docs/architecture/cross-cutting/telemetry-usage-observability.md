@@ -1391,10 +1391,12 @@ once per cache miss and hands the identical bytes to both detectors, returning
 once, period, regardless of how many verdicts the one document yields. The
 agent's own probe (`probeRuntimeChildProps`, [Agent-Managed Model Runtime
 §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time))
-caches that whole pair keyed by `(SpecID, PID, Model)` — once per process
-generation, exactly like the context cache beside it, with the model in the
-key since #54 because one `ollama serve` process serves many models and a
-spec repointed at another one keeps its PID.
+caches that whole pair keyed by `(SpecID, PID, Type, Model)` — once per
+process generation, like the context cache beside it. The model has been in
+the key since #54, because one `ollama serve` process serves many models and
+a spec repointed at another one keeps its PID. The type has been in it since
+#154, because a type edit, too, is applied to a running child with the same
+PID, and the type decides which document is read.
 
 **A third document, read by a detector that can only ever answer `yes`:
 Ollama's `POST /api/show` (issue #54).** `detectOllamaCapabilities`
@@ -1531,55 +1533,86 @@ document every collect cycle for the child's whole life, invisibly, since the
 caller logs only a Debug retry. A body that is *not* complete keeps its own
 answer — the truncated-JSON check runs first and still says "ask again".
 
-**The probe NAMES itself, and its name ranks with the other probe.** The
-agent reports `capabilities.source` on the wire — `llama_cpp_props` or
-`ollama_api_show` (`routing.CapabilitySourceOllamaAPIShow`) — and the gateway
-stamps its rows with what was reported instead of re-deriving the provenance
-from the spec type it pushed itself. The sample carries a `spec_id` but no
-runtime type, so the gateway cannot tell the two documents apart on its own;
-two alternatives were refused, and for the same reason. Guessing the probe
-from row CONTENT (Ollama never reports a `no`, never a live-progress verdict)
-is a heuristic that an all-`yes` `/props` document defeats, and re-deriving
-`routing.EffectiveRuntimeSpecType` from the spec the ingest already loads
-would trade the reporter's report for an inference from configuration,
-duplicating the agent's branch condition in a second module where the two can
-drift. `ollama_api_show` ranks **1** through `capabilitySourceRank`'s default
-branch, with no case of its own and no rank-table edit: it can never
-overwrite `manual` (3) or `vision_benchmark` (2), and it repairs its own
-drift at 1 against 1.
+**One more document, with a twin from the start: `sd-server`'s
+`GET /sdcpp/v1/capabilities` (issue #154).** The agent's
+`parseSdcppCapabilities` (`server-agent/internal/collector/sdcpp.go`, called
+by `ProbeSdcppVerdicts`) and the gateway's `parseSdcppCapabilities`
+(`internal/provider/sdcpp_capabilities.go`, which reads an external
+application's copy of the same document) are a deliberate duplicate under the
+drift discipline above. Each doc comment names the other copy. The
+`sdcppImageCases` table, duplicated verbatim in both modules' tests, pins both
+parsers to one rule: `img_gen` in the exhaustive `supported_modes` list is
+`yes`, a list without it is `no`, and an absent or null list is no verdict.
+The `/props` twins' shared tables are kept identical by hand. These two are
+also compared mechanically: the gateway's
+`TestSdcppImageCasesMatchTheAgentsTable` reads the agent's test file and
+fails when the two declarations differ by a byte, or when either is missing.
+A change to one parser and its own table therefore cannot pass both suites.
+
+**The probe NAMES itself, and its name ranks with the other probes.** The
+agent reports `capabilities.source` on the wire — `llama_cpp_props`,
+`ollama_api_show`, or, since issue #154, `sdcpp_capabilities`
+(`routing.CapabilitySourceOllamaAPIShow`/`routing.CapabilitySourceSdcppCapabilities`)
+— and the gateway stamps its rows with what was reported instead of
+re-deriving the provenance from the spec type it pushed itself. The sample
+carries a `spec_id` but no runtime type, so the gateway cannot tell the
+three documents apart on its own; two alternatives were refused, and for the
+same reason. Guessing the probe from row CONTENT (Ollama never reports a
+`no` and never a live-progress verdict; `sdcpp_capabilities` never reports
+anything but `image`) is a heuristic that an all-`yes` `/props` document
+defeats, and re-deriving `routing.EffectiveRuntimeSpecType` from the spec the
+ingest already loads would trade the reporter's report for an inference from
+configuration, duplicating the agent's branch condition in a second module
+where the two can drift. Both `ollama_api_show` and `sdcpp_capabilities` rank
+**1** through `capabilitySourceRank`'s default branch, with no case of their
+own and no rank-table edit: neither can ever overwrite `manual` (3) or
+`vision_benchmark` (2), and each repairs its own drift at 1 against 1.
 
 **The gateway's allowlist of claimable sources is a trust boundary, not a
 typo filter.** `rowSource` (`internal/gateway/agent_ingest.go`) accepts
-exactly the two PROBE names, plus an absent/empty field for an agent that
-predates the field (which keeps the historical `llama_cpp_props` default —
-safe rather than merely convenient, since such an agent probes `/props`, and
-an Ollama child answers that with a `404`, hence no verdicts and no rows).
-Anything else **voids the whole pass**, live-progress row included: an agent
-claiming `manual` or `vision_benchmark` writes nothing at all. Clamping an
-unrecognised name onto the default was rejected as worse than dropping —
-it would print a provenance nobody reported on the one column whose job is to
-say who said this — and dropping is the option that stays safe against the
-rank, since an unrecognised source ranks 1 and a blind write would let
-unknown provenance overwrite a real probe at equal rank. The drop is logged
-at **`Warn`**, not `Debug`: the gateway's default level is `info`, so at
-`Debug` a newer agent reporting a third source would lose every capability
+exactly the three PROBE names an agent runs, plus an absent/empty field for
+an agent that predates the field (which keeps the historical
+`llama_cpp_props` default — safe rather than merely convenient, since such an
+agent probes `/props`, and an Ollama child answers that with a `404`, hence
+no verdicts and no rows). Anything else **voids the whole pass**,
+live-progress row included: an agent claiming `manual` or `vision_benchmark`
+writes nothing at all. Clamping an unrecognised name onto the default was
+rejected as worse than dropping — it would print a provenance nobody reported
+on the one column whose job is to say who said this — and dropping is the
+option that stays safe against the rank, since an unrecognised source ranks 1
+and a blind write would let unknown provenance overwrite a real probe at
+equal rank. The drop is logged at **`Warn`**, not `Debug`: the gateway's
+default level is `info`, so at
+`Debug` a newer agent reporting a fourth source would lose every capability
 row it ever sent with nothing anywhere to say why, and the rows' absence
 reads as plain "unknown".
 
-**One combination is refused outright rather than attributed: a live-progress
-verdict sourced `ollama_api_show`.** Such a sample writes no `live_progress`
-row at all. Ollama exposes no `timings_per_token`-style surface, so its
-`/api/show` document cannot carry evidence about live progress in *either*
-direction, and a row attributed to that probe would be a false provenance
-whatever verdict it held — which is exactly the claim
-`routing.CapabilityRow`'s own source documentation makes. No honest agent
-sends the combination (`ProbeOllamaVerdicts` leaves the field `""` on every
-return path), and that is *why* the ingest enforces it rather than
+**Two combinations are refused outright rather than attributed: a
+live-progress verdict sourced `ollama_api_show` or `sdcpp_capabilities`.**
+Such a sample writes no `live_progress` row at all. Neither Ollama nor
+`sd-server` exposes a `timings_per_token`-style surface, so neither
+document can carry evidence about live progress in *either* direction, and a
+row attributed to either probe would be a false provenance whatever verdict
+it held — which is exactly the claim `routing.CapabilityRow`'s own source
+documentation makes. No honest agent sends either combination
+(`ProbeOllamaVerdicts` and `ProbeSdcppVerdicts` both leave the field `""` on
+every return path), and that is *why* the ingest enforces it rather than
 documenting it: an invariant a caller can violate is not an invariant. The
-rest of the pass still lands — a `vision` or `tools` verdict is something
-`/api/show` really can answer — and the dropped row is logged at `Warn`. One
-consequence follows: a `live_progress` row can now only ever carry
+rest of the pass still lands in both cases — a `vision`/`tools` verdict is
+something `/api/show` really can answer, and the `image` verdict is what
+`/sdcpp/v1/capabilities` answers — and each dropped row is logged at `Warn`.
+One consequence follows: a `live_progress` row can now only ever carry
 `llama_cpp_props`.
+
+**A third combination is refused for the same reason, generalised: any
+`sdcpp_capabilities` row that is not `image`.** `/sdcpp/v1/capabilities`
+answers exactly one question — whether the loaded model's `supported_modes`
+list holds `img_gen` — so a row under this source for `vision`, `tools`, or
+any other name is a claim the document never made, in either verdict
+direction (`no` is writable for `image` here, unlike under
+`ollama_api_show`, because `supported_modes` is exhaustive). Dropped at
+`Warn`, same as the two above; the `image` verdict itself still rides the
+pass.
 
 **Three names are RESERVED and may not arrive from a probe at all: `mtp`,
 `live_progress` and `speculation_observed`.** The criterion is that this
@@ -1627,16 +1660,16 @@ while `speculation_observed` has no control on that form at all (it submits
 `mtp` and `vision` only) and is repaired only by the process itself, the next
 speculating completion after a restart overwriting a false `no` at rank 1
 against rank 1. `vision`/`video`/`audio`/`tools` are deliberately **not**
-reserved: those four are exactly what the two detectors read out of their
-documents.
+reserved: those four are exactly what the llama.cpp and Ollama detectors
+read out of their documents (the sd-server probe reads `image` alone).
 
 The rule is enforced at the **ingest**, because that is the boundary in the
 path of a buggy or hostile agent putting the name straight into its verdict
 list; the agent's own detector skips the **first two** as well, but that
 filter only ever meets a publisher's string, and it carries no entry for
-`speculation_observed` because that name appears in neither document either
-agent detector reads. The drop is logged at `Warn` and the rest of the pass
-still lands. The day a real MTP detector exists it reports through a field
+`speculation_observed` because that name appears in none of the three
+documents the agent's detectors read. The drop is logged at `Warn` and the
+rest of the pass still lands. The day a real MTP detector exists it reports through a field
 this codebase defined — the way live-progress support does — or the reserved
 list changes on both sides; what it must not do is arrive on the open list,
 whose whole purpose is carrying strings nobody here has vetted.
@@ -1705,9 +1738,18 @@ nobody can make from a count:
 - **The agent's telemetry ingest**
   (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
   `runtimeSampleCapabilityRows`). It stamps whichever of
-  `llama_cpp_props`/`ollama_api_show` the agent **reported** (above), because
-  the agent probes both kinds of child and only its report says which
-  document a verdict came off.
+  `llama_cpp_props`/`ollama_api_show`/`sdcpp_capabilities` the agent
+  **reported** (above), because the agent probes three kinds of child and
+  only its report says which document a verdict came off. The third is
+  accepted for the `image` row only (`rowSource`,
+  `runtimeSampleCapabilityRows`, with no feature check). What the agent
+  feature `capability_source_sdcpp` gates is the AGENT's sending: the agent
+  reports the source only while this gateway declares the name, as the agent
+  last read it (up to about 30 s old). The third is
+  an **agent-launched** `stable_diffusion_cpp` child's own read of the
+  identical document the bullet above reads externally (issue #154,
+  [Routing & Model Selection
+  §2.3](routing-and-model-selection.md#23-the-capability-gate)).
 
 The `/props` pass and the ingest both translate a live-progress verdict
 through the one `routing.LiveProgressCapabilityVerdict`, and all three ask the
@@ -1939,8 +1981,11 @@ an api-key-protected child through the router's `GET
 a **nameless** verdict set (capability evidence with no `model`/`model_path`
 in the body) out to every mapping of the one-endpoint application, mirroring
 the live-progress nameless-entry rule above. A nil `Capabilities` on the wire
-(an agent predating capability detection) and an all-empty one (detection
-ran, determined nothing) are both "no write," but they are different facts a
+(an agent predating capability detection, a child not yet probed
+conclusively, or a `stable_diffusion_cpp` child whose `sdcpp_capabilities`
+report the agent withholds because the gateway does not declare
+`capability_source_sdcpp`) and an all-empty one (detection ran, determined
+nothing) are both "no write," but they are different facts a
 pointer field can distinguish and a bare struct cannot — why
 `sample.RuntimeSample.Capabilities` is `*Capabilities`.
 

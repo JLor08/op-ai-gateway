@@ -2240,7 +2240,7 @@ func TestCollectOnceRuntimeLiveProgressCustomTypeSupported(t *testing.T) {
 }
 
 // TestCapabilitiesSampleCarriesEveryVerdictAsARow proves capabilitiesSample
-// converts each of the four named collector.Capabilities fields into its own
+// converts each named collector.Capabilities field into its own
 // CapabilityVerdict entry, keyed by name, and skips every undetermined
 // ("") field entirely -- there must be no entry at all for Video/Audio here,
 // mirroring the store's row-absence-means-unknown model (#49-2, task 2).
@@ -2281,6 +2281,66 @@ func TestCapabilitiesSampleAllEmptyIsNonNilAndEmpty(t *testing.T) {
 	}
 	if len(got.Verdicts) != 0 {
 		t.Errorf("Verdicts = %+v, want empty", got.Verdicts)
+	}
+}
+
+// TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra pins where the
+// image verdict lands on the wire: after the four other named fields and
+// before every Extra entry, in both directions, and not at all when it is
+// undetermined. The position is the load-bearing part. The gateway keeps the
+// FIRST entry for a name, so an "image" that also appears in Extra (Extra
+// can only say "yes") must lose to the structured field, and the second case
+// shows exactly that collision.
+func TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra(t *testing.T) {
+	cases := []struct {
+		name string
+		caps collector.Capabilities
+		want []sample.CapabilityVerdict
+	}{
+		{
+			name: "yes follows the four named fields and precedes Extra",
+			caps: collector.Capabilities{Vision: "yes", Video: "no", Audio: "no", Tools: "yes", Image: "yes", Extra: []string{"thinking"}},
+			want: []sample.CapabilityVerdict{
+				{Name: "vision", Verdict: "yes"},
+				{Name: "video", Verdict: "no"},
+				{Name: "audio", Verdict: "no"},
+				{Name: "tools", Verdict: "yes"},
+				{Name: "image", Verdict: "yes"},
+				{Name: "thinking", Verdict: "yes"},
+			},
+		},
+		{
+			name: "no is carried, ahead of an Extra entry of the same name",
+			caps: collector.Capabilities{Image: "no", Extra: []string{"image"}},
+			want: []sample.CapabilityVerdict{
+				{Name: "image", Verdict: "no"},
+				{Name: "image", Verdict: "yes"},
+			},
+		},
+		{
+			name: "undetermined is omitted",
+			caps: collector.Capabilities{Vision: "yes", Extra: []string{"thinking"}},
+			want: []sample.CapabilityVerdict{
+				{Name: "vision", Verdict: "yes"},
+				{Name: "thinking", Verdict: "yes"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := capabilitiesSample(tc.caps, sample.CapabilitySourceSdcppCapabilities)
+			if got == nil {
+				t.Fatal("capabilitiesSample = nil, want a non-nil pointer")
+			}
+			if !reflect.DeepEqual(got.Verdicts, tc.want) {
+				t.Errorf("Verdicts = %+v, want exactly %+v", got.Verdicts, tc.want)
+			}
+			// The literal, not the constant: the gateway matches this string
+			// byte for byte, so the constant's value is what is under test.
+			if got.Source != "sdcpp_capabilities" {
+				t.Errorf("Source = %q, want %q", got.Source, "sdcpp_capabilities")
+			}
+		})
 	}
 }
 
@@ -2643,12 +2703,13 @@ func TestCollectOnceRuntimeCapabilitiesOllamaProbesAPIShow(t *testing.T) {
 	}
 }
 
-// TestCollectOnceRuntimeCapabilitiesLlamaCppStillProbesProps pins the OTHER
-// half of task 5's branch: "ollama" is the only type claimed by name, and
-// every other type -- "llama_cpp" here, "custom" in the tests above, which
-// matters most because "custom" is the type-detection FALLBACK and gets no
-// derived probe path at all -- still GETs /props and is byte-identical to
-// before the branch existed. /api/show is counted and must stay at zero.
+// TestCollectOnceRuntimeCapabilitiesLlamaCppStillProbesProps pins the
+// fallback half of the probe's branch: only "ollama" and
+// "stable_diffusion_cpp" are claimed by name, and every other type --
+// "llama_cpp" here, "custom" in the tests above, which matters most because
+// "custom" is the type-detection FALLBACK and gets no derived probe path at
+// all -- still GETs /props and is byte-identical to before the branch
+// existed. /api/show is counted and must stay at zero.
 //
 // Inverting the branch's condition (probing /api/show for everything BUT
 // ollama) fails here on both counters at once.
@@ -2716,6 +2777,579 @@ func TestCollectOnceRuntimeCapabilitiesLlamaCppStillProbesProps(t *testing.T) {
 	}
 	if hits := atomic.LoadInt32(&showHits); hits != 0 {
 		t.Errorf("/api/show hits = %d, want 0 -- only an ollama-typed child may be asked for it", hits)
+	}
+}
+
+// fakeGatewayFeatures is a gatewayFeatureSource whose declared set a test can
+// change between calls, which is how a gateway upgrade looks to a child that
+// keeps running. It counts every Fetch.
+type fakeGatewayFeatures struct {
+	mu    sync.Mutex
+	names []string
+	err   error
+	calls int
+}
+
+func (f *fakeGatewayFeatures) Fetch(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.names, f.err
+}
+
+func (f *fakeGatewayFeatures) set(names []string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.names, f.err = names, err
+}
+
+func (f *fakeGatewayFeatures) fetches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// The production source main.go wires in must satisfy the agent's interface.
+var _ gatewayFeatureSource = (*runtimectl.FeaturesClient)(nil)
+
+// probeChild is a fake managed child that records every request as
+// "METHOD path" and answers only the routes it was given, 404 elsewhere. The
+// routes are literals, never the collector's path constants: comparing a
+// constant with itself would not notice it drifting from the path the real
+// server serves.
+type probeChild struct {
+	srv *httptest.Server
+
+	mu     sync.Mutex
+	routes map[string]string // "METHOD path" -> JSON body
+	seen   map[string]int    // "METHOD path" -> request count
+}
+
+func newProbeChild(t *testing.T, routes map[string]string) *probeChild {
+	t.Helper()
+	c := &probeChild{routes: make(map[string]string, len(routes)), seen: map[string]int{}}
+	for k, v := range routes {
+		c.routes[k] = v
+	}
+	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Method + " " + r.URL.Path
+		c.mu.Lock()
+		c.seen[key]++
+		body, ok := c.routes[key]
+		c.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(c.srv.Close)
+	return c
+}
+
+// serve replaces the body one route answers with.
+func (c *probeChild) serve(key, body string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.routes[key] = body
+}
+
+// requests returns a copy of every request seen so far.
+func (c *probeChild) requests() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int, len(c.seen))
+	for k, v := range c.seen {
+		out[k] = v
+	}
+	return out
+}
+
+// status returns a running Status of specType served by this child, and the
+// loopback base URL probeRuntimeChild would build for it.
+func (c *probeChild) status(t *testing.T, specType string, pid int) (runtimectl.Status, string) {
+	t.Helper()
+	st := runtimectl.Status{
+		SpecID: "rspec_" + specType,
+		Model:  "some-model",
+		State:  runtimectl.StateRunning,
+		PID:    pid,
+		Port:   portFromURL(t, c.srv.URL),
+		Type:   specType,
+	}
+	return st, "http://127.0.0.1:" + strconv.Itoa(st.Port)
+}
+
+const (
+	sdcppCapabilitiesRoute = "GET /sdcpp/v1/capabilities"
+	sdcppImageYesDoc       = `{"supported_modes":["img_gen"],"model":{"stem":"flux1-dev"}}`
+	sdcppImageNoDoc        = `{"supported_modes":["vid_gen"],"model":{"stem":"wan2.1"}}`
+)
+
+// sdcppImage is the capability set a stable_diffusion_cpp child reports:
+// the image verdict alone, under the literal source the gateway matches.
+func sdcppImage(verdict string) *sample.Capabilities {
+	return &sample.Capabilities{
+		Verdicts: []sample.CapabilityVerdict{{Name: "image", Verdict: verdict}},
+		Source:   "sdcpp_capabilities",
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppReadsItsCapabilityDocument is the branch's
+// wiring proof: when the gateway declares capability_source_sdcpp, a
+// stable_diffusion_cpp child is asked exactly one thing, GET
+// /sdcpp/v1/capabilities, and never /props (sd-server serves none). The
+// verdict is cached per (pid, type, model) like every other probe's, and a
+// cached child costs no child request, and no gateway round trip inside the
+// gate's memo interval. A new pid asks again, and the new answer replaces
+// the old one.
+func TestProbeRuntimeChildPropsSdcppReadsItsCapabilityDocument(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"runtime_manager", "capability_source_sdcpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := child.status(t, "stable_diffusion_cpp", 7001)
+	probe := func() sample.RuntimeSample {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		return rs
+	}
+
+	rs := probe()
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests = %v, want exactly %v (the capability document, and no /props)", got, want)
+	}
+	if want := sdcppImage("yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Fatalf("Capabilities = %+v, want %+v", rs.Capabilities, want)
+	}
+	if rs.LiveProgressSupport != "" {
+		t.Errorf("LiveProgressSupport = %q, want \"\" (sd-server has no timings surface)", rs.LiveProgressSupport)
+	}
+
+	rs = probe()
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after a same-pid call = %v, want still %v (a conclusive answer is cached)", got, want)
+	}
+	if want := sdcppImage("yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities (cache hit) = %+v, want %+v", rs.Capabilities, want)
+	}
+	if n := features.fetches(); n != 1 {
+		t.Errorf("gateway feature fetches = %d, want 1 (a cached child re-checks the gate from the memo, not the gateway)", n)
+	}
+
+	child.serve(sdcppCapabilitiesRoute, sdcppImageNoDoc)
+	st.PID = 7002
+	rs = probe()
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after a restart = %v, want %v (a new pid asks again)", got, want)
+	}
+	if want := sdcppImage("no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities (new pid) = %+v, want %+v (the new process's answer, not the cached one)", rs.Capabilities, want)
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppWaitsForTheGatewayFeature pins the gate:
+// while the gateway does not declare capability_source_sdcpp, a
+// stable_diffusion_cpp child is asked NOTHING, the sample carries no
+// capability set and no live-progress verdict, and nothing is cached. The
+// child serves a conclusive document throughout, so a probe that ran would
+// both be seen and be cached. Once the gateway starts declaring the feature,
+// the first call after the agent next asks the gateway probes, with the same
+// pid: a gateway upgrade takes effect without restarting the child. When the
+// agent asks again is gatewayFeatureRecheckInterval's business, pinned by
+// TestGatewayDeclaresAsksOncePerIntervalForEverySdcppChild.
+func TestProbeRuntimeChildPropsSdcppWaitsForTheGatewayFeature(t *testing.T) {
+	cases := []struct {
+		name  string
+		names []string
+		err   error
+	}{
+		{"empty set", []string{}, nil},
+		{"other features only", []string{"runtime_manager", "runtime_upstream_props"}, nil},
+		{"fetch error", nil, errors.New("simulated features fetch failure")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+			features := &fakeGatewayFeatures{names: tc.names, err: tc.err}
+			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+			clk := newFakeClock()
+			a.now = clk.now
+			st, base := child.status(t, "stable_diffusion_cpp", 7010)
+
+			for cycle := 1; cycle <= 3; cycle++ {
+				var rs sample.RuntimeSample
+				a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+				if got := child.requests(); len(got) != 0 {
+					t.Fatalf("cycle %d: child requests = %v, want none (the gateway cannot accept this child's document yet)", cycle, got)
+				}
+				if rs.Capabilities != nil {
+					t.Errorf("cycle %d: Capabilities = %+v, want nil", cycle, rs.Capabilities)
+				}
+				if rs.LiveProgressSupport != "" {
+					t.Errorf("cycle %d: LiveProgressSupport = %q, want \"\"", cycle, rs.LiveProgressSupport)
+				}
+				if _, ok := a.runtimeCapabilityCache[st.SpecID]; ok {
+					t.Fatalf("cycle %d: runtimeCapabilityCache has an entry for %q, want none (a skipped probe must not be cached)", cycle, st.SpecID)
+				}
+			}
+
+			features.set([]string{"capability_source_sdcpp"}, nil)
+			clk.advance(gatewayFeatureRecheckInterval)
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests after the gateway declares the feature = %v, want %v (an upgrade is picked up without a child restart)", got, want)
+			}
+			if want := sdcppImage("yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+				t.Errorf("Capabilities after the upgrade = %+v, want %+v", rs.Capabilities, want)
+			}
+		})
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppWithoutAFeatureSourceProbesNothing pins that
+// an agent built without Deps.GatewayFeatures reads it as "not declared":
+// such an agent cannot know that the gateway accepts the sdcpp source, so it
+// sends what an older gateway expects, which is nothing for this child.
+func TestProbeRuntimeChildPropsSdcppWithoutAFeatureSourceProbesNothing(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	a := NewFromDeps(config.Config{}, Deps{})
+	st, base := child.status(t, "stable_diffusion_cpp", 7020)
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		if got := child.requests(); len(got) != 0 {
+			t.Fatalf("cycle %d: child requests = %v, want none", cycle, got)
+		}
+		if rs.Capabilities != nil || rs.LiveProgressSupport != "" {
+			t.Errorf("cycle %d: Capabilities = %+v, LiveProgressSupport = %q, want nil and \"\"", cycle, rs.Capabilities, rs.LiveProgressSupport)
+		}
+		if _, ok := a.runtimeCapabilityCache[st.SpecID]; ok {
+			t.Fatalf("cycle %d: runtimeCapabilityCache has an entry for %q, want none", cycle, st.SpecID)
+		}
+	}
+}
+
+// blockingGatewayFeatures is a gatewayFeatureSource that hangs the way a
+// black-holed gateway does: Fetch returns only once its ctx is done, and then
+// the way FeaturesClient.Fetch answers a transport error, with its last
+// known-good set (none here) and a nil error. Closing release also unblocks
+// it, so a failing test does not leave the goroutine behind.
+type blockingGatewayFeatures struct {
+	release chan struct{}
+}
+
+func (f *blockingGatewayFeatures) Fetch(ctx context.Context) ([]string, error) {
+	select {
+	case <-ctx.Done():
+	case <-f.release:
+	}
+	return nil, nil
+}
+
+// TestProbeRuntimeChildPropsSdcppBoundsTheGatewayQuestion pins that the
+// gateway question is bounded like every other per-child call. It runs on
+// the collect loop, so without its own bound a gateway that never answers
+// would hold the whole loop (telemetry, wake handling, the cert and trust
+// tickers) for as long as the features client's HTTP timeout allows, once
+// per uncached stable_diffusion_cpp child per cycle. The fake returns only
+// when its context ends, and the caller's context never does. The call must
+// still come back within about collectTimeout, having probed and cached
+// nothing.
+func TestProbeRuntimeChildPropsSdcppBoundsTheGatewayQuestion(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &blockingGatewayFeatures{release: make(chan struct{})}
+	t.Cleanup(func() { close(features.release) })
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := child.status(t, "stable_diffusion_cpp", 7040)
+
+	var rs sample.RuntimeSample
+	done := make(chan struct{})
+	go func() {
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		close(done)
+	}()
+	const grace = time.Second
+	select {
+	case <-done:
+	case <-time.After(collectTimeout + grace):
+		t.Fatalf("probeRuntimeChildProps still blocked after %v on a gateway that never answers, want it back within about collectTimeout (%v)", collectTimeout+grace, collectTimeout)
+	}
+	if got := child.requests(); len(got) != 0 {
+		t.Errorf("child requests = %v, want none (an unanswered gateway question declares nothing)", got)
+	}
+	if rs.Capabilities != nil || rs.LiveProgressSupport != "" {
+		t.Errorf("Capabilities = %+v, LiveProgressSupport = %q, want nil and \"\"", rs.Capabilities, rs.LiveProgressSupport)
+	}
+	if _, ok := a.runtimeCapabilityCache[st.SpecID]; ok {
+		t.Errorf("runtimeCapabilityCache has an entry for %q, want none", st.SpecID)
+	}
+}
+
+// TestProbeRuntimeChildPropsOtherTypesIgnoreTheSdcppFeature pins that the
+// feature changes nothing for any other type: with capability_source_sdcpp
+// declared, a llama_cpp or custom child still GETs /props, an ollama child
+// still POSTs /api/show, none of them is asked for the sd capability
+// document, and none of them costs a gateway round trip, neither on the
+// probe nor on the cache hit that follows it (the hit path re-checks the
+// gate only for an entry whose source is sdcpp_capabilities).
+func TestProbeRuntimeChildPropsOtherTypesIgnoreTheSdcppFeature(t *testing.T) {
+	const (
+		propsRoute = "GET /props"
+		showRoute  = "POST /api/show"
+	)
+	routes := map[string]string{
+		propsRoute:             `{"default_generation_settings":{"params":{"timings_per_token":true}},"modalities":{"vision":true}}`,
+		showRoute:              `{"capabilities":["completion","vision"]}`,
+		sdcppCapabilitiesRoute: sdcppImageYesDoc,
+	}
+	cases := []struct {
+		specType   string
+		wantRoute  string
+		wantSource string
+	}{
+		{"llama_cpp", propsRoute, "llama_cpp_props"},
+		{"custom", propsRoute, "llama_cpp_props"},
+		{"ollama", showRoute, "ollama_api_show"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.specType, func(t *testing.T) {
+			child := newProbeChild(t, routes)
+			features := &fakeGatewayFeatures{names: []string{"capability_source_sdcpp"}}
+			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+			st, base := child.status(t, tc.specType, 7030)
+
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if got, want := child.requests(), map[string]int{tc.wantRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests = %v, want exactly %v", got, want)
+			}
+			if rs.Capabilities == nil || rs.Capabilities.Source != tc.wantSource {
+				t.Errorf("Capabilities = %+v, want source %q", rs.Capabilities, tc.wantSource)
+			}
+
+			var hit sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &hit)
+			if got, want := child.requests(), map[string]int{tc.wantRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests after a same-pid call = %v, want still %v (a conclusive answer is cached)", got, want)
+			}
+			if hit.Capabilities == nil || hit.Capabilities.Source != tc.wantSource {
+				t.Errorf("Capabilities (cache hit) = %+v, want source %q", hit.Capabilities, tc.wantSource)
+			}
+			if n := features.fetches(); n != 0 {
+				t.Errorf("gateway feature fetches = %d, want 0 (only a stable_diffusion_cpp child consults the gateway's feature set)", n)
+			}
+		})
+	}
+}
+
+// fakeClock is the injectable clock the gateway-feature memo reads: a test
+// advances it instead of waiting out gatewayFeatureRecheckInterval, the same
+// seam as the client package's fakeClock for the WebSocket backoff.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock { return &fakeClock{t: time.Unix(1_000_000, 0)} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// sdcppFleet returns a runtime driver reporting n running
+// stable_diffusion_cpp children, each its own spec and pid, all served by
+// child, and the agent collecting from it with the gateway features source
+// and clock given.
+func sdcppFleet(t *testing.T, child *probeChild, n int, features gatewayFeatureSource, clk *fakeClock) (*Agent, *capturePoster) {
+	t.Helper()
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	statuses := make([]runtimectl.Status, n)
+	for i := range statuses {
+		st, _ := child.status(t, "stable_diffusion_cpp", 7100+i)
+		st.SpecID = fmt.Sprintf("rspec_sd_%d", i)
+		statuses[i] = st
+	}
+	drv.setStatuses(statuses)
+	poster := &capturePoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv, GatewayFeatures: features})
+	a.now = clk.now
+	return a, poster
+}
+
+// TestGatewayDeclaresAsksOncePerIntervalForEverySdcppChild pins the memo on
+// the gateway feature question. The gateway here knows the sd spec type but
+// not the source (the #144 build), so no child is ever cached and every one
+// of them reaches the gate on every collect cycle. Before the memo that was
+// one authenticated GET per child per cycle; now every child in every cycle
+// shares one answer until gatewayFeatureRecheckInterval has passed, and the
+// next cycle after that asks exactly once more.
+func TestGatewayDeclaresAsksOncePerIntervalForEverySdcppChild(t *testing.T) {
+	const children, cycles = 3, 5
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"runtime_manager", "runtime_logs", "runtime_config_ack"}}
+	clk := newFakeClock()
+	a, _ := sdcppFleet(t, child, children, features, clk)
+
+	step := (gatewayFeatureRecheckInterval - time.Second) / cycles
+	for cycle := 1; cycle <= cycles; cycle++ {
+		a.collectOnce(context.Background())
+		if n := features.fetches(); n != 1 {
+			t.Fatalf("cycle %d: gateway feature fetches = %d, want 1 (%d children, in every cycle so far inside the interval, share one answer)", cycle, n, children)
+		}
+		clk.advance(step)
+	}
+	if got := child.requests(); len(got) != 0 {
+		t.Fatalf("child requests = %v, want none (the gateway does not declare the source)", got)
+	}
+
+	// Just short of the interval: still the memo.
+	a.collectOnce(context.Background())
+	if n := features.fetches(); n != 1 {
+		t.Fatalf("gateway feature fetches just short of the interval = %d, want still 1", n)
+	}
+
+	clk.advance(gatewayFeatureRecheckInterval)
+	a.collectOnce(context.Background())
+	if n := features.fetches(); n != 2 {
+		t.Fatalf("gateway feature fetches after the interval = %d, want 2 (one more for every child in the cycle)", n)
+	}
+	a.collectOnce(context.Background())
+	if n := features.fetches(); n != 2 {
+		t.Fatalf("gateway feature fetches on the cycle after that = %d, want still 2", n)
+	}
+}
+
+// TestGatewayDeclaresPicksUpAChangedAnswerAfterTheInterval pins the latency
+// the memo buys: a gateway that starts declaring the source (an upgrade to
+// #154) is not seen before gatewayFeatureRecheckInterval has passed since
+// the last question, and is seen on the first cycle after it, for every
+// child at once and without restarting any of them.
+func TestGatewayDeclaresPicksUpAChangedAnswerAfterTheInterval(t *testing.T) {
+	const children = 2
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"runtime_manager"}}
+	clk := newFakeClock()
+	a, poster := sdcppFleet(t, child, children, features, clk)
+
+	a.collectOnce(context.Background())
+	features.set([]string{"runtime_manager", "capability_source_sdcpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval - time.Second)
+	a.collectOnce(context.Background())
+	if got := child.requests(); len(got) != 0 {
+		t.Fatalf("child requests inside the interval = %v, want none (the memo still says the source is not declared)", got)
+	}
+	for _, rs := range poster.last().Runtimes {
+		if rs.Capabilities != nil {
+			t.Fatalf("%s: Capabilities inside the interval = %+v, want nil", rs.SpecID, rs.Capabilities)
+		}
+	}
+
+	clk.advance(time.Second)
+	a.collectOnce(context.Background())
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: children}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after the interval = %v, want %v (every child probes once the new answer is in)", got, want)
+	}
+	for _, rs := range poster.last().Runtimes {
+		if want := sdcppImage("yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+			t.Errorf("%s: Capabilities after the interval = %+v, want %+v", rs.SpecID, rs.Capabilities, want)
+		}
+	}
+	if n := features.fetches(); n != 2 {
+		t.Errorf("gateway feature fetches = %d, want 2 (one per interval, not one per child)", n)
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppRechecksTheGateOnACacheHit pins the
+// downgrade half. A child whose verdict was cached while the gateway
+// declared the source must stop sending it once the gateway no longer does
+// (a rollback to a build that would drop the sample's capability rows with a
+// warning every cycle), and must resume once it is declared again. The
+// cached entry is kept throughout, so resuming costs the child nothing: it
+// is asked exactly once, before the downgrade.
+func TestProbeRuntimeChildPropsSdcppRechecksTheGateOnACacheHit(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_sdcpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	clk := newFakeClock()
+	a.now = clk.now
+	st, base := child.status(t, "stable_diffusion_cpp", 7050)
+	probe := func() sample.RuntimeSample {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		return rs
+	}
+
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *sdcppImage("yes")) {
+		t.Fatalf("Capabilities = %+v, want %+v", rs.Capabilities, sdcppImage("yes"))
+	}
+
+	features.set([]string{"runtime_manager"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	rs := probe()
+	if rs.Capabilities != nil || rs.LiveProgressSupport != "" {
+		t.Fatalf("after the downgrade: Capabilities = %+v, LiveProgressSupport = %q, want nil and \"\" (the gateway no longer accepts the source)", rs.Capabilities, rs.LiveProgressSupport)
+	}
+	entry, ok := a.runtimeCapabilityCache[st.SpecID]
+	if !ok || entry.source != "sdcpp_capabilities" || entry.verdicts.Caps.Image != "yes" {
+		t.Fatalf("cache entry after the downgrade = %+v (present %v), want the image yes entry kept", entry, ok)
+	}
+
+	features.set([]string{"capability_source_sdcpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *sdcppImage("yes")) {
+		t.Fatalf("after the gateway declares the source again: Capabilities = %+v, want %+v", rs.Capabilities, sdcppImage("yes"))
+	}
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("child requests = %v, want %v (the kept entry answers; the child is not asked again)", got, want)
+	}
+	if n := features.fetches(); n != 3 {
+		t.Errorf("gateway feature fetches = %d, want 3 (one per interval)", n)
+	}
+}
+
+// TestProbeRuntimeChildPropsRetypedChildProbesItsNewDocument pins the spec
+// type in the capability cache key. A spec with no explicit type and an
+// sd-server binary is "custom" under a gateway that predates the
+// stable_diffusion_cpp type and "stable_diffusion_cpp" under one that knows
+// it. The type is launch metadata, so a gateway upgrade retypes the spec
+// with the same pid and model. Without the type in the key, the /props 404
+// cached while the child was "custom" would keep answering, and the sd
+// document would not be read until the child restarted.
+func TestProbeRuntimeChildPropsRetypedChildProbesItsNewDocument(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_sdcpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := child.status(t, "custom", 7060)
+
+	var rs sample.RuntimeSample
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+	if got, want := child.requests(), map[string]int{"GET /props": 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests as custom = %v, want exactly %v", got, want)
+	}
+	if rs.Capabilities == nil || rs.Capabilities.Source != "llama_cpp_props" || len(rs.Capabilities.Verdicts) != 0 {
+		t.Fatalf("Capabilities as custom = %+v, want an empty llama_cpp_props set (a conclusive 404)", rs.Capabilities)
+	}
+
+	st.Type = "stable_diffusion_cpp"
+	rs = sample.RuntimeSample{}
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+	if got, want := child.requests(), map[string]int{"GET /props": 1, sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after the retype = %v, want %v (the new type names a different document)", got, want)
+	}
+	if want := sdcppImage("yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities after the retype = %+v, want %+v", rs.Capabilities, want)
 	}
 }
 

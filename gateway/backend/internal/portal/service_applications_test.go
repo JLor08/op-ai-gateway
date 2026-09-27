@@ -3877,11 +3877,12 @@ func TestImageNoIsAReservedManualVerdict(t *testing.T) {
 	if !reservedManualVerdict(routing.CapabilityImage, routing.CapabilityNo) {
 		t.Error("(image, no) must be reserved")
 	}
-	// yes stays writable -- it is how an operator overrides the probe, and the
-	// only enablement path where the probe cannot reach (an agent-launched
-	// sd-server).
+	// yes stays writable -- it is the operator's override of the probe, and
+	// the enablement path where no probe verdict exists (an agent-launched
+	// sd-server child that has never run, or one whose agent predates the
+	// sdcpp_capabilities source).
 	if reservedManualVerdict(routing.CapabilityImage, routing.CapabilityYes) {
-		t.Error("(image, yes) must stay writable: it is the only enablement path where the sdcpp_capabilities probe cannot reach")
+		t.Error("(image, yes) must stay writable: it is the operator's override of the sdcpp_capabilities probe, and the enablement path for a child that has never run or an agent that predates the source")
 	}
 	// The reset is never refused, for any pair.
 	if reservedManualVerdict(routing.CapabilityImage, "") {

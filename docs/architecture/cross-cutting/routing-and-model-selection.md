@@ -563,48 +563,81 @@ alone serves nothing, though. A route without the flavor answers 404
 `routing.no_model_route` whatever its mapping's verdict: candidacy refuses an
 application without it, and the images relay refuses a spec without it.
 
-**Who writes the `image` verdict.** Three sources write it, and two of them
-reach an `sd-server`: the two below. The third, `ollama_api_show`, is the
-agent's probe of an Ollama model it launches, and it writes `image: yes` only
-(the first bullet says why).
+**Who writes the `image` verdict.** Three sources write it, and the first has
+two producers, one for each way an `sd-server` gets its own model: an
+**external** `stable_diffusion_cpp` application, and an **agent-launched**
+one. The third source, `ollama_api_show`, is the agent's probe of an Ollama
+model it launches, and it writes `image: yes` only (the first bullet says
+why).
 
-- **`sdcpp_capabilities`**, the gateway health loop's read of an **external**
-  `stable_diffusion_cpp` application's own `GET /sdcpp/v1/capabilities`
-  (`probeSdcppCapabilities`, `cmd/gateway/app_health.go`), on the
-  application's own health cadence and through the same prober and
-  outbound transport as every other application probe — never for an
-  off-mesh server under `netbird_only`. Its `supported_modes` list is
-  exhaustive, so a list containing `img_gen` writes `yes` and a list without
-  it writes a real `no`; a document with no list at all, an unreachable
-  server, a non-2xx status (even with a valid body) or an unreadable body
-  writes nothing, and the next tick asks again. That makes it the only source
-  that answers **image** in both directions. It is not the only source that
-  writes a real `no` — `llama_cpp_props` does, for `vision`, `video`, `audio`
-  and `tools` — and the only other probe that reports image at all,
-  `ollama_api_show`, can write `image: yes` and never `no`, because Ollama's
-  capability array is not exhaustive. The document's `model.stem` is used
-  **only to attribute** the verdict: it reaches the active mapping whose
-  `app_model_name` equals the stem (discovery names an sd mapping by
-  `/sdapi/v1/sd-models`' `model_name`, which equals the stem on the measured
-  server), a document naming no model reaches every active mapping of the
-  application (one endpoint serves one model), and a stem that matches no
-  mapping writes nothing and is logged at debug level. A verdict that reaches
-  no active mapping, named or not, leaves the pass's cadence key unstamped, so
-  the next health cycle asks again rather than one full interval later: the
-  mapping is created by the same cycle's `model_sync` reconcile, which runs
-  beside this pass, and a new model would otherwise stay without its first
-  verdict, and out of the portal chat, until the interval came round. The
-  stem itself is not stored. The source ranks 1 like every probe, so an operator's `manual`
-  verdict (rank 3) always wins and the probe can repair its own drift. It is
-  the writer `(image, no)` was reserved for in `reservedManualVerdicts`,
-  which still keeps that pair out of an operator's hands so that a manual
-  `no` cannot outrank it forever.
-- **`manual`**, the operator's `image: yes` on the mapping. It is the only
-  source of the verdict where the probe cannot reach: an **agent-launched**
-  `sd-server` is a `server_agent` mapping behind the agent's router, which
-  passes only `/props` through per model, so such a mapping gets no automatic
-  verdict and needs a manual one. It also needs `openai_images` on the
-  `server_agent` application and on its spec (§1, [Agent-Managed Model Runtime
+- **`sdcpp_capabilities`** answers **image** in both directions — its
+  document's `supported_modes` list is exhaustive, so a list containing
+  `img_gen` writes `yes` and a list without it writes a real `no` — from
+  whichever of its two producers can reach the server:
+  - The gateway's own health loop reads an **external** application's own
+    `GET /sdcpp/v1/capabilities` (`probeSdcppCapabilities`,
+    `cmd/gateway/app_health.go`), on the application's own health cadence and
+    through the same prober and outbound transport as every other application
+    probe — never for an off-mesh server under `netbird_only`. A document
+    with no list at all, an unreachable server, a non-2xx status (even with a
+    valid body) or an unreadable body writes nothing, and the next tick asks
+    again. The document's `model.stem` is used **only to attribute** the
+    verdict: it reaches the active mapping whose `app_model_name` equals the
+    stem (discovery names an sd mapping by `/sdapi/v1/sd-models`'
+    `model_name`, which equals the stem on the measured server), a document
+    naming no model reaches every active mapping of the application (one
+    endpoint serves one model), and a stem that matches no mapping writes
+    nothing and is logged at debug level. A verdict that reaches no active
+    mapping, named or not, leaves the pass's cadence key unstamped, so the
+    next health cycle asks again rather than one full interval later: the
+    mapping is created by the same cycle's `model_sync` reconcile, which runs
+    beside this pass, and a new model would otherwise stay without its first
+    verdict, and out of the portal chat, until the interval came round. The
+    stem itself is not stored.
+  - An **agent-launched** child is a `server_agent` mapping behind the
+    agent's router, which the health loop cannot reach — the router passes
+    only `/props` through per model. Instead the agent itself reads the
+    identical document over its own loopback connection to the child
+    (`collector.ProbeSdcppVerdicts`, issue #154) and reports the verdict up
+    the telemetry channel under this same source name, but only while the
+    gateway declares the agent feature `capability_source_sdcpp`: a gateway
+    that knows the `stable_diffusion_cpp` spec type but not this source would
+    otherwise drop the capability rows of every such sample, with a warning.
+    While the gateway does not declare it, the agent probes and caches
+    nothing for that child and does not send a verdict it cached earlier,
+    so a gateway upgrade takes effect without a child restart. The agent
+    asks the gateway at most once every 30 s, for all its sd children
+    together, so an upgrade or a rollback reaches it within about 30 s. The
+    ingest's acceptance itself does not depend on the feature. It accepts this
+    producer for the `image` row only — a live-progress verdict or any other
+    capability attributed to it is dropped with a warning, the same
+    false-provenance argument as the `ollama_api_show` refusals below
+    ([Agent-Managed Model Runtime
+    §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+
+  Either way the source ranks 1 like every probe, so an operator's `manual`
+  verdict (rank 3) always wins and the probe can repair its own drift. The
+  precedence is the same for both producers. They write the same rank-1
+  source into disjoint mappings, external applications on one side and
+  `server_agent` specs on the other, so neither can meet the other's row. It
+  is not the only source that writes a real `no` — `llama_cpp_props`
+  does, for `vision`, `video`, `audio` and `tools` — and the only other probe
+  that reports image at all, `ollama_api_show`, can write `image: yes` and
+  never `no`, because Ollama's capability array is not exhaustive. It is the
+  writer `(image, no)` was reserved for in `reservedManualVerdicts`, which
+  still keeps that pair out of an operator's hands so that a manual `no`
+  cannot outrank it forever.
+- **`manual`**, the operator's `image: yes` on the mapping. `sdcpp_capabilities`
+  leaves **one gap** for an agent-launched child: a spec that has never run
+  has produced no capability document for the agent to have read, and the
+  images gate refuses a request for a mapping without an `image: yes` verdict
+  before the router could even start the child — so an unpinned spec's very
+  first request has nothing to read. Pinning the spec (so it starts with the
+  agent), starting it once, or setting the verdict by hand all clear it; the
+  manual verdict is also the only path for an agent or gateway that predates
+  the source. An agent-launched mapping also needs `openai_images` on the
+  `server_agent` application and on its spec (§1,
+  [Agent-Managed Model Runtime
   §3.4](agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp)).
 
 **Four places apply it**, three of them ordinary candidate filters and one a

@@ -1125,9 +1125,11 @@ func TestIngestAReservedLiveProgressVerdictLosesToTheDedicatedField(t *testing.T
 // makes the OPEN capability vocabulary safe to feed from an upstream one,
 // for the two names it has covered from the start: "mtp" and "live_progress"
 // may not arrive from an agent-reported probe source, whichever of the two
-// probes is claimed. reservedAgentCapabilityNames holds a THIRD name,
-// "speculation_observed", whose own case turns on a different argument (a
-// tie the gateway never repairs) and is pinned separately by
+// open-list probes is claimed (the sdcpp probe answers image alone, which
+// TestIngestDropsNonImageRowsFromTheSdcppProbe pins).
+// reservedAgentCapabilityNames holds a THIRD name, "speculation_observed",
+// whose own case turns on a different argument (a tie the gateway never
+// repairs) and is pinned separately by
 // TestIngestDropsAnAgentReportedSpeculationVerdict.
 //
 // Both names here are ones this codebase reasons about and neither probe can
@@ -1697,8 +1699,10 @@ func TestIngestProbeOverwritesItsOwnAndLegacyVerdicts(t *testing.T) {
 // capability tooltip stamped "llama_cpp_props" -- a false attribution on the
 // one column whose whole job is to say who said this.
 //
-// The three accepted inputs and their rows, each on its own mapping so no
-// subtest can be satisfied by another's write:
+// Three of the accepted inputs and their rows, each on its own mapping so no
+// subtest can be satisfied by another's write (the fourth, the reported
+// sdcpp_capabilities, may speak about image only and is pinned by
+// TestIngestLandsTheSdcppProbesImageVerdictInBothDirections):
 //
 //   - the reported ollama_api_show lands rows sourced ollama_api_show;
 //   - the reported llama_cpp_props lands rows sourced llama_cpp_props;
@@ -1788,11 +1792,11 @@ func TestIngestStampsTheSourceTheAgentReported(t *testing.T) {
 // column exists to prevent -- while dropping leaves the capability UNKNOWN,
 // which this model expresses natively as the absence of a row.
 //
-// Three inputs, and the last two are why the allowlist is exactly the two
-// PROBE sources rather than a typo filter: an agent has no standing to claim
-// "manual" (rank 3, "an operator said so") or "vision_benchmark" (rank 2, a
-// real image actually sent to the real upstream). A blind write would put
-// either lie in front of an operator AND, through
+// Three inputs, and the last two are why the allowlist is exactly the PROBE
+// sources an agent runs rather than a typo filter: an agent has no standing
+// to claim "manual" (rank 3, "an operator said so") or "vision_benchmark"
+// (rank 2, a real image actually sent to the real upstream). A blind write
+// would put either lie in front of an operator AND, through
 // capabilitySourceRank's default branch ranking an unknown source at 1, let
 // an unknown-provenance verdict overwrite a real probe's row at equal rank.
 //
@@ -2093,6 +2097,221 @@ func TestIngestRefusesANegativeVerdictFromTheOllamaProbe(t *testing.T) {
 	if recs := buf.Snapshot(); !findLogRecord(recs, "WARN", "negative verdict") {
 		t.Fatalf("no WARN record about the dropped negative verdicts at the gateway's own default level (info); records = %+v", recs)
 	}
+}
+
+// sdcppWarnRecord returns the first WARN record whose message contains
+// substr and whose source attr is sdcpp_capabilities. Callers pass the
+// fragment that names the sdcpp probe itself: the source attr alone does not
+// keep the sdcpp refusals apart from their ollama_api_show siblings, because
+// the ollama live-progress case logs whatever source it was handed, so a
+// sample routed into it by mistake would still carry
+// source=sdcpp_capabilities.
+func sdcppWarnRecord(recs []logbuffer.Record, substr string) (logbuffer.Record, bool) {
+	for _, r := range recs {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, substr) {
+			continue
+		}
+		if got, _ := r.Attrs["source"].(string); got == routing.CapabilitySourceSdcppCapabilities {
+			return r, true
+		}
+	}
+	return logbuffer.Record{}, false
+}
+
+// TestIngestLandsTheSdcppProbesImageVerdictInBothDirections pins the
+// sdcpp_capabilities source as one this ingest ACCEPTS: an agent that read
+// an agent-launched sd-server's /sdcpp/v1/capabilities document reports the
+// image verdict under that source, and the row lands on the spec's mapping
+// stamped with it.
+//
+// Both directions, and the "no" is the half that sets this source apart.
+// supported_modes is exhaustive, so a document whose list lacks img_gen is a
+// real "no" for image (routing.CapabilitySourceSdcppCapabilities' doc) --
+// unlike ollama_api_show, whose "no" rows this boundary refuses because that
+// document can never produce one. A refusal that forgot to check WHICH source
+// it guards would drop this row, and the "no" subtest is what fails then.
+func TestIngestLandsTheSdcppProbesImageVerdictInBothDirections(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, verdict string
+	}{
+		{"an img_gen-serving document lands image yes", "rspec_sdcpp_yes", routing.CapabilityYes},
+		{"a document without img_gen lands image no", "rspec_sdcpp_no", routing.CapabilityNo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"image","verdict":"`+tc.verdict+`"}],"source":"sdcpp_capabilities"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- sdcpp_capabilities is a source this gateway can attribute", got)
+			}
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityImage {
+				t.Fatalf("the write carried %+v, want exactly the image row", sent)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityImage, tc.verdict, routing.CapabilitySourceSdcppCapabilities)
+		})
+	}
+}
+
+// TestIngestDropsNonImageRowsFromTheSdcppProbe pins the rule that confines
+// sdcpp_capabilities to the one capability its document answers. The
+// document says which modes the server serves; it says nothing about vision,
+// tools or anything else, so a row under this source for any other
+// capability is a false provenance -- the argument that refuses the
+// ollama_api_show shapes it cannot produce, applied to a document that can
+// produce only one row.
+//
+// Only the foreign rows go, and both directions of them: vision "yes" and
+// tools "no" are dropped alike, while the image verdict in the same document
+// still lands. Unfalsifiable the way its ollama siblings are: the mapping
+// already holds vision "no" from the OTHER probe at EQUAL rank, which a
+// leaked "yes" would flip, and the image row proves the write path ran. The
+// drop is visible at the level a real gateway runs at, and the record names
+// what was dropped.
+func TestIngestDropsNonImageRowsFromTheSdcppProbe(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_foreign", false)
+	seedCapabilityRow(t, srv, "map_rspec_sdcpp_foreign", routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_sdcpp_foreign",
+		`{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"},`+
+			`{"name":"image","verdict":"yes"}],"source":"sdcpp_capabilities"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the image row alone)", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityImage {
+		t.Fatalf("the write carried %+v, want exactly the image row -- the sdcpp document answers image and nothing else", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_sdcpp_foreign", routing.CapabilityImage,
+		routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+	assertCapabilityRow(t, srv, "map_rspec_sdcpp_foreign", routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if row, ok := capabilityRow(t, srv, "map_rspec_sdcpp_foreign", routing.CapabilityTools); ok {
+		t.Fatalf("a tools row exists (%+v), want none -- the sdcpp document cannot speak about tools", row)
+	}
+
+	recs := buf.Snapshot()
+	rec, ok := sdcppWarnRecord(recs, "non-image capability to the sdcpp probe")
+	if !ok {
+		t.Fatalf("no WARN record about the dropped non-image rows at the gateway's own default level (info); records = %+v", recs)
+	}
+	if got, _ := rec.Attrs["capabilities"].([]string); !reflect.DeepEqual(got, []string{routing.CapabilityVision, routing.CapabilityTools}) {
+		t.Fatalf("WARN record capabilities attr = %#v, want [vision tools] -- the record must name what was dropped", rec.Attrs["capabilities"])
+	}
+	if got, _ := rec.Attrs["spec_id"].(string); got != "rspec_sdcpp_foreign" {
+		t.Fatalf("WARN record spec_id attr = %q, want rspec_sdcpp_foreign", got)
+	}
+}
+
+// TestIngestRefusesALiveProgressRowFromTheSdcppProbe is the live-progress
+// refusal for the sdcpp_capabilities source, in either direction. sd-server
+// exposes no timings surface, so its capability document is evidence for
+// neither answer, and a live_progress row attributed to it would be a false
+// provenance whatever verdict it carried -- the same argument that refuses
+// the combination under ollama_api_show.
+//
+// No honest agent sends it (ProbeSdcppVerdicts leaves LiveProgress "" on
+// every path), which is why the refusal lives at the boundary where the
+// agent's bytes arrive. The pass is NOT voided: the image verdict is what the
+// document can answer, so it still lands.
+func TestIngestRefusesALiveProgressRowFromTheSdcppProbe(t *testing.T) {
+	for _, support := range []string{"supported", "unsupported"} {
+		t.Run(support, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_lp", false)
+			counting := countingRowStore(srv)
+
+			body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+				`"runtimes":[{"spec_id":"rspec_sdcpp_lp","state":"running","live_progress_support":"` + support + `",` +
+				`"capabilities":{"verdicts":[{"name":"image","verdict":"yes"}],"source":"sdcpp_capabilities"}}]}`
+			req, raw := ingestReq(t, body)
+			if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the image row alone)", got)
+			}
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityImage {
+				t.Fatalf("the write carried %+v, want exactly the image row -- only the row the sdcpp document could not have produced may be dropped", sent)
+			}
+			assertCapabilityRow(t, srv, "map_rspec_sdcpp_lp", routing.CapabilityImage,
+				routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+			if row, ok := capabilityRow(t, srv, "map_rspec_sdcpp_lp", routing.CapabilityLiveProgress); ok {
+				t.Fatalf("a live_progress row exists (%+v), want none -- sd-server exposes no timings surface, so its document is evidence for neither answer", row)
+			}
+			recs := buf.Snapshot()
+			if _, ok := sdcppWarnRecord(recs, "live-progress verdict to the sdcpp probe"); !ok {
+				t.Fatalf("no WARN record about the dropped live-progress row under sdcpp_capabilities at the gateway's own default level (info); records = %+v", recs)
+			}
+		})
+	}
+}
+
+// TestIngestSdcppImageVerdictDoesNotOverwriteAManualVerdict pins that the
+// new source ranks like every probe (rank 1 through capabilitySourceRank's
+// default branch): an operator's manual image "no" -- a row the portal no
+// longer lets anyone state, but one a deployment may already hold -- is not
+// talked over by the probe's "yes". The rule is routing.WritableCapabilityRows',
+// asked rather than restated.
+//
+// The sdcpp document answers image and nothing else, so the "second,
+// unmanaged verdict in the same document" trick its siblings use is not
+// available here. The control is a second runtime in the SAME sample instead:
+// a second model of the same application, whose mapping holds no image row at
+// all. Exactly one write must fire, and it must be the control's, so "nothing
+// was written to the managed mapping" cannot be satisfied by a write path
+// that had simply stopped working.
+func TestIngestSdcppImageVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_sdcpp_manual", false)
+	now := time.Now().UTC()
+	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{
+		ID: "map_rspec_sdcpp_manual_ctl", ApplicationID: "app_rspec_sdcpp_manual",
+		GatewayModelName: "runtime-model-ctl", AppModelName: "runtime-model-ctl",
+		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create control mapping: %v", err)
+	}
+	if err := srv.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: "rspec_sdcpp_manual_ctl", MappingID: "map_rspec_sdcpp_manual_ctl", Enabled: true,
+		Binary: "/usr/bin/sd-server", Args: "[]", Env: "{}", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("upsert control runtime spec: %v", err)
+	}
+	seedCapabilityRow(t, srv, "map_rspec_sdcpp_manual", routing.CapabilityImage,
+		routing.CapabilityNo, routing.CapabilitySourceManual)
+	counting := countingRowStore(srv)
+
+	const caps = `"capabilities":{"verdicts":[{"name":"image","verdict":"yes"}],"source":"sdcpp_capabilities"}`
+	body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},"runtimes":[` +
+		`{"spec_id":"rspec_sdcpp_manual","state":"running",` + caps + `},` +
+		`{"spec_id":"rspec_sdcpp_manual_ctl","state":"running",` + caps + `}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the control mapping's image row)", got)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_sdcpp_manual", routing.CapabilityImage,
+		routing.CapabilityNo, routing.CapabilitySourceManual)
+	assertCapabilityRow(t, srv, "map_rspec_sdcpp_manual_ctl", routing.CapabilityImage,
+		routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
 }
 
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities

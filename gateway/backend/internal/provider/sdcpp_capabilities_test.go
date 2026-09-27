@@ -4,11 +4,13 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"testing"
 )
 
@@ -167,4 +169,104 @@ func TestProbeSdcppCapabilitiesEdges(t *testing.T) {
 			t.Fatalf("X-Api-Key = %q, want sd-secret", gotAuth)
 		}
 	})
+}
+
+// sdcppImageCases is the verdict table for the stable-diffusion.cpp
+// capability document. It is duplicated VERBATIM in
+// server-agent/internal/collector/sdcpp_test.go, because the two Go modules
+// share no package and each keeps its own copy of the rule
+// (parseSdcppCapabilities here, parseSdcppCapabilities there). The two
+// copies must decide identically on identical input: if a case fails, fix
+// the parser, not this table, and change both tables together.
+// TestSdcppImageCasesMatchTheAgentsTable below fails when the two
+// declarations differ by a byte.
+var sdcppImageCases = []struct {
+	name      string
+	body      string
+	wantImage string // "yes" | "no" | ""
+	wantErr   bool
+}{
+	{"img_gen listed", `{"supported_modes":["img_gen"]}`, "yes", false},
+	{"img_gen among others", `{"supported_modes":["vid_gen","img_gen"]}`, "yes", false},
+	{"img_gen padded", `{"supported_modes":[" img_gen "]}`, "yes", false},
+	{"exhaustive list without img_gen", `{"supported_modes":["vid_gen"]}`, "no", false},
+	{"case variant is not img_gen", `{"supported_modes":["IMG_GEN"]}`, "no", false},
+	{"longer mode is not img_gen", `{"supported_modes":["img_gen_edit"]}`, "no", false},
+	{"empty list is exhaustive", `{"supported_modes":[]}`, "no", false},
+	{"absent list is no answer", `{"model":{"stem":"flux1-dev"}}`, "", false},
+	{"null list is no answer", `{"supported_modes":null}`, "", false},
+	{"unrelated fields ignored", `{"supported_modes":["img_gen"],"limits":{"max":4},"output_formats":["png"]}`, "yes", false},
+	{"list of the wrong type", `{"supported_modes":"img_gen"}`, "", true},
+	{"non-string entry", `{"supported_modes":[1]}`, "", true},
+	{"model of the wrong type", `{"supported_modes":["img_gen"],"model":"flux1-dev"}`, "", true},
+	{"stem of the wrong type", `{"supported_modes":["img_gen"],"model":{"stem":1}}`, "", true},
+	{"not JSON", `<html>502</html>`, "", true},
+}
+
+func TestParseSdcppCapabilitiesTwinTable(t *testing.T) {
+	for _, tc := range sdcppImageCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseSdcppCapabilities([]byte(tc.body))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got.Image != tc.wantImage {
+				t.Fatalf("Image = %q, want %q", got.Image, tc.wantImage)
+			}
+		})
+	}
+}
+
+// agentSdcppCasesPath is the agent's copy of sdcppImageCases, relative to
+// this package's directory, where go test runs it. Both Go modules live in
+// one repository, and CI checks the whole repository out before it tests
+// this module (the same path prefix as agent_binaries_test.go's golden and
+// runtime_logs_viewer_test.go's gwapi.go read).
+const agentSdcppCasesPath = "../../../../server-agent/internal/collector/sdcpp_test.go"
+
+// sdcppImageCasesBlock returns src's `var sdcppImageCases = ...` declaration,
+// from its first line through the first line that is exactly "}", or nil
+// when src declares no such table.
+func sdcppImageCasesBlock(src []byte) []byte {
+	start := bytes.Index(src, []byte("\nvar sdcppImageCases = "))
+	if start < 0 {
+		return nil
+	}
+	start++ // drop the newline before the declaration
+	end := bytes.Index(src[start:], []byte("\n}\n"))
+	if end < 0 {
+		return nil
+	}
+	return src[start : start+end+len("\n}")]
+}
+
+// TestSdcppImageCasesMatchTheAgentsTable holds the two copies of
+// sdcppImageCases identical. Each copy is pinned against its own module's
+// parseSdcppCapabilities, so a change to one parser together with its own
+// table would pass both suites while the two rules drift apart. This reads
+// the agent's test file off disk and compares the two declarations byte for
+// byte. Both extracts must be non-empty: a renamed or reshaped table would
+// otherwise compare nothing with nothing and pass.
+func TestSdcppImageCasesMatchTheAgentsTable(t *testing.T) {
+	const ownPath = "sdcpp_capabilities_test.go"
+	own, err := os.ReadFile(ownPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ownPath, err)
+	}
+	agent, err := os.ReadFile(agentSdcppCasesPath)
+	if err != nil {
+		t.Fatalf("read the agent's copy %s: %v (the two modules are one repository, and this check needs both)", agentSdcppCasesPath, err)
+	}
+	ownBlock, agentBlock := sdcppImageCasesBlock(own), sdcppImageCasesBlock(agent)
+	if len(ownBlock) == 0 {
+		t.Fatalf("no `var sdcppImageCases = ...` declaration ending in a line \"}\" found in %s", ownPath)
+	}
+	if len(agentBlock) == 0 {
+		t.Fatalf("no `var sdcppImageCases = ...` declaration ending in a line \"}\" found in %s", agentSdcppCasesPath)
+	}
+	if !bytes.Equal(ownBlock, agentBlock) {
+		t.Fatalf("sdcppImageCases differs between gateway/backend/internal/provider/sdcpp_capabilities_test.go and "+
+			"server-agent/internal/collector/sdcpp_test.go. The two parseSdcppCapabilities copies must decide identically: "+
+			"change both tables, and both parsers, together.\n--- gateway\n%s\n--- agent\n%s", ownBlock, agentBlock)
+	}
 }

@@ -232,11 +232,13 @@ arbitrary code execution on every AI server.
 ## ADR-025 — Agent capabilities negotiate by named feature flags, not versions
 **Context:** the agent and gateway ship and upgrade independently, and version
 comparison is fragile under forks and backports. **Decision:** gateway and agent
-each declare a list of **named feature flags**, and a feature is active if and
-only if a string-equal name appears on both lists. Agent → gateway rides the
-telemetry sample's existing `capabilities` object; gateway → agent is an
-ETag-conditional `GET /api/agent/v1/features` — deliberately not a hello frame,
-so it works identically for POST and WebSocket agents. Negotiation is re-decided
+each declare a list of **named feature flags**, and a flag both sides declare is
+active if and only if a string-equal name appears on both lists; a flag that
+states a fact about one side alone need only be on that side's list (below).
+Agent → gateway rides the telemetry sample's existing `capabilities` object;
+gateway → agent is an ETag-conditional `GET /api/agent/v1/features` —
+deliberately not a hello frame, so it works identically for POST and WebSocket
+agents. Negotiation is re-decided
 continuously, not at boot. Unknown names are ignored on both sides; a missing or
 empty list, and a 404 on the features endpoint, all read as the empty set. One
 flag per **shipped** capability. **Consequence:** `if agent_version >= X` is not
@@ -256,6 +258,16 @@ every older binary or abandon the report for everyone. The pattern to follow:
 **when the absence of a message is the thing you have to interpret, the flag
 gates the FALLBACK rather than the feature** — the behaviour without it is a
 weaker but correct path, never "off".
+
+The mirror image exists too: a fact the **gateway** states about itself, on the
+gateway's list alone. `capability_source_sdcpp` (issue #154) says the gateway's
+capability ingest accepts the `sdcpp_capabilities` source, and the agent reads
+it before it sends that source at all, because a gateway without the name
+would void every such capability pass. The agent declares nothing back: the
+gateway is the side that must accept the source, nothing on the gateway waits
+on the agent, and an agent-side name would therefore gate nothing — so a flag
+on one list only is not a half-finished negotiation, it is the name placed on
+the side whose fact it is.
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-026 — Gateway→agent control is desired state, not commands
@@ -891,6 +903,30 @@ decision (one endpoint, many models, so one `/api/show` per mapping per
 cycle); `/api/ps` as the context source, a different quantity from the model
 maximum; and any widening of the agent router's `GET`-only upstream
 allowlist.
+**Extended by issue #154: a THIRD agent detector over a third document, and
+the only one of the three that answers a single capability.**
+`ProbeSdcppVerdicts` (`server-agent/internal/collector/sdcpp.go`) reads an
+agent-launched `stable_diffusion_cpp` child's `GET /sdcpp/v1/capabilities`
+and answers `image` alone, in both directions: `supported_modes` is
+exhaustive, so a list holding `img_gen` is `yes`, a list without it is a real
+`no`, and a document with no list answers nothing. Its rule is a twin of the
+gateway's `parseSdcppCapabilities` (`internal/provider/sdcpp_capabilities.go`),
+which reads the same document for an external application, under the drift
+discipline above: the two must decide identically on identical input, and a
+case table duplicated verbatim in both modules' tests pins both. The sample
+names it `sdcpp_capabilities`, which ranks 1 through the same default branch
+with no rank-table edit, so the ingest boundary now accepts **three** probe
+names rather than two, and still voids the whole pass for anything else. The
+third is accepted for the `image` row only: a live-progress verdict or any
+other capability claimed under it is dropped row by row, at `Warn`, because
+the document cannot have answered it. And unlike the first two, the agent runs
+this detector, and sends a verdict it cached from it, only while the gateway
+declares the feature `capability_source_sdcpp`, since a gateway that predates
+the source would void the pass of every such sample. It asks the gateway at
+most once every 30 s, for all such children together
+([ADR-044 (e)](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor),
+[Telemetry, Usage Analytics & Observability
+§8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
 **Consequence:** the detector, its evidence rule and its refusals are what
 this decision durably records. **Where the verdicts LAND is no longer this
 decision's** — the first shape did not survive contact with the operator's
@@ -1674,7 +1710,10 @@ upgrade step adds it to a route that served images through `openai` before the
 split (ADR-044's consequence). The day-one cost changed shape with
 it: an external stable-diffusion.cpp application gets the flavor from its
 type's default and its `image` verdict from that probe, while an agent-launched
-one needs an operator for both. (d) is narrowed rather than closed — see
+one needs an operator for the flavor and gets its `image` verdict from its own
+agent's read of the same document
+([ADR-044 (e)](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)),
+except before it has first run. (d) is narrowed rather than closed — see
 ADR-044 (f). And the
 affinity premise of the Rejected "gating inside `affinityApplicationStale`"
 no longer holds for images: `AffinityKey.APIFlavor` is still coarse, but the
@@ -2073,13 +2112,23 @@ path still works
 ([Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp)).
 
 **(e) `sdcpp_capabilities` is the writer ADR-042 (b) reserved `(image, no)`
-for.** The gateway's health loop reads an external application's
-`/sdcpp/v1/capabilities`, whose `supported_modes` list is exhaustive, so it is
-the only source that answers `image` in both directions. It ranks 1 like every
-probe, so an operator's verdict always wins, and it uses the document's
-`model.stem` only to attribute a verdict to the mapping of that name — the stem
-is not stored. It cannot reach an agent-launched server, whose router passes
-only `/props` through per model, so such a mapping needs a manual `image: yes`
+for, and it now has two producers.** The gateway's health loop reads an
+**external** application's `/sdcpp/v1/capabilities` directly; an
+**agent-launched** child's own agent reads the identical document behind the
+agent's router — which the health loop cannot reach, since the router passes
+only `/props` through per model — and reports the verdict up the telemetry
+channel under the same source name, but only while the gateway declares the
+agent feature `capability_source_sdcpp` (issue #154). Either way
+`supported_modes` is exhaustive, so it is the only source that answers
+`image` in both directions, it ranks 1 like every probe so an operator's
+verdict always wins, and the health loop's copy uses the document's
+`model.stem` only to attribute a verdict to the mapping of that name — the
+stem is not stored. The one remaining gap is a spec that has never run: the
+images gate needs a `yes` verdict before the router will even start an
+agent-launched child for an image request, and a child that has never run has
+produced no document for either reader to have read. An operator's manual
+`image: yes` still covers that first request, and it still wins forever after
+by rank
 ([Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
 
 **(f) The portal listing carries `openai_images`, and `/v1/models` does not.**

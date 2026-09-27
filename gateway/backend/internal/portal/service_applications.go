@@ -288,16 +288,18 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// prevents is a permanent veto -- a manual row is rank 3, outranks every
 	// automated source, and nothing re-derives it, so a manual `no` would
 	// outrank the writer entitled to establish it forever, against a
-	// genuinely capable model. That writer is the gateway health loop's read
-	// of a stable_diffusion_cpp application's own /sdcpp/v1/capabilities
-	// (routing.CapabilitySourceSdcppCapabilities), the first source whose
-	// image "no" is real, because its supported_modes list is exhaustive
-	// (Ollama's declared-capability array, the only other probe that reports
-	// image at all, is not, so it can only say yes). (image, yes)
-	// stays writable: it is how an operator overrides that probe, and it is
-	// the only enablement path where the probe cannot reach -- an
-	// agent-launched sd-server, a server_agent mapping whose router passes
-	// only /props through.
+	// genuinely capable model. That writer is a read of stable-diffusion.cpp's
+	// own /sdcpp/v1/capabilities (routing.CapabilitySourceSdcppCapabilities),
+	// by either of its two producers: the gateway health loop's, for a
+	// stable_diffusion_cpp application, and the agent's, for an sd-server
+	// child it launched. It is the first source whose image "no" is real,
+	// because its supported_modes list is exhaustive (Ollama's
+	// declared-capability array, the only other probe that reports image at
+	// all, is not, so it can only say yes). (image, yes) stays writable: it
+	// is the operator's override of that probe, and it remains the
+	// enablement path where no probe verdict exists -- an agent-launched
+	// sd-server child that has never run, so nothing has read its document
+	// yet, or one whose agent predates the source and so never reports it.
 	routing.CapabilityImage: {routing.CapabilityNo: true},
 }
 

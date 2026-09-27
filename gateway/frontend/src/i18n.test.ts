@@ -2966,11 +2966,21 @@ describe('stable-diffusion.cpp strings name what the operator sees', () => {
       );
     });
 
-    // The image verdict has two automatic sources, not one: the gateway's
-    // sdcpp_capabilities probe and the agent's Ollama /api/show probe.
-    it(`names both automatic image-verdict sources in the mapping hint (${locale})`, () => {
+    // The image verdict is detected automatically in three cases: the
+    // gateway's read of an external stable-diffusion.cpp application's
+    // capability document, the agent's read of the same document for an
+    // sd-server it launches, and the agent's Ollama /api/show probe.
+    it(`names the automatic image-verdict sources in the mapping hint (${locale})`, () => {
       expect(t.mappingImageCapableUnknownHint).toContain('stable-diffusion.cpp');
       expect(t.mappingImageCapableUnknownHint).toContain('Ollama');
+    });
+
+    // The agent can read an sd-server's document only once the child has
+    // run, and the images gate refuses the request that would start it. So
+    // the hint sends the operator to the control that starts a launch spec
+    // without a request, named by the label the form shows.
+    it(`names the pinned control for a launch spec that has never run in the mapping hint (${locale})`, () => {
+      expect(t.mappingImageCapableUnknownHint).toContain(t.runtimeSpecPinned);
     });
   }
 });
