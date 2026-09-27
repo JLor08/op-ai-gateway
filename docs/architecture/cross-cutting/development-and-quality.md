@@ -167,10 +167,19 @@ reports success on a broken corpus is worse than no checker.
 - **Docs job**: `sh scripts/check-docs.test.sh` then `./scripts/check-docs.sh`
   ([§4.1](#41-documentation-consistency-make-lint-docs)). No toolchain setup —
   it needs only the checkout.
+- **Sonar tooling job**: `sh scripts/sonar/branch-findings.test.sh` and
+  `bash scripts/sonar/sonar.test.sh`, the offline tests of the local SonarQube
+  gate's scripts ([§7](#7-sonarqube-quality-gate-local)). The gate itself stays
+  out of CI; these need only the checkout, `git` and `jq`, and the job fails
+  rather than skips when `jq` is missing.
 - **Frontend job**: `npm ci`, `npm run format:check`, `npm run lint`,
   `npm run build` (the type-checked build is the i18n de/en parity guard —
   `en: PortalMessages` fails to compile on a missing or excess key), and
   `npm test`.
+- **E2E runtime job**: installs the frontend and e2e dependencies and
+  Chromium, warms the Go build cache for the gateway, the agent and the
+  suite's stub server, and runs `npm run e2e:runtime` — the one Playwright
+  suite CI runs ([§6.1](#61-e2eruntime--the-one-suite-with-real-child-processes)).
 
 ## 6. Test suites
 
@@ -259,8 +268,8 @@ reports success on a broken corpus is worse than no checker.
   such a change.
 
 > **Only `e2e:runtime` runs in CI; the other 19 Playwright suites do not.**
-> `.github/workflows/ci.yml` has four jobs — `go`, `docs`, `frontend`, and
-> `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
+> `.github/workflows/ci.yml` has five jobs — `go`, `docs`, `sonar-scripts`,
+> `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
 > least-exercised subsystem, and the one whose three-commit regression no gate
 > noticed — issue #24). Every **other** suite is still a **local-only gate a
 > pull request can pass without running**: `make test-e2e` runs the base suite
@@ -370,7 +379,8 @@ they are precondition, not the feature under test.
 A self-hosted **SonarQube Community Build** provides static analysis and a
 quality gate that a coding agent can run and act on headlessly. It is a
 **local development tool, deliberately not part of CI**: the server runs via
-`scripts/sonar/docker-compose.yml` bound to `127.0.0.1:9000` only, and its
+`scripts/sonar/docker-compose.yml` bound to `127.0.0.1:9000` only, on a pinned
+image ([§7.2](#72-pinned-images-and-deliberate-upgrades)), and its
 generated credentials live in the gitignored `.sonar-local/` (0700/0600) —
 never in the repository. The docker volumes are globally named, so they are
 shared across every git worktree on the same docker daemon; `.sonar-local/`
@@ -389,7 +399,7 @@ Lifecycle (`scripts/sonar/sonar.sh`, wrapped by make targets):
 | `make sonar-findings` | Exports open issues + hotspots as JSON into `.sonar-local/`, and records which analysis the export describes (`analysis-meta.json`: SCM revision + date) so a stale export can be detected |
 | `make sonar-branch-findings` | Filters that export down to the findings on lines **this branch** changed (see below); the **authoritative pre-PR gate** — exits non-zero when the branch owns one, and refuses a stale export whose revision is not `HEAD` |
 | `make sonar-down` | Stops the server (data volume kept) |
-| `sonar.sh purge` | Destroys the server **including** its database — resets credentials **and the new-code baseline** |
+| `sonar.sh purge` | Destroys the server **including** its database — resets credentials **and the new-code baseline**, and drops the recorded server version ([§7.2](#72-pinned-images-and-deliberate-upgrades)) |
 
 Semantics and policy:
 
@@ -496,6 +506,95 @@ Operational notes (encoded in `sonar-project.properties` comments):
   Docker's memory limit — an unbounded bridge balloons into the VM's OOM
   killer and the scan dies with `EXECUTION FAILURE` (which is otherwise safe
   to retry).
+
+### 7.2 Pinned images and deliberate upgrades
+
+Both images are pinned to exact releases: the server in
+`scripts/sonar/docker-compose.yml` (`sonarqube:26.8.0.126808-community`), the
+scanner in `scripts/sonar/sonar.sh`
+(`sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1`). A floating tag is not an
+option for the server. It keeps everything — credentials, analyses, the
+new-code baseline — in its **embedded H2 database** on the
+`op-ai-gateway-sonar-data` volume, and SonarQube cannot move an embedded
+database to another release, in either direction (measured with 26.8.0 and
+26.9.0):
+
+- **A newer server on an older volume** stays in status `DB_MIGRATION_NEEDED`,
+  and `POST /api/system/migrate_db` answers `NOT_SUPPORTED` ("Upgrade is not
+  supported on embedded database").
+- **An older server on a newer volume** never answers — `/api/system/status`
+  stays unreachable — and its container exits, with code 0, after logging
+  "Database was upgraded to a more recent version of SonarQube".
+
+With a floating tag such as `sonarqube:community`, the first case strikes the
+day a newer image is pulled, and both look like a slow start: a plain wait
+sits out its whole timeout before a bare "timed out waiting for SonarQube".
+`sonar.sh up` — and `scan`, when it has to start the server — therefore fails
+fast in both cases. It stops the container, leaves the volume untouched, and
+names the two ways out:
+
+1. **Keep the local data** by running the image that matches the volume:
+   `export SONAR_IMAGE=sonarqube:<version>-community`. The override is not
+   remembered, so it has to be set for every `sonar.sh` and `make sonar-*`
+   call, until this worktree's branch pins that release or until you purge
+   (unset it before the purge); `up`, a `scan` that starts the server, and
+   `purge` print a note while it is set. Bootstrap — which every `up`, `scan`
+   and `gate` runs, while `findings` does not — records the UP server's
+   version in `.sonar-local/server-version`, so the message can name the
+   image. A record that names the very release that just failed is stale — the
+   volume was recreated by something that does not keep the record, such as
+   an older `sonar.sh` — and is ignored whenever the failing release can be
+   read (from the status endpoint, or from the image's `SONAR_VERSION`);
+   without a usable record the message says how to read an image's release
+   from its `SONAR_VERSION`.
+2. **Start fresh** with `sonar.sh purge && sonar.sh up`, after
+   `unset SONAR_IMAGE`: an override that is still set would create the fresh
+   volume on its own release, and the message adds the `unset` whenever one
+   is. The purge deletes every local analysis, the new-code baseline and the
+   admin credentials, and drops the record; bootstrap mints new credentials,
+   and the next scan sets a new baseline (§7).
+
+`SONAR_SCANNER_IMAGE` overrides the scanner the same way, and
+`SONAR_SCANNER_OPTS` sets the scanner's JVM options (default `-Xmx2048m`). The
+scanner keeps no state, but it is pinned too, so the gate is the same
+known-good pair on every machine: a floating `latest` scanner can move ahead
+of the pinned server it has to talk to.
+
+**Upgrading deliberately.** Moving a pin is an ordinary change made through a
+pull request, and the server pin resets every developer's local Sonar data:
+
+1. Pick the release's full tag, `sonarqube:<version>-community` with the build
+   number (for example `26.9.0.129388-community`) — never `community`,
+   `lts-community` or another tag that moves.
+2. Bump it in `docker-compose.yml`, and the scanner in `sonar.sh` when the new
+   server needs a newer one. Check the server's release notes for the minimum
+   scanner version.
+3. Once the change is on `main`, each developer runs `unset SONAR_IMAGE;
+   sonar.sh purge && make sonar-up` once. Until then, `SONAR_IMAGE` keeps the
+   old server running against the old volume.
+4. Re-check the version-specific statements in §7 against the new release, such
+   as the SCM blame measurement above.
+
+The volume is shared by every worktree on the docker daemon (§7), but each
+worktree takes the pin from its own `docker-compose.yml`. After the purge, a
+worktree whose branch predates the bump still pins the old release: starting
+the server there recreates the one container on the old image, which then
+fails as an older server on a newer volume. In such a worktree, take way 1
+(export the new release) or rebase onto `main` — not way 2, which would move
+the volume back to the old release and make every up-to-date worktree fail
+the other way. While the author of the bump tests it before it lands, the
+author's purge puts the volume ahead of every other worktree, `main`'s
+included; they fail the same way, and until the bump lands only way 1 helps,
+since `main` has nothing to rebase onto yet. Moving a pin back is the reverse
+case and needs the same purge, because an older server cannot open a newer
+volume either: a worktree that still pins the newer release then stops at
+`DB_MIGRATION_NEEDED`, and way 1 there exports the older release.
+
+The startup wait, the record and the override notes, both mismatch directions
+included, are pinned by `scripts/sonar/sonar.test.sh`, which runs offline
+against stubs of `curl`, `docker compose`, `docker` and `sleep`:
+`bash scripts/sonar/sonar.test.sh`. It also checks that both images stay pinned
+to full release tags.
 
 ## 8. License headers & generated code
 

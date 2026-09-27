@@ -37,6 +37,17 @@
 #   down                  docker compose down (volumes/data kept).
 #   purge                 docker compose down -v (drops all persisted data).
 #
+# Both images are pinned to exact releases: the server in docker-compose.yml
+# (SONAR_IMAGE overrides it), the scanner below (SONAR_SCANNER_IMAGE overrides
+# it). The server's embedded database cannot be upgraded or downgraded, so a
+# server image that does not match the data volume can never come UP; `up`
+# (and `scan`, when it has to start the server) detects both directions and
+# fails fast, naming the two ways out, instead of waiting out the timeout.
+# bootstrap -- which `up` and `scan` (so also `gate`) run -- records the UP
+# server's version in .sonar-local/server-version, so that message can name the
+# matching image; `findings` does not record.
+# SONAR_SCANNER_OPTS sets the scanner's JVM options (default -Xmx2048m).
+#
 # Credentials (admin password + API token) live in the gitignored
 # .sonar-local/ directory (dir 0700, files 0600) -- never committed. That
 # directory is the MAIN git worktree's, shared by every linked worktree (the
@@ -73,6 +84,15 @@ HOTSPOTS_FILE="$LOCAL_DIR/hotspots.json"
 # LAST SUCCESSFUL analysis in place, and exporting it looks identical to a real
 # pass -- issue #22, problem 4).
 ANALYSIS_META_FILE="$LOCAL_DIR/analysis-meta.json"
+# The SonarQube version that last came UP on the shared data volume. It lives
+# next to the credentials because it describes the same volume they do, and it
+# is what lets a version-mismatch failure say which image still opens it.
+SERVER_VERSION_FILE="$LOCAL_DIR/server-version"
+
+# Pinned like the server image, for the same reproducibility: a floating
+# `latest` scanner can move ahead of the pinned server it has to talk to.
+SCANNER_IMAGE_DEFAULT="sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
+SCANNER_IMAGE="${SONAR_SCANNER_IMAGE:-$SCANNER_IMAGE_DEFAULT}"
 
 UP_TIMEOUT="${SONAR_UP_TIMEOUT:-300}"     # seconds to wait for the server to report UP
 CE_TIMEOUT="${SONAR_CE_TIMEOUT:-900}"     # seconds to wait for the compute-engine task
@@ -120,9 +140,103 @@ server_status() {
   curl -fsS "$SONAR_URL/api/system/status" 2>/dev/null | jq -r '.status // "UNREACHABLE"' 2>/dev/null || echo "UNREACHABLE"
 }
 
+# The running server's version ("26.8.0.126808"), or nothing when unreachable.
+# The status endpoint reports it in every state, DB_MIGRATION_NEEDED included.
+server_version() {
+  curl -fsS "$SONAR_URL/api/system/status" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true
+}
+
+# The compose container's state ("running", "exited", ...), or nothing when it
+# does not exist. `-a` is required: plain `ps` lists running containers only,
+# so an exited server would be invisible and the wait would sit out its
+# timeout.
+container_state() {
+  compose ps -a --format '{{.State}}' sonarqube 2>/dev/null | head -n 1 || true
+}
+
+# The SonarQube release of the image compose would run (SONAR_IMAGE, else the
+# pin), read from the image's own SONAR_VERSION -- or nothing when the image is
+# not available locally. Output is captured whole before it is cut, so no
+# producer ever writes into a closed pipe (see wait_for_up).
+configured_image_version() {
+  local images env
+  images="$(compose config --images 2>/dev/null || true)"
+  [ -n "$images" ] || return 0
+  env="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${images%%$'\n'*}" 2>/dev/null || true)"
+  case "$env" in
+    *SONAR_VERSION=*) env="${env#*SONAR_VERSION=}"; printf '%s\n' "${env%%$'\n'*}" ;;
+  esac
+}
+
+record_server_version() {
+  local version
+  version="$(server_version)"
+  [ -n "$version" ] || return 0
+  ensure_local_dir
+  printf '%s\n' "$version" >"$SERVER_VERSION_FILE"
+}
+
 # ---------------------------------------------------------------------------
 # up / wait-for-up
 # ---------------------------------------------------------------------------
+
+# fail_version_mismatch <"an older"|"a newer"> <failing version> <what
+# happened>: the data volume and the server image are different SonarQube
+# releases, which the embedded database never survives -- in either
+# direction. Stops the container (the volume is kept) and exits with the two
+# ways out.
+fail_version_mismatch() {
+  local direction="$1" failing="$2" what="$3" recorded=""
+  [ -f "$SERVER_VERSION_FILE" ] && recorded="$(head -n 1 "$SERVER_VERSION_FILE")"
+  # A record naming the very release that just failed is stale: the volume was
+  # recreated since by something that does not keep the record (an older
+  # sonar.sh, or docker volume rm). Recommending it would repeat the failure.
+  if [ -n "$failing" ] && [ "$recorded" = "$failing" ]; then
+    recorded=""
+  fi
+  compose down >/dev/null 2>&1 || true
+  log ""
+  log "sonar.sh: error: ${what}"
+  log "  The data volume op-ai-gateway-sonar-data was created by ${direction} SonarQube"
+  log "  release than this image, and SonarQube's embedded database cannot be moved"
+  log "  across releases (POST /api/system/migrate_db: 'Upgrade is not supported on"
+  log "  embedded database'). The container has been stopped; the volume is untouched."
+  log ""
+  log "  Two ways out:"
+  log "  1. Keep the local Sonar data: run the image that matches the volume. The"
+  log "     override is not remembered, so export it for every sonar.sh / make"
+  log "     sonar-* call until this worktree's branch pins that release, or until"
+  log "     you purge (unset it before the purge):"
+  if [ -n "$recorded" ]; then
+    log "       export SONAR_IMAGE=sonarqube:${recorded}-community"
+    log "     (${recorded} last came UP on this volume, per ${SERVER_VERSION_FILE})"
+  else
+    log "       export SONAR_IMAGE=sonarqube:<version>-community"
+    log "     with the full release that last ran this volume. None is recorded in"
+    log "     ${SERVER_VERSION_FILE}. An image's release is its SONAR_VERSION:"
+    log "       docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' <image> | grep SONAR_VERSION"
+    log "     A volume from the old floating tag opens with sonarqube:community for as"
+    log "     long as that local image has not been pulled again."
+  fi
+  log "  2. Drop the local Sonar data and start fresh on the image docker-compose.yml"
+  log "     pins:"
+  if [ -n "${SONAR_IMAGE:-}" ]; then
+    log "       unset SONAR_IMAGE; $0 purge && $0 up"
+    log "     (SONAR_IMAGE=${SONAR_IMAGE} is set; left set, it would recreate the"
+    log "     volume on that release.)"
+  else
+    log "       $0 purge && $0 up"
+  fi
+  log "     This deletes every local analysis, the new-code baseline and the admin"
+  log "     credentials; bootstrap creates new ones and the next scan sets a new"
+  log "     baseline. The volume is shared by every worktree, so after this purge"
+  log "     a worktree whose branch still pins another release fails this check"
+  log "     the other way: there take way 1 or rebase, not a second purge."
+  log ""
+  log "  See 'Pinned images and deliberate upgrades' in"
+  log "  docs/architecture/cross-cutting/development-and-quality.md."
+  exit 1
+}
 
 wait_for_up() {
   local elapsed=0 status
@@ -131,9 +245,37 @@ wait_for_up() {
     status="$(server_status)"
     case "$status" in
       UP) log "SonarQube is UP (after ${elapsed}s)."; return 0 ;;
+      # Terminal on the embedded database: the migration it waits for is
+      # refused, so it would sit here until the timeout.
+      DB_MIGRATION_NEEDED)
+        local running
+        running="$(server_version)"
+        fail_version_mismatch "an older" "$running" "SonarQube ${running:-(version unknown)} reports DB_MIGRATION_NEEDED."
+        ;;
       DOWN|"" ) : ;; # transient during first-time ES bootstrap; keep polling
       *) log "  ... status=${status} (${elapsed}s elapsed)" ;;
     esac
+    # A server that cannot open its database never answers at all -- the
+    # status stays UNREACHABLE -- and its container exits (with code 0), so
+    # the container is the only place that failure shows.
+    #
+    # The logs are captured whole and matched in the shell. Piping them into
+    # `grep -q` would lose under pipefail: grep exits at the first match,
+    # compose dies of SIGPIPE writing the stack trace that follows, and the
+    # condition reads false.
+    if [ "$(container_state)" = "exited" ]; then
+      local logs
+      logs="$(compose logs --tail=200 sonarqube 2>&1 || true)"
+      case "$logs" in
+        *'Database was upgraded to a more recent version of SonarQube'*)
+          fail_version_mismatch "a newer" "$(configured_image_version)" \
+            "the SonarQube container exited: its database was upgraded to a more recent version of SonarQube."
+          ;;
+      esac
+      log "The SonarQube container exited before reaching UP. Recent container logs:"
+      printf '%s\n' "$logs" | tail -n 60 >&2 || true
+      die "SonarQube exited during startup"
+    fi
     sleep "$POLL_INTERVAL"
     elapsed=$((elapsed + POLL_INTERVAL))
     if [ $((elapsed % 15)) -eq 0 ]; then
@@ -145,8 +287,17 @@ wait_for_up() {
   die "timed out waiting for SonarQube"
 }
 
+# A leftover SONAR_IMAGE export silently decides which release creates a fresh
+# volume, so every start says when it is in effect.
+note_image_override() {
+  if [ -n "${SONAR_IMAGE:-}" ]; then
+    log "note: SONAR_IMAGE=${SONAR_IMAGE} overrides the image docker-compose.yml pins."
+  fi
+}
+
 cmd_up() {
   require_cmd docker curl jq
+  note_image_override
   log "Starting SonarQube (docker compose) ..."
   compose up -d
   wait_for_up
@@ -199,6 +350,9 @@ write_creds() {
 cmd_bootstrap() {
   require_cmd curl jq
   [ "$(server_status)" = "UP" ] || die "SonarQube is not UP yet; run 'sonar.sh up' first"
+  # Every up and scan passes through here with the server UP, including a scan
+  # against a server that was already running, so this keeps the record current.
+  record_server_version
 
   ensure_local_dir
   local stored_password="" stored_token=""
@@ -317,6 +471,7 @@ cmd_scan() {
 
   if [ "$(server_status)" != "UP" ]; then
     log "SonarQube is not running yet; starting it ..."
+    note_image_override
     compose up -d
     wait_for_up
   fi
@@ -371,9 +526,9 @@ cmd_scan() {
     -e SONAR_SCANNER_OPTS="${SONAR_SCANNER_OPTS:--Xmx2048m}" \
     -e SCANNER_WORKDIR_PATH="/usr/src/.scannerwork" \
     -v "${ROOT}:/usr/src" \
-    "${extra_mounts[@]}" \
+    ${extra_mounts[@]+"${extra_mounts[@]}"} \
     -w /usr/src \
-    sonarsource/sonar-scanner-cli \
+    "$SCANNER_IMAGE" \
     -Dsonar.projectVersion="${project_version}"
   end_ts="$(date +%s)"
   log "Scanner finished in $((end_ts - start_ts))s."
@@ -577,7 +732,13 @@ cmd_down() {
 
 cmd_purge() {
   require_cmd docker
+  if [ -n "${SONAR_IMAGE:-}" ]; then
+    log "note: SONAR_IMAGE=${SONAR_IMAGE} is set; unset it before the next up, or the"
+    log "      fresh volume is created on that release instead of the pinned one."
+  fi
   compose down -v
+  # The recorded version described the volume that was just dropped.
+  rm -f "$SERVER_VERSION_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -600,6 +761,15 @@ Usage: $0 <up|bootstrap|coverage|scan|gate|findings|down|purge> [options]
                       fetch issues + hotspots, print a summary
   down                docker compose down (keep volumes)
   purge               docker compose down -v (drop all data)
+
+Environment:
+  SONAR_IMAGE          server image (default: the pin in docker-compose.yml)
+  SONAR_SCANNER_IMAGE  scanner image (default: ${SCANNER_IMAGE_DEFAULT})
+  SONAR_SCANNER_OPTS   scanner JVM options (default: -Xmx2048m)
+  SONAR_UP_TIMEOUT     seconds to wait for the server (default: 300)
+  SONAR_CE_TIMEOUT     seconds to wait for the analysis (default: 900)
+  SONAR_LOCAL_DIR      credentials and exports (default: the main worktree's
+                       .sonar-local)
 EOF
 }
 
@@ -621,4 +791,8 @@ main() {
   esac
 }
 
-main "$@"
+# Run only when executed, so scripts/sonar/sonar.test.sh can source the
+# functions and drive them against stubs.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
