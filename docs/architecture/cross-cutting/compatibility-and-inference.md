@@ -963,12 +963,13 @@ gateway model name, everything §1–§9 of this chapter routes around.
 | Scope | Reader | Cap |
 |---|---|---|
 | The five inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full |
+| The portal chat documents (`POST /api/portal/chats`, `PUT /api/portal/chats/{id}`, `POST /api/portal/chats/{id}/runs`) | `readRawJSONLimit` | `portal.MaxChatRequestBytes` = 5 MiB (the 4 MiB content cap plus the JSON envelope); the bundled nginx allows the same on `/api/portal/chats` |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
 This mirrors llama-swap's own behavior of proxying request bodies without a
-size limit. A handful of portal endpoints that accept large-but-bounded opaque
-content (chat transcripts) read uncapped too, with their own service-level cap
-— unrelated to the inference size policy documented here.
+size limit. The chat documents are bounded, not uncapped: the gateway reads
+them at the chat request cap and the service enforces the content cap —
+unrelated to the inference size policy documented here.
 
 ## 11. Multimodal images
 
@@ -1270,12 +1271,12 @@ and clears the mark only once it has adopted the server's answer. While the
 mark stands, **no write may carry that chat's local transcript** — the
 invariant, deliberately stated rather than a list of the functions that
 currently honour it, because an enumeration goes stale the next time someone
-adds a writer. A writer satisfies it one of two ways: by refusing outright
-(the debounced PUT, the `pagehide` keepalive and the unmount flush all do,
-and the user is told the tab has stopped persisting the chat), or by
-re-deriving its document from the server (a rename must still be able to
-change the title, so it sends the server's own stored content back with the
-new one instead of the local buffer).
+adds a writer. The writers that carry a transcript (the debounced PUT, the
+`pagehide` keepalive and the unmount flush) all refuse a stale chat, and the
+user is told the tab has stopped persisting it. A rename satisfies the
+invariant by carrying no transcript at all: it sends only the new title, and
+the backend's PUT keeps the stored content when the body has no `content`
+key.
 
 A refetch of an image document can easily outlast the 800 ms save debounce,
 so cancelling a pending save on failure would be too late — the mark has to

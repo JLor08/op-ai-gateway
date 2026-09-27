@@ -88,6 +88,15 @@ describe('formatPortalError', () => {
     expect(formatPortalError('just a string', messages.de)).toBe('just a string');
     expect(formatPortalError(undefined, messages.de)).toBe('undefined');
   });
+
+  // A proxy's 413 (nginx's own HTML page, no JSON error body) is named
+  // request.body_too_large by transport.ts's request(); this pins the label
+  // it renders to, in both locales.
+  it('names a proxy 413 as request.body_too_large, in both locales', () => {
+    const err = new PortalApiError(413, 'request.body_too_large', 'request body too large');
+    expect(formatPortalError(err, messages.de)).toContain(messages.de.errorRequestBodyTooLarge);
+    expect(formatPortalError(err, messages.en)).toContain(messages.en.errorRequestBodyTooLarge);
+  });
 });
 
 describe('errorLabelByCode (whole-map invariants)', () => {

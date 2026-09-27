@@ -110,14 +110,16 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
       if (!found) throw new Error('chat not found');
       return found;
     }),
-    saveChat: vi.fn(async (id: string, body: { title: string; content: unknown }) => {
+    // Mirrors the backend's PATCH-style PUT: a body with no `content` key
+    // (a title-only rename) keeps the row's stored content untouched.
+    saveChat: vi.fn(async (id: string, body: { title: string; content?: unknown }) => {
       seq += 1;
       const index = rows.findIndex((row) => row.id === id);
       if (index >= 0)
         rows[index] = {
           ...rows[index],
           title: body.title,
-          content: body.content,
+          ...('content' in body ? { content: body.content } : {}),
           updated_at: stamp(),
         };
       return rows[index];
@@ -480,11 +482,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() =>
         expect(screen.getByTestId('chats').textContent).toContain('c_seed:Renamed'),
       );
+      // Title-only: no `content` key, so the backend's PATCH-style PUT keeps
+      // the stored document untouched.
       await waitFor(() =>
-        expect(chatApi.spies.saveChat).toHaveBeenCalledWith(
-          'c_seed',
-          expect.objectContaining({ title: 'Renamed' }),
-        ),
+        expect(chatApi.spies.saveChat).toHaveBeenCalledWith('c_seed', { title: 'Renamed' }),
       );
     });
 
@@ -1640,66 +1641,41 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
     });
 
-    // renameChat is the FOURTH writer, and the only one that cannot simply
-    // refuse: it PUTs buildDoc() for the active chat directly, bypassing
-    // flushSave, and the user asked to change a TITLE -- a rename that
-    // silently does nothing is its own surprise. So it falls back to the
-    // branch it already has for every other chat and sends the SERVER's own
-    // stored content back with the new title. The rename happens; the
-    // unproven local transcript is not what gets written.
-    it('renames a stale chat by writing the SERVER document, never the local transcript', async () => {
+    // A rename carries no transcript, so it is not one of the writers the
+    // tests above hold to refusing a stale chat. The backend's PUT keeps the
+    // stored content when the body carries no `content` key, so a rename
+    // sends only the title: it never reads the chat's document at all,
+    // active, background, or stale alike, and a chat's transcript staleness
+    // has nothing to do with whether its title can be changed.
+    it('renames a non-active chat by sending only the title, with no document fetch', async () => {
       chatApi = makeChatApi([
         {
-          id: 'c1',
-          title: 'C1',
-          created_at: T,
-          updated_at: T,
+          id: 'c_alpha',
+          title: 'Alpha',
+          created_at: T2,
+          updated_at: T2,
+          content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+        },
+        {
+          id: 'c_beta',
+          title: 'Beta',
+          created_at: T1,
+          updated_at: T1,
           content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
         },
       ]);
       renderProvider();
       await waitForReady();
+      // c_alpha (newest) is the active chat; c_beta is the one renamed below.
+      await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c_alpha'));
       chatApi.spies.saveChat.mockClear();
-      chatApi.spies.chat.mockRejectedValue(new Error('refetch unavailable'));
+      chatApi.spies.chat.mockClear();
 
-      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'draw a cat' } });
-      fireEvent.click(screen.getByRole('button', { name: 'send' }));
-      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-      const es = FakeEventSource.instances[0];
-
-      await act(async () => {
-        es.emit('done', {
-          status: 'completed',
-          kind: 'image',
-          content_parts: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
-        });
-      });
-      await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
-      await screen.findByText(t.errorChatTranscriptStale);
-      // The local buffer now holds two turns the seeded server row does not,
-      // which is what makes the two documents distinguishable below.
-      expect(screen.getByTestId('count').textContent).toBe('2');
-
-      // The outage was transient -- the refetch works again by the time the
-      // user renames. (If it did not, saveChat would never be reached and the
-      // catch would surface the failure, which is loud rather than
-      // destructive; either way the stale buffer is not written.)
-      chatApi.spies.chat.mockImplementation(async (id: string) => {
-        const found = chatApi.rows.find((row) => row.id === id);
-        if (!found) throw new Error('chat not found');
-        return found;
-      });
-
-      fireEvent.click(screen.getByRole('button', { name: 'rename-c1' }));
+      fireEvent.click(screen.getByRole('button', { name: 'rename-c_beta' }));
 
       await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1));
-      const [savedId, body] = chatApi.spies.saveChat.mock.calls[0];
-      expect(savedId).toBe('c1');
-      // The rename is NOT a silent no-op...
-      expect(body.title).toBe('Renamed');
-      // ...and the transcript it carries is the server's (no messages), not
-      // the two-turn local buffer.
-      expect((body.content as { messages: unknown[] }).messages).toHaveLength(0);
+      expect(chatApi.spies.saveChat).toHaveBeenCalledWith('c_beta', { title: 'Renamed' });
+      expect(chatApi.spies.chat).not.toHaveBeenCalledWith('c_beta');
     });
 
     // The other side of the same switch: an adopt that SUCCEEDS must leave

@@ -859,6 +859,12 @@ through `http.MaxBytesReader` capped at exactly 1 MiB
 (`maxJSONBodyBytes = 1 << 20`, `internal/gateway/server.go`) — an oversized
 body gets `413` before JSON decoding is even attempted.
 
+**The chat documents are the exception.** `POST /api/portal/chats`,
+`PUT /api/portal/chats/{id}` and `POST /api/portal/chats/{id}/runs` read at
+`portal.MaxChatRequestBytes` (5 MiB: the 4 MiB content cap plus the JSON
+envelope) and answer the same `413 request.body_too_large` over it; the
+service then enforces the content cap itself (`400 portal.chat_too_large`).
+
 **Inference bodies are intentionally uncapped.** `/v1/chat/completions`,
 `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` and
 `/v1/images/generations` read their body with no `MaxBytesReader` limit at all,

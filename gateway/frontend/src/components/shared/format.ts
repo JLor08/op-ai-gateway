@@ -128,6 +128,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'server_override.model_unavailable': 'errorServerOverrideModelUnavailable',
   'request.failed': 'errorRequestFailed',
   'request.invalid_response': 'errorRequestFailed',
+  'request.body_too_large': 'errorRequestBodyTooLarge',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes (chat_runs.go / chat_runs_images.go), the mapping capability-form
   // refusal reachable from the operator form this feature added

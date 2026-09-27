@@ -46,6 +46,12 @@ const (
 	// duplicated there -- a second copy in the frontend would drift from this
 	// one with nothing to catch it.
 	MaxChatContentBytes = 4 << 20
+	// MaxChatRequestBytes caps a chat request BODY -- create, save and run
+	// start -- at the content cap plus room for the JSON envelope around it
+	// (title, settings, the other keys). The gateway reads those bodies at this
+	// limit, the bundled nginx configs allow exactly this much on
+	// /api/portal/chats, and a test pins that they never fall below it.
+	MaxChatRequestBytes = MaxChatContentBytes + 1<<20
 )
 
 // ChatSummaryDTO is the list DTO: plaintext metadata only, never the content.

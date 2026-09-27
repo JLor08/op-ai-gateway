@@ -558,13 +558,11 @@ export function ChatStoreProvider({
     setChats,
   );
   const {
-    buildDoc,
     flushSave,
     clearDirty,
     skipNextSave,
     cancelPendingSave,
     setTranscriptStale,
-    isTranscriptStale,
     flushOnUnmount,
   } = persistence;
 
@@ -1192,115 +1190,93 @@ export function ChatStoreProvider({
     [activateChat, forgetRun, cancelPendingSave],
   );
 
-  const renameChat = useCallback(
-    (id: string, title: string) => {
-      const trimmed = title.trim();
-      if (!trimmed) return;
-      // Captured BEFORE the optimistic write, so the catch below can put both
-      // back. `previousTitle` is undefined only for an id that is not in the
-      // list at all, in which case the optimistic map below is a no-op too and
-      // there is nothing to roll back.
-      //
-      // `activeIdAtWrite` is captured too, and it is the load-bearing one: it
-      // is what lets the catch tell "the ref still belongs to the chat I wrote
-      // it for" from "the user has since moved on", which the ids alone at
-      // catch time cannot express. See the catch.
-      const previousTitle = chatsRef.current.find((chat) => chat.id === id)?.title;
-      const activeIdAtWrite = activeChatIdRef.current;
-      const wroteActiveTitle = id === activeIdAtWrite;
-      const previousActiveTitle = activeTitleRef.current;
-      setChats((prev) => prev.map((chat) => (chat.id === id ? { ...chat, title: trimmed } : chat)));
-      if (wroteActiveTitle) activeTitleRef.current = trimmed;
-      void (async () => {
-        try {
-          // The PUT contract requires title + content. Use the live document for
-          // the active chat; otherwise fetch the target's content first.
-          //
-          // ...and NOT the live document when this client cannot vouch for it.
-          // A rename is a fourth writer: it PUTs buildDoc() directly and never
-          // touches flushSave, so the refusal the other three share does not
-          // reach it. But refusing the rename outright would be its own
-          // surprise -- the user asked to change a TITLE and would watch
-          // nothing happen -- so it falls back to the branch this function
-          // already has for every other chat and sends the SERVER's own stored
-          // content back with the new title. The transcript is then written
-          // unchanged (it is the server's own bytes) and the rename still
-          // renames. If that fetch fails too, saveChat is never reached and
-          // the catch below says so, which is loud rather than destructive.
-          const stale = isTranscriptStale(id);
-          const content =
-            id === activeChatIdRef.current && !stale
-              ? buildDoc()
-              : normalizeDoc((await apiRef.current.chat(id)).content);
-          const saved = await apiRef.current.saveChat(id, { title: trimmed, content });
-          setChats((prev) =>
-            byNewest(
-              prev.map((chat) =>
-                chat.id === id
-                  ? { ...chat, title: saved.title, updated_at: saved.updated_at }
-                  : chat,
-              ),
+  const renameChat = useCallback((id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    // Captured BEFORE the optimistic write, so the catch below can put both
+    // back. `previousTitle` is undefined only for an id that is not in the
+    // list at all, in which case the optimistic map below is a no-op too and
+    // there is nothing to roll back.
+    //
+    // `activeIdAtWrite` is captured too, and it is the load-bearing one: it
+    // is what lets the catch tell "the ref still belongs to the chat I wrote
+    // it for" from "the user has since moved on", which the ids alone at
+    // catch time cannot express. See the catch.
+    const previousTitle = chatsRef.current.find((chat) => chat.id === id)?.title;
+    const activeIdAtWrite = activeChatIdRef.current;
+    const wroteActiveTitle = id === activeIdAtWrite;
+    const previousActiveTitle = activeTitleRef.current;
+    setChats((prev) => prev.map((chat) => (chat.id === id ? { ...chat, title: trimmed } : chat)));
+    if (wroteActiveTitle) activeTitleRef.current = trimmed;
+    void (async () => {
+      try {
+        // The backend's PUT keeps the stored content when the body carries
+        // no `content` key, so a rename writes only the title and never
+        // depends on -- or risks overwriting with -- the local transcript.
+        const saved = await apiRef.current.saveChat(id, { title: trimmed });
+        setChats((prev) =>
+          byNewest(
+            prev.map((chat) =>
+              chat.id === id ? { ...chat, title: saved.title, updated_at: saved.updated_at } : chat,
             ),
+          ),
+        );
+      } catch (err) {
+        // Roll the optimistic title back. Without this the sidebar keeps
+        // showing a name the server rejected until the next reload, when it
+        // silently reverts -- a toast saying "that failed" next to a title
+        // that looks like it succeeded. The one writer of the four with no
+        // client-side run gate, so the 409 that PUT /chats/{id} answers
+        // while a run is active reaches it by design.
+        //
+        // On EVERY failure code, not just 409: a rename refused for any
+        // reason (404 on a chat deleted in another tab, a 5xx, ...) leaves
+        // the same lie on screen, and "which codes revert" is a distinction
+        // nothing downstream could act on.
+        //
+        // THE REF IS NOT THIS CHAT'S TITLE. `activeTitleRef` is the title
+        // the debounced autosave PUTs for whatever chat is active RIGHT
+        // NOW, and "right now" is after an await that the user spent doing
+        // whatever they liked -- including switching chats. An
+        // unconditional restore here therefore writes one chat's old title
+        // into another chat's ref, and the next autosave persists the
+        // rename the server just refused onto a chat nobody renamed, with
+        // no toast about it: rename Alpha, click over to Beta, watch the
+        // 409 this rollback exists for, and Beta is saved as "Alpha".
+        //
+        // So the restore undoes the write above only when the ref still
+        // belongs to the chat that write was for: this call wrote it
+        // (`wroteActiveTitle`) AND the active chat has not changed since
+        // (`activeChatIdRef.current === activeIdAtWrite`). Both conditions
+        // are needed, and each rules out a different hazard:
+        //
+        //   - not written, still same active chat -- a rename of a
+        //     NON-active chat. The ref is some other chat's title and was
+        //     never ours to touch.
+        //   - written, active chat changed -- the Alpha/Beta case above.
+        //     `activateChat` already set the ref to the NEW chat's own
+        //     title (it writes activeChatIdRef and activeTitleRef in the
+        //     same breath), so there is nothing to repair and everything to
+        //     break.
+        //   - not written, active chat changed TO the renamed one -- the
+        //     mirror image: `previousActiveTitle` is the title of a chat
+        //     that is no longer active, and `activateChat` has again
+        //     already set the ref correctly.
+        //
+        // The list row (above) has no such problem: it is keyed by id, so
+        // it is always safe to put back.
+        if (previousTitle !== undefined) {
+          setChats((prev) =>
+            prev.map((chat) => (chat.id === id ? { ...chat, title: previousTitle } : chat)),
           );
-        } catch (err) {
-          // Roll the optimistic title back. Without this the sidebar keeps
-          // showing a name the server rejected until the next reload, when it
-          // silently reverts -- a toast saying "that failed" next to a title
-          // that looks like it succeeded. The one writer of the four with no
-          // client-side run gate, so the 409 this branch added to
-          // PUT /chats/{id} while a run is active reaches it by design.
-          //
-          // On EVERY failure code, not just 409: a rename refused for any
-          // reason (404 on a chat deleted in another tab, a 5xx, the content
-          // fetch above throwing before saveChat is even reached) leaves the
-          // same lie on screen, and "which codes revert" is a distinction
-          // nothing downstream could act on.
-          //
-          // THE REF IS NOT THIS CHAT'S TITLE. `activeTitleRef` is the title
-          // the debounced autosave PUTs for whatever chat is active RIGHT
-          // NOW, and "right now" is after an await that the user spent doing
-          // whatever they liked -- including switching chats. An
-          // unconditional restore here therefore writes one chat's old title
-          // into another chat's ref, and the next autosave persists the
-          // rename the server just refused onto a chat nobody renamed, with
-          // no toast about it: rename Alpha, click over to Beta, watch the
-          // 409 this rollback exists for, and Beta is saved as "Alpha".
-          //
-          // So the restore undoes the write above only when the ref still
-          // belongs to the chat that write was for: this call wrote it
-          // (`wroteActiveTitle`) AND the active chat has not changed since
-          // (`activeChatIdRef.current === activeIdAtWrite`). Both conditions
-          // are needed, and each rules out a different hazard:
-          //
-          //   - not written, still same active chat -- a rename of a
-          //     NON-active chat. The ref is some other chat's title and was
-          //     never ours to touch.
-          //   - written, active chat changed -- the Alpha/Beta case above.
-          //     `activateChat` already set the ref to the NEW chat's own
-          //     title (it writes activeChatIdRef and activeTitleRef in the
-          //     same breath), so there is nothing to repair and everything to
-          //     break.
-          //   - not written, active chat changed TO the renamed one -- the
-          //     mirror image: `previousActiveTitle` is the title of a chat
-          //     that is no longer active, and `activateChat` has again
-          //     already set the ref correctly.
-          //
-          // The list row (above) has no such problem: it is keyed by id, so
-          // it is always safe to put back.
-          if (previousTitle !== undefined) {
-            setChats((prev) =>
-              prev.map((chat) => (chat.id === id ? { ...chat, title: previousTitle } : chat)),
-            );
-          }
-          if (wroteActiveTitle && activeChatIdRef.current === activeIdAtWrite) {
-            activeTitleRef.current = previousActiveTitle;
-          }
-          showErrorRef.current(formatPortalError(err, tRef.current));
         }
-      })();
-    },
-    [buildDoc, isTranscriptStale],
-  );
+        if (wroteActiveTitle && activeChatIdRef.current === activeIdAtWrite) {
+          activeTitleRef.current = previousActiveTitle;
+        }
+        showErrorRef.current(formatPortalError(err, tRef.current));
+      }
+    })();
+  }, []);
 
   const removeImage = useCallback(
     (index: number) => setImages((prev) => prev.filter((_, position) => position !== index)),

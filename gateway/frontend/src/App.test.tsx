@@ -1203,13 +1203,15 @@ beforeEach(() => {
       }
       if (path.startsWith('/api/portal/chats/') && init?.method === 'PUT') {
         const id = path.substring('/api/portal/chats/'.length);
-        const body = JSON.parse(String(init.body)) as { title: string; content: unknown };
+        // Mirrors the backend's PATCH-style PUT: a body with no `content` key
+        // (a title-only rename) keeps the row's stored content untouched.
+        const body = JSON.parse(String(init.body)) as { title: string; content?: unknown };
         apiState.chatRows = apiState.chatRows.map((row) =>
           row.id === id
             ? {
                 ...row,
                 title: body.title,
-                content: body.content,
+                ...('content' in body ? { content: body.content } : {}),
                 updated_at: '2026-07-17T12:05:00Z',
               }
             : row,

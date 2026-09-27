@@ -98,14 +98,16 @@ function makeChatApi() {
       if (!found) throw new Error('chat not found');
       return found;
     }),
-    saveChat: vi.fn(async (id: string, body: { title: string; content: unknown }) => {
+    // Mirrors the backend's PATCH-style PUT: a body with no `content` key
+    // (a title-only rename) keeps the row's stored content untouched.
+    saveChat: vi.fn(async (id: string, body: { title: string; content?: unknown }) => {
       seq += 1;
       const index = rows.findIndex((row) => row.id === id);
       if (index >= 0)
         rows[index] = {
           ...rows[index],
           title: body.title,
-          content: body.content,
+          ...('content' in body ? { content: body.content } : {}),
           updated_at: stamp(),
         };
       return rows[index];

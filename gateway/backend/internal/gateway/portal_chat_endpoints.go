@@ -15,9 +15,11 @@ import (
 
 // handlePortalChats serves the chat collection: GET lists the principal's chat
 // summaries, POST creates a new chat (title + opaque content). Content bodies
-// can exceed the default 1 MiB JSON limit (the service caps the pre-seal
-// content at a few MiB, surfacing ErrChatTooLarge as 400), so the body is read
-// uncapped and the service is the size authority.
+// can exceed the default 1 MiB JSON limit, so the body is read at
+// portal.MaxChatRequestBytes (the content cap plus the JSON envelope; over it
+// the answer is the gateway's own 413 request.body_too_large), and the
+// service stays the authority on the content cap itself (ErrChatTooLarge,
+// 400).
 func (s *Server) handlePortalChats(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
@@ -36,7 +38,7 @@ func (s *Server) handlePortalChats(w http.ResponseWriter, r *http.Request) {
 		// endpoint to carry it.
 		writeJSON(w, http.StatusOK, portal.ChatListResponse{Data: chats, MaxContentBytes: portal.MaxChatContentBytes})
 	case http.MethodPost:
-		raw, ok := readRawJSONUnlimited(w, r)
+		raw, ok := readRawJSONLimit(w, r, portal.MaxChatRequestBytes)
 		if !ok {
 			return
 		}
@@ -123,7 +125,7 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 			writePortalChatError(w, ErrRunAlreadyActive)
 			return
 		}
-		raw, ok := readRawJSONUnlimited(w, r)
+		raw, ok := readRawJSONLimit(w, r, portal.MaxChatRequestBytes)
 		if !ok {
 			return
 		}
