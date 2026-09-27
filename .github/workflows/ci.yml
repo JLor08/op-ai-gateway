@@ -2,8 +2,10 @@
 # Copyright (C) 2026 OnPrem AI Gateway contributors
 #
 # Continuous integration: format check, lint, build, and test for the Go
-# backend + server-agent and the React/TypeScript frontend. Ready to run as
-# soon as a runner is attached to the repository.
+# backend + server-agent and the React/TypeScript frontend; the docs
+# consistency check; the offline tests of the local Sonar tooling; and the
+# e2e:runtime Playwright suite. Ready to run as soon as a runner is attached to
+# the repository.
 name: CI
 
 on:
@@ -92,6 +94,24 @@ jobs:
         run: sh scripts/check-docs.test.sh
       - name: Docs consistency
         run: ./scripts/check-docs.sh
+
+  # The local SonarQube gate itself never runs here (it is a local development
+  # tool); these are its scripts' own offline tests. Neither starts docker or a
+  # server: the branch filter runs against a throwaway git repository, the
+  # startup wait against stubs. git and jq come with the runner image.
+  sonar-scripts:
+    name: Sonar tooling (offline tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # branch-findings.test.sh SKIPs, exit 0, without jq; a job that went
+      # green while testing nothing would read as a pass.
+      - name: Require jq
+        run: jq --version
+      - name: Branch filter (branch-findings.sh)
+        run: sh scripts/sonar/branch-findings.test.sh
+      - name: Startup wait, version record and main guard (sonar.sh)
+        run: bash scripts/sonar/sonar.test.sh
 
   frontend:
     name: Frontend (portal)

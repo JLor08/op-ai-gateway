@@ -3,7 +3,8 @@
 #
 # Local, headless SonarQube quality gate. Loopback-only (127.0.0.1:9000) --
 # not exposed to the network. Data/logs/extensions persist in named volumes
-# across `sonar.sh down` (removed by `sonar.sh purge`). The `sonar-net`
+# across `sonar.sh down` (removed by `sonar.sh purge`); the image is pinned
+# (see below) because that data cannot survive a version change. The `sonar-net`
 # network lets the sonar-scanner-cli container (run ad hoc by `sonar.sh scan`,
 # not part of this compose file) reach the server by its service name.
 #
@@ -11,7 +12,26 @@
 
 services:
   sonarqube:
-    image: sonarqube:community
+    # Pinned to one exact release, never a floating tag such as `community`.
+    # The server keeps everything (credentials, analyses, the new-code
+    # baseline) in its EMBEDDED H2 database on the sonar_data volume, and
+    # SonarQube cannot upgrade an embedded database: POST /api/system/migrate_db
+    # answers "Upgrade is not supported on embedded database". A newer image
+    # therefore stays in DB_MIGRATION_NEEDED on an older volume, and an older
+    # image exits on a newer one ("Database was upgraded to a more recent
+    # version of SonarQube"). With a floating tag that happens the day someone
+    # pulls. `sonar.sh up` detects both and names the two ways out.
+    #
+    # Moving this pin is a deliberate upgrade that resets every developer's
+    # local Sonar data -- see "Pinned images and deliberate upgrades" in
+    # docs/architecture/cross-cutting/development-and-quality.md.
+    # SONAR_IMAGE overrides the pin for as long as it is set, e.g. to keep
+    # using the image an existing volume was created with. It is not
+    # remembered: export it for every sonar.sh / make sonar-* call until this
+    # worktree's branch pins that release, or until you purge (unset it
+    # before the purge). In a worktree whose branch predates a pin bump,
+    # rebase rather than purge.
+    image: ${SONAR_IMAGE:-sonarqube:26.8.0.126808-community}
     container_name: op-ai-gateway-sonarqube
     ports:
       - "127.0.0.1:9000:9000"
