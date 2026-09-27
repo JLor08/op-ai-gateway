@@ -54,9 +54,9 @@ type activeRunDTO struct {
 // portalRunErrRows are writePortalRunError's mapper-specific rows (checked
 // before sharedErrorMap); portal.ErrChatNotFound and portal.ErrChatTooLarge
 // map identically in writePortalChatError and live in sharedErrorMap
-// instead. ErrRunAlreadyActive lives there too now (task 9: PUT /chats/{id}
-// -- via writePortalChatError -- refuses identically while a run is active,
-// so the single definition belongs where both mappers read it, not in this
+// instead. ErrRunAlreadyActive lives there too (PUT /chats/{id} -- via
+// writePortalChatError -- refuses identically while a run is active, so the
+// single definition belongs where both mappers read it, not in this
 // mapper-specific table). store.ErrNotFound maps to a different code in
 // other mappers, so it must stay here (mirroring the original combined
 // portal.ErrChatNotFound/store.ErrNotFound case: both still resolve to the
@@ -84,7 +84,7 @@ func (s *Server) handleStartChatRun(w http.ResponseWriter, r *http.Request, chat
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	raw, ok := readRawJSONUnlimited(w, r)
+	raw, ok := readRawJSONLimit(w, r, portal.MaxChatRequestBytes)
 	if !ok {
 		return
 	}

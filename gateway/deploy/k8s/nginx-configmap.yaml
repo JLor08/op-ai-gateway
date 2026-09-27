@@ -200,8 +200,15 @@ data:
     location /.well-known/acme-challenge/ { proxy_pass http://op-gateway-backend:8080; }
 
     location /api/       { proxy_pass http://op-gateway-backend:8080; }
-    # Inference endpoints carry base64 image data — no body cap (the Go layer keeps
-    # control-plane endpoints at 1 MiB); matches llama-swap's unbounded proxy behavior.
+    # Portal chat documents: a saved chat, and a regenerate's history, can be as
+    # large as the gateway's chat request cap (portal.MaxChatRequestBytes, 5 MiB --
+    # the 4 MiB content cap plus the JSON envelope). Everything else under /api/
+    # keeps nginx's 1 MiB default. No proxy_set_header here, so the server-level set
+    # (the X-OP-* blanking, and the buffering/timeout the run event stream needs) is
+    # inherited.
+    location /api/portal/chats { client_max_body_size 5m; proxy_pass http://op-gateway-backend:8080; }
+    # Inference endpoints carry base64 image data — no body cap (the rest of /api/
+    # stays at nginx's 1 MiB default); matches llama-swap's unbounded proxy behavior.
     location /v1/        { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }
     location /openai/    { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }
     location /anthropic/ { client_max_body_size 0; proxy_pass http://op-gateway-backend:8080; }

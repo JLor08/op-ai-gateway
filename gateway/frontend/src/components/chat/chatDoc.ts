@@ -151,10 +151,12 @@ export function lsRemove(key: string): void {
 // only when the kind is non-empty. This mirrors the backend's
 // `json:"kind,omitempty"`, which exists so a text thread's persisted settings
 // stay byte-identical to what they were before image threads existed (the
-// backend has a test asserting the key never appears for one). Both writers
-// of a settings object -- normalizeDoc below, which renameChat PUTs verbatim
-// for a non-active chat, and buildDoc in useChatPersistence -- go through
-// this, so neither can reintroduce the key from the client side.
+// backend has a test asserting the key never appears for one). Both builders
+// of a settings object go through this, so neither can reintroduce the key
+// from the client side: buildDoc in useChatPersistence, which writes the
+// document, and normalizeDoc below, which seeds the state buildDoc writes
+// back -- so a kind key normalizeDoc invents or drops is invented or dropped
+// on the server too, by the next save.
 export function kindSetting(kind: string | undefined): { kind?: string } {
   return kind ? { kind } : {};
 }

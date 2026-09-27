@@ -137,7 +137,11 @@ export function chatApi(fetcher: Fetcher) {
     createChat: (body: { title?: string; content?: unknown }) =>
       request<Chat>(fetcher, '/api/portal/chats', { method: 'POST', body }),
     chat: (id: string) => request<Chat>(fetcher, `/api/portal/chats/${encodeURIComponent(id)}`),
-    saveChat: (id: string, body: { title: string; content: unknown }) =>
+    // `content` is OPTIONAL: the backend's PUT keeps the stored content when
+    // the body carries no `content` key, so a title-only rename (renameChat,
+    // ChatStore.tsx) writes just `{ title }`: it never uploads the local
+    // transcript, and never overwrites the chat with it.
+    saveChat: (id: string, body: { title: string; content?: unknown }) =>
       request<Chat>(fetcher, `/api/portal/chats/${encodeURIComponent(id)}`, {
         method: 'PUT',
         body,

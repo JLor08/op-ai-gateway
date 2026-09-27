@@ -110,9 +110,12 @@ export async function request<T>(
   const payload = await readJSON(response);
   if (!response.ok) {
     const error = isErrorPayload(payload) ? payload.error : undefined;
+    // A 413 without a JSON error body is a proxy's size limit (nginx answers
+    // with an HTML page), not an unknown failure: name it.
+    const fallbackCode = response.status === 413 ? 'request.body_too_large' : 'request.failed';
     throw new PortalApiError(
       response.status,
-      error?.code ?? 'request.failed',
+      error?.code ?? fallbackCode,
       error?.message ?? (response.statusText || 'request failed'),
     );
   }

@@ -44,6 +44,8 @@ const de = {
   errorAuthInvalidToken: 'Ungültiger Gateway-Token',
   errorPortalTokenNameRequired: 'Token-Name ist erforderlich',
   errorRequestFailed: 'Anfrage fehlgeschlagen',
+  errorRequestBodyTooLarge:
+    'Die Anfrage ist zu groß: Ein Größenlimit des Gateways oder eines vorgeschalteten Proxys hat sie abgelehnt.',
   requests24hDetail: 'Ihre Anfragen',
   tokens24hDetail: 'Ihre Tokens',
   healthyHostsDetail: 'gesund / gesamt',
@@ -2526,6 +2528,8 @@ const en: PortalMessages = {
   errorAuthInvalidToken: 'Invalid gateway token',
   errorPortalTokenNameRequired: 'Token name is required',
   errorRequestFailed: 'Request failed',
+  errorRequestBodyTooLarge:
+    'The request is too large: a size limit of the gateway or of a proxy in front of it refused it.',
   requests24hDetail: 'Your requests',
   tokens24hDetail: 'Your tokens',
   healthyHostsDetail: 'healthy / total',

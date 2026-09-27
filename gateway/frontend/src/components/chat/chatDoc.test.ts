@@ -29,8 +29,9 @@ describe('metricsOf', () => {
 // so a text thread's persisted settings stay byte-identical to what they were
 // before image threads existed, and it has a test asserting the key never
 // appears for one (service_chats_kind_test.go). These mirror that from the
-// client side: normalizeDoc's output is PUT verbatim by renameChat for a
-// non-active chat, so it is a writer of the stored document too.
+// client side: normalizeDoc seeds the state that buildDoc writes back, so a
+// kind key it invents or drops is invented or dropped on the server too, by
+// the next save.
 describe('the persisted kind mirrors the backend omitempty', () => {
   it('omits the key entirely for an empty or absent kind', () => {
     expect(kindSetting(undefined)).toEqual({});

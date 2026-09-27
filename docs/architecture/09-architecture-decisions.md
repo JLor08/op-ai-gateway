@@ -82,8 +82,13 @@ capture is visible only to its owner (even admins are excluded).
 
 ## ADR-009 — No body-size cap on inference; 1 MiB on control-plane
 **Decision:** the inference endpoints read the body with no size cap (large
-base64/multimodal requests); control-plane endpoints keep a 1 MiB cap. Any reverse
-proxy must set `client_max_body_size 0` on the inference paths. **Consequence:**
+base64/multimodal requests); control-plane endpoints keep a 1 MiB cap. The portal
+chat endpoints are the one control-plane exception: their bodies carry whole chat
+documents and are capped at `portal.MaxChatRequestBytes` (the 4 MiB content cap
+plus 1 MiB for the JSON envelope), which the bundled nginx allows on
+`/api/portal/chats`. Any reverse
+proxy must set `client_max_body_size 0` on the inference paths, and must allow at
+least `portal.MaxChatRequestBytes` (5 MiB) on `/api/portal/chats`. **Consequence:**
 the rule is per-endpoint-class, not a fixed list — there were four such
 endpoints when this was decided and there are five since
 `/v1/images/generations`, which reads an uncapped body for the same reason and

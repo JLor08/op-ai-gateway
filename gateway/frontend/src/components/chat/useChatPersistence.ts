@@ -30,10 +30,6 @@ import {
 } from './chatDoc';
 
 export type ChatPersistenceApi = {
-  // Build the opaque content document from the current active-chat state.
-  // Exposed (not just used internally) because renameChat also needs it for
-  // the active chat's PUT.
-  buildDoc: () => ActiveChatDoc;
   // Persist the active chat now (cancels any pending debounce). Best-effort:
   // errors surface a toast and leave the chat marked dirty for a later retry.
   flushSave: () => Promise<void>;
@@ -65,13 +61,6 @@ export type ChatPersistenceApi = {
   // too late by then. Cleared again by a successful adopt, by deleteChat, and
   // by activating a chat straight from a freshly loaded server document.
   setTranscriptStale: (chatId: string, stale: boolean) => void;
-  // Whether chatId carries that mark. Read by writers that live OUTSIDE this
-  // module and therefore cannot be refused from inside it — renameChat PUTs
-  // buildDoc() for the active chat directly, bypassing flushSave, so it has
-  // to ask. The invariant is "no write may carry an unproven local
-  // transcript", not "these N functions check a flag": a writer that cannot
-  // refuse must re-derive its document from the server instead.
-  isTranscriptStale: (chatId: string) => boolean;
   // Final best-effort flush on a real provider unmount (logout): cancels the
   // pending timer and, unless a run is live, fires a synchronous-dispatch
   // save for the active chat if it is dirty.
@@ -294,14 +283,16 @@ export function useChatPersistence(
       // dirty and the unmount flush (logout) and the next change both retry.
       //
       // WHAT IS EXPOSED: every persisted change made since the last debounced
-      // save COMPLETED. The debounced save above has no size limit and is the
-      // path that actually persists an image turn, but it is a TRAILING
-      // debounce that RESETS its timer on each change -- so SAVE_DEBOUNCE_MS
-      // (800 ms) is a settle window, not a ceiling. After an 800 ms pause
-      // everything is on the server and this skip costs nothing; under a
-      // stream of changes arriving faster than that (dragging the temperature
-      // slider, typing a system prompt without pausing) the save never fires
-      // and ALL of those changes are exposed, for as long as it continues.
+      // save COMPLETED. The debounced save above is bounded by the chat
+      // request cap (which the bundled edge allows on /api/portal/chats);
+      // the image turn itself is committed server-side by the run. The
+      // debounced save is a TRAILING debounce that RESETS its timer on each
+      // change -- so SAVE_DEBOUNCE_MS (800 ms) is a settle window, not a
+      // ceiling. After an 800 ms pause everything is on the server and this
+      // skip costs nothing; under a stream of changes arriving faster than
+      // that (dragging the temperature slider, typing a system prompt without
+      // pausing) the save never fires and ALL of those changes are exposed,
+      // for as long as it continues.
       // Bounding that would mean a max-wait debounce, which is a change to
       // every chat and not just to image threads.
       //
@@ -344,8 +335,6 @@ export function useChatPersistence(
     else staleChatsRef.current.delete(chatId);
   }, []);
 
-  const isTranscriptStale = useCallback((chatId: string) => staleChatsRef.current.has(chatId), []);
-
   // Final best-effort flush on a real provider unmount (logout — a
   // client-side state change, NOT a page reload, so this fires reliably
   // unlike the pagehide path). The caller (ChatStoreProvider) invokes this
@@ -366,13 +355,11 @@ export function useChatPersistence(
   }, [buildDoc, isRunning, activeChatIdRef, activeTitleRef, apiRef]);
 
   return {
-    buildDoc,
     flushSave,
     clearDirty,
     skipNextSave,
     cancelPendingSave,
     setTranscriptStale,
-    isTranscriptStale,
     flushOnUnmount,
   };
 }

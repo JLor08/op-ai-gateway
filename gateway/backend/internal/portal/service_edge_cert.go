@@ -1169,6 +1169,11 @@ server {
     # Everything else: portal, /api/, /healthz.
     location / { proxy_pass %[1]s; }
 
+    # Portal chat documents can be as large as the gateway's chat request cap
+    # (5 MiB); everything else under /api/ keeps nginx's 1 MiB default. No
+    # proxy_set_header, so the server-level set above is inherited.
+    location /api/portal/chats { client_max_body_size 5m; proxy_pass %[1]s; }
+
     # WebSocket agent-telemetry stream. Setting any proxy_set_header inside a
     # location DISCARDS the inherited set, so all of them are repeated here.
     location = /api/agent/v1/stream {
@@ -1187,8 +1192,9 @@ server {
         proxy_read_timeout 3600s;
     }
 
-    # Inference endpoints carry base64 image data -- no body cap (the gateway
-    # keeps its control-plane endpoints at 1 MiB itself).
+    # Inference endpoints carry base64 image data -- no body cap (the rest of
+    # the control plane stays at nginx's 1 MiB default; the chat documents
+    # above are the exception).
     location /v1/        { client_max_body_size 0; proxy_pass %[1]s; }
     location /openai/    { client_max_body_size 0; proxy_pass %[1]s; }
     location /anthropic/ { client_max_body_size 0; proxy_pass %[1]s; }

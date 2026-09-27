@@ -318,3 +318,73 @@ func TestPortalChatsListCarriesMaxContentBytes(t *testing.T) {
 		t.Fatalf("max_content_bytes = %d, want %d", list.MaxContentBytes, portal.MaxChatContentBytes)
 	}
 }
+
+// A chat request body is bounded at portal.MaxChatRequestBytes: the content cap
+// plus room for the JSON envelope. Each of the three document-sized chat bodies
+// (create, save, run start) is checked on both sides of that bound. Over it, the
+// gateway answers its own JSON 413 before decoding. Between the content cap and
+// the bound, the body is read, and the service answers on the content cap
+// itself (400 portal.chat_too_large), so the service stays the authority on how
+// large a DOCUMENT may be. The second case is what tells the chat bound from the
+// 1 MiB default: a handler that reads its body at the default gives a 413 there.
+func TestPortalChatBodiesAreBoundedAtTheChatRequestCap(t *testing.T) {
+	srv, dir := newChatTestServer(t)
+	// newChatTestServer leaves ChatRuns nil (most of this file never starts a
+	// run). The "run" subtests below do reach handleStartChatRun, and
+	// without a real registry a reverted guard would decode the oversized
+	// body and panic inside reserveRun's nil-receiver s.ChatRuns.add(...)
+	// rather than failing the subtest cleanly -- taking down the whole test
+	// binary on a regression instead of reporting it.
+	srv.ChatRuns = NewChatRunRegistry(5)
+	seedLoginUser(t, dir, "usr_b", "b@example.test", "password-1", "user")
+	cookie := loginCookie(t, srv, "b@example.test", "password-1")
+
+	rec := chatRequest(t, srv, cookie, http.MethodPost, "/api/portal/chats", `{"title":"t","content":{"messages":[]}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v (%s)", err, rec.Body.String())
+	}
+
+	// A create or save body carries its size in the document itself.
+	withPad := func(n int) string {
+		return `{"title":"t","content":{"messages":[],"pad":"` + strings.Repeat("a", n) + `"}}`
+	}
+	// A run body carries it in the user turn: PrepareChatRun appends that turn
+	// to the stored document and saves the result, which SaveChat refuses on
+	// the content cap.
+	withUserMessage := func(n int) string {
+		return `{"user_message":"` + strings.Repeat("a", n) + `","settings":{}}`
+	}
+	for _, tc := range []struct {
+		name, method, path string
+		body               func(n int) string
+	}{
+		{"create", http.MethodPost, "/api/portal/chats", withPad},
+		{"save", http.MethodPut, "/api/portal/chats/" + created.ID, withPad},
+		{"run", http.MethodPost, "/api/portal/chats/" + created.ID + "/runs", withUserMessage},
+	} {
+		t.Run(tc.name+" over the bound gets the gateway's 413", func(t *testing.T) {
+			rec := chatRequest(t, srv, cookie, tc.method, tc.path, tc.body(portal.MaxChatRequestBytes))
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413, body = %.200s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "request.body_too_large")
+		})
+		t.Run(tc.name+" between the content cap and the bound is read and refused on the content cap", func(t *testing.T) {
+			body := tc.body(portal.MaxChatContentBytes)
+			if len(body) <= portal.MaxChatContentBytes || len(body) >= portal.MaxChatRequestBytes {
+				t.Fatalf("body is %d bytes, want between MaxChatContentBytes = %d and MaxChatRequestBytes = %d", len(body), portal.MaxChatContentBytes, portal.MaxChatRequestBytes)
+			}
+			rec := chatRequest(t, srv, cookie, tc.method, tc.path, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %.200s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "portal.chat_too_large")
+		})
+	}
+}
