@@ -72,8 +72,8 @@ export function ApiVariantControls({
   onMessagesModeChange: (mode: EndpointMode) => void;
   onLiveTimingsChange: (enabled: boolean) => void;
   // A validation message for the flavor group, or undefined for none. The
-  // CALLER decides whether an empty selection is an error: the application
-  // form refuses it, the launch-spec form does not.
+  // CALLER decides whether an empty selection is an error; both callers, the
+  // application form and the launch-spec form, refuse it.
   flavorsError?: string;
   // The flavor group's fieldset, for a caller that moves focus to it when it
   // refuses a save over the flavors (see CheckboxGroup's groupRef).

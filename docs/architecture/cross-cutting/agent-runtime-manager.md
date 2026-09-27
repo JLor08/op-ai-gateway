@@ -1062,10 +1062,14 @@ fact about this runtime is, and why:
   Both forms offer it as a third flavor checkbox,
   `openai_images`, in the shared `ApiVariantControls`: tick it on the
   `server_agent` application for candidacy and on each image spec for the
-  relay. It is opt-in, so neither form ticks it by default: a new spec's
-  create form starts from its parent application's flavors without
-  `openai_images`, and the spec type does not set flavors. The type field's
-  note for `stable_diffusion_cpp` says which boxes to tick.
+  relay. It is opt-in: the `server_agent` application form does not tick it
+  by default, and a spec's first write — the create form, or Edit of a
+  mapping that has no spec yet — starts from its parent application's flavors
+  without `openai_images`, unless the parent lists `openai_images` alone,
+  which the first write then inherits
+  ([§11.5](#115-what-each-remaining-tab-shows)). The spec type does not set
+  flavors. The type field's note for `stable_diffusion_cpp` says which boxes
+  to tick.
 
 - **Its `image` verdict is automatic too, read through the agent rather than
   around it.** The gateway's health loop reaches only an **external**
@@ -3783,7 +3787,7 @@ silently equivalent to "not loaded": the screen renders a banner saying the
 server's operating mode could not be determined, keeps writes off, and offers a
 retry.
 
-Two more rules on this screen generalise:
+Three more rules on this screen generalise:
 
 - **An `admin_state` write builds its PUT body by rest-spreading the actual
   loaded spec** and replacing the one field, never by assembling an explicit
@@ -3802,6 +3806,15 @@ Two more rules on this screen generalise:
   `deleteMeaning()` now answers `spec | mapping | unknown`, read by both the row
   action and the confirm handler — their disagreement having been the actual
   defect — with `unknown` falling through to the smaller operation.
+- **Only the latest form open fills the launch-spec form.** Edit re-reads the
+  spec with its own GET, and the list stays clickable while that GET is in
+  flight, so the operator can open Edit on another row, or Create, before it
+  lands. A GET answering for a superseded click still reaches the per-mapping
+  cache, but fills no form field, switches no view and reports no error, and
+  it leaves the loading lock to the latest click. Without that, a late answer
+  for an earlier click would switch the form to that mapping's spec while the
+  names stay the later mapping's, and the save would write the later
+  mapping's upstream model name onto the earlier mapping.
 
 ### 11.2 Restart is a sequence, not an endpoint
 
@@ -3848,6 +3861,17 @@ no endpoint, the sequence carries all the correctness burden:
   bounce. When the row is gone for good, **no clear PUT is sent at all** —
   PUTting a spec whose mapping may have been deleted would either 404 or
   resurrect a spec the operator just removed.
+- **A spec delete during the wait decides the clear, not the stream alone.**
+  Delete stays available while a restart waits, and the spec PUT is an upsert,
+  so a clear PUT the backend handles after the DELETE creates the deleted spec
+  again, with no override. While a spec DELETE for the flow's mapping is in
+  flight, a `stopped` frame therefore does not complete the sequence; a later
+  frame does, once the DELETE has settled. The clearing step sends no PUT, and
+  shows the same notice as a vanished row, when the cached document is no
+  longer configured (the delete committed) or carries another spec id (the spec
+  was deleted and created again, and its `admin_state` is the operator's new
+  choice). A failed DELETE leaves the spec in the cache, and the clear goes
+  ahead.
 - **On timeout the override is deliberately not cleared.** The portal cannot
   distinguish a wedged child from a merely slow one, and clearing would hand
   control back to normal policy at an unknown moment. The notice states plainly
@@ -4133,7 +4157,10 @@ like an error.
 endpoint-mode dropdowns the application form shows, extracted into one shared
 component,
 `ApiVariantControls` (`gateway/frontend/src/components/shared/ApiVariantControls.tsx`),
-so the two forms cannot drift apart. `RuntimeAdminSection` renders it against
+so the two forms cannot drift apart; both also refuse a save with every
+flavor unticked ([Compatibility & Inference
+§6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
+`RuntimeAdminSection` renders it against
 `spec.api_flavors`/`responses_mode`/`messages_mode` (`PutRuntimeSpecRequest`
 carries the same trio), which — once saved — is the **sole** authority for
 that model's Codex/Claude Code endpoints; the parent `server_agent`
@@ -4184,30 +4211,45 @@ unticking and saving again, and accepted as the price of staying permissive
 under `Auto`. The read-only `effective_type` echo beside it is deliberately
 **not** that signal: it is undefined on create and stale the moment `binary` is
 edited.
-**Snapshot, not inheritance:** opening the **create** form pre-fills the three
-fields from the parent application's *current* values (`openCreate` in
-`RuntimeAdminSection.tsx` reads `application.api_flavors`/`responses_mode`/
-`messages_mode` into local form state) purely so a new spec starts out
-agreeing with what the application already exposes rather than a blank
-passthrough-only guess. `openai_images` is left out of that snapshot **only
-when a text flavor survives the exclusion**: it is opt-in on the spec too, and
-a parent that declares it for its image children would otherwise hand it to
-every new text model's spec. Under a parent whose flavors are *exactly*
-`[openai_images]` the exclusion is skipped and `openai_images` is inherited
-as is, because dropping it there would leave every flavor unticked — an
-untouched save would then send `[]`, which the backend's own create default
-turns into `[openai, anthropic]` (the two text flavors, not narrower),
-leaving the new spec's child unreachable by any flavor an operator could use,
-with no warning. This is a **frontend, form-open-time** convenience, not a
-backend default: the backend's own absent-field default is unconditionally
-`passthrough` for both modes and both text flavors (`openai`, `anthropic`)
-enabled (`PutRuntimeSpecRequest`, `internal/portal/service_runtime.go`), and
-it never reads the parent application to fill in a gap (pinned by
-`TestPutRuntimeSpecDoesNotInheritAppModes`). A later edit to the application's
-own values therefore never propagates to an existing spec — only a **new**
-spec's create form picks up the application's current template — matching the
-"full-document replace, no inheritance" posture the rest of this feature holds
-to (§11.1).
+**Snapshot, not inheritance:** a spec's **first write** pre-fills the three
+fields from the parent application's *current* values
+(`runtimeSpecTemplate`, used by `openCreate` and, for a mapping without a spec
+row, by `openEdit` in `RuntimeAdminSection.tsx`) purely so a new spec starts
+out agreeing with what the application already exposes rather than a blank
+passthrough-only guess. Edit of a spec-less mapping takes the same template
+because until that first write the mapping routes on its application's
+flavors and modes (the no-spec fallback), and because it is where the
+operator retries a create whose spec write failed. The GET's synthesized
+document holds zero values for the three fields there (`[]` and `""`), not
+choices: a form opened on them would refuse to save the `[]`, and the
+backend would store the `""` as `passthrough` rather than the modes the
+mapping routed on. Its `enabled: false` is a zero value too, so that Edit
+opens with Enabled ticked, as the create form does. `openai_images` is left
+out of the template **only when a text flavor survives the exclusion**: it is
+opt-in on the spec too, and a parent that declares it for its image children
+would otherwise hand it to every new text model's spec. Under a parent whose
+flavors are *exactly* `[openai_images]` the exclusion is skipped and
+`openai_images` is inherited as is, because dropping it there would leave
+every flavor unticked, a form the launch-spec form refuses to save. This is a
+**frontend, form-open-time** convenience, not a backend default: the
+backend's default for an absent or empty field, on every spec write, is
+unconditionally `passthrough` for both modes and both text flavors (`openai`,
+`anthropic`) enabled (`PutRuntimeSpecRequest`,
+`internal/portal/service_runtime.go`), and it never reads the parent
+application to fill in a gap (pinned by
+`TestPutRuntimeSpecDoesNotInheritAppModes`, and for a rewrite of a stored
+spec by `TestPutRuntimeSpecModeAndFlavorDefaultsOnARewrite`). A later edit
+to the application's own values therefore never propagates to an existing
+spec — only a spec's first write picks up the application's current
+template — matching the "full-document replace, no inheritance" posture the
+rest of this feature holds to (§11.1). The override actions and the VRAM
+benchmark replay a stored document as is, so a spec stored as `[]` (no
+supported writer produces one) would come back from them as both text
+flavors. The backend keeps that default rather than refusing an explicit
+`[]`: those replays send the stored list back unchanged, so a refusal would
+make them fail on such a row. The application API does not refuse one
+either; the two forms refuse it instead ([Compatibility & Inference
+§6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
 
 **A GPU row can show a THIRD number, and it is an offer rather than a field.**
 When the mapping's benchmark history carries an applicable VRAM measurement

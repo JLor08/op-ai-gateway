@@ -228,9 +228,14 @@ Conventions worth stating, because each is a judgement call a client depends on:
 - **There is no bulk "list runtime specs for an application" endpoint.** The spec
   is mapping-scoped, so a client fans out one GET per mapping.
   `configured: false` is the *only* signal for "this mapping has no spec row
-  yet" — every other field is then a zero value (`gpus`/`args`/`env` still
-  non-nil but empty) and `id` is absent. A PUT never re-keys the row: the
-  returned spec keeps its `id`.
+  yet". The document is then synthesized: `id` is absent and `mapping_id` is
+  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`
+  non-nil but empty, `responses_mode`/`messages_mode` `""`), except
+  `visible_devices_mode` (`env`) and `api_token_mode`/`api_token_header_source`
+  (`app`), which carry their defaults; `app_api_token_set`/`app_api_token_header`
+  echo the parent application; and `effective_type` is `custom`, what the empty
+  `binary` detects as, whose resolved probe paths are empty. A PUT never
+  re-keys the row: the returned spec keeps its `id`.
 - **`DELETE` returns `200 {"ok":true}`, never 204**; a wrong method returns 405
   with an `Allow` header.
 - **`expected_uuid` / `expected_name` on a budget row are never
@@ -550,12 +555,13 @@ and [Agent-Managed Model Runtime
 §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows).
 Wire notes a client must know:
 
-- **Create** (`CreateApplicationRequest`, `PutRuntimeSpecRequest`): an absent
-  or blank mode defaults to `passthrough`; an absent or empty `api_flavors` on
-  the runtime-spec shape defaults to the two text flavors, `openai` and
-  `anthropic` (never `openai_images`) — the same "every supported upstream now
-  serves both endpoints" default the application side has always used. An
-  unrecognized mode or flavor is rejected before any write.
+- **Create, and every runtime-spec write** (`CreateApplicationRequest`,
+  `PutRuntimeSpecRequest`): an absent or blank mode defaults to `passthrough`;
+  an absent or empty `api_flavors` on the runtime-spec shape defaults to the
+  two text flavors, `openai` and `anthropic` (never `openai_images`) — the
+  same "every supported upstream now serves both endpoints" default the
+  application side has always used. An unrecognized mode or flavor is
+  rejected before any write.
 - **Update** (`UpdateApplicationRequest`): the two modes are `*string`,
   keep-if-absent like every other pointer field on this DTO — but unlike a
   plain optional string there is no "clear to empty" for a three-state enum:
@@ -567,14 +573,15 @@ Wire notes a client must know:
   the parent application's current values — it gets the same
   passthrough/both-flavors default a brand-new application would. The portal
   form performs the "start from the parent application's current values"
-  snapshot itself, once, when the create form is opened
+  snapshot itself, once, when a spec's first write is opened — the create
+  form, or Edit of a mapping that has no spec yet
   ([Agent-Managed Model Runtime
   §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows));
   a direct API client gets no such convenience. That snapshot has one
   exception: `openai_images` is left out of it, UNLESS the parent's flavors
   are exactly `[openai_images]`, in which case it is snapshotted as is (see
-  §11.5 for why — dropping it there would leave the new spec unreachable by
-  any flavor an untouched save could produce).
+  §11.5 for why — dropping it there would leave every flavor unticked, which
+  the form refuses to save).
 - **`responses_live_timings_enabled`** is a separate opt-in that rides the
   same two surfaces: it is a `bool` on `ApplicationDTO` and on
   `RuntimeSpecDTO`, and a `*bool` on `CreateApplicationRequest`,

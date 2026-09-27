@@ -2055,7 +2055,7 @@ configured image generation through an `openai` application. Every image
 upstream is therefore given the flavor explicitly, by the `stable_diffusion_cpp`
 application type's default or by the flavor checkbox; the launch-spec type sets
 no flavor, so an agent-launched child needs the checkbox unless its parent
-application lists only `openai_images`, which a new spec inherits.
+application lists only `openai_images`, which a spec's first write inherits.
 
 **(b) Flavor exclusion stays two-staged, and the images relay joins the second
 stage.** Candidacy filters on the application's flavors; a `server_agent`

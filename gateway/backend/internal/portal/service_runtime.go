@@ -397,8 +397,15 @@ type RuntimeSpecGPUDTO struct {
 // agent-managed launch spec (routing.RuntimeSpec + its GPU rows).
 type RuntimeSpecDTO struct {
 	// Configured is false when the mapping has no runtime spec row yet — the
-	// only signal GetRuntimeSpec ever uses for "not configured"; every other
-	// field is then a zero value (GPUs/Args/Env still non-nil empty).
+	// only signal GetRuntimeSpec ever uses for "not configured". The document
+	// is then synthesized: ID is absent and MappingID is set; the spec's own
+	// fields are zero values (GPUs/Args/Env/APIFlavors non-nil but empty, both
+	// endpoint modes ""), except VisibleDevicesMode ("env") and
+	// APITokenMode/APITokenHeaderSource ("app"), which carry their defaults;
+	// AppAPITokenSet/AppAPITokenHeader echo the parent application; and the
+	// resolved echoes are computed from that empty spec: EffectiveType is
+	// "custom" (what an empty Binary detects as), so ResolvedMetricsPath and
+	// ResolvedContextProbePath are custom's empty defaults.
 	Configured                  bool              `json:"configured"`
 	ID                          string            `json:"id,omitempty"`
 	MappingID                   string            `json:"mapping_id"`
@@ -500,7 +507,8 @@ type PutRuntimeSpecRequest struct {
 	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
 	// Absent (empty/"") defaults to both/passthrough — see putRuntimeSpec;
 	// the backend does NOT inherit the parent server_agent application's
-	// values, the portal frontend pre-fills the create form instead.
+	// values; the portal form starts a spec's first write from them instead
+	// (runtimeSpecTemplate: Create, and Edit of a spec-less mapping).
 	APIFlavors    []string `json:"api_flavors"`
 	ResponsesMode string   `json:"responses_mode"`
 	MessagesMode  string   `json:"messages_mode"`
@@ -706,9 +714,9 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
-	// frontend pre-fills the create form; the backend only supplies a sane
-	// default when the request omits a field). See
-	// TestPutRuntimeSpecDoesNotInheritAppModes.
+	// portal form starts a spec's first write from the parent; the backend
+	// only supplies a sane default when a field is absent or empty, on every
+	// write). See TestPutRuntimeSpecDoesNotInheritAppModes.
 	respMode := routing.EndpointModePassthrough
 	if strings.TrimSpace(req.ResponsesMode) != "" {
 		m, ok := validEndpointMode(req.ResponsesMode)

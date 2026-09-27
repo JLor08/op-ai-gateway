@@ -26,9 +26,15 @@ export interface RuntimeSpecGPU {
 
 // A mapping's agent-managed launch spec (GET/PUT/DELETE
 // /api/portal/mappings/{id}/runtime-spec). `configured: false` means the
-// mapping has no spec row yet -- the only signal for "not configured"; every
-// other field is then a zero value (gpus/args/env still non-nil empty), and
-// `id` is absent (the backend's `omitempty`).
+// mapping has no spec row yet -- the only signal for "not configured". The
+// document is then synthesized: `id` is absent (the backend's `omitempty`),
+// `mapping_id` is set, and the spec's own fields are zero values (gpus/args/
+// env/api_flavors non-nil but empty, both endpoint modes ""), except
+// visible_devices_mode ('env') and api_token_mode/api_token_header_source
+// ('app'), which carry their defaults. app_api_token_set/app_api_token_header
+// echo the parent application, effective_type is 'custom' (what the empty
+// binary detects as), and both resolved probe paths are custom's empty
+// defaults.
 export interface RuntimeSpec {
   configured: boolean;
   id?: string;
@@ -92,8 +98,11 @@ export interface RuntimeSpec {
   // Per-endpoint API-variant snapshot for this managed model (gateway-side only;
   // NOT sent to the agent). api_flavors gates routing eligibility; the two modes
   // decide disabled / translate / passthrough for /v1/responses and /v1/messages.
-  // A full-document upsert stores all three explicitly (snapshot from the app on
-  // create; see RuntimeAdminSection). Mirrors the Go RuntimeSpecDTO.
+  // A full-document upsert stores all three explicitly; the form starts a first
+  // write from the parent application (runtimeSpecTemplate). A `configured:
+  // false` document carries api_flavors [] and "" for BOTH modes on the wire,
+  // whatever this type says; the form never renders those, it seeds them from
+  // the parent. Mirrors the Go RuntimeSpecDTO.
   api_flavors: string[];
   responses_mode: EndpointMode;
   messages_mode: EndpointMode;

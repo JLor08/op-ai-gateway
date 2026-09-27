@@ -529,12 +529,9 @@ plausible-looking validation rule would break the normal case:
   portal's alone
   ([API Surface](api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode)).
   Nothing should ever store `''` post-migration: migration 72 backfills every
-  existing row and the portal's own create paths substitute `passthrough` for
-  a blank request field before the write, never after. `EndpointMode.OrDefault`
-  resolves the hypothetical unset (`''`) case to `passthrough` rather than
-  `disabled` — a defaulting rule a zero-value in-memory struct literal (a test
-  fixture, say) would need — but as shipped no production read path calls it;
-  it is exercised only by its own unit test. `agent_runtime_specs.api_flavors`
+  existing row, and the portal substitutes `passthrough` for a blank request
+  field before the write, never after — on an application's create and on
+  every runtime-spec write. `agent_runtime_specs.api_flavors`
   reuses `applications.api_flavors`' own shape (opaque JSON-array `text`,
   migration 72) and is a **snapshot**, not a live reference: once a spec is
   created it never re-reads its parent application's row, by design

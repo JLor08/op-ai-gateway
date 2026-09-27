@@ -135,6 +135,23 @@ describe('running-connections (active requests) i18n keys', () => {
   });
 });
 
+// Each form's flavor refusal gives its reason only through this message, shown
+// at the flavor group and wired as the group's accessible description; an
+// empty string is no error at all to CheckboxGroup, so the refusal would give
+// no reason. The component tests compare against the same table, so they
+// would pass on '' too.
+describe('flavor-refusal i18n keys', () => {
+  it('defines both forms’ refusal messages as non-empty strings in de and en', () => {
+    const keys = ['applicationFlavorsRequired', 'runtimeSpecFlavorsRequired'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('live tokens/sec provenance strings claim only what the row can know', () => {
   it('does not pin the missing rate on the upstream, because the absence is client-dependent', () => {
     // The tooltip used to read "this upstream reports no exact token count

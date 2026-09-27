@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -303,9 +304,10 @@ func TestRuntimeSpecDTOCarriesFlavorsAndModes(t *testing.T) {
 }
 
 // TestPutRuntimeSpecModeAndFlavorDefaults pins the backend defaults applied
-// when a PUT omits api_flavors/responses_mode/messages_mode: flavors default
-// to both, and each mode defaults to passthrough (mirrors the application
-// create-path default, Task A2).
+// when a spec's first PUT omits api_flavors/responses_mode/messages_mode:
+// flavors default to both, and each mode defaults to passthrough (mirrors the
+// application create-path default, Task A2). The rewrite case is
+// TestPutRuntimeSpecModeAndFlavorDefaultsOnARewrite.
 func TestPutRuntimeSpecModeAndFlavorDefaults(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -323,8 +325,8 @@ func TestPutRuntimeSpecModeAndFlavorDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
 	}
-	if len(dto.APIFlavors) != 2 {
-		t.Fatalf("api_flavors default = %#v, want both", dto.APIFlavors)
+	if want := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}; !slices.Equal(dto.APIFlavors, want) {
+		t.Fatalf("api_flavors default = %#v, want %#v", dto.APIFlavors, want)
 	}
 	if dto.ResponsesMode != string(routing.EndpointModePassthrough) ||
 		dto.MessagesMode != string(routing.EndpointModePassthrough) {
@@ -332,22 +334,96 @@ func TestPutRuntimeSpecModeAndFlavorDefaults(t *testing.T) {
 	}
 }
 
+// TestPutRuntimeSpecModeAndFlavorDefaultsOnARewrite pins that the defaults
+// apply on every write, not only on a spec's first one: a re-PUT of a spec
+// stored with non-default flavors and modes, with the trio absent or empty,
+// lands on both text flavors with passthrough rather than keeping the stored
+// values (the keep-if-absent rule responses_live_timings_enabled follows does
+// not extend to them). The empty case is the shape an override or benchmark
+// replay of a stored [] and "" sends.
+func TestPutRuntimeSpecModeAndFlavorDefaultsOnARewrite(t *testing.T) {
+	cases := []struct {
+		name    string
+		rewrite PutRuntimeSpecRequest
+	}{
+		{
+			name:    "absent",
+			rewrite: PutRuntimeSpecRequest{Enabled: true, Binary: "/usr/local/bin/llama-server"},
+		},
+		{
+			name: "empty",
+			rewrite: PutRuntimeSpecRequest{
+				Enabled: true, Binary: "/usr/local/bin/llama-server",
+				APIFlavors: []string{}, ResponsesMode: "", MessagesMode: "",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+			ctx := context.Background()
+			svc, routeStore := newServerTestService(t, now)
+			server := createTestServer(t, svc, "S", "s.example.test")
+			app := seedServerAgentApplication(t, routeStore, server.ID, now)
+			mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
+			if err != nil {
+				t.Fatalf("CreateMapping: %v", err)
+			}
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+				Enabled: true, Binary: "/usr/local/bin/llama-server",
+				APIFlavors:    []string{routing.APIFlavorOpenAI},
+				ResponsesMode: string(routing.EndpointModeTranslate),
+				MessagesMode:  string(routing.EndpointModeDisabled),
+			}); err != nil {
+				t.Fatalf("first PutRuntimeSpec: %v", err)
+			}
+			dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, tc.rewrite)
+			if err != nil {
+				t.Fatalf("rewrite PutRuntimeSpec: %v", err)
+			}
+			got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+			if err != nil {
+				t.Fatalf("GetRuntimeSpec: %v", err)
+			}
+			want := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
+			for label, d := range map[string]RuntimeSpecDTO{"PUT answer": dto, "GET": got} {
+				if !slices.Equal(d.APIFlavors, want) {
+					t.Fatalf("%s api_flavors = %#v, want %#v (default on a rewrite)", label, d.APIFlavors, want)
+				}
+				if d.ResponsesMode != string(routing.EndpointModePassthrough) ||
+					d.MessagesMode != string(routing.EndpointModePassthrough) {
+					t.Fatalf("%s modes = %q/%q, want passthrough (default on a rewrite)", label, d.ResponsesMode, d.MessagesMode)
+				}
+			}
+		})
+	}
+}
+
 // TestPutRuntimeSpecDoesNotInheritAppModes pins the "no backend inheritance"
 // contract (spec §5.4/§12): the runtime-spec PUT is a full-document upsert
 // with no field inheritance from the parent server_agent application -- the
-// frontend pre-fills a create form from the app's current values, but the
-// backend only ever supplies its own passthrough/both defaults for absent
-// fields. seedServerAgentApplication's app carries a non-default APIFlavors
-// ([openai] only, no anthropic) and zero-value (i.e. "") modes; a PUT that
-// omits the trio must land on the backend's OWN defaults, not the parent
-// app's stored values.
+// portal form starts a spec's first write from the parent application
+// (runtimeSpecTemplate: Create, and Edit of a spec-less mapping), but the
+// backend only ever supplies its own passthrough/both defaults for an
+// absent or empty field, on every write. The test forces the seeded app's
+// APIFlavors to [openai] only (no anthropic) and its ResponsesMode/
+// MessagesMode to disabled before the PUT, so an inherited value could
+// never pass for the backend's own default; a PUT that omits the trio must
+// land on the backend's OWN defaults, not the parent app's stored values.
 func TestPutRuntimeSpecDoesNotInheritAppModes(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
 	svc, routeStore := newServerTestService(t, now)
 	server := createTestServer(t, svc, "S", "s.example.test")
-	// Seed a server_agent app whose modes are non-default (disabled).
+	// Seed a server_agent app whose flavors are [openai] only and whose modes
+	// are both disabled, so an inherited value could not pass for the default.
 	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	app.APIFlavors = []string{routing.APIFlavorOpenAI}
+	app.ResponsesMode = routing.EndpointModeDisabled
+	app.MessagesMode = routing.EndpointModeDisabled
+	if err := routeStore.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
 	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "m", AppModelName: "m"})
 	if err != nil {
 		t.Fatalf("CreateMapping: %v", err)
@@ -358,13 +434,17 @@ func TestPutRuntimeSpecDoesNotInheritAppModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
 	}
-	// Backend default is passthrough, NOT the app's stored value.
+	// Backend default is passthrough for BOTH modes, NOT the app's disabled.
 	if dto.ResponsesMode != string(routing.EndpointModePassthrough) {
 		t.Fatalf("responses_mode = %q, want passthrough (no backend inheritance)", dto.ResponsesMode)
 	}
-	// Backend default flavors is both, NOT the app's stored [openai]-only value.
-	if len(dto.APIFlavors) != 2 {
-		t.Fatalf("api_flavors = %#v, want both (no backend inheritance from app's [openai]-only value)", dto.APIFlavors)
+	if dto.MessagesMode != string(routing.EndpointModePassthrough) {
+		t.Fatalf("messages_mode = %q, want passthrough (no backend inheritance)", dto.MessagesMode)
+	}
+	// Backend default flavors are exactly both text flavors, NOT the app's
+	// [openai]-only value, and never openai_images.
+	if want := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}; !slices.Equal(dto.APIFlavors, want) {
+		t.Fatalf("api_flavors = %#v, want %#v (no backend inheritance)", dto.APIFlavors, want)
 	}
 }
 
