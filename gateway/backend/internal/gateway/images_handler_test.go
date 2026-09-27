@@ -958,6 +958,53 @@ func TestImagesServesServerAgentChildWhoseSpecIncludesImages(t *testing.T) {
 	}
 }
 
+// TestAnIngestedSdcppImageVerdictAdmitsAnImagesRequest is the agent-launched
+// sd-server's path end to end at package level: the image verdict the agent
+// reads off the child's /sdcpp/v1/capabilities document, reported under
+// sdcpp_capabilities, is what lets the images gate admit a request for that
+// child's mapping -- with no operator verdict anywhere.
+//
+// The fixture is the images-serving server_agent child above with its manual
+// image row removed, so the mapping starts with NO image verdict and the gate
+// refuses (routing.model_not_capable, nothing proxied). One telemetry sample
+// from the owning server later, the same request is proxied.
+func TestAnIngestedSdcppImageVerdictAdmitsAnImagesRequest(t *testing.T) {
+	ctx := context.Background()
+	prov := &recordingProxyProvider{respBody: `{"created":1,"data":[{"b64_json":"AA=="}]}`}
+	srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages})
+	if err := srv.Routes.DeleteMappingCapability(ctx, "route-agent-images", routing.CapabilityImage); err != nil {
+		t.Fatalf("DeleteMappingCapability: %v", err)
+	}
+	if row, ok := capabilityRow(t, srv, "route-agent-images", routing.CapabilityImage); ok {
+		t.Fatalf("the mapping still holds an image row (%+v) before ingest, want none", row)
+	}
+
+	rec := postImages(t, srv, `{"model":"flux1-dev","prompt":"a cat","n":1}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("before ingest: status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "routing.model_not_capable")
+	if prov.proxyCalls != 0 {
+		t.Fatalf("before ingest: ProxyNative calls = %d, want 0", prov.proxyCalls)
+	}
+
+	req, raw := ingestReq(t, capabilitiesBody("spec-agent-images",
+		`{"verdicts":[{"name":"image","verdict":"yes"}],"source":"sdcpp_capabilities"}`))
+	if err := srv.ingestTelemetrySample(ctx, "srv-agent-images", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	assertCapabilityRow(t, srv, "route-agent-images", routing.CapabilityImage,
+		routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+
+	rec = postImages(t, srv, `{"model":"flux1-dev","prompt":"a cat","n":1}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after ingest: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 {
+		t.Fatalf("after ingest: ProxyNative calls = %d, want 1", prov.proxyCalls)
+	}
+}
+
 // newRedirectingTestServer builds an images server whose dev token is opted in
 // to the unknown-model redirect with the given LastUsedModel and fallback.
 // Three models are routable for an images request, one per shape the redirect

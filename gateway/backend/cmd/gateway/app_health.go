@@ -1103,7 +1103,15 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		//
 		// It reaches an EXTERNAL sd-server only. An agent-launched sd-server
 		// is a server_agent mapping behind the agent's router, which passes
-		// only /props through per model, so its image verdict stays manual.
+		// only /props through per model, so this pass cannot read its
+		// document. That child's verdict comes from the agent instead: the
+		// agent reads the same document from the child it launched and
+		// reports the image verdict under sdcpp_capabilities, which the
+		// agent ingest accepts for image only (internal/gateway's rowSource
+		// and runtimeSampleCapabilityRows). The agent sends that source only
+		// while this gateway declares capability_source_sdcpp
+		// (gatewayAgentFeatures), as the agent last read it, up to about 30s
+		// old; the ingest's acceptance does not depend on it.
 		//
 		// A verdict that reached no active mapping clears its stamp again
 		// once the pass is over (unstampSdcpp, after wg.Wait), so the next

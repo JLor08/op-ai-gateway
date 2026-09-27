@@ -151,13 +151,18 @@ type RuntimeSample struct {
 	// populates it, and "" already means unknown to every consumer.
 	LiveProgressSupport string `json:"live_progress_support"`
 	// Capabilities is the auto-detected capability verdict set from the same
-	// /props document that yields LiveProgressSupport above (#49-2). A
-	// POINTER with omitempty, deliberately: nil distinguishes "this agent
-	// predates capability detection" from "detected, nothing determined"
-	// (a non-nil Capabilities with an empty Verdicts) -- a distinction the
-	// string fields above cannot make for themselves. See Capabilities' own
-	// doc comment below for the full reasoning, including why Verdicts is a
-	// keyed list rather than a map.
+	// document that yields LiveProgressSupport above (#49-2): /props, or
+	// /api/show for an ollama child (#54), or /sdcpp/v1/capabilities for a
+	// stable_diffusion_cpp child (#154). A POINTER with omitempty,
+	// deliberately: nil means "nothing to say this cycle" -- an agent that
+	// predates capability detection, a child that is not running, a probe
+	// with no conclusive answer yet, or (since 0.7.4) a stable_diffusion_cpp
+	// child whose verdict the agent does not send because the gateway does
+	// not declare capability_source_sdcpp -- and is distinct from "detected,
+	// nothing determined" (a non-nil Capabilities with an empty Verdicts), a
+	// distinction the string fields above cannot make for themselves. See
+	// Capabilities' own doc comment below for the full reasoning, including
+	// why Verdicts is a keyed list rather than a map.
 	Capabilities *Capabilities       `json:"capabilities,omitempty"`
 	GPUs         []RuntimeGPUSample  `json:"gpus,omitempty"`
 	LastError    *RuntimeErrorSample `json:"last_error,omitempty"`
@@ -165,8 +170,11 @@ type RuntimeSample struct {
 
 // Capabilities is one managed child's auto-detected capability set (#49-2).
 //
-// A POINTER on RuntimeSample, and that is load-bearing: nil means "this agent
-// predates capability detection", while non-nil with an empty Verdicts means
+// A POINTER on RuntimeSample, and that is load-bearing: nil means "nothing
+// to say this cycle" (an agent that predates capability detection, a child
+// that is not running, a probe with no conclusive answer yet, or a
+// stable_diffusion_cpp child whose verdict the gateway's feature set does
+// not let the agent send), while non-nil with an empty Verdicts means
 // "detection ran and determined nothing" — which is exactly what an
 // api-key-protected child reports, since a 401/403 is a CONCLUSIVE refusal.
 // A bare map with omitempty could not carry that distinction: an empty map
@@ -209,7 +217,9 @@ type Capabilities struct {
 	// carries no omitempty and Normalize forces it non-nil, so a non-nil
 	// Capabilities always marshals as at least {"verdicts":[]} ("detection
 	// ran, determined nothing") while a nil pointer omits the key entirely
-	// ("this agent predates capability detection"). Only making Source the
+	// ("nothing to report": an agent predating capability detection, a child
+	// not yet probed conclusively, or a withheld sdcpp_capabilities report).
+	// Only making Source the
 	// sole field, or giving Verdicts an omitempty of its own, could merge
 	// those two facts.
 	//
@@ -238,20 +248,26 @@ type CapabilityVerdict struct {
 
 // Capability verdict SOURCES: the closed vocabulary Capabilities.Source
 // draws from, one name per probe the agent can run. Mirrors the gateway's
-// routing.CapabilitySourceLlamaCppProps / CapabilitySourceOllamaAPIShow
-// byte-for-byte -- the two modules cannot share code, so the STRINGS are
-// the contract, and a rename on one side silently voids every row the other
-// side would have written. Their gateway-side doc carries the precedence
-// rank these names feed; nothing here ranks anything.
+// routing.CapabilitySource* constants of the same names byte-for-byte --
+// the two modules cannot share code, so the STRINGS are the contract, and a
+// rename on one side silently voids every row the other side would have
+// written. Their gateway-side doc carries the precedence rank these names
+// feed; nothing here ranks anything.
 const (
 	// CapabilitySourceLlamaCppProps is a GET of a llama.cpp /props document
-	// (collector.ProbePropsVerdicts) -- every spec type except "ollama",
-	// "custom" included, since "custom" is the type-detection fallback.
+	// (collector.ProbePropsVerdicts) -- every spec type except "ollama" and
+	// "stable_diffusion_cpp", "custom" included, since "custom" is the
+	// type-detection fallback.
 	CapabilitySourceLlamaCppProps = "llama_cpp_props"
 	// CapabilitySourceOllamaAPIShow is a POST of Ollama's /api/show
 	// (collector.ProbeOllamaVerdicts): what Ollama DECLARES about a model,
 	// a different document answering the same question.
 	CapabilitySourceOllamaAPIShow = "ollama_api_show"
+	// CapabilitySourceSdcppCapabilities is a GET of stable-diffusion.cpp's
+	// /sdcpp/v1/capabilities, whose supported_modes list is exhaustive: it
+	// answers the image capability in both directions and nothing else.
+	// Identical to the gateway's routing.CapabilitySourceSdcppCapabilities.
+	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 )
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring

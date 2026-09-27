@@ -578,7 +578,7 @@ const de = {
     'Unbekannt = keine Festlegung. Automatisch neu erkannt wird Vision nur, wenn der Upstream wirklich ein llama.cpp-/props-Dokument liefert (Sekunden bis rund 30 s); bei Router-, vLLM- oder Ollama-Upstreams bleibt es unbestimmt, bis es jemand setzt.',
   mappingImageCapable: 'Bilderzeugung',
   mappingImageCapableUnknownHint:
-    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Automatisch erkannt wird das nur in zwei Fällen: bei einer stable-diffusion.cpp-Anwendung, die das Gateway direkt erreicht (mit dem nächsten Health-Check, rund 30 s), und bei einem Ollama-Modell, das der Server-Agent startet, sobald Ollama für dieses Modell die Fähigkeit „image“ meldet (dann nur als Ja). Überall sonst setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Automatisch erkannt wird das in drei Fällen: bei einer stable-diffusion.cpp-Anwendung, die das Gateway direkt erreicht (mit dem nächsten Health-Check, rund 30 s), bei einem stable-diffusion.cpp-Modell, das der Server-Agent startet (Agent 0.7.4 oder neuer), sobald es einmal gelaufen ist, und bei einem Ollama-Modell, das der Server-Agent startet, sobald Ollama für dieses Modell die Fähigkeit „image“ meldet (dann nur als Ja). Eine Startkonfiguration, die noch nie gelaufen ist, hat noch kein Ergebnis, und eine Bildanfrage startet sie nicht: dort „Angeheftet (nie beenden)“ ankreuzen, sie einmal starten oder dies auf Ja setzen. Überall sonst setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -3019,7 +3019,7 @@ const en: PortalMessages = {
     'Unknown = no verdict on file. Vision is re-detected on its own only when the upstream really is a llama.cpp /props document (within seconds, or one health tick of about 30 s); for a router, vLLM or Ollama upstream it stays undetermined until someone sets it.',
   mappingImageCapable: 'Image generation',
   mappingImageCapableUnknownHint:
-    'Unknown: whether this mapping generates images is not on file. It is detected automatically in two cases only: for a stable-diffusion.cpp application the gateway reaches directly (on the next health tick, about 30 s), and for an Ollama model the server agent launches, once Ollama declares its "image" capability for that model (then only ever as Yes). Anywhere else, set it to Yes to enable image generation for this model.',
+    'Unknown: whether this mapping generates images is not on file. It is detected automatically in three cases: for a stable-diffusion.cpp application the gateway reaches directly (on the next health tick, about 30 s), for a stable-diffusion.cpp model the server agent launches (agent 0.7.4 or newer), once it has run, and for an Ollama model the server agent launches, once Ollama declares its "image" capability for that model (then only ever as Yes). A launch spec that has never run has no verdict yet, and an image request does not start it: tick "Pinned (never stop)" on it, start it once, or set this to Yes. Anywhere else, set it to Yes to enable image generation for this model.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',

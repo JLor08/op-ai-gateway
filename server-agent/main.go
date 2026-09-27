@@ -224,6 +224,8 @@ func main() {
 	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter, runtimeBindHost)
 	defer drv.Close()
 	deps.RuntimeDriver = drv
+	// The capability probe sends the sdcpp source only if the gateway declares it.
+	deps.GatewayFeatures = featuresClient
 	// The one wire that closes the cert_mode=proxy gap: the gateway publishes
 	// every proxy route with a hard-wired "http://127.0.0.1:<app.Port>"
 	// upstream, but under cert_mode=proxy the router above binds the agent's

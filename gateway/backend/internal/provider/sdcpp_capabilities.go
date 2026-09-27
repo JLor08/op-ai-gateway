@@ -116,6 +116,16 @@ type sdcppCapabilitiesDoc struct {
 // type, is an error and yields no verdict -- a document this code cannot read
 // must not be mistaken for one that lists no image mode, which would be a
 // "no".
+//
+// This is a DUPLICATE, on purpose, of parseSdcppCapabilities in
+// server-agent/internal/collector/sdcpp.go, which reads the same document
+// from an sd-server the agent launched. The two are separate Go modules and
+// cannot share code, the same precedent as detectCapabilities in
+// model_info.go. The sdcppImageCases table, duplicated verbatim in both
+// modules' tests, pins both copies, and
+// TestSdcppImageCasesMatchTheAgentsTable holds the two tables identical.
+// Whoever changes this rule must change that copy, and both tables,
+// identically.
 func parseSdcppCapabilities(body []byte) (SdcppVerdicts, error) {
 	var doc sdcppCapabilitiesDoc
 	if err := json.Unmarshal(body, &doc); err != nil {

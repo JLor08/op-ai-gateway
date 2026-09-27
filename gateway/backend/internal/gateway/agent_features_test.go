@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -64,6 +65,31 @@ func TestAgentFeaturesEndpoint(t *testing.T) {
 	}
 	if got := rec2.Header().Get("ETag"); got != etag {
 		t.Fatalf("304 must still carry the ETag; got %q, want %q", got, etag)
+	}
+}
+
+// TestAgentFeaturesDeclaresTheSdcppCapabilitySource pins the one name the
+// agent's sdcpp_capabilities report hangs on. The agent sends that source
+// only when this endpoint lists "capability_source_sdcpp"
+// (gatewayFeatureCapabilitySourceSdcpp on its side), so the name is compared
+// as the literal the agent matches, read off the served body: a renamed
+// constant or a dropped list entry both fail here, where the agent would
+// otherwise just go quiet.
+func TestAgentFeaturesDeclaresTheSdcppCapabilitySource(t *testing.T) {
+	srv := NewTestServer()
+	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, agentFeaturesRequest("features-secret", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var got agentFeaturesDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	if !slices.Contains(got.Features, "capability_source_sdcpp") {
+		t.Fatalf("features = %v, want it to declare capability_source_sdcpp", got.Features)
 	}
 }
 

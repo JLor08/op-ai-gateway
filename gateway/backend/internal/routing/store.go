@@ -1200,13 +1200,17 @@ const (
 //
 // CapabilitySourceSdcppCapabilities names the fourth probe-rank source:
 // stable-diffusion.cpp's own capability document, GET /sdcpp/v1/capabilities,
-// which the gateway's health loop reads for a stable_diffusion_cpp
-// application and from whose supported_modes it derives the CapabilityImage
-// verdict (provider.SdcppCapabilitiesProber). It is named for the document it
-// read, exactly as the three above are and for the same reason. It too ranks
-// 1 through capabilitySourceRank's DEFAULT branch (no rank-table entry, and
-// none is wanted) -- never able to overwrite manual (3) or vision_benchmark
-// (2), always able to repair its own drift (1 vs 1).
+// from whose supported_modes the CapabilityImage verdict is derived. It has
+// two producers, each reading that document from where it can reach it: the
+// gateway's health loop, for a stable_diffusion_cpp application
+// (provider.SdcppCapabilitiesProber), and the agent's GET
+// /sdcpp/v1/capabilities read of an sd-server child it launched (see
+// server-agent's collector.ProbeSdcppVerdicts), which the gateway's agent
+// ingest accepts under this source for CapabilityImage only. It is named for
+// the document it read, exactly as the three above are and for the same
+// reason. It too ranks 1 through capabilitySourceRank's DEFAULT branch (no
+// rank-table entry, and none is wanted) -- never able to overwrite manual (3)
+// or vision_benchmark (2), always able to repair its own drift (1 vs 1).
 //
 // What sets it apart is narrower than direction in general -- llama_cpp_props
 // already writes a real "no" for vision, video, audio and tools -- and is

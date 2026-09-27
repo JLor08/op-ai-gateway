@@ -439,7 +439,11 @@ type Capabilities struct {
 	Video  string
 	Audio  string
 	Tools  string
-	Extra  []string
+	// Image is whether the model GENERATES images ("yes"/"no"/""). Only the
+	// stable-diffusion.cpp probe (ProbeSdcppVerdicts) sets it; the /props and
+	// /api/show detectors never do.
+	Image string
+	Extra []string
 }
 
 // detectCapabilities is the capability detector for a llama.cpp /props

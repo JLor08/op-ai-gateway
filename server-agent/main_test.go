@@ -63,3 +63,73 @@ func TestMeasurerWiringGoesThroughTheSelector(t *testing.T) {
 		t.Error("main.go does not call collector.NewVRAMMeasurer -- the runtime manager would be left with no measurer at all")
 	}
 }
+
+// TestGatewayFeaturesWiringReachesTheAgent pins the one line of main.go that
+// turns the stable-diffusion.cpp capability probe on. The agent reads a nil
+// Deps.GatewayFeatures as "the gateway declares nothing", which is what an
+// older gateway expects, so without the line every production agent would
+// silently never probe a stable_diffusion_cpp child, and every other test
+// would stay green: nothing else runs main(). The agent must also be handed
+// the SAME features client the runtime driver polls, so both read one
+// gateway's answers through one ETag-conditional client.
+//
+// Read from this file's AST, like TestMeasurerWiringGoesThroughTheSelector
+// above: main() builds everything inline, and extracting the assembly just to
+// call it from here would move far more code than the one wire it pins.
+func TestGatewayFeaturesWiringReachesTheAgent(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+	ident := func(e ast.Expr) string {
+		if id, ok := e.(*ast.Ident); ok {
+			return id.Name
+		}
+		return ""
+	}
+	// calls reports whether e is a call of runtimectl.<name>; proxy has a
+	// NewDriver of its own.
+	calls := func(e ast.Expr, name string) bool {
+		c, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		return ok && ident(sel.X) == "runtimectl" && sel.Sel.Name == name
+	}
+	var built, polled, wired []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if len(n.Lhs) != 1 || len(n.Rhs) != 1 {
+				return true
+			}
+			if calls(n.Rhs[0], "NewFeaturesClient") {
+				built = append(built, ident(n.Lhs[0]))
+			}
+			if sel, ok := n.Lhs[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "GatewayFeatures" {
+				wired = append(wired, ident(n.Rhs[0]))
+			}
+		case *ast.KeyValueExpr:
+			if ident(n.Key) == "GatewayFeatures" {
+				wired = append(wired, ident(n.Value))
+			}
+		case *ast.CallExpr:
+			// runtimectl.NewDriver(mgr, src, features, reporter, bindHost)
+			if calls(n, "NewDriver") && len(n.Args) >= 3 {
+				polled = append(polled, ident(n.Args[2]))
+			}
+		}
+		return true
+	})
+	if len(built) != 1 || built[0] == "" {
+		t.Fatalf("main.go builds the features client as %q, want exactly one runtimectl.NewFeaturesClient assigned to a variable", built)
+	}
+	if len(polled) != 1 || polled[0] != built[0] {
+		t.Fatalf("runtimectl.NewDriver is handed %q as its features client, want %q", polled, built[0])
+	}
+	if len(wired) != 1 || wired[0] != built[0] {
+		t.Fatalf("agent.Deps.GatewayFeatures is set from %q in main.go, want exactly %q, the client the runtime driver polls -- "+
+			"without it the agent reads the gateway as declaring nothing and never probes a stable_diffusion_cpp child", wired, built[0])
+	}
+}

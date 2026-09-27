@@ -15,8 +15,12 @@ import (
 // (design spec §9, feature negotiation): behavior hangs exclusively on
 // string-equal feature NAMES, never on version comparison -- a version gate
 // breaks under forks, backports, and custom builds, while a name says what
-// the binary can actually do. A feature is ACTIVE iff BOTH the gateway and
-// the agent declare it; each side computes that intersection independently.
+// the binary can actually do. A name both sides declare is ACTIVE iff BOTH
+// the gateway and the agent declare it; each side computes that intersection
+// independently. A name that states a fact about one side alone need only be
+// on that side's list: capability_source_sdcpp is on this list only, and the
+// agent-declared gpu_selection, runtime_api_token, runtime_model_probe and
+// runtime_upstream_props are on the agent's only.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
 // runtime_logs is declared here for completeness of the negotiation contract
@@ -34,7 +38,24 @@ import (
 // AGENT's declared set before it will wait for an applied-config
 // acknowledgement instead of blindly waiting out the agent's poll interval
 // (runtimeConfigAckFeature, agent_runtime.go).
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature}
+//
+// capability_source_sdcpp is one-sided, so the intersection rule above does
+// not apply to it: the agent's declared set has no counterpart. It is this
+// gateway's statement of what its capability ingest accepts, the
+// sdcpp_capabilities source for the image row only (rowSource,
+// runtimeSampleCapabilityRows), and the AGENT reads it as a precondition. It
+// checks this list for the name, as it does for runtime_manager, before it
+// reports a stable_diffusion_cpp child's image verdict under that source at
+// all. The ingest's acceptance does not consult the name; a gateway build
+// without the name simply has no such acceptance, which is why the agent
+// does not send the source there.
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature}
+
+// capabilitySourceSdcppFeature says this gateway's capability ingest accepts
+// the sdcpp_capabilities source from an agent (rowSource), for the image row
+// only. The agent sends that source only when this name is declared (its
+// gatewayFeatureCapabilitySourceSdcpp).
+const capabilitySourceSdcppFeature = "capability_source_sdcpp"
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

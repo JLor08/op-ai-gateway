@@ -809,10 +809,15 @@ header-only representation would silently disagree across the two transports.
 A pushed frame must therefore carry the full document **including** its `etag`.
 
 `/features` returns the gateway's declared names —
-`{"features":["runtime_manager","runtime_logs","runtime_config_ack"]}`. Gating is
-name-based string equality: a feature is active only when the gateway and the
-agent both declare it. A **404 is not an error** for an agent — it means an older
-gateway, and reads as the empty feature set.
+`{"features":["runtime_manager","runtime_logs","runtime_config_ack","capability_source_sdcpp"]}`. Gating is
+name-based string equality: a flag both sides declare is active only when the
+gateway and the agent both declare it. A flag that states a fact about one side
+alone need only be on that side's list, and `capability_source_sdcpp` is on the
+gateway's alone: the agent reads it here and does not declare it back
+([Agent-Managed Model Runtime
+§7](../cross-cutting/agent-runtime-manager.md#7-feature-negotiation)). A **404 is
+not an error** for an agent — it means an older gateway, and reads as the empty
+feature set.
 
 `/runtime-config` returns the desired state **for the server that owns the agent
 token**; the server id is never taken from a parameter. Shape rules that two

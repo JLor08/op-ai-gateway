@@ -221,12 +221,24 @@ type agentRuntimeCapabilitiesSample struct {
 // ranks an unrecognised source at 1, so a blind write would let an
 // unknown-provenance verdict overwrite a real probe's row at equal rank.
 //
-// The allowlist is exactly the two PROBE sources, which is what makes this a
-// trust boundary and not a typo filter: the vocabulary also contains
-// CapabilitySourceManual (rank 3) and CapabilitySourceVisionBenchmark
-// (rank 2), and an agent has no standing to claim either. A sample that did
-// would put "an operator said so" in front of an operator and lock a real
-// benchmark out of its own row. Neither reaches a row from here.
+// The allowlist is exactly the three PROBE sources an agent runs, which is
+// what makes this a trust boundary and not a typo filter: the vocabulary
+// also contains CapabilitySourceManual (rank 3) and
+// CapabilitySourceVisionBenchmark (rank 2), and an agent has no standing to
+// claim either. A sample that did would put "an operator said so" in front
+// of an operator and lock a real benchmark out of its own row. Neither
+// reaches a row from here. Nor does CapabilitySourceLlamaCppTimings, a
+// probe-rank source no agent produces: the gateway reads it off traffic it
+// relayed itself.
+//
+// CapabilitySourceSdcppCapabilities is claimable because the agent's
+// collector.ProbeSdcppVerdicts produces it, reading an agent-launched
+// sd-server's /sdcpp/v1/capabilities document. That document answers one
+// question, whether the server generates images, so the source may speak
+// about the image row only: runtimeSampleCapabilityRows drops every other row
+// it arrives with, and a live-progress verdict with it. Accepting the source
+// here only decides the provenance; what that provenance may say is decided
+// there, row by row.
 //
 // It lives in this package rather than in routing on purpose: routing owns
 // the store-side RANK, which is about how two sources compare; which sources
@@ -241,6 +253,8 @@ func (c *agentRuntimeCapabilitiesSample) rowSource() (string, bool) {
 		return routing.CapabilitySourceLlamaCppProps, true
 	case routing.CapabilitySourceOllamaAPIShow:
 		return routing.CapabilitySourceOllamaAPIShow, true
+	case routing.CapabilitySourceSdcppCapabilities:
+		return routing.CapabilitySourceSdcppCapabilities, true
 	default:
 		return "", false
 	}
@@ -275,10 +289,11 @@ func (c *agentRuntimeCapabilitiesSample) reportedSource() string {
 // THIS probe determined, attributed to source (the caller's already-resolved
 // rowSource, never c.Source as written) and stamped at, ready for
 // routing.WritableCapabilityRows to decide which of them may actually be
-// written. A nil receiver (no wire object at all --
-// an agent predating capability detection) yields nothing, as does a non-nil
-// but empty one (detection ran, determined nothing): two different facts that
-// both mean no rows, which is why the wire field is a pointer.
+// written. A nil receiver (no wire object at all: the agent has nothing to
+// say for this child this cycle, see agentRuntimeSample.Capabilities) yields
+// nothing, as does a non-nil but empty one (detection ran, determined
+// nothing): two different facts that both mean no rows, which is why the
+// wire field is a pointer.
 //
 // Every name is carried, known or not: an unknown capability name with a
 // definitive verdict is a perfectly good row, in EITHER direction. The
@@ -371,17 +386,22 @@ type agentRuntimeSample struct {
 	// Capabilities is this child's auto-detected capability verdict set (#49
 	// sub-project 2), from the SAME probe pass that fills
 	// LiveProgressSupport above (server-agent's probeRuntimeChildProps --
-	// llama.cpp's /props, or Ollama's /api/show since #54, which is why the
-	// set names its own Source). A
-	// POINTER, mirroring the agent's own sample.RuntimeSample.Capabilities
-	// *sample.Capabilities field byte-for-byte on the wire: nil distinguishes
-	// "this agent predates capability detection" (an older build -- nothing
-	// to say) from a non-nil, all-empty value ("detection ran, nothing
-	// determined") -- two different facts that both mean no write, but for
-	// different reasons, which is exactly why this field is a pointer rather
-	// than a bare struct. See writeBackRuntimeCapabilities for the
-	// gateway-side write-back, which persists these AND LiveProgressSupport
-	// above as one set of model_mapping_capabilities rows.
+	// llama.cpp's /props, Ollama's /api/show since #54, or sd-server's
+	// /sdcpp/v1/capabilities since #154, which is why the set names its own
+	// Source). A POINTER, mirroring the agent's own
+	// sample.RuntimeSample.Capabilities *sample.Capabilities field
+	// byte-for-byte on the wire: nil means the agent has nothing to say for
+	// this child this cycle -- an agent that predates capability detection,
+	// a child that is not running or has no conclusive answer yet, or, from
+	// a 0.7.4+ agent, a stable_diffusion_cpp child whose verdict it does not
+	// send because this gateway's feature list, as that agent last read it,
+	// lacked capability_source_sdcpp -- and is distinct from a non-nil,
+	// all-empty value ("detection ran, nothing determined"): two different
+	// facts that both mean no write, but for different reasons, which is
+	// exactly why this field is a pointer rather than a bare struct. See
+	// writeBackRuntimeCapabilities for the gateway-side write-back, which
+	// persists these AND LiveProgressSupport above as one set of
+	// model_mapping_capabilities rows.
 	Capabilities *agentRuntimeCapabilitiesSample `json:"capabilities,omitempty"`
 	GPUs         []agentRuntimeGPUSample         `json:"gpus,omitempty"`
 	LastError    *agentRuntimeError              `json:"last_error,omitempty"`
@@ -969,10 +989,10 @@ func (s *Server) resolveRuntimeSpecCapabilities(ctx context.Context, serverID, s
 //     not an oversight to fix later.
 //  3. An UNDETERMINED verdict writes NOTHING, and cannot: "unknown" is the
 //     ABSENCE of a row, so there is no empty verdict to accidentally write.
-//     A nil Capabilities (an agent predating capability detection) and a
-//     non-nil empty one (detection ran, determined nothing) are different
-//     facts -- which is why the wire field is a pointer -- and both simply
-//     yield no rows. An unchanged verdict issues no write either
+//     A nil Capabilities (nothing to say for this child this cycle, see
+//     agentRuntimeSample.Capabilities) and a non-nil empty one (detection
+//     ran, determined nothing) are different facts -- which is why the wire
+//     field is a pointer -- and both simply yield no rows. An unchanged verdict issues no write either
 //     (WritableCapabilityRows' second rule), which matters more for a
 //     capability than for a metric: a build capability is stable by nature,
 //     so the SAME child build reports the SAME verdict every second for its
@@ -1036,15 +1056,18 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 }
 
 // reservedAgentCapabilityNames are the capability names this codebase
-// REASONS ABOUT and that neither capability probe can observe, so their
+// REASONS ABOUT and that no agent capability probe can observe, so their
 // appearance in an agent's open verdict list is necessarily either an
 // upstream publisher's string or a bug -- never evidence.
 //
 // The criterion is exactly that, and it is why vision/video/audio/tools are
-// NOT here: those four are what the two detectors read out of their
-// documents (llama.cpp's modalities + chat_template_caps, Ollama's
+// NOT here: those four are what the llama.cpp and Ollama detectors read out
+// of their documents (llama.cpp's modalities + chat_template_caps, Ollama's
 // capabilities array), so a probe reporting one of them is reporting what it
-// saw. Neither document says anything about any name below:
+// saw. The third probe, which reads stable-diffusion.cpp's capability
+// document, answers image alone and is held to that row by row
+// (runtimeSampleCapabilityRows), so it needs nothing from this list. Neither
+// of the other two documents says anything about any name below:
 //
 //   - "mtp" is not detected anywhere today. The row comes from the portal --
 //     an operator's checkbox (manual) or the model-NAME heuristic
@@ -1143,23 +1166,30 @@ var reservedAgentCapabilityNames = map[string]bool{
 // provenance is what was unrecognisable, and no part of it is more
 // attributable than the rest.
 //
-// TWO shapes are refused rather than stamped, and both are refusals of a
-// FALSE PROVENANCE that the ollama_api_show source cannot carry, whatever
-// the sender intended -- see each refusal below for its own argument:
+// THREE shapes are refused rather than stamped, and each is a refusal of a
+// FALSE PROVENANCE that the source it names cannot carry, whatever the
+// sender intended -- see each refusal below for its own argument:
 //
-//  1. a live-progress verdict attributed to ollama_api_show, in either
-//     direction. Ollama exposes no timings_per_token-style surface at all,
-//     so its document is evidence for neither answer.
+//  1. a live-progress verdict attributed to ollama_api_show or to
+//     sdcpp_capabilities, in either direction. Neither Ollama nor sd-server
+//     exposes a timings_per_token-style surface at all, so neither document
+//     is evidence for either answer.
 //  2. ANY capability's "no" verdict attributed to ollama_api_show.
 //     Ollama's capability array is not exhaustive, so the detector behind
 //     that source can only ever produce "yes" or nothing -- which is the
 //     claim routing.CapabilityRow's own source doc makes about every row
 //     carrying it, not just about the live-progress one.
+//  3. ANY capability other than image attributed to sdcpp_capabilities, in
+//     either direction. stable-diffusion.cpp's capability document answers
+//     exactly one question -- whether its supported_modes list img_gen --
+//     so a row under that source for any other capability says something
+//     the document never said.
 //
-// Both are one-line rules for the same reason: an invariant a caller can
+// All are one-line rules for the same reason: an invariant a caller can
 // violate is not an invariant, and this is the boundary where the agent's
-// bytes arrive. Neither voids the pass -- the "yes" verdicts of the same
-// document are exactly what /api/show CAN answer, so they still ride it.
+// bytes arrive. None voids the pass -- what the same document CAN answer
+// (/api/show's "yes" verdicts, the sdcpp document's image verdict in either
+// direction) still rides it.
 //
 // A consequence worth stating, because it is a limit on what the tests here
 // can show: the live-progress row can now only ever carry llama_cpp_props,
@@ -1173,10 +1203,11 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 		// WARN, and the level is load-bearing: this gateway's default log
 		// level is info (config.Load's OP_AI_GATEWAY_LOG_LEVEL default), so
 		// at Debug the drop is INVISIBLE in every default deployment. A
-		// newer agent reporting a third source would lose every capability
-		// row it ever sends, and lose it silently -- the rows' absence is
-		// how this model spells "unknown", indistinguishable from a probe
-		// that never ran, so there would be nothing anywhere to point at.
+		// newer agent reporting a source this build does not know would
+		// lose every capability row it ever sends, and lose it silently --
+		// the rows' absence is how this model spells "unknown",
+		// indistinguishable from a probe that never ran, so there would be
+		// nothing anywhere to point at.
 		//
 		// Warn is this file's established level for a rejection that DROPS
 		// A WRITE: the three cross-server spec rejections (vram, context,
@@ -1203,7 +1234,8 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	}
 	var rows []routing.CapabilityRow
 	if verdict := routing.LiveProgressCapabilityVerdict(rt.LiveProgressSupport); verdict != "" {
-		if source == routing.CapabilitySourceOllamaAPIShow {
+		switch source {
+		case routing.CapabilitySourceOllamaAPIShow:
 			// REFUSED, not stamped. The combination is one no honest agent
 			// produces -- ProbeOllamaVerdicts leaves LiveProgress "" on
 			// every one of its return paths -- but a buggy or hostile one
@@ -1231,7 +1263,21 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			// invisible at the gateway's default info level otherwise.
 			slog.Warn("runtime capability sample attributes a live-progress verdict to the ollama probe, dropping that row",
 				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
-		} else {
+		case routing.CapabilitySourceSdcppCapabilities:
+			// REFUSED, for the ollama refusal's reason, and just as
+			// independent of intent. ProbeSdcppVerdicts leaves LiveProgress
+			// "" on every return path, so no honest agent sends this; the
+			// boundary refuses it anyway because a caller can. sd-server
+			// exposes no timings surface at all, so its capability document
+			// is evidence for neither answer, and a live_progress row under
+			// that source is a false provenance whatever it says.
+			//
+			// Only the live-progress row goes; the image verdict below is
+			// what that document answers, so it still rides the pass. Warn
+			// for the same reason as the ollama line above.
+			slog.Warn("runtime capability sample attributes a live-progress verdict to the sdcpp probe, dropping that row",
+				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
+		default:
 			rows = append(rows, routing.CapabilityRow{
 				Capability: routing.CapabilityLiveProgress, Verdict: verdict,
 				Source: source, CheckedAt: at,
@@ -1240,7 +1286,7 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	}
 	reported := rt.Capabilities.capabilityRows(source, at)
 	kept := make([]routing.CapabilityRow, 0, len(reported))
-	var dropped, deniedNo []string
+	var dropped, deniedNo, notImage []string
 	for _, row := range reported {
 		switch {
 		case reservedAgentCapabilityNames[row.Capability]:
@@ -1273,6 +1319,22 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			// document can answer, so the rest of the pass still lands,
 			// still sourced ollama_api_show.
 			deniedNo = append(deniedNo, row.Capability)
+		case source == routing.CapabilitySourceSdcppCapabilities && row.Capability != routing.CapabilityImage:
+			// REFUSED, in either direction: the same false-provenance
+			// argument as the two ollama_api_show refusals, applied to a
+			// document that answers exactly one question.
+			// stable-diffusion.cpp's /sdcpp/v1/capabilities says which modes
+			// the server serves, and the agent derives the image verdict
+			// from whether that list holds img_gen. It says nothing about
+			// vision, tools or any other capability, so a row under this
+			// source for one of them could not have come from that document
+			// -- a buggy or hostile agent's claim, stamped with a provenance
+			// that cannot produce it.
+			//
+			// "no" stays writable for image, unlike under ollama_api_show:
+			// supported_modes is exhaustive, so a list without img_gen is a
+			// real answer (routing.CapabilitySourceSdcppCapabilities).
+			notImage = append(notImage, row.Capability)
 		default:
 			kept = append(kept, row)
 		}
@@ -1292,6 +1354,12 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 		// plain "unknown".
 		slog.Warn("runtime capability sample attributes a negative verdict to the ollama probe, dropping those rows",
 			"spec_id", rt.SpecID, "source", source, "capabilities", deniedNo)
+	}
+	if len(notImage) > 0 {
+		// Warn, same argument again: the drop repeats for every sample this
+		// agent build sends, and the absent rows read as plain "unknown".
+		slog.Warn("runtime capability sample attributes a non-image capability to the sdcpp probe, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", notImage)
 	}
 	return append(rows, kept...)
 }
