@@ -443,10 +443,11 @@ governed by a three-state `routing.EndpointMode`
 | `translate` | the client body is translated to `/v1/chat/completions`, exactly the lossy compat path described in §1–§5 |
 | `passthrough` | the gateway proxies the **raw client body** to the upstream's own native endpoint and streams the raw response back unmodified |
 
-An absent or blank mode defaults to `passthrough` (`DefaultEndpointMode`) —
-substituted at write time by the portal service for both the application and
-runtime-spec create paths — for every application type, because every
-supported upstream now serves both native endpoints (see [Agent-Managed Model
+An absent or blank mode defaults to `passthrough`
+(`routing.EndpointModePassthrough`) — substituted at write time by the portal
+service, on an application's create and on every runtime-spec write
+(`putRuntimeSpec`) — for every application type, because every supported
+upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
 
 **Where the effective mode lives.** An ordinary application carries
@@ -502,12 +503,13 @@ flavor is unchecked, or the flavor stays checked and the mode is set to
 `/v1/chat/completions` while refusing Codex's `/v1/responses` specifically.
 Unchecking a flavor does not force its stored mode to `disabled`; the
 effective rule already treats it as off, so re-checking the flavor restores
-whatever mode was last set. Unchecking **every** flavor is refused by the
-application form, with a message at the flavor group and focus moved to it, so
-the refusal is announced rather than silent: an empty list is stored as
-`[openai, anthropic]`, so the form would save a text candidate while showing
-nothing ticked (`ApplicationSection`'s submit; the launch-spec form has no such
-refusal).
+whatever mode was last set. Unchecking **every** flavor is refused by both
+forms, the application form and the launch-spec form, with a message at the
+flavor group and focus moved to it, so the refusal is announced rather than
+silent: an empty list is stored as `[openai, anthropic]`, so the form would
+save a text candidate while showing nothing ticked (`ApplicationSection`'s and
+`RuntimeAdminSection`'s submits; the launch-spec form refuses before it writes
+the mapping).
 
 **Two-tier enforcement**, because a `server_agent` application's authority
 only resolves per-model, after a candidate has already been picked:

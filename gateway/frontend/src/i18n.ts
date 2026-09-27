@@ -858,6 +858,8 @@ const de = {
     'Diese Zeilen bestehen nur aus Leerzeichen. Sie werden nicht übersprungen, sondern unverändert als Argument übergeben – als Argument aus Leerzeichen. Wenn das gewollt ist, bitte so lassen – sonst die Zeile leeren oder löschen. Unten mit · (Leerzeichen) und → (Tabulator) markiert:',
   runtimeSpecPartialFailure:
     'Die Modell-Zuordnung wurde gespeichert, die Spezifikation jedoch nicht',
+  runtimeSpecFlavorsRequired:
+    'Mindestens eine API-Variante muss ausgewählt sein. Ohne Auswahl würde die Startkonfiguration als openai + anthropic gespeichert.',
   runtimeAreaPlaceholder: 'Dieser Bereich wird in einem folgenden Ausbauschritt ergänzt.',
   runtimeStatusUnknown: 'Unbekannt',
   // Task 22: Live-Status, Admin-Übersteuerungen, Datei-Modus (schreibgeschützt).
@@ -3276,6 +3278,8 @@ const en: PortalMessages = {
   runtimeSpecArgsBlankLine:
     'These lines are nothing but whitespace. They are not skipped — each is handed over verbatim as an argument made of spaces. If that is deliberate, leave it — otherwise empty the line or delete it. Marked below with · (space) and → (tab):',
   runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
+  runtimeSpecFlavorsRequired:
+    'Select at least one API flavor. With none selected, the launch spec would be saved as openai + anthropic.',
   runtimeAreaPlaceholder: 'This area will be added in a later rollout step.',
   runtimeStatusUnknown: 'Unknown',
   // Task 22: live status, admin overrides, file-mode read-only.

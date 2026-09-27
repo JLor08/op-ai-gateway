@@ -92,8 +92,8 @@ the application (and, for an agent-managed child, on its runtime spec), and an
 `image: yes` verdict on the mapping (§2.3). Every image upstream needs the
 flavor set explicitly: the `stable_diffusion_cpp` application type's default
 sets it, and the flavor checkbox sets it for everything else, an agent-launched
-child's launch spec included (a new spec inherits it only from a parent that
-lists `openai_images` alone). No upgrade step sets it, so a
+child's launch spec included (a spec's first write inherits it only from a
+parent that lists `openai_images` alone). No upgrade step sets it, so a
 model that served images through an `openai` application before the flavor
 split answers 404 `routing.no_model_route` until an operator ticks
 `openai_images` on the application and, for an agent-managed child, on its

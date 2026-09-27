@@ -17,6 +17,7 @@ import type {
   BenchmarkRunDTO,
   BenchmarkStatus,
   CreateMappingRequest,
+  EndpointMode,
   GPUBudget,
   HardwareGPU,
   HardwareResponse,
@@ -77,7 +78,9 @@ const application: PortalApplication = {
   port: 8081,
   scheme: 'http',
   endpoint: 'http://s1.example.test:8081',
-  api_flavors: [],
+  // The server_agent type default (applicationTypeDefaults): a parent created
+  // through the application form carries both text flavors.
+  api_flavors: ['openai', 'anthropic'],
   priority: 0,
   weight: 0,
   timeout_ms: 600000,
@@ -160,7 +163,9 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     api_token_header: '',
     app_api_token_set: false,
     app_api_token_header: '',
-    api_flavors: [],
+    // What the backend stores for a spec written without flavors, and so what
+    // a configured spec carries unless a test says otherwise.
+    api_flavors: ['openai', 'anthropic'],
     responses_mode: 'passthrough',
     messages_mode: 'passthrough',
     responses_live_timings_enabled: false,
@@ -172,6 +177,25 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     resolved_context_probe_path: '',
     ...overrides,
   };
+}
+
+// What GET /runtime-spec answers for a mapping with no spec row
+// (GetRuntimeSpec's synthesized document): configured false, no flavors, and
+// both modes "" -- never set, so Go's zero value, sent without omitempty. The
+// RuntimeSpec type says EndpointMode for the modes; the wire says "" here, so
+// the cast is the point. effective_type is 'custom', which the empty binary
+// detects as; custom's resolved probe paths are the '' makeSpec already has.
+// The app-derived echoes match the module's default parent, which has no API
+// token.
+function unconfiguredSpec(mappingId: string): RuntimeSpec {
+  return makeSpec({
+    configured: false,
+    mapping_id: mappingId,
+    api_flavors: [],
+    responses_mode: '' as EndpointMode,
+    messages_mode: '' as EndpointMode,
+    effective_type: 'custom',
+  });
 }
 
 // Shared by both the API-token mode tests and the header-source tests below:
@@ -400,18 +424,24 @@ function renderSection(
       return { ok: true };
     }),
     runtimeSpec: vi.fn(
-      async (mappingId: string) =>
-        specsByMappingId[mappingId] ?? makeSpec({ mapping_id: mappingId }),
+      async (mappingId: string) => specsByMappingId[mappingId] ?? unconfiguredSpec(mappingId),
     ),
     putRuntimeSpec: vi.fn(async (mappingId: string, body: PutRuntimeSpecRequest) => {
       putSpecs.push({ mappingId, body });
       // `id` (the SPEC id, the join key against the live status stream) is
       // preserved exactly as the backend does -- a PUT never re-keys the row.
+      // The stored document is normalized the way the backend normalizes it
+      // (normalizeFlavors, the mode defaults in putRuntimeSpec): an empty
+      // flavor list comes back as both text flavors, an empty mode as
+      // passthrough. Echoing the body verbatim hid exactly that widening.
       return makeSpec({
         configured: true,
         mapping_id: mappingId,
         id: specsByMappingId[mappingId]?.id,
         ...body,
+        api_flavors: body.api_flavors.length > 0 ? body.api_flavors : ['openai', 'anthropic'],
+        responses_mode: body.responses_mode || 'passthrough',
+        messages_mode: body.messages_mode || 'passthrough',
       });
     }),
     deleteRuntimeSpec: vi.fn(async (id: string) => {
@@ -959,12 +989,10 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
   // flavor, so the operator has something left to tick for a fresh text
   // model. Under a parent whose flavors are EXACTLY [openai_images] that
   // assumption fails: dropping it would open a new spec with every flavor
-  // unticked, and an untouched save on that state sends [] -- which the
-  // backend stores as [openai, anthropic], not narrower. The child then
-  // serves nothing an operator can reach (not a text candidate, and the
-  // images relay refuses a spec without openai_images), with no warning.
-  // Inherit openai_images as-is when the parent has no text flavor to fall
-  // back to.
+  // unticked, a state the launch-spec form refuses to save
+  // (runtimeSpecFlavorsRequired), so the first save of an images-only child
+  // would wait on the operator finding and ticking openai_images. Inherit
+  // openai_images as-is when the parent has no text flavor to fall back to.
   it('inherits openai_images into a new spec when the parent application is images-only', async () => {
     const { putSpecs } = renderSection({
       application: { ...application, api_flavors: ['openai_images'] },
@@ -1077,7 +1105,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         makeMapping({ id, ...(body as Partial<PortalModelMapping>) }),
       ),
       deleteMapping: vi.fn(async () => ({ ok: true })),
-      runtimeSpec: vi.fn(async (mappingId: string) => makeSpec({ mapping_id: mappingId })),
+      runtimeSpec: vi.fn(async (mappingId: string) => unconfiguredSpec(mappingId)),
       putRuntimeSpec: vi.fn(async () => {
         throw new Error('boom');
       }),
@@ -1136,6 +1164,488 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
   });
 });
 
+// An empty flavor list is not an honest save: the backend stores [] as
+// [openai, anthropic], so a form showing nothing ticked would save a text
+// candidate -- on a stable_diffusion_cpp spec, the trap its operator unticked
+// the text flavors to avoid. The launch-spec form refuses it, like the
+// application form.
+describe('RuntimeAdminSection refuses a spec save with no flavor ticked', () => {
+  const untickAll = () => {
+    for (const name of ['openai', 'anthropic']) {
+      const box = screen.getByRole('checkbox', { name });
+      if ((box as HTMLInputElement).checked) fireEvent.click(box);
+    }
+  };
+  const fillCreate = () => {
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+  };
+
+  it('does not create with every flavor unticked, and says why next to the flavors', async () => {
+    const { created, putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fillCreate();
+    untickAll();
+    expect(screen.getByText(t.runtimeSpecFlavorsRequired)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    // Give a submit that should not happen every chance to happen.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Refused BEFORE the mapping write, so no half-created mapping is left.
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+    expect(screen.getByRole('group', { name: t.applicationFlavors })).toHaveAccessibleDescription(
+      t.runtimeSpecFlavorsRequired,
+    );
+  });
+
+  it('moves focus to the flavor group when it refuses, and again on a second refusal', async () => {
+    const { created } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fillCreate();
+    untickAll();
+    const submit = screen.getByRole('button', { name: t.runtimeSpecCreate });
+    const group = screen.getByRole('group', { name: t.applicationFlavors });
+
+    submit.focus();
+    fireEvent.click(submit);
+    await waitFor(() => expect(group).toHaveFocus());
+
+    submit.focus();
+    expect(group).not.toHaveFocus();
+    fireEvent.click(submit);
+    await waitFor(() => expect(group).toHaveFocus());
+    expect(created).toHaveLength(0);
+  });
+
+  it('shows no error before the group is touched or a save refused', async () => {
+    renderSection({ application: { ...application, api_flavors: [] } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    // The form opens with nothing ticked (a legacy parent), and says nothing yet.
+    expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+  });
+
+  it('clears the message and creates once a flavor is ticked again', async () => {
+    const { created, putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fillCreate();
+    untickAll();
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }));
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(created).toHaveLength(1);
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+  });
+
+  it('does not save an edit with every flavor unticked', async () => {
+    const { updatedMappings, putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    untickAll();
+    const submit = screen.getByRole('button', { name: t.save });
+    const group = screen.getByRole('group', { name: t.applicationFlavors });
+
+    submit.focus();
+    fireEvent.click(submit);
+    await waitFor(() => expect(group).toHaveFocus());
+    expect(group).toHaveAccessibleDescription(t.runtimeSpecFlavorsRequired);
+
+    submit.focus();
+    expect(group).not.toHaveFocus();
+    fireEvent.click(submit);
+    await waitFor(() => expect(group).toHaveFocus());
+    // Refused BEFORE the mapping PATCH as well as the spec PUT.
+    expect(updatedMappings).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // The message comes through the `t` prop like every other string, so the
+  // English form shows its own text, not the German one.
+  it('shows the refusal at the group in English too, on Create and on Edit', async () => {
+    const en = messages.en;
+    const { created, updatedMappings, putSpecs, rerenderWithLocale } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({ configured: true, mapping_id: 'map_1', binary: '/usr/bin/llama-server' }),
+      },
+    });
+    await screen.findByText('gw-model');
+    rerenderWithLocale(en);
+
+    fireEvent.click(await screen.findByRole('button', { name: en.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(en.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(en.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    untickAll();
+    fireEvent.click(screen.getByRole('button', { name: en.runtimeSpecCreate }));
+    const createGroup = screen.getByRole('group', { name: en.applicationFlavors });
+    await waitFor(() => expect(createGroup).toHaveFocus());
+    expect(createGroup).toHaveAccessibleDescription(en.runtimeSpecFlavorsRequired);
+    expect(created).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: en.cancel }));
+    fireEvent.click(await screen.findByRole('button', { name: en.runtimeSpecEditAction }));
+    await screen.findByLabelText(en.runtimeSpecBinary);
+    untickAll();
+    fireEvent.click(screen.getByRole('button', { name: en.save }));
+    const editGroup = screen.getByRole('group', { name: en.applicationFlavors });
+    await waitFor(() => expect(editGroup).toHaveFocus());
+    expect(editGroup).toHaveAccessibleDescription(en.runtimeSpecFlavorsRequired);
+    expect(updatedMappings).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // A spec stored with [] (only a direct database write produces one) opens
+  // as stored: nothing ticked and no error, but it does not save until a
+  // flavor is ticked.
+  it('opens a stored [] spec as stored, without the error, and refuses to save it', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          api_flavors: [],
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(putSpecs).toHaveLength(0);
+    expect(screen.getByText(t.runtimeSpecFlavorsRequired)).toBeInTheDocument();
+  });
+
+  // A default parent's flavors are non-empty, so reopening the form would
+  // hide the error anyway (specApiFlavors is re-derived from the parent and
+  // is non-empty either way) -- that would pass whether or not a stale
+  // `touched` from the earlier refusal survived. A LEGACY parent with no
+  // flavors of its own is what actually exercises the reset: reopening
+  // re-derives an EMPTY specApiFlavors again, so the error stays hidden only
+  // if `touched` was really cleared.
+  it('forgets a refusal when the form is opened again', async () => {
+    renderSection({ application: { ...application, api_flavors: [] } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    // Nothing to untick: the legacy parent already opens the form empty.
+    fillCreate();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    expect(await screen.findByText(t.runtimeSpecFlavorsRequired)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+  });
+
+  // Same reset, same reason, on the edit form's own touched flag
+  // (openEdit's setSpecFlavorsTouched(false)). Only a spec STORED with []
+  // (never something a form save can produce) opens with nothing ticked, so
+  // it is what reopening has to re-derive an empty selection from.
+  it('forgets a refusal when the edit form is opened again', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          api_flavors: [],
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(screen.getByText(t.runtimeSpecFlavorsRequired)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+});
+
+// A mapping without a spec row routes on its application's flavors and modes
+// until the first spec write (targetFrom's no-spec fallback). Edit of such a
+// mapping -- also the documented retry after a failed Create -- starts from
+// those values through the same template Create uses, and with Enabled
+// ticked as Create opens, instead of the GET's zero values: [] (which the form
+// refuses to save), "" (which the backend stores as passthrough) and
+// `enabled: false`.
+describe('RuntimeAdminSection Edit of a mapping without a spec', () => {
+  async function openEditOfSpecless(parent: Partial<PortalApplication>) {
+    const handles = renderSection({
+      application: { ...application, ...parent },
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return handles;
+  }
+
+  it('opens with the parent flavors and modes, and an untouched save sends them', async () => {
+    const { putSpecs } = await openEditOfSpecless({
+      api_flavors: ['openai'],
+      responses_mode: 'translate',
+      messages_mode: 'disabled',
+    });
+    expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
+    expect(screen.getByRole('combobox', { name: t.applicationResponsesMode })).toHaveTextContent(
+      t.applicationModeTranslate,
+    );
+    expect(screen.queryByText(t.runtimeSpecFlavorsRequired)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+  });
+
+  it('leaves openai_images out when the parent also has a text flavor, as Create does', async () => {
+    const { putSpecs } = await openEditOfSpecless({
+      api_flavors: ['openai', 'anthropic', 'openai_images'],
+    });
+    expect(
+      screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
+    ).not.toBeChecked();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+  });
+
+  it('keeps openai_images for an images-only parent, as Create does', async () => {
+    const { putSpecs } = await openEditOfSpecless({ api_flavors: ['openai_images'] });
+    expect(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages })).toBeChecked();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+  });
+
+  // The GET's `enabled: false` is a zero value like its [] and "", and the
+  // Create this Edit retries opens with Enabled ticked.
+  it('opens with Enabled ticked, as Create does, and an untouched save sends it', async () => {
+    const { putSpecs } = await openEditOfSpecless({});
+    expect(screen.getByRole('checkbox', { name: t.runtimeSpecEnabled })).toBeChecked();
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.enabled).toBe(true);
+  });
+
+  it('opens a configured spec stored disabled as stored, with Enabled unticked', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          enabled: false,
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    expect(screen.getByRole('checkbox', { name: t.runtimeSpecEnabled })).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.enabled).toBe(false);
+  });
+
+  it('loads a configured spec as stored, never from the parent', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai'], responses_mode: 'translate' },
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          api_flavors: ['anthropic'],
+          responses_mode: 'disabled',
+          messages_mode: 'translate',
+        }),
+      },
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('translate');
+  });
+});
+
+// The list stays on screen while an Edit GET is in flight, so the operator can
+// click Edit on another row, or Create, before it lands. Only the form the
+// operator opened last may be filled: a GET landing late for an earlier click
+// would otherwise switch the form to that mapping's spec while the names stay
+// the later mapping's, and the save would write the later mapping's upstream
+// model name onto the earlier mapping.
+describe('RuntimeAdminSection overlapping form opens', () => {
+  const specA = makeSpec({
+    configured: true,
+    id: 'spec_a',
+    mapping_id: 'map_a',
+    binary: '/opt/a/llama-server',
+  });
+  const specB = makeSpec({
+    configured: true,
+    id: 'spec_b',
+    mapping_id: 'map_b',
+    binary: '/opt/b/llama-server',
+  });
+
+  function renderTwoMappings() {
+    return renderSection({
+      mappings: [
+        makeMapping({ id: 'map_a', gateway_model_name: 'gw-a', app_model_name: 'app-a' }),
+        makeMapping({ id: 'map_b', gateway_model_name: 'gw-b', app_model_name: 'app-b' }),
+      ],
+      specsByMappingId: { map_a: specA, map_b: specB },
+    });
+  }
+
+  // Holds every later spec GET open until the test lands (or fails) it, per
+  // mapping.
+  function holdSpecGets(fakeApi: ReturnType<typeof renderSection>['fakeApi']) {
+    const settlers = new Map<string, (outcome: 'land' | 'fail') => void>();
+    fakeApi.runtimeSpec.mockImplementation(
+      (mappingId: string) =>
+        new Promise<RuntimeSpec>((resolve, reject) => {
+          settlers.set(mappingId, (outcome) =>
+            outcome === 'land'
+              ? resolve(mappingId === 'map_a' ? specA : specB)
+              : reject(new Error(`spec GET for ${mappingId} failed`)),
+          );
+        }),
+    );
+    const settle = (mappingId: string, outcome: 'land' | 'fail') =>
+      act(async () => {
+        settlers.get(mappingId)?.(outcome);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    return {
+      land: (mappingId: string) => settle(mappingId, 'land'),
+      fail: (mappingId: string) => settle(mappingId, 'fail'),
+    };
+  }
+
+  async function settleListLoad(fakeApi: ReturnType<typeof renderSection>['fakeApi']) {
+    await screen.findByText('gw-b');
+    await waitFor(() => expect(fakeApi.runtimeSpec).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  it('keeps the later Edit when the earlier Edit GET lands last', async () => {
+    const { fakeApi, putSpecs, updatedMappings } = renderTwoMappings();
+    await settleListLoad(fakeApi);
+    const { land } = holdSpecGets(fakeApi);
+
+    fireEvent.click(inRowWith('gw-a').getByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.click(inRowWith('gw-b').getByRole('button', { name: t.runtimeSpecEditAction }));
+    await land('map_b');
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
+
+    await land('map_a');
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
+    expect(screen.getByLabelText(t.mappingGatewayName)).toHaveValue('gw-b');
+    expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('app-b');
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].mappingId).toBe('map_b');
+    expect(updatedMappings.map((u) => u.id)).toEqual(['map_b']);
+  });
+
+  // The earlier GET landing FIRST must not release the later row, whose own
+  // GET is still in flight, nor report a failure for a click the operator has
+  // already moved on from.
+  it('keeps the later row locked, and stays silent, when the earlier Edit GET settles first', async () => {
+    const { fakeApi } = renderTwoMappings();
+    await settleListLoad(fakeApi);
+    const { land, fail } = holdSpecGets(fakeApi);
+
+    fireEvent.click(inRowWith('gw-a').getByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.click(inRowWith('gw-b').getByRole('button', { name: t.runtimeSpecEditAction }));
+    await fail('map_a');
+    expect(screen.queryByText('spec GET for map_a failed')).not.toBeInTheDocument();
+    expect(
+      inRowWith('gw-b').getByRole('button', { name: t.runtimeSpecEditAction }),
+    ).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.queryByLabelText(t.runtimeSpecBinary)).not.toBeInTheDocument();
+
+    await land('map_b');
+    expect(await screen.findByLabelText(t.runtimeSpecBinary)).toHaveValue('/opt/b/llama-server');
+  });
+
+  it('does not let an Edit GET landing after a Create take the form over', async () => {
+    const { fakeApi, created } = renderTwoMappings();
+    await settleListLoad(fakeApi);
+    const { land } = holdSpecGets(fakeApi);
+
+    fireEvent.click(inRowWith('gw-a').getByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+
+    await land('map_a');
+    expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('app-new');
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('');
+    expect(screen.getByRole('button', { name: t.runtimeSpecCreate })).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+
+    // The superseded click does not leave its row locked behind it.
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    // IconAction marks a disabled action with aria-disabled, not `disabled`.
+    await waitFor(() =>
+      expect(
+        inRowWith('gw-a').getByRole('button', { name: t.runtimeSpecEditAction }),
+      ).not.toHaveAttribute('aria-disabled'),
+    );
+  });
+});
+
 describe('RuntimeAdminSection edit + delete', () => {
   it('edits an existing spec', async () => {
     const spec = makeSpec({
@@ -1190,7 +1700,7 @@ describe('RuntimeAdminSection edit + delete', () => {
   it('deletes the mapping itself when no spec is configured yet', async () => {
     const { deletedSpecIds, deletedMappingIds } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
     });
 
     await screen.findByText('gw-model');
@@ -2491,6 +3001,45 @@ describe('RuntimeAdminSection admin overrides', () => {
     expect(putSpecs[0].body).toEqual(expectedBody(spec, ''));
   });
 
+  // An override replays the cached document as is, and the cache holds what
+  // the last PUT answered. For a spec stored with [] and "" (no form save
+  // produces one) the first override sends them back unchanged; the backend
+  // stores them as both text flavors with passthrough, so the next override
+  // replays that.
+  it('replays a stored [] and "" as is, then the widened document the PUT answered', async () => {
+    const spec = fullSpec({
+      api_flavors: [],
+      responses_mode: '' as EndpointMode,
+      messages_mode: '' as EndpointMode,
+    });
+    const { putSpecs, stream } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      statusRows: [makeStatus({ spec_id: 'spec_1' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+
+    await waitForEnabledButton(t.runtimeForceStop);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual([]);
+    expect(putSpecs[0].body.responses_mode).toBe('');
+    expect(putSpecs[0].body.messages_mode).toBe('');
+
+    // The override actions mark their busy lock with aria-disabled.
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.runtimeClearOverride })).not.toHaveAttribute(
+        'aria-disabled',
+      ),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeClearOverride }));
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[1].body.responses_mode).toBe('passthrough');
+    expect(putSpecs[1].body.messages_mode).toBe('passthrough');
+  });
+
   it('shows the override actions the current admin_state allows, and only those', async () => {
     const { stream } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
@@ -2786,6 +3335,147 @@ describe('RuntimeAdminSection restart sequence', () => {
 
     stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
     await waitFor(() => expect(putSpecs).toHaveLength(2));
+  });
+
+  // Delete stays available while a restart waits. The delete commits
+  // emptySpec (configured: false) to the cache, and a later `stopped` frame
+  // for the old spec id would then PUT that empty document back: the backend
+  // refuses it (no binary), so the operator saw an error for a write nobody
+  // asked for. A spec that is no longer configured has vanished, like one
+  // that is gone from the cache.
+  it('does not replay a spec deleted while the restart waited', async () => {
+    const { putSpecs, stream, deletedSpecIds } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    await waitForEnabledButton(t.runtimeSpecDelete);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    expect(await screen.findByText(t.runtimeRestartVanished)).toBeInTheDocument();
+    // Give a PUT that should not happen every chance to happen.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  // Opens the confirm dialog on the specs tab and confirms a spec delete whose
+  // DELETE stays in flight until the test settles it.
+  async function deleteSpecHeldOpen(
+    fakeApi: ReturnType<typeof renderSection>['fakeApi'],
+    deletedSpecIds: string[],
+  ) {
+    let settle: (outcome: 'ok' | 'fail') => void = () => {};
+    fakeApi.deleteRuntimeSpec.mockImplementationOnce((id: string) => {
+      deletedSpecIds.push(id);
+      return new Promise<{ ok: boolean }>((resolve, reject) => {
+        settle = (outcome) =>
+          outcome === 'ok' ? resolve({ ok: true }) : reject(new Error('delete failed'));
+      });
+    });
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    await waitForEnabledButton(t.runtimeSpecDelete);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+    return (outcome: 'ok' | 'fail') =>
+      act(async () => {
+        settle(outcome);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+  }
+
+  // The spec PUT is an upsert: a clear PUT handled after the DELETE creates
+  // the deleted spec again, with no override, so the agent may start it. The
+  // cache still holds the configured document until the DELETE answers, so
+  // the clear waits for it; the next frame then finds the spec vanished.
+  it('holds the clear while a spec delete is in flight, then reports the spec vanished', async () => {
+    const { fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+
+    // The `stopped` frame lands inside the DELETE's round trip.
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(putSpecs).toHaveLength(1);
+
+    await settleDelete('ok');
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    expect(await screen.findByText(t.runtimeRestartVanished)).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  // The other outcome of the same wait: the spec is still there, so the
+  // sequence clears its override rather than leaving the model
+  // admission-blocked behind a vanished notice.
+  it('clears the override after all when the in-flight delete fails', async () => {
+    const { spec, fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(putSpecs).toHaveLength(1);
+
+    await settleDelete('fail');
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body).toEqual(expectedBody(spec, ''));
+    expect(screen.queryByText(t.runtimeRestartVanished)).not.toBeInTheDocument();
+  });
+
+  // Deleted, then created again through Edit before the old process reported
+  // `stopped`: the mapping has a configured spec again, but not the one the
+  // restart forced down. Its admin_state is the operator's new choice, so
+  // the old sequence must not clear it.
+  it('does not clear the override of a spec created again after the delete', async () => {
+    const { fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    await openStatusTab();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+    await settleDelete('ok');
+
+    // The mapping has no spec row now, and the new one gets its own id.
+    fakeApi.runtimeSpec.mockImplementation(async (mappingId: string) =>
+      unconfiguredSpec(mappingId),
+    );
+    const recordPut = fakeApi.putRuntimeSpec.getMockImplementation()!;
+    fakeApi.putRuntimeSpec.mockImplementationOnce(async (mappingId, body) => ({
+      ...(await recordPut(mappingId, body)),
+      id: 'spec_2',
+    }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/local/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    await screen.findByRole('button', { name: t.runtimeSpecCreate });
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(putSpecs).toHaveLength(2);
+    expect(screen.getByText(t.runtimeRestartVanished)).toBeInTheDocument();
   });
 });
 
@@ -3096,7 +3786,7 @@ describe('RuntimeAdminSection feature-mismatch banner (spec §9)', () => {
   it('stays quiet when no spec is configured at all', async () => {
     renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
       report: makeReport({ agent_version: '0.1.4', agent_features: [] }),
     });
     await screen.findByText('gw-model');
@@ -5132,7 +5822,7 @@ describe('RuntimeAdminSection delete gate (task 22b)', () => {
   it('locks the delete on a row whose spec read FAILED, and Edit re-answers it', async () => {
     const { fakeApi, deletedMappingIds, deletedSpecIds } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
     });
     fakeApi.runtimeSpec.mockImplementationOnce(() => Promise.reject(new Error('spec GET failed')));
     await screen.findByText('gw-model');
@@ -6692,7 +7382,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
   it('sends health_path "" on a first write through EDIT (no spec yet) when Type is Auto, the binary is an sd-server, and the field is untouched', async () => {
     const { putSpecs } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
@@ -6712,7 +7402,7 @@ describe('RuntimeAdminSection health path create/edit submission', () => {
   it('sends the typed value on a first write through EDIT when the health path was edited', async () => {
     const { putSpecs } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: { map_1: makeSpec({ configured: false, mapping_id: 'map_1' }) },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
@@ -7200,16 +7890,17 @@ describe('RuntimeAdminSection responses live timings', () => {
     // Edit is deliberately ungated and is reachable on a mapping with NO spec
     // row. That document's `false` is a ZERO VALUE, not an operator decision:
     // hydrating it would make this form's FIRST write send an explicit false
-    // and lose the llama.cpp create default.
+    // and lose the llama.cpp create default. The document carries no type, so
+    // the operator picks llama.cpp here, which is what shows that default.
     renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      specsByMappingId: {
-        map_1: makeSpec({ mapping_id: 'map_1', type: 'llama_cpp' }),
-      },
+      specsByMappingId: { map_1: unconfiguredSpec('map_1') },
     });
     await screen.findByText('gw-model');
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
     await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecTypeLlamaCpp }));
     expect(screen.getByRole('checkbox', { name: t.applicationLiveTimings })).toBeChecked();
   });
 });

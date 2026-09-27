@@ -64,6 +64,7 @@ import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
+import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
@@ -181,10 +182,15 @@ const adminStateOptions: { value: string; labelKey: MessageKey }[] = [
   { value: 'force_stopped', labelKey: 'runtimeForceStop' },
 ];
 
-// A brand-new/never-configured spec is `configured: false` with every other
-// field at its zero value (RuntimeSpec's own doc comment) -- reproduced here
-// so a delete or an unloaded row can be rendered/edited without waiting on a
-// network round trip.
+// The document a mapping without a spec row has (RuntimeSpec's own doc
+// comment), reproduced here so a delete can be reflected without waiting on
+// another GET: `configured: false`, the spec's own fields at their zero
+// values, and visible_devices_mode/api_token_mode/api_token_header_source at
+// their defaults ('env'/'app'/'app'), as GetRuntimeSpec synthesizes it. It
+// differs from the wire in three places: both endpoint modes are
+// 'passthrough' where the wire sends "" (EndpointMode cannot hold ""), the
+// app-derived echoes are left false/'' rather than copied from the parent
+// application, and effective_type is '' where the backend resolves 'custom'.
 function emptySpec(mappingId: string): RuntimeSpec {
   return {
     configured: false,
@@ -1212,6 +1218,9 @@ export function RuntimeAdminSection({
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
   const [loadingEditFor, setLoadingEditFor] = useState('');
+  // Bumped by every launch-spec form open (openEdit, openCreate): an Edit GET
+  // fills the form only while it is still the latest one.
+  const editOpenSeqRef = useRef(0);
   // The mapping row the model-mapping tab is editing, or null. Kept separate
   // from `specMode`: they are two different sub-views over two different
   // documents, and the tab strip is hidden while either is open, so neither can
@@ -1958,6 +1967,12 @@ export function RuntimeAdminSection({
   // sequence the operator has already been told is over.
   const overrideRunRef = useRef(0);
   const restartRunRef = useRef(0);
+  // Spec DELETEs in flight, counted per mapping id (confirmDelete's spec
+  // branch); a count because a second confirm can overlap the first.
+  const specDeletesInFlightRef = useRef<Map<string, number>>(new Map());
+  function specDeletesInFlight(mappingId: string): boolean {
+    return (specDeletesInFlightRef.current.get(mappingId) ?? 0) > 0;
+  }
   const mountedRef = useRef(true);
   // Set in the effect BODY as well as its cleanup -- matching
   // MappingSection/ModelServersSection/GroupServersSection, which all do the
@@ -2049,6 +2064,14 @@ export function RuntimeAdminSection({
     // of an already-resting spec fires both PUTs back to back, starts
     // nothing, and reports success.
     if (row.state === 'stopped' && frameSeqRef.current > restart.waitFrom) {
+      // A spec DELETE for this mapping still in flight holds the clear: the
+      // cache keeps the configured document until the DELETE answers, and
+      // the spec PUT is an upsert, so a clear handled after the DELETE would
+      // create the deleted spec again. The next frame decides once it has
+      // settled: a committed delete leaves `emptySpec` for finishRestart to
+      // report as vanished, a failed one leaves the spec to clear. The
+      // deadline above still bounds the wait.
+      if (specDeletesInFlight(restart.mappingId)) return;
       void finishRestart(restart);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2183,7 +2206,13 @@ export function RuntimeAdminSection({
     // the stream's spec id: the clear PUT must not depend on the spec-id join
     // still resolving, and it must still be the actual stored document.
     const spec = specsById[flow.mappingId];
-    if (spec === undefined) {
+    // Gone from the cache, deleted while the restart waited (a delete commits
+    // emptySpec, configured: false), or deleted and created again, which gives
+    // the mapping a spec with another id: in each case the spec this restart
+    // forced down is gone. PUTting the empty document would only earn a
+    // refusal, and clearing the new spec would overwrite an override the
+    // operator set on it.
+    if (spec === undefined || !spec.configured || spec.id !== flow.specId) {
       setRestart(null);
       setRestartNotice('vanished');
       return;
@@ -2259,6 +2288,21 @@ export function RuntimeAdminSection({
   const [apiTokenRotate, setApiTokenRotate] = useState(false);
   const [gpuRows, setGpuRows] = useState<GpuRow[]>([]);
   const [specApiFlavors, setSpecApiFlavors] = useState<string[]>([]);
+  // Whether the flavor group has been touched in this form session -- ticked
+  // or unticked, or a save refused over it. An empty selection is shown as an
+  // error only then, so a spec stored with [] opens without one; the refusal
+  // itself (specFlavorsMissing, at submit) does not depend on it.
+  const [specFlavorsTouched, setSpecFlavorsTouched] = useState(false);
+  // A refused save must be perceivable, not just a button that does nothing:
+  // each refusal moves focus to the flavor group, whose description is the
+  // reason. Counted rather than flagged so a second refusal refocuses, and
+  // applied in an effect so focus lands after the message has rendered and is
+  // wired to the group. Same mechanism as the application form's.
+  const specFlavorsGroupRef = useRef<HTMLFieldSetElement>(null);
+  const [specFlavorRefusals, setSpecFlavorRefusals] = useState(0);
+  useEffect(() => {
+    if (specFlavorRefusals > 0) specFlavorsGroupRef.current?.focus();
+  }, [specFlavorRefusals]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
   const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
   // RuntimeSpec Type: the explicit runtime-server kind ('' = auto-detect from
@@ -2413,10 +2457,12 @@ export function RuntimeAdminSection({
     setSpecResponsesMode(spec.responses_mode);
     setSpecMessagesMode(spec.messages_mode);
     setSpecType(spec.type);
-    // `configured: false` means the mapping has no spec row and every other
-    // field is a zero value -- so that `false` is not an operator decision
-    // and must not become one. Edit is ungated and reaches exactly that
-    // document, and the write it leads to is a FIRST write.
+    // `configured: false` means the mapping has no spec row, so what the
+    // document carries are zero values, defaults and app-derived echoes
+    // rather than stored choices -- that `false` is not an operator decision
+    // and must not become one (the flavors, the modes and Enabled are seeded
+    // in `openEdit` for the same reason). Edit is ungated and reaches exactly
+    // that document, and the write it leads to is a FIRST write.
     setSpecLiveTimings(spec.configured ? spec.responses_live_timings_enabled : undefined);
     // The same zero-value argument for the health path: with no spec row the
     // field shows this form's own fallback, not a stored value, so the save
@@ -2427,33 +2473,22 @@ export function RuntimeAdminSection({
   }
 
   function openCreate() {
+    // Supersedes an Edit whose GET is still in flight (see openEdit). That GET
+    // no longer clears its row's loading lock, so this does.
+    editOpenSeqRef.current += 1;
+    setLoadingEditFor('');
     setGatewayName('');
     setAppName('');
     resetSpecFields();
+    setSpecFlavorsTouched(false);
     setSpecFirstWrite(true);
-    // Snapshot from the parent application: a spec created for it starts out
-    // agreeing with what the app already exposes, rather than a fresh
-    // passthrough-only guess that the operator has to re-derive by hand.
-    // openai_images excepted: it is opt-in on the spec as everywhere else. A
-    // server_agent parent declares it for its image children, and copying it
-    // would make every new text model's spec admit image requests too. Only
-    // the operator ticks it here -- UNLESS the parent has no text flavor to
-    // fall back to: dropping openai_images from a parent whose flavors are
-    // exactly [openai_images] would open the form with every flavor unticked,
-    // and an untouched save on that state sends [], which the backend stores
-    // as [openai, anthropic] (the create default), not narrower -- so the
-    // child would serve nothing the operator could reach, with no warning.
-    // Excepting the exception only when a text flavor survives the filter
-    // keeps that trap closed while leaving the normal case untouched.
-    const parentFlavors = application.api_flavors;
-    const parentHasTextFlavor = parentFlavors.some((flavor) => flavor !== 'openai_images');
-    setSpecApiFlavors(
-      parentHasTextFlavor
-        ? parentFlavors.filter((flavor) => flavor !== 'openai_images')
-        : [...parentFlavors],
-    );
-    setSpecResponsesMode(application.responses_mode);
-    setSpecMessagesMode(application.messages_mode);
+    // The parent application's template (runtimeSpecTemplate, which carries
+    // the openai_images rule and its reasoning); Edit of a spec-less mapping
+    // starts from the same one.
+    const template = runtimeSpecTemplate(application);
+    setSpecApiFlavors(template.apiFlavors);
+    setSpecResponsesMode(template.responsesMode);
+    setSpecMessagesMode(template.messagesMode);
     setSpecMode('create');
   }
 
@@ -2465,9 +2500,17 @@ export function RuntimeAdminSection({
   // cache refuses it: the form is about to PUT that document back, so it must
   // show what it will send. The stale FORM is the etag problem this cache
   // cannot solve; the stale CACHE is not (fix round 1, C2).
+  //
+  // Only the LATEST form open may fill the form. The list stays on screen
+  // while this GET is in flight, and `rowActions` locks only the loading row,
+  // so the operator can click Edit on another mapping, or Create, before it
+  // lands. Without the check, a GET for an earlier click that lands last would
+  // switch the form to its own spec while the names stay the later mapping's,
+  // and the save would write the later mapping's upstream model name onto the
+  // earlier mapping. The cache update before that check stays unconditional:
+  // the payload is still a read of server truth.
   async function openEdit(mapping: PortalModelMapping) {
-    setGatewayName(mapping.gateway_model_name);
-    setAppName(mapping.app_model_name);
+    const seq = ++editOpenSeqRef.current;
     setLoadingEditFor(mapping.id);
     const seen = beginSpecRead(mapping.id);
     try {
@@ -2486,12 +2529,28 @@ export function RuntimeAdminSection({
         next.delete(mapping.id);
         return next;
       });
+      if (seq !== editOpenSeqRef.current) return;
+      setGatewayName(mapping.gateway_model_name);
+      setAppName(mapping.app_model_name);
+      setSpecFlavorsTouched(false);
       hydrateSpecFields(spec);
+      // No spec row yet: the document's [], "" and `enabled: false` are zero
+      // values, not a stored choice, and until this first write the mapping
+      // routes on its application's flavors and modes. Start from those, and
+      // with Enabled ticked, exactly as Create does -- this is also where the
+      // operator retries a Create whose spec write failed.
+      if (!spec.configured) {
+        const template = runtimeSpecTemplate(application);
+        setSpecApiFlavors(template.apiFlavors);
+        setSpecResponsesMode(template.responsesMode);
+        setSpecMessagesMode(template.messagesMode);
+        setEnabled(true);
+      }
       setSpecMode({ kind: 'edit', mapping });
     } catch (err) {
-      showError(formatPortalError(err, t));
+      if (seq === editOpenSeqRef.current) showError(formatPortalError(err, t));
     } finally {
-      setLoadingEditFor('');
+      if (seq === editOpenSeqRef.current) setLoadingEditFor('');
     }
   }
 
@@ -2784,8 +2843,22 @@ export function RuntimeAdminSection({
     };
   }
 
+  // An empty flavor list cannot be saved honestly: the backend stores [] as
+  // [openai, anthropic] (normalizeFlavors, on every spec write), so a form
+  // showing nothing ticked would save a text candidate -- on a
+  // stable_diffusion_cpp spec, the one its operator unticked the text flavors
+  // to avoid. The save is refused and the reason shown, before the mapping is
+  // written, so a refusal never leaves a half-created mapping behind.
+  function specFlavorsMissing(): boolean {
+    if (specApiFlavors.length > 0) return false;
+    setSpecFlavorsTouched(true);
+    setSpecFlavorRefusals((count) => count + 1);
+    return true;
+  }
+
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (specFlavorsMissing()) return;
     const args = parseArgsText(argsText);
     const parsedEnv = parseEnvText(envText, t);
     if (parsedEnv.error) {
@@ -2875,6 +2948,7 @@ export function RuntimeAdminSection({
   async function submitEdit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     if (typeof specMode === 'string' || specMode.kind !== 'edit') return;
+    if (specFlavorsMissing()) return;
     const id = specMode.mapping.id;
     const args = parseArgsText(argsText);
     const parsedEnv = parseEnvText(envText, t);
@@ -2997,7 +3071,16 @@ export function RuntimeAdminSection({
         // too: an override PUT still in flight for this mapping must not
         // resurrect the spec that has just been deleted.
         const ticket = beginSpecWrite(id);
-        await api.deleteRuntimeSpec(id);
+        // Counted while in flight so a waiting restart holds its clear PUT
+        // until the DELETE has settled (the stream effect above).
+        specDeletesInFlightRef.current.set(id, (specDeletesInFlightRef.current.get(id) ?? 0) + 1);
+        try {
+          await api.deleteRuntimeSpec(id);
+        } finally {
+          const left = (specDeletesInFlightRef.current.get(id) ?? 1) - 1;
+          if (left > 0) specDeletesInFlightRef.current.set(id, left);
+          else specDeletesInFlightRef.current.delete(id);
+        }
         const deleted = emptySpec(id);
         commitSpecCache(id, ticket, deleted);
         clearRestartNoticeAfter(deleted);
@@ -3919,7 +4002,16 @@ export function RuntimeAdminSection({
               messagesMode={specMessagesMode}
               liveTimings={specLiveTimings}
               liveTimingsKind={specLiveTimingsKind}
-              onFlavorsChange={setSpecApiFlavors}
+              onFlavorsChange={(next) => {
+                setSpecApiFlavors(next);
+                setSpecFlavorsTouched(true);
+              }}
+              flavorsError={
+                specFlavorsTouched && specApiFlavors.length === 0
+                  ? t.runtimeSpecFlavorsRequired
+                  : undefined
+              }
+              flavorsGroupRef={specFlavorsGroupRef}
               onResponsesModeChange={setSpecResponsesMode}
               onMessagesModeChange={setSpecMessagesMode}
               onLiveTimingsChange={setSpecLiveTimings}
