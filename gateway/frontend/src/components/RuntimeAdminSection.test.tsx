@@ -8187,7 +8187,10 @@ describe('RuntimeAdminSection launch-spec flavor hints', () => {
 // A switch of Type to or from stable_diffusion_cpp moves the API-variant block
 // only while it still holds the values the form put there, judged against the
 // parent template and the sd default.
-describe('RuntimeAdminSection launch-spec type-switch flavor defaults', () => {
+// Each case drives one or two whole launch-spec form sessions through several
+// MUI selects. On a loaded CI runner the longest of them takes well over half
+// of vitest's 5 s default, so the block sets its own budget.
+describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeout: 15_000 }, () => {
   it('sets openai_images with both modes disabled when an untouched Create switches to sd', async () => {
     const { putSpecs } = renderSection({
       application: {
