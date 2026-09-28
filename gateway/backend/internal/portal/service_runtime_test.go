@@ -1256,9 +1256,10 @@ func TestRuntimeWarningsTimeoutBelowStartup(t *testing.T) {
 
 	// An ENABLED spec with a 60s startup timeout (60000ms) exceeds the
 	// application's stored TimeoutMS (seedServerAgentApplication leaves it at
-	// the zero value) -- must warn.
+	// the zero value) -- must warn. The spec names only the application's own
+	// flavor, so api_flavors_not_on_application stays out of the exact list.
 	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
-		Binary: "/bin/x", Enabled: true, StartupTimeoutSeconds: 60,
+		Binary: "/bin/x", Enabled: true, StartupTimeoutSeconds: 60, APIFlavors: []string{routing.APIFlavorOpenAI},
 	}); err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
 	}
@@ -1299,9 +1300,11 @@ func TestRuntimeWarningsIgnoresDisabledSpecs(t *testing.T) {
 	}
 	// Enabled:false with a huge startup timeout -- must not trigger the
 	// warning even though the application's TimeoutMS (zero value here) is
-	// nowhere near it.
+	// nowhere near it. The spec names only the application's own flavor: the
+	// flavor warnings count disabled specs, and this test pins the timeout
+	// warning alone.
 	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
-		Binary: "/bin/x", Enabled: false, StartupTimeoutSeconds: 600,
+		Binary: "/bin/x", Enabled: false, StartupTimeoutSeconds: 600, APIFlavors: []string{routing.APIFlavorOpenAI},
 	}); err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
 	}

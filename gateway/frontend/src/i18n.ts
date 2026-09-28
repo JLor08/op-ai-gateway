@@ -61,6 +61,18 @@ const de = {
   tableServerId: 'Server-ID',
   tableName: 'Name',
   tableApis: 'Verfügbar über',
+  // The two "Available via" cells that list no flavor (ModelList.tsx): an
+  // images-only row without an image verdict gets the note, a row with no
+  // flavor at all gets the chip.
+  modelFlavorsNoImageVerdict: 'kein Bild-Urteil',
+  modelFlavorsNoImageVerdictTooltip:
+    'Bildanfragen werden abgelehnt, solange das Modell kein „image: yes“-Urteil hat. Bei einer Gruppe braucht jedes Mitglied eines.',
+  modelFlavorsNone: 'keine',
+  modelFlavorsNoneTooltipModel: 'Dieses Modell wird unter keiner API angeboten.',
+  modelFlavorsNoneTooltipGroup:
+    'Keines der Mitglieder dieser Gruppe wird unter einer API angeboten.',
+  modelFlavorsNoneTooltipAdmin:
+    'Prüfe die API-Varianten und Modi der Anwendung und, bei einem vom Server-Agent gestarteten Modell, seine Runtime-Spezifikation.',
   tableModelLoaded: 'Geladen',
   tableModelOffered: 'Angeboten',
   tableModelLoading: 'Lädt',
@@ -695,6 +707,10 @@ const de = {
     'Das Anwendungs-Timeout ist kürzer als der längste Start-Timeout einer aktivierten Spezifikation; ein kalter Modellstart schlägt dadurch fehl.',
   runtimeBinaryPathOsMismatchWarning:
     'Mindestens ein Programmpfad passt nicht zum Betriebssystem, das der Agent dieses Servers meldet (z. B. ein Windows-Pfad wie „C:\\…“ auf einem Linux-Server oder umgekehrt). Der Agent wird den Prozess ablehnen. Der Pfad wird nicht blockiert – gemeldet wird nur, was die Telemetrie hergibt.',
+  runtimeFlavorNotOnApplicationWarning:
+    'Eine Runtime-Spezifikation nennt eine API-Variante, die ihre Anwendung nicht deklariert. Diese Variante hat keine Wirkung.',
+  runtimeTextOnStableDiffusionWarning:
+    'Eine Runtime-Spezifikation für stable-diffusion.cpp nennt eine Text-API-Variante (openai oder anthropic) oder gar keine Variante. sd-server hat keinen Chat-Endpunkt, deshalb schlagen Textanfragen an ihr Modell fehl.',
   runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
   runtimeSpecCreate: 'Spezifikation anlegen',
   runtimeSpecEditAction: 'Bearbeiten',
@@ -862,6 +878,12 @@ const de = {
     'Die Modell-Zuordnung wurde gespeichert, die Spezifikation jedoch nicht',
   runtimeSpecFlavorsRequired:
     'Mindestens eine API-Variante muss ausgewählt sein. Ohne Auswahl würde die Startkonfiguration als openai + anthropic gespeichert.',
+  // The launch-spec form's hints under the flavor controls: they say in the
+  // form what RuntimeWarnings reports once the spec is saved.
+  runtimeSpecFlavorsNotOnApplicationHint:
+    'Die Anwendung deklariert mindestens eine angehakte API-Variante nicht. Eine solche Variante hat für diese Startkonfiguration keine Wirkung, solange sie bei der Anwendung fehlt.',
+  runtimeSpecTextFlavorsOnStableDiffusionHint:
+    'sd-server hat keinen Chat-Endpunkt. Für eine stable-diffusion.cpp-Startkonfiguration nur „openai_images (Bilderzeugung)“ anhaken.',
   runtimeAreaPlaceholder: 'Dieser Bereich wird in einem folgenden Ausbauschritt ergänzt.',
   runtimeStatusUnknown: 'Unbekannt',
   // Task 22: Live-Status, Admin-Übersteuerungen, Datei-Modus (schreibgeschützt).
@@ -1880,6 +1902,10 @@ const de = {
   tokenOverrideHideTarget: 'Zielmodell ausblenden',
   tokenOverrideHideTargetHint:
     'Entfernt den Namen des Zielmodells aus der Modell-Liste. Zeigen mehrere Zuordnungen auf dasselbe Ziel, genügt eine gesetzte Zeile, um es auszublenden.',
+  // Appended to a saved override target, rule target or fallback whose
+  // Models() row has no served flavor, which the save refuses (see
+  // OverrideTargetSelect).
+  tokenOverrideTargetUnavailable: '(nicht verfügbar)',
   serverOverrideLabel: 'Server-Override',
   serverOverrideNote:
     'Erzwingt jede Anfrage auf einen bestimmten Server, den Sie verwalten. Leer = kein Override.',
@@ -2545,6 +2571,14 @@ const en: PortalMessages = {
   tableServerId: 'Server ID',
   tableName: 'Name',
   tableApis: 'Available via',
+  modelFlavorsNoImageVerdict: 'no image verdict',
+  modelFlavorsNoImageVerdictTooltip:
+    'Image requests are refused until the model has an "image: yes" verdict. For a group, every member needs one.',
+  modelFlavorsNone: 'none',
+  modelFlavorsNoneTooltipModel: 'This model is not offered under any API.',
+  modelFlavorsNoneTooltipGroup: "None of this group's members is offered under any API.",
+  modelFlavorsNoneTooltipAdmin:
+    "Check the application's API flavors and modes and, for a model the server agent launches, its launch spec.",
   tableModelLoaded: 'Loaded',
   tableModelOffered: 'Offered',
   tableModelLoading: 'Loading',
@@ -3134,6 +3168,10 @@ const en: PortalMessages = {
     'The application timeout is shorter than the longest startup timeout among the enabled specs; a cold model start will fail as a result.',
   runtimeBinaryPathOsMismatchWarning:
     'At least one binary path does not match the operating system this server\'s agent reports (for example a Windows path like "C:\\…" on a Linux server, or the reverse). The agent will refuse to launch the process. The path is not blocked — this only reports what the telemetry shows.',
+  runtimeFlavorNotOnApplicationWarning:
+    'A launch spec lists an API flavor its application does not declare. That flavor has no effect.',
+  runtimeTextOnStableDiffusionWarning:
+    'A stable-diffusion.cpp launch spec lists a text API flavor (openai or anthropic), or no flavor at all. sd-server has no chat endpoint, so text requests to its model fail.',
   runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
   runtimeSpecCreate: 'Create spec',
   runtimeSpecEditAction: 'Edit',
@@ -3284,6 +3322,10 @@ const en: PortalMessages = {
   runtimeSpecPartialFailure: 'The model mapping was saved, but the spec could not be saved',
   runtimeSpecFlavorsRequired:
     'Select at least one API flavor. With none selected, the launch spec would be saved as openai + anthropic.',
+  runtimeSpecFlavorsNotOnApplicationHint:
+    'At least one ticked API flavor is not declared by the application. It has no effect for this launch spec while the application lacks it.',
+  runtimeSpecTextFlavorsOnStableDiffusionHint:
+    'sd-server has no chat endpoint. Tick only "openai_images (image generation)" for a stable-diffusion.cpp launch spec.',
   runtimeAreaPlaceholder: 'This area will be added in a later rollout step.',
   runtimeStatusUnknown: 'Unknown',
   // Task 22: live status, admin overrides, file-mode read-only.
@@ -4238,6 +4280,7 @@ const en: PortalMessages = {
   tokenOverrideHideTarget: 'Hide target model',
   tokenOverrideHideTargetHint:
     "Removes the target model's own name from the model list. When several mappings point to the same target, one checked row is enough to hide it.",
+  tokenOverrideTargetUnavailable: '(unavailable)',
   serverOverrideLabel: 'Server override',
   serverOverrideNote:
     'Forces every request onto one specific server you manage. Empty = no override.',

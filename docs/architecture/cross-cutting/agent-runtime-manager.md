@@ -1050,7 +1050,14 @@ fact about this runtime is, and why:
   (`targetIsImagesOnly`) with 404 `routing.no_model_route`, and `/v1/responses`
   and `/v1/messages` refuse it too, ordinarily with their `*.endpoint_disabled`
   404, because it lists neither endpoint's flavor. None of these refusals is
-  retried against another application. The gateway's own background chat
+  retried against another application. No listing offers it as a text model
+  either, while its spec can be read: every listing, and the unknown-model
+  redirect's offering, reads a mapping's flavors from its spec by the rule
+  dispatch follows, so the child carries `openai_images` alone, and that only
+  while its parent declares the flavor too
+  ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec),
+  [API Compatibility & Inference
+  §9](compatibility-and-inference.md#9-model-discovery)). The gateway's own background chat
   prompts skip it too: the benchmark scheduler and the model warmer judge a
   mapping by its effective flavors ([Routing & Model Selection
   §7](routing-and-model-selection.md#7-model-selection-metrics)). A run an
@@ -1059,17 +1066,26 @@ fact about this runtime is, and why:
   upstream cannot serve, so an `sd-server` spec lists `openai_images` alone
   ([API Compatibility & Inference
   §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
-  Both forms offer it as a third flavor checkbox,
-  `openai_images`, in the shared `ApiVariantControls`: tick it on the
+  Two runtime warnings name the two ways to get this wrong (§11.5):
+  `api_flavors_text_on_stable_diffusion` for an `sd-server` spec whose flavors
+  are not images-only, and `api_flavors_not_on_application` for a spec that
+  lists `openai_images` alone under a parent that lacks it, which leaves the
+  child served, and listed, under no API at all.
+  Both forms offer `openai_images` as a third flavor checkbox, in the shared
+  `ApiVariantControls`: tick it on the
   `server_agent` application for candidacy and on each image spec for the
   relay. It is opt-in: the `server_agent` application form does not tick it
   by default, and a spec's first write — the create form, or Edit of a
   mapping that has no spec yet — starts from its parent application's flavors
   without `openai_images`, unless the parent lists `openai_images` alone,
   which the first write then inherits
-  ([§11.5](#115-what-each-remaining-tab-shows)). The spec type does not set
-  flavors. The type field's note for `stable_diffusion_cpp` says which boxes
-  to tick.
+  ([§11.5](#115-what-each-remaining-tab-shows)). The spec type sets no flavor
+  in the backend; the launch-spec form does, for an untouched spec: switching
+  its Type to `stable_diffusion_cpp` while the flavors still equal the parent's
+  template ticks `openai_images` alone and disables both endpoint modes, and
+  switching back to an explicit non-sd type restores what that replaced
+  ([§11.5](#115-what-each-remaining-tab-shows)). The type field's note for
+  `stable_diffusion_cpp` says which boxes to tick.
 
 - **Its `image` verdict is automatic too, read through the agent rather than
   around it.** The gateway's health loop reaches only an **external**
@@ -1090,7 +1106,12 @@ fact about this runtime is, and why:
   either reader to have read yet. Pin the spec, start it once so the
   automatic path can run, or set the verdict by hand once (after which it is
   stored, like any other verdict) — the manual path also remains the only one
-  for a gateway or agent build old enough to predate this source.
+  for a gateway or agent build old enough to predate this source. Until the
+  verdict arrives no listing offers it for use: the portal chat offers a model
+  whose only flavor is `openai_images` only with `image: true`, the Models
+  view's "Available via" column shows it with a muted "no image verdict" note
+  instead of a flavor, and no text listing names it ([API Compatibility &
+  Inference §9](compatibility-and-inference.md#9-model-discovery)).
 
 The facts above about `sd-server` itself were checked against
 `leejet/stable-diffusion.cpp` at commit `cc515a0` (`master`, 2026-09-16); a
@@ -4251,6 +4272,41 @@ make them fail on such a row. The application API does not refuse one
 either; the two forms refuse it instead ([Compatibility & Inference
 §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
 
+**Two inline hints mirror the flavor warnings while the form is open**,
+because the warnings banner of the specs tab (below) is not shown then. Both
+are non-blocking alerts under the flavor controls, the pattern the Metal-device
+hint (`showMetalNonMacos`) uses. One names a ticked flavor the parent
+application does not declare, which has no effect
+(`api_flavors_not_on_application`); the other names ticked flavors that are
+not images-only on a spec that is sd (`api_flavors_text_on_stable_diffusion`).
+The spec is sd when its Type is `stable_diffusion_cpp`, or when its Type is
+Auto, its `binary` is unchanged since the form loaded, and the loaded spec was
+Auto and resolved to `stable_diffusion_cpp`. The form does not mirror the
+backend's binary-name detection, so under Auto a changed binary, or a spec
+loaded with an explicit Type, shows no hint; once the spec is saved, the
+warning judges its binary.
+
+**A type switch moves untouched flavors and modes, as it moves an untouched
+health path** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+Switching Type to `stable_diffusion_cpp` while the flavors equal the parent
+template's (`runtimeSpecTemplate`, compared order-insensitively) remembers the
+current flavors and both modes, and sets `["openai_images"]` with both endpoint
+modes `disabled`, the application form's own default for that type; the mode
+dropdowns are already locked while their flavor is unticked. Switching from
+`stable_diffusion_cpp` to an explicit non-sd type — never to Auto — while the
+values are still exactly that sd default restores the remembered values, or
+the parent template when nothing is remembered because the spec was loaded as
+sd. Switching to Auto moves nothing, for the health path's reason: an Auto spec
+with an `sd-server` binary is still sd. In every other case the values are the
+operator's and stay as they are. "Untouched" is judged against the template,
+not by the form's flavor-touched flag, which resets on every open. The hint
+and switch rules live in `runtimeSpecTypeFlavors.ts`
+(`specFlavorsAfterTypeSwitch` for the switch). This is a form convenience: the
+backend stays type-agnostic about flavors, and its default for an absent or
+empty list stays both text flavors whatever the type
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(g)).
+
 **A GPU row can show a THIRD number, and it is an offer rather than a field.**
 When the mapping's benchmark history carries an applicable VRAM measurement
 ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)),
@@ -4366,7 +4422,7 @@ wrongly rejects `${TRANSPORT}`; an `includes('${AGENT_ENV:OP_AGENT_')` test
 wrongly accepts the near-misses the agent refuses).
 
 A per-application warnings endpoint returns opaque string codes and today emits
-two. Both are pure derivations with no store write, reloaded after every spec
+four. All are pure derivations with no store write, reloaded after every spec
 save or delete. An unmapped future code renders its raw wire string rather than
 a wrong label — the forward-compatibility convention applied to **every** opaque
 wire enum on this screen, runtime states included.
@@ -4389,6 +4445,31 @@ consequence of *running*, this one describes a value the operator just typed,
 and a spec is routinely created disabled and enabled afterwards. And a path
 absolute under **both** rules (a UNC share spelled with forward slashes,
 `//host/share/x`) contradicts nothing and stays silent.
+
+**`api_flavors_not_on_application`** — a spec of a `server_agent` application
+lists a flavor the application does not declare. Candidacy reads the
+application's flavors, so that flavor has no effect: a spec `["openai_images"]`
+under a parent without `openai_images` is served, and listed, under no API at
+all
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)).
+It also fires for a harmless extra — a parent from which `anthropic` was
+removed on purpose — so its label says the flavor has no effect, not that the
+spec is broken.
+
+**`api_flavors_text_on_stable_diffusion`** — a spec of a `server_agent`
+application whose effective type (`EffectiveRuntimeSpecType`: the explicit
+`type`, else the one detected from `binary`) is `stable_diffusion_cpp` has
+flavors that are not images-only, an empty list included. The listings'
+`openai` rule would offer such a spec as a text model, and `sd-server` has no
+chat endpoint (measured: `POST /v1/chat/completions` answers 404).
+
+Both count disabled specs, like `binary_path_os_mismatch` and unlike the
+timeout warning, because dispatch reads a spec's flavors whether it is enabled
+or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
+`anySpecBinaryContradictsReportedOS` (`anySpecListsFlavorNotOnApplication`,
+`anyStableDiffusionSpecNotImagesOnly`), over the application and the specs
+`RuntimeWarnings` already loads, so neither adds a store read. The launch-spec
+form mirrors both as inline hints while it is open (above).
 
 **Co-residency matrix.** A strict lower triangle: rows are specs `1..n-1`,
 columns `0..i-1` for row `i`, so `n` specs produce exactly `n(n-1)/2` toggle
@@ -5693,10 +5774,10 @@ schema with **no** such normalisation, so a field left out there gets 30 s of
 startup budget and a 2 s probe timeout instead. A model server whose health
 endpoint answers slowly under load is where that difference shows.
 
-The portal's one cross-field warning
-(`timeout_ms_below_startup_timeout`, §11.5) exists because the gateway's total
-deadline keeps running while the agent's router holds the request: **the agent
-runtime alone does not heal the 30 s case.**
+`timeout_ms_below_startup_timeout`, the one runtime warning (§11.5) about this
+table, exists because the gateway's total deadline keeps running while the
+agent's router holds the request: **the agent runtime alone does not heal the
+30 s case.**
 
 Streaming heartbeats (§4.4) re-arm two of the three consumers that matter, and
 the honest limits are worth stating rather than presenting heartbeats as the

@@ -13,11 +13,20 @@ import {
   type OverrideRow,
   type OverrideRowValues,
 } from './ModelOverrideEditor';
+import { overrideTargets } from './OverrideTargetSelect';
 import { messages, type Locale } from '../../i18n';
 
 afterEach(cleanup);
 
-const models = [{ id: 'qwen3-32b', display_name: 'qwen3-32b' }];
+// 'sd-child' is listed with flavors []: served under no API, so no picker
+// offers it and a save that targets it is refused.
+const targets = overrideTargets(
+  [
+    { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: ['openai'], loading_on_count: 0 },
+    { id: 'sd-child', display_name: 'sd-child', flavors: [], loading_on_count: 0 },
+  ],
+  null,
+);
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
@@ -34,7 +43,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         onRowsChange={opts.onRowsChange ?? vi.fn()}
         catchAll={opts.catchAll ?? ''}
         onCatchAllChange={opts.onCatchAllChange ?? vi.fn()}
-        models={models}
+        targets={targets}
         t={t}
         idPrefix="token"
         catchAllId="token-model-catchall"
@@ -54,7 +63,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         onRowsChange={setRows}
         catchAll={catchAll}
         onCatchAllChange={setCatchAll}
-        models={models}
+        targets={targets}
         t={t}
         idPrefix="token"
         catchAllId="token-model-catchall"
@@ -153,6 +162,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
       expect(rows).toHaveLength(2);
       expect(rows[0].id).not.toEqual(rows[1].id);
+    });
+  });
+
+  describe(`ModelOverrideEditor targets [${locale}]`, () => {
+    it('offers a rule target only the names served under an API', async () => {
+      renderEditor({ rows: [{ from: 'a', to: '', offer: false, hideTarget: false }] });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: `${t.tokenOverrideToLabel} 1` }));
+      expect(await screen.findByRole('option', { name: 'qwen3-32b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('offers the catch-all only the names served under an API', async () => {
+      renderEditor({ rows: [] });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel }));
+      expect(await screen.findByRole('option', { name: 'qwen3-32b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('keeps a refused rule target and catch-all visible and marks both unavailable', () => {
+      renderEditor({
+        rows: [{ from: 'a', to: 'sd-child', offer: false, hideTarget: false }],
+        catchAll: 'sd-child',
+      });
+      const unavailable = `sd-child ${t.tokenOverrideTargetUnavailable}`;
+      expect(screen.getByRole('combobox', { name: `${t.tokenOverrideToLabel} 1` })).toHaveValue(
+        unavailable,
+      );
+      expect(screen.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel })).toHaveValue(
+        unavailable,
+      );
+      expect(screen.getAllByTestId('searchable-select-unavailable')).toHaveLength(2);
     });
   });
 

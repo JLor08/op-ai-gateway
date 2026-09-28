@@ -16,11 +16,14 @@ import (
 // wrong redirect.
 //
 // Callable is the ACCESS set: what this token can actually route to under its
-// real name, i.e. exactly the names a direct request can succeed with. It
-// applies the same per-token reachability the LISTING does (the server
-// allowlist and resource-group provisioning of visibleMappingViews), and then
-// splits the two model_settings suppression values apart, because only one of
-// them is about access at all:
+// real name, i.e. exactly the names a direct request can succeed with. Its
+// flavor test is the listing's served rule (routing.MappingServesAPIFlavor:
+// the application declares the flavor, and the mapping's effective flavors and
+// messages mode admit it: a runtime spec's for an agent-launched mapping with a
+// spec row, the application's own otherwise). It applies the same per-token
+// reachability the LISTING does (the server allowlist and resource-group
+// provisioning of visibleMappingViews), and then splits the two model_settings
+// suppression values apart, because only one of them is about access at all:
 //
 //   - "hidden" (and a rule's HideTarget) is DISPLAY ONLY — the name drops out
 //     of the listing and still routes perfectly. It stays in Callable, and an
@@ -41,7 +44,14 @@ import (
 // Existing is every name that exists at all for that flavor, deliberately
 // WITHOUT the per-token visibility filter and WITHOUT the listing switches —
 // only that separation lets the redirect tell "no such model" from "not yours".
-// So Callable ⊆ Existing.
+// Its flavor test is the served rule's flavor half
+// (routing.MappingHasAPIFlavor), for the names and for the group overlay
+// alike: a name that fails it does not exist under that flavor, like one whose
+// application lacks the flavor. A name whose messages endpoint is disabled
+// still exists under anthropic and is not callable there, the same "exists but
+// you cannot call it" case as a locked name: the narrow redirect leaves it
+// alone, and only UnknownModelRedirectBlocked redirects it. So Callable ⊆
+// Existing.
 //
 // THE LISTING SET IS NOT HERE, on purpose. What a token sees advertised —
 // ModelsForFlavor / Models(), which drop the suppressed names and add the
@@ -60,10 +70,10 @@ import (
 // requires "image") is refused by the capability gate for a model without it,
 // so a LastUsedModel or fallback outside Capable would turn a legible "unknown
 // model" into a 404 model_not_capable about a model the client never named.
-// The flavor cannot answer this: Callable for openai_images holds every model
-// of an application that declares the flavor, verdict or not. Capable is judged
-// by the listing's own image fold (imageFlagsByName, groupCapabilityFlags), the
-// rule behind ModelDTO.Image, so a name is a candidate exactly when the portal
+// The flavor cannot answer this: Callable for openai_images holds every name
+// the images relay would admit, verdict or not. Capable is judged by the
+// listing's own image fold (imageFlagsByName, groupCapabilityFlags), the rule
+// behind ModelDTO.Image, so a name is a candidate exactly when the portal
 // lists it as generating images. With no required capability Capable is
 // Callable itself. A required capability that has no fold makes Capable empty:
 // nothing is known to carry it, so nothing is a candidate. The requested-name
@@ -152,34 +162,38 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 // candidate to go to. Because the caller cannot distinguish a partial result
 // from a real one, the only safe partial result is none.
 //
-// ONE EXCEPTION: the per-application runtime-spec read the capability fold
-// makes for a server_agent application (RuntimeSpecsByApplication, inside
-// capableNames -> runtimeSpecFlavorsForViews) does NOT push this function to
-// the all-or-nothing empty result on failure. It degrades PER APPLICATION
-// instead — it logs and drops only that application's mappings from Capable
-// (fail-closed, mirroring the listing's own image fold), leaving Callable
-// and Existing untouched and every other application's Capable entries
-// intact. Measured with a failing RuntimeSpecsByApplication for one
-// server_agent application among several mappings:
-// Callable={agent-image, plain-image}, Capable={plain-image}.
+// ONE EXCEPTION: the per-application runtime-spec read for a server_agent
+// application (RuntimeSpecsByApplication, in runtimeSpecIndexForViews) does
+// NOT push this function to the all-or-nothing empty result on failure. It
+// degrades PER APPLICATION instead, the way the listing does: Callable and
+// Existing read that application's own flavors and messages mode for its
+// mappings (fail-open, see perNameFlavors), and Capable drops its mappings
+// (fail-closed, the listing's own image fold, see viewServesImages). Every
+// other application is unaffected.
+// TestModelsImageWithholdsAnAgentModelWhenItsSpecReadFails pins it:
+// Callable(openai_images)={agent-image, plain-image}, Capable={plain-image}.
+// Failing open is the redirect's safe direction here too: an Existing that
+// shrank during a store blip would make it reroute requests for names that
+// exist.
 //
-// This is deliberately NOT the fail-open that the listing does. ModelsForFlavor
-// falls back to seedModelNames on a store error and modelFlavorSets proceeds
-// without groups or suppression when the overlay read fails, because a glitch
-// must never blank the model list a user is looking at. Here the failure
-// direction is reversed: empty sets make the redirect DECLINE and the client
-// see today's ordinary error, instead of a request being sent somewhere
-// unintended. Same store, opposite safe direction, on purpose.
+// The all-or-nothing rule is deliberately NOT the fail-open that the listing
+// applies to the same reads. ModelsForFlavor falls back to seedModelNames on a
+// store error and modelFlavorSets proceeds without groups or suppression when
+// the overlay read fails, because a glitch must never blank the model list a
+// user is looking at. Here the failure direction is reversed: empty sets make
+// the redirect DECLINE and the client see today's ordinary error, instead of a
+// request being sent somewhere unintended. Same store, opposite safe
+// direction, on purpose.
 //
 // The one shared fallback is the unconfigured routing store, where it mirrors
 // ModelsForFlavor's seed models so both answers agree with what /v1/models
 // actually served.
 //
-// Cost: one mapping traversal (activeMappingViews) and one group-overlay load,
-// both shared between the sets — this sits on the per-request path in the
-// redirect and Service caches nothing. A required capability adds the image
-// fold's own reads, the same the listing makes: one batch capability read and
-// one runtime-spec read per server_agent application.
+// Cost: one mapping traversal (activeMappingViews), one group-overlay load and
+// one runtime-spec read per server_agent application (runtimeSpecIndexForViews,
+// over the unfiltered views), all shared between the sets — this sits on the
+// per-request path in the redirect and Service caches nothing. A required
+// capability adds the image fold's one batch capability read.
 func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor string, required []string) ModelOffering {
 	if s.routes == nil {
 		return seedModelOffering(flavor, required)
@@ -205,15 +219,19 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	if err != nil {
 		return emptyModelOffering()
 	}
+	// One runtime-spec read over the UNFILTERED views feeds all three sets: it
+	// covers the visible views as well, and Existing reads the rest.
+	idx := s.runtimeSpecIndexForViews(ctx, views)
 	// Callable comes out of the LISTING's own composition (same function), so the
 	// two can never disagree about what this token reaches. It is that
 	// composition's OTHER half — the pre-suppression map it already builds for
 	// the alias overlay, which is precisely "token-filtered, but before the
 	// model_settings hidden/locked names were dropped, and with every active
 	// group regardless of its display visibility" — minus the locked names,
-	// re-dropped by callableNamesForFlavor. No extra store read: it comes out of
-	// the one call below that was already being made, and the visibility map the
-	// locked filter needs is the overlay's own, already loaded.
+	// re-dropped by callableNamesForFlavor. It costs no store read of its own:
+	// the composition runs on the views, the spec index and the overlay already
+	// loaded above, and the visibility map the locked filter needs is the
+	// overlay's own.
 	//
 	// The finished LISTING that same call also produces is discarded here (`_`):
 	// no question this type answers is about the listing, and composing it is
@@ -221,16 +239,16 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// one call, not a second computation. Reusing the listing's own composition
 	// is what keeps Callable from drifting away from what the token really
 	// reaches.
-	_, preSuppress := flavorSetsFromViews(visible, &overlay, token)
+	_, preSuppress := flavorSetsFromViews(visible, idx, &overlay, token)
 	callable := callableNamesForFlavor(preSuppress, flavor, overlay.visByLower)
-	capable, err := s.capableNames(ctx, callable, visible, overlay, required)
+	capable, err := s.capableNames(ctx, callable, visible, idx, overlay, required)
 	if err != nil {
 		return emptyModelOffering()
 	}
 	return ModelOffering{
 		Callable: callable,
 		Capable:  capable,
-		Existing: existingNamesForFlavor(views, overlay, flavor),
+		Existing: existingNamesForFlavor(views, idx, overlay, flavor),
 	}
 }
 
@@ -238,11 +256,13 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // required (ModelOffering.Capable). It folds over the same token-filtered views
 // the listing folds over for this token (Models() reads visibleMappingViews),
 // with the listing's own rules: imageFlagsByName for a model name, and
-// groupCapabilityFlags over the group overlay for a group name. "image" is the
-// only capability a request requires today and the only one with a fold here;
-// any other makes the result empty (fail-closed). An error is a failed store
-// read, which the caller turns into the all-or-nothing empty offering.
-func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
+// groupCapabilityFlags over the group overlay for a group name. idx is the
+// caller's runtime-spec index and must cover views; capableNames makes no spec
+// read of its own. "image" is the only capability a request requires today
+// and the only one with a fold here; any other makes the result empty
+// (fail-closed). An error is a failed capability read, which the caller turns
+// into the all-or-nothing empty offering.
+func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
 	if len(required) == 0 {
 		return callable, nil
 	}
@@ -259,9 +279,10 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 	if err != nil {
 		return nil, err
 	}
-	specFlavors, specFailed := s.runtimeSpecFlavorsForViews(ctx, views)
-	flags := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), specFlavors, specFailed)
-	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views))
+	flags := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+	// The group fold reads only the overlay's members, which no flavor rule
+	// changes; the served rule is the one the listing's Image fold uses.
+	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views, idx, routing.MappingServesAPIFlavor))
 	for name, flag := range groupCapabilityFlags(entries, flags) {
 		flags[name] = flag
 	}
@@ -330,15 +351,18 @@ func callableNamesForFlavor(preSuppress map[string]map[string]struct{}, flavor s
 }
 
 // existingNamesForFlavor is every name that exists at all for one flavor: the
-// models plus the group names.
+// models plus the group names. A model exists under the flavor when one of its
+// mappings passes the flavor half (routing.MappingHasAPIFlavor), and a group
+// when one of its offerable members does: the overlay below folds the same
+// flavor-half map, never the served one.
 //
 // It is built WITHOUT the token filter and without the visibility overlay: a
 // model the token cannot see still exists, and conflating the two would make
-// every invisible model look unknown. Hence the caller's UNFILTERED views and
-// the group overlay's suppress set discarded.
-func existingNamesForFlavor(views []mappingView, overlay groupOverlayInputs, flavor string) map[string]struct{} {
+// every invisible model look unknown. Hence the caller's UNFILTERED views, an
+// idx that covers them, and the group overlay's suppress set discarded.
+func existingNamesForFlavor(views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, flavor string) map[string]struct{} {
 	out := make(map[string]struct{})
-	all := perNameFlavors(views)
+	all := perNameFlavors(views, idx, routing.MappingHasAPIFlavor)
 	for name, flavors := range all {
 		if _, ok := flavors[flavor]; ok {
 			out[name] = struct{}{}

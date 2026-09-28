@@ -29,6 +29,7 @@ import { useToast } from '../shared/ToastProvider';
 import type { ChatContent } from '../shared/chatContent';
 import { prepareImageDataUrl, ImageAttachError } from '../shared/imageAttach';
 import { imagesLeft } from '../shared/chatCapacity';
+import { offeredFlavors } from '../shared/offeredFlavors';
 import {
   ACTIVE_ID_KEY,
   DEFAULTS,
@@ -302,18 +303,19 @@ export function ChatStoreProvider({
   const { showError } = useToast();
 
   // A model is offered when the chat can send it something the gateway will
-  // serve: a text request (the openai flavor), or an image request. An image
-  // request needs BOTH the openai_images flavor and an image verdict, because
-  // the images gate refuses a model without image: yes -- and an images-only
-  // model (an sd-server, whose upstream has no chat endpoint) without that
-  // verdict could only ever produce a request that fails.
+  // serve: a text request (chat completions, the openai flavor) or an image
+  // request (the openai_images flavor). offeredFlavors keeps openai_images
+  // only behind an image verdict, because the images gate refuses a model
+  // without image: yes -- an images-only model (an sd-server, whose upstream
+  // has no chat endpoint) without that verdict could only ever produce a
+  // request that fails. anthropic alone offers nothing: the chat sends no
+  // /v1/messages request.
   const chatModels = useMemo(
     () =>
-      models.filter(
-        (option) =>
-          option.flavors.includes('openai') ||
-          (option.flavors.includes('openai_images') && option.image === true),
-      ),
+      models.filter((option) => {
+        const offered = offeredFlavors(option);
+        return offered.includes('openai') || offered.includes('openai_images');
+      }),
     [models],
   );
   // The dropdown's option list. A non-empty `model` that is not (or no longer)

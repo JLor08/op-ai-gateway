@@ -121,6 +121,129 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ModelList available-via column [${locale}]`, () => {
+    const row = (
+      fields: Pick<ModelOption, 'id' | 'flavors'> & Partial<ModelOption>,
+    ): ModelOption => ({ display_name: fields.id, loading_on_count: 0, ...fields });
+    // One row per shape of the column: flavors without openai_images, an
+    // image verdict (images-only and mixed), a mixed row without a verdict,
+    // an images-only row without a verdict, and a row with no flavor.
+    const shapes: ModelOption[] = [
+      row({ id: 'text-model', flavors: ['openai', 'anthropic'] }),
+      row({ id: 'sd-verdict', flavors: ['openai_images'], image: true }),
+      row({ id: 'mixed-verdict', flavors: ['openai', 'openai_images'], image: true }),
+      row({ id: 'mixed-text', flavors: ['openai', 'openai_images'], image: false }),
+      row({ id: 'sd-no-verdict', flavors: ['openai_images'], image: false }),
+      row({ id: 'dead-model', flavors: [] }),
+    ];
+
+    // The row's cell under the "Available via" header, located by the
+    // header's position so a column inserted ahead of it cannot shift the
+    // assertion onto another cell.
+    function flavorsCell(id: string): HTMLElement {
+      const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+      const idx = headers.findIndex((txt) => txt.includes(t.tableApis));
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const tr = screen.getAllByText(id)[0].closest('tr')!;
+      return within(tr).getAllByRole('cell')[idx];
+    }
+
+    async function hoverTooltip(cell: HTMLElement, label: string): Promise<HTMLElement> {
+      fireEvent.mouseOver(within(cell).getByText(label));
+      return screen.findByRole('tooltip');
+    }
+
+    function shownIds(): string[] {
+      return shapes.map((m) => m.id).filter((id) => screen.queryAllByText(id).length > 0);
+    }
+
+    it('lists every flavor of a row without openai_images', () => {
+      renderList({ t, models: shapes });
+      expect(flavorsCell('text-model').textContent).toBe('openai, anthropic');
+    });
+
+    it('lists every flavor, openai_images included, of a row with an image verdict', () => {
+      renderList({ t, models: shapes });
+      expect(flavorsCell('sd-verdict').textContent).toBe('openai_images');
+      expect(flavorsCell('mixed-verdict').textContent).toBe('openai, openai_images');
+    });
+
+    it('lists only the text flavors of a mixed row without an image verdict', () => {
+      renderList({ t, models: shapes });
+      expect(flavorsCell('mixed-text').textContent).toBe('openai');
+    });
+
+    it('shows a muted note with its tooltip for an images-only row without a verdict', async () => {
+      renderList({ t, models: shapes });
+      const cell = flavorsCell('sd-no-verdict');
+      expect(cell.textContent).toBe(t.modelFlavorsNoImageVerdict);
+      // A note, not a chip: nothing is broken, the verdict is missing.
+      expect(
+        within(cell).getByText(t.modelFlavorsNoImageVerdict).closest('.MuiChip-root'),
+      ).toBeNull();
+      const tooltip = await hoverTooltip(cell, t.modelFlavorsNoImageVerdict);
+      expect(tooltip.textContent).toBe(t.modelFlavorsNoImageVerdictTooltip);
+    });
+
+    it('shows a warning chip for a row with no flavor', () => {
+      renderList({ t, models: shapes });
+      const cell = flavorsCell('dead-model');
+      expect(cell.textContent).toBe(t.modelFlavorsNone);
+      expect(within(cell).getByText(t.modelFlavorsNone)).toHaveAttribute('data-status', 'watch');
+    });
+
+    it('explains the chip of a model row to a non-admin without the admin sentence', async () => {
+      renderList({ t, models: shapes });
+      const tooltip = await hoverTooltip(flavorsCell('dead-model'), t.modelFlavorsNone);
+      expect(tooltip.textContent).toBe(t.modelFlavorsNoneTooltipModel);
+    });
+
+    it('adds the admin sentence to the chip of a model row for an admin', async () => {
+      renderList({ t, models: shapes, isAdmin: true });
+      const tooltip = await hoverTooltip(flavorsCell('dead-model'), t.modelFlavorsNone);
+      expect(tooltip.textContent).toBe(
+        `${t.modelFlavorsNoneTooltipModel} ${t.modelFlavorsNoneTooltipAdmin}`,
+      );
+    });
+
+    it('explains the chip of a group row by its members, to a non-admin', async () => {
+      renderList({ t, models: [row({ id: 'dead-group', flavors: [], is_group: true })] });
+      const tooltip = await hoverTooltip(flavorsCell('dead-group'), t.modelFlavorsNone);
+      expect(tooltip.textContent).toBe(t.modelFlavorsNoneTooltipGroup);
+    });
+
+    it('adds the admin sentence to the chip of a group row for an admin', async () => {
+      renderList({
+        t,
+        models: [row({ id: 'dead-group', flavors: [], is_group: true })],
+        isAdmin: true,
+      });
+      const tooltip = await hoverTooltip(flavorsCell('dead-group'), t.modelFlavorsNone);
+      expect(tooltip.textContent).toBe(
+        `${t.modelFlavorsNoneTooltipGroup} ${t.modelFlavorsNoneTooltipAdmin}`,
+      );
+    });
+
+    // The column filter matches what the cell shows, not the raw DTO list: a
+    // mixed row without a verdict shows "openai" only, so it is not found
+    // under openai_images.
+    it('filters on the displayed label', async () => {
+      renderList({ t, models: shapes });
+      const filterName = `${t.listFilter}: ${t.tableApis}`;
+      fireEvent.click(screen.getByRole('button', { name: filterName }));
+      const input = await screen.findByRole('textbox', { name: filterName });
+
+      fireEvent.change(input, { target: { value: 'openai_images' } });
+      expect(shownIds()).toEqual(['sd-verdict', 'mixed-verdict']);
+
+      fireEvent.change(input, { target: { value: t.modelFlavorsNoImageVerdict } });
+      expect(shownIds()).toEqual(['sd-no-verdict']);
+
+      fireEvent.change(input, { target: { value: t.modelFlavorsNone } });
+      expect(shownIds()).toEqual(['dead-model']);
+    });
+  });
+
   describe(`ModelList loading vs empty [${locale}]`, () => {
     it('shows the loading label while loading with no models', () => {
       renderList({ t, models: [], loading: true });

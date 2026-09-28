@@ -21,6 +21,12 @@ const models: ModelOption[] = [
   { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
   { id: 'qwen-coder', display_name: 'qwen-coder', flavors: ['openai'], loading_on_count: 0 },
 ];
+// 'sd-child' is listed with flavors []: served under no API, so no override
+// picker offers it and a save that targets it is refused.
+const pickerModels: ModelOption[] = [
+  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+  { id: 'sd-child', display_name: 'sd-child', flavors: [], loading_on_count: 0 },
+];
 
 const adminCandidates = [
   {
@@ -867,11 +873,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       renderServicesView({
         services: [svc],
         models: [
-          { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [], loading_on_count: 0 },
+          { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: ['openai'], loading_on_count: 0 },
           {
             id: 'fast-group',
             display_name: 'fast-group',
-            flavors: [],
+            flavors: ['openai'],
             loading_on_count: 0,
             is_group: true,
           },
@@ -924,6 +930,44 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           unknown_model_fallback: '',
         }),
       );
+    });
+  });
+
+  describe(`ServiceTokensSection override pickers offer only names served under an API [${locale}]`, () => {
+    // Opens the create-token dialog of a service whose models include
+    // 'sd-child' and returns the dialog.
+    async function openCreateTokenDialog() {
+      renderServicesView({ services: [makeService({ id: 'svc_pickers' })], models: pickerModels });
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+      return within(screen.getByRole('dialog'));
+    }
+
+    it('leaves such a name out of a rule target', async () => {
+      const createDialog = await openCreateTokenDialog();
+      fireEvent.click(createDialog.getByRole('button', { name: t.tokenOverrideAddRow }));
+      fireEvent.mouseDown(
+        createDialog.getByRole('combobox', { name: `${t.tokenOverrideToLabel} 1` }),
+      );
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('leaves such a name out of the catch-all', async () => {
+      const createDialog = await openCreateTokenDialog();
+      fireEvent.mouseDown(
+        createDialog.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel }),
+      );
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('leaves such a name out of the fallback', async () => {
+      const createDialog = await openCreateTokenDialog();
+      fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+      fireEvent.mouseDown(createDialog.getByLabelText(t.tokenUnknownFallback));
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
     });
   });
 

@@ -7,7 +7,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import type { ModelOverrideEntry } from '../../api';
 import type { Translation } from './types';
 import { Field } from './Field';
-import { SearchableSelect } from './SearchableSelect';
+import { OverrideTargetSelect, type OverrideTargets } from './OverrideTargetSelect';
 
 // The DATA half of a row in the model-override editor: a requested-model
 // free-text key -> a gateway model id, plus the two listing switches (see
@@ -52,11 +52,6 @@ export function newOverrideRow(values: OverrideRowValues): OverrideRow {
   overrideRowSeq += 1;
   return { ...values, id: `override-row-${overrideRowSeq}` };
 }
-
-// The "to" dropdown only ever needs id + display_name — both ModelOption
-// (the full model list) and ServerModelOption (a server-override-narrowed
-// list, see TokenList) satisfy this.
-export type OverrideModelOption = { id: string; display_name: string };
 
 // A row is incomplete when exactly one side is filled; such a row blocks
 // submit.
@@ -111,13 +106,17 @@ export function overrideSummary(
  * it does NOT follow the row prefix in either caller (TokenList's is
  * "token-model-catchall", not "token-catchall") so it is threaded separately
  * rather than derived from `idPrefix`.
+ *
+ * `targets` is what every row's "to" picker and the catch-all offer (see
+ * overrideTargets): the caller derives it once per form, from the model
+ * listing or a server override's own listing.
  */
 export function ModelOverrideEditor({
   rows,
   onRowsChange,
   catchAll,
   onCatchAllChange,
-  models,
+  targets,
   t,
   idPrefix,
   catchAllId,
@@ -126,7 +125,7 @@ export function ModelOverrideEditor({
   onRowsChange: (rows: OverrideRow[]) => void;
   catchAll: string;
   onCatchAllChange: (value: string) => void;
-  models: OverrideModelOption[];
+  targets: OverrideTargets;
   t: Translation;
   idPrefix: string;
   catchAllId: string;
@@ -173,15 +172,13 @@ export function ModelOverrideEditor({
               →
             </Box>
             <Box sx={{ flex: 1 }}>
-              <SearchableSelect
+              <OverrideTargetSelect
                 id={`${idPrefix}-override-to-${i}`}
                 label={`${t.tokenOverrideToLabel} ${i + 1}`}
                 value={row.to}
                 onChange={(v) => updateRow(i, { to: v })}
-                options={[
-                  { value: '', label: '-' },
-                  ...models.map((m) => ({ value: m.id, label: m.display_name })),
-                ]}
+                targets={targets}
+                t={t}
               />
             </Box>
             <IconButton
@@ -220,16 +217,14 @@ export function ModelOverrideEditor({
           {t.tokenOverrideAddRow}
         </Button>
       </Box>
-      <SearchableSelect
+      <OverrideTargetSelect
         id={catchAllId}
         label={t.tokenOverrideCatchAllLabel}
         value={catchAll}
         onChange={onCatchAllChange}
         helperText={t.tokenOverrideCatchAllNote}
-        options={[
-          { value: '', label: '-' },
-          ...models.map((m) => ({ value: m.id, label: m.display_name })),
-        ]}
+        targets={targets}
+        t={t}
       />
     </Box>
   );

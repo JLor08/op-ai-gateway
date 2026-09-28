@@ -19,11 +19,21 @@ import (
 // nothing, which leaves today's error untouched.
 //
 // "Does not apply" is deliberately narrow by default: only a name that does not
-// exist at all. A model that exists but this token may not use is a refusal,
-// and a refusal is a signal about a misconfiguration — silently routing around
-// it costs whoever debugs it later. UnknownModelRedirectBlocked widens this to
-// cover those too. Either way the caller keeps applying every admission gate to
-// the RESULT, so the redirect can never reach further than the token may.
+// exist for the request's flavor (ModelOffering.Existing). A name exists for a
+// flavor when one of its mappings passes the flavor half of the served rule
+// (routing.MappingHasAPIFlavor): its application declares the flavor, and an
+// agent-launched child's runtime spec does not rule it out. For openai, that
+// means the spec is not images-only. For anthropic and openai_images, it means
+// the spec lists the flavor. A group exists when one of its offerable members
+// does. So an images-only child does not exist for a text request, a child
+// whose spec lacks anthropic does not exist for /v1/messages, and a child
+// whose spec is [anthropic] still exists for a text request. A model that
+// exists but this token may not use is a refusal, and so is a model that
+// exists but whose endpoint is disabled for it (a messages mode of disabled).
+// A refusal is a signal about a misconfiguration — silently routing around it
+// costs whoever debugs it later. UnknownModelRedirectBlocked widens this to
+// cover those too. Either way the caller keeps applying every admission gate
+// to the RESULT, so the redirect can never reach further than the token may.
 //
 // Both questions this asks the offering — "does the request apply" and "is this
 // candidate usable" — are asked of Callable, NEVER of a LISTING. A listing set
@@ -37,14 +47,25 @@ import (
 // means "a direct request for this name can succeed", which is the only correct
 // answer to either question — including for a "locked" (group-only) name, which
 // Callable excludes precisely because a direct request for it cannot route.
+// Callable holds only names that pass the served rule
+// (routing.MappingServesAPIFlavor), so it also excludes an images-only child
+// for a text request and a messages-disabled model for /v1/messages: dispatch
+// refuses a request for either before any upstream call.
 // Both questions go through callableFor, which is Callable narrowed by the one
 // admission gate the portal cannot see: the service-account model allowlist.
 //
 // A failed offering lookup needs no special case here. ModelOfferingFor is
-// all-or-nothing and hands back WHOLLY EMPTY sets on any store error, and
+// all-or-nothing for its mapping, visibility, group-overlay and capability
+// reads: on a store error from any of them it hands back WHOLLY EMPTY sets, and
 // against empty sets every candidate reads as uncallable, so the chain runs out
 // and declines. A store hiccup therefore surfaces as today's ordinary error
-// rather than silently rerouting the request somewhere arbitrary.
+// rather than silently rerouting the request somewhere arbitrary. A failed
+// runtime-spec read is narrower: it degrades only that application, whose
+// models then count with their application's flavors and messages mode. That
+// keeps Existing from shrinking and rerouting their requests during a store
+// blip; the price is that the candidate half can take an images-only child for
+// a text request until the read recovers. None of that application's models is
+// Capable for an images request.
 func redirectUnknownModel(token auth.Token, requested string, off portal.ModelOffering) string {
 	if !token.UnknownModelRedirect {
 		return ""
@@ -84,12 +105,14 @@ func candidateFor(token auth.Token, off portal.ModelOffering, name string) bool 
 // — the single question both halves of redirectUnknownModel ask.
 //
 // portal.ModelOffering.Callable answers it for everything the portal knows
-// about: the server-side existence of the name, resource-group provisioning,
-// and the "locked" (group-only) access boundary. It cannot answer it alone,
-// because one admission gate lives entirely on this side of the boundary and
-// the portal never sees it — the service-account model allowlist (modelAllowed,
-// inference_handlers.go). A name blocked ONLY by the allowlist is in Callable
-// and yet 403s at inference_handlers.go's modelAllowed gate a few lines later.
+// about: the server-side existence of the name, whether dispatch serves the
+// request's flavor for it (the served rule, routing.MappingServesAPIFlavor),
+// resource-group provisioning, and the "locked" (group-only) access boundary.
+// It cannot answer it alone, because one admission gate lives entirely on this
+// side of the boundary and the portal never sees it — the service-account model
+// allowlist (modelAllowed, inference_handlers.go). A name blocked ONLY by the
+// allowlist is in Callable and yet 403s at inference_handlers.go's modelAllowed
+// gate a few lines later.
 //
 // Leaving it out broke the feature in both directions:
 //

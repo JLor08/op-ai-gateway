@@ -1719,7 +1719,10 @@ one needs an operator for the flavor and gets its `image` verdict from its own
 agent's read of the same document
 ([ADR-044 (e)](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)),
 except before it has first run. (d) is narrowed rather than closed — see
-ADR-044 (f). And the
+ADR-044 (f), and
+[ADR-045](#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec),
+which narrows it again by taking the listing's flavors from the runtime spec.
+And the
 affinity premise of the Rejected "gating inside `affinityApplicationStale`"
 no longer holds for images: `AffinityKey.APIFlavor` is still coarse, but the
 coarse flavor of an image request is now `openai_images`, so its key never
@@ -2061,6 +2064,12 @@ upstream is therefore given the flavor explicitly, by the `stable_diffusion_cpp`
 application type's default or by the flavor checkbox; the launch-spec type sets
 no flavor, so an agent-launched child needs the checkbox unless its parent
 application lists only `openai_images`, which a spec's first write inherits.
+(Amended by
+[ADR-045](#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(g): the backend still sets no flavor from the type, but the launch-spec form
+ticks `openai_images` alone, with both endpoint modes `disabled`, when an
+untouched spec's Type is switched to `stable_diffusion_cpp`, and restores what
+it replaced on a switch back to an explicit non-sd type.)
 
 **(b) Flavor exclusion stays two-staged, and the images relay joins the second
 stage.** Candidacy filters on the application's flavors; a `server_agent`
@@ -2160,6 +2169,23 @@ fallback that generates images is taken and one the capability gate would
 refuse is skipped rather than turned into a `model_not_capable` about a model
 the client never named.
 
+**Amended by [ADR-045](#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(the listing's flavors read the spec).** (f)'s capability half stands: the
+listing's `image` still requires an `image: yes` verdict and a route that
+declares `openai_images`, the portal chat's offering rule is unchanged, and an
+images request's redirect still takes only a `Capable` candidate. Its
+listing-flavor half is superseded: "the per-flavor filter behind `/v1/models`
+and the listing's `flavors` field still read application flavors rather than a
+spec's" no longer describes the code. Both, and the offering the unknown-model
+redirect reads for every flavor, now ask `routing`'s one flavor rule, which
+takes a `server_agent` mapping's flavors and messages mode from its spec when
+it has one. So an images-only child on an application that also declares
+`openai` is no longer listed to chat clients or taken as a chat redirect
+target, a name that no flavor serves lists `flavors: []`, and `/api/v0/models`
+lists what `/v1/models` lists. What stays is that `/v1/models` reads no
+capability row, and that an images client reading it still sees the chat
+models; ADR-042 (d) is narrowed again, not closed.
+
 **Rejected:** **discovery from `loaded_models_path`** — the consequence in (c)
 was measured, not predicted. — **`openai_images` in the empty default** — (a).
 — **An images endpoint mode** — the flavor already expresses "serves images, or
@@ -2177,3 +2203,256 @@ checkbox, which nothing ticks by default.
 [Agent-Managed Model Runtime
 §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [HTTP API Surface](reference/api-surface.md#application-type-api_flavors-and-loaded_models_format).
+
+## ADR-045 — A model listing advertises what dispatch serves: one flavor rule, read from the spec
+**Context:** every model listing took a model's flavors from its
+**application** (`perNameFlavors` over `view.app.APIFlavors`), while dispatch
+for a `server_agent` mapping with a runtime spec takes them from the **spec**
+(`Resolver.targetFrom`), and the text translate dispatch refuses an
+images-only target with 404 `routing.no_model_route`
+([ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)
+(b)). So an agent-launched `sd-server` child with the spec `[openai_images]`
+was offered as a text model by the portal chat, `/v1/models`,
+`/anthropic/v1/models` and the unknown-model redirect; every text request to
+it failed, and nothing warned the operator (issue #160). The portal's Models
+view's "Available via" column showed the same application-wide set on every
+child, so on an application `[openai, anthropic, openai_images]` the text
+children showed `openai_images` and the sd child `anthropic, openai`. And
+`/api/v0/models` listed every portal model as `"llm"`, unfiltered, images-only
+models included (issue #148). Only the listing's `image` flag already read the
+spec (ADR-044 (f)).
+
+**Decision (a): one rule, in `internal/routing`, read by dispatch and by every
+listing.** `routing/served_flavors.go` is store-free and sits beside
+`EffectiveRuntimeSpecType`. `EffectiveFields` returns a mapping's effective
+flavors E, its responses and messages modes (M is the messages mode) and its
+live-timings flag: the spec's for a `server_agent` application with a spec row
+for the mapping — a stored `[]` counts as a spec, and `Enabled` is ignored —
+and the application's otherwise. `targetFrom` builds its `Target` from it, and
+`targetIsImagesOnly` and `Server.mappingIsImagesOnly` (the warmer's and the
+benchmark scheduler's check) call the moved `FlavorsAreImagesOnly`, so the
+precedence exists once and neither background job changes behaviour.
+Images-only keeps its definition: the list names `openai_images` and neither
+`openai` nor `anthropic`, so an empty list is never images-only. With A the
+application's flavors, the rule has a **flavor half** (`MappingHasAPIFlavor`)
+and a **served** rule (`MappingServesAPIFlavor`: the flavor half plus the
+mode):
+
+| Flavor | Flavor half | Served (listed) | Mirrors |
+|---|---|---|---|
+| `openai` | `openai` ∈ A and E is not images-only | = flavor half | chat completions: `resolveTranslateTarget` → `targetIsImagesOnly` |
+| `anthropic` | `anthropic` ∈ A and `anthropic` ∈ E | flavor half and M ≠ `disabled` | `/v1/messages`: `tryProxyNative`'s flavor check and mode read, and candidacy (`applicationServesEndpoint`) for an ordinary application |
+| `openai_images` | `openai_images` ∈ A and `openai_images` ∈ E | = flavor half | the images relay's flavor stage; the capability stage stays with `image` and `Capable` |
+
+The A-half of each is candidacy's own predicate, not a restatement —
+`applicationHasAPIFlavor` for the flavor half, `applicationServesEndpoint` with
+`openai_chat_completions`, `anthropic_messages` or `openai_images` for the
+served rule — so a later change to candidacy moves the listing with it. For an
+ordinary application `applicationServesEndpoint` already reads the messages
+mode; for a `server_agent` application it reads the coarse flavor only, and E
+and M complete the rule.
+
+**Why `openai` is narrow and `anthropic` full.** The portal chat, the warmer
+and the redirect's text leg call chat completions, which refuses only an
+images-only target, so a child whose spec is `[anthropic]` or `[]` answers chat
+and stays listed under `openai`. `/v1/messages` holds every request whose
+resolve there succeeds to the full ADR-033 conjunct, flavor and mode, so the
+`anthropic` listing does too.
+
+**(b) Every listing and `Callable` use the served rule; `Existing` uses the
+flavor half.** `perNameFlavors` is the only per-name flavor fold and takes the
+rule to evaluate as a parameter. A spec index (`runtimeSpecIndex`, built by
+`runtimeSpecIndexForViews`: the spec row per mapping, plus the applications
+whose spec read failed) replaces the flavor-only map and is handed as one
+value to `perNameFlavors`, `flavorSetsFromViews`, `existingNamesForFlavor`,
+`capableNames` and `imageFlagsByName`; `modelsResponse` reuses the read it
+already made, and `capableNames` loses its own. The served rule drives the
+`flavors` of `Models()` and `ManageModels()`, `ModelsForFlavor` (behind
+`/v1/models`, `/openai/v1/models` and `/anthropic/v1/models`),
+`ModelOffering.Callable` and the group fold of `Capable`, and through them
+`callableModelNames` and the redirect, with no code change there. `Existing`
+uses the flavor half, for its names and for its group overlay alike: a name
+that fails a flavor's flavor half does not exist under that flavor, exactly
+like a name whose application lacks the flavor, while a name whose messages
+endpoint is `disabled` still exists under `anthropic` but is not callable.
+`/api/v0/models` (`handleLMStudioModels`, through `openAIModelDTOs`) keeps
+only the DTOs whose `flavors` contain `openai`, and keeps `"type": "llm"`;
+`modelsResponse` and `flavorSetsFromViews` apply the same views, group
+overlay, suppression and override aliases, so it lists exactly `/v1/models`'
+names, groups and aliases included. `ServerModels` stays flavor-blind.
+
+**Consequence: requests of a token with the unknown-model redirect on change,
+in both directions.** "Effective model" is the name after the override rows and
+the catch-all ([Routing & Model Selection
+§2.1](cross-cutting/routing-and-model-selection.md#21-per-token-model-resolution)).
+These requests kept their model and got a 404; they now fail the flavor half,
+as an application-level flavor absence does, and the narrow default redirects
+them:
+
+| Request | Effective model | Its 404 without the redirect |
+|---|---|---|
+| `/v1/chat/completions` | an images-only child | `routing.no_model_route` |
+| `/v1/responses` | an images-only child | `responses.endpoint_disabled` |
+| `/v1/messages` | an agent child whose spec lacks `anthropic` | `messages.endpoint_disabled` |
+| `/v1/images/generations` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict |
+
+Image candidates do not move, because `Capable` already read the spec. A
+messages-disabled model — effective M `disabled`: an ordinary application, an
+agent child's spec or its application fallback, and a group of only such
+members — stays in `Existing(anthropic)`, so the narrow default leaves it its
+404, as before; under `UnknownModelRedirectBlocked` it is now redirected, where
+it used to be callable and kept. As `LastUsedModel` or fallback on
+`/v1/messages` it is now skipped, where it used to be taken and then answered
+404 (`routing.no_model_route` at candidacy, or `messages.endpoint_disabled`);
+and every name that fails the served rule for a flavor is skipped as a
+candidate for that flavor.
+
+**(c) A failed spec read: text fail-open, image fail-closed.** For an
+application whose `RuntimeSpecsByApplication` read fails, E = A and M is the
+application's messages mode, for all three flavors, in `flavors`,
+`ModelsForFlavor`, `Callable`, `Existing` and `callableModelNames` alike, while
+`image` and the image `Capable` stay false and text `Capable` equals
+`Callable`, as before. Shrinking `Existing` during a store blip would make the
+redirect reroute requests, against its documented safe direction, and one bad
+row already fails a whole application's read. The price is that the candidate
+half admits an images-only `LastUsedModel` again while the read fails, exactly
+as it did before this rule. The warning keeps "runtime spec read failed" and
+the application id, is unthrottled because it fires only on a store error, and
+no longer claims to come from the models listing, since `ModelsForFlavor` and
+redirect-on requests reach it too.
+
+**(d) A name whose served set is empty keeps its row and loses every
+`Callable`.** Such a name has no mapping, and a group no offerable member,
+that passes the served rule for any flavor: the operator's configuration (an
+application without `openai_images` under a spec `[openai_images]`), an
+ordinary `[anthropic]` application with messages `disabled`, an agent child
+whose application lacks `openai` and whose spec is `[anthropic]` with messages
+`disabled` (with `openai` in A that spec passes the `openai` row), a group
+whose offerable members are all empty, and an offered alias onto one. The row
+stays in `Models()` and `ManageModels()` with a non-nil `flavors: []`, because
+`validateServiceAllowedModels` reads `Models()` and hiding it would break every
+edit of a service whose allowlist names the model. It leaves `Existing` only
+for the flavors whose flavor half it fails, so a messages-disabled `[anthropic]`
+model still exists under `anthropic`. `callableModelNames` excludes it, so a
+token override, rule target or fallback that names it is refused with 400
+`portal.token_model_override_invalid`, and because the user-token editor
+resends every model-valued field, an edit of a user token that already targets
+it fails until the target changes. The six override pickers — the catch-all,
+the rule targets and the fallback, on user and on service tokens — therefore
+offer only names whose `flavors` are non-empty (`overrideTargets`,
+`OverrideTargetSelect`). On a user token with a server override set, the
+catch-all and rule-target pickers take their options from `ServerModels`
+instead, which carries no flavors and keeps hidden names, minus the ids whose
+`Models()` row has `flavors: []`, and the fallback picker is never narrowed to
+the server. A saved value whose `Models()` row has `flavors: []` stays
+visible, marked unavailable, the way the chat treats a vanished model, so the
+operator sees why the save fails. Two known limits remain. `Models()` drops
+hidden names, so the frontend cannot see whether a hidden name has an empty
+served set: a saved value of that kind is never marked, in any picker, and
+under a server override such a name is also offered and the save refuses it
+(400 `portal.token_model_override_invalid`). `ServerModels` also ignores
+provisioning and group locking, so the server-override list can offer other
+names the save refuses.
+
+**(e) The "Available via" column shows the flavors a model is offered under.**
+A shared frontend helper (`offeredFlavors`) derives them from a DTO: its
+`flavors`, minus `openai_images` unless `image` is true. `ModelList.tsx` shows
+them, and the chat's `chatModels` uses the same helper, unchanged in
+behaviour: it offers a model whose offered flavors include `openai` or
+`openai_images`. A model whose `flavors` are exactly `[openai_images]` with
+`image` false shows a muted "no image verdict" note, and one with
+`flavors: []` a "none" warning chip; the chip's tooltip is static, one text
+for a model row and one for a group row, because the DTO carries no
+agent-launched marker and no member list, and for an admin it names both
+places to check, the application's API flavors and modes and, for a model the
+server agent launches, its launch spec. An image request without `image: yes`
+is refused with `model_not_capable`, and the listing's `image` is the same
+fold as `Capable`, so a displayed `openai_images` means an image request can
+pass. The DTO's `flavors` keep meaning the routable flavors, which `Callable`
+agrees with, so the subtraction is the frontend's.
+
+**(f) Two operator warnings name the configurations the rule leaves
+unserved.** `RuntimeWarnings` emits `api_flavors_not_on_application` when some
+spec of a `server_agent` application lists a flavor the application does not
+declare, which has no effect because candidacy reads the application's
+flavors, and `api_flavors_text_on_stable_diffusion` when some spec whose
+effective type is `stable_diffusion_cpp` has flavors that are not images-only
+(an empty list included), which the `openai` rule would list as a text model
+although `sd-server` has no chat endpoint (measured: 404). Disabled specs
+count, because `targetFrom` ignores `Enabled`. The first also fires for a
+harmless extra, such as a parent from which `anthropic` was removed on
+purpose, so its label says the flavor has no effect, not that the spec is
+broken.
+
+**(g) The launch-spec form mirrors both, and moves untouched flavors on a type
+switch.** While the form is open the warnings banner is not shown, so two
+non-blocking alerts under the flavor controls say the same thing there: a
+ticked flavor the parent application lacks, and ticked flavors that are not
+images-only on a spec that is sd — Type `stable_diffusion_cpp`, or Auto with
+the binary unchanged since load and a loaded `effective_type` of
+`stable_diffusion_cpp`. Switching Type to `stable_diffusion_cpp` while the
+flavors equal the parent template's sets `[openai_images]` with both endpoint
+modes `disabled` and remembers what it replaced; switching from it to an
+explicit non-sd type while the values are still exactly that default restores
+them, or the parent template when nothing is remembered; switching to Auto
+moves nothing, the rule the health path follows; and values the operator
+changed stay. The backend stays type-agnostic about flavors.
+
+**Residuals, recorded rather than fixed.** `/v1/responses` for a spec whose E
+lacks `openai` and is not images-only: the listing says `openai`, and the
+endpoint refuses (issue #150). No endpoint mode other than the messages mode
+is reflected in a listing; `openai` stands for chat completions, which has no
+mode. A name or group takes the union of its mappings' and members' served
+sets and the AND of their `image`, so one that mixes a text member with an
+images-only one keeps `openai`, and a text request can still land on the
+images-only member (issue #145); one that mixes an image-capable mapping with
+one lacking a verdict hides `openai_images` in the column, the fail-closed AND
+the chat and the redirect use too.
+
+**Cost.** With N the `server_agent` applications (at most one per server):
+`Models()` and `ManageModels()` still read N specs, now reused;
+`ModelsForFlavor` reads N over the visible views; `ModelOfferingFor` reads N
+over the unfiltered views, once for its three sets, for a text request as for
+an image one; `callableModelNames`, on token writes only, reads 3N. Dispatch,
+the warmer, the benchmark scheduler and `RuntimeWarnings` read nothing new.
+
+**Rejected:** **the full ADR-033 rule for `openai`** — it would unlist
+`[anthropic]` and `[]` children that chat completions serves, and the chat
+would lose working models. — **A second copy of the precedence in the
+portal** — it would drift from `targetFrom` with nothing to catch it; one
+function in `routing` is what both read. — **`Existing` on the served rule** —
+a messages-disabled model would read as unknown, and the narrow default would
+silently reroute a request whose 404 is a signal about a misconfiguration. —
+**A text fail-closed spec read** — (c). — **Hiding a row whose served set is
+empty** — (d). — **Dropping `openai_images` from the DTO's `flavors` without
+`image`** — `flavors` would stop meaning the routable flavors; the column
+subtracts it instead. — **An agent-launched marker or member list on the DTO
+for the chip's tooltip** — the static texts name both places to check without
+widening the DTO. — **Refusing, on save, a spec flavor the application lacks**
+— it also fires for a harmless extra, and the override actions and the VRAM
+benchmark replay a stored spec as is, so a refusal would fail them on a spec
+whose parent later dropped the flavor. — **Detecting untouched flavors with the
+form's touched flag** — it resets on every open; the form compares against the
+parent template. — **Moving flavors on a switch to Auto** — an Auto spec with
+an `sd-server` binary is still sd
+([Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+— **A type rule for llama-server and `openai_images`** — there is no evidence
+for it, it contradicts Ollama's verdicts, and the column already hides an
+`openai_images` without a verdict.
+→ [Routing & Model Selection
+§2.1](cross-cutting/routing-and-model-selection.md#21-per-token-model-resolution),
+[§2.2](cross-cutting/routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither),
+[§8](cross-cutting/routing-and-model-selection.md#8-errors-and-http-mapping),
+[API Compatibility & Inference
+§3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
+[§6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
+[§9](cross-cutting/compatibility-and-inference.md#9-model-discovery),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp),
+[§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[HTTP API Surface
+§1](reference/api-surface.md#1-inference--compatibility-endpoints).

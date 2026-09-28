@@ -19,6 +19,12 @@ import {
 const models = [
   { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
 ];
+// 'sd-child' is listed with flavors []: served under no API, so no override
+// picker offers it and a save that targets it is refused.
+const pickerModels: ModelOption[] = [
+  { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+  { id: 'sd-child', display_name: 'sd-child', flavors: [], loading_on_count: 0 },
+];
 const defaultProjects: ProjectRef[] = [
   { id: 'proj_a', name: 'Project A' },
   { id: 'proj_b', name: 'Project B' },
@@ -804,11 +810,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it('offers models and groups in one fallback picker', async () => {
       renderTokenList({
         models: [
-          { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: [], loading_on_count: 0 },
+          { id: 'qwen3-32b', display_name: 'qwen3-32b', flavors: ['openai'], loading_on_count: 0 },
           {
             id: 'fast-group',
             display_name: 'fast-group',
-            flavors: [],
+            flavors: ['openai'],
             loading_on_count: 0,
             is_group: true,
           },
@@ -921,6 +927,82 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         unknown_model_redirect_blocked: false,
         unknown_model_fallback: '',
       });
+    });
+  });
+
+  describe(`TokenList override pickers offer only names served under an API [${locale}]`, () => {
+    it('leaves such a name out of a rule target', async () => {
+      renderTokenList({ models: pickerModels });
+      openCreate();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenOverrideAddRow }));
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: `${t.tokenOverrideToLabel} 1` }));
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('leaves such a name out of the catch-all', async () => {
+      renderTokenList({ models: pickerModels });
+      openCreate();
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel }));
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it('leaves such a name out of the fallback', async () => {
+      renderTokenList({ models: pickerModels });
+      openCreate();
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenUnknownRedirect }));
+      fireEvent.mouseDown(screen.getByLabelText(t.tokenUnknownFallback));
+      expect(await screen.findByRole('option', { name: 'gpt-oss-20b' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+    });
+
+    it("subtracts such a name from the server override's models and keeps a hidden one", async () => {
+      // 'hidden-model' has no Models() row (a hidden name), so nothing
+      // subtracts it and it stays. 'sd-child' has a row with flavors [] and
+      // goes.
+      const { fakeApi } = renderTokenList({
+        models: pickerModels,
+        servers: [makeServer({ id: 'srv_a', name: 'Server A' })],
+        serverModelsByServer: {
+          srv_a: [
+            { id: 'hidden-model', display_name: 'hidden-model' },
+            { id: 'sd-child', display_name: 'sd-child' },
+          ],
+        },
+      });
+      openCreate();
+      await selectOption(t.serverOverrideLabel, 'Server A');
+      await waitFor(() => expect(fakeApi.serverModels).toHaveBeenCalledWith('srv_a'));
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel }));
+      expect(await screen.findByRole('option', { name: 'hidden-model' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /sd-child/ })).not.toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: 'gpt-oss-20b' })).not.toBeInTheDocument();
+    });
+
+    it('keeps saved targets that no API serves visible and marks them unavailable', () => {
+      renderTokenList({
+        models: pickerModels,
+        tokens: [
+          makeToken({
+            id: 'tok_edit',
+            model_override: 'sd-child',
+            model_override_map: { claude: { to: 'sd-child', offer: false, hide_target: false } },
+            unknown_model_redirect: true,
+            unknown_model_fallback: 'sd-child',
+          }),
+        ],
+      });
+      openEdit();
+      const unavailable = `sd-child ${t.tokenOverrideTargetUnavailable}`;
+      expect(screen.getByRole('combobox', { name: `${t.tokenOverrideToLabel} 1` })).toHaveValue(
+        unavailable,
+      );
+      expect(screen.getByRole('combobox', { name: t.tokenOverrideCatchAllLabel })).toHaveValue(
+        unavailable,
+      );
+      expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue(unavailable);
+      expect(screen.getAllByTestId('searchable-select-unavailable')).toHaveLength(3);
     });
   });
 

@@ -152,6 +152,24 @@ describe('flavor-refusal i18n keys', () => {
   });
 });
 
+// The launch-spec form states the two flavor warnings in these hints while the
+// warnings banner is hidden behind the form; an empty string would render an
+// empty alert.
+describe('launch-spec flavor hint i18n keys', () => {
+  it('defines both hints as non-empty strings in de and en', () => {
+    const keys = [
+      'runtimeSpecFlavorsNotOnApplicationHint',
+      'runtimeSpecTextFlavorsOnStableDiffusionHint',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('live tokens/sec provenance strings claim only what the row can know', () => {
   it('does not pin the missing rate on the upstream, because the absence is client-dependent', () => {
     // The tooltip used to read "this upstream reports no exact token count
@@ -2054,6 +2072,8 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'runtimeIneffectiveSpecs',
       'runtimeTimeoutWarning',
       'runtimeBinaryPathOsMismatchWarning',
+      'runtimeFlavorNotOnApplicationWarning',
+      'runtimeTextOnStableDiffusionWarning',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -2977,6 +2997,12 @@ describe('stable-diffusion.cpp strings name what the operator sees', () => {
       expect(t.runtimeSpecTypeStableDiffusionCppNote).toContain('server_agent');
     });
 
+    it(`names the openai_images box by its label in the launch-spec text-flavor hint (${locale})`, () => {
+      expect(t.runtimeSpecTextFlavorsOnStableDiffusionHint).toContain(
+        t.applicationFlavorOpenaiImages,
+      );
+    });
+
     it(`labels the openai_images box with the file's own term for image generation (${locale})`, () => {
       expect(t.applicationFlavorOpenaiImages.toLowerCase()).toContain(
         t.mappingImageCapable.toLowerCase(),
@@ -3000,6 +3026,46 @@ describe('stable-diffusion.cpp strings name what the operator sees', () => {
       expect(t.mappingImageCapableUnknownHint).toContain(t.runtimeSpecPinned);
     });
   }
+});
+
+describe('models "Available via" column i18n keys', () => {
+  it('defines the note and chip texts with the agreed copy', () => {
+    expect(messages.de.modelFlavorsNoImageVerdict).toBe('kein Bild-Urteil');
+    expect(messages.en.modelFlavorsNoImageVerdict).toBe('no image verdict');
+    expect(messages.de.modelFlavorsNoImageVerdictTooltip).toBe(
+      'Bildanfragen werden abgelehnt, solange das Modell kein „image: yes“-Urteil hat. Bei einer Gruppe braucht jedes Mitglied eines.',
+    );
+    expect(messages.en.modelFlavorsNoImageVerdictTooltip).toBe(
+      'Image requests are refused until the model has an "image: yes" verdict. For a group, every member needs one.',
+    );
+    expect(messages.de.modelFlavorsNone).toBe('keine');
+    expect(messages.en.modelFlavorsNone).toBe('none');
+    expect(messages.de.modelFlavorsNoneTooltipModel).toBe(
+      'Dieses Modell wird unter keiner API angeboten.',
+    );
+    expect(messages.en.modelFlavorsNoneTooltipModel).toBe(
+      'This model is not offered under any API.',
+    );
+    expect(messages.de.modelFlavorsNoneTooltipGroup).toBe(
+      'Keines der Mitglieder dieser Gruppe wird unter einer API angeboten.',
+    );
+    expect(messages.en.modelFlavorsNoneTooltipGroup).toBe(
+      "None of this group's members is offered under any API.",
+    );
+    expect(messages.de.modelFlavorsNoneTooltipAdmin).toBe(
+      'Prüfe die API-Varianten und Modi der Anwendung und, bei einem vom Server-Agent gestarteten Modell, seine Runtime-Spezifikation.',
+    );
+    expect(messages.en.modelFlavorsNoneTooltipAdmin).toBe(
+      "Check the application's API flavors and modes and, for a model the server agent launches, its launch spec.",
+    );
+  });
+
+  // The admin sentence names the application's flavor controls by the label
+  // the application form shows.
+  it('names the application form flavor label in the admin sentence', () => {
+    expect(messages.de.modelFlavorsNoneTooltipAdmin).toContain(messages.de.applicationFlavors);
+    expect(messages.en.modelFlavorsNoneTooltipAdmin).toContain(messages.en.applicationFlavors);
+  });
 });
 
 // " -- " is how a code comment spells a dash. A user-facing string uses the

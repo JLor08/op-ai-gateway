@@ -52,7 +52,7 @@ func benchmarkDue(app routing.Application, lastRun map[string]time.Time, now tim
 //
 // It also skips a mapping that serves only images (mappingIsImagesOnly): the scheduled run
 // is a speed benchmark, a chat prompt, which such a mapping cannot answer, so every run of
-// it would fail. The test is by EFFECTIVE flavors (flavorsAreImagesOnly), never by the
+// it would fail. The test is by EFFECTIVE flavors (routing.FlavorsAreImagesOnly), never by the
 // application type: an external stable_diffusion_cpp application whose operator also ticked
 // openai is not images-only and is still benchmarked, and only an agent-launched sd-server
 // child whose spec lists exactly openai_images is skipped. A mapping whose spec cannot be

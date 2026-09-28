@@ -101,20 +101,21 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 }
 
 // targetIsImagesOnly reports whether target's effective APIFlavors (as for
-// targetServesFlavor) are images-only -- see flavorsAreImagesOnly.
+// targetServesFlavor) are images-only -- see routing.FlavorsAreImagesOnly.
 //
 // It is the one spec-flavor check the text translate dispatch makes (see
 // resolveTranslateTarget), and it is deliberately NARROWER than the general
-// effective-served rule targetServesFlavor answers (§6 / ADR-033). That
-// dispatch read no spec flavors at all before openai_images existed, so every
-// agent-managed child served /v1/chat/completions -- one whose spec was
-// narrowed to [anthropic], or stored as [], included -- and the portal chat
-// still offers such models, because its listing reads application flavors.
-// Holding that path to the general rule would silently stop those working
-// setups; refusing only a child that can do nothing but generate images closes
-// the gap the images flavor opened and leaves every spec that keeps a text
-// flavor, or is stored as [], serving chat completions (an empty list is never
-// images-only).
+// effective-served rule targetServesFlavor answers (§6 / ADR-033): an
+// agent-managed child whose spec keeps a text flavor -- one narrowed to
+// [anthropic] included -- or is stored as [] serves /v1/chat/completions, and
+// only a child that can do nothing but generate images is refused (an empty
+// list is never images-only). The model listings apply the same test: the
+// openai row of routing.MappingServesAPIFlavor is candidacy's chat-completions
+// predicate plus FlavorsAreImagesOnly on the mapping's routing.EffectiveFields,
+// whose flavors this target carries, so a mapping is listed for chat exactly
+// when candidacy admits it for chat completions and this dispatch then accepts
+// it. Holding this path to the general rule would refuse chat completions to
+// children those listings offer for chat.
 //
 // For an ordinary application this never fires: its flavors are its
 // candidacy, so an application listing only openai_images is never a
@@ -123,27 +124,7 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 // application's flavors candidacy just admitted. Only a runtime spec can
 // narrow a text candidate down to images.
 func targetIsImagesOnly(target routing.Target) bool {
-	return flavorsAreImagesOnly(target.APIFlavors)
-}
-
-// flavorsAreImagesOnly reports whether a flavor list names openai_images and
-// neither text flavor (openai, anthropic). Naming openai_images is also what
-// makes the list non-empty, so an empty list is never images-only.
-//
-// It is targetIsImagesOnly's rule for a caller that has no resolved
-// routing.Target but a mapping's effective flavors (Server.mappingIsImagesOnly):
-// the background jobs that send a mapping a chat prompt of their own.
-func flavorsAreImagesOnly(flavors []string) bool {
-	images := false
-	for _, f := range flavors {
-		switch f {
-		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic:
-			return false
-		case routing.APIFlavorOpenAIImages:
-			images = true
-		}
-	}
-	return images
+	return routing.FlavorsAreImagesOnly(target.APIFlavors)
 }
 
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
