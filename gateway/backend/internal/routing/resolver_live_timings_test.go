@@ -111,9 +111,10 @@ func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 		},
 		{
 			// Alone, catches: the application's false being reported as true.
-			// The ONLY row that catches that on the ordinary path -- a seed of
-			// literal true with the spec override left intact passes rows 1,
-			// 3, 4 and 5 and fails only here.
+			// The ONLY row that catches that on the ordinary path -- an
+			// application branch of literal true in EffectiveFields, with its
+			// spec branch left intact, passes rows 1, 3, 4 and 5 and fails
+			// only here.
 			name:           "ordinary application, flag off",
 			appType:        ProviderLlamaCPP,
 			appLiveTimings: false,
@@ -122,10 +123,10 @@ func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 		},
 		{
 			// Alone, catches: the spec's value being ignored outright -- the
-			// app-only OpportunisticMetrics shape, or a missing
-			// `liveTimings = spec.ResponsesLiveTimingsEnabled` override. It
-			// CANNOT distinguish "the spec is preferred" from "the two are
-			// OR-ed"; that is the next row's job.
+			// app-only OpportunisticMetrics shape, or EffectiveFields' spec
+			// branch taking the flag from the application. It CANNOT
+			// distinguish "the spec is preferred" from "the two are OR-ed";
+			// that is the next row's job.
 			name:           "server_agent, spec overrides app OFF to ON",
 			appType:        ProviderServerAgent,
 			appLiveTimings: false,
@@ -136,8 +137,9 @@ func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 			// Alone, catches: the spec's value being OR-ed with (rather than
 			// preferred over) the application's, as well as the app-only
 			// shape. The ONLY row in the table where "the spec wins" and
-			// "either one wins" disagree -- `liveTimings = liveTimings ||
-			// spec.ResponsesLiveTimingsEnabled` fails here and nowhere else.
+			// "either one wins" disagree -- a spec branch of
+			// `app.ResponsesLiveTimingsEnabled || spec.ResponsesLiveTimingsEnabled`
+			// fails here and nowhere else.
 			name:           "server_agent, spec overrides app ON to OFF",
 			appType:        ProviderServerAgent,
 			appLiveTimings: true,
@@ -147,9 +149,9 @@ func TestTargetResponsesLiveTimingsPrecedence(t *testing.T) {
 		{
 			// Alone, catches: a no-spec server_agent mapping being forced to
 			// the spec zero value (false) instead of falling back to the
-			// application. The ONLY row that catches the override escaping
-			// `if ok {` -- moved one level out it reads the zero-valued spec
-			// and fails here alone.
+			// application. The ONLY row that catches EffectiveFields dropping
+			// its hasSpec test -- its spec branch then reads targetFrom's
+			// zero-valued spec and fails here alone.
 			name:           "server_agent, no spec at all",
 			appType:        ProviderServerAgent,
 			appLiveTimings: true,

@@ -26,7 +26,6 @@ import { Field } from './shared/Field';
 import { StatusChip } from './shared/StatusChip';
 import { SecretReveal } from './shared/SecretReveal';
 import { ConfirmDialog } from './shared/ConfirmDialog';
-import { SearchableSelect } from './shared/SearchableSelect';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import {
@@ -36,6 +35,7 @@ import {
   overrideSummary,
   type OverrideRow,
 } from './shared/ModelOverrideEditor';
+import { OverrideTargetSelect, overrideTargets } from './shared/OverrideTargetSelect';
 import { useToast } from './shared/ToastProvider';
 
 const serviceTokenStatusLabelByKey: Record<string, MessageKey> = {
@@ -237,13 +237,12 @@ export function ServiceTokensSection({
     },
   ];
 
-  // The unknown-model redirect's fallback picker offers the SAME
+  // Every model-valued setting of the form (each rule's target, the
+  // catch-all and the unknown-model redirect's fallback) picks from the SAME
   // model-plus-group list `models` already carries (portal model listing,
-  // groups marked `is_group`) — no separate fetch (Task 8).
-  const unknownFallbackOptions = [
-    { value: '', label: '-' },
-    ...models.map((m) => ({ value: m.id, label: m.display_name })),
-  ];
+  // groups marked `is_group`) — no separate fetch — minus the names no API
+  // serves (see overrideTargets).
+  const modelTargets = overrideTargets(models, null);
 
   const tokenRowActions = (r: ServiceTokenDTO): RowAction[] => [
     {
@@ -358,7 +357,7 @@ export function ServiceTokensSection({
               onRowsChange={setTokenOverrideRows}
               catchAll={tokenCatchAll}
               onCatchAllChange={setTokenCatchAll}
-              models={models}
+              targets={modelTargets}
               t={t}
               idPrefix="service-token"
               catchAllId="service-token-catchall"
@@ -400,13 +399,14 @@ export function ServiceTokensSection({
               <Typography variant="caption" color="text.secondary">
                 {t.tokenUnknownRedirectBlockedHint}
               </Typography>
-              <SearchableSelect
+              <OverrideTargetSelect
                 id="service-token-unknown-fallback"
                 label={t.tokenUnknownFallback}
                 value={tokenUnknownFallback}
                 onChange={setTokenUnknownFallback}
                 disabled={!tokenUnknownRedirect}
-                options={unknownFallbackOptions}
+                targets={modelTargets}
+                t={t}
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenLastUsedModel}

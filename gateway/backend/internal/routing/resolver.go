@@ -1308,20 +1308,17 @@ func serverSelectable(server AIServer) bool {
 }
 
 // targetFrom builds the Target for a resolved candidate (server + application +
-// mapping, plus the mapping's joined capability verdicts). For an ordinary
-// application the effective flavors/modes are the application's own; for a
-// server_agent mapping the RESOLVED RuntimeSpec is the sole authority for its model's
-// flavors + endpoint modes (the app's values are only the fallback for a mapping that
-// has no spec at all — design §3.3/§4).
+// mapping, plus the mapping's joined capability verdicts). The Target's
+// flavors, endpoint modes and live-timings flag are the mapping's
+// EffectiveFields: the application's own for an ordinary application, and for
+// a server_agent mapping the RESOLVED RuntimeSpec's, the sole authority for
+// its model (the application's values are only the fallback for a mapping
+// that has no spec at all). The model listings resolve a mapping's flavors
+// with the same function, so the two cannot disagree on which row wins.
 func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor string) (Target, error) {
 	server, app, mapping := c.Server, c.Application, c.Mapping
-	flavors, responsesMode, messagesMode := app.APIFlavors, app.ResponsesMode, app.MessagesMode
-	// Same precedence as the modes on the line above, for the same reason: the
-	// flag qualifies ResponsesMode, so it must be read from whichever row said
-	// what ResponsesMode says. Kept as its own statement so the mode tuple
-	// stays the three values it has always been.
-	liveTimings := app.ResponsesLiveTimingsEnabled
 	var spec RuntimeSpec
+	hasSpec := false
 	var liveProgressSpecType string
 	if app.Type == ProviderServerAgent {
 		loaded, ok, err := r.store.RuntimeSpecByMapping(ctx, mapping.ID)
@@ -1329,9 +1326,7 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 			return Target{}, fmt.Errorf("load runtime spec: %w", err)
 		}
 		if ok {
-			spec = loaded
-			flavors, responsesMode, messagesMode = spec.APIFlavors, spec.ResponsesMode, spec.MessagesMode
-			liveTimings = spec.ResponsesLiveTimingsEnabled
+			spec, hasSpec = loaded, true
 		}
 		// EffectiveRuntimeSpecType is the only shape evidence available for a
 		// server_agent child: its application type says nothing about what
@@ -1340,6 +1335,7 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		// this costs no extra store lookup.
 		liveProgressSpecType = string(EffectiveRuntimeSpecType(spec))
 	}
+	eff := EffectiveFields(app, spec, hasSpec)
 	// SpecUpstreamAuth resolves the SEALED token + effective header for this
 	// mapping (spec is zero-valued for non-server_agent apps and for a
 	// server_agent mapping with no spec, which SpecUpstreamAuth treats as
@@ -1356,14 +1352,14 @@ func (r *Resolver) targetFrom(ctx context.Context, c MappingCandidate, apiFlavor
 		APIFlavor:            apiFlavor,
 		APIToken:             apiToken,
 		APITokenHeader:       apiTokenHeader,
-		APIFlavors:           append([]string(nil), flavors...),
-		ResponsesMode:        responsesMode,
-		MessagesMode:         messagesMode,
+		APIFlavors:           append([]string(nil), eff.APIFlavors...),
+		ResponsesMode:        eff.ResponsesMode,
+		MessagesMode:         eff.MessagesMode,
 		OpportunisticMetrics: app.OpportunisticMetricsEnabled,
-		// ResponsesLiveTimingsEnabled carries the spec-then-app resolution
-		// computed above, NOT app.ResponsesLiveTimingsEnabled -- see the
-		// liveTimings seed and its override in the server_agent branch.
-		ResponsesLiveTimingsEnabled: liveTimings,
+		// ResponsesLiveTimingsEnabled carries EffectiveFields' spec-then-app
+		// resolution, NOT app.ResponsesLiveTimingsEnabled: the flag qualifies
+		// ResponsesMode, so it comes from whichever row ResponsesMode came from.
+		ResponsesLiveTimingsEnabled: eff.ResponsesLiveTimingsEnabled,
 		// LiveProgressSupport reads the candidate's capability verdict
 		// (MappingCandidate.LiveProgressSupport). #49-3 moved every writer
 		// onto a "live_progress" capability row and migration 79 then dropped

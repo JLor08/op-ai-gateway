@@ -146,28 +146,29 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 }
 
 // mappingIsImagesOnly reports whether a mapping's EFFECTIVE flavors are
-// images-only (flavorsAreImagesOnly), resolved with routing.Resolver.targetFrom's
-// precedence: for a server_agent application the mapping's runtime spec is the
-// authority whenever it has one, even one stored as [], and the application's
-// list stands otherwise. A background job that sends the mapping a chat prompt
-// asks it first, because such a mapping cannot answer one.
+// images-only (routing.FlavorsAreImagesOnly), resolved by routing.EffectiveFields,
+// the precedence routing.Resolver.targetFrom applies: for a server_agent
+// application the mapping's runtime spec is the authority whenever it has one,
+// even one stored as [], and the application's list stands otherwise. A
+// background job that sends the mapping a chat prompt asks it first, because
+// such a mapping cannot answer one. Only a server_agent application's mapping
+// can have a spec, so any other application is answered without a store read.
 //
 // Unlike benchmarkSpecFor it keeps "no spec" apart from a failed read: the
 // first means the application's flavors, the second means the answer is
 // unknown, which it reports as an error so the caller can skip rather than
 // guess.
 func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
-	flavors := app.APIFlavors
+	var spec routing.RuntimeSpec
+	hasSpec := false
 	if app.Type == routing.ProviderServerAgent {
-		spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
+		loaded, ok, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
 		if err != nil {
 			return false, err
 		}
-		if ok {
-			flavors = spec.APIFlavors
-		}
+		spec, hasSpec = loaded, ok
 	}
-	return flavorsAreImagesOnly(flavors), nil
+	return routing.FlavorsAreImagesOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors), nil
 }
 
 // benchmarkSpecFor resolves the RuntimeSpec a benchmarkTarget should carry (its

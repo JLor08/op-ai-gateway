@@ -56,6 +56,7 @@ import {
   overrideSummary,
   type OverrideRow,
 } from './shared/ModelOverrideEditor';
+import { OverrideTargetSelect, overrideTargets } from './shared/OverrideTargetSelect';
 
 const allTokenScopes = ['gateway:use', 'admin'] as const;
 
@@ -446,18 +447,21 @@ export function TokenList({
     }
     // Once a server override is selected, the model-override map's gateway-model
     // dropdown (both per-row and the catch-all) narrows to that server's OWN
-    // offered models (api.serverModels) instead of the full model list.
-    const overrideModelOptions = serverOverride !== '' ? serverOverrideModels : models;
+    // offered models (api.serverModels) instead of the full model list. Either
+    // way, a name whose Models() row has flavors [] is left out; see
+    // overrideTargets for the names the server list still offers although the
+    // save refuses them.
+    const overrideModelTargets = overrideTargets(
+      models,
+      serverOverride === '' ? null : serverOverrideModels,
+    );
     // The unknown-model redirect's fallback picker offers the SAME
     // model-plus-group list the caller loads for everything else (the
     // portal model listing already carries groups, marked `is_group`) —
     // no separate fetch, and deliberately NOT server-override-narrowed
-    // (unlike overrideModelOptions above): the redirect is unrelated to a
+    // (unlike overrideModelTargets above): the redirect is unrelated to a
     // server override.
-    const unknownFallbackOptions = [
-      { value: '', label: '-' },
-      ...models.map((m) => ({ value: m.id, label: m.display_name })),
-    ];
+    const unknownFallbackTargets = overrideTargets(models, null);
     return (
       <>
         <Breadcrumbs
@@ -537,7 +541,7 @@ export function TokenList({
               onRowsChange={setOverrideRows}
               catchAll={catchAll}
               onCatchAllChange={setCatchAll}
-              models={overrideModelOptions}
+              targets={overrideModelTargets}
               t={t}
               idPrefix="token"
               catchAllId="token-model-catchall"
@@ -583,13 +587,14 @@ export function TokenList({
               <Typography variant="caption" color="text.secondary">
                 {t.tokenUnknownRedirectBlockedHint}
               </Typography>
-              <SearchableSelect
+              <OverrideTargetSelect
                 id="token-unknown-fallback"
                 label={t.tokenUnknownFallback}
                 value={unknownFallback}
                 onChange={setUnknownFallback}
                 disabled={!unknownRedirect}
-                options={unknownFallbackOptions}
+                targets={unknownFallbackTargets}
+                t={t}
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenLastUsedModel}

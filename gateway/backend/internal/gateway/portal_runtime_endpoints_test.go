@@ -600,8 +600,10 @@ func TestHandlePortalApplicationWarningsGet(t *testing.T) {
 	}
 
 	// Enable a runtime spec on m1 whose startup timeout (60s) exceeds the
-	// application's TimeoutMS (30000ms, seeded above) -- must now warn.
-	specBody := `{"binary":"/usr/local/bin/llama-server","enabled":true,"startup_timeout_seconds":60}`
+	// application's TimeoutMS (30000ms, seeded above) -- must now warn. The
+	// spec names only the application's own flavor (openai), so
+	// api_flavors_not_on_application stays out of the exact list.
+	specBody := `{"binary":"/usr/local/bin/llama-server","enabled":true,"startup_timeout_seconds":60,"api_flavors":["openai"]}`
 	putRec := httptest.NewRecorder()
 	srv.ServeHTTP(putRec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+m1+"/runtime-spec", specBody))
 	if putRec.Code != http.StatusOK {

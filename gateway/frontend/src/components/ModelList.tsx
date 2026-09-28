@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useState, type ReactNode } from 'react';
-import { Box, Chip } from '@mui/material';
+import { Box, Chip, Tooltip, Typography } from '@mui/material';
 import ListAltIcon from '@mui/icons-material/ListAlt';
 import type { ModelOption, ModelVisibility } from '../api';
 import type { PortalApi, Translation } from './shared/types';
@@ -18,9 +18,67 @@ import { ModelServersSection } from './ModelServersSection';
 import { GroupServersSection } from './GroupServersSection';
 import { useToast } from './shared/ToastProvider';
 import { formatPortalError } from './shared/format';
+import { offeredFlavors } from './shared/offeredFlavors';
 
 // "list" or the per-model detail sub-view (the servers offering that model).
 type Mode = 'list' | { kind: 'detail'; model: ModelOption };
+
+// What the "Available via" cell shows for a row: its offered flavors
+// (offeredFlavors, so openai_images only behind an image verdict). A row with
+// nothing to list says why instead of showing a dash: an images-only row
+// without a verdict gets a muted note, and a row with no flavor at all gets a
+// warning chip. `label` is also the column's filter and sort value, so the
+// filter matches what the cell shows.
+type FlavorsCell =
+  | { kind: 'flavors'; label: string }
+  | { kind: 'noImageVerdict' | 'none'; label: string; tooltip: string };
+
+function flavorsCell(model: ModelOption, t: Translation, isAdmin: boolean): FlavorsCell {
+  if (model.flavors.length === 0) {
+    return {
+      kind: 'none',
+      label: t.modelFlavorsNone,
+      tooltip: noFlavorsTooltip(model, t, isAdmin),
+    };
+  }
+  const offered = offeredFlavors(model);
+  if (offered.length === 0) {
+    return {
+      kind: 'noImageVerdict',
+      label: t.modelFlavorsNoImageVerdict,
+      tooltip: t.modelFlavorsNoImageVerdictTooltip,
+    };
+  }
+  return { kind: 'flavors', label: offered.join(', ') };
+}
+
+// The DTO carries no member list and no agent-launched marker, so the chip's
+// tooltip is static: whether the row is a model or a group, plus, for an
+// admin, where to look. An override alias row carries its target's is_group,
+// so it reads like its target's row.
+function noFlavorsTooltip(model: ModelOption, t: Translation, isAdmin: boolean): string {
+  const reason = model.is_group ? t.modelFlavorsNoneTooltipGroup : t.modelFlavorsNoneTooltipModel;
+  return isAdmin ? `${reason} ${t.modelFlavorsNoneTooltipAdmin}` : reason;
+}
+
+function renderFlavorsCell(cell: FlavorsCell): ReactNode {
+  if (cell.kind === 'flavors') return cell.label;
+  // Tooltip wraps a <span>, not StatusChip directly: StatusChip is not a
+  // forwardRef, so MUI's Tooltip cannot attach its listeners to it.
+  return (
+    <Tooltip title={cell.tooltip}>
+      <span>
+        {cell.kind === 'none' ? (
+          <StatusChip status="watch" label={cell.label} />
+        ) : (
+          <Typography component="span" variant="body2" color="text.secondary">
+            {cell.label}
+          </Typography>
+        )}
+      </span>
+    </Tooltip>
+  );
+}
 
 export function ModelList({
   t,
@@ -120,7 +178,8 @@ export function ModelList({
     {
       id: 'flavors',
       label: t.tableApis,
-      value: (m) => m.flavors.join(', ') || '-',
+      value: (m) => flavorsCell(m, t, isAdmin).label,
+      render: (m) => renderFlavorsCell(flavorsCell(m, t, isAdmin)),
       filter: 'text',
     },
     {

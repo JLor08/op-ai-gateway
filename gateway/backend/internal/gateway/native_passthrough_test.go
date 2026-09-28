@@ -891,10 +891,12 @@ func newServerAgentSpecTestServer(t *testing.T, prov provider.Client, appFlavors
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-native-spec", Name: "Native Spec Upstream", Domain: "native-spec.example.test", Provider: routing.ProviderVLLM, Endpoint: "http://native-spec.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	// App-level flavors are the caller's, and every caller lists at least the
-	// flavors of the endpoints it tests, so candidacy (the app-level fallback
-	// check in applicationServesEndpoint) admits the request whichever endpoint
-	// is under test — the spec below is what narrows the effective flavor set.
+	// App-level flavors are the caller's. Most callers list at least the
+	// flavors of the endpoints they test, so candidacy (the app-level fallback
+	// check in applicationServesEndpoint) admits the request and the spec below
+	// is what narrows the effective flavor set. The parity matrix
+	// (requireListingsMatchDispatch) also passes sets without them, where
+	// candidacy's refusal is the expected answer.
 	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-native-spec", ServerID: "srv-native-spec", Type: routing.ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: appFlavors, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
@@ -1019,29 +1021,6 @@ func routingFailureShape(e usage.Event) usage.Event {
 	e.LatencyMS = 0
 	e.CreatedAt = time.Time{}
 	return e
-}
-
-// TestTargetIsImagesOnly pins the predicate's rule on its own: images-only
-// means openai_images listed and neither text flavor; an empty list is not.
-func TestTargetIsImagesOnly(t *testing.T) {
-	cases := []struct {
-		flavors []string
-		want    bool
-	}{
-		{nil, false},
-		{[]string{}, false},
-		{[]string{routing.APIFlavorOpenAIImages}, true},
-		{[]string{routing.APIFlavorOpenAIImages, "custom"}, true},
-		{[]string{routing.APIFlavorOpenAI}, false},
-		{[]string{routing.APIFlavorAnthropic}, false},
-		{[]string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, false},
-		{[]string{routing.APIFlavorOpenAIImages, routing.APIFlavorAnthropic}, false},
-	}
-	for _, tc := range cases {
-		if got := targetIsImagesOnly(routing.Target{APIFlavors: tc.flavors}); got != tc.want {
-			t.Errorf("targetIsImagesOnly(%q) = %v, want %v", tc.flavors, got, tc.want)
-		}
-	}
 }
 
 // TestChatCompletionsRefusesImagesOnlyServerAgentChild covers the gap an

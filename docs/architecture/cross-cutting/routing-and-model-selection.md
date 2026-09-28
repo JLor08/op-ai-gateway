@@ -376,6 +376,37 @@ The narrow default is deliberate: a refusal on a model that *does* exist is a
 signal about a misconfiguration, and silently routing around it costs whoever
 debugs it later. The widened mode is the explicit opt-out from that.
 
+**Which names the two sets hold follows one flavor rule**
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec),
+§2.2). `Callable` holds a name when it passes the **served** rule for the
+request's flavor, and `Existing` when it passes the rule's **flavor half**,
+both judged on the effective flavors dispatch reads: a `server_agent`
+mapping's runtime spec, else its application. So a name whose effective
+flavors cannot serve the flavor does not exist under it, like a name whose
+application lacks the flavor, and the narrow default redirects it. Without the
+redirect each of these answers a 404:
+
+| Request | Effective model | Its 404 without the redirect |
+|---|---|---|
+| `/v1/chat/completions` | an images-only child | `routing.no_model_route` |
+| `/v1/responses` | an images-only child | `responses.endpoint_disabled` |
+| `/v1/messages` | an agent child whose spec lacks `anthropic` | `messages.endpoint_disabled` |
+| `/v1/images/generations` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict |
+
+An override that targets such a child counts the same way, because step 3
+judges the effective name. A **messages-disabled** model — its effective
+messages mode `disabled`, on an ordinary application, on an agent child's spec
+or through that child's application fallback, or a group of only such members
+— passes the flavor half and fails the served rule: it is in
+`Existing(anthropic)` and not in `Callable(anthropic)`. The narrow default
+leaves it alone, so it keeps its 404, and `UnknownModelRedirectBlocked`
+redirects it, like a locked name. A candidate faces the served rule too: a
+name that fails it for the request's flavor is skipped as `LastUsedModel` or
+fallback, so an images-only marker is not taken for a text request, nor a
+messages-disabled one on `/v1/messages` — except while its application's spec
+read fails (below). Image candidates are judged by `Capable`, whose image fold
+reads the spec as well (§2.2).
+
 **"Callable" here is `ModelOffering.Callable` *plus* the service allowlist.**
 `callableFor` (`internal/gateway/inference_redirect.go`) is the predicate both
 questions actually go through: the offering set narrowed by `modelAllowed`, the
@@ -394,21 +425,26 @@ the client's own choice, and the capability gate's refusal names it.
 
 **Cost and failure direction.** A token with the redirect off pays one boolean
 test and no store work at all; only an opted-in token triggers the offering
-lookup (one mapping traversal plus one group-overlay load per request,
-uncached; a request that requires a capability adds the image fold's own
-reads, the listing's: one batch capability read and one runtime-spec read per
-`server_agent` application). `ModelOfferingFor` is **all-or-nothing** for the
-mapping/visibility/group-overlay/capability-row reads it makes directly: on a
-store error from any of those, every set comes back empty, every candidate
-then reads as uncallable, the chain declines, and the client sees today's
-ordinary error rather than a request sent somewhere unintended. This is
-deliberately the opposite of the model listing's fail-open, which must never
-blank the list a user is looking at. The one exception is the per-application
-runtime-spec read the capability fold makes for a `server_agent` application
-(`RuntimeSpecsByApplication`, inside `capableNames`): a failure there
-degrades **per application**, not the whole answer — it logs and drops only
-that application's mappings from `Capable` (fail-closed, matching the
-listing's own image fold), while `Callable` and `Existing` are unaffected.
+lookup: one mapping traversal, one group-overlay load and one runtime-spec
+read per `server_agent` application (at most one per server, over the
+unfiltered views, shared by the three sets) per request, uncached; a request
+that requires a capability adds one batch capability read. `ModelOfferingFor`
+is **all-or-nothing** for the mapping/visibility/group-overlay/capability-row
+reads it makes directly: on a store error from any of those, every set comes
+back empty, every candidate then reads as uncallable, the chain declines, and
+the client sees today's ordinary error rather than a request sent somewhere
+unintended. This is deliberately the opposite of the model listing's
+fail-open, which must never blank the list a user is looking at. The one
+exception is the per-application runtime-spec read
+(`RuntimeSpecsByApplication`, inside `runtimeSpecIndexForViews`): a failure
+there degrades **per application**, not the whole answer, and it logs. For
+every flavor, `Callable` and `Existing` then take that application's flavors
+and messages mode from the application itself (fail-open, as the listing
+does), because shrinking `Existing` during a store blip would make the
+redirect reroute requests; the candidate half therefore admits an images-only
+`LastUsedModel` of that application while the read fails. For an image
+request `Capable` drops that application's mappings (fail-closed, matching the
+listing's own image fold), and for a text request it is `Callable` itself.
 Measured with a failing `RuntimeSpecsByApplication` for one `server_agent`
 application among several mappings: `Callable={agent-image, plain-image}`,
 `Capable={plain-image}`.
@@ -426,7 +462,29 @@ not exist yet has no reachability of its own to compute. That is
 safe because the check is a usability guard, not the enforcement point:
 candidates are re-checked against the live offering on every request, and the
 result still faces the service's own allowlist, so a value that goes stale — or
-one the service may not use — is inert rather than dangerous.
+one the service may not use — is inert rather than dangerous. The set is the
+union of `Callable` over the three flavors, so a name that no flavor serves —
+an agent child whose spec lists only `openai_images` under a parent that lacks
+it, say
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(d)) — is refused, and because the user-token editor resends every
+model-valued field, an edit of a user token that already targets one fails
+until the target changes. The portal's six override pickers (the catch-all,
+the rule targets and the fallback, on user and on service tokens) therefore
+offer only names whose `Models()` row has non-empty `flavors`. On a user token
+with a server override set, the catch-all and rule-target pickers offer that
+server's own listing (`ServerModels`) instead, minus the ids whose `Models()`
+row has `flavors: []`, hidden names included; the fallback picker is never
+narrowed to the server. A saved value whose `Models()` row has `flavors: []`
+stays visible, marked unavailable, rather than dropped. `Models()` drops
+hidden names, so the frontend cannot see whether a hidden name has an empty
+served set: a saved value of that kind is never marked, in any picker, and
+under a server override such a name is also offered and the save refuses it.
+`ServerModels` also ignores provisioning and group locking, so the
+server-override list can offer other names the save refuses. Both are known
+limits
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(d)).
 
 The **fallback** is the one exception, and only on the service-token path: it is
 validated against that principal's callable set **narrowed by the service's own
@@ -473,10 +531,34 @@ contrast only — it is not part of `ModelOffering`:
 
 | Set | Question it answers | Per-token reach | `hidden` names | `locked` names | override aliases |
 |---|---|---|---|---|---|
-| `Callable` | what this token can route to directly | applied | **kept** | dropped | not applied |
+| `Callable` | what this token can route to directly: the names that pass the flavor rule's **served** rule | applied | **kept** | dropped | not applied |
 | `Capable` | which of those carry every capability the request requires | applied | kept | dropped | not applied |
-| `Existing` | what exists at all | ignored | kept | kept | not applied |
-| *(the listing — `ModelsForFlavor`/`Models`, not on `ModelOffering`)* | what a listing shows this token | applied | dropped | dropped | overlaid |
+| `Existing` | what exists at all: the names that pass the flavor rule's **flavor half** | ignored | kept | kept | not applied |
+| *(the listing — `ModelsForFlavor`/`Models`, not on `ModelOffering`)* | what a listing shows this token, by the served rule | applied | dropped | dropped | overlaid |
+
+**The flavor rule behind the sets** lives in
+`internal/routing/served_flavors.go`, so dispatch and every set read one
+precedence. `routing.EffectiveFields` gives a mapping's effective flavors E and
+messages mode M: its runtime spec's for a `server_agent` mapping with a spec
+row (a stored `[]` counts, `Enabled` does not matter), its application's
+otherwise — the values `Resolver.targetFrom` builds its `Target` from. With A
+the application's flavors, the **flavor half** (`routing.MappingHasAPIFlavor`)
+holds for `openai` when `openai` ∈ A and E is not images-only, and for
+`anthropic` or `openai_images` when the flavor is in both A and E; the
+**served** rule (`routing.MappingServesAPIFlavor`) adds M ≠ `disabled` for
+`anthropic`, and reads A through candidacy's own `applicationServesEndpoint`.
+`openai` is narrow because chat completions refuses only an images-only
+target, so a `["anthropic"]` or `[]` child stays callable under it; `anthropic`
+is the full effective-served rule because `/v1/messages` applies it ([API
+Compatibility & Inference
+§6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
+[ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)).
+A name holds the union over its mappings, and a group over its offerable
+members. `Callable`, the group fold of `Capable` and the listing use the
+served rule; `Existing` uses the flavor half, for its names and for its group
+overlay alike (`existingNamesForFlavor`), so a messages-disabled name is in
+`Existing(anthropic)` but not in `Callable(anthropic)` (§2.1), and a name that
+no flavor serves is in no `Callable` at all.
 
 `Capable ⊆ Callable ⊆ Existing`. With no required capability `Capable` is
 `Callable` itself. For `image` it is judged by the listing's own image fold
@@ -486,8 +568,9 @@ on every mapping of the name this token reaches, the application's
 `openai_images` and, for an
 agent-launched model with a spec, the spec's too; a group only when every
 offerable member qualifies. The flavor cannot answer this by itself:
-`Callable` for `openai_images` holds every model of an application that
-declares the flavor, whatever its verdict. A required capability with no fold
+`Callable` for `openai_images` holds every model whose route declares the
+flavor — its application and, for an agent-launched model with a spec, the
+spec too — whatever its verdict. A required capability with no fold
 leaves `Capable` empty, so nothing is a candidate. The listing is neither a subset nor a superset of
 `Callable`: it loses the suppressed names and gains the token's own aliases,
 which are rewritten before routing and are therefore not routable names — so it
@@ -1225,7 +1308,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 
 | Routing error | HTTP status | When |
 |---|---|---|
-| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what the images relay answers after resolution when a `server_agent` mapping's spec excludes `openai_images` ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) |
+| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images relay when the spec excludes `openai_images`, and the text translate dispatch when the spec is images-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |

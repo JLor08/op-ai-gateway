@@ -1613,12 +1613,14 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 //
 // Every known flavor counts, openai_images included: a name valid for only one
 // of them is still a valid setting, and every consumer re-checks the flavor per
-// request. Groups share the model namespace and are therefore included by the
+// request. A name that no flavor serves (routing.MappingServesAPIFlavor) is in
+// no Callable set and therefore not a valid setting, although Models() still
+// lists it. Groups share the model namespace and are therefore included by the
 // same lookup.
 //
 // The set is built ONCE per create/update and passed to each validator, rather
-// than rebuilt per entry: it costs one mapping traversal plus one group-overlay
-// load per flavor.
+// than rebuilt per entry: it costs one mapping traversal, one group-overlay
+// load and one runtime-spec read per server_agent application, per flavor.
 func (s *Service) callableModelNames(ctx context.Context, owner auth.Token) map[string]struct{} {
 	out := make(map[string]struct{})
 	for _, flavor := range knownAPIFlavors {
@@ -1698,9 +1700,10 @@ func validateModelOverrideRules(callable map[string]struct{}, raw map[string]sto
 // `callable` is a FUNCTION, not a set, because the two early returns above the
 // only use of it are the common cases: an update that switches the redirect
 // off, or leaves the fallback empty, needs no callable set at all — and
-// building one costs a mapping traversal plus a group-overlay load PER API
-// FLAVOR (callableModelNames). Taking the set eagerly meant paying for it to
-// reach a `return` that never looked at it.
+// building one costs a mapping traversal, a group-overlay load and one
+// runtime-spec read per server_agent application, PER API FLAVOR
+// (callableModelNames). Taking the set eagerly meant paying for it to reach a
+// `return` that never looked at it.
 func validateUnknownModelRedirect(callable func() map[string]struct{}, on, blocked bool, fallback string) (bool, bool, string, error) {
 	if !on {
 		return false, false, "", nil
@@ -2007,9 +2010,12 @@ func (s *Service) Dashboard(ctx context.Context, token auth.Token) DashboardResp
 	}
 }
 
-// Models returns the offered-model listing for the inference /v1/models list,
-// the chat picker, and override validation: hidden/locked models are SUPPRESSED
-// from the standalone listing (active groups are still added).
+// Models returns the offered-model listing for the portal chat picker, the LM
+// Studio /api/v0/models list and the service allowlist check
+// (validateServiceAllowedModels): hidden/locked models are SUPPRESSED from the
+// standalone listing (active groups are still added). Each model's flavors are
+// the ones dispatch serves it under (routing.MappingServesAPIFlavor); a model
+// that no flavor serves is still listed, with [].
 func (s *Service) Models(ctx context.Context, token auth.Token) ModelsResponse {
 	return s.modelsResponse(ctx, token, true)
 }
@@ -2077,15 +2083,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// The image flag is imageFlagsByName, the one image fold the
 			// unknown-model redirect asks too (ModelOffering.Capable). Unlike
 			// vision it also takes the mapping's route: the verdict alone does
-			// not make the images endpoint serve a model, so a mapping whose
-			// application (or resolved spec) excludes openai_images ANDs in as
-			// false -- see viewServesImages, and runtimeSpecFlavorsForViews for
-			// the spec flavors of every agent-launched mapping.
-			specFlavors, specFailed := s.runtimeSpecFlavorsForViews(ctx, views)
-			imageOn := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), specFlavors, specFailed)
-			// Derive both the per-model flavor set and the loaded-state from a
-			// single pass over the active mapping views (one store round-trip).
-			flavors := make(map[string]map[string]struct{})
+			// not make the images endpoint serve a model, so a mapping that
+			// fails the openai_images flavor half ANDs in as false -- see
+			// viewServesImages. idx is this listing's one runtime-spec read,
+			// shared by the image fold and the flavor fold below.
+			idx := s.runtimeSpecIndexForViews(ctx, views)
+			imageOn := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+			// Each model's flavors are the ones dispatch serves it under
+			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
+			// flavorSetsFromViews applies for /v1/models too. Every model keeps
+			// its key, so one that no flavor serves is still listed, with [].
+			flavors := perNameFlavors(views, idx, routing.MappingServesAPIFlavor)
 			// loadedOn: gateway model name -> set of server names where a mapping's
 			// upstream (app) model name is currently reported loaded.
 			loadedOn := make(map[string]map[string]struct{})
@@ -2103,10 +2111,12 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// see routing.CapabilityRow's doc-comment on why "unknown" is a row's
 			// absence rather than a third verdict.
 			visionOn := make(map[string]bool)
+			// One pass over the views derives the loaded-state and the rest of
+			// the per-model data. visionOn tests its own keys for first sight:
+			// flavors already holds every name before the loop starts.
 			for _, view := range views {
 				name := view.mapping.GatewayModelName
-				if _, ok := flavors[name]; !ok {
-					flavors[name] = make(map[string]struct{})
+				if _, ok := visionOn[name]; !ok {
 					visionOn[name] = true
 				}
 				if _, ok := offeredOn[name]; !ok {
@@ -2117,11 +2127,6 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				if cs := view.mapping.ContextSize; cs > 0 {
 					if cur, ok := contextSizeOn[name]; !ok || cs < cur {
 						contextSizeOn[name] = cs
-					}
-				}
-				for _, flavor := range view.app.APIFlavors {
-					if isKnownAPIFlavor(flavor) {
-						flavors[name][flavor] = struct{}{}
 					}
 				}
 				if s.loadedModels != nil && view.mapping.AppModelName != "" {
@@ -2370,7 +2375,8 @@ func capabilityRowsFor(capsByMapping map[string][]routing.CapabilityRow, capabil
 // imageFlagsByName is THE image fold: per gateway model name among views,
 // whether the images endpoint would serve it. It backs the listing's
 // ModelDTO.Image and the unknown-model redirect's ModelOffering.Capable, so the
-// two can never disagree about which model generates images.
+// two can never disagree about which model generates images. idx supplies each
+// mapping's runtime spec (runtimeSpecIndex) and must cover every view.
 //
 // A name carries the image capability only when EVERY one of its mappings has
 // an image=yes verdict (imageRows, keyed by mapping id) AND would pass both
@@ -2380,7 +2386,7 @@ func capabilityRowsFor(capsByMapping map[string][]routing.CapabilityRow, capabil
 // starts true on its first mapping and is only ever ANDed down, never up.
 // Image is independent of vision: a generator that accepts no image input is
 // image=true, vision=false.
-func imageFlagsByName(views []mappingView, imageRows map[string]routing.CapabilityRow, specFlavors map[string][]string, specFailed map[string]struct{}) map[string]bool {
+func imageFlagsByName(views []mappingView, imageRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	out := make(map[string]bool)
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
@@ -2389,7 +2395,7 @@ func imageFlagsByName(views []mappingView, imageRows map[string]routing.Capabili
 			acc = true
 		}
 		out[name] = acc && imageRows[view.mapping.ID].Verdict == routing.CapabilityYes &&
-			viewServesImages(view, specFlavors, specFailed)
+			viewServesImages(view, idx)
 	}
 	return out
 }
@@ -2414,39 +2420,41 @@ func groupCapabilityFlags(entries []groupOverlayEntry, flags map[string]bool) ma
 
 // viewServesImages reports whether an image request resolved to this mapping
 // would pass both flavor stages, so that the listing's Image never offers a
-// model the images endpoint refuses: CANDIDACY admits only an application that
-// declares openai_images (routing.applicationServesEndpoint), and for a
-// server_agent mapping with a runtime spec the images relay then holds the
-// spec's own flavors to it too (targetServesFlavor; the spec is the flavor
-// authority routing.Resolver.targetFrom resolves). A server_agent mapping with
-// no spec falls back to the application's flavors, exactly as targetFrom does.
-// An application whose spec read failed serves no images here (fail-closed).
-func viewServesImages(view mappingView, specFlavors map[string][]string, specFailed map[string]struct{}) bool {
-	if !slices.Contains(view.app.APIFlavors, routing.APIFlavorOpenAIImages) {
+// model the images endpoint refuses. That is the openai_images flavor half
+// (routing.MappingHasAPIFlavor): CANDIDACY admits only an application that
+// declares openai_images, and the images relay then holds the mapping's
+// effective flavors to it too -- the spec's for a server_agent mapping with a
+// spec row, the application's otherwise, exactly as routing.Resolver.targetFrom
+// resolves them.
+//
+// An application whose spec read failed serves no images here (fail-closed):
+// its spec may exclude openai_images, and an image flag that is wrong sends an
+// image request to a model that refuses it.
+func viewServesImages(view mappingView, idx runtimeSpecIndex) bool {
+	if _, failed := idx.failed[view.app.ID]; failed {
 		return false
 	}
-	if view.app.Type != routing.ProviderServerAgent {
-		return true
-	}
-	if _, failed := specFailed[view.app.ID]; failed {
-		return false
-	}
-	flavors, hasSpec := specFlavors[view.mapping.ID]
-	if !hasSpec {
-		return true
-	}
-	return slices.Contains(flavors, routing.APIFlavorOpenAIImages)
+	return routing.MappingHasAPIFlavor(view.app, idx.effective(view), routing.APIFlavorOpenAIImages)
 }
 
-// runtimeSpecFlavorsForViews returns the runtime-spec APIFlavors of every
-// server_agent mapping among views that has a spec, keyed by mapping id. It
-// costs one RuntimeSpecsByApplication read per distinct server_agent
-// application -- at most one per server -- and none for a listing without
-// one. An application whose read fails is returned in failed rather than
-// guessed at, and logged, like the capability read's degrade.
-func (s *Service) runtimeSpecFlavorsForViews(ctx context.Context, views []mappingView) (flavors map[string][]string, failed map[string]struct{}) {
-	flavors = make(map[string][]string)
-	failed = make(map[string]struct{})
+// runtimeSpecIndex is the runtime-spec state every portal flavor fold reads
+// for a set of mapping views: the spec row of each server_agent mapping that
+// has one, keyed by mapping id, and the server_agent applications whose spec
+// read failed, keyed by application id. The zero value is an index with no
+// spec and no failure. Build it with runtimeSpecIndexForViews.
+type runtimeSpecIndex struct {
+	specs  map[string]routing.RuntimeSpec
+	failed map[string]struct{}
+}
+
+// runtimeSpecIndexForViews reads the runtime specs of every server_agent
+// application among views into one runtimeSpecIndex. It costs one
+// RuntimeSpecsByApplication read per distinct server_agent application -- at
+// most one per server -- and none for views without one. An application whose
+// read fails lands in failed rather than being guessed at, and is logged: an
+// unlogged degrade would look like a normal listing.
+func (s *Service) runtimeSpecIndexForViews(ctx context.Context, views []mappingView) runtimeSpecIndex {
+	idx := runtimeSpecIndex{specs: make(map[string]routing.RuntimeSpec), failed: make(map[string]struct{})}
 	seen := make(map[string]struct{})
 	for _, view := range views {
 		if view.app.Type != routing.ProviderServerAgent {
@@ -2458,16 +2466,27 @@ func (s *Service) runtimeSpecFlavorsForViews(ctx context.Context, views []mappin
 		seen[view.app.ID] = struct{}{}
 		specs, err := s.routes.RuntimeSpecsByApplication(ctx, view.app.ID)
 		if err != nil {
-			slog.Warn("portal: models-listing runtime spec read failed; image withheld for the application's models",
+			slog.Warn("portal: runtime spec read failed; the application's models are listed under its own flavors and modes, and image is withheld for them",
 				"app_id", view.app.ID, "err", err)
-			failed[view.app.ID] = struct{}{}
+			idx.failed[view.app.ID] = struct{}{}
 			continue
 		}
 		for _, spec := range specs {
-			flavors[spec.MappingID] = spec.APIFlavors
+			idx.specs[spec.MappingID] = spec
 		}
 	}
-	return flavors, failed
+	return idx
+}
+
+// effective returns view's effective flavors and modes
+// (routing.EffectiveFields): its spec row's for a server_agent mapping that
+// has one, the application's otherwise. An application whose spec read failed
+// has no spec row in the index, so its mappings get the application's own
+// fields, the fail-open direction; viewServesImages, which fails closed,
+// checks failed before it asks.
+func (idx runtimeSpecIndex) effective(view mappingView) routing.EffectiveSpecFields {
+	spec, hasSpec := idx.specs[view.mapping.ID]
+	return routing.EffectiveFields(view.app, spec, hasSpec)
 }
 
 func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (string, []RouteDTO) {
@@ -3768,14 +3787,13 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 	return filterByAllowedServers(ctx, s.AllowedServerIDs, token, views, func(v mappingView) string { return v.server.ID }, false)
 }
 
-// knownAPIFlavors is the sorted set of coarse API flavors a model listing
-// carries: every flavor an application may declare, the images flavor
-// included. A listing keeps only these, so a flavor missing here is a flavor
-// no listing reports -- an images-only application's models would reach the
-// chat with no flavors at all. Carrying a flavor is not offering the model on
-// every surface: each per-flavor listing (ModelsForFlavor, i.e. /v1/models)
-// still asks for its OWN flavor, so an images-only model never appears in a
-// text listing.
+// knownAPIFlavors is the sorted set of coarse API flavors a model listing can
+// carry, the images flavor included: perNameFlavors asks its rule about each
+// of them, so a flavor missing here is a flavor no listing reports -- an
+// images-only model would reach the chat with no flavors at all. A model
+// carries the ones dispatch serves it under (routing.MappingServesAPIFlavor),
+// and each per-flavor listing (ModelsForFlavor, i.e. /v1/models) asks for its
+// OWN flavor, so an images-only model never appears in a text listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
 var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
@@ -3787,22 +3805,20 @@ var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpen
 // requests it cannot serve.
 var seedAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}
 
-func isKnownAPIFlavor(flavor string) bool {
-	return slices.Contains(knownAPIFlavors, flavor)
-}
-
 // isSeedAPIFlavor reports whether the seed models are offered on flavor.
 func isSeedAPIFlavor(flavor string) bool {
 	return slices.Contains(seedAPIFlavors, flavor)
 }
 
 // modelFlavorSets maps each name this principal is OFFERED to the set of known
-// API flavors that expose it. That is three layers, in order: the union of
-// app.APIFlavors across the active mapping views VISIBLE to the principal (see
-// visibleMappingViews), then the model-group overlay (active groups added by
-// flavor union, hidden/locked names dropped), then the PER-TOKEN override-alias
-// overlay — each Offer rule's requested name added with its target's flavors,
-// each HideTarget rule's target removed (applyOverrideAliases).
+// API flavors that expose it. That is three layers, in order: per name, the
+// union of the flavors dispatch serves its mappings under
+// (routing.MappingServesAPIFlavor, folded by perNameFlavors) across the active
+// mapping views VISIBLE to the principal (see visibleMappingViews), then the
+// model-group overlay (active groups added by flavor union, hidden/locked
+// names dropped), then the PER-TOKEN override-alias overlay — each Offer
+// rule's requested name added with its target's flavors, each HideTarget
+// rule's target removed (applyOverrideAliases).
 //
 // So the result is a LISTING, per principal AND per token, not a set of names
 // the principal may reach: an alias in it is rewritten before routing and is
@@ -3849,22 +3865,40 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	if loaded, gErr := s.loadGroupOverlayInputs(ctx); gErr == nil {
 		overlay = &loaded
 	}
-	sets, preSuppress = flavorSetsFromViews(views, overlay, token)
+	sets, preSuppress = flavorSetsFromViews(views, s.runtimeSpecIndexForViews(ctx, views), overlay, token)
 	return sets, preSuppress, nil
 }
 
-// perNameFlavors maps each mapping view's gateway model name to the set of
-// KNOWN API flavors its application declares.
-func perNameFlavors(views []mappingView) map[string]map[string]struct{} {
+// flavorRule is the per-mapping flavor predicate perNameFlavors folds:
+// routing.MappingServesAPIFlavor (the served rule, which every listing and
+// ModelOffering.Callable read) or routing.MappingHasAPIFlavor (its flavor
+// half, which ModelOffering.Existing reads).
+type flavorRule func(app routing.Application, eff routing.EffectiveSpecFields, flavor string) bool
+
+// perNameFlavors is the one per-name flavor fold: it maps each mapping view's
+// gateway model name to the KNOWN API flavors under which rule admits at least
+// one of its mappings, given that mapping's effective flavors and modes
+// (runtimeSpecIndex.effective). idx must cover every view. Every name among
+// views is a key, even when no flavor admits it: such a name is still an
+// offerable model and group member, whose listing row carries no flavor.
+//
+// For an application whose spec read failed the fold reads the application's
+// own flavors and messages mode, the fail-open direction: a store blip must
+// neither hide its models from a listing nor shrink Existing, which would make
+// the unknown-model redirect reroute requests for names that exist.
+func perNameFlavors(views []mappingView, idx runtimeSpecIndex, rule flavorRule) map[string]map[string]struct{} {
 	sets := make(map[string]map[string]struct{})
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
-		if _, ok := sets[name]; !ok {
-			sets[name] = make(map[string]struct{})
+		set, ok := sets[name]
+		if !ok {
+			set = make(map[string]struct{})
+			sets[name] = set
 		}
-		for _, flavor := range view.app.APIFlavors {
-			if isKnownAPIFlavor(flavor) {
-				sets[name][flavor] = struct{}{}
+		eff := idx.effective(view)
+		for _, flavor := range knownAPIFlavors {
+			if rule(view.app, eff, flavor) {
+				set[flavor] = struct{}{}
 			}
 		}
 	}
@@ -3877,10 +3911,14 @@ func perNameFlavors(views []mappingView) map[string]map[string]struct{} {
 // the group/visibility inputs were unavailable — the fail-open path, which
 // yields the plain per-model sets with neither groups nor suppression.
 //
+// Each name's flavors are the ones dispatch serves it under
+// (routing.MappingServesAPIFlavor), read through idx, which must cover every
+// view.
+//
 // Factored out so ModelOfferingFor can compose the same listing from views it
 // has already read, instead of walking the mapping store a second time.
-func flavorSetsFromViews(views []mappingView, overlay *groupOverlayInputs, token auth.Token) (sets, preSuppress map[string]map[string]struct{}) {
-	sets = perNameFlavors(views)
+func flavorSetsFromViews(views []mappingView, idx runtimeSpecIndex, overlay *groupOverlayInputs, token auth.Token) (sets, preSuppress map[string]map[string]struct{}) {
+	sets = perNameFlavors(views, idx, routing.MappingServesAPIFlavor)
 	preSuppress = make(map[string]map[string]struct{}, len(sets))
 	for name, flavors := range sets {
 		preSuppress[name] = flavors
@@ -3976,8 +4014,8 @@ type groupOverlayEntry struct {
 // modelGroupOverlay computes the model-group additions and the model-visibility
 // suppression set to overlay onto the offered-model listing (spec §4a/§4b).
 //
-// perNameFlavors is the per-model flavor map already built from
-// activeMappingViews; its keys are exactly the currently OFFERABLE gateway model
+// perNameFlavors is a per-name flavor map, built by perNameFlavors over the
+// caller's views; its keys are exactly the currently OFFERABLE gateway model
 // names. It is read-only (never mutated here).
 //
 // Returns, for every ACTIVE group with at least one offerable member, an entry
@@ -4153,11 +4191,17 @@ func seedFlavorsSorted() []string {
 // seedModelNames are the fallback models when no routing store is configured.
 var seedModelNames = []string{"gpt-oss-20b", "qwen-coder"}
 
-// ModelsForFlavor returns the sorted gateway model names routable on the given
-// API flavor (whose application declares that flavor), filtered to the models
-// the given principal is allowed to see under resource-group provisioning
-// (Resource Groups Phase 2). Falls back to the seed models (which expose the
-// text flavors, seedAPIFlavors) when no routing store is configured.
+// ModelsForFlavor returns the sorted gateway model names listed on the given
+// API flavor: the names dispatch serves under it (routing.MappingServesAPIFlavor
+// -- the application declares the flavor, and the mapping's effective flavors
+// and messages mode admit it: a runtime spec's for an agent-launched mapping
+// with a spec row, the application's own otherwise), plus the group and
+// override-alias overlays of modelFlavorSets, filtered to the models the
+// given principal is allowed to see under resource-group provisioning
+// (Resource Groups Phase 2).
+// It reads the runtime specs of the views it lists (runtimeSpecIndexForViews).
+// Falls back to the seed models (which expose the text flavors,
+// seedAPIFlavors) when no routing store is configured.
 func (s *Service) ModelsForFlavor(ctx context.Context, token auth.Token, flavor string) []string {
 	if s.routes != nil {
 		if sets, err := s.modelFlavorSets(ctx, token); err == nil {

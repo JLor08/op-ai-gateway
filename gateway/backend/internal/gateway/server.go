@@ -25,6 +25,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/tracing"
 	"op-ai-gateway/internal/usage"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1404,10 +1405,12 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-// lmStudioModelsFromDTOs maps the portal model listing into LM Studio's
+// lmStudioModelsFromDTOs maps portal model rows into LM Studio's
 // GET /api/v0/models item shape so opencode's lmstudio provider can auto-detect
 // each model's context window (max_context_length). Chat still flows over the
 // OpenAI-compatible /v1/chat/completions path; only the metadata is emulated.
+// It maps every row it is given; handleLMStudioModels passes only the rows
+// openAIModelDTOs keeps.
 func lmStudioModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -1432,6 +1435,24 @@ func lmStudioModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 	return out
 }
 
+// openAIModelDTOs keeps the portal model rows whose flavors carry openai: the
+// names /v1/chat/completions serves. A client of /api/v0/models chats over that
+// endpoint, so a row without openai -- an anthropic-only or images-only model,
+// a model offered under no API at all, or a group or offered alias of only
+// such models -- would be offered as an "llm" that every chat request to it
+// fails. Models() applies the same views, group overlay, suppression and
+// override aliases as ModelsForFlavor, so the rows kept are exactly the names
+// /v1/models lists.
+func openAIModelDTOs(models []portal.ModelDTO) []portal.ModelDTO {
+	out := make([]portal.ModelDTO, 0, len(models))
+	for _, m := range models {
+		if slices.Contains(m.Flavors, routing.APIFlavorOpenAI) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -1440,7 +1461,7 @@ func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	models := s.Portal.Models(r.Context(), token).Data
+	models := openAIModelDTOs(s.Portal.Models(r.Context(), token).Data)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": lmStudioModelsFromDTOs(models)})
 }
 

@@ -846,6 +846,26 @@ describe('RuntimeAdminSection launch specs list', () => {
     expect(await screen.findByText(t.runtimeTimeoutWarning)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeBinaryPathOsMismatchWarning)).toBeInTheDocument();
   });
+
+  // The two launch-spec flavor advisories (a flavor the application does not
+  // declare, and text flavors on a stable-diffusion.cpp spec) ride the same
+  // opaque-code channel: each code maps to its own label, in both locales,
+  // and neither falls through to its raw wire string.
+  it('shows the two launch-spec flavor warning banners by their labels', async () => {
+    renderSection({
+      warnings: ['api_flavors_not_on_application', 'api_flavors_text_on_stable_diffusion'],
+    });
+    expect(await screen.findByText(t.runtimeFlavorNotOnApplicationWarning)).toBeInTheDocument();
+    expect(screen.getByText(t.runtimeTextOnStableDiffusionWarning)).toBeInTheDocument();
+    expect(screen.queryByText('api_flavors_not_on_application')).not.toBeInTheDocument();
+    expect(screen.queryByText('api_flavors_text_on_stable_diffusion')).not.toBeInTheDocument();
+    expect(messages.en.runtimeFlavorNotOnApplicationWarning).not.toBe(
+      t.runtimeFlavorNotOnApplicationWarning,
+    );
+    expect(messages.en.runtimeTextOnStableDiffusionWarning).not.toBe(
+      t.runtimeTextOnStableDiffusionWarning,
+    );
+  });
 });
 
 describe('RuntimeAdminSection create (mapping + spec)', () => {
@@ -7980,5 +8000,441 @@ describe('RuntimeAdminSection responses live timings body', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.type).toBe('ollama');
     expect('responses_live_timings_enabled' in putSpecs[0].body).toBe(false);
+  });
+});
+
+async function pickFlavorFormType(name: string) {
+  fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+  fireEvent.click(await screen.findByRole('option', { name }));
+}
+
+async function pickFlavorFormMode(label: string, name: string) {
+  fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+  fireEvent.click(await screen.findByRole('option', { name }));
+}
+
+async function openFlavorSpecEdit(spec: Partial<RuntimeSpec>, parent?: PortalApplication) {
+  const rendered = renderSection({
+    mappings: [makeMapping({ id: 'map_1' })],
+    specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1', ...spec }) },
+    application: parent,
+  });
+  await screen.findByText('gw-model');
+  fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+  await screen.findByLabelText(t.runtimeSpecBinary);
+  return rendered;
+}
+
+function flavorBoxes() {
+  return {
+    openai: screen.getByRole('checkbox', { name: 'openai' }),
+    anthropic: screen.getByRole('checkbox', { name: 'anthropic' }),
+    images: screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
+  };
+}
+
+// The warnings banner is hidden while the form is open, so the form states the
+// two flavor warnings of RuntimeWarnings itself, under the flavor controls.
+describe('RuntimeAdminSection launch-spec flavor hints', () => {
+  it('warns about a ticked flavor the application does not declare, and only then', async () => {
+    renderSection({ application: { ...application, api_flavors: ['openai', 'anthropic'] } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecFlavorsNotOnApplicationHint)).not.toBeInTheDocument();
+
+    fireEvent.click(flavorBoxes().images);
+    expect(screen.getByText(t.runtimeSpecFlavorsNotOnApplicationHint)).toBeInTheDocument();
+
+    fireEvent.click(flavorBoxes().images);
+    expect(screen.queryByText(t.runtimeSpecFlavorsNotOnApplicationHint)).not.toBeInTheDocument();
+  });
+
+  it('does not warn about a ticked flavor the application declares', async () => {
+    renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic', 'openai_images'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.click(flavorBoxes().images);
+    expect(screen.queryByText(t.runtimeSpecFlavorsNotOnApplicationHint)).not.toBeInTheDocument();
+  });
+
+  it('warns when the switch to sd ticks openai_images under a parent without it', async () => {
+    renderSection({ application: { ...application, api_flavors: ['openai', 'anthropic'] } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(screen.getByText(t.runtimeSpecFlavorsNotOnApplicationHint)).toBeInTheDocument();
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('warns about text flavors on an explicit sd type, and not on another type', async () => {
+    await openFlavorSpecEdit({
+      binary: '/opt/sd/sd-server',
+      type: 'stable_diffusion_cpp',
+      effective_type: 'stable_diffusion_cpp',
+      api_flavors: ['openai', 'anthropic'],
+    });
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('clears the text-flavor hint once only openai_images is ticked', async () => {
+    await openFlavorSpecEdit({
+      binary: '/opt/sd/sd-server',
+      type: 'stable_diffusion_cpp',
+      effective_type: 'stable_diffusion_cpp',
+      api_flavors: ['openai', 'openai_images'],
+    });
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+
+    fireEvent.click(flavorBoxes().openai);
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('warns under Auto for a loaded spec that resolved to sd, until its binary changes', async () => {
+    await openFlavorSpecEdit({
+      binary: '/opt/sd/sd-server',
+      type: '',
+      effective_type: 'stable_diffusion_cpp',
+      api_flavors: ['openai', 'anthropic'],
+    });
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+
+    // The resolved type is stale once the binary changes: the detection is
+    // Go-only, so the form stops claiming the spec is sd.
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/other-server' },
+    });
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+  });
+
+  it('stops warning when a loaded explicit sd spec switches to Auto, since only its Type made it sd', async () => {
+    // The binary is one the backend's detection does not know, so under Auto
+    // the saved spec resolves to custom and draws no sd warning.
+    await openFlavorSpecEdit({
+      binary: '/usr/local/bin/flux-wrapper.sh',
+      type: 'stable_diffusion_cpp',
+      effective_type: 'stable_diffusion_cpp',
+      api_flavors: ['openai', 'anthropic'],
+    });
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+
+    await pickFlavorFormType(t.runtimeSpecTypeAuto);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('forgets the loaded spec’s resolved type when a Create opens', async () => {
+    await openFlavorSpecEdit(
+      {
+        binary: '/opt/sd/sd-server',
+        type: '',
+        effective_type: 'stable_diffusion_cpp',
+        api_flavors: ['openai', 'anthropic'],
+      },
+      { ...application, api_flavors: ['openai', 'anthropic'] },
+    );
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not warn under Auto for a loaded spec that resolved to another type', async () => {
+    await openFlavorSpecEdit({
+      binary: '/usr/bin/llama-server',
+      type: '',
+      effective_type: 'llama_cpp',
+      api_flavors: ['openai', 'anthropic'],
+    });
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not warn under Auto on Create, whatever the binary', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    expect(
+      screen.queryByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint),
+    ).not.toBeInTheDocument();
+  });
+});
+
+// A switch of Type to or from stable_diffusion_cpp moves the API-variant block
+// only while it still holds the values the form put there, judged against the
+// parent template and the sd default.
+describe('RuntimeAdminSection launch-spec type-switch flavor defaults', () => {
+  it('sets openai_images with both modes disabled when an untouched Create switches to sd', async () => {
+    const { putSpecs } = renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'passthrough',
+        messages_mode: 'translate',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+
+    expect(flavorBoxes().images).toBeChecked();
+    expect(flavorBoxes().openai).not.toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+  });
+
+  it('restores the replaced values, not the template, on a switch back to an explicit type', async () => {
+    const { putSpecs } = renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    // The same flavor set in another order, and a mode off the template: the
+    // switch to sd still counts the flavors as untouched.
+    fireEvent.click(flavorBoxes().openai);
+    fireEvent.click(flavorBoxes().openai);
+    await pickFlavorFormMode(t.applicationResponsesMode, t.applicationModeTranslate);
+
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(flavorBoxes().images).toBeChecked();
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['anthropic', 'openai']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+    expect(putSpecs[0].body.messages_mode).toBe('passthrough');
+  });
+
+  it('restores the parent template when a spec loaded as sd switches to an explicit type', async () => {
+    const { putSpecs } = await openFlavorSpecEdit(
+      {
+        binary: '/opt/sd/sd-server',
+        type: 'stable_diffusion_cpp',
+        effective_type: 'stable_diffusion_cpp',
+        api_flavors: ['openai_images'],
+        responses_mode: 'disabled',
+        messages_mode: 'disabled',
+      },
+      {
+        ...application,
+        api_flavors: ['openai', 'anthropic', 'openai_images'],
+        responses_mode: 'translate',
+        messages_mode: 'passthrough',
+      },
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeVllm);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+    expect(putSpecs[0].body.messages_mode).toBe('passthrough');
+  });
+
+  it('moves nothing when an sd spec switches to Auto', async () => {
+    const { putSpecs } = await openFlavorSpecEdit({
+      binary: '/opt/sd/sd-server',
+      type: 'stable_diffusion_cpp',
+      effective_type: 'stable_diffusion_cpp',
+      api_flavors: ['openai_images'],
+      responses_mode: 'disabled',
+      messages_mode: 'disabled',
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeAuto);
+
+    expect(flavorBoxes().images).toBeChecked();
+    expect(flavorBoxes().openai).not.toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('');
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+  });
+
+  it('leaves flavors other than the template alone on a switch to sd', async () => {
+    renderSection({ application: { ...application, api_flavors: ['openai', 'anthropic'] } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.click(flavorBoxes().anthropic);
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    expect(screen.getByText(t.runtimeSpecTextFlavorsOnStableDiffusionHint)).toBeInTheDocument();
+  });
+
+  it('leaves values other than the sd default alone on a switch away from sd', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    fireEvent.click(flavorBoxes().openai);
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+
+    expect(flavorBoxes().images).toBeChecked();
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images', 'openai']);
+  });
+
+  it('forgets the replaced values when the form is opened again', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/opt/sd/sd-server',
+          type: 'stable_diffusion_cpp',
+          effective_type: 'stable_diffusion_cpp',
+          api_flavors: ['openai_images'],
+          responses_mode: 'disabled',
+          messages_mode: 'disabled',
+        }),
+      },
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      },
+    });
+    await screen.findByText('gw-model');
+    // A Create that replaced values with a mode off the template, then left.
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormMode(t.applicationResponsesMode, t.applicationModeTranslate);
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    await pickFlavorFormType(t.runtimeSpecTypeVllm);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('passthrough');
+  });
+
+  // resetSpecFields's own reset -- the mirror of the test above, which pins
+  // hydrateSpecFields's. A switch to sd remembered while editing a STORED
+  // spec must not survive Cancel into a Create opened afterward, even though
+  // that Create's own switch to sd is a no-op (its flavors no longer match the
+  // template) and so never overwrites the remembered slot by itself.
+  it('forgets the values an earlier sd switch remembered when a Create opens', async () => {
+    const { putSpecs } = await openFlavorSpecEdit(
+      {
+        binary: '/usr/bin/llama-server',
+        type: 'llama_cpp',
+        effective_type: 'llama_cpp',
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'translate',
+        messages_mode: 'passthrough',
+      },
+      {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      },
+    );
+    // Remembers {apiFlavors: [openai, anthropic], responsesMode: translate,
+    // messagesMode: passthrough}: the stored spec's own values, which equal
+    // the template's flavors but not its responses mode.
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(flavorBoxes().images).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sd/sd-server' },
+    });
+    // Both mode dropdowns are gated on their own flavor's checkbox
+    // (ApiVariantControls): set them to disabled here, while openai and
+    // anthropic are still ticked, since unticking either below disables its
+    // dropdown and freezes the stored mode.
+    await pickFlavorFormMode(t.applicationResponsesMode, t.applicationModeDisabled);
+    await pickFlavorFormMode(t.applicationMessagesMode, t.applicationModeDisabled);
+
+    // Untick a flavor so THIS switch to sd is a no-op -- the flavors no
+    // longer match the template -- and so leaves the remembered slot exactly
+    // as it was, whichever value that is.
+    fireEvent.click(flavorBoxes().anthropic);
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+
+    // Reach the sd default by hand: [openai_images], both modes disabled.
+    fireEvent.click(flavorBoxes().openai);
+    fireEvent.click(flavorBoxes().images);
+    expect(flavorBoxes().images).toBeChecked();
+
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    // A leaked remembered value would restore the Edit's translate/passthrough
+    // spec; a Create that forgot it restores the parent template instead.
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('passthrough');
+    expect(putSpecs[0].body.messages_mode).toBe('passthrough');
   });
 });

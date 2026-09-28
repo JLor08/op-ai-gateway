@@ -1613,7 +1613,7 @@ func gpuBudgetDTOs(budgets []routing.ServerGPUBudget) []GPUBudgetDTO {
 	return out
 }
 
-// --- Task 6: runtime warnings -----------------------------------------------
+// --- runtime warnings -------------------------------------------------------
 
 // runtimeTimeoutBelowStartupWarning: the application's gateway-side upstream
 // deadline (TimeoutMS) keeps running while the agent is still starting a
@@ -1634,6 +1634,25 @@ const runtimeTimeoutBelowStartupWarning = "timeout_ms_below_startup_timeout"
 // unconditionally (runtimeSpecBinaryIsAbsolute) and this advisory carries the
 // OS knowledge we happen to have.
 const runtimeBinaryPathOSMismatchWarning = "binary_path_os_mismatch"
+
+// runtimeFlavorNotOnApplicationWarning: a runtime spec of a server_agent
+// application lists an API flavor that the application does not declare.
+// Candidacy admits a mapping on the application's flavors
+// (routing.applicationServesEndpoint), so a request of that flavor never
+// reaches the spec, and the flavor has no effect. An advisory, not an error:
+// an application from which a flavor was removed on purpose leaves the same
+// harmless extra on its specs.
+const runtimeFlavorNotOnApplicationWarning = "api_flavors_not_on_application"
+
+// runtimeTextOnStableDiffusionWarning: a runtime spec whose effective type
+// (routing.EffectiveRuntimeSpecType) is stable_diffusion_cpp lists flavors
+// that are not images-only (routing.FlavorsAreImagesOnly). The gateway then
+// treats the model as a text model under each text flavor the served rule
+// (routing.MappingServesAPIFlavor) grants it, openai whenever its application
+// declares openai: the listings offer it under that flavor, and text requests
+// of that flavor are dispatched to it. sd-server has no chat endpoint, so
+// those requests fail.
+const runtimeTextOnStableDiffusionWarning = "api_flavors_text_on_stable_diffusion"
 
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
@@ -1666,6 +1685,12 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 	}
 	if osMismatch {
 		warnings = append(warnings, runtimeBinaryPathOSMismatchWarning)
+	}
+	if anySpecListsFlavorNotOnApplication(app, specs) {
+		warnings = append(warnings, runtimeFlavorNotOnApplicationWarning)
+	}
+	if anyStableDiffusionSpecNotImagesOnly(app, specs) {
+		warnings = append(warnings, runtimeTextOnStableDiffusionWarning)
 	}
 	return warnings, nil
 }
@@ -1724,6 +1749,47 @@ func runtimeSpecBinaryContradictsOS(binary, reportedOS string) bool {
 		return posix && !windows
 	}
 	return windows && !posix
+}
+
+// anySpecListsFlavorNotOnApplication backs
+// runtimeFlavorNotOnApplicationWarning: it reports whether any of specs lists
+// a flavor that app does not declare. Only a server_agent application's specs
+// are read for flavors (routing.EffectiveFields), so any other application
+// answers false. Disabled specs count, as in anySpecBinaryContradictsReportedOS:
+// dispatch reads a spec's flavors whatever its Enabled flag, and a spec is
+// routinely created disabled and enabled afterwards.
+func anySpecListsFlavorNotOnApplication(app routing.Application, specs []routing.RuntimeSpec) bool {
+	if app.Type != routing.ProviderServerAgent {
+		return false
+	}
+	for _, spec := range specs {
+		for _, flavor := range spec.APIFlavors {
+			if !slices.Contains(app.APIFlavors, flavor) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyStableDiffusionSpecNotImagesOnly backs
+// runtimeTextOnStableDiffusionWarning: it reports whether any of specs has the
+// effective type stable_diffusion_cpp (the explicit Type, else the type
+// detected from the binary) and flavors that are not images-only. A spec with
+// an empty flavor list counts: an empty list is never images-only, so the
+// gateway treats that spec as a text model too. Same scope as
+// anySpecListsFlavorNotOnApplication: a server_agent application only,
+// disabled specs included.
+func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routing.RuntimeSpec) bool {
+	if app.Type != routing.ProviderServerAgent {
+		return false
+	}
+	for _, spec := range specs {
+		if routing.EffectiveRuntimeSpecType(spec) == routing.RuntimeSpecTypeStableDiffusionCpp && !routing.FlavorsAreImagesOnly(spec.APIFlavors) {
+			return true
+		}
+	}
+	return false
 }
 
 // notifyRuntimeChanged best-effort notifies the runtime-config-changed hook

@@ -332,26 +332,33 @@ bounded by `captureMaxBytes`, not by a wider cap.
   **later chat request**'s unknown-model redirect tries first under
   `UnknownModelRedirect` ([Routing & Model Selection
   §2.1](routing-and-model-selection.md#21-per-token-model-resolution)). That
-  redirect asks the `openai` offering, so it can pick the image model only
-  when the model's application also declares `openai`; an application
-  declaring only `openai_images` (the `stable_diffusion_cpp` default) keeps it
-  out. When it does pick it, nothing on the chat path requires a capability,
-  so the chat request is sent to that upstream — unless the model is an
-  agent-managed child whose spec is images-only, which the text translate path
-  refuses with 404 `routing.no_model_route` (§6) — one more reason the
-  models-list gap in
-  [ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
-  (d) is worth closing. The images request's own redirect asks the
-  `openai_images` offering together with the request's required capability,
-  and takes a `LastUsedModel` or fallback only when that name carries `image`
-  by the portal listing's own image fold (`ModelOffering.Capable`, [Routing &
-  Model Selection
+  redirect asks the `openai` offering, whose `Callable` holds a name only when
+  its application declares `openai` and its effective flavors are not
+  images-only
+  ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)):
+  an application declaring only `openai_images` (the `stable_diffusion_cpp`
+  default) keeps the image model out, and so does an agent-managed child whose
+  spec is images-only, under a parent that declares `openai` for its text
+  children. What it can still pick is an image model whose effective flavors
+  also carry a text flavor; nothing on the chat path requires a capability, so
+  the chat request is sent to that upstream. The images request's own redirect
+  asks the `openai_images` offering together with the request's required
+  capability, and takes a `LastUsedModel` or fallback only when that name
+  carries `image` by the portal listing's own image fold
+  (`ModelOffering.Capable`, [Routing & Model Selection
   §2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)).
   A candidate without it is skipped, so a client that hardcodes `dall-e-3`
   against a token whose fallback generates images is served by the fallback,
   and one whose candidates are all text models gets 404
   `routing.no_model_route` for its own name — never a `model_not_capable`
-  about a model it did not send.
+  about a model it did not send. A requested name is redirected by the narrow
+  default when every one of its mappings fails the `openai_images` flavor half
+  — the text children of a mixed application, whose specs lack the flavor
+  while the application declares it, or a group of only such names — because
+  it is then not in `Existing(openai_images)`, like a name whose application
+  lacks the flavor; without the redirect it answers 404
+  `routing.no_model_route`, or `routing.model_not_capable` when it has no
+  verdict.
 
 **Session and affinity.** The endpoint has its own `sessionEndpoint` case and
 that case is deliberately empty: an OpenAI images request carries no
@@ -422,10 +429,11 @@ survives a round trip.
 Chat Completions edge and is the primary tested case for the null-content
 tool-call-replay shape (§3.1) and for context-window reporting: it auto-detects
 a model's context window via the LM-Studio-shaped `GET /api/v0/models`
-(`handleLMStudioModels`, `internal/gateway/server.go`), which reports each
-gateway model's `max_context_length` (and, when currently loaded,
-`loaded_context_length`) alongside an LM-Studio `state` (`loaded`/`not-loaded`)
-— metadata only; chat still flows over `/v1/chat/completions`.
+(`handleLMStudioModels`, `internal/gateway/server.go`), which reports, for
+each model offered under `openai` (the names `/v1/models` lists, §9), its
+`max_context_length` (and, when currently loaded, `loaded_context_length`)
+alongside an LM-Studio `state` (`loaded`/`not-loaded`) — metadata only; chat
+still flows over `/v1/chat/completions`.
 
 ## 6. Endpoint modes and native passthrough
 
@@ -577,8 +585,10 @@ flavor is not checked against its list, so a spec narrowed to `["anthropic"]`,
 or stored as `[]`, serves `/v1/chat/completions`, and serves those unjudged
 Responses and Messages requests too. That is how every spec served before
 `openai_images` existed, when this path read no spec flavors at all, and the
-portal chat still offers such models because its listing reads application
-flavors, so enforcing the rule here would silently stop working setups. Nor
+listings' `openai` rule mirrors this path rather than the general rule, so the
+portal chat and `/v1/models` still offer such models
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec));
+enforcing the general rule here would silently stop working setups. Nor
 is the rule's mode half enforced here, since this path has never read the
 endpoint's mode: a spec whose Responses or Messages mode is `disabled` serves
 those unjudged requests as well. Both are recorded debt
@@ -877,11 +887,12 @@ fallback semantics**:
 |---|---|---|
 | `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway"}]}` | `Portal.ModelsForFlavor(token, "openai")` |
 | `GET /anthropic/v1/models` | Anthropic `{"data":[{"id","type":"model","display_name","created_at"}]}` | `Portal.ModelsForFlavor(token, "anthropic")` |
-| `GET /api/v0/models` | LM Studio `{"object":"list","data":[{"id","object":"model","type":"llm","state","max_context_length","loaded_context_length"}]}` | `Portal.Models(token)`, unfiltered by flavor |
+| `GET /api/v0/models` | LM Studio `{"object":"list","data":[{"id","object":"model","type":"llm","state","max_context_length","loaded_context_length"}]}` | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai`, so it lists exactly the names `/v1/models` lists |
 
 `ModelsForFlavor` (`internal/portal/service.go`) returns the sorted gateway
-model names that have at least one **active** mapping whose application
-declares that flavor, filtered to what the calling principal may see under
+model names that have at least one **active** mapping that passes the served
+rule for that flavor (below), or for a group an offerable member that does,
+filtered to what the calling principal may see under
 resource-group provisioning visibility — the list is intentionally **not**
 filtered by a service token's model allowlist (discovery is unrestricted;
 invocation is gated separately, §3/§6). With no routing store configured, all
@@ -904,24 +915,52 @@ an offered alias carries its target's.
 
 **The portal listing carries `openai_images`; `/v1/models` deliberately does
 not.** Every listing keeps only the coarse flavors it knows
-(`knownAPIFlavors`: `anthropic`, `openai`, `openai_images`), so a model whose
-application declares only `openai_images` reaches the portal's model DTO with
+(`knownAPIFlavors`: `anthropic`, `openai`, `openai_images`), so a model that
+is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
 (§12). `/v1/models` asks for `openai` alone, so the same model is **not**
 listed there: that listing is what an external OpenAI client fills its *chat*
-picker from, and an images-only model offered for chat would fail. The
-per-flavor filter behind `/v1/models`, and every listing's `flavors` field,
-read the application's own `api_flavors`, never a `server_agent` spec's
-narrower set; only the portal listing's `image` flag reads the spec as well
-(above). `/api/v0/models` reads the portal
-listing unfiltered by flavor, so it lists an images-only model too.
-`callableModelNames`, the configuration-time guard on a token's model-valued
-settings (the catch-all override and each rule target on a user or service
-token, and the redirect's fallback), unions all three flavors, so any of them
-may name an images-only model: every consumer re-checks the flavor per
-request. A service's model **allowlist** is validated against the portal
-listing instead (`validateServiceAllowedModels`), which lists such a model
-too.
+picker from, and an images-only model offered for chat would fail.
+
+**Every listing's flavors follow the rule dispatch follows.** A model's
+`flavors`, and the per-flavor filter behind `/v1/models` and
+`/anthropic/v1/models`, hold the flavors under which at least one of its
+mappings passes the served rule ([Routing & Model Selection
+§2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither),
+[ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)):
+`openai` when the application declares it and the effective flavors — the
+runtime spec's for a `server_agent` mapping with a spec, the application's
+otherwise — are not images-only, the one check the text translate dispatch
+makes (§6), so a spec of `["anthropic"]` or `[]` stays listed under `openai`;
+`anthropic` when the application and the effective flavors both declare it and
+the effective messages mode is not `disabled`; and `openai_images` when the
+application and the effective flavors both declare it. A group's flavors are
+the union of its offerable members'. So an agent-launched child whose spec is
+`["openai_images"]` carries at most `openai_images`, whatever else its parent
+declares, and appears on neither text listing. When a `server_agent`
+application's spec read fails, its models take the application's flavors and
+messages mode for as long as the read fails (fail-open, like every listing),
+while their `image` stays false. `/api/v0/models` keeps only the portal rows
+whose `flavors` contain `openai` and types each `"llm"`; because the portal
+listing and the per-flavor sets apply the same views, group overlay,
+suppression and override aliases, it lists exactly `/v1/models`' names, groups
+and aliases included.
+
+**A name that no flavor serves keeps its row, with `flavors: []`.** No mapping
+of it, and for a group no offerable member, passes the served rule for any
+flavor — an agent child whose spec lists only `openai_images` under a parent
+that lacks that flavor, say, or an `["anthropic"]` application whose messages
+mode is `disabled`. Its row stays in the portal listing and in `ManageModels`,
+because a service's model **allowlist** is validated against the portal
+listing (`validateServiceAllowedModels`), and hiding the row would break every
+edit of a service whose allowlist names it. `callableModelNames`, the
+configuration-time guard on a token's model-valued settings (the catch-all
+override and each rule target on a user or service token, and the redirect's
+fallback), unions `Callable` over all three flavors: any of them may name an
+images-only model, which every consumer re-checks per request, but none may
+name a model that no flavor serves, which is refused with 400
+`portal.token_model_override_invalid` ([Routing & Model Selection
+§2.1](routing-and-model-selection.md#21-per-token-model-resolution)).
 
 **Per-token override aliases.** A token's model-override rules
 (`requested -> {to, offer, hide_target}`) are also a listing overlay
@@ -952,11 +991,29 @@ keep listing and reach apart are
 [Routing & Model Selection §2.2](routing-and-model-selection.md).
 
 The portal's own **Models** view (`ModelList.tsx`) is the cross-flavor
-counterpart: each row's "APIs" column lists every flavor (`openai`,
-`anthropic`, `openai_images`) the model is currently routable under, alongside
-its loaded state,
-offering servers, context size, and vision capability — one place to see, per
-gateway model name, everything §1–§9 of this chapter routes around.
+counterpart: each row's "Available via" column shows the flavors (`openai`,
+`anthropic`, `openai_images`) the model is **offered** under — its `flavors`,
+minus `openai_images` unless `image` is true, the helper (`offeredFlavors`)
+the chat's picker uses too (§12) — alongside its loaded state, offering
+servers, context size, and vision capability: one place to see, per gateway
+model name, everything §1–§9 of this chapter routes around. A displayed
+`openai_images` therefore means an image request can pass, because the images
+gate refuses a model without `image: yes` with `model_not_capable`, and
+`image` is the same fold as `Capable`. Two kinds of row show no flavor. A model whose
+`flavors` are exactly `["openai_images"]` and whose `image` is false shows a
+muted "no image verdict" note, whose tooltip says that image requests are
+refused until the model — for a group, every member — has an `image: yes`
+verdict. During a capability or runtime-spec read failure the note can also
+show for a model that has one, because `image` fails closed there. A row with
+`flavors: []` shows a "none" warning chip, whose tooltip says the model (for a
+group row, every one of its members) is offered under no API and, for an
+admin, names both places to check: the application's API flavors and modes
+and, for a model the server agent launches, its launch spec; an override
+alias row reads like its target's row. The tooltips are static, because the
+DTO carries no agent-launched marker and no member list. The column's text
+filter matches the displayed label. A name that mixes an image-capable mapping
+with one lacking a verdict hides `openai_images`, although the capable one
+would serve — the same fail-closed AND the chat and the redirect use.
 
 ## 10. Request bodies and size limits
 
@@ -1067,11 +1124,18 @@ A run is registered before its kind is known (the reservation predates
 the run's immutable identity fields.
 
 **The picker offers a model the gateway would serve.** `ChatStore`'s
-`chatModels` keeps a model that carries the `openai` flavor, or one that
-carries `openai_images` **and** `image: true`. The second clause is what makes
-an images-only model — one on an `sd-server` application that declares only
-`openai_images`, whose upstream has no chat endpoint and whose DTO therefore
-carries only that flavor (§9) — selectable at all. The `image` half keeps out
+`chatModels` keeps a model whose **offered** flavors — its `flavors`, minus
+`openai_images` unless `image` is true, the helper the Models view's column
+uses (§9) — include `openai` or `openai_images`; `anthropic` alone is not
+enough, because the chat's text turn is a chat completions request. So it
+keeps a model that carries `openai`, or one that carries `openai_images`
+**and** `image: true`. The second clause is what makes an images-only model
+selectable at all: one on an `sd-server` application that declares only
+`openai_images`, or an agent-launched `sd-server` child whose spec lists only
+that flavor under a parent that declares it too — neither upstream has a chat
+endpoint, and each DTO carries only that flavor, because the listing's flavors
+follow the rule dispatch follows (§9). A model that no flavor serves carries
+none and is not offered at all. The `image` half keeps out
 an `openai_images` model the images gate would refuse, which could not be
 chatted with either: offering it could only produce a request that fails. And
 `image: true` is what makes the thread an image thread, for any model; the

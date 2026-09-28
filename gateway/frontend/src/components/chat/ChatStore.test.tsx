@@ -1802,6 +1802,41 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ChatStoreProvider offered models [${locale}]`, () => {
+    // The chat sends a text request (chat completions) or an image request,
+    // so it offers a model whose offered flavors include openai or
+    // openai_images, and openai_images counts only behind an image verdict.
+    it('offers exactly the models the chat can send a request the gateway serves', async () => {
+      const shape = (id: string, flavors: string[], image?: boolean): ModelOption => ({
+        id,
+        display_name: id,
+        flavors,
+        loading_on_count: 0,
+        image,
+      });
+      renderProvider([], {
+        models: [
+          shape('text-model', ['openai', 'anthropic']),
+          shape('anthropic-only', ['anthropic']),
+          shape('no-flavor', []),
+          shape('sd-verdict', ['openai_images'], true),
+          shape('sd-no-verdict', ['openai_images'], false),
+          // A text model on a mixed application without an image verdict:
+          // offered for its openai flavor.
+          shape('mixed-text', ['openai', 'openai_images'], false),
+          shape('anthropic-images-no-verdict', ['anthropic', 'openai_images'], false),
+          shape('anthropic-images-verdict', ['anthropic', 'openai_images'], true),
+        ],
+      });
+      await waitForReady();
+      // A fresh chat selects no model, so modelOptions is chatModels itself.
+      expect(screen.getByTestId('model').textContent).toBe('');
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'text-model,sd-verdict,mixed-text,anthropic-images-verdict',
+      );
+    });
+  });
+
   describe(`ChatStoreProvider remembers an unavailable model [${locale}]`, () => {
     it('keeps a saved model not in chatModels selected, unavailable, and never re-persists it', async () => {
       chatApi = makeChatApi([

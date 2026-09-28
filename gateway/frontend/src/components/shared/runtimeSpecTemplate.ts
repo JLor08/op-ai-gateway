@@ -15,7 +15,8 @@ export type RuntimeSpecTemplate = {
  * already exposes rather than a passthrough-only guess the operator has to
  * re-derive by hand. Used by the Create form and by Edit of a mapping that has
  * no spec row yet (the retry after a failed Create lands there), so both first
- * writes start from the same values.
+ * writes start from the same values. The Type select's flavor defaults
+ * (specFlavorsAfterTypeSwitch) also judge untouched flavors against it.
  *
  * `openai_images` is left out: it is opt-in on the spec as everywhere else. A
  * server_agent parent declares it for its image children, and copying it

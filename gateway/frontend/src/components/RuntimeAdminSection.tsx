@@ -65,6 +65,14 @@ import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
 import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
+import {
+  formSpecIsStableDiffusion,
+  specFlavorsAfterTypeSwitch,
+  textFlavorsOnStableDiffusion,
+  tickedFlavorMissingOnApplication,
+  type LoadedSpecType,
+  type RuntimeSpecFlavorValues,
+} from './shared/runtimeSpecTypeFlavors';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
@@ -172,6 +180,8 @@ type GpuRow = {
 const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   timeout_ms_below_startup_timeout: 'runtimeTimeoutWarning',
   binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
+  api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
+  api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
 };
 
 // admin_state's three valid wire values (service_runtime.go): "" (no
@@ -2305,6 +2315,17 @@ export function RuntimeAdminSection({
   }, [specFlavorRefusals]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
   const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
+  // The API-variant values a switch of Type to stable_diffusion_cpp replaced,
+  // so a switch back can restore them (specFlavorsAfterTypeSwitch). null when
+  // no such switch happened since the form opened, or after a switch back
+  // restored them.
+  const [specFlavorsBeforeSd, setSpecFlavorsBeforeSd] = useState<RuntimeSpecFlavorValues | null>(
+    null,
+  );
+  // The Type, binary and resolved type of the spec the form was hydrated from,
+  // for the sd flavor hint under Auto (formSpecIsStableDiffusion). null on
+  // Create.
+  const [specLoadedType, setSpecLoadedType] = useState<LoadedSpecType | null>(null);
   // RuntimeSpec Type: the explicit runtime-server kind ('' = auto-detect from
   // `binary`) plus the two per-type probe-path overrides. Mirrors the
   // api_token_mode trio above -- writable state here, the resolved values
@@ -2417,6 +2438,8 @@ export function RuntimeAdminSection({
     setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
+    setSpecFlavorsBeforeSd(null);
+    setSpecLoadedType(null);
   }
 
   function hydrateSpecFields(spec: RuntimeSpec) {
@@ -2470,6 +2493,12 @@ export function RuntimeAdminSection({
     setSpecFirstWrite(!spec.configured);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
+    setSpecFlavorsBeforeSd(null);
+    setSpecLoadedType({
+      type: spec.type,
+      binary: spec.binary,
+      effective_type: spec.effective_type,
+    });
   }
 
   function openCreate() {
@@ -2854,6 +2883,29 @@ export function RuntimeAdminSection({
     setSpecFlavorsTouched(true);
     setSpecFlavorRefusals((count) => count + 1);
     return true;
+  }
+
+  // The Type select's API-variant defaults (specFlavorsAfterTypeSwitch, which
+  // holds the rule): the sd default on a switch to stable_diffusion_cpp, the
+  // replaced values on a switch back, and nothing for values the operator
+  // changed.
+  function applySpecTypeFlavorDefaults(next: RuntimeSpec['type']) {
+    const change = specFlavorsAfterTypeSwitch({
+      from: specType,
+      to: next,
+      current: {
+        apiFlavors: specApiFlavors,
+        responsesMode: specResponsesMode,
+        messagesMode: specMessagesMode,
+      },
+      template: runtimeSpecTemplate(application),
+      remembered: specFlavorsBeforeSd,
+    });
+    if (change === null) return;
+    setSpecApiFlavors(change.values.apiFlavors);
+    setSpecResponsesMode(change.values.responsesMode);
+    setSpecMessagesMode(change.values.messagesMode);
+    setSpecFlavorsBeforeSd(change.remembered);
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -3924,6 +3976,16 @@ export function RuntimeAdminSection({
       argsHaveMetalDevices &&
       agentOsKnown &&
       !isMacOsAgent;
+    // The two flavor warnings of RuntimeWarnings, stated in the form, which
+    // hides the warnings banner while it is open.
+    const showFlavorsNotOnApplication = tickedFlavorMissingOnApplication(
+      specApiFlavors,
+      application.api_flavors,
+    );
+    const showTextFlavorsOnSd = textFlavorsOnStableDiffusion(
+      specApiFlavors,
+      formSpecIsStableDiffusion(specType, binary, specLoadedType),
+    );
     return (
       <>
         <Breadcrumbs
@@ -4016,6 +4078,12 @@ export function RuntimeAdminSection({
               onMessagesModeChange={setSpecMessagesMode}
               onLiveTimingsChange={setSpecLiveTimings}
             />
+            {showFlavorsNotOnApplication && (
+              <Alert severity="warning">{t.runtimeSpecFlavorsNotOnApplicationHint}</Alert>
+            )}
+            {showTextFlavorsOnSd && (
+              <Alert severity="warning">{t.runtimeSpecTextFlavorsOnStableDiffusionHint}</Alert>
+            )}
             <FormControlLabel
               control={
                 <Checkbox checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
@@ -4056,6 +4124,7 @@ export function RuntimeAdminSection({
                 if (next !== '' && healthPath === runtimeSpecHealthPathDefault(specType)) {
                   setHealthPath(runtimeSpecHealthPathDefault(next));
                 }
+                applySpecTypeFlavorDefaults(next);
                 setSpecType(next);
               }}
               sx={{ maxWidth: 340 }}
