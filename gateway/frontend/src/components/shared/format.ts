@@ -83,6 +83,9 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'benchmark.already_running': 'errorBenchmarkAlreadyRunning',
   'benchmark.server_in_use': 'errorBenchmarkServerInUse',
   'benchmark.no_models': 'errorBenchmarkNoModels',
+  // writeBenchmarkError's 500 fallback (gateway/benchmark_endpoints.go): a
+  // store read failed before the run started.
+  'benchmark.request_failed': 'errorBenchmarkRequestFailed',
   // The VRAM benchmark's precondition refusals (409 at the trigger), read
   // verbatim from the Go constants in gateway/benchmark_vram_isolation.go and
   // gateway/benchmark_vram_confidence.go.

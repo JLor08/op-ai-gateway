@@ -523,7 +523,9 @@ func (c *OpenAICompatibleClient) RecordLiveProgressRejection(target routing.Targ
 //     carried them is never retried, so an ordinary 400 keeps its meaning.
 //  2. the failure is of the schema-rejection class: a 400/422 status
 //     (SchemaRejectionStatus) or an in-stream error frame. Never 503, never any
-//     other status.
+//     other status, and never an agent router frame reporting an EnsureRunning
+//     failure (retryableErrorFrame), whose retry would repeat the EnsureRunning
+//     call, a second start of the child included.
 //  3. nothing has been emitted yet -- an explicit boolean set on the first
 //     SUCCESSFUL emit, so the invariant is CHECKED rather than inferred from where
 //     the code happens to sit.
@@ -570,9 +572,14 @@ func (c *OpenAICompatibleClient) CompleteStream(ctx context.Context, target rout
 // completeStreamAttempt performs ONE upstream streaming request and translates its
 // SSE into emit calls. Its first result reports whether the attempt failed the way
 // an upstream that cannot accept the live-progress parameters fails -- a 400/422
-// status, or an in-stream error frame. It is advice, not a verdict: CompleteStream
-// acts on it only under its own three guards, so it can never affect a request
-// that did not carry the parameters or that has already emitted.
+// status, or an in-stream error frame other than an agent router start failure.
+// It is advice, not a verdict: CompleteStream acts on it only under its own three
+// guards, so it can never affect a request that did not carry the parameters or
+// that has already emitted.
+//
+// The context's stream-activity hook (WithStreamActivity), read once here, is
+// called for every SSE comment line as the scanner reaches it. Comments produce
+// no event, so the hook changes nothing about emit or the retry signal.
 func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, target routing.Target, req inference.Request, liveProgress bool, emit StreamEmit) (bool, error) {
 	raw, err := streamRequestBody(target, req, liveProgress)
 	if err != nil {
@@ -595,14 +602,14 @@ func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, targ
 	if rw := CaptureSinkFrom(ctx).ResponseWriter(); rw != nil {
 		streamReader = io.TeeReader(httpResp.Body, rw)
 	}
+	activity := StreamActivityFrom(ctx)
 	scanner := bufio.NewScanner(streamReader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
+		data, ok := streamLineData(strings.TrimSpace(scanner.Text()), activity)
+		if !ok {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
 			break
 		}
@@ -623,20 +630,34 @@ func (c *OpenAICompatibleClient) completeStreamAttempt(ctx context.Context, targ
 	return false, emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: st.usage, FinishReason: st.finishReason})
 }
 
+// streamLineData returns the trimmed payload of an SSE `data:` line and true, or
+// "" and false for every other line. A comment line (one starting with ':', such
+// as the agent router's `: keepalive` heartbeat) is reported to activity first
+// when activity is non-nil; it carries no event either way.
+func streamLineData(line string, activity func()) (string, bool) {
+	if strings.HasPrefix(line, ":") {
+		if activity != nil {
+			activity()
+		}
+		return "", false
+	}
+	data, ok := strings.CutPrefix(line, "data:")
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(data), true
+}
+
 // startStreamRequest builds and sends completeStreamAttempt's upstream HTTP
 // request, recording the request (and, on a 2xx status, the response headers)
-// with the context's capture sink. This is completeStreamAttempt's original
-// inline request-building/sending code, extracted verbatim.
+// with the context's capture sink.
 //
 // Its second result mirrors completeStreamAttempt's own retry signal: true
 // when the response status is in the schema-rejection class
 // (SchemaRejectionStatus). A non-nil *http.Response is returned only on a 2xx
-// status, and only then -- the caller owns closing its Body, exactly as
-// completeStreamAttempt's own `defer httpResp.Body.Close()` did before this
-// was split out: on every other path (a request/transport error, or a
-// non-2xx status), that defer would never have been reached, and here the
-// response body is closed inline instead, at the same point (this function
-// returning) before completeStreamAttempt ever sees it.
+// status, and only then -- the caller owns closing its Body. On every other
+// path (a request/transport error, or a non-2xx status), the response body is
+// closed inline instead, before completeStreamAttempt ever sees it.
 func (c *OpenAICompatibleClient) startStreamRequest(ctx context.Context, target routing.Target, raw []byte) (*http.Response, bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(raw))
 	if err != nil {
@@ -684,10 +705,8 @@ type streamChunkState struct {
 	toolOrder    []int
 }
 
-// streamChunk is one decoded OpenAI-compatible chat-completions SSE chunk.
-// Named (rather than declared inline in applyStreamChunk, as it originally
-// was) purely so applyStreamChunk's helpers below can share the type -- same
-// fields, same JSON tags, same zero values as the original inline struct.
+// streamChunk is one decoded OpenAI-compatible chat-completions SSE chunk, a
+// named type so applyStreamChunk's helpers below can share it.
 type streamChunk struct {
 	Choices []streamChunkChoice `json:"choices"`
 	Usage   *streamChunkUsage   `json:"usage"`
@@ -736,34 +755,68 @@ type streamChunkTimings struct {
 	DraftN             int     `json:"draft_n"`
 }
 
+// streamChunkError is an in-stream error frame's `error` object. Code stays raw
+// JSON: the agent router sends a string (runtime.*) while vLLM sends a number,
+// and a string field would make json.Unmarshal fail on the latter, which drops
+// the whole frame.
 type streamChunkError struct {
-	Message string `json:"message"`
+	Code    json.RawMessage `json:"code"`
+	Message string          `json:"message"`
+}
+
+// routerStartFailureCodes are the agent router's error codes for an
+// EnsureRunning failure: the model is not managed, or its child was refused, not
+// admitted, failed to start or not started in time. The router sends them as an
+// in-stream error frame once its heartbeat has committed a 200, and re-sending
+// the request would repeat the EnsureRunning call, a second start of the child
+// included.
+// runtime.upstream_gone is deliberately absent: it is how the router reports the
+// child's own non-2xx after that commit, a live-progress rejection included.
+var routerStartFailureCodes = map[string]struct{}{
+	"runtime.start_timeout":     {},
+	"runtime.start_failed":      {},
+	"runtime.admission_blocked": {},
+	"runtime.not_permitted":     {},
+	"runtime.model_not_managed": {},
+}
+
+// retryableErrorFrame reports whether an in-stream error frame belongs to the
+// schema-rejection class (CompleteStream's guard 2). Every frame does, except one
+// whose code is a JSON string in routerStartFailureCodes; an absent, null or
+// non-string code is never in that set.
+func retryableErrorFrame(e *streamChunkError) bool {
+	var code string
+	if json.Unmarshal(e.Code, &code) != nil {
+		return true
+	}
+	_, startFailure := routerStartFailureCodes[code]
+	return !startFailure
 }
 
 // applyStreamChunk decodes one SSE `data:` line's JSON payload and applies it
 // to st, emitting any resulting stream events: decode -> compute progress ->
 // terminal usage -> emit deltas -> accumulate tool calls (mergeChunkUsage,
-// chunkProgress and applyChunkChoice below). This is completeStreamAttempt's
-// per-chunk body, extracted verbatim; the scanner loop, its guards, and the
-// retry decision all stay in completeStreamAttempt.
+// chunkProgress and applyChunkChoice below). The scanner loop and its guards
+// stay in completeStreamAttempt, and the retry decision in CompleteStream.
 //
 // Its first result mirrors completeStreamAttempt's own: true when this chunk
-// carried an in-stream error frame (the schema-rejection class -- see
-// CompleteStream's doc comment, guard 2). A non-nil error (whether from that
-// frame or from a failed emit) must be returned by the caller immediately,
-// exactly as the original inline code did; a nil error means "continue
-// scanning", regardless of the decode outcome.
+// carried an in-stream error frame that retryableErrorFrame puts in the
+// schema-rejection class (see CompleteStream's doc comment, guard 2). A non-nil
+// error (whether from that frame or from a failed emit) must be returned by the
+// caller immediately; a nil error means "continue scanning", regardless of the
+// decode outcome.
 func applyStreamChunk(data string, st *streamChunkState, emit StreamEmit) (bool, error) {
 	var chunk streamChunk
 	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 		return false, nil
 	}
 	if chunk.Error != nil {
-		// An in-stream error frame. Reported as retryable too: guard (3) means the
-		// client has seen nothing yet, and some OpenAI-compatible proxies (LiteLLM,
+		// An in-stream error frame. Reported as retryable too, bar the agent
+		// router's start failures (retryableErrorFrame): guard (3) means the client
+		// has seen nothing yet, and some OpenAI-compatible proxies (LiteLLM,
 		// OpenRouter -- reachable behind a llama_swap `peer`) surface a rejected body
 		// as an error EVENT after a 200 rather than as a 400 status.
-		return true, fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
+		return retryableErrorFrame(chunk.Error), fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, chunk.Error.Message)
 	}
 	mergeChunkUsage(st, chunk)
 	progress := chunkProgress(chunk)

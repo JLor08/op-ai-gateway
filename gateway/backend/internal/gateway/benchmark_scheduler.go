@@ -77,7 +77,7 @@ func (s *Server) TriggerScheduledBenchmark(ctx context.Context, server routing.A
 	}
 	// The run outlives this trigger (it executes on a background context that
 	// TryStart's cancel tears down when the run finishes / is released).
-	runCtx, cancel := context.WithCancel(context.Background()) // background (not the scheduler ctx) is intentional so a launched run OUTLIVES a scheduler shutdown, self-terminating via the idle watchdog — mirrors the manual startBenchmark path.
+	runCtx, cancel := context.WithCancel(context.Background()) // background (not the scheduler ctx) is intentional so a launched run OUTLIVES a scheduler shutdown, self-terminating via the stream watchdog — mirrors the manual startBenchmark path.
 	run, ok := s.Benchmarks.TryStart(server.ID, "scheduled", "speed", len(targets), time.Now().UTC(), cancel)
 	if !ok {
 		// A run (a sibling scheduled run or a manual run) is already in flight on this

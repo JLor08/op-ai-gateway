@@ -30,7 +30,7 @@ All backend variables are read through `internal/config/config.go`'s `Load()` (e
 | `OP_AI_GATEWAY_LOG_BUFFER_SIZE` | int | Capacity of the in-memory log ring backing the portal Logs view | `5000` |
 | `OP_AI_GATEWAY_DEFAULT_LANGUAGE` | string | Default UI/session language (`de`/`en`) | `de` |
 | `OP_AI_GATEWAY_THEMES_DIR` | string | Directory of externally supplied theme definitions (one subdirectory per theme id); missing/empty is not an error | `/themes` |
-| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | duration (0 = auto/off) | Idle-stream watchdog timeout for streaming completions; a value parsing to `<= 0` explicitly disables the watchdog | `120s` |
+| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | duration (0 = auto/off) | Idle-stream watchdog timeout for streaming completions; a value parsing to `<= 0` explicitly disables the watchdog on the inference endpoints. The gateway's own benchmark streams (load, context probe, VRAM probe, benchmarks, model warmer) always keep one: for a value `<= 0` they fall back to 2 minutes. Before such a stream's first event, SSE keepalive comments also reset it, up to the first-data budget, the larger of the application's `timeout_ms` and the stream's idle budget (this value, or the 2-minute fallback); that credit needs an idle budget above the agent router's 10 s heartbeat interval ([Compatibility & Inference §7.2](../cross-cutting/compatibility-and-inference.md#72-the-benchmark-stream-watchdog)) | `120s` |
 | `OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT` | duration | Per-probe HTTP timeout for the app-health reachability loop | `3s` |
 | `OP_AI_GATEWAY_SEED_APP_HEALTH_MODE` | string | Test/e2e seam: seeds the mock application's `health_check_mode` directly (e.g. `model_sync`) | `` (default health-path probing) |
 

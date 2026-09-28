@@ -1049,6 +1049,115 @@ func TestCompleteStreamDoesNotRetryAfterTheFirstEmit(t *testing.T) {
 	}
 }
 
+// agentLiveProgressTarget is a server_agent target whose launch spec resolves to
+// llama.cpp, so CompleteStream sends it the live-progress parameters by the shape
+// clause alone, which is the only case in which an error frame can be retried.
+func agentLiveProgressTarget(endpoint string) routing.Target {
+	return routing.Target{
+		Endpoint:             endpoint,
+		Provider:             routing.ProviderServerAgent,
+		LiveProgressSpecType: string(routing.RuntimeSpecTypeLlamaCpp),
+		RouteID:              "map_agent",
+		ProviderModel:        "m",
+		Timeout:              5 * time.Second,
+	}
+}
+
+// routerFrameUpstream stands in for the agent router after its heartbeat has
+// committed a 200: every request gets one keepalive comment and then frame as its
+// only data line. Answering the retry the same way means an unwanted retry is
+// not visible in the result -- both attempts get the identical frame -- only in
+// the recorded request count and in LiveProgressRejected.
+func routerFrameUpstream(frame string) (*liveProgressUpstream, *httptest.Server) {
+	up := &liveProgressUpstream{}
+	server := up.serve(func(w http.ResponseWriter, _ int, _ []byte) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, ": keepalive\n\n")
+		_, _ = io.WriteString(w, "data: "+frame+"\n\n")
+	})
+	return up, server
+}
+
+// TestCompleteStreamDoesNotRetryARouterStartFailureFrame pins the exception to
+// guard (2): the agent router reports an EnsureRunning failure after its
+// heartbeat commit as an error frame with one of five runtime.* string codes, and
+// re-sending the request would repeat the EnsureRunning call, a second start of
+// the child included. Each of them surfaces after exactly one upstream call and
+// records no live-progress rejection, although the parameters were sent and
+// nothing was emitted.
+func TestCompleteStreamDoesNotRetryARouterStartFailureFrame(t *testing.T) {
+	for _, code := range []string{
+		"runtime.start_timeout",
+		"runtime.start_failed",
+		"runtime.admission_blocked",
+		"runtime.not_permitted",
+		"runtime.model_not_managed",
+	} {
+		t.Run(code, func(t *testing.T) {
+			up, server := routerFrameUpstream(`{"error":{"code":"` + code + `","message":"` + code + `"}}`)
+			defer server.Close()
+
+			client := NewOpenAICompatibleClient(server.Client())
+			target := agentLiveProgressTarget(server.URL)
+			err := client.CompleteStream(context.Background(), target, streamTestRequest(), func(inference.StreamEvent) error { return nil })
+			if want := "provider.unavailable: upstream stream error: " + code; !errors.Is(err, ErrUnavailable) || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+			bodies := up.recorded()
+			if len(bodies) != 1 {
+				t.Fatalf("upstream requests = %d, want 1 (a retry would repeat EnsureRunning)", len(bodies))
+			}
+			if !hasLiveProgressParams(t, bodies[0]) {
+				t.Fatal("the attempt did not carry the live-progress parameters, so no retry was possible to begin with")
+			}
+			if client.LiveProgressRejected(target) {
+				t.Fatal("a router start failure was recorded as a live-progress rejection")
+			}
+		})
+	}
+}
+
+// TestCompleteStreamRetriesEveryOtherErrorFrameOnce pins what that exception
+// leaves alone. runtime.upstream_gone is how the router reports the child's own
+// non-2xx after the commit, a live-progress rejection included. vLLM sends a
+// numeric code, which must still decode as an error frame. A frame without a
+// code, with a null one or with another string code is the proxy case the retry
+// exists for. Each is retried once without the parameters; because the stub
+// answers the retry with the same frame, only the recorded request count shows
+// it.
+func TestCompleteStreamRetriesEveryOtherErrorFrameOnce(t *testing.T) {
+	cases := []struct {
+		name    string
+		frame   string
+		message string
+	}{
+		{"router upstream_gone", `{"error":{"code":"runtime.upstream_gone","message":"runtime: upstream returned status 400"}}`, "runtime: upstream returned status 400"},
+		{"numeric code", `{"error":{"code":400,"message":"x"}}`, "x"},
+		{"no code", `{"error":{"message":"boom"}}`, "boom"},
+		{"null code", `{"error":{"code":null,"message":"boom"}}`, "boom"},
+		{"other string code", `{"error":{"code":"invalid_request_error","message":"bad"}}`, "bad"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			up, server := routerFrameUpstream(c.frame)
+			defer server.Close()
+
+			client := NewOpenAICompatibleClient(server.Client())
+			err := client.CompleteStream(context.Background(), agentLiveProgressTarget(server.URL), streamTestRequest(), func(inference.StreamEvent) error { return nil })
+			if want := "provider.unavailable: upstream stream error: " + c.message; !errors.Is(err, ErrUnavailable) || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+			bodies := up.recorded()
+			if len(bodies) != 2 {
+				t.Fatalf("upstream requests = %d, want 2 (one with the parameters, one retry without)", len(bodies))
+			}
+			if !hasLiveProgressParams(t, bodies[0]) || hasLiveProgressParams(t, bodies[1]) {
+				t.Fatal("want the live-progress parameters on the first attempt only")
+			}
+		})
+	}
+}
+
 // TestCompleteStreamMemoizesTheRejectionPerMapping proves the negative-only memo
 // does its job: a genuinely incompatible upstream costs ONE wasted round trip for
 // the mapping, not one per request. The second request skips the parameters

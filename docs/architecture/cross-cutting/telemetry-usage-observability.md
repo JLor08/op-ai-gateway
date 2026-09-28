@@ -2014,7 +2014,17 @@ hold, are what make that retry invisible to the client:
    in-stream error frame (some OpenAI-compatible proxies report a refused body
    as an SSE error event after a 200). Never 503, which means
    `ErrUpstreamStarting` and is consumed by the load runner, and never any
-   other status;
+   other status. Never an agent router frame whose `code` is an
+   `EnsureRunning` failure (`runtime.start_timeout`, `runtime.start_failed`,
+   `runtime.admission_blocked`, `runtime.not_permitted` or
+   `runtime.model_not_managed`, [Agent-Managed Model Runtime
+   §4.3](agent-runtime-manager.md#43-stable-error-codes)) either: the router
+   sends those once its heartbeat has committed a 200, and a retry would
+   repeat the `EnsureRunning` call, a second start of the child included.
+   `runtime.upstream_gone` stays in the class, because it is how the router
+   reports the child's own non-2xx after that commit, including a rejection of
+   the parameters. The frame's `code` is decoded as
+   raw JSON, so a numeric code (vLLM) still counts as an error frame;
 3. nothing has been emitted yet — an explicit boolean set on the first
    *successful* emit, so the invariant is checked rather than inferred from
    where the code sits.

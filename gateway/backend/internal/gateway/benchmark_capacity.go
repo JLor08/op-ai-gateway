@@ -126,8 +126,12 @@ func (s *Server) measureMappingCapacity(ctx context.Context, tgt benchmarkTarget
 	if settle <= 0 {
 		settle = capacityDefaultSettle
 	}
-	// Each level is bounded so a stalled level self-terminates (mirrors the per-call idle
-	// watchdog inside streamOnce). max(app timeout, the always-on benchmark idle default).
+	// Each level is bounded so a stalled level self-terminates: max(app timeout, the always-on
+	// benchmark idle default). It is a parent deadline over the level's streams, each of which
+	// keeps its own watchdog and first-data budget inside streamOnce. A level that runs out
+	// before a stream's own timers passes through that watchdog as the provider's own timeout.
+	// This budget can equal a stream's first-data budget (coldStartBudget), and then a stream
+	// that has produced no data by then may end with either that timeout or a watchdog text.
 	perLevelBudget := time.Duration(tgt.app.TimeoutMS) * time.Millisecond
 	if perLevelBudget < benchmarkDefaultStreamIdle {
 		perLevelBudget = benchmarkDefaultStreamIdle

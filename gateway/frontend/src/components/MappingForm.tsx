@@ -17,7 +17,7 @@ import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/
 import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { useToast } from './shared/ToastProvider';
-import { pollBenchmarkStatus } from './shared/benchmark';
+import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchmark';
 
 /**
  * Everything the mask edits, named exactly like the mapping API's fields so a
@@ -101,6 +101,18 @@ type CapabilityChoice = CapabilityVerdictInput;
 function capabilitySeed(row: PortalModelMapping | null, capability: string): CapabilityChoice {
   const verdict = row?.capabilities?.find((c) => c.capability === capability)?.verdict;
   return verdict === 'yes' || verdict === 'no' ? verdict : '';
+}
+
+/**
+ * The toast for a context probe that did not reach a result. The poll cap
+ * means the probe is still going, so the toast says it is pending; it is still
+ * an error toast, because that one stays until it is closed. A 409
+ * (already_running / server_in_use) and any other poll or network failure get
+ * the shared formatted message.
+ */
+function probeFailureMessage(err: unknown, t: Translation): string {
+  if (err instanceof BenchmarkPollTimeoutError) return t.mappingContextProbePending;
+  return formatPortalError(err, t);
 }
 
 /**
@@ -292,8 +304,7 @@ export function MappingForm({
         );
       }
     } catch (err) {
-      // 409 (already_running / server_in_use) + any poll/network failure land here.
-      if (mountedRef.current) showError(formatPortalError(err, t));
+      if (mountedRef.current) showError(probeFailureMessage(err, t));
     } finally {
       if (mountedRef.current) setProbing(false);
     }

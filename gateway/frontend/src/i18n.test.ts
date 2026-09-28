@@ -689,6 +689,7 @@ describe('model-mapping performance-metric i18n keys', () => {
       'mappingProbeContext',
       'mappingProbeContextRunning',
       'mappingProbeContextFailed',
+      'mappingContextProbePending',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -732,6 +733,7 @@ describe('benchmark i18n keys', () => {
       'errorBenchmarkAlreadyRunning',
       'errorBenchmarkServerInUse',
       'errorBenchmarkNoModels',
+      'errorBenchmarkRequestFailed',
       'benchmarkArea',
       'benchmarkScope',
       'benchmarkScopeServer',
@@ -761,6 +763,7 @@ describe('benchmark i18n keys', () => {
       'modelServerLoadStarted',
       'modelServerLoadSuccess',
       'modelServerLoadError',
+      'modelServerLoadPending',
       'modelServerBusy',
       'modelServerAlreadyRunning',
     ] as const;

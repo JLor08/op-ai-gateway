@@ -18,7 +18,7 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import { makeVisionColumn } from './shared/visionColumn';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
-import { pollBenchmarkStatus } from './shared/benchmark';
+import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchmark';
 import { formatPortalError } from './shared/format';
 
 /**
@@ -293,6 +293,20 @@ function capabilityTooltip(row: ModelServerCapability, t: Translation): string {
   return parts.join(' ');
 }
 
+// The toast for a Load that did not reach a result. The poll cap means the run
+// is still going, so the toast says the load is pending, not that it failed;
+// it is still an error toast, because that one stays until it is closed, while
+// a success toast fades after 4 s and would report an outcome nobody has seen.
+// A 409 (the server is busy / a run is already on it) gets a specific text; any
+// other error gets the shared formatted message.
+function loadFailureMessage(e: unknown, t: Translation): string {
+  if (e instanceof BenchmarkPollTimeoutError) return t.modelServerLoadPending;
+  const code = e instanceof PortalApiError ? e.code : '';
+  if (code === 'benchmark.server_in_use') return t.modelServerBusy;
+  if (code === 'benchmark.already_running') return t.modelServerAlreadyRunning;
+  return formatPortalError(e, t);
+}
+
 export function ModelServersSection({
   t,
   api,
@@ -363,7 +377,8 @@ export function ModelServersSection({
   }, [api, model.id, pollIntervalMs]);
 
   // Load a mapping's model on its server (idle-gated backend). Poll to completion,
-  // then surface success / the run's error / a specific 409 toast.
+  // then surface success / the run's error with its text / a Load that did not
+  // reach a result (loadFailureMessage).
   async function doLoad(row: ModelServerRow) {
     setInFlight((p) => ({ ...p, [row.mapping_id]: true }));
     try {
@@ -372,15 +387,10 @@ export function ModelServersSection({
       const status = await pollBenchmarkStatus(api, row.server_id, { intervalMs: pollIntervalMs });
       const err =
         (status.results ?? []).find((r) => r.mapping_id === row.mapping_id)?.error ?? status.error;
-      if (err) showError(t.modelServerLoadError);
+      if (err) showError(`${t.modelServerLoadError}: ${err}`);
       else showSuccess(t.modelServerLoadSuccess);
     } catch (e) {
-      // A 409 = the server is busy / a run is already on it → a specific toast; any
-      // other error → the shared formatted message.
-      const code = e instanceof PortalApiError ? e.code : '';
-      if (code === 'benchmark.server_in_use') showError(t.modelServerBusy);
-      else if (code === 'benchmark.already_running') showError(t.modelServerAlreadyRunning);
-      else showError(formatPortalError(e, t));
+      showError(loadFailureMessage(e, t));
     } finally {
       if (mountedRef.current) setInFlight((p) => ({ ...p, [row.mapping_id]: false }));
     }

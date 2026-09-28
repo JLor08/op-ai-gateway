@@ -100,8 +100,15 @@ was admitted under this decision rather than amending it
 **Decision:** the inference endpoints lift the 30 s server read/write deadlines and
 bound SSE streams by an inactivity watchdog plus client disconnect, not a total
 cap; a stalled upstream ends with an in-band `stream_idle_timeout` frame.
-**Consequence:** provider `CompleteStream` must not impose its own total deadline
-(the per-target timeout is for non-streaming completion only).
+**Consequence:** provider `CompleteStream` must not impose its own total deadline.
+The per-target timeout (the application's `timeout_ms`) bounds non-streaming
+completion, and on the gateway's own benchmark streams it also sets the
+first-data budget: the larger of `timeout_ms` and the idle budget bounds a
+stream that the upstream keeps alive with SSE comments but that has not yet
+produced an event. That is not a total cap: once the first event arrives only
+the idle watchdog applies, and `CompleteStream` still arms no timer of its own
+([Compatibility & Inference
+§7.2](cross-cutting/compatibility-and-inference.md#72-the-benchmark-stream-watchdog)).
 
 ## ADR-011 — A standalone, CGO-free reporting agent
 **Decision:** telemetry is collected by a separate binary (`op-ai-server-agent`)

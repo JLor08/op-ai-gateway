@@ -12,6 +12,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,22 +67,55 @@ func (p *plainErrProvider) CompleteStream(_ context.Context, _ routing.Target, _
 	return errors.New("boom: not an availability problem")
 }
 
-func shortenColdLoadRetry(t *testing.T, gap, budget time.Duration) {
+// shortenColdLoadRetry shortens the load loop for one test: the retry gap,
+// the 503 wait, and -- because the loop's bound is the larger of that wait and
+// the stream's first-data budget, max(timeout_ms, idle) -- srv's stream idle
+// budget and tgt's timeout_ms too, so the bound is budget.
+func shortenColdLoadRetry(t *testing.T, srv *Server, tgt *benchmarkTarget, gap, budget time.Duration) {
 	t.Helper()
 	oldGap, oldBudget := coldLoadPollGap, coldLoadResidentMaxWait
 	coldLoadPollGap, coldLoadResidentMaxWait = gap, budget
 	t.Cleanup(func() { coldLoadPollGap, coldLoadResidentMaxWait = oldGap, oldBudget })
+	srv.streamIdleTimeout = budget
+	tgt.app.TimeoutMS = int(budget.Milliseconds())
+}
+
+// ensureResidentWithin runs ensureResidentForRun and fails the test when it has
+// not returned within limit, cancelling the run so the loop does not outlive
+// the test. It returns the error and how long the call took.
+func ensureResidentWithin(t *testing.T, srv *Server, tgt benchmarkTarget, limit time.Duration) (time.Duration, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
+	start := time.Now()
+	go func() {
+		_, _, err := srv.ensureResidentForRun(ctx, tgt)
+		done <- outcome{err: err, elapsed: time.Since(start)}
+	}()
+	select {
+	case o := <-done:
+		return o.elapsed, o.err
+	case <-time.After(limit):
+		t.Fatalf("ensureResidentForRun did not return within %v", limit)
+		return 0, nil
+	}
 }
 
 // TestEnsureResidentRetriesColdLoad503: a server that answers 503 three times
 // while loading, then succeeds, must NOT fail the run -- the load is retried
 // until it becomes servable.
 func TestEnsureResidentRetriesColdLoad503(t *testing.T) {
-	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
 	fake := &unavailableThenOKProvider{failFirst: 3}
 	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, 2*time.Second)
 
-	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	_, _, err := srv.ensureResidentForRun(context.Background(), tgt)
 	if err != nil {
 		t.Fatalf("ensureResidentForRun err = %v, want nil (retried past the cold-load 503)", err)
 	}
@@ -92,28 +126,220 @@ func TestEnsureResidentRetriesColdLoad503(t *testing.T) {
 
 // TestEnsureResidentGivesUpAfterColdLoadBudget: an upstream that never leaves
 // 503 still fails -- but only after the budget, and only after it was retried.
+// What it returns at the bound is the last 503 itself.
 func TestEnsureResidentGivesUpAfterColdLoadBudget(t *testing.T) {
-	shortenColdLoadRetry(t, time.Millisecond, 40*time.Millisecond)
 	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
 	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, 150*time.Millisecond)
 
-	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	_, err := ensureResidentWithin(t, srv, tgt, 5*time.Second)
 	if !errors.Is(err, provider.ErrUnavailable) {
 		t.Fatalf("ensureResidentForRun err = %v, want a wrapped provider.ErrUnavailable", err)
+	}
+	if !errors.Is(err, provider.ErrUpstreamStarting) {
+		t.Fatalf("ensureResidentForRun err = %v, want the last 503 (provider.ErrUpstreamStarting)", err)
 	}
 	if fake.calls < 2 {
 		t.Fatalf("CompleteStream calls = %d, want at least 2 (the load was retried before giving up)", fake.calls)
 	}
 }
 
+// TestEnsureResidentBoundIsTheLargerOfWaitAndStreamBudget: the load loop's one
+// bound is max(coldLoadResidentMaxWait, max(timeout_ms, idle)), whichever of
+// the two is larger.
+func TestEnsureResidentBoundIsTheLargerOfWaitAndStreamBudget(t *testing.T) {
+	const bound = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name      string
+		wait      time.Duration
+		timeoutMS int
+	}{
+		{"the stream budget is larger", 40 * time.Millisecond, int(bound.Milliseconds())},
+		{"the 503 wait is larger", bound, 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
+			srv := &Server{Provider: fake}
+			tgt := benchTestTarget()
+			shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, tc.wait)
+			srv.streamIdleTimeout = 100 * time.Millisecond
+			tgt.app.TimeoutMS = tc.timeoutMS
+
+			elapsed, err := ensureResidentWithin(t, srv, tgt, 5*time.Second)
+			if !errors.Is(err, provider.ErrUpstreamStarting) {
+				t.Fatalf("err = %v, want the last 503 (provider.ErrUpstreamStarting)", err)
+			}
+			if elapsed < bound-50*time.Millisecond {
+				t.Fatalf("elapsed = %v, want about the %v bound (the larger of the 503 wait and the stream budget)", elapsed, bound)
+			}
+		})
+	}
+}
+
+// TestEnsureResidentStopsAtTheBoundAfterASleep: when a retry gap's sleep
+// leaves no more than one gap of the bound, the loop returns the last 503
+// instead of starting another attempt. With a 200 ms gap and a 300 ms bound,
+// the one sleep leaves about 100 ms, so exactly one attempt runs.
+func TestEnsureResidentStopsAtTheBoundAfterASleep(t *testing.T) {
+	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
+	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, 200*time.Millisecond, 300*time.Millisecond)
+
+	_, err := ensureResidentWithin(t, srv, tgt, 5*time.Second)
+	if !errors.Is(err, provider.ErrUpstreamStarting) {
+		t.Fatalf("err = %v, want the last 503 (provider.ErrUpstreamStarting)", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("CompleteStream calls = %d, want 1 (the sleep left no more than one gap, so no second attempt)", fake.calls)
+	}
+}
+
+// TestEnsureResidentDoesNotSleepPastTheBound: when an attempt leaves no more
+// than one gap of the bound, the loop returns the last 503 at once instead of
+// sleeping. With a 300 ms gap and a 200 ms bound, the first 503 returns well
+// before one gap has passed.
+func TestEnsureResidentDoesNotSleepPastTheBound(t *testing.T) {
+	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
+	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, 300*time.Millisecond, 200*time.Millisecond)
+
+	elapsed, err := ensureResidentWithin(t, srv, tgt, 5*time.Second)
+	if !errors.Is(err, provider.ErrUpstreamStarting) {
+		t.Fatalf("err = %v, want the last 503 (provider.ErrUpstreamStarting)", err)
+	}
+	if elapsed >= 150*time.Millisecond {
+		t.Fatalf("elapsed = %v, want < 150ms (no sleep once the bound is within one gap)", elapsed)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("CompleteStream calls = %d, want 1", fake.calls)
+	}
+}
+
+// keepaliveAfter503Provider answers failFirst 503s, then holds the stream open
+// with a keepalive every 5 ms through the stream activity hook, never sending
+// data -- an agent router still starting the child. It records whether any
+// attempt carried a context deadline and whether the hook was installed.
+type keepaliveAfter503Provider struct {
+	calls       int
+	failFirst   int
+	sawDeadline bool
+	sawHook     bool
+}
+
+func (p *keepaliveAfter503Provider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
+	return provider.Response{}, nil
+}
+
+func (p *keepaliveAfter503Provider) CompleteStream(ctx context.Context, _ routing.Target, _ inference.Request, _ provider.StreamEmit) error {
+	p.calls++
+	if _, ok := ctx.Deadline(); ok {
+		p.sawDeadline = true
+	}
+	if p.calls <= p.failFirst {
+		return fmt.Errorf("%w: upstream status 503", provider.ErrUpstreamStarting)
+	}
+	hook := provider.StreamActivityFrom(ctx)
+	p.sawHook = hook != nil
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: read stream: %v", provider.ErrUnavailable, ctx.Err())
+		case <-tick.C:
+			if hook != nil {
+				hook()
+			}
+		}
+	}
+}
+
+// firstDataBudgetIn parses the budget out of the watchdog's first-data text.
+func firstDataBudgetIn(t *testing.T, err error) time.Duration {
+	t.Helper()
+	const prefix = "provider.timeout: benchmark stream: no first data within "
+	const suffix = " although the upstream kept the connection alive (max of the application's timeout_ms and the idle budget)"
+	text := ""
+	if err != nil {
+		text = err.Error()
+	}
+	if !strings.HasPrefix(text, prefix) || !strings.HasSuffix(text, suffix) {
+		t.Fatalf("err = %v, want the watchdog's first-data text", err)
+	}
+	budget, perr := time.ParseDuration(strings.TrimSuffix(strings.TrimPrefix(text, prefix), suffix))
+	if perr != nil {
+		t.Fatalf("parse the budget in %q: %v", text, perr)
+	}
+	return budget
+}
+
+// TestEnsureResidentCutsANearBoundAttemptToTheBound: a text attempt started
+// after some 503s gets the first-data budget max(idle, min(budget, remaining)),
+// not the full stream budget, and no context deadline -- so it ends at the
+// loop's bound with the watchdog's own text.
+//
+// The idle budget is 30 keepalive ticks, so a keepalive is never late enough
+// to let the idle timer end the attempt first.
+func TestEnsureResidentCutsANearBoundAttemptToTheBound(t *testing.T) {
+	const budget = time.Second
+	const idle = 150 * time.Millisecond
+	fake := &keepaliveAfter503Provider{failFirst: 3}
+	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, 5*time.Millisecond, 50*time.Millisecond)
+	srv.streamIdleTimeout = idle
+	tgt.app.TimeoutMS = int(budget.Milliseconds())
+
+	_, err := ensureResidentWithin(t, srv, tgt, 5*time.Second)
+	if fake.sawDeadline {
+		t.Fatalf("an attempt carried a context deadline, want only the watchdog's timers")
+	}
+	if !fake.sawHook {
+		t.Fatalf("the near-bound attempt had no stream activity hook, want its keepalives credited")
+	}
+	if !errors.Is(err, provider.ErrTimeout) {
+		t.Fatalf("err = %v, want the watchdog's provider.ErrTimeout", err)
+	}
+	got := firstDataBudgetIn(t, err)
+	if got >= budget || got <= idle {
+		t.Fatalf("attempt budget = %v, want the remaining bound: below the %v stream budget and above the %v idle", got, budget, idle)
+	}
+	if fake.calls != 4 {
+		t.Fatalf("CompleteStream calls = %d, want 4 (three 503s, then the attempt the watchdog ended)", fake.calls)
+	}
+}
+
+// TestLoadAttemptBudget: the stream budget, cut to the remaining bound, never
+// below idle.
+func TestLoadAttemptBudget(t *testing.T) {
+	const budget, idle = 10 * time.Minute, 2 * time.Minute
+	for _, tc := range []struct {
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{15 * time.Minute, budget},
+		{5 * time.Minute, 5 * time.Minute},
+		{time.Minute, idle},
+		{-time.Second, idle},
+	} {
+		if got := loadAttemptBudget(budget, idle, tc.remaining); got != tc.want {
+			t.Errorf("loadAttemptBudget(%v, %v, %v) = %v, want %v", budget, idle, tc.remaining, got, tc.want)
+		}
+	}
+}
+
 // TestEnsureResidentDoesNotRetryGenuineError: a non-availability error is
 // returned immediately, unretried, so a real failure is never masked as loading.
 func TestEnsureResidentDoesNotRetryGenuineError(t *testing.T) {
-	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
 	fake := &plainErrProvider{}
 	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, 2*time.Second)
 
-	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	_, _, err := srv.ensureResidentForRun(context.Background(), tgt)
 	if err == nil {
 		t.Fatalf("ensureResidentForRun err = nil, want the genuine error")
 	}
@@ -130,11 +356,12 @@ func TestEnsureResidentDoesNotRetryGenuineError(t *testing.T) {
 // bad model name / crashed server would be retried for the whole budget, and a
 // mid-load OOM crash would be re-driven into a loop.
 func TestEnsureResidentDoesNotRetryNon503Unavailable(t *testing.T) {
-	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
 	fake := &unavailable404Provider{}
 	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, 2*time.Second)
 
-	_, _, err := srv.ensureResidentForRun(context.Background(), benchTestTarget())
+	_, _, err := srv.ensureResidentForRun(context.Background(), tgt)
 	if !errors.Is(err, provider.ErrUnavailable) {
 		t.Fatalf("err = %v, want a wrapped provider.ErrUnavailable (the 404)", err)
 	}
@@ -149,13 +376,14 @@ func TestEnsureResidentDoesNotRetryNon503Unavailable(t *testing.T) {
 // TestEnsureResidentReturnsCtxErrorOnCancel: a cancelled run returns ctx.Err(),
 // not a stale 503, even mid-retry.
 func TestEnsureResidentReturnsCtxErrorOnCancel(t *testing.T) {
-	shortenColdLoadRetry(t, time.Millisecond, 2*time.Second)
 	fake := &unavailableThenOKProvider{failFirst: 1 << 30} // always 503
 	srv := &Server{Provider: fake}
+	tgt := benchTestTarget()
+	shortenColdLoadRetry(t, srv, &tgt, time.Millisecond, 2*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, err := srv.ensureResidentForRun(ctx, benchTestTarget())
+	_, _, err := srv.ensureResidentForRun(ctx, tgt)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled (a cancelled run must not report the stale 503)", err)
 	}
