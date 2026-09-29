@@ -97,6 +97,18 @@ describe('formatPortalError', () => {
     expect(formatPortalError(err, messages.de)).toContain(messages.de.errorRequestBodyTooLarge);
     expect(formatPortalError(err, messages.en)).toContain(messages.en.errorRequestBodyTooLarge);
   });
+
+  // A benchmark starter's 500 (writeBenchmarkError's fallback) renders its own
+  // label, not the server's bare "benchmark request failed".
+  it('labels a benchmark starter 500 as benchmark.request_failed, in both locales', () => {
+    const err = new PortalApiError(500, 'benchmark.request_failed', 'benchmark request failed');
+    expect(formatPortalError(err, messages.de)).toBe(
+      `benchmark.request_failed: ${messages.de.errorBenchmarkRequestFailed}`,
+    );
+    expect(formatPortalError(err, messages.en)).toBe(
+      `benchmark.request_failed: ${messages.en.errorBenchmarkRequestFailed}`,
+    );
+  });
 });
 
 describe('errorLabelByCode (whole-map invariants)', () => {
@@ -187,6 +199,52 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         .slice()
         .sort(),
     );
+  });
+
+  /**
+   * The benchmark starters' own codes other than the VRAM ones above, pinned
+   * as LITERALS for the same reason: the whole-map invariants cannot catch a
+   * code STRING drifting from the backend's, and an unmapped code reaches the
+   * toast as the raw English the server sent.
+   *
+   * Declared in Go as `codeBenchmarkAlreadyRunning` and
+   * `codeBenchmarkServerInUse` (`internal/gateway/benchmark_endpoints.go`),
+   * as the `portal.ErrBenchmarkNoModels` sentinel's row in `benchmarkErrRows`
+   * there, and as `writeBenchmarkError`'s 500 fallback code
+   * (`benchmark.request_failed`), which a starter answers when a store read
+   * fails before the run starts.
+   *
+   * The starters also answer three other codes that this list leaves out on
+   * purpose, because no portal action can trigger them:
+   * `benchmark.mode_invalid` and `benchmark.scope_invalid`
+   * (`parseBenchmarkMode`, `benchmark_endpoints.go`), since the scope is fixed
+   * by the URL path and the mode comes from the portal's own fixed selector;
+   * and `benchmark.not_found`, since every store read behind
+   * `writeBenchmarkError` folds a missing row into `mapping.not_found` (or the
+   * application/server equivalent) before it can return `store.ErrNotFound`.
+   */
+  const benchmarkWireCodes = [
+    'benchmark.already_running',
+    'benchmark.server_in_use',
+    'benchmark.no_models',
+    'benchmark.request_failed',
+  ] as const;
+
+  it('carries every non-VRAM benchmark code a portal action can receive, by its exact wire string', () => {
+    for (const code of benchmarkWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    // Both directions: a `benchmark.*` code outside the VRAM prefix added to
+    // the map without being named here fails too.
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('benchmark.') && !code.startsWith('benchmark.vram_'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(benchmarkWireCodes.slice().sort());
   });
 
   /**

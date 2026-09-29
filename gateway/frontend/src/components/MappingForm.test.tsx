@@ -48,11 +48,18 @@ const idle: BenchmarkStatus = {
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
 
-  function renderForm(opts: { appNameReadOnly?: boolean; row?: PortalModelMapping | null } = {}) {
+  function renderForm(
+    opts: {
+      appNameReadOnly?: boolean;
+      row?: PortalModelMapping | null;
+      contextProbePath?: string;
+      benchmarkStatus?: () => Promise<BenchmarkStatus>;
+    } = {},
+  ) {
     const submitted: MappingFormValues[] = [];
     const api = {
       activeBenchmarks: vi.fn(async () => []),
-      benchmarkStatus: vi.fn(async () => idle),
+      benchmarkStatus: vi.fn(opts.benchmarkStatus ?? (async () => idle)),
       probeMappingContext: vi.fn(async () => idle),
     } as unknown as Pick<PortalApi, 'activeBenchmarks' | 'benchmarkStatus' | 'probeMappingContext'>;
     const view = (nextRow: PortalModelMapping | null) => (
@@ -61,7 +68,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           t={t}
           api={api}
           serverId="srv_1"
-          contextProbePath=""
+          contextProbePath={opts.contextProbePath ?? ''}
           row={nextRow}
           appNameReadOnly={opts.appNameReadOnly}
           busy={false}
@@ -349,6 +356,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         screen.queryByRole('checkbox', { name: t.mappingVisionCapable }),
       ).not.toBeInTheDocument();
       expect(screen.queryByRole('checkbox', { name: t.mappingIsMtp })).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`MappingForm context probe [${locale}]`, () => {
+    it('says the probe is still pending, not failed, when the status poll reaches its cap', async () => {
+      // The run never ends while the real poller runs to its cap.
+      renderForm({
+        contextProbePath: '/props',
+        benchmarkStatus: async () => ({ ...idle, running: true }),
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.mappingProbeContext }));
+
+      expect(
+        await screen.findByText(t.mappingContextProbePending, undefined, { timeout: 5000 }),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('benchmark poll timed out')).toBeNull();
+    });
+
+    it('reports a status-poll failure as the error it is, not as pending', async () => {
+      renderForm({
+        contextProbePath: '/props',
+        benchmarkStatus: async () => {
+          throw new Error('network down');
+        },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.mappingProbeContext }));
+
+      expect(await screen.findByText('network down')).toBeInTheDocument();
+      expect(screen.queryByText(t.mappingContextProbePending)).toBeNull();
     });
   });
 

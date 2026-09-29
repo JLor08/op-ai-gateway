@@ -600,6 +600,8 @@ const de = {
   mappingProbeContext: 'Kontextgröße ermitteln',
   mappingProbeContextRunning: 'Wird ermittelt…',
   mappingProbeContextFailed: 'Kontextgröße konnte nicht ermittelt werden',
+  mappingContextProbePending:
+    'Die Ermittlung der Kontextgröße dauert länger als erwartet; starte sie erneut, sobald der Server wieder frei ist.',
   runtimeAdmin: 'Agent-gesteuerte Runtime',
   runtimeSpecs: 'Runtime-Spezifikationen',
   runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
@@ -1284,6 +1286,8 @@ const de = {
   modelServerLoadStarted: 'Ladevorgang gestartet',
   modelServerLoadSuccess: 'Modell geladen',
   modelServerLoadError: 'Laden fehlgeschlagen',
+  modelServerLoadPending:
+    'Das Laden dauert länger als erwartet; prüfe den Status des Modells später in der Liste.',
   modelServerBusy: 'Der Server ist gerade in Verwendung',
   modelServerAlreadyRunning: 'Auf diesem Server läuft bereits ein Vorgang',
   syncModels: 'Modelle abgleichen',
@@ -1356,6 +1360,8 @@ const de = {
   errorBenchmarkServerInUse:
     'Der Server wird gerade verwendet; bitte erneut versuchen, wenn er frei ist.',
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
+  errorBenchmarkRequestFailed:
+    'Der Lauf konnte nicht gestartet werden: Beim Lesen der gespeicherten Konfiguration ist ein interner Fehler aufgetreten. Bitte erneut versuchen.',
   // Die vier Absagen des VRAM-Benchmarks. Jede nennt eine Bedingung, unter der
   // die versprochene Isolierung durch keinen gateway-seitigen Schreibvorgang
   // erreichbar ist -- deshalb eine Absage statt eines abgeschwächten Laufs.
@@ -3067,6 +3073,8 @@ const en: PortalMessages = {
   mappingProbeContext: 'Determine context size',
   mappingProbeContextRunning: 'Determining…',
   mappingProbeContextFailed: 'Could not determine context size',
+  mappingContextProbePending:
+    'Determining the context size is taking longer than expected; run it again once the server is free.',
   runtimeAdmin: 'Agent-managed runtime',
   runtimeSpecs: 'Runtime specs',
   runtimeSpecEdit: 'Edit runtime spec',
@@ -3687,6 +3695,8 @@ const en: PortalMessages = {
   modelServerLoadStarted: 'Load started',
   modelServerLoadSuccess: 'Model loaded',
   modelServerLoadError: 'Load failed',
+  modelServerLoadPending:
+    "The load is taking longer than expected; check the model's status in the list later.",
   modelServerBusy: 'The server is currently in use',
   modelServerAlreadyRunning: 'An operation is already running on this server',
   syncModels: 'Sync models',
@@ -3757,6 +3767,8 @@ const en: PortalMessages = {
   errorBenchmarkAlreadyRunning: 'A benchmark is already running on this server.',
   errorBenchmarkServerInUse: 'The server is in use; try again when idle.',
   errorBenchmarkNoModels: 'No models to benchmark.',
+  errorBenchmarkRequestFailed:
+    'The run could not be started: an internal error occurred while reading the stored configuration. Please try again.',
   // The VRAM benchmark's four refusals. Each names a condition under which the
   // isolation the run promises cannot be achieved by any gateway-side write,
   // which is why it refuses rather than degrading.

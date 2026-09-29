@@ -738,9 +738,11 @@ write — so a stalled real socket (as opposed to an idle *upstream*) is still
 caught, without needing a second timer. **No provider `CompleteStream`
 implementation applies a total deadline of its own** (`internal/provider/ollama.go`,
 `internal/provider/openai_compatible.go`): only `Complete` (the non-streaming
-path) wraps `ctx` in `context.WithTimeout(target.Timeout)`; a stream's only
-cancellation source is the caller's idle watchdog or the client's own
-disconnect.
+path) wraps `ctx` in `context.WithTimeout(target.Timeout)`; a stream is
+cancelled only by its caller or by the client's own disconnect. The caller's
+cancellation sources are the idle watchdog above, a benchmark stream's own
+watchdog (§7.2), and any deadline or cancellation on the caller's own context,
+such as a capacity level's budget or the model warmer's 60 s ceiling.
 
 `/v1/images/generations` sits entirely on the *other* side of that split: it
 pins `Stream` to `false`, so it always takes the buffered branch and is bounded
@@ -770,8 +772,9 @@ path, and the distinctions below are the reason the
   `timeout_ms` as an idle timeout leads to the wrong remedy for every cold-load
   report.
 - **Streaming requests are bounded by the idle watchdog above.** On the
-  *translate* path the client sees a 200 followed by a terminal
-  `provider.stream_idle_timeout` frame; the *native* path failing before headers
+  *translate* path the client sees a 200 followed by a terminal idle-timeout
+  frame (`provider.stream_idle_timeout` on Chat Completions and Responses, an
+  Anthropic `error` event on Messages); the *native* path failing before headers
   reports `502 provider.unavailable`, which is **mislabelled** — a separate fix.
 
 Four secondary traps on the same path are still live and explain field symptoms
@@ -780,40 +783,117 @@ whose causes are elsewhere than where they appear:
 | Trap | Field symptom |
 |---|---|
 | The application health probe has a **3 s** timeout and flips a *blocking* application unreachable after **one** failed cycle. | A server drops out of routing entirely if that is its only application — and can then never warm up. |
-| The benchmark's own **120 s** watchdog. | A model that loads in more than ~2 minutes never records a `load_time_ms`. |
+| The benchmark streams' idle budget (**120 s** by default) ends a silent cold load on an upstream that sends nothing before its first event; behind the agent router, whose `: keepalive` comments count until then, the bound is the larger of the application's `timeout_ms` and the idle budget (§7.2). | On such an upstream, a model that loads in more than ~2 minutes never records a `load_time_ms`. |
 | `warmCallTimeout` is hardcoded at **60 s**, defeating climb-up warming for large models (spun off as a separate fix). | Large models are never warmed. |
 | Swap-protection routes a concurrent same-model request to a **second server**. | The same model is loaded twice. |
 
-Because `timeout_ms` is a total deadline, the **`server_agent` application type
-defaults it to 600000 ms (10 minutes)** instead of the stock 30000 — at 30000
-every cold managed-model load fails reproducibly. The **`stable_diffusion_cpp`**
-type defaults to the same 600000 ms for its own reason: an image request is one
-buffered call governed by this total alone (§3.4), a 512x512 generation
-measured about 17 s, and the server's own limits permit far larger ones.
+Because `timeout_ms` is a total deadline on a non-streaming request, the
+**`server_agent` application type defaults it to 600000 ms (10 minutes)**
+instead of the stock 30000. At 30000 every non-streaming request that meets a
+cold managed-model load longer than 30 s fails reproducibly, and a benchmark
+stream (the Load's included) gets no keepalive credit against the default
+120 s idle budget, so its silent cold start ends at that budget (§7.2). The
+**`stable_diffusion_cpp`** type defaults to the same 600000 ms for its own
+reason: an image request is one buffered call governed by this total alone
+(§3.4), a 512x512 generation measured about 17 s, and the server's own limits
+permit far larger ones.
 `normalizeApplicationTimeoutMS(appType, timeoutMS)` preserves any non-zero value
 and maps zero to the type's default, so the default is re-applied on a retype and
 when an update sends `timeout_ms: 0`; note the ordering dependency, that
 `UpdateApplication` calls it **after** assigning the new type, so a single PATCH
 that both retypes to `server_agent` and sets `timeout_ms: 0` gets the *new*
-type's 600000. Normalising that value back to 30000 "for consistency" breaks
-every cold load. The portal additionally warns when an application's `timeout_ms`
-does not exceed the largest `startup_timeout_seconds` among its enabled
+type's 600000. Normalising that value back to 30000 "for consistency" brings
+both failures back. The portal additionally warns when an application's `timeout_ms`
+is below the largest `startup_timeout_seconds` among its enabled
 mappings — **the agent runtime alone does not heal the 30 s case**, because the
 gateway's timer keeps running while the agent's router holds the request.
 
 The agent's router emits SSE keepalive comments during a silent streaming window,
-which re-arms the **native passthrough** watchdog (byte-based) and nginx's timer,
-but **not** the translate path's watchdog (event-based, and its scanner skips SSE
-comment lines) and **not** the non-streaming total deadline. The real gateway-side
-fix — deadlines computed from measured `load_time_ms` and
-`prompt_tokens_per_second` × a prompt estimate, using the authoritative
-loaded-state the agent now provides, plus benchmark-watchdog decoupling and the
-double-load vector — is deliberately deferred to a later routing-integration
-sub-project.
+which re-arms the **native passthrough** watchdog (byte-based), nginx's timer
+and, up to a bound, the **benchmark streams'** watchdog (§7.2), but **not** the
+translate path's watchdog (event-based, and its scanner skips SSE comment lines)
+and **not** the non-streaming total deadline. Whether a live translate stream
+actually breaks off on a cold start behind the router has not been measured
+([Risks & Technical Debt
+§11.1](../11-risks-and-technical-debt.md#111-operational-risks)). The real
+gateway-side fix for live requests — deadlines computed from measured
+`load_time_ms` and `prompt_tokens_per_second` × a prompt estimate, using the
+authoritative loaded-state the agent now provides, plus the double-load vector —
+is deliberately deferred to a later routing-integration sub-project.
 
 **Immediate operator relief, independent of that work:** raise `timeout_ms` on
 applications serving large models, and raise `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`
 — at the cost of detecting genuine hangs later.
+
+### 7.2 The benchmark stream watchdog
+
+The streams the gateway sends straight to a provider, outside the inference
+endpoints — the load run, the context probe, the VRAM probe, the speed,
+capacity and vision benchmarks, the cold pass's sibling swap and the model
+warmer — go through one watchdog helper, `watchBenchmarkStream`
+(`internal/gateway/benchmark_stream_watchdog.go`), behind `streamOnce` and
+`streamCollect` (`internal/gateway/benchmark_runner.go`). Such a stream has no
+client whose disconnect could end it, so the helper is always on. It works
+with two timers:
+
+- **The idle timer** runs for `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, or for
+  2 minutes (`benchmarkDefaultStreamIdle`) when that is `0` or negative, and
+  every event the provider emits resets it, as on the translate path.
+- **The first-data timer** runs for the first-data budget, the larger of the
+  target's `Timeout` (the application's `timeout_ms`) and the idle budget. It is
+  armed only when that budget exceeds the idle budget: by default 600 s for a
+  `server_agent` or `stable_diffusion_cpp` application, while a stock
+  application's 30000 ms, against the default 120 s idle budget, leaves the
+  budget at the idle budget and arms nothing.
+  While it is armed and nothing has been emitted, every SSE comment line (the
+  router's `: keepalive`, reported by the provider through
+  `provider.WithStreamActivity`) also resets the idle timer. The first emitted
+  event stops the first-data timer and ends that credit. From then on only
+  events count, which matches the router: it sends no keepalive once the
+  child's first byte flows. When the budget equals the idle budget, a comment
+  counts for nothing, exactly as on the translate path.
+
+So a stream that produces data has no total cap, and a stream that only
+keepalives hold open ends at the budget
+([ADR-010](../09-architecture-decisions.md#adr-010--streaming-idle-watchdog--lifted-deadlines-no-total-cap)).
+That also bounds a start queued with `admission_wait_timeout_seconds: 0`, which
+the router heartbeats with no end of its own. The credit needs an idle budget
+above the router's 10 s heartbeat interval; with a smaller one the idle timer
+fires between two keepalives. Only the OpenAI-compatible client reports comment
+lines: an Ollama stream is NDJSON and gets no credit.
+
+The helper maps its own two timers to errors that wrap `provider.ErrTimeout`:
+
+| Text | When |
+|---|---|
+| `provider.timeout: benchmark stream: no data for <idle> (OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT)` | the idle timer fired, or the first-data timer fired before any keepalive was credited |
+| `provider.timeout: benchmark stream: no first data within <budget> although the upstream kept the connection alive (max of the application's timeout_ms and the idle budget)` | the first-data timer fired after at least one credited keepalive |
+
+For a Load or VRAM-probe attempt, `<budget>` in that second row can be less than
+max(timeout_ms, idle budget): the load loop (below) cuts each attempt's
+first-data budget to what remains of its own bound, so the printed duration
+can be shorter than the parenthetical's formula while the parenthetical still
+names it.
+
+A cancellation from outside the helper comes back as the provider reported it:
+a capacity level's own budget and the warmer's 60 s ceiling (`warmCallTimeout`)
+still end their streams on their own terms.
+
+**The load core bounds its whole retry loop with one deadline.**
+`ensureResidentForRun`, which the load run and the VRAM probe share, retries a
+503 (`ErrUpstreamStarting`) in `loadUntilServable`
+(`internal/gateway/load_runner.go`) until the larger of 5 minutes
+(`coldLoadResidentMaxWait`) and the first-data budget has passed: 10 minutes at
+the 600000 ms default. Each attempt gets the first-data budget cut to what
+remains of that deadline, but never less than the idle budget, so an attempt
+started near the deadline can overrun it by at most one idle budget. Once no
+more than one retry gap remains, the loop returns the last 503. Neither of the
+helper's two errors is retried. The run holds the server's benchmark
+reservation for as long as it waits: the server is excluded from routing, and
+its launch-spec writes are refused, so `admission_wait_timeout_seconds` cannot
+be changed until the run ends, and a lower `timeout_ms` applies only to the
+next run. A `force_stopped` spec, which the router answers with an immediate
+503, keeps a Load retrying until the deadline.
 
 ## 8. Provider clients
 
@@ -1465,7 +1545,7 @@ for what the limiter reads.
 
 | Env var | Default | Governs |
 |---|---|---|
-| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | `120s` | idle-inactivity watchdog for all streaming/native-passthrough responses (§7); `0`/negative disables it |
+| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | `120s` | idle-inactivity watchdog for all streaming/native-passthrough responses (§7); `0`/negative disables it there. The gateway's own benchmark streams fall back to 2 minutes instead, and wait for their first event up to the larger of the application's `timeout_ms` and their idle budget while the upstream sends keepalive comments (§7.2) |
 
 See [Configuration](configuration.md) for the full variable list.
 

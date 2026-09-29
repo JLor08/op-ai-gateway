@@ -16,14 +16,28 @@ export type BenchmarkPollOptions = {
   maxPolls?: number;
 };
 
+/**
+ * The poll cap was reached while the run was still going. The run has not
+ * ended and may still succeed or fail, so a caller can say that instead of
+ * reporting a failure. A burst of fetch errors rejects with the fetch error,
+ * not with this.
+ */
+export class BenchmarkPollTimeoutError extends Error {
+  constructor() {
+    super('benchmark poll timed out');
+    this.name = 'BenchmarkPollTimeoutError';
+  }
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * Poll the per-server benchmark status until the run finishes (running===false)
  * or the safety cap is reached. A transient fetch error is swallowed and polling
- * continues, up to MAX_CONSECUTIVE_ERRORS in a row; exceeding that — or hitting
- * the poll cap — rejects so the caller can surface a failure toast. Resolves with
- * the final status (so the caller can toast a summary + refresh the metrics).
+ * continues until MAX_CONSECUTIVE_ERRORS fail in a row, which rejects with the
+ * last fetch error; hitting the poll cap rejects with a BenchmarkPollTimeoutError.
+ * Resolves with the final status (so the caller can toast a summary + refresh
+ * the metrics).
  */
 export async function pollBenchmarkStatus(
   api: Pick<PortalApi, 'benchmarkStatus'>,
@@ -44,5 +58,5 @@ export async function pollBenchmarkStatus(
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) throw err;
     }
   }
-  throw new Error('benchmark poll timed out');
+  throw new BenchmarkPollTimeoutError();
 }

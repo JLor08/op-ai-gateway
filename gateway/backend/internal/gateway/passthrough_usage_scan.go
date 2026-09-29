@@ -736,8 +736,8 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // so it tracks the true end of the stream). Never over the whole request — that
 // would fold in queueing and prompt processing and stop being the same
 // quantity every other surface in this feature reports. The arithmetic mirrors
-// streamOnce in benchmark_runner.go:113-118 (output tokens / generation
-// seconds).
+// streamOnceWithin's wall-clock fallback in benchmark_runner.go (output tokens /
+// generation seconds).
 //
 // The fallback additionally requires an AUTHORITATIVE TERMINAL usage frame
 // (isTerminalUsageFrame). An output-token count on its own is not enough:

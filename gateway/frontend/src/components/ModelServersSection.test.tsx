@@ -349,6 +349,96 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(await screen.findByText(t.modelServerLoadSuccess)).toBeInTheDocument();
     });
 
+    it("names the run's own error in the failure toast", async () => {
+      const loadModel = vi
+        .fn()
+        .mockResolvedValue({ running: true, server_id: 'srv-c' } as BenchmarkStatus);
+      const benchmarkStatus = vi.fn().mockResolvedValue({
+        running: false,
+        server_id: 'srv-c',
+        results: [
+          {
+            mapping_id: 'map-c',
+            error:
+              'provider.timeout: benchmark stream: no data for 2m0s (OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT)',
+          },
+        ],
+      } as unknown as BenchmarkStatus);
+      const { api } = makeApi({ loadModel, benchmarkStatus } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      fireEvent.click(await loadItem());
+
+      expect(
+        await screen.findByText(
+          `${t.modelServerLoadError}: provider.timeout: benchmark stream: no data for 2m0s (OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT)`,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("falls back to the run-level error in the failure toast when the row's result has none", async () => {
+      const loadModel = vi
+        .fn()
+        .mockResolvedValue({ running: true, server_id: 'srv-c' } as BenchmarkStatus);
+      const benchmarkStatus = vi.fn().mockResolvedValue({
+        running: false,
+        server_id: 'srv-c',
+        results: [],
+        error: 'provider.unavailable: upstream status 404',
+      } as unknown as BenchmarkStatus);
+      const { api } = makeApi({ loadModel, benchmarkStatus } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      fireEvent.click(await loadItem());
+
+      expect(
+        await screen.findByText(
+          `${t.modelServerLoadError}: provider.unavailable: upstream status 404`,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('says the load is still pending, not failed, when the status poll reaches its cap', async () => {
+      const loadModel = vi
+        .fn()
+        .mockResolvedValue({ running: true, server_id: 'srv-c' } as BenchmarkStatus);
+      // The run never ends while the real poller runs to its cap.
+      const benchmarkStatus = vi
+        .fn()
+        .mockResolvedValue({ running: true, server_id: 'srv-c' } as BenchmarkStatus);
+      const { api } = makeApi({ loadModel, benchmarkStatus } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      fireEvent.click(await loadItem());
+
+      expect(
+        await screen.findByText(t.modelServerLoadPending, undefined, { timeout: 5000 }),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('benchmark poll timed out')).toBeNull();
+    });
+
+    it('reports a status-poll failure as the error it is, not as pending', async () => {
+      const loadModel = vi
+        .fn()
+        .mockResolvedValue({ running: true, server_id: 'srv-c' } as BenchmarkStatus);
+      const benchmarkStatus = vi.fn().mockRejectedValue(new Error('network down'));
+      const { api } = makeApi({ loadModel, benchmarkStatus } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      fireEvent.click(await loadItem());
+
+      expect(await screen.findByText('network down')).toBeInTheDocument();
+      expect(screen.queryByText(t.modelServerLoadPending)).toBeNull();
+    });
+
     it('surfaces a busy toast when the server is in use (409)', async () => {
       const loadModel = vi
         .fn()

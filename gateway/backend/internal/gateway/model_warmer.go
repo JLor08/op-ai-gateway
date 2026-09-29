@@ -21,8 +21,10 @@ const (
 	warmCooldown = 60 * time.Second
 	// warmCallTimeout is the absolute ceiling on the whole background warm (resolve + probe
 	// + load stream). A warm runs on context.Background (it has no client to end it), so a
-	// wedged upstream MUST NOT hang the goroutine forever. streamOnce is additionally
-	// idle-watchdog-bounded; this is the outer bound.
+	// wedged upstream MUST NOT hang the goroutine forever. streamOnce is additionally bounded
+	// by the benchmark stream watchdog; this is the outer bound. It ends a cold start that
+	// outlasts it even when streamOnce's first-data budget (coldStartBudget) is larger, and
+	// the watchdog passes that cancellation through as the provider's own timeout.
 	warmCallTimeout = 60 * time.Second
 )
 
@@ -143,9 +145,9 @@ func (w *modelWarmer) warmOnce(name string) {
 		}
 	}
 
-	// Force the load. streamOnce attaches the per-app upstream credential, runs an always-on
-	// idle watchdog, and goes DIRECT to the provider — so it records NO usage/billing and never
-	// registers in Active. The result is discarded (best-effort load-ahead).
+	// Force the load. streamOnce attaches the per-app upstream credential, runs the always-on
+	// benchmark stream watchdog, and goes DIRECT to the provider — so it records NO usage/billing
+	// and never registers in Active. The result is discarded (best-effort load-ahead).
 	if _, _, err := s.streamOnce(ctx, streamer, target, req); err != nil {
 		slog.Debug("model warm: load stream failed", "model", name, "err", err)
 	}

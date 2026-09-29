@@ -27,14 +27,18 @@ var errBenchmarkNoStreaming = errors.New("benchmark: provider does not support s
 // importable here).
 const benchmarkMaxContextSize = 100_000_000
 
-// benchmarkDefaultStreamIdle bounds each benchmark streaming call when the edge
-// idle timeout (s.streamIdleTimeout) is disabled. A benchmark run has NO client to
-// end it (it executes on context.Background), so the watchdog must ALWAYS be on:
-// otherwise a stalled upstream (a cold model load/swap that never emits) would hang
-// streamOnce forever, so run.finish() (deferred in runBenchmark) never runs, so the
-// server stays flagged busy and is permanently excluded from routing. Generous
-// because the watchdog resets on EVERY event, so only a true stall (no event for
-// this long) trips it — a slow-but-progressing cold load is not killed.
+// benchmarkDefaultStreamIdle is the idle budget of each benchmark streaming call
+// when the edge idle timeout (s.streamIdleTimeout) is disabled
+// (benchmarkStreamIdle). A benchmark run has NO client to end it (it executes on
+// context.Background), so the watchdog must ALWAYS be on: otherwise a stalled
+// upstream (a cold model load/swap that never emits) would hang streamOnce
+// forever, so run.finish() (deferred in runBenchmark) never runs, so the server
+// stays flagged busy and is permanently excluded from routing. The idle timer
+// resets on every event, but an SSE comment counts only before the first event
+// and only when the stream's first-data budget (coldStartBudget) exceeds idle. So
+// a cold start that emits nothing is bounded by that budget while the upstream
+// keeps the connection alive, and by idle when it goes silent
+// (watchBenchmarkStream).
 const benchmarkDefaultStreamIdle = 2 * time.Minute
 
 // benchmarkPrompts are the fixed prompts a run issues per mapping. Small + bounded so
@@ -82,29 +86,22 @@ type benchmarkTarget struct {
 // (output tokens / seconds from first token to completion) into usage.TokensPerSecond.
 // Note: there is NO wall-clock fallback for PromptPerSecond (prefill rate) — an
 // upstream that reports no timings leaves it unknown (0).
+//
+// The stream runs under the benchmark stream watchdog (watchBenchmarkStream) with
+// the target's first-data budget, coldStartBudget.
 func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClient, target routing.Target, req inference.Request) (time.Duration, inference.Usage, error) {
-	// A benchmark run outlives the trigger request (context.Background), so bound each
-	// streaming call with an idle watchdog: if no event arrives within `idle`, cancel —
-	// otherwise a stalled upstream (the cold-load case a benchmark provokes) would hang
-	// forever and leave the server permanently busy/excluded from routing. Any event
-	// (progress) resets the timer, so a slow-but-progressing cold load is not killed.
-	// Attach the target application's per-app upstream credential (fail-open).
-	ctx = s.upstreamAuthCtx(ctx, target)
-	idle := s.streamIdleTimeout
-	if idle <= 0 {
-		idle = benchmarkDefaultStreamIdle // ALWAYS on for benchmarks, even if the edge idle is disabled
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	watchdog := time.AfterFunc(idle, cancel)
-	defer watchdog.Stop()
+	return s.streamOnceWithin(ctx, streamer, target, req, coldStartBudget(target, s.benchmarkStreamIdle()))
+}
 
+// streamOnceWithin is streamOnce with an explicit first-data budget for the
+// watchdog. The load loop (loadUntilServable) calls it directly, to cut an
+// attempt's budget to what remains of the loop's own bound.
+func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.StreamingClient, target routing.Target, req inference.Request, budget time.Duration) (time.Duration, inference.Usage, error) {
 	start := time.Now()
 	var firstAt time.Time
 	var gotFirst bool
 	var usage inference.Usage
-	streamErr := streamer.CompleteStream(ctx, target, req, func(ev inference.StreamEvent) error {
-		watchdog.Reset(idle) // progress resets the stall timer
+	streamErr := s.watchBenchmarkStream(ctx, streamer, target, req, budget, func(ev inference.StreamEvent) error {
 		switch ev.Type {
 		case inference.StreamEventTextDelta:
 			if !gotFirst && (ev.Text != "" || ev.Reasoning != "") {
@@ -137,10 +134,8 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 	// at all, so one implausible benchmark sample would replace the routing value the
 	// scorer and a model group's MinTokensPerSecond gate read outright, with nothing
 	// to average it back out.
-	if usage.TokensPerSecond == 0 && usage.OutputTokens > 0 && gotFirst {
-		if window := end.Sub(firstAt); window >= minGatewayRateWindow {
-			usage.TokensPerSecond = float64(usage.OutputTokens) / window.Seconds()
-		}
+	if usage.TokensPerSecond == 0 && gotFirst {
+		usage.TokensPerSecond = flooredRate(usage.OutputTokens, end.Sub(firstAt))
 	}
 	return ttft, usage, nil
 }
@@ -391,20 +386,11 @@ func visionImageMessages(mode string, dataURL string) []inference.Message {
 }
 
 // streamCollect issues one streaming request and returns the concatenated text
-// deltas. Same idle-watchdog/auth bounding as streamOnce.
+// deltas. Same watchdog (watchBenchmarkStream), first-data budget and upstream
+// credential as streamOnce.
 func (s *Server) streamCollect(ctx context.Context, streamer provider.StreamingClient, target routing.Target, req inference.Request) (string, error) {
-	ctx = s.upstreamAuthCtx(ctx, target)
-	idle := s.streamIdleTimeout
-	if idle <= 0 {
-		idle = benchmarkDefaultStreamIdle
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	watchdog := time.AfterFunc(idle, cancel)
-	defer watchdog.Stop()
 	var sb strings.Builder
-	err := streamer.CompleteStream(ctx, target, req, func(ev inference.StreamEvent) error {
-		watchdog.Reset(idle)
+	err := s.watchBenchmarkStream(ctx, streamer, target, req, coldStartBudget(target, s.benchmarkStreamIdle()), func(ev inference.StreamEvent) error {
 		if ev.Type == inference.StreamEventTextDelta {
 			sb.WriteString(ev.Text)
 		}
@@ -436,9 +422,10 @@ var (
 	// a VRAM/load benchmark provokes by design (it isolates the target and then
 	// asks for it cold). A large model can take minutes to become servable, so
 	// this is generous; a genuinely stuck upstream still fails, just after the
-	// budget rather than on the first probe. A var so tests can shorten it. A
-	// blocking-but-progressing load is bounded separately by streamOnce's own idle
-	// watchdog and never reaches this loop.
+	// budget rather than on the first probe. A var so tests can shorten it. The
+	// loop's bound is the larger of this and the stream's first-data budget
+	// (loadUntilServable), and a load that blocks instead of answering 503 is
+	// bounded by the stream watchdog of its attempt (watchBenchmarkStream).
 	coldLoadResidentMaxWait = 5 * time.Minute
 	// coldLoadCallTimeout is a defensive per-call bound for the loaded-probe and the unload
 	// when the app carries no positive Timeout — so a wedged upstream can NEVER hang the
@@ -740,7 +727,7 @@ func (s *Server) runContextProbe(ctx context.Context, run *benchmarkRun, serverI
 		s.Benchmarks.publish(serverID, run.snapshot())
 	}()
 	// 1) Warm-load: stream a tiny request so the model becomes resident (llama-swap/llama.cpp load
-	//    on first request). Reuses the idle-watchdog-bounded streamOnce.
+	//    on first request). Reuses streamOnce and its watchdog (watchBenchmarkStream).
 	streamer, ok := s.Provider.(provider.StreamingClient)
 	if !ok {
 		res.Error = errBenchmarkNoStreaming.Error()

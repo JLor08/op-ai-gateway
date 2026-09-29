@@ -318,21 +318,31 @@ const (
 	defaultApplicationAffinityTTLSeconds = 1800
 	defaultApplicationHealthCheckPath    = "/v1/health"
 	// defaultServerAgentTimeoutMS is the TimeoutMS default for
-	// routing.ProviderServerAgent applications. Application.TimeoutMS is a
-	// TOTAL request deadline: it starts when the provider adapter is entered
-	// and is never reset by upstream activity, covering the dial, the request
-	// write, the silent wait for response headers, and the full body read. An
-	// agent-managed runtime's very first request for a cold model must wait
-	// for that model process to start and load, which for a large model can
-	// take minutes -- with the stock 30s default every cold start would
-	// reproducibly fail with 502 provider.timeout.
+	// routing.ProviderServerAgent applications. For a non-streaming request
+	// Application.TimeoutMS is a TOTAL request deadline: it starts when the
+	// provider adapter is entered and is never reset by upstream activity,
+	// covering the dial, the request write, the silent wait for response
+	// headers, and the full body read. An agent-managed runtime's very first
+	// request for a cold model must wait for that model process to start and
+	// load, which for a large model can take minutes -- with the stock 30s
+	// default every cold start would reproducibly fail with 502
+	// provider.timeout. It also sets a benchmark stream's first-data budget
+	// (a Load, the context and VRAM probes, a benchmark, the model warmer):
+	// such a stream may wait max(TimeoutMS, the benchmark stream idle budget:
+	// the stream idle timeout, or 2 minutes when it is disabled) for its
+	// first data while the upstream keeps the connection alive
+	// (gateway.coldStartBudget), within any outer bound of its caller (the
+	// model warmer's own 60s ceiling ends a warm first).
 	defaultServerAgentTimeoutMS = 600000
 	// defaultStableDiffusionTimeoutMS is the TimeoutMS default for
 	// ProviderStableDiffusionCpp, for the same reason as the server_agent
-	// value above: TimeoutMS is a TOTAL request deadline. A 512x512
-	// generation measured ~17s against a real sd-server, and that server's own
-	// reported limits permit 4096x4096, which is far slower. With the stock
-	// 30s default an ordinary image request fails as 502 provider.timeout.
+	// value above: for a non-streaming (image) request, TimeoutMS is a TOTAL
+	// request deadline. A 512x512 generation measured ~17s against a real
+	// sd-server, and that server's own reported limits permit 4096x4096,
+	// which is far slower. With the stock 30s default an ordinary image
+	// request fails as 502 provider.timeout. Its benchmark streams take
+	// their first-data budget from TimeoutMS the same way as server_agent's
+	// above.
 	defaultStableDiffusionTimeoutMS = 600000
 )
 

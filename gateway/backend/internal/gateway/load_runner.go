@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strings"
@@ -75,47 +76,72 @@ func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) 
 	if resident {
 		return true, probed, nil
 	}
-	// The run just cleared the target's stop, so this is a genuine cold load. A
-	// server that answers 503 WHILE it is still loading -- the behaviour of
-	// llama-swap and other single-slot swappers, which this benchmark provokes by
-	// design -- would otherwise fail the whole run on the first probe. Retry the
-	// load until it becomes servable, the cold-load budget elapses, or the run is
-	// cancelled.
-	//
-	// The predicate is DELIBERATELY narrow: ONLY provider.ErrUpstreamStarting (a
-	// 503) is retried. Every other failure returns at once -- a 4xx (bad model
-	// name / auth), a refused connection or a mid-load crash (a VRAM benchmark
-	// pushing the ceiling is exactly where an OOM crash happens; re-driving the
-	// load would loop the crash), and streamOnce's own idle-watchdog cancellation
-	// of a genuinely hung stream. Only a live server explicitly reporting "still
-	// loading" waits.
+	if err := s.loadUntilServable(ctx, streamer, target, req); err != nil {
+		return false, probed, err
+	}
+	s.reflectLoadedAfterLoad(ctx, target, tgt)
+	return false, probed, nil
+}
+
+// loadUntilServable streams req until the model serves it, for a model that is
+// not (known to be) resident: the VRAM run has just cleared the target's stop,
+// and a Load found the model not loaded or could not tell. A server that
+// answers 503 WHILE it is still loading -- the behaviour of llama-swap and
+// other single-slot swappers, which this benchmark provokes by design --
+// would otherwise fail the whole run on the first probe. So the load is
+// retried until it becomes servable, the loop's bound runs out, or the run is
+// cancelled.
+//
+// The predicate is DELIBERATELY narrow: ONLY provider.ErrUpstreamStarting (a
+// 503) is retried. Every other failure returns at once -- a 4xx (bad model
+// name / auth), a refused connection or a mid-load crash (a VRAM benchmark
+// pushing the ceiling is exactly where an OOM crash happens; re-driving the
+// load would loop the crash), and the stream watchdog's provider.ErrTimeout
+// for an attempt that stalled or produced no data within its budget. Only a
+// live server explicitly reporting "still loading" waits.
+//
+// ONE bound covers the whole loop: the larger of coldLoadResidentMaxWait and
+// the stream's first-data budget (coldStartBudget), so an application whose
+// timeout_ms allows a longer cold start than the 503 wait gets the longer of
+// the two. An attempt carries no context deadline of its own; its first-data
+// budget is cut to what remains of the bound instead (loadAttemptBudget), so
+// only the watchdog's two timers can end it and its error text says which.
+// When no more than one retry gap of the bound remains, the loop returns the
+// last 503 instead of sleeping or starting another attempt.
+func (s *Server) loadUntilServable(ctx context.Context, streamer provider.StreamingClient, target routing.Target, req inference.Request) error {
 	gap := coldLoadPollGap
 	if gap <= 0 {
 		gap = 100 * time.Millisecond // never busy-spin
 	}
-	deadline := time.Now().Add(coldLoadResidentMaxWait)
+	idle := s.benchmarkStreamIdle()
+	budget := coldStartBudget(target, idle)
+	deadline := time.Now().Add(max(coldLoadResidentMaxWait, budget))
 	for {
-		if _, _, streamErr := s.streamOnce(ctx, streamer, target, req); streamErr != nil {
-			if !errors.Is(streamErr, provider.ErrUpstreamStarting) {
-				return false, probed, streamErr
-			}
-			if ctx.Err() != nil {
-				return false, probed, ctx.Err()
-			}
-			if !time.Now().Before(deadline) {
-				return false, probed, streamErr
-			}
-			select {
-			case <-ctx.Done():
-				return false, probed, ctx.Err()
-			case <-time.After(gap):
-			}
-			continue
+		_, _, err := s.streamOnceWithin(ctx, streamer, target, req, loadAttemptBudget(budget, idle, time.Until(deadline)))
+		if !errors.Is(err, provider.ErrUpstreamStarting) {
+			return err // nil once the model served, or a failure the loop does not wait out
 		}
-		break
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Until(deadline) <= gap {
+			return err
+		}
+		if !sleepCtx(ctx, gap) {
+			return ctx.Err()
+		}
+		if time.Until(deadline) <= gap {
+			return err
+		}
 	}
-	s.reflectLoadedAfterLoad(ctx, target, tgt)
-	return false, probed, nil
+}
+
+// loadAttemptBudget is one load attempt's first-data budget: the stream's
+// budget, cut to what remains of the load loop's bound, and never below idle.
+// A budget at or below idle arms no first-data timer, so an attempt started
+// near the bound can overrun it by at most one idle budget.
+func loadAttemptBudget(budget, idle, remaining time.Duration) time.Duration {
+	return max(idle, min(budget, remaining))
 }
 
 // modelResident best-effort reports whether tgt's upstream model is already

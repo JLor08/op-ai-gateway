@@ -78,11 +78,15 @@ the constraint set this feature is built around. The relevant facts are recorded
 in [API Compatibility & Inference](compatibility-and-inference.md); the two that
 shape the design are:
 
-- **`Application.timeout_ms` is a total request deadline, never reset by
-  upstream activity.** A cold load longer than the stock 30 s therefore fails
-  reproducibly with `502 provider.timeout`. This is why the `server_agent`
-  application type defaults `timeout_ms` to 600000 (10 minutes) — a value a
-  later "consistency" cleanup must not normalise back.
+- **`Application.timeout_ms` is a total deadline on a non-streaming request,
+  never reset by upstream activity.** A non-streaming request that meets a cold
+  load longer than the stock 30 s therefore fails reproducibly with
+  `502 provider.timeout`. On the gateway's own benchmark streams, the Load among
+  them, it sets the first-data budget, and at 30 s against the default 120 s
+  idle budget that grants no heartbeat credit: a silent cold start there ends
+  at the idle budget ([§12](#12-the-timeout-budget)). This is why the
+  `server_agent` application type defaults `timeout_ms` to 600000 (10 minutes)
+  — a value a later "consistency" cleanup must not normalise back.
 - **The application health probe flips an application unreachable after a single
   failed 3 s cycle.** A model server that blocks its health endpoint during a
   cold load therefore drops out of routing and can never warm up again. Escaping
@@ -94,10 +98,14 @@ cold load — a silent window with no bytes — not a separate problem, which is
 the router's streaming heartbeats (§4.4) cover both phases.
 
 The gateway-side remedies that need routing intelligence — deadlines computed
-from measured `load_time_ms` and prompt-token rate, benchmark-watchdog
-decoupling, and the cross-server double-load fix — are deliberately deferred to
-a later routing-integration sub-project. This feature contributes the
-authoritative loaded-state that work will consume.
+from measured `load_time_ms` and prompt-token rate, and the cross-server
+double-load fix — are deliberately deferred to a later routing-integration
+sub-project. This feature contributes the authoritative loaded-state that work
+will consume. The gateway's own benchmark streams need none of it: until their
+first event, the router's heartbeats keep them alive up to the larger of the
+application's `timeout_ms` and the idle budget ([§12](#12-the-timeout-budget)).
+A live translate stream gets no such credit ([Risks & Technical Debt
+§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 ## 3. Authority: the gateway specifies, the AI server permits
 
@@ -4429,7 +4437,13 @@ wire enum on this screen, runtime states included.
 
 **`timeout_ms_below_startup_timeout`** — the application's request `timeout_ms`
 is below the largest `startup_timeout_seconds` among its **enabled** specs, so
-the gateway's request deadline expires before a cold load can finish.
+the gateway can give up on a cold start the agent would still let finish, in
+two places. A non-streaming request hits its total deadline. The
+Load and the other benchmark streams end with `provider.timeout` at their
+first-data budget at the latest, the larger of `timeout_ms` and the idle budget
+([§12](#12-the-timeout-budget)), and a Load does not retry that timeout. The
+budget, too, stays below the startup timeout unless the idle budget reaches
+it, which the 120 s idle default does not against the 180 s startup default.
 
 **`binary_path_os_mismatch`** — a spec's `binary` is absolute for the *other*
 platform than the GOOS this server's agent reports in its telemetry (a `C:\…`
@@ -5760,8 +5774,8 @@ consistent if configured together.
 
 | Bound | Where | Default | Covers |
 |---|---|---|---|
-| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent` and `stable_diffusion_cpp` (30000 elsewhere) | **Total** request deadline, never reset by upstream activity. |
-| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s | Idle watchdog on streaming responses. |
+| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent` and `stable_diffusion_cpp` (30000 elsewhere) | **Total** deadline of a non-streaming request, never reset by upstream activity. On the gateway's own benchmark streams it also sets the first-data budget (below). |
+| `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s (2 min on a benchmark stream when set to `0` or less) | Idle watchdog on streaming responses. On a benchmark stream the router's heartbeats also reset it until the first event, up to the first-data budget (below). |
 | `spec.admission_wait_timeout_seconds` | Agent, per spec | `0` = until the client disconnects | Queueing for a slot. |
 | `spec.startup_timeout_seconds` | Agent, per spec | 180 (floored at 30 when unset) | Process start until first green health probe. |
 | `spec.health_timeout_seconds` | Agent, per spec | 5 (agent falls back to 2 when unset) | One health probe. |
@@ -5779,18 +5793,31 @@ table, exists because the gateway's total deadline keeps running while the
 agent's router holds the request: **the agent runtime alone does not heal the
 30 s case.**
 
-Streaming heartbeats (§4.4) re-arm two of the three consumers that matter, and
-the honest limits are worth stating rather than presenting heartbeats as the
-general cold-load fix:
+Streaming heartbeats (§4.4) re-arm some of the timers on this path and not
+others, and the honest limits are worth stating rather than presenting
+heartbeats as the general cold-load fix:
 
 - **They do help** the gateway's native passthrough path — the path Codex and
   Claude Code use — whose idle watchdog is byte-based, and nginx's own 3600 s
   timer.
+- **They help the gateway's own benchmark streams, up to a bound.** The load
+  run, the context probe, the VRAM probe, the speed, capacity and vision
+  benchmarks, and the sibling swap of the speed benchmark's cold pass count
+  every SSE comment line as a sign of life until the first event, but only up
+  to the **first-data budget**: the larger of `timeout_ms` and the idle
+  budget, 600 s by default for `server_agent`. A child still silent after that
+  ends the stream with `provider.timeout`. There is no credit
+  when `timeout_ms` does not exceed the idle budget, and the credit needs an
+  idle budget above the 10 s heartbeat interval. A Load retries a 503 until the
+  larger of 5 minutes and that budget, 10 minutes by default, and holds the
+  server's benchmark reservation all the while. The model warmer gets the same
+  credit but stays under its own 60 s ceiling ([Compatibility & Inference
+  §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)).
 - **They do not help** the gateway's *translate*-path idle watchdog, whose reset
   is event-based and whose scanner skips SSE comment lines.
 - **They do not help the non-streaming total deadline at all.**
 
-The remedy for the other two is the deferred routing-integration work: deadlines
+The remedy for the last two is the deferred routing-integration work: deadlines
 computed from measured load time and prompt-token rate. Immediate operator
 relief, independent of this feature: raise `timeout_ms` on applications serving
 large models, and raise `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` — at the cost of
