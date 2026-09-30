@@ -1269,10 +1269,13 @@ admission phase leaves a warm-but-slow model looking dead to the client.
 
 `POST /ensure/{model}` (§4.1) gets no heartbeat at all. It is not a stream, and
 a heartbeat would commit a 200 before the outcome is known, which is the one
-thing its caller reads. It is one silent call instead, which is safe because no
-hop between the gateway and the router arms an idle or read timer: not the
-gateway's transport, not the agent's TLS proxy, not the router's own server.
-The non-streaming proxy path holds a cold start the same way.
+thing its caller reads. It is one silent call instead. That is safe as long as
+no hop between the gateway and the router arms an idle or read timer shorter
+than the wait, and none of the bundled hops does: not the gateway's transport,
+not the agent's TLS proxy, not the router's own server. The non-streaming proxy
+path holds a cold start the same way. A proxy an operator adds in between cuts
+either call when its timeout is shorter
+([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 `Accept-Encoding` is stripped from the outbound request so the transport can
 negotiate and transparently decompress; forwarding it would splice gzip bytes
@@ -6080,8 +6083,11 @@ heartbeats as the general cold-load fix:
   §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)). An
   images-only Load or VRAM probe streams nothing: each attempt is one bodiless
   `POST /ensure/{model}` (§4.1), held under that same loop deadline, the router
-  sends no heartbeat on it, and no hop between the gateway and the router has
-  an idle timer for its silence to trip ([§11.9](#119-manual-runs-on-an-images-only-mapping)).
+  sends no heartbeat on it, and none of the bundled hops between the gateway
+  and the router has an idle timer for its silence to trip
+  ([§11.9](#119-manual-runs-on-an-images-only-mapping)); a proxy an operator
+  adds in between must allow that silence
+  ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 - **They do not help** the gateway's *translate*-path idle watchdog, whose reset
   is event-based and whose scanner skips SSE comment lines.
 - **They do not help the non-streaming total deadline at all.**
