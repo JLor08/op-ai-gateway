@@ -186,7 +186,12 @@ export function MappingSection({
       label: t.runBenchmark,
       icon: <SpeedIcon fontSize="small" />,
       onClick: () =>
-        setBenchmarkScope({ kind: 'mapping', id: row.id, name: row.gateway_model_name }),
+        setBenchmarkScope({
+          kind: 'mapping',
+          id: row.id,
+          name: row.gateway_model_name,
+          applicationId: row.application_id,
+        }),
     },
     {
       key: 'toggle',

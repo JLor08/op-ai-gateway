@@ -78,6 +78,7 @@ export const vramWarnings = [
   'post_transport_agent',
   'undeclared_gpu_allocation',
   'residency_unknown',
+  'first_generation_not_measured',
 ] as const;
 export type VramWarning = (typeof vramWarnings)[number];
 
@@ -128,6 +129,7 @@ const warningLabelKeys: Readonly<Record<VramWarning, MessageKey>> = {
   post_transport_agent: 'benchmarkVramWarningPostTransport',
   undeclared_gpu_allocation: 'benchmarkVramWarningUndeclaredGpu',
   residency_unknown: 'benchmarkVramWarningResidencyUnknown',
+  first_generation_not_measured: 'benchmarkVramWarningFirstGenerationNotMeasured',
 };
 
 // Which field IDENTIFIED the card at measurement time -- a record of what the

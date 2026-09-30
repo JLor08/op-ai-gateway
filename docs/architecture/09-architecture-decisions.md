@@ -2236,9 +2236,14 @@ flavors E, its responses and messages modes (M is the messages mode) and its
 live-timings flag: the spec's for a `server_agent` application with a spec row
 for the mapping — a stored `[]` counts as a spec, and `Enabled` is ignored —
 and the application's otherwise. `targetFrom` builds its `Target` from it, and
-`targetIsImagesOnly` and `Server.mappingIsImagesOnly` (the warmer's and the
-benchmark scheduler's check) call the moved `FlavorsAreImagesOnly`, so the
-precedence exists once and neither background job changes behaviour.
+`targetIsImagesOnly`, the warmer's check (`Server.mappingIsImagesOnly`) and the
+benchmark scheduler's (`mappingSpecIsImagesOnly`, over the spec it reads with
+`mappingRuntimeSpec`) call the moved `FlavorsAreImagesOnly`, so the
+precedence exists once and neither background job changes behaviour. The
+operator's manual runs read the same rule (`mappingSpecIsImagesOnly`), and so do
+the model-server row's `load_refusal` and the mapping DTO's `images_only`,
+which show the runs' decision in the portal
+([ADR-046](#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
 Images-only keeps its definition: the list names `openai_images` and neither
 `openai` nor `anthropic`, so an empty list is never images-only. With A the
 application's flavors, the rule has a **flavor half** (`MappingHasAPIFlavor`)
@@ -2463,3 +2468,178 @@ for it, it contradicts Ollama's verdicts, and the column already hides an
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [HTTP API Surface
 §1](reference/api-surface.md#1-inference--compatibility-endpoints).
+
+## ADR-046 — A request-scoped router ensure route: start a managed child without forwarding a request
+**Context:** the Load run and the VRAM benchmark share one load core
+(`ensureResidentForRun`), and it loads **by generating**: one `max_tokens: 1`
+chat stream, so a backend that allocates its KV cache lazily has done so before
+anything is measured. Behind the agent router that stream is also what starts
+the child: the router starts it and then forwards the request to it. An
+agent-launched `sd-server` child answers `POST /v1/chat/completions` with 404
+and an empty body (measured), so a Load of it failed while the child it had
+just started stayed up (issue #161). The context probe, the VRAM probe and the
+speed, capacity and vision benchmarks sent the same child a chat prompt too;
+only the benchmark scheduler and the model warmer skipped it
+([ADR-045](#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec) (a)). The router had no way to start a child
+except by forwarding a request that names it.
+
+**Decision (a): the router grows `POST /ensure/{model}`, which starts a managed
+child and forwards nothing.** The gateway sends no body, and any body a caller
+sends anyway is read and discarded, never forwarded: net/http notices a client
+that leaves only once the handler has read the body to its end, so an unread
+body would keep a departed caller's place in the queue. A body over the router's
+32 MiB bound gets 413 `runtime.request_too_large`, as on model routing, before
+anything starts. `{model}` is the decoded path after `/ensure/` — the spec's
+`upstream_model`, which is the mapping's `app_model_name` — so an id that
+contains `/` works; the gateway builds the path with `ExpandModelPath`, which
+escapes each segment and keeps `/`. Any other method on the path falls through
+to model routing, as on the GET-only control routes. The handler calls
+`EnsureRunning` on the request's own context and answers through the router's
+existing code table: 404 `runtime.model_not_managed` (an unknown model, an
+empty one, or no manager), 503 `runtime.admission_blocked` (a force-stopped
+spec, or a start the admission gates refused), 504 `runtime.start_timeout`,
+502 `runtime.start_failed` or `runtime.not_permitted`, and 502
+`runtime.upstream_gone` for any other failure, such as the manager shutting
+down. On success it calls
+`release()` at once and then, only if the client is still connected, refreshes
+the write deadline and writes 200 `{"status":"running"}`. There is no heartbeat
+and no new error code: the route is one long call. That is safe because no hop
+between the gateway and the router arms an idle or read timer — not the
+gateway's transport, not the agent's TLS proxy, not the router's server — and
+it is how the non-streaming proxy path already holds a cold start. The agent
+waits up to the spec's `startup_timeout_seconds`, plus
+`admission_wait_timeout_seconds` when that is above 0; at 0, which queues until
+the client disconnects, the gateway's deadline is the bound. A caller that
+disconnects while still queued drops its place, and nothing starts. A start
+already under way still comes up and counts as a use — `lastUsed` is set and
+nothing is in flight — so the idle policy applies to it as after any inference
+request.
+
+**The bodiless shape is the safety net for an older router.** An agent without
+the route treats `POST /ensure/{model}` as an ordinary proxied request, and
+model routing answers a request whose body names no model with 404
+`runtime.model_not_managed` before it calls `EnsureRunning`. So the route starts
+nothing on an agent that predates it, even if a gateway sent it there. A body
+naming the model would have made the same request start the child on such an
+agent and forward it as inference.
+
+**It fits ADR-026, and ADR-037 is left as it was.** The start is scoped to the
+request, persists nothing and travels on the data plane, like the inference
+request that starts a cold child today; `admin_state`, `force_running` and
+`pinned` are untouched, so desired state stays the only control channel
+([ADR-026](#adr-026--gatewayagent-control-is-desired-state-not-commands)). The
+route is not under `/upstream/`, whose allowlist ADR-037 limits to a GET of
+`/props` that never starts or keeps alive a child
+([ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token));
+that allowlist is unchanged. Exposure is unchanged too: the router
+authenticates nothing ([Agent-Managed Model Runtime
+§4.6](cross-cutting/agent-runtime-manager.md#46-the-bind-host-is-operator-controlled)),
+and a POST whose body names the model already starts its child.
+
+**(b) The gateway sends the route only to an agent that declares it.** The agent
+declares `runtime_ensure` on its own list only (`Since: "0.8.0"`, a MINOR bump
+from `0.7.4`), and the gateway reads it off the agent's sample
+(`s.AgentFeatures.Has(server.ID, runtimeEnsureFeature)`) without declaring it
+back ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)).
+Without the name, an images-only Load or VRAM probe is refused with 409
+`benchmark.agent_ensure_unsupported` before anything reaches the agent. Its
+label names `runtime_ensure`, an agent 0.8.0 or newer, and an agent that has not
+reported since the gateway restarted, because the gateway holds the declared
+set in memory. A newer agent under an older gateway simply never receives the
+route.
+
+**(c) Only the Load and the VRAM probe of an images-only `server_agent` mapping
+use it.** Images-only is ADR-045's rule over the mapping's effective flavors
+(`mappingSpecIsImagesOnly`), not the spec's type: an sd spec that keeps a text
+flavor is still loaded by generating, and the runtime warning
+`api_flavors_text_on_stable_diffusion` names that configuration. A text child
+keeps loading by generating, because the lazy-KV-cache argument holds for it
+and a text Load also proves that chat works. The Load starter marks the target
+(`benchmarkTarget.loadWithoutGenerating`); the VRAM probe's plan carries the
+same decision (`vramRunPlanned.ensure`) onto the target it loads. The load core
+keeps its already-resident short-circuit, and then, inside the same 503-retry
+loop and under that loop's own deadline, calls the provider's `RuntimeEnsurer`
+instead of streaming, so the window in which a just-cleared `force_stopped` has
+not yet reached the agent is absorbed as it is for a text target. The provider sends the
+bodiless POST with the same upstream credential as every provider call, arms no
+timeout of its own, accepts only a 2xx whose `status` is `running` (a 2xx that
+says anything else, or whose body is cut short, is
+`provider.invalid_response`; a read that the deadline cuts off is
+`provider.timeout`, and one that a cancellation cuts off is
+`provider.unavailable`), keeps a 503 retryable
+(`ErrUpstreamStarting`) and a 401 or 403 an auth rejection (`ErrAuthRejected`),
+and keeps the router envelope's code (`RouterError`). A failed ensure is
+recorded (`loadEnsureError`) in one of four texts: the loop's own deadline, when the
+provider reports it as a timeout, as
+`provider.timeout: not running within <loop bound> …`; a failure that carries
+one of the codes the route answers as `<router code>: <hint> (<provider text>)`,
+one hint per code, the start-timeout one quoting the target spec's
+`startup_timeout_seconds`; a 2xx without `running`, or one cut short, as
+`provider.invalid_response: the agent's ensure route answered without "running"`;
+and any other failure with the provider's own text ([Agent-Managed Model
+Runtime §11.9](cross-cutting/agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)). "Loaded" then
+means the child's health path answered 2xx — for `sd-server` that is
+`/v1/models` by default — and the row turns loaded within about one telemetry
+sample.
+
+**The VRAM number comes with a caveat, not a refusal.** An ensure plan carries
+the warning `first_generation_not_measured` from the start: the run measures
+the child once it is up and healthy, and what `sd-server` allocates on top when
+it first generates has not been measured. It is a warning rather than an
+inconclusive reason, so the launch-spec form still offers the number, with the
+caveat. The runner checks `runtime_ensure` again before it drains, for an
+ensure plan only, so a run whose agent stopped declaring the name after the
+trigger ends with an error naming `benchmark.agent_ensure_unsupported` before a
+spec is written. The run's own `runtime_manager` re-check is left alone:
+adding the name there would refuse every VRAM probe on an older agent, text
+targets included.
+
+**Consequence: the other manual runs of an images-only mapping are refused, and
+a Load does not override desired state.** Every mapping-scope starter checks, in
+order and before it reserves the server: authorization; a run already holding
+the server (409 `benchmark.already_running` — first, because a VRAM run's drain
+has stored `force_stopped` on every enabled spec, and a Load during it must not be told
+to clear that); for a `server_agent` application, one read of the mapping's
+spec that fails closed (500 `benchmark.request_failed`) and becomes the run's
+target spec, so the run and its hints see what the check saw — except that the
+VRAM probe takes its images-only decision from the fleet read its plan makes, a
+second read; then the refusals. A
+context probe and a mapping-scope speed, capacity, both or vision run get 409
+`benchmark.images_only`, and so does a Load of an images-only mapping whose
+application is not `server_agent`. A Load of a spec whose `admin_state` is
+`force_stopped` gets 409 `benchmark.spec_force_stopped`, whether it would
+generate or ensure: without the refusal it would retry the router's immediate
+503 until its bound, and a Load must not clear an operator's override. Application and server
+scope skip an images-only mapping instead (`results[].skipped: "images_only"`)
+and name a mapping whose spec could not be read; only a scope with nothing left
+to run is refused. The portal shows the same decisions before the click: the
+mapping DTO's `images_only`, and the model-server row's `load_refusal`, which
+one helper (`loadRefusal`) computes for both the row and the Load starter.
+
+**Rejected:** **`/upstream/{model}/ensure`** — ADR-037 limits `/upstream/` to a
+GET of `/props` that never starts or keeps alive a child. — **A body that names
+the model** — an older router would start the child and forward the request.
+— **`GET`** — the route has a side effect. — **Heartbeats** — they commit a 200
+before the outcome is known. — **Start, then poll** — a detached waiter is
+saved state. — **`force_running`** — it persists, and a VRAM probe refuses to
+start against a stored override. — **A real image generation** — 17–20 s of GPU
+for every Load. — **No credential on this one call** — it would be the provider
+package's only exception. — **Detecting the route by trying it** — an older
+agent's 404 carries the same code as an unmanaged model. — **Gating on
+`agent_version`** — ADR-025. — **Falling back to the chat Load** — it cannot
+succeed. — **Guessing "text" when the spec read fails** — that is the very
+prompt the check exists to stop. — **A whole-run 500 at application or server
+scope when one read fails** — it blocks the readable siblings. — **Recording the
+skip inside the run loop, or in `error`** — the first writes history rows, the
+second reads as a failure.
+→ [Agent-Managed Model Runtime
+§4.1](cross-cutting/agent-runtime-manager.md#41-control-routes),
+[§4.4](cross-cutting/agent-runtime-manager.md#44-streaming-heartbeats-and-the-lazy-200),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[§11.6](cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs),
+[§11.9](cross-cutting/agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping),
+[API Compatibility & Inference
+§7.2](cross-cutting/compatibility-and-inference.md#72-the-benchmark-stream-watchdog),
+[Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks),
+[HTTP API Surface](reference/api-surface.md#benchmark-load-and-context-probe-runs).

@@ -4,7 +4,7 @@
 // This file is the router port (design doc §6.1): the single HTTP port the
 // gateway talks to for a server_agent application, which routes every
 // inference request to the right managed model process, starting it first
-// if necessary. Four route classes:
+// if necessary. Five route classes:
 //
 //   - GET /health, GET /v1/health -- always 200 while the router is up.
 //     "Reachability means the router accepts, not that a model is warm" --
@@ -24,6 +24,15 @@
 //     keep alive a child -- and relayed byte-verbatim so the gateway's
 //     evidence rule reads the child's own document. The allowlist is
 //     exactly /props; widening it is #49-2/#55 business.
+//   - POST /ensure/{model} -- start a managed child without forwarding a
+//     request to it: model from the PATH (everything after "/ensure/", so
+//     ids containing "/" work), EnsureRunning under the request context,
+//     then 200 {"status":"running"}. Bodiless, so a router without this
+//     route answers it from serveProxy with 404 runtime.model_not_managed
+//     before EnsureRunning and never starts a child for it; any body a
+//     caller sends anyway is read and discarded, never forwarded. No
+//     heartbeats: a failure is a genuine HTTP status from the sentinel table
+//     below.
 //   - everything else -- the model-routed reverse proxy.
 //
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
@@ -103,9 +112,9 @@ import (
 )
 
 // maxBodyBytes bounds the buffered read of an inbound request body (needed
-// to extract `model`/`stream` before the destination is known). A request
-// body beyond this is rejected with 413 before any admission decision is
-// even attempted.
+// to extract `model`/`stream` before the destination is known), and the
+// discarded read of an ensure request's body. A request body beyond this is
+// rejected with 413 before any admission decision is even attempted.
 const maxBodyBytes = 32 << 20
 
 // heartbeatInterval is the cadence of `: keepalive` SSE comment lines during
@@ -282,10 +291,11 @@ func newRouter(m managerPort) *router {
 }
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// M9: the brief specifies GET for the control paths; a different
-	// method on one of these exact paths falls through to the
-	// model-routed proxy instead (the ordinary "everything else" case),
-	// rather than getting the always-200 treatment regardless of method.
+	// M9: every control path answers one method -- GET, or POST for
+	// /ensure/{model}; a different method on one of these paths falls
+	// through to the model-routed proxy instead (the ordinary "everything
+	// else" case), rather than getting the control treatment regardless
+	// of method.
 	isGet := r.Method == http.MethodGet
 	switch {
 	case isGet && (r.URL.Path == "/health" || r.URL.Path == "/v1/health"):
@@ -296,6 +306,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveModels(w, r)
 	case isGet && strings.HasPrefix(r.URL.Path, "/upstream/"):
 		rt.serveUpstreamProps(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, ensurePathPrefix):
+		rt.serveEnsure(w, r)
 	default:
 		rt.serveProxy(w, r)
 	}
@@ -455,6 +467,91 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 	forwardUpstreamResponse(w, nil, resp)
 }
 
+// ensurePathPrefix is the path prefix of POST /ensure/{model}; everything
+// after it is the model.
+const ensurePathPrefix = "/ensure/"
+
+// ensureResponse is POST /ensure/{model}'s success body.
+type ensureResponse struct {
+	Status string `json:"status"`
+}
+
+// serveEnsure handles POST /ensure/{model}: start the model's managed child
+// if it is not running, wait until it is healthy, and answer 200
+// {"status":"running"} -- forwarding nothing to the child. It is how the
+// gateway loads a child whose server answers no chat completion (an
+// images-only model), which the model-routed proxy can only reach by
+// forwarding a request that child cannot serve.
+//
+// Deliberate properties:
+//   - The model is the decoded PATH after "/ensure/", so an id containing
+//     "/" works (provider.ExpandModelPath on the gateway side escapes each
+//     segment and keeps "/"). Any body is read and discarded, never
+//     forwarded: net/http notices a client that leaves only once the body
+//     has been read to its end, and the request context below depends on
+//     that. A body over maxBodyBytes is refused with 413
+//     runtime.request_too_large before EnsureRunning, as serveProxy refuses
+//     one.
+//   - The gateway's call is bodiless on purpose: a router without this
+//     route hands the request to serveProxy, which answers a body that names
+//     no model with 404 runtime.model_not_managed before EnsureRunning, so
+//     an older agent never starts a child for it.
+//   - One long call, no heartbeats. EnsureRunning bounds the wait (the
+//     spec's startup timeout, plus its admission wait when that is above 0;
+//     an admission wait of 0 lasts until the client leaves), no hop between
+//     the gateway and this handler has an idle timer, and so a failure stays
+//     a genuine HTTP status from sentinelCode: 404 model_not_managed, 503
+//     admission_blocked (a force-stopped spec, or admission refused), 504
+//     start_timeout, 502 start_failed or not_permitted, or 502 upstream_gone
+//     for any other failure (e.g. the manager shutting down).
+//     servePlainProxy holds a cold start the same way.
+//   - The request context is EnsureRunning's context. A client that leaves
+//     while its request is queued drops its waiter, and nothing starts. One
+//     that leaves while the child is starting gets an error and so nothing to
+//     release; the start still comes up with nothing in flight, and the idle
+//     policy applies to it as after any request.
+//   - release() runs BEFORE the answer is written, since nothing is proxied:
+//     the start counts as one use (LastUsed is stamped) and leaves nothing in
+//     flight. The answer is written only while the client is still there.
+//     Nothing is persisted: force_running and pinned are untouched.
+func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimPrefix(r.URL.Path, ensurePathPrefix)
+	if rt.m == nil || model == "" {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		writeBodyReadError(w, err)
+		return
+	}
+	_, release, err := rt.m.EnsureRunning(r.Context(), model)
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	release()
+	if r.Context().Err() != nil {
+		return // the client left as the start succeeded; nobody reads an answer
+	}
+	refreshWriteDeadline(w)
+	writeJSON(w, http.StatusOK, ensureResponse{Status: "running"})
+}
+
+// writeBodyReadError answers a request whose body, read through a
+// maxBodyBytes MaxBytesReader, could not be read: 413
+// runtime.request_too_large for a body over the bound, and the sentinel
+// mapping of the read error otherwise.
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var mbErr *http.MaxBytesError
+	if errors.As(err, &mbErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "runtime.request_too_large",
+			fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+		return
+	}
+	writeSentinelError(w, fmt.Errorf("runtime: read request body: %w", err))
+}
+
 // modelStreamPeek is the minimal shape the router reads out of a proxied
 // request body: just enough to route it and decide whether to heartbeat.
 // Every other field of the real request (OpenAI/Anthropic-shaped or
@@ -465,20 +562,15 @@ type modelStreamPeek struct {
 }
 
 // serveProxy is the model-routed reverse proxy: every request that is not
-// one of the four fixed GET-only routes above -- health, running, models,
-// and the /upstream/{model}/props probe. It buffers the body (bounded),
-// extracts model/stream, and hands off to the plain or streaming path.
+// one of the fixed control routes above -- the four GET-only ones (health,
+// running, models, and the /upstream/{model}/props probe) and POST
+// /ensure/{model}. It buffers the body (bounded), extracts model/stream, and
+// hands off to the plain or streaming path.
 func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		var mbErr *http.MaxBytesError
-		if errors.As(err, &mbErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "runtime.request_too_large",
-				fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
-			return
-		}
-		writeSentinelError(w, fmt.Errorf("runtime: read request body: %w", err))
+		writeBodyReadError(w, err)
 		return
 	}
 

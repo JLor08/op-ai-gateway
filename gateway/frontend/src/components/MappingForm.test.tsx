@@ -386,6 +386,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(await screen.findByText('network down')).toBeInTheDocument();
       expect(screen.queryByText(t.mappingContextProbePending)).toBeNull();
     });
+
+    // The probe loads the model with a chat prompt, which the gateway refuses
+    // for an images-only mapping (benchmark.images_only). The button says so
+    // before the click, in a hint it is described by.
+    it('disables the probe for an images-only mapping and names the reason beside it', () => {
+      renderForm({ contextProbePath: '/props', row: makeMapping({ images_only: true }) });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextImagesOnly);
+    });
+
+    it('offers the probe for a text mapping, with no images-only hint', async () => {
+      renderForm({ contextProbePath: '/props', row: makeMapping({ images_only: false }) });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      await waitFor(() => expect(button).toBeEnabled());
+      expect(button).not.toHaveAccessibleDescription();
+      expect(screen.queryByText(t.mappingProbeContextImagesOnly)).not.toBeInTheDocument();
+    });
+
+    // The create form has no mapping to probe yet.
+    it('offers no probe on the create form', () => {
+      renderForm({ contextProbePath: '/props', row: null });
+      expect(screen.getByLabelText(t.mappingContextSize)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.mappingProbeContext })).not.toBeInTheDocument();
+    });
   });
 
   describe(`MappingForm ownership boundary [${locale}]`, () => {

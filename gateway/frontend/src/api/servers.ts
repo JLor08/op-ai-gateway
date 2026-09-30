@@ -381,6 +381,13 @@ export type BenchmarkResult = {
   prompt_tokens_per_second: number;
   load_time_ms: number;
   context_size?: number;
+  // True when a Load confirmed the model resident (a load run only).
+  loaded?: boolean;
+  // Set when an application- or server-scope run skipped this mapping without
+  // sending it anything: "images_only" (its effective API flavors serve images
+  // only). A skipped result carries no measurement, and its numeric fields are
+  // 0 because the backend does not omit them.
+  skipped?: 'images_only';
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;

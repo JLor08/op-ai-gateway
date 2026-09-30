@@ -209,6 +209,15 @@ export type PortalModelMapping = {
   max_concurrency: number;
   recommended_concurrency: number;
   gen_tokens_per_second_at_capacity: number;
+  // True when the mapping's effective API flavors (its launch spec's on a
+  // server_agent application with a spec, else the application's) name
+  // openai_images and neither openai nor anthropic -- the rule the gateway's
+  // refusals apply, so a run that sends the mapping a chat prompt (the context
+  // probe, speed, capacity, both, vision) is refused for it. ADVISORY: the
+  // backend reports false when it could not read the spec, and the refusal
+  // itself fails closed. Always present on the real wire DTO; optional here so
+  // existing fixtures compile unchanged.
+  images_only?: boolean;
 };
 
 export type PortalMappingListResponse = { data: PortalModelMapping[] };
@@ -452,6 +461,10 @@ export type ModelServerRow = {
   application_id: string;
   mapping_id: string;
   loaded: boolean;
+  // Whether the caller may Load this row: the Load starter's own
+  // authorization (system scope, a server owner, or a can_manage_servers
+  // manager of one of the server's admin groups). The admin scope alone does
+  // not grant it.
   can_load: boolean;
   // Live runtime lifecycle ("running"/"starting"/... or "" when no agent-managed
   // runtime status is known); active_requests/queue_depth are its live per-model
@@ -516,7 +529,23 @@ export type ModelServerRow = {
   capabilities: ModelServerCapability[];
   // Live 1-based rank among this model's offering servers (0 = unknown/unranked).
   priority: number;
+  // Why the gateway would refuse a Load of this row, computed by the same
+  // backend helper the Load starter answers with, so the reason and the
+  // starter's `benchmark.<reason>` 409 cannot disagree. Absent when a Load can
+  // start, on a row the caller cannot Load (can_load false), while the server
+  // is busy with a run, and when a read it needs fails: the application, or a
+  // server_agent mapping's launch spec (the starter then answers for itself).
+  load_refusal?: LoadRefusal;
 };
+
+// The closed set of ModelServerRow.load_refusal values:
+//   images_only              -- an images-only model the server agent does not
+//                               launch; a Load would send it a chat prompt.
+//   agent_ensure_unsupported -- an images-only agent model whose agent does not
+//                               report the runtime_ensure feature.
+//   spec_force_stopped       -- the launch spec's admin override is
+//                               force_stopped, which a Load never lifts.
+export type LoadRefusal = 'images_only' | 'agent_ensure_unsupported' | 'spec_force_stopped';
 
 // One capability verdict on a ModelServerRow, mirroring the backend's
 // ModelServerCapabilityDTO field-for-field: which capability, its verdict

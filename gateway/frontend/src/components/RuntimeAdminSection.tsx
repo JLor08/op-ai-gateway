@@ -2872,6 +2872,16 @@ export function RuntimeAdminSection({
     };
   }
 
+  // Refreshes what a committed spec write (create, edit, spec delete) can
+  // change: the warnings, and each mapping row's `images_only` marker, which
+  // the backend computes from the spec's API flavors when the mapping has a
+  // spec and from the application's otherwise. The rows in hand were read
+  // before the write.
+  function reloadAfterSpecWrite() {
+    void reloadWarnings();
+    void reloadMappings();
+  }
+
   // An empty flavor list cannot be saved honestly: the backend stores [] as
   // [openai, anthropic] (normalizeFlavors, on every spec write), so a form
   // showing nothing ticked would save a text candidate -- on a
@@ -2987,7 +2997,7 @@ export function RuntimeAdminSection({
       const spec = await api.putRuntimeSpec(mapping.id, buildSpecBody(args, parsedEnv.env));
       commitSpecCache(mapping.id, ticket, spec);
       clearRestartNoticeAfter(spec);
-      void reloadWarnings();
+      reloadAfterSpecWrite();
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
@@ -3060,7 +3070,7 @@ export function RuntimeAdminSection({
       const spec = await api.putRuntimeSpec(id, buildSpecBody(args, parsedEnv.env));
       commitSpecCache(id, ticket, spec);
       clearRestartNoticeAfter(spec);
-      void reloadWarnings();
+      reloadAfterSpecWrite();
       setSpecMode('list');
     } catch (err) {
       showError(`${t.runtimeSpecPartialFailure}: ${formatPortalError(err, t)}`);
@@ -3136,7 +3146,7 @@ export function RuntimeAdminSection({
         const deleted = emptySpec(id);
         commitSpecCache(id, ticket, deleted);
         clearRestartNoticeAfter(deleted);
-        void reloadWarnings();
+        reloadAfterSpecWrite();
       } else {
         // The other half of the same rule (fix round 1, M5): dropping the
         // entry is a write to it too. Without a ticket a spec write still in
@@ -3194,7 +3204,12 @@ export function RuntimeAdminSection({
       label: t.runBenchmark,
       icon: <SpeedIcon fontSize="small" />,
       onClick: () =>
-        setBenchmarkScope({ kind: 'mapping', id: row.id, name: row.gateway_model_name }),
+        setBenchmarkScope({
+          kind: 'mapping',
+          id: row.id,
+          name: row.gateway_model_name,
+          applicationId: row.application_id,
+        }),
     },
     {
       key: 'toggle',

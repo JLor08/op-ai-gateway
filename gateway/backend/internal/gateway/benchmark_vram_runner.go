@@ -52,7 +52,8 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 // The sequence, and why each step exists:
 //
 //  1. re-check the two VOLATILE reachability gates, which an agent report can
-//     flip between the trigger and here;
+//     flip between the trigger and here, and for an ensure plan the agent's
+//     runtime_ensure, which it can flip the same way;
 //  2. read which specs have a process to stop, then drain EVERY enabled spec
 //     including the target -- a baseline taken while the target is resident
 //     measures nothing at all;
@@ -62,7 +63,10 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //  5. clear the TARGET's override only, and load it through the shared load
 //     core -- which loads BY GENERATING, so a backend that allocates on first
 //     use has necessarily already done so before the post-load window opens.
-//     There is deliberately no second generation step;
+//     There is deliberately no second generation step. An images-only target
+//     (an ensure plan) is the exception: the core starts it through the agent
+//     router's ensure route, and the report says the first generation is not
+//     in the number (vramWarningFirstGenerationNotMeasured);
 //  6. a target that reports RESIDENT after a confirmed drain is contamination,
 //     not a shortcut: something the gateway could not stop is serving it;
 //  7. settle, then the same stability gate, then the floor gate;
@@ -88,6 +92,14 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// would drain a fleet whose agent never reads the document.
 	if reason, unavailable := s.vramIsolationUnavailable(ctx, serverID); unavailable {
 		res.Error = reason
+		return
+	}
+	// An ensure plan also needs the agent to still declare runtime_ensure,
+	// which telemetry ingest can flip the same way; without it the target
+	// could not be started after the whole fleet was drained. Checked for an
+	// ensure plan only: a text target never needs the feature.
+	if plan.ensure && !s.AgentFeatures.Has(serverID, runtimeEnsureFeature) {
+		res.Error = vramEnsureUnsupported().Error()
 		return
 	}
 
@@ -181,7 +193,11 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	pendingRestore = vramWithout(pendingRestore, plan.targetSpecID)
 
 	// (6) What the load proved about contamination, and about whether it could
-	// be asked at all.
+	// be asked at all. An ensure plan's target is loaded without generating.
+	// That decision is the plan's own read of the fleet (vramRunPlan), while
+	// tgt.spec, which gives the load its credential and its start-timeout
+	// hint, is the starter's read (startVRAMProbe).
+	tgt.loadWithoutGenerating = plan.ensure
 	if vramRecordResidency(s.ensureResidentForRun(ctx, tgt)).apply(report, &res) {
 		return
 	}

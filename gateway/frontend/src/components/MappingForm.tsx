@@ -103,6 +103,11 @@ function capabilitySeed(row: PortalModelMapping | null, capability: string): Cap
   return verdict === 'yes' || verdict === 'no' ? verdict : '';
 }
 
+/** A capability select's props for its hint: shown only while the choice is unknown. */
+function unknownHint(choice: CapabilityChoice, hint: string): { helperText?: string } {
+  return choice === '' ? { helperText: hint } : {};
+}
+
 /**
  * The toast for a context probe that did not reach a result. The poll cap
  * means the probe is still going, so the toast says it is pending; it is still
@@ -113,6 +118,61 @@ function capabilitySeed(row: PortalModelMapping | null, capability: string): Cap
 function probeFailureMessage(err: unknown, t: Translation): string {
   if (err instanceof BenchmarkPollTimeoutError) return t.mappingContextProbePending;
   return formatPortalError(err, t);
+}
+
+const probeImagesOnlyHintId = 'mapping-probe-context-hint';
+
+/**
+ * The context-size probe's button, on the edit form only (the create form has
+ * no mapping to probe yet). Disabled while a probe runs, while the server is
+ * busy, without a `context_probe_path`, and for an images-only mapping: the
+ * probe loads the model with a chat prompt, which the gateway refuses for it
+ * (`benchmark.images_only`). That last reason shows nowhere else on the form,
+ * so the button is described by a hint that names it.
+ */
+function ContextProbeButton({
+  t,
+  row,
+  probing,
+  serverBusy,
+  contextProbePath,
+  onProbe,
+}: Readonly<{
+  t: Translation;
+  row: PortalModelMapping | null;
+  probing: boolean;
+  serverBusy: boolean;
+  contextProbePath: string;
+  onProbe: (target: PortalModelMapping) => void;
+}>) {
+  if (!row) return null;
+  const imagesOnly = row.images_only === true;
+  return (
+    <Box>
+      <Button
+        type="button"
+        variant="outlined"
+        size="small"
+        disabled={probing || serverBusy || contextProbePath.trim() === '' || imagesOnly}
+        aria-describedby={imagesOnly ? probeImagesOnlyHintId : undefined}
+        startIcon={probing ? <CircularProgress size={16} color="inherit" /> : undefined}
+        onClick={() => onProbe(row)}
+      >
+        {probing ? t.mappingProbeContextRunning : t.mappingProbeContext}
+      </Button>
+      {imagesOnly && (
+        <Typography
+          id={probeImagesOnlyHintId}
+          variant="caption"
+          color="text.secondary"
+          component="p"
+          sx={{ mt: 0.5 }}
+        >
+          {t.mappingProbeContextImagesOnly}
+        </Typography>
+      )}
+    </Box>
+  );
 }
 
 /**
@@ -422,20 +482,14 @@ export function MappingForm({
           onChange={(e) => setContextSize(e.target.value)}
           inputProps={{ min: 0, step: 1 }}
         />
-        {row && (
-          <Box>
-            <Button
-              type="button"
-              variant="outlined"
-              size="small"
-              disabled={probing || serverBusy || contextProbePath.trim() === ''}
-              startIcon={probing ? <CircularProgress size={16} color="inherit" /> : undefined}
-              onClick={() => void probeContext(row)}
-            >
-              {probing ? t.mappingProbeContextRunning : t.mappingProbeContext}
-            </Button>
-          </Box>
-        )}
+        <ContextProbeButton
+          t={t}
+          row={row}
+          probing={probing}
+          serverBusy={serverBusy}
+          contextProbePath={contextProbePath}
+          onProbe={(target) => void probeContext(target)}
+        />
         <Field
           id="mapping-energy-wh-per-token"
           type="number"
@@ -509,7 +563,7 @@ export function MappingForm({
           label={t.mappingIsMtp}
           value={isMtp}
           onChange={(e) => setIsMtp(e.target.value as CapabilityChoice)}
-          {...(isMtp === '' ? { helperText: t.mappingIsMtpUnknownHint } : {})}
+          {...unknownHint(isMtp, t.mappingIsMtpUnknownHint)}
         >
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
@@ -520,7 +574,7 @@ export function MappingForm({
           label={t.mappingVisionCapable}
           value={visionCapable}
           onChange={(e) => setVisionCapable(e.target.value as CapabilityChoice)}
-          {...(visionCapable === '' ? { helperText: t.mappingVisionCapableUnknownHint } : {})}
+          {...unknownHint(visionCapable, t.mappingVisionCapableUnknownHint)}
         >
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
@@ -541,7 +595,7 @@ export function MappingForm({
           label={t.mappingImageCapable}
           value={imageCapable}
           onChange={(e) => setImageCapable(e.target.value as CapabilityChoice)}
-          {...(imageCapable === '' ? { helperText: t.mappingImageCapableUnknownHint } : {})}
+          {...unknownHint(imageCapable, t.mappingImageCapableUnknownHint)}
         >
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>

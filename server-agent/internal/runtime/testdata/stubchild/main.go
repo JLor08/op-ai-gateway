@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,6 +38,7 @@ func main() {
 	envLog := flag.String("env-log", "", "if set, write what this process ACTUALLY received for -env-name, as \"set:<value>\" or \"unset\" -- the only way to observe a child's own environment from the parent's test, and it deliberately distinguishes an absent variable from one set to the empty string")
 	envName := flag.String("env-name", "", "the environment variable -env-log reports")
 	cwdLog := flag.String("cwd-log", "", "if set, write this process's ACTUAL working directory (os.Getwd) -- the only way to observe from the parent's test where the manager launched the child, which is what proves R2's empty-work_dir default (cmd.Dir = the binary's own directory)")
+	requestLog := flag.String("request-log", "", "if set, append one line \"<METHOD> <PATH>\" per HTTP request this process receives, before answering it -- proves from the child's side which requests reached it, independent of the router's and the manager's own bookkeeping")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	flag.Parse()
 
@@ -168,8 +170,31 @@ func main() {
 		fmt.Fprint(w, "stubchild: scripted failure")
 	})
 
+	var handler http.Handler = mux
+	if *requestLog != "" {
+		handler = logRequests(*requestLog, mux)
+	}
+
 	addr := "127.0.0.1:" + strconv.Itoa(*port)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("stubchild: listen %s: %v", addr, err)
 	}
+}
+
+// logRequests appends "<METHOD> <PATH>" to path for every request before next
+// serves it, so a request's line is on disk by the time its client reads the
+// answer. The mutex keeps concurrent requests' lines whole.
+func logRequests(path string, next http.Handler) http.Handler {
+	var mu sync.Mutex
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Fatalf("stubchild: open request log: %v", err)
+		}
+		fmt.Fprintf(f, "%s %s\n", r.Method, r.URL.Path)
+		f.Close()
+		mu.Unlock()
+		next.ServeHTTP(w, r)
+	})
 }

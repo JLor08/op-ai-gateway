@@ -574,8 +574,9 @@ func TestStartLoadModel(t *testing.T) {
 		t.Fatalf("unknown mapping: status = %d, want 404", code)
 	}
 
-	// Already reserved => TryStart fails => 409 already_running; the pre-existing reservation is
-	// NOT released.
+	// Already reserved => refuseBusyServer answers 409 already_running before the spec read; the
+	// pre-existing reservation is NOT released. (A reservation taken between that check and
+	// TryStart is TestStartersLosingTheReservationRaceKeepTheWinningRun's case.)
 	if _, ok := s.Benchmarks.TryStart(baOwnedServer, "server", "speed", 1, now, func() {}); !ok {
 		t.Fatalf("pre-reserve TryStart failed")
 	}
@@ -583,7 +584,7 @@ func TestStartLoadModel(t *testing.T) {
 		t.Fatalf("already-reserved: status = %d, want 409", code)
 	}
 	if !s.Benchmarks.ServerBusy(baOwnedServer) {
-		t.Fatalf("pre-existing reservation released on the TryStart-fail path, want it preserved")
+		t.Fatalf("pre-existing reservation released on the busy-server path, want it preserved")
 	}
 	s.Benchmarks.Release(baOwnedServer)
 

@@ -70,8 +70,9 @@ func seedOffering(t *testing.T, routeStore *routing.MemoryStore, now time.Time, 
 }
 
 // ModelServers returns one row per (server, mapping) that offers the model,
-// sorted by server name, enriched with live loaded-state and can_load (admin =
-// true for every row). An unknown model resolves to an empty slice.
+// sorted by server name, enriched with live loaded-state and can_load (a
+// system-scope principal = true for every row). An unknown model resolves to
+// an empty slice.
 func TestModelServers(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	loaded := fakeLoadedModels{byApp: map[string][]string{"app-a": {"up-a"}}}
@@ -79,7 +80,7 @@ func TestModelServers(t *testing.T) {
 	seedOffering(t, routeStore, now, "srv-a", "app-a", "map-a", "shared", "up-a", 42)
 	seedOffering(t, routeStore, now, "srv-b", "app-b", "map-b", "shared", "up-b", 0)
 
-	rows, err := svc.ModelServers(context.Background(), adminToken(), "shared")
+	rows, err := svc.ModelServers(context.Background(), systemToken(), "shared")
 	if err != nil {
 		t.Fatalf("ModelServers: %v", err)
 	}
@@ -96,7 +97,7 @@ func TestModelServers(t *testing.T) {
 		t.Fatalf("rows[1].Loaded = true, want false (up-b not loaded)")
 	}
 	if !rows[0].CanLoad || !rows[1].CanLoad {
-		t.Fatalf("admin CanLoad = (%v, %v), want (true, true)", rows[0].CanLoad, rows[1].CanLoad)
+		t.Fatalf("system CanLoad = (%v, %v), want (true, true)", rows[0].CanLoad, rows[1].CanLoad)
 	}
 	if rows[0].GenTokensPerSecond != 42 {
 		t.Fatalf("rows[0].GenTokensPerSecond = %v, want 42", rows[0].GenTokensPerSecond)
@@ -142,6 +143,125 @@ func TestModelServersCanLoadOwnership(t *testing.T) {
 	}
 	if byServer["srv-b"].CanLoad {
 		t.Fatalf("non-owned server-b CanLoad = true, want false")
+	}
+}
+
+// TestModelServersCanLoadIsTheLoadStartersAuthorization: can_load is exactly
+// what the Load starter authorizes (authorizeServer), per row. srv-a is linked
+// to the admin group AG, srv-b is owned by usr_srv_owner. A system-scope
+// principal may Load both; AG's owner and a can_manage_servers co-manager of
+// AG may Load srv-a only; srv-b's owner srv-b only; and neither a plain admin
+// nor a co-manager of AG without can_manage_servers may Load either -- the
+// admin scope alone admits nobody. A refusal is the starter's answer, not a
+// failed read, so none of them logs one.
+func TestModelServersCanLoadIsTheLoadStartersAuthorization(t *testing.T) {
+	e := newGroupTestEnv(t)
+	e.createUser("usr_s", "system_admin")
+	e.createUser("usr_ag_owner", "admin")
+	e.createUser("usr_servers", "admin")
+	e.createUser("usr_users", "admin")
+	sysAdmin := token("usr_s", "system", "admin")
+	agOwner := token("usr_ag_owner", "admin")
+	sg := e.mustCreateGroup(sysAdmin, CreateGroupInput{Tier: store.GroupTierSystem, Name: "SG"})
+	e.mustAddMembers(sysAdmin, sg.ID, "usr_ag_owner", "usr_servers", "usr_users")
+	ag := e.mustCreateGroup(agOwner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
+	e.mustAddMembers(agOwner, ag.ID, "usr_servers", "usr_users")
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_servers", false, false, true, false, false); err != nil {
+		t.Fatalf("PromoteManager(usr_servers): %v", err)
+	}
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_users", true, false, false, false, false); err != nil {
+		t.Fatalf("PromoteManager(usr_users): %v", err)
+	}
+	seedOffering(t, e.routes, e.now, "srv-a", "app-a", "map-a", "shared", "up-a", 0)
+	seedOffering(t, e.routes, e.now, "srv-b", "app-b", "map-b", "shared", "up-b", 0)
+	e.mustLinkServerAdminGroup("srv-a", ag.ID)
+	e.mustSetServerOwners("srv-b", "usr_srv_owner")
+
+	for _, tc := range []struct {
+		name      string
+		principal auth.Token
+		wantA     bool
+		wantB     bool
+	}{
+		{"system scope", sysAdmin, true, true},
+		{"owner of the linked admin group", agOwner, true, false},
+		{"can_manage_servers co-manager of the linked admin group", token("usr_servers", "admin"), true, false},
+		{"co-manager without can_manage_servers", token("usr_users", "admin"), false, false},
+		{"plain admin", token("usr_plain_admin", "admin"), false, false},
+		{"server owner", token("usr_srv_owner"), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertCanLoadAB(t, e.svc, tc.principal, tc.wantA, tc.wantB)
+		})
+	}
+}
+
+// assertCanLoadAB lists "shared" as principal and checks the srv-a and srv-b
+// rows' can_load, and that no failed Load authorization read was logged.
+func assertCanLoadAB(t *testing.T, svc *Service, principal auth.Token, wantA, wantB bool) {
+	t.Helper()
+	var rows []ModelServerDTO
+	var err error
+	logged := captureSlog(t, func() {
+		rows, err = svc.ModelServers(context.Background(), principal, "shared")
+	})
+	if err != nil {
+		t.Fatalf("ModelServers: %v", err)
+	}
+	if strings.Contains(logged, "load authorization read failed") {
+		t.Fatalf("log output = %q, want no read failure: a principal the starter does not admit is an answer, not an error", logged)
+	}
+	if len(rows) != 2 || rows[0].ServerID != "srv-a" || rows[1].ServerID != "srv-b" {
+		t.Fatalf("rows = %+v, want srv-a and srv-b (the row set is not scoped to what the caller may Load)", rows)
+	}
+	if rows[0].CanLoad != wantA || rows[1].CanLoad != wantB {
+		t.Fatalf("CanLoad = (srv-a %v, srv-b %v), want (%v, %v)", rows[0].CanLoad, rows[1].CanLoad, wantA, wantB)
+	}
+}
+
+// failingOwnersStore fails ServerOwners for every server, and counts the calls.
+type failingOwnersStore struct {
+	*routing.MemoryStore
+	err   error
+	calls int
+}
+
+func (f *failingOwnersStore) ServerOwners(context.Context, string) ([]string, error) {
+	f.calls++
+	return nil, f.err
+}
+
+// TestModelServersCanLoadFailsClosedAndLogsOncePerServer: a store error inside
+// the Load authorization makes can_load false for that server's rows, and is
+// read and logged once per server, not once per row.
+func TestModelServersCanLoadFailsClosedAndLogsOncePerServer(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	routeStore := routing.NewMemoryStore()
+	failing := &failingOwnersStore{MemoryStore: routeStore, err: errors.New("owner table unavailable")}
+	svc := newModelServersTestServiceWithRoutes(t, now, fakeLoadedModels{}, failing)
+	seedOffering(t, routeStore, now, "srv-a", "app-a", "map-a", "shared", "up-a", 0)
+	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "map-a2", ApplicationID: "app-a", GatewayModelName: "shared", AppModelName: "up-a2", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	var rows []ModelServerDTO
+	var err error
+	logged := captureSlog(t, func() {
+		rows, err = svc.ModelServers(ctx, ownerToken(), "shared")
+	})
+	if err != nil {
+		t.Fatalf("ModelServers must not fail on a failed Load authorization read: %v", err)
+	}
+	if len(rows) != 2 || rows[0].CanLoad || rows[1].CanLoad {
+		t.Fatalf("rows = %+v, want two rows with can_load false", rows)
+	}
+	if failing.calls != 1 {
+		t.Fatalf("ServerOwners calls = %d, want 1: the authorization is read once per server", failing.calls)
+	}
+	const msg = "portal: model-servers load authorization read failed; can_load false for its rows"
+	if n := strings.Count(logged, msg); n != 1 || !strings.Contains(logged, "server_id=srv-a") || !strings.Contains(logged, "owner table unavailable") {
+		t.Fatalf("log output = %q, want exactly one WARN naming srv-a and the failure", logged)
 	}
 }
 

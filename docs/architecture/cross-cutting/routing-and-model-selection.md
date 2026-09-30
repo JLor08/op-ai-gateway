@@ -1219,7 +1219,7 @@ Observability](telemetry-usage-observability.md#832-shared-ingest-core)).
 
 | Mode | How it starts | Notes |
 |---|---|---|
-| Manual | `POST` on a server/application/mapping scope (`startBenchmark`, `internal/gateway/benchmark_endpoints.go`) | 202 + status; 409 if a run is already in flight on that server, or the server has live in-flight traffic (idle-gated) |
+| Manual | `POST` on a server/application/mapping scope (`startBenchmark`, `internal/gateway/benchmark_endpoints.go`) | 202 + status; 409 if a run is already in flight on that server, or the server has live in-flight traffic (idle-gated); a mapping scope whose mapping is images-only is refused with 409 `benchmark.images_only`, and an application or server scope skips such mappings, recording each as `skipped` ([Agent-Managed Model Runtime §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)) |
 | Scheduled | `Application.BenchmarkScheduleEnabled` + `BenchmarkScheduleIntervalSeconds` (floored at 60s), driven by `StartBenchmarkScheduler`'s 1-minute tick (`internal/gateway/benchmark_scheduler.go`) | speed-only, per-app cadence, idle-gated exactly like manual, skips `metrics_locked` mappings and every mapping whose effective flavors serve only images (a speed benchmark is a chat prompt; a `server_agent` child is judged by its spec, and one whose spec cannot be read is skipped for that pass) |
 | Opportunistic | no run at all — an ambient side effect of `OpportunisticMetricsEnabled` on served traffic | see table above |
 
@@ -1253,7 +1253,11 @@ reports a per-GPU delta alongside the agent's own per-process measurement. Two
 things about it matter at this chapter's altitude. It **shares the load core**
 with the "Load model" action (`ensureResidentForRun`), which loads by issuing
 one `max_tokens: 1` stream — the same mechanism `runLoadModel` uses, and the
-reason the run needs no separate generation step. And it is **not scheduled and
+reason the run needs no separate generation step — except for an images-only
+agent child, which it starts through the router's ensure route without
+generating
+([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
+And it is **not scheduled and
 not sweepable**: `StartBenchmarkScheduler` drives `"speed"` only, and the
 isolation is destructive enough that it must be asked for one model at a time,
 so there is deliberately no application- or server-scoped fan-out. Its own

@@ -181,7 +181,15 @@ import (
 // that must be able to accept the new source; nothing on the gateway side
 // waits on the agent. The same reasoning made #54's ollama_api_show source,
 // 0.7.0 -> 0.7.1, a PATCH.
-const Version = "0.7.4"
+//
+// 0.7.4 -> 0.8.0: the runtime router serves POST /ensure/{model}, which
+// starts a managed child and answers once it is healthy without forwarding a
+// request to it -- the gateway's way to load a child that answers no chat
+// completion. MINOR, and the rule decides it: agent.Features gains
+// "runtime_ensure", the name the gateway checks before it sends the route,
+// because a router without it cannot be told apart by trying (it answers 404
+// runtime.model_not_managed, as for an unmanaged model).
+const Version = "0.8.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

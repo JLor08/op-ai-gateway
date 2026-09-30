@@ -19,16 +19,16 @@ import { makeVisionColumn } from './shared/visionColumn';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { BenchmarkPollTimeoutError, pollBenchmarkStatus } from './shared/benchmark';
-import { formatPortalError } from './shared/format';
+import { errorLabelByCode, formatPortalError } from './shared/format';
 
 /**
  * Per-model detail sub-view: the servers offering a gateway model, each with its
  * mapping's benchmark metrics, a LIVE loaded indicator (fed by SSE), a LIVE "Prio"
  * rank (fed by a ~3s poll), a LIVE runtime-state badge + active/queue counts (also
  * SSE-fed, sharing the state vocabulary RuntimeAdminSection's "Live status" column
- * uses), and a "Laden" (load) row action gated on can_load / loaded / server-idle.
- * A full ListTable (search / filter / sort / columns), the same as every other
- * admin list.
+ * uses), and a "Laden" (load) row action gated on can_load / loaded / server-idle
+ * and on the gateway's load_refusal. A full ListTable (search / filter / sort /
+ * columns), the same as every other admin list.
  *
  * Live: on mount it fetches the offering list, then subscribes to the per-model SSE
  * (snapshot + update frames) AND starts a ~3s poll that re-fetches the same list so
@@ -305,6 +305,19 @@ function loadFailureMessage(e: unknown, t: Translation): string {
   if (code === 'benchmark.server_in_use') return t.modelServerBusy;
   if (code === 'benchmark.already_running') return t.modelServerAlreadyRunning;
   return formatPortalError(e, t);
+}
+
+/**
+ * The tooltip of a Load action the gateway would refuse. `load_refusal` names
+ * the `benchmark.<reason>` 409 the Load starter answers, so the tooltip is that
+ * 409's own label and a hover says what a refused click's toast would. A
+ * reason this build has no label for still means a Load cannot succeed, so it
+ * still disables the action, named by its wire code.
+ */
+function loadRefusalReason(refusal: string, t: Translation): string {
+  const code = `benchmark.${refusal}`;
+  const labelKey = errorLabelByCode[code];
+  return labelKey ? t[labelKey] : code;
 }
 
 export function ModelServersSection({
@@ -618,6 +631,8 @@ export function ModelServersSection({
       reason = t.modelServerLoadDisabledLoaded;
     } else if (inFlight[r.mapping_id]) {
       reason = t.modelServerLoadDisabledBusy;
+    } else if (r.load_refusal) {
+      reason = loadRefusalReason(r.load_refusal, t);
     }
     return [
       {

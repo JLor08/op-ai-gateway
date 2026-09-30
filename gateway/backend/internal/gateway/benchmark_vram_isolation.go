@@ -14,11 +14,13 @@ import (
 	"time"
 )
 
-// The four refusals a VRAM run makes BEFORE it writes a single spec. Each is
-// a state in which the isolation the run promises cannot be achieved by any
-// gateway-side write, so refusing costs the operator one error message while
-// proceeding costs them every model on the server plus a number that means
-// nothing. All four are HTTP 409 at the trigger.
+// The refusals a VRAM run makes BEFORE it writes a single spec. Each is a
+// state in which the run cannot produce the number it promises -- mostly
+// because no gateway-side write can achieve the isolation -- so refusing costs
+// the operator one error message while proceeding costs them every model on
+// the server plus a number that means nothing. Every one is HTTP 409 at the
+// trigger. codeBenchmarkVRAMDeclaredGPUMissing (benchmark_vram_confidence.go)
+// is one more.
 //
 // They are stable API error codes: the portal switches on them to render an
 // actionable message, each with its own German and English key.
@@ -47,12 +49,26 @@ const (
 	// operator-owned override, or a spec OTHER than the target is pinned. The
 	// message names the blocking spec.
 	codeBenchmarkVRAMIsolationBlocked = "benchmark.vram_isolation_blocked"
+
+	// codeBenchmarkVRAMAgentEnsureUnsupported: the target is images-only, so
+	// it has no chat endpoint to be loaded by generating on, and the agent
+	// does not declare runtime_ensure, the only other way to start it. It is
+	// the Load's own code for the same missing feature
+	// (errBenchmarkAgentEnsureUnsupported), not a benchmark.vram_* one, so
+	// the portal names one fix for both runs. Reusing the Load's constants
+	// (codeBenchmarkAgentEnsureUnsupported, msgBenchmarkAgentEnsureUnsupported)
+	// rather than repeating the code and message as their own literals makes
+	// that identity a compile-time fact instead of two texts that can drift
+	// apart.
+	codeBenchmarkVRAMAgentEnsureUnsupported = codeBenchmarkAgentEnsureUnsupported
+	msgBenchmarkVRAMAgentEnsureUnsupported  = msgBenchmarkAgentEnsureUnsupported
 )
 
-// The two conditions that DEGRADE a run's confidence without making it
-// pointless, reported on the result so the operator can weigh the number.
-// Closed vocabulary, persisted inside vram_json, one i18n key each -- the same
-// discipline as the inconclusive reasons.
+// The conditions that DEGRADE a run's confidence without making it pointless,
+// reported on the result so the operator can weigh the number. Closed
+// vocabulary, persisted inside vram_json, one i18n key each -- the same
+// discipline as the inconclusive reasons. vramWarningUndeclaredGPUAllocation
+// (benchmark_vram_confidence.go) is one more.
 const (
 	// vramWarningNonManagedApplications: the server also hosts active
 	// applications the agent does not manage (llama-swap coexisting with the
@@ -95,6 +111,13 @@ const (
 	// operator from acting on that wrong reason. It also covers a probe that
 	// ERRORED, for the same reason: an unanswered question is not a no.
 	vramWarningResidencyUnknown = "residency_unknown"
+	// vramWarningFirstGenerationNotMeasured: the target is images-only, so the
+	// run started it through the agent router's ensure route and it never
+	// generated (vramRunPlanned.ensure). Memory a backend allocates only on
+	// its first generation is therefore not in the number, which can be too
+	// low. A warning, not an inconclusive reason: the number is still offered
+	// for applying, with this caveat beside it.
+	vramWarningFirstGenerationNotMeasured = "first_generation_not_measured"
 )
 
 // The VRAM run's bounds. EVERY ONE IS REASONED, NOT MEASURED -- vars (the
@@ -183,7 +206,13 @@ type vramRunPlanned struct {
 	// (vramInconclusiveIsolationUnacknowledged) rather than silently switching
 	// the evidence standard halfway through a proof.
 	acknowledged bool
-	warnings     []string
+	// ensure is whether the target is images-only, so that the run loads it
+	// through the agent router's ensure route instead of by generating
+	// (benchmarkTarget.loadWithoutGenerating). Decided here from the target's
+	// own spec, and the run re-checks the agent's runtime_ensure before it
+	// drains.
+	ensure   bool
+	warnings []string
 	// baseline is the latest GPU-bearing sample the preconditions read. It
 	// decides which cards are watched and supplies each card's fingerprint;
 	// the actual baseline numbers come from a fresh stable window.
@@ -249,7 +278,8 @@ func vramStateBySpec(statuses []RuntimeStatusDTO) map[string]string {
 // agent report can flip between the trigger and the run (IsFileMode and the
 // declared feature set are both written by telemetry ingest), and runVRAMProbe
 // re-checks exactly those two through vramIsolationUnavailable rather than
-// re-planning. The enumeration-dependent refusals below -- a pre-existing
+// re-planning -- plus, for an ensure plan, the declared runtime_ensure, the
+// same kind of fact. The enumeration-dependent refusals below -- a pre-existing
 // override anywhere, a pinned sibling, a target with no enabled spec -- are
 // therefore evaluated ONCE, before the reservation. Nothing re-evaluates them
 // afterwards, which is why the run's defence against an override that appears
@@ -258,8 +288,9 @@ func vramStateBySpec(statuses []RuntimeStatusDTO) map[string]string {
 // The order is deliberate: the cheapest, most structural refusal first
 // (the target is not agent-managed at all), then the two reachability gates,
 // then the "nothing to measure" gate, and only then the enumeration-dependent
-// isolation refusals -- so an operator sees the most actionable message
-// rather than whichever condition happens to be checked first.
+// refusals -- the isolation refusals, then whether the target can be started
+// at all -- so an operator sees the most actionable message rather than
+// whichever condition happens to be checked first.
 func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunPlanned, error) {
 	serverID := tgt.server.ID
 
@@ -297,17 +328,23 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 	if err != nil {
 		return vramRunPlanned{}, err
 	}
-	specIDs, targetSpecID, err := vramEnumerateFleet(specs, tgt.mapping.ID)
+	specIDs, targetSpec, err := vramEnumerateFleet(specs, tgt.mapping.ID)
 	if err != nil {
 		return vramRunPlanned{}, err
 	}
-	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpecID}
+	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpec.ID}
 	// P1 again, by the other route: an agent-managed application whose target
 	// mapping has no ENABLED spec has no agent-managed process to measure --
 	// the agent's router has nothing to route to, so the load would fail
 	// after the fleet was already drained.
 	if planned.targetSpecID == "" {
 		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMNotAgentManaged, msg: msgBenchmarkVRAMNotAgentManaged}
+	}
+
+	// Whether the target can be started at all, from its own spec in the
+	// fleet read above rather than from a read of its own.
+	if planned.ensure, err = s.vramEnsurePlan(serverID, tgt.app, targetSpec); err != nil {
+		return vramRunPlanned{}, err
 	}
 
 	// P5: a declared GPU index this host does not report can never hold still,
@@ -326,7 +363,7 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 	// about, never refused.
 	planned.bindDelay = vramIsolationBindDelay
 	planned.acknowledged = s.AgentFeatures.Has(serverID, runtimeConfigAckFeature)
-	planned.warnings = s.vramPlanWarnings(ctx, serverID, tgt.app.ID)
+	planned.warnings = s.vramPlanWarnings(ctx, serverID, tgt.app.ID, planned.ensure)
 	// The Apple label. The gateway is hardware-agnostic everywhere else, but
 	// a figure read from unified SYSTEM memory reported as VRAM is a wrong
 	// number rather than a vague one, and the reported OS is the only thing
@@ -338,9 +375,9 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 }
 
 // vramEnumerateFleet is D2.1 and D2.2 together: which ENABLED specs make up
-// the fleet this run has to drain, which of them is the target, and the two
-// conditions under which no gateway-side write can produce the isolation the
-// run promises.
+// the fleet this run has to drain, which of them is the target (a zero spec
+// when none is), and the two conditions under which no gateway-side write can
+// produce the isolation the run promises.
 //
 // A DISABLED spec is nothing the agent ever runs, so it is no part of the
 // fleet to drain. The result is sorted so the drain, the restore and the
@@ -349,14 +386,14 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 // It takes the specs already read rather than reading them itself, so
 // vramRunPlan keeps the whole store-error path -- a refusal here is always a
 // decision about the fleet, never an I/O failure.
-func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (specIDs []string, targetSpecID string, err error) {
+func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (specIDs []string, targetSpec routing.RuntimeSpec, err error) {
 	for _, spec := range specs {
 		if !spec.Enabled {
 			continue
 		}
 		specIDs = append(specIDs, spec.ID)
 		if spec.MappingID == targetMappingID {
-			targetSpecID = spec.ID
+			targetSpec = spec
 		}
 		// D2.2, first refusal: an operator-owned override anywhere -- THE
 		// TARGET'S OWN INCLUDED -- is what makes the restore unambiguous.
@@ -364,7 +401,7 @@ func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (sp
 		// the run never has to reconstruct what an override was; after a
 		// gateway restart it could not know.
 		if spec.AdminState != "" {
-			return nil, "", &vramRefusal{
+			return nil, routing.RuntimeSpec{}, &vramRefusal{
 				code: codeBenchmarkVRAMIsolationBlocked,
 				msg:  "spec " + spec.ID + " already carries the admin override " + spec.AdminState + "; clear it first",
 			}
@@ -376,25 +413,49 @@ func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (sp
 		// than refusing and naming it. The TARGET may be pinned: stopping the
 		// target is the point of the run.
 		if spec.Pinned && spec.MappingID != targetMappingID {
-			return nil, "", &vramRefusal{
+			return nil, routing.RuntimeSpec{}, &vramRefusal{
 				code: codeBenchmarkVRAMIsolationBlocked,
 				msg:  "spec " + spec.ID + " is pinned to stay running; unpin it first",
 			}
 		}
 	}
 	sort.Strings(specIDs)
-	return specIDs, targetSpecID, nil
+	return specIDs, targetSpec, nil
+}
+
+// vramEnsurePlan decides how the run starts the target: false for a text
+// target, which loads by generating as always, and true for an images-only one
+// (mappingSpecIsImagesOnly on targetSpec), which has no chat endpoint to
+// generate on and is started through the agent router's ensure route instead.
+// That route needs an agent that declares runtime_ensure; without it the
+// target cannot be started at all, which is refused before anything is
+// written.
+func (s *Server) vramEnsurePlan(serverID string, app routing.Application, targetSpec routing.RuntimeSpec) (bool, error) {
+	if !mappingSpecIsImagesOnly(app, targetSpec, true) {
+		return false, nil
+	}
+	if !s.AgentFeatures.Has(serverID, runtimeEnsureFeature) {
+		return false, vramEnsureUnsupported()
+	}
+	return true, nil
+}
+
+// vramEnsureUnsupported is the refusal of an images-only target on an agent
+// that does not declare runtime_ensure: at the trigger (vramEnsurePlan), and
+// again by the run before it drains.
+func vramEnsureUnsupported() *vramRefusal {
+	return &vramRefusal{code: codeBenchmarkVRAMAgentEnsureUnsupported, msg: msgBenchmarkVRAMAgentEnsureUnsupported}
 }
 
 // vramPlanWarnings collects the conditions that DEGRADE a run's confidence
 // without making it pointless, in the fixed order the result reports them.
 //
-// They are gathered together because they share one posture -- neither may
+// They are gathered together because they share one posture -- none may
 // refuse -- and separately from the refusals above because that posture is the
 // whole distinction: a refusal costs the operator a message, a warning costs
-// them nothing and buys them the context to weigh the number they get. Neither
+// them nothing and buys them the context to weigh the number they get. No
 // condition is read again during the run; the run carries the strings.
-func (s *Server) vramPlanWarnings(ctx context.Context, serverID, agentAppID string) []string {
+func (s *Server) vramPlanWarnings(ctx context.Context, serverID, agentAppID string, ensure bool) []string {
 	var warnings []string
 	// Q10's warning half: an agent with no open WebSocket is told about, never
 	// refused -- the drain does not even begin until its next runtime poll.
@@ -404,6 +465,11 @@ func (s *Server) vramPlanWarnings(ctx context.Context, serverID, agentAppID stri
 	// Q5: warn on a non-managed neighbour, do not refuse.
 	if s.vramHasNonManagedApplications(ctx, serverID, agentAppID) {
 		warnings = append(warnings, vramWarningNonManagedApplications)
+	}
+	// An ensure plan's target never generates, so its first-generation
+	// allocations are not in the number.
+	if ensure {
+		warnings = append(warnings, vramWarningFirstGenerationNotMeasured)
 	}
 	return warnings
 }
@@ -505,6 +571,8 @@ func (s *Server) vramLiveProcessBySpec(serverID string) map[string]bool {
 // "", "force_running", "force_stopped" switch), mirrored here rather than
 // exported for the same reason vramStatesNoProcess mirrors the agent's state
 // set: a closed set is worth stating independently on the side that reads it.
+// loadRefusal compares against it too, to refuse a Load of a force-stopped
+// spec.
 const vramAdminStateForceStopped = "force_stopped"
 
 // vramDrain writes admin_state: force_stopped to every spec, THE TARGET AMONG

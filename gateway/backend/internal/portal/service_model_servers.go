@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
@@ -15,7 +16,8 @@ import (
 
 // ModelServerDTO is one server that offers a gateway model: the server's identity, the mapping's
 // distilled benchmark metrics, whether the model is currently loaded there, and whether the caller
-// may trigger a load on it (admin or a server owner). Metric fields mirror the mapping DTO.
+// may trigger a load on it (CanLoad, the Load starter's own authorization: see ModelServers).
+// Metric fields mirror the mapping DTO.
 type ModelServerDTO struct {
 	ServerID      string `json:"server_id"`
 	ServerName    string `json:"server_name"`
@@ -43,6 +45,18 @@ type ModelServerDTO struct {
 	// layer injects them from the runtime-status registry after the fact.
 	MetricsProbe string `json:"metrics_probe"`
 	ContextProbe string `json:"context_probe"`
+
+	// LoadRefusal is why a Load of this mapping would be refused right now:
+	// "images_only", "agent_ensure_unsupported" or "spec_force_stopped", the
+	// codes the Load starter answers 409 with minus their "benchmark." prefix,
+	// or "" when nothing refuses it. Like State, Service.ModelServers leaves it
+	// "" and the gateway layer injects it, from the same check the starter
+	// makes. A row the caller cannot Load (CanLoad false) never carries one.
+	// It is advisory and stays "" whenever the gateway cannot tell -- while a
+	// run holds the server, or when the application, or a server_agent
+	// mapping's runtime spec, cannot be read -- so the starter's own answer
+	// decides.
+	LoadRefusal string `json:"load_refusal,omitempty"`
 
 	GenTokensPerSecond           float64 `json:"gen_tokens_per_second"`
 	PromptTokensPerSecond        float64 `json:"prompt_tokens_per_second"`
@@ -150,7 +164,9 @@ type GroupModelServerDTO struct {
 
 // ModelServers returns every reachable server that offers gatewayModelName, one row per
 // (server, mapping), with the mapping's distilled benchmark metrics, the live loaded-state, and a
-// can_load permission flag for the principal (admin OR a server owner). gateway:use, global — the
+// can_load permission flag for the principal: the Load starter's own authorization, authorizeServer
+// (system scope, a server owner, or a can_manage_servers manager of one of the server's linked
+// admin groups), so a plain admin who is none of those gets false. gateway:use, global — the
 // row set is NOT owner-filtered (mirrors Models()), but IS filtered to the servers the principal
 // is allowed to USE under resource-group provisioning (Resource Groups Phase 2 — Task 4): a
 // non-provisioned principal gets an empty slice for a model exclusively offered by a restricted
@@ -162,60 +178,23 @@ type GroupModelServerDTO struct {
 // admin bypasses this check entirely (the ModelServersSection management flow, same as
 // ManageModels()). An unknown model resolves to an empty slice either way.
 func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewayModelName string) ([]ModelServerDTO, error) {
-	admin := isAdmin(principal)
-	if !admin {
-		// Fails CLOSED on a ModelSettings store error: a transient read failure
-		// must not silently drop the hidden/locked suppression and leak a
-		// suppressed model's serving rows to a non-admin. This mirrors
-		// modelGroupOverlay (which backs Models()): it propagates the same
-		// modelVisibilityByLower error rather than falling back to an empty
-		// suppress set, so a blip surfaces as a 500, never as a leak.
-		visByLower, sErr := s.modelVisibilityByLower(ctx)
-		if sErr != nil {
-			return nil, sErr
-		}
-		if isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(gatewayModelName))]) {
-			return []ModelServerDTO{}, nil
-		}
+	suppressed, err := s.modelServersSuppressed(ctx, principal, gatewayModelName)
+	if err != nil {
+		return nil, err
+	}
+	if suppressed {
+		return []ModelServerDTO{}, nil
 	}
 	views, err := s.activeMappingViews(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ownerCache := make(map[string]bool)
-	canManage := func(serverID string) bool {
-		if admin {
-			return true
-		}
-		if v, ok := ownerCache[serverID]; ok {
-			return v
-		}
-		v := false
-		if owners, oerr := s.routes.ServerOwners(ctx, serverID); oerr == nil {
-			for _, o := range owners {
-				if o == principal.UserID {
-					v = true
-					break
-				}
-			}
-		}
-		ownerCache[serverID] = v
-		return v
-	}
+	canLoad := s.loadAuthorizer(ctx, principal)
 
 	// Filter to the offering views FIRST, so the capability batch call below
 	// (the N+1 guard: one query, period) asks for exactly the mapping ids
 	// this response needs -- not every active mapping in the system.
-	matched := make([]mappingView, 0)
-	for _, view := range views {
-		if view.mapping.GatewayModelName == gatewayModelName {
-			matched = append(matched, view)
-		}
-	}
-	mappingIDs := make([]string, len(matched))
-	for i, view := range matched {
-		mappingIDs[i] = view.mapping.ID
-	}
+	matched, mappingIDs := offeringMappingViews(views, gatewayModelName)
 	// Best-effort, exactly ONE query regardless of how many mappings offer
 	// this model: a store error degrades every row's capabilities to empty
 	// (fail-closed -- see ModelServerDTO.Capabilities) rather than failing
@@ -235,40 +214,7 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 
 	rows := make([]ModelServerDTO, 0, len(matched))
 	for _, view := range matched {
-		loaded := false
-		if s.loadedModels != nil && view.mapping.AppModelName != "" {
-			for _, m := range s.loadedModels.LoadedAppModels(view.app.ID, view.server.ID) {
-				if m == view.mapping.AppModelName {
-					loaded = true
-					break
-				}
-			}
-		}
-		caps := capsByMapping[view.mapping.ID]
-		byName := routing.CapabilityRowsByName(caps)
-		liveProgressRow := byName[routing.CapabilityLiveProgress]
-		rows = append(rows, ModelServerDTO{
-			ServerID:                     view.server.ID,
-			ServerName:                   view.server.Name,
-			ApplicationID:                view.app.ID,
-			MappingID:                    view.mapping.ID,
-			Loaded:                       loaded,
-			CanLoad:                      canManage(view.server.ID),
-			GenTokensPerSecond:           view.mapping.GenTokensPerSecond,
-			PromptTokensPerSecond:        view.mapping.PromptTokensPerSecond,
-			LoadTimeMS:                   view.mapping.LoadTimeMS,
-			ContextSize:                  view.mapping.ContextSize,
-			MaxConcurrency:               view.mapping.MaxConcurrency,
-			RecommendedConcurrency:       view.mapping.RecommendedConcurrency,
-			GenTokensPerSecondAtCapacity: view.mapping.GenTokensPerSecondAtCapacity,
-			IsMtp:                        byName[routing.CapabilityMTP].Verdict == routing.CapabilityYes,
-			VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
-			MetricsSource:                view.mapping.MetricsSource,
-			MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
-			LiveProgressSupport:          routing.LiveProgressSupportFromVerdict(liveProgressRow.Verdict),
-			LiveProgressCheckedAt:        capabilityCheckedAt(liveProgressRow),
-			Capabilities:                 modelServerCapabilityDTOs(caps),
-		})
+		rows = append(rows, modelServerRow(view, s.mappingLoaded(view), canLoad(view.server.ID), capsByMapping[view.mapping.ID]))
 	}
 	rows, err = s.filterAllowedModelServerRows(ctx, principal, rows)
 	if err != nil {
@@ -281,6 +227,107 @@ func (s *Service) ModelServers(ctx context.Context, principal auth.Token, gatewa
 		return rows[i].MappingID < rows[j].MappingID
 	})
 	return rows, nil
+}
+
+// modelServersSuppressed reports whether ModelServers answers principal an empty slice for
+// gatewayModelName because the model's visibility is "hidden" or "locked". An admin is never
+// suppressed.
+//
+// It fails CLOSED on a ModelSettings store error: a transient read failure must not silently
+// drop the hidden/locked suppression and leak a suppressed model's serving rows to a
+// non-admin. This mirrors modelGroupOverlay (which backs Models()): it propagates the same
+// modelVisibilityByLower error rather than falling back to an empty suppress set, so a blip
+// surfaces as a 500, never as a leak.
+func (s *Service) modelServersSuppressed(ctx context.Context, principal auth.Token, gatewayModelName string) (bool, error) {
+	if isAdmin(principal) {
+		return false, nil
+	}
+	visByLower, err := s.modelVisibilityByLower(ctx)
+	if err != nil {
+		return false, err
+	}
+	return isHiddenOrLocked(visByLower[strings.ToLower(strings.TrimSpace(gatewayModelName))]), nil
+}
+
+// offeringMappingViews returns the views whose mapping offers gatewayModelName, in order, and
+// their mapping ids.
+func offeringMappingViews(views []mappingView, gatewayModelName string) ([]mappingView, []string) {
+	matched := make([]mappingView, 0)
+	for _, view := range views {
+		if view.mapping.GatewayModelName == gatewayModelName {
+			matched = append(matched, view)
+		}
+	}
+	mappingIDs := make([]string, len(matched))
+	for i, view := range matched {
+		mappingIDs[i] = view.mapping.ID
+	}
+	return matched, mappingIDs
+}
+
+// mappingLoaded reports whether view's mapping's upstream model is in the live loaded set of
+// its application on its server.
+func (s *Service) mappingLoaded(view mappingView) bool {
+	if s.loadedModels == nil || view.mapping.AppModelName == "" {
+		return false
+	}
+	for _, m := range s.loadedModels.LoadedAppModels(view.app.ID, view.server.ID) {
+		if m == view.mapping.AppModelName {
+			return true
+		}
+	}
+	return false
+}
+
+// modelServerRow is ModelServers' row for view: its identity, loaded-state, can_load, metrics,
+// and the capability rows caps (the mapping's, from the listing's one batch read).
+func modelServerRow(view mappingView, loaded, canLoad bool, caps []routing.CapabilityRow) ModelServerDTO {
+	byName := routing.CapabilityRowsByName(caps)
+	liveProgressRow := byName[routing.CapabilityLiveProgress]
+	return ModelServerDTO{
+		ServerID:                     view.server.ID,
+		ServerName:                   view.server.Name,
+		ApplicationID:                view.app.ID,
+		MappingID:                    view.mapping.ID,
+		Loaded:                       loaded,
+		CanLoad:                      canLoad,
+		GenTokensPerSecond:           view.mapping.GenTokensPerSecond,
+		PromptTokensPerSecond:        view.mapping.PromptTokensPerSecond,
+		LoadTimeMS:                   view.mapping.LoadTimeMS,
+		ContextSize:                  view.mapping.ContextSize,
+		MaxConcurrency:               view.mapping.MaxConcurrency,
+		RecommendedConcurrency:       view.mapping.RecommendedConcurrency,
+		GenTokensPerSecondAtCapacity: view.mapping.GenTokensPerSecondAtCapacity,
+		IsMtp:                        byName[routing.CapabilityMTP].Verdict == routing.CapabilityYes,
+		VisionCapable:                byName[routing.CapabilityVision].Verdict == routing.CapabilityYes,
+		MetricsSource:                view.mapping.MetricsSource,
+		MetricsUpdatedAt:             view.mapping.MetricsUpdatedAt,
+		LiveProgressSupport:          routing.LiveProgressSupportFromVerdict(liveProgressRow.Verdict),
+		LiveProgressCheckedAt:        capabilityCheckedAt(liveProgressRow),
+		Capabilities:                 modelServerCapabilityDTOs(caps),
+	}
+}
+
+// loadAuthorizer returns ModelServers' can_load check for principal: whether the Load starter
+// would authorize principal on a server, decided by the starter's own authorizeServer and
+// cached per server id for one listing. A read that fails inside authorizeServer counts as
+// "cannot Load" for that server's rows. A failed owner or admin-group read is logged once per
+// server; a failed server read is not, because authorizeServer answers it with ErrServerNotFound,
+// the same answer as for a principal it does not admit.
+func (s *Service) loadAuthorizer(ctx context.Context, principal auth.Token) func(serverID string) bool {
+	cache := make(map[string]bool)
+	return func(serverID string) bool {
+		if v, ok := cache[serverID]; ok {
+			return v
+		}
+		_, err := s.authorizeServer(ctx, principal, serverID)
+		if err != nil && !errors.Is(err, ErrServerNotFound) {
+			slog.Warn("portal: model-servers load authorization read failed; can_load false for its rows",
+				"server_id", serverID, "err", err)
+		}
+		cache[serverID] = err == nil
+		return err == nil
+	}
 }
 
 // capabilityCheckedAt is one capability row's CheckedAt as an optional wire

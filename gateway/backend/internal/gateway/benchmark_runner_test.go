@@ -1217,9 +1217,9 @@ func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
 	}
 }
 
-// TestBenchmarkSpecForServerAgentWithSpec: benchmarkSpecFor (used at every
-// benchmarkTarget construction site) loads the stored spec for a server_agent
-// mapping.
+// TestBenchmarkSpecForServerAgentWithSpec: benchmarkSpecFor (the model
+// warmer's spec read; every other construction site hands benchmarkTargetFor
+// the spec it read) loads the stored spec for a server_agent mapping.
 func TestBenchmarkSpecForServerAgentWithSpec(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)

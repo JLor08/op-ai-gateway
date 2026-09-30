@@ -86,6 +86,15 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // writeBenchmarkError's 500 fallback (gateway/benchmark_endpoints.go): a
   // store read failed before the run started.
   'benchmark.request_failed': 'errorBenchmarkRequestFailed',
+  // The starters' refusals before the reservation (benchmarkErrRows): a run
+  // that would send an images-only mapping a chat prompt; an images-only agent
+  // mapping whose agent does not report runtime_ensure (the Load, and the VRAM
+  // probe under the same code); a Load of a force_stopped launch spec. The
+  // model list's `load_refusal` reuses these labels as the disabled Load
+  // action's tooltip.
+  'benchmark.images_only': 'errorBenchmarkImagesOnly',
+  'benchmark.agent_ensure_unsupported': 'errorBenchmarkAgentEnsureUnsupported',
+  'benchmark.spec_force_stopped': 'errorBenchmarkSpecForceStopped',
   // The VRAM benchmark's precondition refusals (409 at the trigger), read
   // verbatim from the Go constants in gateway/benchmark_vram_isolation.go and
   // gateway/benchmark_vram_confidence.go.

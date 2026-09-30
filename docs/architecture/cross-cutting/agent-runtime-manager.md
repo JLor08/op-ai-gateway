@@ -1068,9 +1068,16 @@ fact about this runtime is, and why:
   §9](compatibility-and-inference.md#9-model-discovery)). The gateway's own background chat
   prompts skip it too: the benchmark scheduler and the model warmer judge a
   mapping by its effective flavors ([Routing & Model Selection
-  §7](routing-and-model-selection.md#7-model-selection-metrics)). A run an
-  operator starts by hand — a benchmark, a load, a context or VRAM probe —
-  still sends it one, and that run reports the failure. A spec that keeps `openai` stays a text candidate its
+  §7](routing-and-model-selection.md#7-model-selection-metrics)), and a speed
+  benchmark's cold pass never picks it as the sibling it streams to evict its
+  target. No run an operator starts by hand sends it one either: a context
+  probe or a mapping-scope benchmark of such a mapping is refused with 409
+  `benchmark.images_only`, an application- or server-scope benchmark skips it,
+  a cold pass passes it over as a sibling, and a Load or a VRAM probe starts
+  the child through the router's ensure route without generating, on an agent
+  that declares `runtime_ensure`
+  ([§11.9](#119-manual-runs-on-an-images-only-mapping)).
+  A spec that keeps `openai` stays a text candidate its
   upstream cannot serve, so an `sd-server` spec lists `openai_images` alone
   ([API Compatibility & Inference
   §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)).
@@ -1112,7 +1119,8 @@ fact about this runtime is, and why:
   without an `image: yes` verdict before the router could even start the
   child to ask it, so an unpinned spec's first request has no document for
   either reader to have read yet. Pin the spec, start it once so the
-  automatic path can run, or set the verdict by hand once (after which it is
+  automatic path can run — a Load from the Models catalog does, on an agent
+  that declares `runtime_ensure` (§11.9) — or set the verdict by hand once (after which it is
   stored, like any other verdict) — the manual path also remains the only one
   for a gateway or agent build old enough to predate this source. Until the
   verdict arrives no listing offers it for use: the portal chat offers a model
@@ -1141,8 +1149,8 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Five fixed GET-only routes; any other method on those exact paths falls through
-to model routing.
+Five fixed GET-only routes and one POST route; any other method on those paths
+falls through to model routing.
 
 | Route | Answers | Blocks during a load? |
 |---|---|---|
@@ -1150,6 +1158,7 @@ to model routing.
 | `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only** specs in state `running`. | Never |
 | `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones. | Never |
 | `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -1168,8 +1177,31 @@ it.** A `GET` on the path whose suffix is anything other than `/props` is
 refused outright (`runtime.upstream_endpoint_not_allowed`, §4.3): the
 allowlist is exactly one path, never a generic reverse proxy. A non-`GET` on
 the same path falls through to the ordinary model-routed proxy, same as any
-other method on the four routes above (the existing M9 rule) — there is no
-separate method check inside this handler.
+other method on the other control routes above (the existing M9 rule) — there
+is no separate method check inside this handler.
+
+**`POST /ensure/{model}` is the one control route that starts a child**, and it
+starts it without forwarding a request
+([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
+The gateway sends it for the Load and the VRAM probe of an images-only mapping
+([§11.9](#119-manual-runs-on-an-images-only-mapping)),
+whose child has no chat endpoint to load it through. The handler calls
+`EnsureRunning` on the request's context. On success it calls
+`release()` at once and then, only if the client is still connected, refreshes
+the write deadline and writes the 200, so `release()` runs exactly once on this
+path as on every other (§4.4). The agent waits up to the spec's
+`startup_timeout_seconds`, plus `admission_wait_timeout_seconds` when that is
+above 0; at 0 the wait lasts until the client disconnects, so the gateway's
+deadline is the bound. A caller that disconnects while still queued drops its
+place, and nothing starts: the handler reads any body to its end first and
+discards it, because only then does net/http watch the connection for the
+caller leaving. A start already under way still comes up, with
+`lastUsed` set and nothing in flight, so the idle policy then applies as after
+any inference request. The gateway's call has no body on purpose: an agent that
+predates the route hands the request to model routing, which answers 404
+`runtime.model_not_managed` for a body that names no model before it calls
+`EnsureRunning` (§4.2), so the route starts nothing there. The gateway sends it
+only to an agent that declares `runtime_ensure` (§7).
 
 ### 4.2 Model routing
 
@@ -1188,8 +1220,9 @@ Every other request is routed on a `model` field in a JSON request body.
 - Two specs claiming the same `upstream_model` are logged at Warn naming both
   spec ids when the index is rebuilt. Which one wins is not a contract.
 - A request with **no body, a non-JSON body, or a body naming no managed
-  model** gets `404 runtime.model_not_managed`. See §4.5 for what that means for
-  websocket-serving model servers.
+  model** gets `404 runtime.model_not_managed`, before anything is started. See
+  §4.5 for what that means for websocket-serving model servers, and §4.1 for why
+  it makes `POST /ensure/{model}` harmless on an agent that predates the route.
 - **The router is a catch-all: it forwards `/v1/responses` and `/v1/messages`
   exactly like any other path**, routing purely on the body's top-level
   `model` field — it has no notion of Codex or Claude Code, and no notion of
@@ -1233,6 +1266,13 @@ continuous ticker — admission and cold start, the upstream round trip, and the
 wait for the child's first body byte (time-to-first-token for an already-warm
 child) — and stop for good the instant real bytes flow. Covering only the
 admission phase leaves a warm-but-slow model looking dead to the client.
+
+`POST /ensure/{model}` (§4.1) gets no heartbeat at all. It is not a stream, and
+a heartbeat would commit a 200 before the outcome is known, which is the one
+thing its caller reads. It is one silent call instead, which is safe because no
+hop between the gateway and the router arms an idle or read timer: not the
+gateway's transport, not the agent's TLS proxy, not the router's own server.
+The non-streaming proxy path holds a cold start the same way.
 
 `Accept-Encoding` is stripped from the outbound request so the transport can
 negotiate and transparently decompress; forwarding it would splice gzip bytes
@@ -2346,11 +2386,11 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Four
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Five
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
-`runtime_upstream_props`); one, `capability_source_sdcpp`, is on the gateway's
-list only and read by the agent (below).
+`runtime_upstream_props`, `runtime_ensure`); one, `capability_source_sdcpp`, is
+on the gateway's list only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -2374,7 +2414,9 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `Since: "0.5.0"`, `runtime_model_probe` ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`, and
 `runtime_upstream_props` ([§4.1](#41-control-routes),
-[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`,
+and `runtime_ensure` ([§4.1](#41-control-routes),
+[§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which has no
 `Since` because the agent's registry does not carry it. The gateway's own list is
@@ -2486,6 +2528,25 @@ never will, exactly the reasoning `PushRuntimeConfig`'s own feature gate
 already established. `server-agent`'s `Version` moved `0.6.0` → `0.7.0` for
 this entry, MINOR per the same rule.
 
+`runtime_ensure` exists for the same reason as `runtime_upstream_props`: the
+gateway gates real behaviour on it, fail-closed, and that gate is its purpose.
+It says the router serves `POST /ensure/{model}` (§4.1), and the gateway reads
+it off the agent's sample (`s.AgentFeatures.Has(server.ID,
+runtimeEnsureFeature)`) before a Load or a VRAM probe of an images-only
+mapping, the only runs that use the route
+([§11.9](#119-manual-runs-on-an-images-only-mapping)), and for the Models
+catalog row's `load_refusal` ([§11.7](#117-live-runtime-state-on-the-models-catalog)).
+Trying the route instead could not tell the two cases apart: an agent without
+it answers 404 `runtime.model_not_managed` (§4.2), the same code as a model the
+agent does not manage. Without the name the gateway
+refuses such a run with 409 `benchmark.agent_ensure_unsupported` and sends the
+agent nothing. It has no chat Load to fall back to, because the child has no
+chat endpoint. The refusal also covers an agent that has not reported since the
+gateway restarted, because the gateway holds the declared set in memory
+(`agentFeaturesRegistry`, below), and the refusal's label says so. A newer agent
+under an older gateway simply never receives the route. `server-agent`'s
+`Version` moved `0.7.4` → `0.8.0` for this entry, MINOR per the same rule.
+
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
 `runtime_manager` is checked by the AGENT: it manages nothing unless the gateway
@@ -2575,8 +2636,11 @@ and identically everywhere.
 
 The gateway derives **two independent** per-agent feature lists from the same
 wire field, and "the derived set" is ambiguous: `agentFeaturesRegistry` (fed by
-`internal/gateway/agent_ingest.go`, sole consumer `PushRuntimeConfig`'s gate),
-and `internal/portal/service_runtime.go`'s own parse, which feeds the portal
+`internal/gateway/agent_ingest.go`, and read through `Has` by every gateway-side
+feature gate — `PushRuntimeConfig`, the VRAM benchmark, the Load run, the model
+catalog's probe fields and load refusal, the resolver's runtime-model state
+checker, the log view and the app-health `{model}` probe pass), and
+`internal/portal/service_runtime.go`'s own parse, which feeds the portal
 DTO's `agent_features` and hence the mismatch banner. Same field, separate
 state, separate consumers. The duplication is not a DRY violation:
 `internal/portal` may not import `internal/gateway` (see
@@ -2620,6 +2684,12 @@ which gained nothing. The rule counts entries in the agent's own registry, so
 it makes the bump PATCH, and what a flag is FOR agrees: the gateway is the side
 that must accept the new source, so the agent waits on the gateway's name, and
 nothing on the gateway waits on the agent.
+
+**`0.7.4` → `0.8.0` (issue #161) is MINOR, the plain case the rule names.**
+`agent.Features` gained `runtime_ensure` for the router's `POST /ensure/{model}`
+(§4.1), and the gateway waits on that name before it sends the route (§7). The
+version assertion lives in `TestFeaturesDeclareRuntimeEnsure`, beside the
+newest feature, and `runtime_upstream_props`' `Since` stays `"0.7.0"`.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -4438,12 +4508,16 @@ wire enum on this screen, runtime states included.
 **`timeout_ms_below_startup_timeout`** — the application's request `timeout_ms`
 is below the largest `startup_timeout_seconds` among its **enabled** specs, so
 the gateway can give up on a cold start the agent would still let finish, in
-two places. A non-streaming request hits its total deadline. The
+two places. A non-streaming request hits its total deadline. A text
 Load and the other benchmark streams end with `provider.timeout` at their
 first-data budget at the latest, the larger of `timeout_ms` and the idle budget
 ([§12](#12-the-timeout-budget)), and a Load does not retry that timeout. The
 budget, too, stays below the startup timeout unless the idle budget reaches
 it, which the 120 s idle default does not against the 180 s startup default.
+An images-only Load or VRAM probe through the ensure route streams nothing: it
+waits up to the load loop's bound, the larger of 5 minutes and that budget
+([§11.9](#119-manual-runs-on-an-images-only-mapping), §12), so for it the
+warning matters only when the startup timeout exceeds that bound.
 
 **`binary_path_os_mismatch`** — a spec's `binary` is absolute for the *other*
 platform than the GOOS this server's agent reports in its telemetry (a `C:\…`
@@ -4866,7 +4940,11 @@ cache lazily on first use has necessarily already done so before the post-load
 window opens. That is why there is deliberately **no** second "send one tiny
 generation" step — two windows for one observation doubles the exposure to a
 drifting neighbour and to the reservation being held open, for a number that
-cannot differ.
+cannot differ. The one exception is an images-only agent child, which has no
+chat endpoint to generate through: for it the core starts the child through the
+router's `POST /ensure/{model}` instead (§4.1), and the report carries the
+warning `first_generation_not_measured` (below;
+[§11.9](#119-manual-runs-on-an-images-only-mapping)).
 
 **Isolation is `admin_state: force_stopped` on every enabled spec, the target
 included.** `force_stopped` is the only lever that *refuses a start*
@@ -4879,10 +4957,12 @@ leaving the target up would make the baseline window already contain it and
 yield a *definitive* delta of ~0 — for the commonest case an operator would
 probe.
 
-**Four refusals before anything is written**, each a state in which the
-promised isolation cannot be achieved by any gateway-side write. All four are
-HTTP 409 with a stable code, and all four are checked **before** the server is
-reserved, so a refused run writes nothing and reserves nothing:
+**Six refusals before anything is written**, each a state in which the promised
+isolation or the load cannot be achieved by any gateway-side write. All six are
+HTTP 409 with a stable code, and all six are checked **before** the server is
+reserved, after the check that no run already holds it (409
+`benchmark.already_running`) — so a refused run writes nothing and reserves
+nothing:
 
 | Condition | Code |
 |---|---|
@@ -4890,6 +4970,7 @@ reserved, so a refused run writes nothing and reserves nothing:
 | [File mode](#82-file-mode), or an agent that has not declared `runtime_manager` | `benchmark.vram_isolation_unavailable` |
 | The server's latest telemetry carries no GPU sample | `benchmark.vram_no_gpu_samples` |
 | A spec already carries an operator override, or a spec *other than the target* is pinned (the message names it) | `benchmark.vram_isolation_blocked` |
+| The target is images-only ([§11.9](#119-manual-runs-on-an-images-only-mapping)) and its agent has not declared `runtime_ensure`, so the run could load it only by generating, which its upstream cannot serve | `benchmark.agent_ensure_unsupported` |
 | The target's launch spec declares a GPU index this host does not report (the message names it) | `benchmark.vram_declared_gpu_missing` |
 
 The override refusal is what makes the restore unambiguous: the run only ever
@@ -4908,6 +4989,25 @@ full bound and reports `baseline_unstable`, whose stated next action ("something
 on the card was moving; retry once the server is quiet") is wrong and can never
 work. The host's whole card list is already in hand at trigger time, so naming
 the missing index costs nothing.
+
+The **ensure** refusal is the only one whose code is not a `benchmark.vram_*`
+one: it is the Load's own `benchmark.agent_ensure_unsupported`, because the
+cause is the same — an images-only child can be loaded only through the
+router's ensure route, and this agent does not declare it. It comes after the
+second not-agent-managed check and before the declared-GPU one, and it decides
+from the target's spec in the fleet read the plan already makes, so the
+decision adds no read of its own. The probe still reads the target's spec twice: the
+starter's fail-closed read of the mapping's spec builds the target, which gives
+the load its credential and its start-timeout hint, and the plan's read of the
+application's specs gives the fleet and this decision. With the name declared,
+the plan instead marks the run to load through the route
+(`vramRunPlanned.ensure`) and adds the warning
+`first_generation_not_measured` to its warnings. The runner checks the name
+again before it drains, for such a run only, and ends with an error naming
+`benchmark.agent_ensure_unsupported` if the agent has stopped declaring it. The
+run's other re-check, for file mode and `runtime_manager`, does not read the
+name, because reading it there would refuse every VRAM probe on an older agent,
+text targets included.
 
 **A launch-spec write is refused while a run holds the server.** The
 launch-spec endpoint is a full-document replace with `admin_state` among its
@@ -4953,7 +5053,13 @@ resident" for a model that may well be resident, the baseline already contains
 it, and the ~0 delta surfaces at the floor gate as `below_floor` — whose next
 action, *"the window missed the allocation, measure again when the server is
 quiet"*, fails identically every time. So the run reports the check as
-**unavailable** rather than letting the wrong reason stand in for it.
+**unavailable** rather than letting the wrong reason stand in for it. A fifth
+rides an ensure plan from the start: `first_generation_not_measured`. Such a
+run measures the child once it is up and its health check passes, and what
+`sd-server` allocates on top when it first generates has not been measured
+([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
+It is a warning and not an inconclusive reason because warnings do not gate the
+apply affordance: the number is real, and it is offered with its caveat.
 
 **`isolated` is evidence, never a 200.** In file mode every `admin_state` write
 succeeds and stops nothing, so a write's success proves nothing anywhere. The
@@ -5451,7 +5557,9 @@ stays load-bearing for the case it was always for: a persisted row written by a
 **newer** gateway than the portal reading it. The trigger's **refusal codes** are the same
 contract by a different route: they are keyed into `errorLabelByCode`, an
 unmapped one degrades to the backend's raw English in an otherwise localized
-portal, so `format.test.ts` pins those six wire strings as literals.
+portal, so `format.test.ts` pins those six wire strings as literals — and
+`benchmark.agent_ensure_unsupported`, which the trigger shares with the Load, in
+its list of the other `benchmark.*` codes.
 
 **The history section decodes the payload for `kind == "vram"` only**, and the
 plain speed table **excludes** that kind explicitly — a VRAM row falling into it
@@ -5667,6 +5775,31 @@ pre-existing `loaded` boolean instead: **Geladen** if loaded, else **Nicht
 Geladen**, so the merge changes nothing for the majority of model servers
 that never had a runtime state to show.
 
+**The row also says whether a Load would be refused, and why.** `load_refusal`
+is gateway-injected in the same pass: `images_only`, `agent_ensure_unsupported`
+or `spec_force_stopped`, from the helper the Load starter itself calls
+(`loadRefusal`), so the button and the endpoint cannot drift apart. The pass
+reads each distinct application at most once per listing and computes the
+reason before the published-status lookup, so a row with no status yet still
+gets one; an agent row's reason reuses the spec read above, and any other row's
+reason needs no spec. The portal
+disables the row's Load button and shows the reason's label as its tooltip. The
+reason is empty on a row the caller cannot Load (`can_load` false), where the
+portal shows Load disabled with its permission reason and the starter answers
+404. `can_load` is the Load starter's own authorization, computed per server
+with `authorizeServer`: system scope, a server owner, or a `can_manage_servers`
+manager of one of the server's linked admin groups. The admin scope alone does
+not grant it, so a plain admin sees neither an enabled Load nor a spec's admin
+override. A store error in that check reads as `can_load` false for the
+server's rows; a failed owner or admin-group read is logged once per server in a
+listing, while a failed server read reads like a server the caller may not see
+and is not logged. The reason also
+stays empty while a run holds the row's server, because the starter then answers
+`benchmark.already_running` and a VRAM run's drain has set `force_stopped` on
+every enabled spec, and it stays empty when a read it needs fails, so the starter's own
+fail-closed check answers instead
+([§11.9](#119-manual-runs-on-an-images-only-mapping)).
+
 ### 11.8 The Models overview's loading count
 
 One more figure is gateway-injected the same way, onto a different screen
@@ -5767,6 +5900,138 @@ The frontend (`ModelList.tsx`) renders the count as a yellow
 and "Geladen", shown only when the count is greater than zero — the same
 convention its neighbouring count columns already use.
 
+### 11.9 Manual runs on an images-only mapping
+
+An images-only mapping is one whose effective flavors — the spec's for an
+agent-launched child with a spec, the application's otherwise — list
+`openai_images` and neither text flavor: the rule of
+[ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec),
+which the starters apply through `mappingSpecIsImagesOnly`. Its upstream has no chat endpoint
+(`sd-server` answers `POST /v1/chat/completions` with 404, measured), and every
+run below would otherwise send it a chat prompt. The benchmark scheduler and the
+model warmer skip such a mapping silently, and no cold pass swaps to it. The
+runs an operator starts refuse it, skip it, or load it without generating
+([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
+
+**Every mapping-scope starter decides in one order, before it reserves the
+server:**
+
+1. authorization (`AuthorizeBenchmarkScope`);
+2. a run already holding the server: 409 `benchmark.already_running`. This
+   comes first because a VRAM run's drain stores `force_stopped` on every
+   enabled spec, and a Load during it must not be told to clear that;
+3. for a `server_agent` application, **one read of the mapping's spec, which
+   fails closed**: a store error answers 500 `benchmark.request_failed`, logged
+   with the mapping id, and reserves nothing. The same spec supplies the
+   images-only decision and `admin_state`, and the run's target is built from
+   it (`benchmarkTargetFor` takes it rather than reading the row again), so the
+   run and its failure hints see what the check saw. Any other application
+   needs no read. The VRAM probe takes its images-only decision instead from
+   the target's spec in the fleet read its plan makes (§11.6), and adds
+   no read for it;
+4. the refusals:
+
+   | Run | Images-only mapping |
+   |---|---|
+   | Context probe | 409 `benchmark.images_only` |
+   | Speed, capacity, both or vision, mapping scope | 409 `benchmark.images_only` |
+   | Load | the ensure route when the agent declares `runtime_ensure`; 409 `benchmark.agent_ensure_unsupported` when it does not; 409 `benchmark.images_only` for an application that is not `server_agent` |
+   | VRAM probe | the ensure route, with the warning `first_generation_not_measured`, when the agent declares `runtime_ensure`; 409 `benchmark.agent_ensure_unsupported` when it does not (§11.6); an application that is not `server_agent` is already refused as `benchmark.vram_not_agent_managed` |
+
+   Then, for a Load only, a spec whose `admin_state` is `force_stopped` gets
+   409 `benchmark.spec_force_stopped`, text and images-only alike. Without the
+   refusal such a Load would retry the router's immediate 503 until its bound,
+   and a Load must not override desired state
+   ([ADR-026](../09-architecture-decisions.md#adr-026--gatewayagent-control-is-desired-state-not-commands));
+5. the reservation (`TryStart`).
+
+A text `server_agent` mapping therefore answers 500 when its spec read fails,
+for every mapping-scope run: a Load, a context probe, a VRAM probe or a
+mapping-scope benchmark. Guessing "text" on a failed read would send the very
+prompt the check exists to stop.
+
+**Application and server scope skip rather than refuse.** Before it reserves the
+server, the starter sorts each mapping into runnable, skipped (images-only) or
+unreadable (its spec read failed). With nothing runnable it
+reserves nothing: 409 `benchmark.images_only` when every mapping is
+images-only, 500 `benchmark.request_failed` otherwise. Otherwise the run starts,
+and before its goroutine does, it records one result per skipped mapping, with
+`skipped: "images_only"`, and one per unreadable mapping, with
+`error: "runtime spec unreadable; not benchmarked (no chat prompt sent): <err>"`.
+Neither gets a history row, `total` counts every mapping, `done` counts these
+results, and the provider never sees their models. A whole-run 500 when one
+read failed would block readable siblings, and recording the skip inside the run
+loop would write history rows.
+
+**No cold pass swaps to one.** A speed or both run measures a text mapping's
+load time from a cold start, and when its model is resident and the application
+cannot unload it, the cold pass evicts it by streaming a one-token chat prompt
+to a sibling on the same application (`benchmarkSiblingModel`), the eviction a
+single-slot swapper performs. That sibling is chosen by the same rule: one that
+serves only images is passed over, and so is one whose spec cannot be read,
+since whether it serves only images is then unknown. With no other sibling the
+pass cannot confirm a cold start, and the run records no load time, as when the
+application has no sibling at all. The scheduler's speed runs take the same
+path.
+
+**The images-only Load.** The load core keeps its already-resident
+short-circuit, then calls the provider's `RuntimeEnsurer` inside the same
+503-retry loop, under the loop's own deadline, instead of sending a one-token
+stream ([API Compatibility & Inference
+§7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)). A 503
+from the router — the window before a just-cleared `force_stopped` reaches the
+agent, or a real admission refusal — is retried within that bound. On success
+the run records `loaded: true`: the child's health path answered 2xx
+(`/v1/models` by default for `sd-server`, §3.4), and the Models catalog shows
+it loaded within about one telemetry sample. On failure it records a
+`loadEnsureError` in `results[].error` and `status.error`; the error keeps the
+provider error's chain, so a 503 is still retried. Its text is
+`<router code>: <hint> (<provider text>)`, one hint per code the route answers (§4.1):
+
+| Router code | Hint |
+|---|---|
+| `runtime.start_timeout` | `not healthy within startup_timeout_seconds (<n> s)` |
+| `runtime.start_failed` | `the process exited or failed to start; see the agent log` |
+| `runtime.not_permitted` | `the agent refused the binary or its arguments` |
+| `runtime.admission_blocked` | `the agent did not admit the start (a force-stopped spec, a pinned sibling or no free VRAM)` |
+| `runtime.model_not_managed` | `the agent does not manage this model` |
+| `runtime.upstream_gone` | `the agent stopped while starting the child` |
+
+An error without a router code is written in full, with no suffix:
+
+| Case | Text |
+|---|---|
+| The load loop's own deadline | `provider.timeout: not running within <loop bound> (the larger of 5 min and the stream budget); a start already under way may still come up` |
+| A 2xx without `"status":"running"`, or one whose body was cut short | `provider.invalid_response: the agent's ensure route answered without "running"` |
+| Anything else: a 401 or 403, a transport error, a cancellation, or a deadline that is not the loop's own | the provider error's own text, such as `provider.timeout: ensure route: context deadline exceeded` |
+
+Only the provider's own timeout at the loop's deadline gives the first row: a
+router answer that lands at that deadline, such as a last 503, keeps its router
+code and hint.
+
+**The portal marks such a mapping before the click.** The mapping DTO carries
+`images_only`, computed by the same rule: one `RuntimeSpecsByApplication` read
+in `ListMappings` for a `server_agent` application, and one spec read on the
+create and update returns; a failed read gives `false` and a Warn log.
+`BenchmarkSection` disables speed, capacity, both and vision for such a mapping
+and says why, and `MappingForm` disables its context-probe button and adds a
+hint with the reason. `RuntimeAdminSection` reloads its mappings after every
+committed spec write (create, edit or delete), while a change to the
+application's flavors reaches the marker only on the next mapping load. The
+Models catalog's Load button reads the row's
+`load_refusal` (§11.7). A result with `skipped` renders as a skip, not as
+`0 tok/s`, and after a finished speed, capacity, both or vision run a notice
+names every mapping the run did not measure — skipped, unreadable or failed —
+because nothing else on screen shows them once the run has
+ended. The markers are advisory: the starters' own check fails closed.
+
+**The check and the reservation are not atomic, and both directions are
+benign.** A mapping that turns images-only after the check gets the chat
+prompt, and the run records its failure. One that turns text is skipped for
+that run at application or server scope, and a Load or VRAM probe of it takes
+the ensure route, which starts any managed child. A `force_stopped` stored
+after the check leaves a Load retrying the router's 503 until the loop's bound.
+
 ## 12. The timeout budget
 
 Five bounds sit on one request to a cold managed model, and they are only
@@ -5812,7 +6077,11 @@ heartbeats as the general cold-load fix:
   larger of 5 minutes and that budget, 10 minutes by default, and holds the
   server's benchmark reservation all the while. The model warmer gets the same
   credit but stays under its own 60 s ceiling ([Compatibility & Inference
-  §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)).
+  §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)). An
+  images-only Load or VRAM probe streams nothing: each attempt is one bodiless
+  `POST /ensure/{model}` (§4.1), held under that same loop deadline, the router
+  sends no heartbeat on it, and no hop between the gateway and the router has
+  an idle timer for its silence to trip ([§11.9](#119-manual-runs-on-an-images-only-mapping)).
 - **They do not help** the gateway's *translate*-path idle watchdog, whose reset
   is event-based and whose scanner skips SSE comment lines.
 - **They do not help the non-streaming total deadline at all.**
