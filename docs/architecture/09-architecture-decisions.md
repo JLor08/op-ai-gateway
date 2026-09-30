@@ -2503,10 +2503,14 @@ spec, or a start the admission gates refused), 504 `runtime.start_timeout`,
 down. On success it calls
 `release()` at once and then, only if the client is still connected, refreshes
 the write deadline and writes 200 `{"status":"running"}`. There is no heartbeat
-and no new error code: the route is one long call. That is safe because no hop
-between the gateway and the router arms an idle or read timer — not the
-gateway's transport, not the agent's TLS proxy, not the router's server — and
-it is how the non-streaming proxy path already holds a cold start. The agent
+and no new error code: the route is one long call. That is safe as long as no
+hop between the gateway and the router arms an idle or read timer shorter than
+the wait. None of the bundled hops does — not the gateway's transport, not the
+agent's TLS proxy, not the router's server — and it is how the non-streaming
+proxy path already holds a cold start. A proxy an operator adds in between cuts
+the call when its timeout is shorter, and the non-streaming path shares that
+exposure (issue #169;
+[Risks §11.1](11-risks-and-technical-debt.md#111-operational-risks)). The agent
 waits up to the spec's `startup_timeout_seconds`, plus
 `admission_wait_timeout_seconds` when that is above 0; at 0, which queues until
 the client disconnects, the gateway's deadline is the bound. A caller that

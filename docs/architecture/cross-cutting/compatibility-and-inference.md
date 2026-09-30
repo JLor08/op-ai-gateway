@@ -907,8 +907,11 @@ once the child is healthy or its start failed
 The attempt runs under the loop's deadline itself, through
 `context.WithDeadlineCause` with a cause the loop owns (`errLoadLoopBound`), and
 the provider arms no timeout of its own. The router sends no keepalive on this
-route, so there is nothing for a watchdog to credit, and no hop between the
-gateway and the router has an idle timer to trip. A 503 is retried as above.
+route, so there is nothing for a watchdog to credit, and none of the bundled
+hops between the gateway and the router has an idle timer to trip. A proxy an
+operator adds in between must allow the whole wait, or it cuts the attempt
+([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+A 503 is retried as above.
 A failed ensure is recorded (`loadEnsureError`) in one of four texts. The
 loop's own deadline ends the load with
 `provider.timeout: not running within <loop bound> (the larger of 5 min and the stream budget); a start already under way may still come up`,

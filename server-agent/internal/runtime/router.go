@@ -498,8 +498,11 @@ type ensureResponse struct {
 //     an older agent never starts a child for it.
 //   - One long call, no heartbeats. EnsureRunning bounds the wait (the
 //     spec's startup timeout, plus its admission wait when that is above 0;
-//     an admission wait of 0 lasts until the client leaves), no hop between
-//     the gateway and this handler has an idle timer, and so a failure stays
+//     an admission wait of 0 lasts until the client leaves). None of the
+//     bundled hops between the gateway and this handler (the gateway's
+//     transport, the agent's TLS proxy, this router's server) has an idle
+//     timer; a proxy an operator adds in between must allow the whole wait,
+//     or it cuts the call. Through the bundled hops a failure therefore stays
 //     a genuine HTTP status from sentinelCode: 404 model_not_managed, 503
 //     admission_blocked (a force-stopped spec, or admission refused), 504
 //     start_timeout, 502 start_failed or not_permitted, or 502 upstream_gone
