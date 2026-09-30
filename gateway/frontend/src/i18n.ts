@@ -602,6 +602,10 @@ const de = {
   mappingProbeContextFailed: 'Kontextgröße konnte nicht ermittelt werden',
   mappingContextProbePending:
     'Die Ermittlung der Kontextgröße dauert länger als erwartet; starte sie erneut, sobald der Server wieder frei ist.',
+  // Why the context probe is disabled for an images-only mapping: the probe
+  // loads the model with a chat prompt, which the gateway refuses for it.
+  mappingProbeContextImagesOnly:
+    'Nicht verfügbar: Dieses Modell erzeugt nur Bilder (seine API-Varianten nennen openai_images, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Bildmodell nicht beantwortet.',
   runtimeAdmin: 'Agent-gesteuerte Runtime',
   runtimeSpecs: 'Runtime-Spezifikationen',
   runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
@@ -1128,6 +1132,14 @@ const de = {
   benchmarkServerBusy: 'Server gerade in Benutzung',
   benchmarkRunning: 'Benchmark läuft',
   benchmarkLastCompleted: 'Zuletzt abgeschlossen',
+  // An images-only mapping does not answer the chat prompt that speed,
+  // capacity, both and vision send: on the model scope those types are
+  // disabled, on the application and server scopes the mapping is skipped,
+  // and a finished run names what it did not measure.
+  benchmarkImagesOnlyHint:
+    'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
+  benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
+  benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
   // agent-gesteuerte Modell auf dem Server anhält, genau eines lädt und eine
   // Zahl MELDET – er schreibt keines der beiden VRAM-Felder. Zwei Regeln
@@ -1167,6 +1179,8 @@ const de = {
     'Das Modell hat auch auf einer GPU Speicher belegt, die diese Launch-Spec nicht deklariert – ohne set_visible_devices sieht der Prozess alle Karten. Die Zahlen je Karte sind korrekt, aber die Spec beschreibt das Modell unvollständig: legen Sie die fehlende GPU-Zeile an und messen Sie erneut.',
   benchmarkVramWarningResidencyUnknown:
     'Der Lauf konnte nicht prüfen, ob das Modell schon von etwas anderem bedient wird: dieser Anwendung fehlt ein Endpunkt für geladene Modelle (loaded_models_path), oder die Abfrage schlug fehl. Eine dadurch unentdeckte Fremdbelegung erscheint als zu kleine Differenz – hinterlegen Sie den Endpunkt, wenn Sie diese Prüfung brauchen.',
+  benchmarkVramWarningFirstGenerationNotMeasured:
+    'Das Modell erzeugt nur Bilder und wurde deshalb gestartet, ohne etwas zu generieren. Speicher, den der Server erst bei der ersten Generierung belegt, fehlt in dieser Zahl – sie kann zu niedrig sein.',
   benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Basis (MB)',
@@ -1280,7 +1294,7 @@ const de = {
   modelServerSource: 'Quelle',
   modelServerUpdated: 'Aktualisiert',
   modelServerLoad: 'Laden',
-  modelServerLoadDisabledPerm: 'Nur für eigene/Admin-Server',
+  modelServerLoadDisabledPerm: 'Nur für Besitzer und Verwalter dieses Servers',
   modelServerLoadDisabledLoaded: 'Bereits geladen',
   modelServerLoadDisabledBusy: 'Lädt…',
   modelServerLoadStarted: 'Ladevorgang gestartet',
@@ -1362,9 +1376,19 @@ const de = {
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
   errorBenchmarkRequestFailed:
     'Der Lauf konnte nicht gestartet werden: Beim Lesen der gespeicherten Konfiguration ist ein interner Fehler aufgetreten. Bitte erneut versuchen.',
-  // Die vier Absagen des VRAM-Benchmarks. Jede nennt eine Bedingung, unter der
-  // die versprochene Isolierung durch keinen gateway-seitigen Schreibvorgang
-  // erreichbar ist -- deshalb eine Absage statt eines abgeschwächten Laufs.
+  // The starters' three refusals before the reservation. The model list shows
+  // the same three sentences as the tooltip of a disabled Load action.
+  errorBenchmarkImagesOnly:
+    'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
+  errorBenchmarkAgentEnsureUnsupported:
+    'Dieses Modell erzeugt nur Bilder und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
+  errorBenchmarkSpecForceStopped:
+    'Die Startkonfiguration dieses Modells hat die Admin-Übersteuerung „Stopp erzwingen“ (force_stopped), und Laden hebt keine Übersteuerung auf. Heben Sie sie zuerst auf („Übersteuerung aufheben“ im Reiter „Live-Status“ der Anwendung) und laden Sie das Modell dann erneut.',
+  // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a
+  // condition under which the isolation the run promises cannot be achieved
+  // by any gateway-side write, which is why it refuses rather than degrading.
+  // Its benchmark.agent_ensure_unsupported refusal is not one of them: that
+  // code uses the shared errorBenchmarkAgentEnsureUnsupported label above.
   errorBenchmarkVramNotAgentManaged:
     'Dieses Modell wird nicht als agent-gesteuerter Prozess betrieben und kann daher für eine VRAM-Messung nicht isoliert werden.',
   errorBenchmarkVramIsolationUnavailable:
@@ -3075,6 +3099,8 @@ const en: PortalMessages = {
   mappingProbeContextFailed: 'Could not determine context size',
   mappingContextProbePending:
     'Determining the context size is taking longer than expected; run it again once the server is free.',
+  mappingProbeContextImagesOnly:
+    'Not available: this model only generates images (its API flavors name openai_images but neither openai nor anthropic). The context size is determined with a chat prompt, which an image model does not answer.',
   runtimeAdmin: 'Agent-managed runtime',
   runtimeSpecs: 'Runtime specs',
   runtimeSpecEdit: 'Edit runtime spec',
@@ -3572,6 +3598,10 @@ const en: PortalMessages = {
   benchmarkServerBusy: 'Server currently in use',
   benchmarkRunning: 'Benchmark running',
   benchmarkLastCompleted: 'Last completed',
+  benchmarkImagesOnlyHint:
+    'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
+  benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
+  benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
   // UNKNOWN in this feature, and every "no result" names the operator's next
   // action, because that action differs per reason.
@@ -3606,6 +3636,8 @@ const en: PortalMessages = {
     'The model also allocated on a GPU this launch spec does not declare — without set_visible_devices the process sees every card. The per-card numbers are correct, but the spec describes the model incompletely: add the missing GPU row, then measure again.',
   benchmarkVramWarningResidencyUnknown:
     'The run could not check whether something else is already serving this model: this application has no loaded-models endpoint (loaded_models_path), or the probe failed. A contamination missed that way shows up as a too-small delta instead — configure the endpoint if you need that check.',
+  benchmarkVramWarningFirstGenerationNotMeasured:
+    'The model serves images only, so it was started without generating anything. Memory the server allocates only on its first generation is missing from this number, which can be too low.',
   benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
   benchmarkVramColIndex: 'GPU',
   benchmarkVramColBaseline: 'Baseline (MB)',
@@ -3689,7 +3721,7 @@ const en: PortalMessages = {
   modelServerSource: 'Source',
   modelServerUpdated: 'Updated',
   modelServerLoad: 'Load',
-  modelServerLoadDisabledPerm: 'Owner/admin only',
+  modelServerLoadDisabledPerm: "Only for this server's owners and managers",
   modelServerLoadDisabledLoaded: 'Already loaded',
   modelServerLoadDisabledBusy: 'Loading…',
   modelServerLoadStarted: 'Load started',
@@ -3769,9 +3801,17 @@ const en: PortalMessages = {
   errorBenchmarkNoModels: 'No models to benchmark.',
   errorBenchmarkRequestFailed:
     'The run could not be started: an internal error occurred while reading the stored configuration. Please try again.',
-  // The VRAM benchmark's four refusals. Each names a condition under which the
-  // isolation the run promises cannot be achieved by any gateway-side write,
-  // which is why it refuses rather than degrading.
+  errorBenchmarkImagesOnly:
+    'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
+  errorBenchmarkAgentEnsureUnsupported:
+    "This model only generates images, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
+  errorBenchmarkSpecForceStopped:
+    'This model\'s launch spec has the admin override "Force stop" (force_stopped), and a Load never lifts an override. Clear it first ("Clear override" on the application\'s "Live status" tab), then load the model again.',
+  // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a
+  // condition under which the isolation the run promises cannot be achieved
+  // by any gateway-side write, which is why it refuses rather than degrading.
+  // Its benchmark.agent_ensure_unsupported refusal is not one of them: that
+  // code uses the shared errorBenchmarkAgentEnsureUnsupported label above.
   errorBenchmarkVramNotAgentManaged:
     'This model is not an agent-managed process, so it cannot be isolated for a VRAM measurement.',
   errorBenchmarkVramIsolationUnavailable:

@@ -833,8 +833,9 @@ capacity and vision benchmarks, the cold pass's sibling swap and the model
 warmer — go through one watchdog helper, `watchBenchmarkStream`
 (`internal/gateway/benchmark_stream_watchdog.go`), behind `streamOnce` and
 `streamCollect` (`internal/gateway/benchmark_runner.go`). Such a stream has no
-client whose disconnect could end it, so the helper is always on. It works
-with two timers:
+client whose disconnect could end it, so the helper is always on. A Load or VRAM
+probe of an images-only agent child sends no stream, and so passes through no
+watchdog (below). The helper works with two timers:
 
 - **The idle timer** runs for `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, or for
   2 minutes (`benchmarkDefaultStreamIdle`) when that is `0` or negative, and
@@ -892,8 +893,36 @@ helper's two errors is retried. The run holds the server's benchmark
 reservation for as long as it waits: the server is excluded from routing, and
 its launch-spec writes are refused, so `admission_wait_timeout_seconds` cannot
 be changed until the run ends, and a lower `timeout_ms` applies only to the
-next run. A `force_stopped` spec, which the router answers with an immediate
-503, keeps a Load retrying until the deadline.
+next run. A Load of a spec whose `admin_state` is already `force_stopped` is
+refused before the reservation, with 409 `benchmark.spec_force_stopped`; one
+stored after that check, which the router answers with an immediate 503, keeps
+the Load retrying until the deadline.
+
+**An images-only agent child is loaded through the router's ensure route
+instead.** For a Load or VRAM probe of such a mapping on an agent that declares
+`runtime_ensure`, each attempt of the same loop is one bodiless
+`POST /ensure/{model}` (`provider.RuntimeEnsurer`), which the router answers
+once the child is healthy or its start failed
+([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
+The attempt runs under the loop's deadline itself, through
+`context.WithDeadlineCause` with a cause the loop owns (`errLoadLoopBound`), and
+the provider arms no timeout of its own. The router sends no keepalive on this
+route, so there is nothing for a watchdog to credit, and no hop between the
+gateway and the router has an idle timer to trip. A 503 is retried as above.
+A failed ensure is recorded (`loadEnsureError`) in one of four texts. The
+loop's own deadline ends the load with
+`provider.timeout: not running within <loop bound> (the larger of 5 min and the stream budget); a start already under way may still come up`,
+but only when the provider reports the timeout: a router answer that lands at
+that deadline, such as a last 503, keeps its router code. A failure that
+carries one of the codes the route answers reads
+`<router code>: <hint> (<provider text>)`. A 2xx without `"status":"running"`,
+or one cut short, reads
+`provider.invalid_response: the agent's ensure route answered without "running"`.
+Any other failure keeps the provider's own text, such as
+`provider.timeout: ensure route: context deadline exceeded` for a deadline that
+is not the loop's own
+([Agent-Managed Model Runtime
+§11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)).
 
 ## 8. Provider clients
 
@@ -960,6 +989,23 @@ fallback semantics**:
   — a resolved target that can't stream or can't proxy natively is a hard
   `provider.unavailable` error, since silently downgrading a streaming/native
   request to a different provider's behavior would be surprising.
+
+The OpenAI-compatible client also implements `RuntimeEnsurer`
+(`EnsureRuntimeModel`) for the agent router's `POST /ensure/{model}`: a
+bodiless POST to `ExpandModelPath("/ensure/{model}", target.ProviderModel)` with
+the same upstream credential as every call, no timeout of its own, and success
+only for a 2xx whose `status` is `running`. A 2xx that says anything else is
+`provider.invalid_response`. A 2xx whose body cannot be read is classified by
+the context: `provider.timeout` once its deadline has passed,
+`provider.unavailable` when it was cancelled, and `provider.invalid_response`
+only while it is live (a body cut short). A non-2xx keeps the tags
+`unavailableStatus` sets — 503 `ErrUpstreamStarting`, 401/403
+`ErrAuthRejected` — and, when the body is a router envelope, its code, as a
+`RouterError` that unwraps to that error; the context deadline gives
+`provider.timeout`, with the deadline's cause kept in the chain. The
+Multiplexer dispatches it like the sd capability probe, and a provider whose
+client lacks it answers `provider.unavailable`
+([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)).
 
 ## 9. Model discovery
 

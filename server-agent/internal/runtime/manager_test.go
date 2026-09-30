@@ -808,6 +808,69 @@ func TestManagerEnsureRunningReturnsOnContextCancelWhileQueued(t *testing.T) {
 	}
 }
 
+// TestManagerCancelWhileStartingStillComesUp: a caller that leaves while its
+// spec is Starting drops only its own waiter. The start already under way runs
+// to Running with nothing in flight and counts as a use -- coming up stamps
+// LastUsed, so the idle timeout is measured from then instead of draining the
+// child at once -- and the idle policy then unloads it as after any request.
+func TestManagerCancelWhileStartingStillComesUp(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(time.Second, 0, 0, "")
+	spec.IdleTimeoutSeconds = 2
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		release func()
+		err     error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		resultCh <- result{release: release, err: err}
+	}()
+	waitUntil(t, 2*time.Second, "spec-a starting", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStarting
+	})
+	cancel()
+	select {
+	case r := <-resultCh:
+		if !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("EnsureRunning after a cancel while Starting = %v, want context.Canceled", r.err)
+		}
+		if r.release != nil {
+			t.Fatal("EnsureRunning returned a release func with its error; a dropped waiter has nothing to release")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureRunning did not return within 2s of its context being cancelled while Starting")
+	}
+
+	waitUntil(t, 5*time.Second, "spec-a running although its only caller left", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	if st := statusFor(m, "spec-a"); st.InFlight != 0 {
+		t.Errorf("InFlight = %d, want 0: nobody is waiting on this start any more", st.InFlight)
+	}
+	// An absence has no event to wait for. A LastUsed left unset would put
+	// the 2s idle timeout in the past, and the next idle scan (every 30ms
+	// here) would drain the child long before this window ends.
+	time.Sleep(300 * time.Millisecond)
+	if st := statusFor(m, "spec-a"); st == nil || st.State != StateRunning {
+		t.Fatalf("spec-a status = %+v 300ms after coming up, want still running: coming up counts as a use", st)
+	}
+	waitUntil(t, 5*time.Second, "spec-a idle-unloaded once its idle timeout elapsed", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateStopped
+	})
+}
+
 // TestManagerEnsureRunningResolvesWhenSpecRemovedByApply is C2: a waiter
 // queued on a spec that Apply then removes must be resolved, not dropped.
 // Before the fix, applyConfig's delete(o.specs, id) (and onProcExited's,

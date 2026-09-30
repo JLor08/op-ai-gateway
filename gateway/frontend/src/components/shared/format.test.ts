@@ -109,6 +109,19 @@ describe('formatPortalError', () => {
       `benchmark.request_failed: ${messages.en.errorBenchmarkRequestFailed}`,
     );
   });
+
+  // The starters' three refusals before they reserve the server, each with its
+  // OWN label: they send the operator to three different places (a model that
+  // only generates images, an agent update, an admin override).
+  it.each([
+    ['benchmark.images_only', 'errorBenchmarkImagesOnly'],
+    ['benchmark.agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
+    ['benchmark.spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
+  ] as const)('labels the %s refusal with %s, in both locales', (code, key) => {
+    const err = new PortalApiError(409, code, 'raw server text');
+    expect(formatPortalError(err, messages.de)).toBe(`${code}: ${messages.de[key]}`);
+    expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
+  });
 });
 
 describe('errorLabelByCode (whole-map invariants)', () => {
@@ -212,7 +225,11 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * as the `portal.ErrBenchmarkNoModels` sentinel's row in `benchmarkErrRows`
    * there, and as `writeBenchmarkError`'s 500 fallback code
    * (`benchmark.request_failed`), which a starter answers when a store read
-   * fails before the run starts.
+   * fails before the run starts. The last three are the starters' refusals
+   * before the reservation: `errBenchmarkImagesOnly`,
+   * `errBenchmarkAgentEnsureUnsupported` and `errBenchmarkSpecForceStopped`,
+   * rows in the same `benchmarkErrRows`. The VRAM probe answers the second of
+   * them too, under this same code rather than a `benchmark.vram_*` one.
    *
    * The starters also answer three other codes that this list leaves out on
    * purpose, because no portal action can trigger them:
@@ -228,6 +245,9 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'benchmark.server_in_use',
     'benchmark.no_models',
     'benchmark.request_failed',
+    'benchmark.images_only',
+    'benchmark.agent_ensure_unsupported',
+    'benchmark.spec_force_stopped',
   ] as const;
 
   it('carries every non-VRAM benchmark code a portal action can receive, by its exact wire string', () => {

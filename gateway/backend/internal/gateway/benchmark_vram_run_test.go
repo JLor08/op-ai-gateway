@@ -28,7 +28,8 @@ import (
 // the hook that makes the fixture model reality: the thing that LOADS the
 // model is the thing that allocates VRAM, so a test raises the fake GPU's
 // used bytes from inside CompleteStream rather than guessing when the load
-// happened.
+// happened. onEnsure is the same hook for an images-only target, which the
+// run starts through the agent router's ensure route instead.
 type vramFakeProvider struct {
 	mu       sync.Mutex
 	calls    int
@@ -36,6 +37,8 @@ type vramFakeProvider struct {
 	loaded   map[string]bool
 	onStream func()
 	err      error
+	ensures  int
+	onEnsure func()
 }
 
 func (p *vramFakeProvider) Complete(context.Context, routing.Target, inference.Request) (provider.Response, error) {
@@ -79,6 +82,25 @@ func (p *vramFakeProvider) streamCount() int {
 	return p.calls
 }
 
+// EnsureRuntimeModel makes the fake a provider.RuntimeEnsurer: the agent
+// router's ensure route, which starts the child without a generation.
+func (p *vramFakeProvider) EnsureRuntimeModel(context.Context, routing.Target) error {
+	p.mu.Lock()
+	p.ensures++
+	hook := p.onEnsure
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return nil
+}
+
+func (p *vramFakeProvider) ensureCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ensures
+}
+
 type vramFixture struct {
 	srv *Server
 	// mem is the routing.Store the fixture seeded and the run writes through.
@@ -109,6 +131,7 @@ type vramFixtureOpts struct {
 	targetPinned      bool
 	siblingPinned     bool
 	targetGPUs        []routing.RuntimeSpecGPU
+	targetAPIFlavors  []string // the target spec's api_flavors; nil = none
 	noSiblingSpec     bool
 	siblingDisabled   bool
 	noTargetSpec      bool
@@ -205,12 +228,12 @@ func newVRAMFixture(t *testing.T, opts vramFixtureOpts) *vramFixture {
 	must("CreateMapping(target)", mem.CreateMapping(ctx, targetMapping))
 	must("CreateMapping(sibling)", mem.CreateMapping(ctx, routing.ModelMapping{ID: "map_sib", ApplicationID: app.ID, GatewayModelName: "gw-sib", AppModelName: "up-sib", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 
-	seedSpec := func(id, mappingID, adminState string, pinned, enabled bool, gpus []routing.RuntimeSpecGPU) {
+	seedSpec := func(id, mappingID, adminState string, pinned, enabled bool, gpus []routing.RuntimeSpecGPU, flavors []string) {
 		t.Helper()
 		must("UpsertRuntimeSpec("+id+")", mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
 			ID: id, MappingID: mappingID, Enabled: enabled, Binary: "/usr/local/bin/llama-server",
 			Args: "[]", Env: "{}", HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
-			Pinned: pinned, AdminState: adminState, CreatedAt: now, UpdatedAt: now,
+			Pinned: pinned, AdminState: adminState, APIFlavors: flavors, CreatedAt: now, UpdatedAt: now,
 		}))
 		if len(gpus) > 0 {
 			for i := range gpus {
@@ -224,10 +247,10 @@ func newVRAMFixture(t *testing.T, opts vramFixtureOpts) *vramFixture {
 		targetGPUs = []routing.RuntimeSpecGPU{{GPUIndex: 0, VRAMEstimateMB: 18000}}
 	}
 	if !opts.noTargetSpec {
-		seedSpec("rspec_target", "map_target", opts.targetAdminState, opts.targetPinned, true, targetGPUs)
+		seedSpec("rspec_target", "map_target", opts.targetAdminState, opts.targetPinned, true, targetGPUs, opts.targetAPIFlavors)
 	}
 	if !opts.noSiblingSpec {
-		seedSpec("rspec_sib", "map_sib", opts.siblingAdminState, opts.siblingPinned, !opts.siblingDisabled, nil)
+		seedSpec("rspec_sib", "map_sib", opts.siblingAdminState, opts.siblingPinned, !opts.siblingDisabled, nil, nil)
 	}
 
 	hostOS := opts.os

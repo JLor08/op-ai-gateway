@@ -345,6 +345,38 @@ func (m *Multiplexer) dispatchProbeSdcppCapabilities(ctx context.Context, target
 	return SdcppVerdicts{}, ErrUnavailable
 }
 
+var _ RuntimeEnsurer = (*Multiplexer)(nil)
+
+// EnsureRuntimeModel routes the agent router's ensure call to the provider's
+// client (like ProbeSdcppCapabilities), falling back to the fallback client. A
+// provider whose client does not implement RuntimeEnsurer yields
+// ErrUnavailable: a nil error would read as a child that is running.
+func (m *Multiplexer) EnsureRuntimeModel(ctx context.Context, target routing.Target) error {
+	ctx, span := tracing.Start(ctx, "provider.EnsureRuntimeModel")
+	defer span.End()
+	err := m.dispatchEnsureRuntimeModel(ctx, target)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
+}
+
+func (m *Multiplexer) dispatchEnsureRuntimeModel(ctx context.Context, target routing.Target) error {
+	if m == nil {
+		return ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if e, ok := client.(RuntimeEnsurer); ok {
+			return e.EnsureRuntimeModel(ctx, target)
+		}
+	}
+	if e, ok := m.fallback.(RuntimeEnsurer); ok {
+		return e.EnsureRuntimeModel(ctx, target)
+	}
+	return fmt.Errorf("%w: runtime ensure not supported for provider %q", ErrUnavailable, target.Provider)
+}
+
 var _ MemoryProber = (*Multiplexer)(nil)
 
 // ProbeServerMemory routes the upstream saturation probe to the provider's client

@@ -326,6 +326,7 @@ func TestVRAMResultVocabularyIsPinned(t *testing.T) {
 		{vramWarningNonManagedApplications, "non_managed_applications"},
 		{vramWarningPostTransportAgent, "post_transport_agent"},
 		{vramWarningResidencyUnknown, "residency_unknown"},
+		{vramWarningFirstGenerationNotMeasured, "first_generation_not_measured"},
 		// What identified the card a number is attributed to.
 		{vramFingerprintUUID, "uuid"},
 		{vramFingerprintNameTotal, "name_total"},

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"sync"
 	"testing"
 )
 
@@ -195,6 +196,61 @@ func TestMultiplexerDispatchesSdcppCapabilitiesToOpenAICompatibleClient(t *testi
 	}
 	if len(paths) != 1 {
 		t.Fatalf("upstream paths = %v, want no request for a client without the capability", paths)
+	}
+}
+
+// TestMultiplexerDispatchesRuntimeEnsureToOpenAICompatibleClient mirrors
+// providerClients: a server_agent target must reach the ONE shared
+// OpenAI-compatible client's EnsureRuntimeModel, so the ensure POST rides the
+// outbound app transport. A provider whose client lacks the capability, with
+// no fallback that has it, answers ErrUnavailable and sends nothing; a
+// fallback that has it is used.
+func TestMultiplexerDispatchesRuntimeEnsureToOpenAICompatibleClient(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"status":"running"}`))
+	}))
+	defer srv.Close()
+	seen := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), paths...)
+	}
+	shared := NewOpenAICompatibleClient(srv.Client())
+	mux := NewMultiplexer(map[string]Client{
+		routing.ProviderVLLM:        shared,
+		routing.ProviderServerAgent: shared, // same instance, exactly as providerClients wires it
+		routing.ProviderOllama:      &recordingClient{},
+	}, nil)
+
+	if err := mux.EnsureRuntimeModel(context.Background(), routing.Target{Provider: routing.ProviderServerAgent, Endpoint: srv.URL, ProviderModel: "flux"}); err != nil {
+		t.Fatalf("EnsureRuntimeModel(server_agent) returned %v", err)
+	}
+	if got := seen(); len(got) != 1 || got[0] != "POST /ensure/flux" {
+		t.Fatalf("upstream requests = %v, want exactly [POST /ensure/flux]", got)
+	}
+
+	err := mux.EnsureRuntimeModel(context.Background(), routing.Target{Provider: routing.ProviderOllama, Endpoint: srv.URL, ProviderModel: "flux"})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("EnsureRuntimeModel(ollama) error = %v, want ErrUnavailable -- a client without the capability cannot start a child", err)
+	}
+	if want := `provider.unavailable: runtime ensure not supported for provider "ollama"`; err.Error() != want {
+		t.Fatalf("EnsureRuntimeModel(ollama) error text = %q, want %q", err.Error(), want)
+	}
+	if got := seen(); len(got) != 1 {
+		t.Fatalf("upstream requests = %v, want no request for a client without the capability", got)
+	}
+
+	withFallback := NewMultiplexer(map[string]Client{routing.ProviderOllama: &recordingClient{}}, shared)
+	if err := withFallback.EnsureRuntimeModel(context.Background(), routing.Target{Provider: routing.ProviderOllama, Endpoint: srv.URL, ProviderModel: "flux"}); err != nil {
+		t.Fatalf("EnsureRuntimeModel(ollama, fallback with the capability) returned %v", err)
+	}
+	if got := seen(); len(got) != 2 || got[1] != "POST /ensure/flux" {
+		t.Fatalf("upstream requests = %v, want the fallback's POST /ensure/flux as the second", got)
 	}
 }
 

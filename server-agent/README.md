@@ -391,13 +391,17 @@ left out of the base so they stay yours to set. Overriding `HOME` (or
 
 #### What the router port serves
 
-Apart from three `GET` control paths — `/health` (and `/v1/health`), `/running`
-(llama-swap shape, so the gateway's existing loaded-model detection works
-unchanged) and `/v1/models` — **the router routes exclusively on a `model`
-field in a JSON request body.** Everything else is a proxied inference request,
-and to be proxied it must carry a body that parses as JSON and names a model
-this agent manages. Consequences worth knowing before pointing an application
-at it:
+Apart from five control paths, **the router routes exclusively on a `model`
+field in a JSON request body.** The control paths are four `GET`s — `/health`
+(and `/v1/health`), `/running` (llama-swap shape, so the gateway's existing
+loaded-model detection works unchanged), `/v1/models` and
+`/upstream/{model}/props` (a running child's `/props`; it never starts one) —
+and one bodiless `POST`, `/ensure/{model}`, which starts the model's child if
+needed and answers `{"status":"running"}` once it is healthy, without
+forwarding anything to it. Everything else is a proxied inference request, and
+to be proxied it must carry a body that parses as JSON and names a model this
+agent manages. Consequences worth knowing before pointing an application at
+it:
 
 - A request with no body, a non-JSON body, or no `model` field gets
   **`404 runtime.model_not_managed`** — including WebSocket handshakes, which

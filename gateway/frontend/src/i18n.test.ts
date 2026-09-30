@@ -690,6 +690,7 @@ describe('model-mapping performance-metric i18n keys', () => {
       'mappingProbeContextRunning',
       'mappingProbeContextFailed',
       'mappingContextProbePending',
+      'mappingProbeContextImagesOnly',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -734,6 +735,12 @@ describe('benchmark i18n keys', () => {
       'errorBenchmarkServerInUse',
       'errorBenchmarkNoModels',
       'errorBenchmarkRequestFailed',
+      'errorBenchmarkImagesOnly',
+      'errorBenchmarkAgentEnsureUnsupported',
+      'errorBenchmarkSpecForceStopped',
+      'benchmarkResultSkippedImagesOnly',
+      'benchmarkNotMeasured',
+      'benchmarkImagesOnlyHint',
       'benchmarkArea',
       'benchmarkScope',
       'benchmarkScopeServer',
@@ -776,6 +783,62 @@ describe('benchmark i18n keys', () => {
     expect(messages.de.benchmarkAll).toBe('Alle benchmarken');
     expect(messages.en.benchmarkAll).toBe('Benchmark all');
   });
+});
+
+describe('images-only and Load-refusal i18n keys', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    const t = messages[locale];
+
+    // Every sentence that says a mapping serves images only names the field
+    // the operator changes that in, by its form label, and the one flavor the
+    // rule looks for.
+    it.each([
+      'errorBenchmarkImagesOnly',
+      'benchmarkImagesOnlyHint',
+      'mappingProbeContextImagesOnly',
+    ] as const)(`names the API flavors field and openai_images in %s (${locale})`, (key) => {
+      expect(t[key]).toContain(t.applicationFlavors);
+      expect(t[key]).toContain('openai_images');
+    });
+
+    // The gateway keeps the agents' features in memory, so right after a
+    // gateway restart a current agent reads as unsupported until it reports
+    // again. The label has to say so, or it sends the operator to update an
+    // agent that is already new enough.
+    it(`names the feature, the version and the restart window in the ensure refusal (${locale})`, () => {
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain('runtime_ensure');
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
+        locale === 'de' ? 'Agent 0.8.0 oder neuer' : 'agent 0.8.0 or newer',
+      );
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
+        locale === 'de'
+          ? 'seit dem Neustart des Gateways noch nicht gemeldet'
+          : 'or the agent has not reported since the gateway restarted',
+      );
+    });
+
+    // An application or server run whose every mapping serves only images is
+    // refused with the same code, so the label names that case too, in its
+    // last sentence: the operator picked a scope, not one model.
+    it(`names the whole-scope case in the images-only refusal (${locale})`, () => {
+      const sentence =
+        locale === 'de'
+          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.'
+          : 'An application or server run is refused this way when every model in it only generates images.';
+      expect(t.errorBenchmarkImagesOnly.endsWith(` ${sentence}`), t.errorBenchmarkImagesOnly).toBe(
+        true,
+      );
+    });
+
+    // The override is named by the labels the runtime screen shows, so the
+    // operator finds the control that clears it.
+    it(`names the override and where to clear it in the force-stopped refusal (${locale})`, () => {
+      expect(t.errorBenchmarkSpecForceStopped).toContain('force_stopped');
+      expect(t.errorBenchmarkSpecForceStopped).toContain(t.runtimeForceStop);
+      expect(t.errorBenchmarkSpecForceStopped).toContain(t.runtimeClearOverride);
+      expect(t.errorBenchmarkSpecForceStopped).toContain(t.runtimeLiveStatus);
+    });
+  }
 });
 
 describe('capacity-benchmark i18n keys', () => {

@@ -306,6 +306,9 @@ function renderSection(
     // than the module default -- e.g. a non-empty `context_probe_path`, which
     // is what enables the shared mask's context-probe button.
     application?: PortalApplication;
+    // The server's applications, as the benchmark sub-view lists them; only
+    // `application` owns `mappings`.
+    serverApplications?: PortalApplication[];
     // The three calls `MappingForm`'s context probe makes, overridable exactly
     // as MappingSection's own tests override them.
     activeBenchmarks?: PortalApi['activeBenchmarks'];
@@ -395,7 +398,8 @@ function renderSection(
   const subscribedServerIds: string[] = [];
 
   const fakeApi = {
-    mappings: vi.fn(() => {
+    mappings: vi.fn((applicationId: string) => {
+      if (applicationId !== applicationForTest.id) return Promise.resolve({ data: [] });
       mappingsCalls += 1;
       if (
         (opts.mappingsFailing && mappingsCalls === 1) ||
@@ -566,7 +570,7 @@ function renderSection(
     // The per-row benchmark action opens `BenchmarkSection`, which loads the
     // server's apps + the scoped mapping's history on mount and subscribes to
     // its live SSE. Exactly the six methods it calls beyond the two above.
-    applications: vi.fn(async () => ({ data: [applicationForTest] })),
+    applications: vi.fn(async () => ({ data: opts.serverApplications ?? [applicationForTest] })),
     benchmarkServer: vi.fn(async () => idleBenchmark),
     benchmarkApplication: vi.fn(async () => idleBenchmark),
     benchmarkMapping: vi.fn(async () => idleBenchmark),
@@ -1778,6 +1782,119 @@ describe('RuntimeAdminSection edit + delete', () => {
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+  });
+});
+
+/**
+ * A mapping's `images_only` marker is computed from its EFFECTIVE flavors,
+ * which are the launch spec's once one exists. The mapping rows this screen
+ * holds were read before the spec write, so every write that can change the
+ * effective flavors (a create, an edit, a spec delete) re-reads them; the
+ * model-mapping tab's edit mask reads the marker off those rows.
+ */
+describe('RuntimeAdminSection reloads the mappings after a spec write', { timeout: 15_000 }, () => {
+  /**
+   * Wraps the fake's mappings read, keeping what it answers, so that every
+   * later call records how many entries `writes` held when it was issued. A
+   * reload issued before the write has committed records 0.
+   */
+  function recordWritesSeenByMappingReads(
+    fakeApi: ReturnType<typeof renderSection>['fakeApi'],
+    writes: readonly unknown[],
+  ): number[] {
+    const original = fakeApi.mappings.getMockImplementation()!;
+    const seen: number[] = [];
+    fakeApi.mappings.mockImplementation((applicationId: string) => {
+      seen.push(writes.length);
+      return original(applicationId);
+    });
+    return seen;
+  }
+
+  it('re-reads the marker after a spec edit, so the mapping tab disables the context probe', async () => {
+    const { fakeApi, putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          mapping_id: 'map_1',
+          binary: '/opt/sd-server/sd-server',
+          api_flavors: ['openai'],
+        }),
+      },
+      // The probe button is gated on the application's probe path, and the
+      // module default has none: without one it is disabled either way.
+      application: { ...application, context_probe_path: '/props' },
+    });
+    await screen.findByText('gw-model');
+    // What the gateway answers once the spec names openai_images only -- and
+    // only once it does: a read issued before the PUT still sees the old spec.
+    fakeApi.mappings.mockImplementation(async () => ({
+      data: [makeMapping({ id: 'map_1', images_only: putSpecs.length > 0 })],
+    }));
+
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_images']);
+    await waitFor(() => expect(fakeApi.mappings).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(await screen.findByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+    const probe = await screen.findByRole('button', { name: t.mappingProbeContext });
+    await waitFor(() => expect(probe).toBeDisabled());
+    expect(probe).toHaveAccessibleDescription(t.mappingProbeContextImagesOnly);
+  });
+
+  it('re-reads the mappings after a create has written the spec', async () => {
+    const { fakeApi, putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const writesSeen = recordWritesSeenByMappingReads(fakeApi, putSpecs);
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    await waitFor(() => expect(fakeApi.mappings).toHaveBeenCalledTimes(2));
+    expect(writesSeen).toEqual([1]);
+  });
+
+  // The warnings are the other thing a spec write can change, and they are
+  // re-read together with the mappings.
+  it('re-reads the warnings along with the mappings after a spec write', async () => {
+    const { fakeApi, putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    await waitFor(() => expect(fakeApi.runtimeWarnings).toHaveBeenCalledTimes(2));
+  });
+
+  it('re-reads the mappings after a spec delete, which returns the mapping to the application flavors', async () => {
+    const { fakeApi, deletedSpecIds } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: makeSpec({ configured: true, mapping_id: 'map_1' }) },
+    });
+    await screen.findByText('gw-model');
+    await waitForEnabledButton(t.runtimeSpecDelete);
+    const writesSeen = recordWritesSeenByMappingReads(fakeApi, deletedSpecIds);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+    );
+
+    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+    await waitFor(() => expect(fakeApi.mappings).toHaveBeenCalledTimes(2));
+    expect(writesSeen).toEqual([1]);
   });
 });
 
@@ -6338,7 +6455,7 @@ describe('RuntimeAdminSection visibility mode', () => {
  * destroy rows the launch specs depend on -- and with the ownership boundary
  * enforced in the one direction the spec form does not enforce it.
  */
-describe('RuntimeAdminSection model-mapping tab', () => {
+describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
   it('places the model-mapping tab to the LEFT of the runtime specs', async () => {
     renderSection({ mappings: [makeMapping({ id: 'map_1' })] });
     await screen.findByText('gw-model');
@@ -6451,6 +6568,26 @@ describe('RuntimeAdminSection model-mapping tab', () => {
     // came from -- proving it is the section's trail, not a second bar.
     fireEvent.click(screen.getByRole('button', { name: application.endpoint }));
     expect(await screen.findByRole('button', { name: t.mappingEdit })).toBeInTheDocument();
+  });
+
+  // The server's first application is not necessarily this one. The row
+  // action names the mapping's own application, so the benchmark sub-view
+  // reads the mapping's images-only marker from this application's mappings.
+  it("scopes the benchmark sub-view to the mapping's own application, not the server's first", async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model', images_only: true })],
+      serverApplications: [
+        { ...application, id: 'app_0', type: 'vllm', endpoint: 'https://s0.example.test:8000' },
+        application,
+      ],
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runBenchmark }));
+
+    const start = await screen.findByRole('button', { name: t.benchmarkStart });
+    await waitFor(() => expect(start).toBeDisabled());
+    expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
   });
 
   it('edits the two fields the mapping owns and never sends the one the spec owns', async () => {

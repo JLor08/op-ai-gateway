@@ -135,6 +135,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     opts: {
       mappings?: PortalModelMapping[];
       application?: PortalApplication;
+      // The server's applications, as the benchmark sub-view lists them; only
+      // `application` owns `mappings`.
+      applications?: PortalApplication[];
       benchmarkApplication?: PortalApi['benchmarkApplication'];
       benchmarkMapping?: PortalApi['benchmarkMapping'];
       benchmarkStatus?: PortalApi['benchmarkStatus'];
@@ -159,9 +162,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       done: 0,
     };
     const fakeApi = {
-      mappings: vi.fn(async () => ({ data: mappings })),
+      mappings: vi.fn(async (applicationId: string) => ({
+        data: applicationId === app.id ? mappings : [],
+      })),
       // The benchmark sub-view (BenchmarkSection) loads the server's apps on mount.
-      applications: vi.fn(async () => ({ data: [app] })),
+      applications: vi.fn(async () => ({ data: opts.applications ?? [app] })),
       createMapping: vi.fn(async (applicationId: string, body: CreateMappingRequest) => {
         created.push({ serverId: applicationId, body });
         return makeMapping({ id: 'map_created', ...(body as Partial<PortalModelMapping>) });
@@ -471,7 +476,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
-  describe(`MappingSection benchmark navigation [${locale}]`, () => {
+  describe(`MappingSection benchmark navigation [${locale}]`, { timeout: 15_000 }, () => {
     it('opens the benchmark area scoped to the mapping from the row action (no immediate run)', async () => {
       const { fakeApi } = renderSection({
         mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model' })],
@@ -494,6 +499,28 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(fakeApi.benchmarkMapping).not.toHaveBeenCalled();
       expect(fakeApi.benchmarkApplication).not.toHaveBeenCalled();
       expect(fakeApi.benchmarkServer).not.toHaveBeenCalled();
+    });
+
+    // The server's first application is not necessarily this one. The row
+    // action names the mapping's own application, so the benchmark area reads
+    // the mapping's images-only marker from that application's mappings.
+    it("scopes the benchmark area to the mapping's own application, not the server's first", async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-model', images_only: true })],
+        applications: [
+          { ...application, id: 'app_0', endpoint: 'https://s0.example.test:8000' },
+          application,
+        ],
+      });
+      await screen.findByText('gw-model');
+      const rowButton = screen
+        .getAllByRole('button', { name: t.runBenchmark })
+        .find((b) => b.textContent === '');
+      fireEvent.click(rowButton!);
+
+      const start = await screen.findByRole('button', { name: t.benchmarkStart });
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
     });
 
     it('opens the benchmark area scoped to the application from the panel action (no immediate run)', async () => {

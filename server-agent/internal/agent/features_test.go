@@ -253,18 +253,32 @@ func TestFeaturesDeclareRuntimeUpstreamProps(t *testing.T) {
 	if !found {
 		t.Fatal("Features does not declare runtime_upstream_props")
 	}
+}
+
+// TestFeaturesDeclareRuntimeEnsure pins the ensure-route capability: the
+// gateway sends POST /ensure/{model} -- the Load and the VRAM probe of an
+// images-only managed child -- only to an agent that declares this exact
+// name, and refuses those runs for every other agent, so a rename here
+// silently refuses them on every agent.
+func TestFeaturesDeclareRuntimeEnsure(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_ensure" {
+			found = true
+			if f.Since != "0.8.0" {
+				t.Fatalf("runtime_ensure Since = %q, want 0.8.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_ensure")
+	}
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
-	// followed. 0.7.4 is the agent-sdcpp-capabilities branch's PATCH bump
-	// (issue #154, see the Version constant's own block): a
-	// stable_diffusion_cpp child's capability probe now reads sd-server's
-	// own capability document and reports its image verdict, gated on a
-	// feature the GATEWAY declares -- an observable behaviour change but no
-	// new Features entry, so it is PATCH, which is also why
-	// runtime_upstream_props' Since above stays at the 0.7.0 it shipped in
-	// rather than following Version.
-	if Version != "0.7.4" {
-		t.Fatalf("Version = %q, want 0.7.4 (one bump per shipped change: 0.7.3 has shipped, and #154 adds no Features entry, so it is PATCH)", Version)
+	// followed. 0.8.0 is MINOR because agent.Features gains runtime_ensure
+	// (see the Version constant's own block).
+	if Version != "0.8.0" {
+		t.Fatalf("Version = %q, want 0.8.0 (agent.Features gains runtime_ensure, so the bump from 0.7.4 is MINOR)", Version)
 	}
 }

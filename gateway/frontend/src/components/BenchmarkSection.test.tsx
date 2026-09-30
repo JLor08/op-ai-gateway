@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BenchmarkSection, type BenchmarkScope } from './BenchmarkSection';
 import { messages, type Locale } from '../i18n';
@@ -129,6 +129,7 @@ const idle: BenchmarkStatus = {
 type Overrides = {
   apps?: PortalApplication[];
   mappings?: PortalModelMapping[];
+  mappingsByApp?: Record<string, PortalModelMapping[]>;
   runs?: BenchmarkRunDTO[];
   benchmarkServer?: PortalApi['benchmarkServer'];
   benchmarkApplication?: PortalApi['benchmarkApplication'];
@@ -153,7 +154,9 @@ function makeApi(over: Overrides = {}) {
 
   const api = {
     applications: vi.fn(async () => ({ data: over.apps ?? [] })),
-    mappings: vi.fn(async () => ({ data: over.mappings ?? [] })),
+    mappings: vi.fn(async (appId: string) => ({
+      data: over.mappingsByApp?.[appId] ?? over.mappings ?? [],
+    })),
     mappingBenchmarks: vi.fn(async () => over.runs ?? []),
     benchmarkServer:
       over.benchmarkServer ?? (vi.fn(async () => idle) as unknown as PortalApi['benchmarkServer']),
@@ -251,6 +254,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await pickOption(t.benchmarkType, t.benchmarkTypeCapacity);
       fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
       await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_1', 'capacity'));
+    });
+
+    // The application scope names its application, which is not necessarily
+    // the server's first.
+    it("starts the application scope it was opened with, not the server's first", async () => {
+      const benchmarkApplication = vi.fn(
+        async () => idle,
+      ) as unknown as PortalApi['benchmarkApplication'];
+      renderSection(
+        { kind: 'application', id: 'app_2', name: 'two' },
+        {
+          apps: [
+            makeApp({ id: 'app_1' }),
+            makeApp({ id: 'app_2', endpoint: 'https://two.test:8000' }),
+          ],
+          benchmarkApplication,
+        },
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole('combobox', { name: t.benchmarkScopeApplication }),
+        ).toHaveTextContent('https://two.test:8000'),
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.benchmarkStart }));
+      await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_2', 'speed'));
     });
 
     it("starts a mapping+both run via benchmarkMapping(id, 'both')", async () => {
@@ -858,6 +886,284 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         screen.getByText(t.benchmarkVramInconclusiveBaselineUnstable, { exact: false }),
       ).toBeInTheDocument();
       expect(screen.queryByText(t.benchmarkVramColDelta)).not.toBeInTheDocument();
+    });
+  });
+
+  // An images-only mapping (its effective API flavors name openai_images and
+  // no text flavor) cannot answer the chat prompt that speed, capacity, both
+  // and vision send. The gateway refuses those runs on the mapping scope and
+  // skips the mapping on the application and server scopes; these tests pin
+  // what the portal shows for both.
+  describe(`BenchmarkSection images-only mappings [${locale}]`, { timeout: 15_000 }, () => {
+    function result(over: Partial<BenchmarkResult>): BenchmarkResult {
+      return {
+        mapping_id: 'map_1',
+        gateway_model_name: 'gw-model',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        ...over,
+      };
+    }
+
+    function delivering(status: Partial<BenchmarkStatus>): Overrides {
+      return {
+        subscribeBenchmark: vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+          onStatus({ ...idle, scope: 'application', mode: 'speed', ...status });
+          return () => {};
+        }) as unknown as PortalApi['subscribeBenchmark'],
+      };
+    }
+
+    const imagesOnlyMapping: Overrides = {
+      apps: [makeApp({ id: 'app_1' })],
+      mappings: [makeMapping({ id: 'map_img', gateway_model_name: 'sd-model', images_only: true })],
+    };
+
+    it('renders a skipped mapping as its skip, never as "0 tok/s, 0 ms"', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: true,
+          total: 2,
+          done: 1,
+          results: [result({ gateway_model_name: 'sd-model', skipped: 'images_only' })],
+        }),
+      );
+      expect(
+        await screen.findByText(`sd-model: ${t.benchmarkResultSkippedImagesOnly}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
+    // Every run kind that sends a chat prompt gets the notice.
+    it.each(['speed', 'capacity', 'both', 'vision'])(
+      'names the skipped and the unmeasured mappings once a %s run has finished',
+      async (mode) => {
+        const unreadable =
+          'runtime spec unreadable; not benchmarked (no chat prompt sent): store unavailable';
+        renderSection(
+          { kind: 'server' },
+          delivering({
+            running: false,
+            mode,
+            total: 3,
+            done: 3,
+            results: [
+              result({
+                mapping_id: 'map_ok',
+                gateway_model_name: 'text-model',
+                gen_tokens_per_second: 42,
+              }),
+              result({
+                mapping_id: 'map_img',
+                gateway_model_name: 'sd-model',
+                skipped: 'images_only',
+              }),
+              result({
+                mapping_id: 'map_bad',
+                gateway_model_name: 'other-model',
+                error: unreadable,
+              }),
+            ],
+          }),
+        );
+        const notice = await screen.findByLabelText(t.benchmarkNotMeasured);
+        expect(
+          within(notice).getByText(`sd-model: ${t.benchmarkResultSkippedImagesOnly}`),
+        ).toBeInTheDocument();
+        expect(within(notice).getByText(`other-model: ${unreadable}`)).toBeInTheDocument();
+        // A measured mapping is not "not measured": its number is in the history.
+        expect(within(notice).queryByText(/text-model/)).not.toBeInTheDocument();
+      },
+    );
+
+    it('shows no notice after a finished run that measured every mapping', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: false,
+          total: 1,
+          done: 1,
+          results: [result({ gen_tokens_per_second: 42 })],
+        }),
+      );
+      await screen.findByRole('button', { name: t.benchmarkStart });
+      expect(screen.queryByLabelText(t.benchmarkNotMeasured)).not.toBeInTheDocument();
+    });
+
+    // A VRAM run renders its own outcome, and a load or a context probe is not
+    // a measurement this form started: none of them gets the notice.
+    it.each(['vram', 'load', 'context'])(
+      'shows no notice after a finished %s run, even with an error',
+      async (mode) => {
+        renderSection(
+          { kind: 'server' },
+          delivering({
+            running: false,
+            mode,
+            total: 1,
+            done: 1,
+            results: [result({ error: 'provider.unavailable: upstream status 503' })],
+          }),
+        );
+        await screen.findByRole('button', { name: t.benchmarkStart });
+        expect(screen.queryByLabelText(t.benchmarkNotMeasured)).not.toBeInTheDocument();
+      },
+    );
+
+    it('disables the chat-prompt run types for an images-only mapping and says why', async () => {
+      const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+      renderSection(
+        { kind: 'mapping', id: 'map_img', name: 'sd-model' },
+        { ...imagesOnlyMapping, probeMappingVram },
+      );
+      const start = await screen.findByRole('button', { name: t.benchmarkStart });
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
+      expect(screen.getByText(t.benchmarkImagesOnlyHint)).toBeInTheDocument();
+
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.benchmarkType }));
+      for (const label of [
+        t.benchmarkTypeSpeed,
+        t.benchmarkTypeCapacity,
+        t.benchmarkTypeBoth,
+        t.benchmarkTypeVision,
+      ]) {
+        expect(await screen.findByRole('option', { name: label })).toHaveAttribute(
+          'aria-disabled',
+          'true',
+        );
+      }
+      // The VRAM measurement loads the model without a chat prompt, so it stays.
+      const vram = screen.getByRole('option', { name: t.benchmarkTypeVram });
+      expect(vram).not.toHaveAttribute('aria-disabled', 'true');
+      fireEvent.click(vram);
+
+      await waitFor(() => expect(start).toBeEnabled());
+      // The hint stays, but it no longer describes a refusal of Start.
+      expect(start).not.toHaveAccessibleDescription();
+      fireEvent.click(start);
+      await waitFor(() => expect(probeMappingVram).toHaveBeenCalledWith('map_img'));
+    });
+
+    // The type is not switched when the Model picker moves to an images-only
+    // mapping, so a chat-prompt type chosen on a text mapping stays selected:
+    // Start is refused for each of them, not only for the default speed.
+    it.each([
+      ['capacity', 'benchmarkTypeCapacity'],
+      ['both', 'benchmarkTypeBoth'],
+      ['vision', 'benchmarkTypeVision'],
+    ] as const)(
+      'refuses Start when %s stays selected as the Model picker moves to an images-only mapping',
+      async (_mode, key) => {
+        renderSection(
+          { kind: 'mapping', id: 'map_txt', name: 'txt', applicationId: 'app_1' },
+          {
+            apps: [makeApp({ id: 'app_1' })],
+            mappings: [
+              makeMapping({ id: 'map_txt', gateway_model_name: 'txt' }),
+              makeMapping({ id: 'map_img', gateway_model_name: 'sd-model', images_only: true }),
+            ],
+          },
+        );
+        await screen.findByRole('combobox', { name: t.benchmarkHistory });
+        await pickOption(t.benchmarkType, t[key]);
+        const start = screen.getByRole('button', { name: t.benchmarkStart });
+        expect(start).toBeEnabled();
+        await pickOption(t.benchmarkScopeMapping, 'sd-model');
+        await waitFor(() => expect(start).toBeDisabled());
+        expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
+      },
+    );
+
+    // A model scope picked on the form rather than opened from a row names no
+    // mapping: it runs the application's first one, so the marker is read off
+    // that one.
+    it('reads the marker off the first mapping when the model scope is picked on the form', async () => {
+      renderSection({ kind: 'server' }, imagesOnlyMapping);
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      await pickOption(t.benchmarkScope, t.benchmarkScopeMapping);
+      await waitFor(() => expect(start).toBeDisabled());
+    });
+
+    it('keeps every run type for a text mapping, with no hint', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [makeMapping({ id: 'map_1', images_only: false })],
+        },
+      );
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      expect(screen.getByRole('button', { name: t.benchmarkStart })).toBeEnabled();
+      expect(screen.queryByText(t.benchmarkImagesOnlyHint)).not.toBeInTheDocument();
+    });
+
+    // The application and server scopes skip an images-only mapping and run
+    // the rest, so the marker blocks nothing there.
+    it('leaves the application scope startable although its first mapping is images-only', async () => {
+      const benchmarkApplication = vi.fn(
+        async () => idle,
+      ) as unknown as PortalApi['benchmarkApplication'];
+      renderSection(
+        { kind: 'application', id: 'app_1', name: 'app' },
+        { ...imagesOnlyMapping, benchmarkApplication },
+      );
+      // The history picker renders once the mappings have loaded.
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      expect(screen.queryByText(t.benchmarkImagesOnlyHint)).not.toBeInTheDocument();
+      fireEvent.click(start);
+      await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_1', 'speed'));
+    });
+
+    it("reads the marker from the mapping's own application, not the server's first", async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_img', name: 'sd-model', applicationId: 'app_2' },
+        {
+          apps: [makeApp({ id: 'app_1' }), makeApp({ id: 'app_2' })],
+          mappingsByApp: {
+            app_1: [makeMapping({ id: 'map_txt', application_id: 'app_1' })],
+            app_2: [
+              makeMapping({
+                id: 'map_img',
+                application_id: 'app_2',
+                gateway_model_name: 'sd-model',
+                images_only: true,
+              }),
+            ],
+          },
+        },
+      );
+      const start = await screen.findByRole('button', { name: t.benchmarkStart });
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
+    });
+
+    // The scope names its application and its mapping before either list has
+    // loaded. Until then the pickers show nothing rather than an id none of
+    // their options carries yet, which MUI warns about on every such render.
+    it('warns of no out-of-range picker value while the lists load, then shows the loaded mapping', async () => {
+      const warn = vi.spyOn(console, 'warn');
+      try {
+        renderSection(
+          { kind: 'mapping', id: 'map_img', name: 'sd-model', applicationId: 'app_1' },
+          imagesOnlyMapping,
+        );
+        await screen.findByRole('combobox', { name: t.benchmarkHistory });
+        expect(screen.getByRole('combobox', { name: t.benchmarkScopeMapping })).toHaveTextContent(
+          'sd-model',
+        );
+        expect(
+          warn.mock.calls.map((args) => args.join(' ')).filter((m) => m.includes('out-of-range')),
+        ).toEqual([]);
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 }

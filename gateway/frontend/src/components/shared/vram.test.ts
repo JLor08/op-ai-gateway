@@ -480,7 +480,7 @@ describe('the Go source of truth', () => {
       floor: 9,
       declared: vramInconclusiveReasons,
     },
-    { what: 'confidence warning', prefix: 'Warning', floor: 4, declared: vramWarnings },
+    { what: 'confidence warning', prefix: 'Warning', floor: 5, declared: vramWarnings },
     { what: 'fingerprint kind', prefix: 'Fingerprint', floor: 2, declared: vramFingerprintKinds },
     { what: 'isolation proof', prefix: 'Proof', floor: 2, declared: vramIsolationProofs },
   ])('declares exactly the $what values the Go package declares', ({ prefix, declared, floor }) => {

@@ -9,6 +9,7 @@ import { messages, type Locale } from '../i18n';
 import {
   PortalApiError,
   type BenchmarkStatus,
+  type LoadRefusal,
   type ModelOption,
   type ModelServerCapability,
   type ModelServerRow,
@@ -327,6 +328,47 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // rowC: loadable + idle → enabled.
       openMenu('GPU-Box-C');
       expect(await loadItem()).not.toHaveAttribute('aria-disabled', 'true');
+    });
+
+    // rowC is loadable in every other respect (can_load, not loaded, idle), so
+    // the refusal is the only reason Laden can be disabled. The tooltip is the
+    // label of the 409 the Load starter would answer, so the hover and a
+    // refused click's toast say the same thing.
+    it.each([
+      ['images_only', 'errorBenchmarkImagesOnly'],
+      ['agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
+      ['spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
+    ] as const)('disables Laden for a %s row, with %s as its tooltip', async (refusal, key) => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-c' ? { ...r, load_refusal: refusal } : r,
+      );
+      const { api } = makeApi({ modelServers: vi.fn().mockResolvedValue(rows) });
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      const item = await loadItem();
+      expect(item).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.mouseOver(item);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(t[key]);
+    });
+
+    // A reason a newer gateway sends and this build has no label for still
+    // means the Load cannot succeed, so it still disables Laden, named by its
+    // wire code.
+    it('disables Laden for an unknown refusal too, naming its code', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-c' ? { ...r, load_refusal: 'future_reason' as LoadRefusal } : r,
+      );
+      const { api } = makeApi({ modelServers: vi.fn().mockResolvedValue(rows) });
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      openMenu('GPU-Box-C');
+      const item = await loadItem();
+      expect(item).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.mouseOver(item);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent('benchmark.future_reason');
     });
 
     it('loads a model and shows a success toast on completion', async () => {

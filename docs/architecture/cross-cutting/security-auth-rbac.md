@@ -618,7 +618,9 @@ flowchart LR
 
 A plain `admin` scope with no ownership and no delegated group reach gets the
 exact same 404 as an anonymous stranger — this replaced an earlier "any admin
-manages every server" bypass. The same no-existence-leak collapsing pattern
+manages every server" bypass. The per-model server list's `can_load` flag
+(`ModelServers`) asks `authorizeServer` too, so a row offers a Load exactly
+when the Load starter would authorize it. The same no-existence-leak collapsing pattern
 (a missing/forbidden target both surface as "not found") is reused for user
 management (`ManageableUserIDs`) and every resource type below.
 

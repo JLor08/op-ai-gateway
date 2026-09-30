@@ -64,7 +64,8 @@ type benchmarkTarget struct {
 	// routing.Resolver.targetFrom's live-request path: a set/random-mode
 	// server_agent child's SEALED spec token is used, everything else falls
 	// back to the app token unchanged. Callers populate it at construction
-	// (benchmarkSpecFor); benchmarkTarget itself never loads it.
+	// (benchmarkTargetFor, from the spec the caller read; the model warmer
+	// through benchmarkSpecFor); benchmarkTarget itself never loads it.
 	spec routing.RuntimeSpec
 	// liveProgressSupport is the mapping's live-progress capability verdict --
 	// "" (never determined) | "supported" | "unsupported" -- resolved from its
@@ -79,6 +80,13 @@ type benchmarkTarget struct {
 	// per target keeps the store read out of the per-stream path, and keeps
 	// the builder table-testable with no store at all.
 	liveProgressSupport string
+	// loadWithoutGenerating marks a target whose model the load core
+	// (ensureResidentForRun) starts through the agent's ensure route instead
+	// of loading it by generating: a server_agent child that serves only
+	// images, on a server whose agent declared runtime_ensure (loadRefusal).
+	// The Load starter sets it (loadTargetFor); the VRAM run copies it from
+	// its plan (vramRunPlanned.ensure) onto the target it loads.
+	loadWithoutGenerating bool
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -94,8 +102,8 @@ func (s *Server) streamOnce(ctx context.Context, streamer provider.StreamingClie
 }
 
 // streamOnceWithin is streamOnce with an explicit first-data budget for the
-// watchdog. The load loop (loadUntilServable) calls it directly, to cut an
-// attempt's budget to what remains of the loop's own bound.
+// watchdog. The load loop's text attempt (loadAttemptFor) calls it directly,
+// to cut the attempt's budget to what remains of the loop's own bound.
 func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.StreamingClient, target routing.Target, req inference.Request, budget time.Duration) (time.Duration, inference.Usage, error) {
 	start := time.Now()
 	var firstAt time.Time
@@ -140,41 +148,36 @@ func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.Streami
 	return ttft, usage, nil
 }
 
-// mappingIsImagesOnly reports whether a mapping's EFFECTIVE flavors are
-// images-only (routing.FlavorsAreImagesOnly), resolved by routing.EffectiveFields,
-// the precedence routing.Resolver.targetFrom applies: for a server_agent
-// application the mapping's runtime spec is the authority whenever it has one,
-// even one stored as [], and the application's list stands otherwise. A
-// background job that sends the mapping a chat prompt asks it first, because
-// such a mapping cannot answer one. Only a server_agent application's mapping
-// can have a spec, so any other application is answered without a store read.
+// mappingIsImagesOnly reads a mapping's runtime spec (mappingRuntimeSpec)
+// and reports whether its EFFECTIVE flavors are images-only
+// (mappingSpecIsImagesOnly). The model warmer asks it before it sends a
+// candidate a chat prompt, because such a mapping cannot answer one.
 //
 // Unlike benchmarkSpecFor it keeps "no spec" apart from a failed read: the
 // first means the application's flavors, the second means the answer is
 // unknown, which it reports as an error so the caller can skip rather than
 // guess.
 func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
-	var spec routing.RuntimeSpec
-	hasSpec := false
-	if app.Type == routing.ProviderServerAgent {
-		loaded, ok, err := s.Routes.RuntimeSpecByMapping(ctx, mappingID)
-		if err != nil {
-			return false, err
-		}
-		spec, hasSpec = loaded, ok
+	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, app, mappingID)
+	if err != nil {
+		return false, err
 	}
-	return routing.FlavorsAreImagesOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors), nil
+	return mappingSpecIsImagesOnly(app, spec, hasSpec), nil
 }
 
-// benchmarkSpecFor resolves the RuntimeSpec a benchmarkTarget should carry (its
-// .spec field) for later auth resolution via routing.SpecUpstreamAuth, mirroring
-// routing.Resolver.targetFrom's live-request rule: only a server_agent
-// application's mapping can have a spec at all, so any other app type returns a
-// zero spec WITHOUT touching the store. A mapping with no spec yet, or a
-// spec-store error, also returns zero (best-effort — a benchmark/capacity/
-// warm/probe run must never fail because a spec lookup hiccupped). A zero spec
-// makes SpecUpstreamAuth fall back to the app token: today's pre-Runtime-Spec-
+// benchmarkSpecFor resolves the RuntimeSpec the model warmer's
+// benchmarkTarget carries (its .spec field) for later auth resolution via
+// routing.SpecUpstreamAuth, mirroring routing.Resolver.targetFrom's
+// live-request rule: only a server_agent application's mapping can have a
+// spec at all, so any other app type returns a zero spec WITHOUT touching the
+// store. A mapping with no spec yet, or a spec-store error, also returns zero
+// (best-effort -- a warm is a load-ahead that must never fail because a spec
+// lookup hiccupped; the warmer has already skipped a candidate whose spec
+// could not be classified, through mappingIsImagesOnly). A zero spec makes
+// SpecUpstreamAuth fall back to the app token: today's pre-Runtime-Spec-
 // API-Token behaviour, unchanged for every non-server_agent or no-spec case.
+// The manual runs and the scheduler read fail-closed instead
+// (mappingRuntimeSpec) and hand the spec to benchmarkTargetFor.
 func (s *Server) benchmarkSpecFor(ctx context.Context, app routing.Application, mappingID string) routing.RuntimeSpec {
 	if app.Type != routing.ProviderServerAgent {
 		return routing.RuntimeSpec{}
@@ -230,26 +233,37 @@ func (s *Server) benchmarkLiveProgressSupport(ctx context.Context, mappingID str
 	return routing.LiveProgressSupportFromVerdict(row.Verdict)
 }
 
-// benchmarkTargetFor builds a benchmarkTarget with BOTH of its
-// store-resolved fields filled in: the resolved RuntimeSpec
-// (benchmarkSpecFor) and the mapping's live-progress capability verdict
-// (benchmarkLiveProgressSupport).
+// benchmarkTargetFor builds a benchmarkTarget from the runtime spec its
+// caller already read (mappingRuntimeSpec: spec, and hasSpec whether the
+// mapping has one) and the mapping's live-progress capability verdict
+// (benchmarkLiveProgressSupport), which it reads itself.
+//
+// It takes the spec instead of reading it, so a starter's refusal check and
+// the target's credential (routing.SpecUpstreamAuth) see the same row: a
+// second read could see a different one, or fail after the first succeeded.
+// The spec is kept only for a server_agent application's mapping that has
+// one, the one case routing.Resolver.targetFrom applies a spec in; any other
+// target carries a zero spec, which makes SpecUpstreamAuth fall back to the
+// application token.
 //
 // Every construction site that starts from a plain routing.ModelMapping goes
 // through it -- the four benchmark/probe/load/vram endpoint handlers and the
-// scheduler -- so neither field can be filled at four sites and forgotten at
-// the fifth. (The model warmer is the one exception: it already holds a
+// scheduler -- so the verdict cannot be filled at four sites and forgotten
+// at the fifth. (The model warmer is the one exception: it already holds a
 // routing.MappingCandidate, whose LiveProgressSupport came from
 // ActiveMappingsForModel's join, so it fills the field from that instead of
 // paying a second read for the same row.)
-func (s *Server) benchmarkTargetFor(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping) benchmarkTarget {
-	return benchmarkTarget{
+func (s *Server) benchmarkTargetFor(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping, spec routing.RuntimeSpec, hasSpec bool) benchmarkTarget {
+	tgt := benchmarkTarget{
 		server:              server,
 		app:                 app,
 		mapping:             mapping,
-		spec:                s.benchmarkSpecFor(ctx, app, mapping.ID),
 		liveProgressSupport: s.benchmarkLiveProgressSupport(ctx, mapping.ID),
 	}
+	if hasSpec && app.Type == routing.ProviderServerAgent {
+		tgt.spec = spec
+	}
+	return tgt
 }
 
 // benchmarkTargetReq builds the routing.Target + a base inference.Request (from the first
@@ -425,7 +439,8 @@ var (
 	// budget rather than on the first probe. A var so tests can shorten it. The
 	// loop's bound is the larger of this and the stream's first-data budget
 	// (loadUntilServable), and a load that blocks instead of answering 503 is
-	// bounded by the stream watchdog of its attempt (watchBenchmarkStream).
+	// bounded by the stream watchdog of its attempt (watchBenchmarkStream), or,
+	// for an ensure attempt, by the loop's bound itself (ensureLoadAttempt).
 	coldLoadResidentMaxWait = 5 * time.Minute
 	// coldLoadCallTimeout is a defensive per-call bound for the loaded-probe and the unload
 	// when the app carries no positive Timeout — so a wedged upstream can NEVER hang the
@@ -525,15 +540,23 @@ func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedMo
 
 // benchmarkSiblingModel returns another active mapping's upstream model name on the same
 // application (a distinct AppModelName), for the swap-workaround eviction.
+//
+// The swap sends that sibling a chat prompt, so a sibling that serves only images
+// (mappingIsImagesOnly) is passed over, and so is one whose runtime spec cannot be read,
+// since whether it serves only images is then unknown.
 func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget) (string, bool) {
 	mappings, err := s.Routes.MappingsByApplication(ctx, tgt.app.ID)
 	if err != nil {
 		return "", false
 	}
 	for _, m := range mappings {
-		if m.Status == routing.ServerStatusActive && strings.TrimSpace(m.AppModelName) != "" && m.AppModelName != tgt.mapping.AppModelName {
-			return m.AppModelName, true
+		if m.Status != routing.ServerStatusActive || strings.TrimSpace(m.AppModelName) == "" || m.AppModelName == tgt.mapping.AppModelName {
+			continue
 		}
+		if imagesOnly, err := s.mappingIsImagesOnly(ctx, tgt.app, m.ID); err != nil || imagesOnly {
+			continue
+		}
+		return m.AppModelName, true
 	}
 	return "", false
 }

@@ -1902,6 +1902,15 @@ type ModelMappingDTO struct {
 	MetricsSource    string                     `json:"metrics_source"`
 	MetricsUpdatedAt *time.Time                 `json:"metrics_updated_at,omitempty"`
 	CreatedAt        time.Time                  `json:"created_at"`
+	// ImagesOnly reports that the mapping's effective flavors
+	// (routing.EffectiveFields: its runtime spec's for a server_agent mapping
+	// that has one, its application's otherwise) are images-only
+	// (routing.FlavorsAreImagesOnly). The gateway refuses to send such a
+	// mapping a chat prompt, and the marker lets the portal disable the
+	// context probe and the speed, capacity, both and vision benchmarks for
+	// it up front. It is advisory: a failed spec read reports false, and the
+	// gateway's own check still refuses.
+	ImagesOnly bool `json:"images_only"`
 }
 
 type MappingListResponse struct {
@@ -2081,9 +2090,10 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	if err != nil {
 		return MappingListResponse{}, err
 	}
+	imagesOnly := s.mappingsImagesOnly(ctx, app, mappings)
 	out := make([]ModelMappingDTO, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID])))
+		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID]), imagesOnly[mapping.ID]))
 	}
 	return MappingListResponse{Data: out}, nil
 }
@@ -2269,7 +2279,7 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// notifyRuntimeChangedForMapping -- the gate is the owning application's
 	// type, not which field this request set.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName), nil
+	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
@@ -2509,7 +2519,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// the agent's router for up to a minute while the old one still routes. See
 	// notifyRuntimeChangedForMapping.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName), nil
+	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
 }
 
 // DeleteMapping removes the mapping.
@@ -3017,7 +3027,8 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // mappingDTO projects a mapping onto the wire shape the portal's mapping form
 // binds to. caps is that mapping's stored capability rows keyed by capability
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
-// "nothing determined").
+// "nothing determined"). imagesOnly is the mapping's ImagesOnly marker, from
+// mappingsImagesOnly or mappingImagesOnly.
 //
 // Capabilities is what MappingForm.tsx SEEDS its two capability selects
 // from: one entry per determined row, and the ABSENCE of an entry is the
@@ -3039,7 +3050,7 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // the truth; UpdateMapping's compare-before-write is the other half of the
 // same guarantee, and the way back out is an empty verdict in
 // UpdateMappingRequest.CapabilityVerdicts.
-func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow) ModelMappingDTO {
+func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow, imagesOnly bool) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
 		ApplicationID:                mapping.ApplicationID,
@@ -3061,6 +3072,7 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		MetricsSource:                mapping.MetricsSource,
 		MetricsUpdatedAt:             mapping.MetricsUpdatedAt,
 		CreatedAt:                    mapping.CreatedAt,
+		ImagesOnly:                   imagesOnly,
 	}
 }
 

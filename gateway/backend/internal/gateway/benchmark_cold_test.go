@@ -263,3 +263,74 @@ func TestEnsureColdLoadVerifyTimeout(t *testing.T) {
 		t.Fatalf("unload calls = %d, want 1", fake.unloadCallCount())
 	}
 }
+
+// coldSeedAgentStore seeds srv1 with a server_agent application app1 whose loaded set is
+// observable, the given active mappings (id -> appModelName), and a runtime spec with flavors
+// for each mapping in specs.
+func coldSeedAgentStore(t *testing.T, mappings map[string]string, specs map[string][]string) (*routing.MemoryStore, routing.Application) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	app := routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, LoadedModelsPath: "/running", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	if err := mem.CreateApplication(ctx, app); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	for id, up := range mappings {
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: "app1", GatewayModelName: "gw-" + id, AppModelName: up, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", id, err)
+		}
+	}
+	for id, flavors := range specs {
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "rs_" + id, MappingID: id, Enabled: true, Binary: "/opt/bin/server", Args: "[]", Env: "{}", HealthPath: "/health", APIFlavors: flavors, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", id, err)
+		}
+	}
+	return mem, app
+}
+
+// The sibling swap sends its sibling a chat prompt, so it passes over a sibling that serves
+// only images and one whose spec cannot be read, and swaps to the first text sibling after
+// them. With no such sibling it streams nothing and cannot confirm a cold state.
+func TestEnsureColdLoadSiblingSwapSkipsAnImagesOnlySibling(t *testing.T) {
+	images := []string{routing.APIFlavorOpenAIImages}
+	text := []string{routing.APIFlavorOpenAI}
+	t.Run("a text sibling after them", func(t *testing.T) {
+		shortColdBounds(t, time.Millisecond, 2*time.Second)
+		mem, app := coldSeedAgentStore(t,
+			map[string]string{"map1": "up-model", "map2": "sd-model", "map3": "unread-model", "map4": "up-model-4"},
+			map[string][]string{"map1": text, "map2": images, "map3": text, "map4": text})
+		specs := &refusalSpecStore{Store: mem, fail: map[string]bool{"map3": true}, reads: map[string]int{}}
+		fake := newColdLister([]string{"up-model"})
+		fake.swapEvicts = true
+		srv := &Server{Provider: fake, Routes: specs}
+		tgt := coldTestTarget()
+		tgt.app = app
+		if !srv.ensureColdLoad(context.Background(), tgt) {
+			t.Fatal("ensureColdLoad = false, want true (the swap to the text sibling evicted the model)")
+		}
+		if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-model-4" {
+			t.Fatalf("streamed = %v, want exactly [up-model-4]: no chat prompt to the images-only or the unreadable sibling", got)
+		}
+	})
+	t.Run("only an images-only sibling", func(t *testing.T) {
+		shortColdBounds(t, time.Millisecond, 2*time.Second)
+		mem, app := coldSeedAgentStore(t,
+			map[string]string{"map1": "up-model", "map2": "sd-model"},
+			map[string][]string{"map1": text, "map2": images})
+		fake := newColdLister([]string{"up-model"})
+		fake.swapEvicts = true
+		srv := &Server{Provider: fake, Routes: mem}
+		tgt := coldTestTarget()
+		tgt.app = app
+		if srv.ensureColdLoad(context.Background(), tgt) {
+			t.Fatal("ensureColdLoad = true, want false: no sibling can take the swap")
+		}
+		if got := fake.streamedModels(); len(got) != 0 {
+			t.Fatalf("streamed = %v, want none", got)
+		}
+	})
+}

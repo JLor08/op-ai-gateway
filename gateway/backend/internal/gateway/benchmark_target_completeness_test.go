@@ -20,7 +20,8 @@ var benchmarkOmits = map[string]bool{
 	// Deliberately "" so the live-progress rejection memo (which never memoizes an
 	// empty RouteID) cannot suppress a repeat across a run's 64 streams; also gates
 	// the opportunistic-metrics side path (RouteID != ""), which a benchmark -- the
-	// authoritative measurement -- must never trigger. (benchmark_runner.go:258-263)
+	// authoritative measurement -- must never trigger (see the RouteID comment
+	// in benchmarkTargetReq, benchmark_runner.go).
 	"RouteID": true,
 	// No ActiveRequest is registered and no InferenceEvent emitted on the benchmark
 	// stream (streamOnce -> CompleteStream), so nothing reads Target.ServerID here.

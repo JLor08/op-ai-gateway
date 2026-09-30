@@ -180,8 +180,10 @@ func TestRunContextProbeWarmLoadError(t *testing.T) {
 }
 
 // TestStartContextProbeIdleGate exercises the two 409 paths of the HTTP handler: a server already
-// reserved (TryStart fails, no Release of the pre-existing run) and a server with in-flight traffic
-// (idle-gate refuses AND Releases the just-taken reservation).
+// reserved (refuseBusyServer answers before the spec read, no Release of the pre-existing run) and
+// a server with in-flight traffic (idle-gate refuses AND Releases the just-taken reservation). A
+// reservation taken between the busy check and TryStart is
+// TestStartersLosingTheReservationRaceKeepTheWinningRun's case.
 func TestStartContextProbeIdleGate(t *testing.T) {
 	s := newBenchmarkActiveFixture(t)
 	// Seed an active mapping under the owned server so the mapping scope authorizes.
@@ -202,8 +204,8 @@ func TestStartContextProbeIdleGate(t *testing.T) {
 		return rec.Code
 	}
 
-	// Case A: server already reserved => TryStart fails => 409, and the pre-existing
-	// reservation must NOT be released (the handler does not Release on the TryStart-fail path).
+	// Case A: server already reserved => refuseBusyServer answers 409 before the spec read, and the
+	// pre-existing reservation must NOT be released.
 	if _, ok := s.Benchmarks.TryStart(baOwnedServer, "server", "speed", 1, now, func() {}); !ok {
 		t.Fatalf("pre-reserve TryStart failed")
 	}
@@ -211,7 +213,7 @@ func TestStartContextProbeIdleGate(t *testing.T) {
 		t.Fatalf("already-reserved: status = %d, want 409", code)
 	}
 	if !s.Benchmarks.ServerBusy(baOwnedServer) {
-		t.Fatalf("pre-existing reservation was released on the TryStart-fail path, want it preserved")
+		t.Fatalf("pre-existing reservation was released on the busy-server path, want it preserved")
 	}
 	s.Benchmarks.Release(baOwnedServer) // clear for the next case
 

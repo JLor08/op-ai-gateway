@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
@@ -350,25 +351,92 @@ func (s *Server) rankModelServers(ctx context.Context, model string) map[string]
 	return ranks
 }
 
-// injectRuntimeModelState fills each row's live State/ActiveRequests/QueueDepth/MetricsProbe/
-// ContextProbe from the volatile runtime-status registry, mirroring how rankModelServers' caller injects
-// Priority: Service.ModelServers always leaves these zero/empty because only the
-// gateway layer holds the registry + routing store needed to resolve them.
+// injectRuntimeModelState fills each row's LoadRefusal (rowLoadRefusal) and its live State/
+// ActiveRequests/QueueDepth/MetricsProbe/ContextProbe from the volatile runtime-status registry,
+// mirroring how rankModelServers' caller injects Priority: Service.ModelServers always leaves
+// these zero/empty because only the gateway layer holds the registries + routing store needed to
+// resolve them.
+//
+// Each row costs one RuntimeSpecByMapping read, which serves both: the refusal is computed from it
+// first, so a row with no spec, or with a spec whose status was never published, still gets its
+// reason. Each distinct application is read at most once per listing (applicationForRow).
 //
 // Best-effort and nil-safe throughout: a nil RuntimeStatus or Routes, a mapping with no
-// runtime spec, or a spec with no published status all just leave the row's zero value —
-// never an error, and never a reason to fail the whole list. Each distinct ServerID's
-// status snapshot is fetched at most once (statusSnapshot copies its whole per-server
-// slice), then indexed by spec id so every row in that server is a cheap map lookup.
+// runtime spec, or a spec with no published status all just leave the row's RUNTIME-STATE
+// fields (State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe) at their zero value —
+// never an error, and never a reason to fail the whole list. LoadRefusal is not among
+// them: it is still computed from the row's application and spec (rowLoadRefusal) even
+// when none of the above holds a value. Each distinct ServerID's status snapshot is
+// fetched at most once (statusSnapshot copies its whole per-server slice), then indexed
+// by spec id so every row in that server is a cheap map lookup.
 func (s *Server) injectRuntimeModelState(ctx context.Context, rows []portal.ModelServerDTO) {
-	if s.RuntimeStatus == nil || s.Routes == nil {
+	if s.Routes == nil {
 		return
 	}
 	byServer := map[string]map[string]RuntimeStatusDTO{}
+	apps := map[string]cachedApplication{}
 	for i := range rows {
-		statuses := s.runtimeStatusesForServer(byServer, rows[i].ServerID)
-		s.injectRowRuntimeState(ctx, &rows[i], statuses)
+		row := &rows[i]
+		spec, hasSpec, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
+		row.LoadRefusal = s.rowLoadRefusal(ctx, apps, *row, spec, hasSpec, err)
+		if err != nil || !hasSpec {
+			continue // best-effort: no spec for this mapping, or lookup failed — leave zero
+		}
+		s.injectRowRuntimeState(row, spec, s.runtimeStatusesForServer(byServer, row.ServerID))
 	}
+}
+
+// cachedApplication is one applicationForRow result: the application, or ok == false when
+// its read failed.
+type cachedApplication struct {
+	app routing.Application
+	ok  bool
+}
+
+// applicationForRow returns appID's application, reading it on first use and caching the
+// result, a failed read included, in apps, so each distinct application is read at most once
+// per listing. A failed read is logged once (per distinct application, per listing), for the
+// same reason the portal's own images_only reads are: a silent degrade to "no reason" leaves
+// no diagnostic trail.
+func (s *Server) applicationForRow(ctx context.Context, apps map[string]cachedApplication, appID string) (routing.Application, bool) {
+	if cached, seen := apps[appID]; seen {
+		return cached.app, cached.ok
+	}
+	app, err := s.Routes.ApplicationByID(ctx, appID)
+	if err != nil {
+		slog.Warn("model-servers: application read failed; load_refusal left empty for its rows", "app_id", appID, "err", err)
+	}
+	cached := cachedApplication{app: app, ok: err == nil}
+	apps[appID] = cached
+	return cached.app, cached.ok
+}
+
+// rowLoadRefusal is row's LoadRefusal: loadRefusal over what the Load starter decides by --
+// the mapping's application, for a server_agent application the mapping's runtime spec (spec,
+// hasSpec and specErr, the row's one spec read), and the server's runtime_ensure flag -- so the
+// row and the starter cannot disagree. A spec under any other application type changes nothing:
+// the starter never reads one, and loadRefusal (through routing.EffectiveFields and its own
+// server_agent check) ignores one.
+//
+// It is "" for a row the caller cannot Load (CanLoad false, which portal.Service.ModelServers
+// computes with the starter's own authorization): the portal shows Load disabled with its
+// permission reason there, and the starter answers 404. It is "" while a run holds the server:
+// the starter answers benchmark.already_running first, and a VRAM run's drain stores
+// force_stopped on the server's specs until it restores them. It is also "" when the
+// application or a server_agent mapping's spec cannot be read, which leaves the answer to the
+// starter's own fail-closed read.
+func (s *Server) rowLoadRefusal(ctx context.Context, apps map[string]cachedApplication, row portal.ModelServerDTO, spec routing.RuntimeSpec, hasSpec bool, specErr error) string {
+	if !row.CanLoad || s.Benchmarks.ServerBusy(row.ServerID) {
+		return ""
+	}
+	app, ok := s.applicationForRow(ctx, apps, row.ApplicationID)
+	if !ok {
+		return ""
+	}
+	if specErr != nil && app.Type == routing.ProviderServerAgent {
+		return ""
+	}
+	return loadRefusal(app, spec, hasSpec, s.AgentFeatures.Has(row.ServerID, runtimeEnsureFeature))
 }
 
 // runtimeStatusesForServer returns serverID's runtime-status snapshot indexed by spec id,
@@ -388,14 +456,10 @@ func (s *Server) runtimeStatusesForServer(byServer map[string]map[string]Runtime
 }
 
 // injectRowRuntimeState fills row's State/ActiveRequests/QueueDepth/MetricsProbe/ContextProbe
-// from statuses (row's owning server's runtime-status snapshot indexed by spec id), resolving
-// row's runtime spec to find the right entry. Best-effort and nil-safe: a mapping with no
-// runtime spec, or a spec with no published status, just leaves the row's zero value.
-func (s *Server) injectRowRuntimeState(ctx context.Context, row *portal.ModelServerDTO, statuses map[string]RuntimeStatusDTO) {
-	spec, ok, err := s.Routes.RuntimeSpecByMapping(ctx, row.MappingID)
-	if err != nil || !ok {
-		return // best-effort: no spec for this mapping, or lookup failed — leave zero
-	}
+// from statuses (row's owning server's runtime-status snapshot indexed by spec id), looking up
+// spec, row's runtime spec. Best-effort: a spec with no published status just leaves the row's
+// zero value.
+func (s *Server) injectRowRuntimeState(row *portal.ModelServerDTO, spec routing.RuntimeSpec, statuses map[string]RuntimeStatusDTO) {
 	dto, ok := statuses[spec.ID]
 	if !ok {
 		return

@@ -43,7 +43,26 @@ import {
 export type BenchmarkScope =
   | { kind: 'server' }
   | { kind: 'application'; id: string; name: string }
-  | { kind: 'mapping'; id: string; name: string };
+  | { kind: 'mapping'; id: string; name: string; applicationId?: string };
+
+/** The application whose mappings the form loads first: the scope's own, or a
+ * mapping scope's own application when the caller names it. Without it the
+ * server's first application is loaded, and an images-only marker on any
+ * other application's mapping is never found. */
+function initialAppId(scope: BenchmarkScope): string {
+  if (scope.kind === 'application') return scope.id;
+  if (scope.kind === 'mapping') return scope.applicationId ?? '';
+  return '';
+}
+
+/** What a scope picker shows: the chosen id, else the first option's. Until
+ * its list has loaded the picker has no option at all, and the scope's own id
+ * would be a value none of its options carries (which MUI warns about), so it
+ * shows nothing until then. */
+function pickerValue(chosenId: string, options: readonly { id: string }[]): string {
+  if (options.length === 0) return '';
+  return chosenId || options[0].id;
+}
 
 type ScopeKind = BenchmarkScope['kind'];
 /**
@@ -54,6 +73,39 @@ type ScopeKind = BenchmarkScope['kind'];
  * "measure my models" would stop every model on the box.
  */
 type BenchType = 'speed' | 'capacity' | 'both' | 'vision' | 'vram';
+
+/**
+ * The four run kinds that are a `?mode=` value. Each sends the mapping a chat
+ * prompt, so none of them can run on an images-only mapping (the gateway
+ * refuses it with `benchmark.images_only` on the model scope and skips it on
+ * the others, where it refuses the run the same way only when every mapping
+ * in the scope serves images only). They are also the kinds whose finished
+ * results nothing renders once the live panel closes: the VRAM kind has its
+ * own outcome view, and a load or a context probe is not started from this
+ * form.
+ */
+const promptModes: ReadonlySet<string> = new Set<BenchType>([
+  'speed',
+  'capacity',
+  'both',
+  'vision',
+]);
+
+/**
+ * Whether the mapping the model scope is set to serves images only. Only the
+ * model scope asks: the application and server scopes skip such a mapping and
+ * run the rest, and the gateway answers `benchmark.images_only` for one whose
+ * every mapping serves images only, so there is no rest to run.
+ */
+function selectedMappingIsImagesOnly(
+  scopeKind: ScopeKind,
+  mappings: readonly PortalModelMapping[],
+  mappingId: string,
+): boolean {
+  if (scopeKind !== 'mapping') return false;
+  const id = mappingId || mappings[0]?.id;
+  return mappings.find((m) => m.id === id)?.images_only === true;
+}
 
 // An unknown number renders as a dash, never as 0: `0` means UNKNOWN
 // everywhere in this feature, so a zero cell would invent a measurement of
@@ -235,9 +287,11 @@ function VramOutcome({ t, result }: Readonly<{ t: Translation; result: Benchmark
   );
 }
 
-/** One live-result line: an error takes priority, then a vision-capability
- * probe result, then a capacity-ramp result, else the plain speed reading. */
+/** One result line: a skip takes priority (a skipped result's numbers are
+ * zeros, not a measurement), then an error, then a vision-capability probe
+ * result, then a capacity-ramp result, else the plain speed reading. */
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
+  if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.error) return r.error;
   if (r.vision_capable !== undefined) {
     return `${t.benchmarkVision}: ${r.vision_capable ? '✓' : '✗'}`;
@@ -289,6 +343,42 @@ function RunningPanel({ t, status }: Readonly<{ t: Translation; status: Benchmar
           </Typography>
         ))}
       </Box>
+    </Box>
+  );
+}
+
+/**
+ * The results of a FINISHED speed, capacity, both or vision run that measured
+ * nothing: a skipped mapping and one that failed. The live panel closes the
+ * moment `running` flips false, and after that neither has a line anywhere: a
+ * skipped mapping and one whose launch spec could not be read get no history
+ * row at all, and a failed one only in the history of whichever mapping the
+ * picker below happens to show.
+ */
+function finishedUnmeasuredResults(status: BenchmarkStatus | null): BenchmarkResult[] {
+  if (!status || status.running || !promptModes.has(status.mode ?? '')) return [];
+  return (status.results ?? []).filter((r) => r.skipped || r.error);
+}
+
+/** The finished run's unmeasured mappings, one line each, shown where the live
+ * panel was (like `VramOutcome`). */
+function UnmeasuredNotice({
+  t,
+  results,
+}: Readonly<{ t: Translation; results: BenchmarkResult[] }>) {
+  return (
+    <Box
+      aria-label={t.benchmarkNotMeasured}
+      sx={{ mb: 2, p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1 }}
+    >
+      <Typography variant="subtitle2" component="h3" sx={{ mb: 0.5 }}>
+        {t.benchmarkNotMeasured}
+      </Typography>
+      {results.map((r) => (
+        <Typography key={r.mapping_id} variant="body2" color="text.secondary">
+          {r.gateway_model_name}: {benchmarkResultLine(r, t)}
+        </Typography>
+      ))}
     </Box>
   );
 }
@@ -527,7 +617,7 @@ export function BenchmarkSection({
   const [startError, setStartError] = useState<string>('');
 
   const [scopeKind, setScopeKind] = useState<ScopeKind>(initialScope.kind);
-  const [appId, setAppId] = useState(initialScope.kind === 'application' ? initialScope.id : '');
+  const [appId, setAppId] = useState(initialAppId(initialScope));
   const [mappingId, setMappingId] = useState(
     initialScope.kind === 'mapping' ? initialScope.id : '',
   );
@@ -699,6 +789,14 @@ export function BenchmarkSection({
     liveStatus && !liveStatus.running && liveStatus.mode === 'vram'
       ? (liveStatus.results ?? [])
       : [];
+  const unmeasuredResults = finishedUnmeasuredResults(liveStatus);
+
+  // An images-only mapping on the model scope: the four chat-prompt types are
+  // disabled, and so is Start while one of them is selected. The type is not
+  // switched to VRAM on the operator's behalf, because that run drains the
+  // whole server.
+  const imagesOnly = selectedMappingIsImagesOnly(scopeKind, mappings, mappingId);
+  const typeRefused = imagesOnly && promptModes.has(benchType);
 
   const lastCompleted = useMemo(() => {
     if (!history || history.length === 0) return null;
@@ -710,6 +808,7 @@ export function BenchmarkSection({
       {finishedVramResults.map((r) => (
         <VramOutcome key={r.mapping_id} t={t} result={r} />
       ))}
+      {unmeasuredResults.length > 0 && <UnmeasuredNotice t={t} results={unmeasuredResults} />}
       {running ? (
         <RunningPanel t={t} status={liveStatus!} />
       ) : (
@@ -737,7 +836,7 @@ export function BenchmarkSection({
             <SelectField
               id="benchmark-app"
               label={t.benchmarkScopeApplication}
-              value={appId || apps[0]?.id || ''}
+              value={pickerValue(appId, apps)}
               onChange={(e) => {
                 setAppId(e.target.value);
                 setMappingId('');
@@ -754,7 +853,7 @@ export function BenchmarkSection({
             <SelectField
               id="benchmark-mapping"
               label={t.benchmarkScopeMapping}
-              value={mappingId || mappings[0]?.id || ''}
+              value={pickerValue(mappingId, mappings)}
               onChange={(e) => setMappingId(e.target.value)}
             >
               {mappings.map((m) => (
@@ -770,10 +869,18 @@ export function BenchmarkSection({
             value={benchType}
             onChange={(e) => setBenchType(e.target.value as BenchType)}
           >
-            <option value="speed">{t.benchmarkTypeSpeed}</option>
-            <option value="capacity">{t.benchmarkTypeCapacity}</option>
-            <option value="both">{t.benchmarkTypeBoth}</option>
-            <option value="vision">{t.benchmarkTypeVision}</option>
+            <option value="speed" disabled={imagesOnly}>
+              {t.benchmarkTypeSpeed}
+            </option>
+            <option value="capacity" disabled={imagesOnly}>
+              {t.benchmarkTypeCapacity}
+            </option>
+            <option value="both" disabled={imagesOnly}>
+              {t.benchmarkTypeBoth}
+            </option>
+            <option value="vision" disabled={imagesOnly}>
+              {t.benchmarkTypeVision}
+            </option>
             {/* Offered only where it can run. The hint below is UNCONDITIONAL
                 for the same reason: it is the only place the scope restriction
                 and the drain are stated, so it has to be readable before the
@@ -783,8 +890,18 @@ export function BenchmarkSection({
           <Typography variant="caption" color="text.secondary" sx={{ mt: -1.5 }}>
             {t.benchmarkTypeVramHint}
           </Typography>
+          {imagesOnly && (
+            <Typography id="benchmark-images-only-hint" variant="caption" color="text.secondary">
+              {t.benchmarkImagesOnlyHint}
+            </Typography>
+          )}
           <Box>
-            <Button variant="contained" onClick={() => void start()} disabled={starting}>
+            <Button
+              variant="contained"
+              onClick={() => void start()}
+              disabled={starting || typeRefused}
+              aria-describedby={typeRefused ? 'benchmark-images-only-hint' : undefined}
+            >
               {t.benchmarkStart}
             </Button>
           </Box>

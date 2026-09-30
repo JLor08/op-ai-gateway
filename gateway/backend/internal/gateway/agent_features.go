@@ -19,8 +19,9 @@ import (
 // the gateway and the agent declare it; each side computes that intersection
 // independently. A name that states a fact about one side alone need only be
 // on that side's list: capability_source_sdcpp is on this list only, and the
-// agent-declared gpu_selection, runtime_api_token, runtime_model_probe and
-// runtime_upstream_props are on the agent's only.
+// agent-declared gpu_selection, runtime_api_token, runtime_model_probe,
+// runtime_upstream_props and runtime_ensure (runtimeEnsureFeature) are on
+// the agent's only.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
 // runtime_logs is declared here for completeness of the negotiation contract

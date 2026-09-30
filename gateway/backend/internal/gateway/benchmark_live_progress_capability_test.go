@@ -151,7 +151,7 @@ func TestBenchmarkTargetForFillsTheLiveProgressVerdict(t *testing.T) {
 		t.Fatalf("MappingByID: %v", err)
 	}
 
-	tgt := srv.benchmarkTargetFor(ctx, server, app, mapping)
+	tgt := srv.benchmarkTargetFor(ctx, server, app, mapping, routing.RuntimeSpec{}, false)
 	if tgt.liveProgressSupport != "unsupported" {
 		t.Fatalf("benchmarkTargetFor liveProgressSupport = %q, want %q -- a verdict left at \"\" makes every benchmark stream pay a 400 plus a retry, forever", tgt.liveProgressSupport, "unsupported")
 	}

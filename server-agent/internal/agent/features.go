@@ -157,6 +157,22 @@ var Features = []Feature{
 	// the binary that first carries this name is the same 0.7.0 that first
 	// carries the route.
 	{Name: "runtime_upstream_props", Since: "0.7.0"},
+	// runtime_ensure: this agent's runtime router serves POST /ensure/{model}
+	// -- a bodiless request that starts the model's managed child if it is
+	// not running, waits until it is healthy, and answers 200
+	// {"status":"running"} without forwarding anything to the child. Like
+	// runtime_upstream_props, the GATEWAY gates real behavior on this flag,
+	// fail-closed: the Load and the VRAM probe of an images-only child (a
+	// server that answers no chat completion, such as stable-diffusion.cpp's
+	// sd-server) use the route only on an agent that declares this name, and
+	// are refused for any other. Trying the route instead cannot tell the two
+	// apart: a router without it answers the bodiless POST with 404
+	// runtime.model_not_managed, the same status and code it answers an
+	// unmanaged model with.
+	//
+	// Since is 0.8.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "runtime_ensure", Since: "0.8.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.
