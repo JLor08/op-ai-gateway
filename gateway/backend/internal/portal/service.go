@@ -37,6 +37,10 @@ const (
 	CodeTokenNotFound   = "portal.token_not_found"
 	CodeServerNotFound  = "server.not_found"
 	CodeServiceNotFound = "service.not_found"
+	// CodeVendorAccountNotFound is ErrVendorAccountNotFound's API error code,
+	// exported so internal/gateway/portal_vendor_account_endpoints.go shares the
+	// exact value instead of re-hardcoding it.
+	CodeVendorAccountNotFound = "vendor_account.not_found"
 )
 
 var (
@@ -109,6 +113,21 @@ var (
 	ErrServiceNotFound   = errors.New(CodeServiceNotFound)
 	ErrServiceForbidden  = errors.New("service.forbidden")
 	ErrServiceValidation = errors.New("service.validation_failed")
+
+	// Vendor accounts ("Anbieter"): per-user external AI vendor accounts.
+	// ErrVendorAccountNotFound covers both "no such account" AND "principal does
+	// not own it" (no existence leak, mirrors ErrServerNotFound).
+	// ErrVendorAccountForbidden is the create gate for a principal that is not a
+	// real user (no UserID to own the account).
+	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
+	// account, whose only credential is the OAuth token set.
+	ErrVendorAccountNotFound         = errors.New(CodeVendorAccountNotFound)
+	ErrVendorAccountForbidden        = errors.New("vendor_account.forbidden")
+	ErrVendorAccountNameRequired     = errors.New("vendor_account.name_required")
+	ErrVendorAccountVendorInvalid    = errors.New("vendor_account.vendor_invalid")
+	ErrVendorAccountAuthTypeInvalid  = errors.New("vendor_account.auth_type_invalid")
+	ErrVendorAccountStatusInvalid    = errors.New("vendor_account.status_invalid")
+	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable
