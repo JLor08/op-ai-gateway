@@ -821,13 +821,16 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		if acc.Status != VendorAccountStatusActive {
 			continue
 		}
-		// OpenAI subscription serving is Milestone 5b (Responses-only,
-		// chatgpt-account-id header, a different upstream). Until then an OpenAI
-		// subscription account cannot serve, so it must NOT match here — skip it and
-		// let the standard path decide (ErrNoModelRoute when nothing self-hosted
-		// serves the model). Anthropic subscription and every api_key account are
-		// served below.
-		if acc.AuthType == VendorAuthSubscription && acc.Vendor != VendorAnthropic {
+		// An OpenAI SUBSCRIPTION account serves ONLY via NATIVE PASSTHROUGH of an
+		// inbound /v1/responses request (Milestone 5b): a different upstream (the
+		// ChatGPT backend), a chatgpt-account-id header, and the Responses wire
+		// format. So it matches ONLY a fine openai_responses request — the raw
+		// req.APIFlavor, NOT the coarse apiFlavor param, which folds responses and
+		// chat both to "openai". A chat-flavor request to such an account must NOT
+		// match (portal chat/completions support is Milestone 5c); it falls through
+		// to the standard path and ErrNoModelRoute. Anthropic subscription and every
+		// api_key account are unaffected and served below over either dialect.
+		if acc.AuthType == VendorAuthSubscription && acc.Vendor != VendorAnthropic && req.APIFlavor != "openai_responses" {
 			continue
 		}
 		models, err := r.store.VendorAccountModels(ctx, acc.ID)
@@ -839,11 +842,17 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 				continue
 			}
 			if acc.AuthType == VendorAuthSubscription {
-				// Anthropic subscription (OAuth): the bearer is resolved + refreshed
-				// at dispatch from the account's sealed OAuth tokens, so the target
-				// carries VendorAccountID + the Claude-Code masquerade + the required
-				// OAuth headers, and NO APIToken.
-				return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true, nil
+				// Subscription (OAuth): the bearer is resolved + refreshed at dispatch
+				// from the account's sealed OAuth tokens, so the target carries
+				// VendorAccountID and the vendor's required headers, and NO APIToken.
+				if acc.Vendor == VendorAnthropic {
+					// Anthropic: translate either inbound dialect to Messages; carries
+					// the Claude-Code masquerade + the OAuth version/beta headers.
+					return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true, nil
+				}
+				// OpenAI: native passthrough of the inbound Responses request to the
+				// ChatGPT backend (reached only for openai_responses, gated above).
+				return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor), true, nil
 			}
 			return vendorAccountTarget(acc, m, req.Model, apiFlavor), true, nil
 		}
@@ -925,6 +934,56 @@ func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, 
 		},
 		// Both inbound dialects are served via translate (zero endpoint modes).
 		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
+	}
+}
+
+// vendorSubscriptionOpenAITarget assembles the Target for a matched OPENAI
+// SUBSCRIPTION (Codex ChatGPT Pro/Plus/Team OAuth) account + model row (Milestone
+// 5b). Unlike the Anthropic subscription target it is NATIVE PASSTHROUGH, not
+// translate: an inbound /v1/responses request is forwarded verbatim to the ChatGPT
+// backend, so it differs from the Anthropic target in exactly these ways:
+//
+//   - Provider ProviderVendorOpenAI + the ChatGPT backend Endpoint
+//     (https://chatgpt.com/backend-api/codex), and ResponsesMode passthrough so the
+//     native-passthrough layer relays the Responses body/SSE without translating.
+//     The upstream path is /responses (not /v1/responses) — see endpointModeFor.
+//   - APIFlavors is [openai] ONLY: this target serves openai_responses and nothing
+//     else (no anthropic translate, no chat/completions — that is Milestone 5c).
+//   - NO Masquerade: the ChatGPT backend wants the real Codex body, not a system
+//     block injected by a translate client.
+//   - ExtraHeaders carries the two STATIC Codex headers every call needs. The
+//     chatgpt-account-id header is NOT here — it is a per-account value resolved
+//     from the sealed tokens at dispatch (subscriptionAuthCtx), the same place the
+//     bearer is attached.
+//
+// As with the Anthropic target, VendorAccountID names the account the dispatch
+// layer resolves + refreshes the bearer from, and APIToken/APITokenHeader stay
+// empty. Only an openai_responses request reaches here (resolveVendorAccount gates
+// it). The header values below are the live REVERSE-ENGINEERED Codex CLI constants;
+// see internal/vendorauth for their canonical home and the ToS caveat (routing
+// cannot import vendorauth, so they are string literals here, mirroring the
+// Anthropic target's approach).
+func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+	return Target{
+		RouteID:         "vendor:" + acc.ID + ":" + model,
+		ServerID:        "",
+		Provider:        ProviderVendorOpenAI,
+		Endpoint:        "https://chatgpt.com/backend-api/codex",
+		Model:           model,
+		ProviderModel:   m.UpstreamModel,
+		Timeout:         vendorAccountDefaultTimeout,
+		APIFlavor:       apiFlavor,
+		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:  "",
+		VendorAccountID: acc.ID,
+		ExtraHeaders: map[string]string{
+			"OpenAI-Beta": "responses=experimental",
+			"originator":  "codex_cli_rs",
+		},
+		// Responses is served via NATIVE PASSTHROUGH; chat/completions and the
+		// anthropic dialect are not served by an OpenAI subscription account yet.
+		APIFlavors:    []string{APIFlavorOpenAI},
+		ResponsesMode: EndpointModePassthrough,
 	}
 }
 
