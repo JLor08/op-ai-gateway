@@ -121,7 +121,30 @@ type Target struct {
 	// application, "" otherwise -- the only shape evidence available for a child
 	// whose application type says nothing about it.
 	LiveProgressSpecType string
+	// ExtraHeaders are STATIC headers the dispatch layer attaches to the upstream
+	// request verbatim, on top of any credential header. A vendor SUBSCRIPTION
+	// (OAuth) Anthropic target carries the required anthropic-version and
+	// anthropic-beta oauth headers here; an ordinary self-hosted target leaves it
+	// nil. They never carry a secret (the credential rides separately via the
+	// upstream-auth context), so they are safe to log.
+	ExtraHeaders map[string]string
+	// Masquerade selects a client-side request disguise: "" (none) or
+	// "claude_code" (MasqueradeClaudeCode), which makes the Anthropic client
+	// prepend the Claude-Code system block required on the subscription/OAuth
+	// Messages path. Only subscription targets set it.
+	Masquerade string
+	// VendorAccountID, when non-empty, marks a SUBSCRIPTION vendor target whose
+	// upstream bearer is NOT carried in APIToken but resolved -- and refreshed if
+	// stale -- at dispatch time from the named account's sealed OAuth tokens
+	// (upstreamAuthCtx). APIToken/APITokenHeader are empty for such a target. An
+	// API-KEY vendor target and every self-hosted target leave this "".
+	VendorAccountID string
 }
+
+// MasqueradeClaudeCode is the Target.Masquerade value that makes the Anthropic
+// client prepend the exact Claude-Code first system block (the subscription /
+// OAuth serving path). Kept with Target because it is a Target field value.
+const MasqueradeClaudeCode = "claude_code"
 
 // ReachabilityChecker reports whether an application is currently reachable.
 // The resolver gates candidate selection and affinity reuse through it so that

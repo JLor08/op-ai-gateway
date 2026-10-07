@@ -19,7 +19,16 @@ import (
 // non-empty apiFlavor argument), it populates all 17 Target fields. If a
 // future field is genuinely unset by targetFrom on a real resolved target,
 // add it here WITH a reason rather than deleting the assertion.
-var targetFromMayLeaveZero = map[string]bool{}
+var targetFromMayLeaveZero = map[string]bool{
+	// The three vendor-subscription fields are set ONLY on a hand-built vendor
+	// subscription Target (vendorSubscriptionAnthropicTarget); targetFrom builds
+	// self-hosted/server_agent targets, which never masquerade, carry no static
+	// extra headers, and resolve their credential from APIToken rather than a
+	// vendor account. Each is legitimately zero here.
+	"ExtraHeaders":    true, // static upstream headers only a vendor subscription target carries
+	"Masquerade":      true, // "" (no disguise) for every self-hosted target
+	"VendorAccountID": true, // non-empty only for a dispatch-resolved subscription bearer
+}
 
 // TestTargetFromPopulatesEveryField is the routing.Target analogue of
 // TestPutRequestFromDTOCoversEveryWritableField (internal/portal): it exists

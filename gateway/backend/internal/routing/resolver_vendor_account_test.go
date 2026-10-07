@@ -270,6 +270,9 @@ var vendorTargetMayBeZero = map[string]bool{
 	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
 	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
 	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default); set for Anthropic
+	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
+	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"VendorAccountID":             true, // the API-KEY bearer rides in APIToken, not resolved from an account at dispatch
 }
 
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of
