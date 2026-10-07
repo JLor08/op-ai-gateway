@@ -30,6 +30,10 @@ func TestVendorAccountEndpointsAre409WhileTheMasterFlagIsOff(t *testing.T) {
 		{"get", http.MethodGet, "/api/portal/vendor-accounts/va_anything", vaOwnerSecret, ""},
 		{"patch", http.MethodPatch, "/api/portal/vendor-accounts/va_anything", vaOwnerSecret, `{"name":"x"}`},
 		{"delete", http.MethodDelete, "/api/portal/vendor-accounts/va_anything", vaOwnerSecret, ""},
+		{"connect import", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/import", vaOwnerSecret, `{"access_token":"t"}`},
+		{"connect begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOwnerSecret, ""},
+		{"connect complete", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/complete", vaOwnerSecret, `{"code":"c"}`},
+		{"connect begin as another user", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOtherSecret, ""},
 		{"list as another user", http.MethodGet, "/api/portal/vendor-accounts", vaOtherSecret, ""},
 		// Even a system principal is refused: the flag is a module switch, not an ACL.
 		{"list as system", http.MethodGet, "/api/portal/vendor-accounts", vaSystemSecret, ""},

@@ -52,6 +52,14 @@ func enableVendorAccountsFlag(t *testing.T, srv *Server) {
 // (vaSystemSecret) to flip it and the settings store it lives in.
 func newVendorAccountSettingsTestServer(t *testing.T, volatile bool) (*Server, *routing.MemoryStore, *portal.MemorySystemSettings) {
 	t.Helper()
+	return newVendorAccountSettingsTestServerWithDeps(t, volatile, nil)
+}
+
+// newVendorAccountSettingsTestServerWithDeps is newVendorAccountSettingsTestServer
+// with a hook to adjust the portal.ServiceDeps before the Service is built (the
+// connect tests inject httptest vendor OAuth endpoints this way).
+func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adjust func(*portal.ServiceDeps)) (*Server, *routing.MemoryStore, *portal.MemorySystemSettings) {
+	t.Helper()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	tokens := auth.NewTokenStore()
 	dir := portal.NewMemoryDirectory(tokens)
@@ -70,7 +78,11 @@ func newVendorAccountSettingsTestServer(t *testing.T, volatile bool) (*Server, *
 	routeStore := routing.NewMemoryStore()
 	recorder := usage.NewRecorder()
 	settings := portal.NewMemorySystemSettings()
-	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile})
+	deps := portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile}
+	if adjust != nil {
+		adjust(&deps)
+	}
+	svc := portal.NewService(deps)
 	srv := New(ServerDeps{Tokens: tokens, Usage: recorder, Routes: routeStore, Portal: svc})
 	return srv, routeStore, settings
 }
