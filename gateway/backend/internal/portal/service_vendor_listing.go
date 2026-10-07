@@ -36,6 +36,17 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 		if acc.Status != routing.VendorAccountStatusActive {
 			continue
 		}
+		// An OpenAI SUBSCRIPTION account serves ONLY /v1/responses via native
+		// passthrough (Milestone 5b); chat/completions support is Milestone 5c. The
+		// overlay advertises a model under the coarse {openai, anthropic} dialects,
+		// so listing an OpenAI subscription model here would put it in /v1/models and
+		// the chat picker, where a chat/completions call then 404s — breaking
+		// served_flavors parity. Skip it until M5c. (API-key OpenAI accounts and
+		// Anthropic subscription accounts still serve both dialects via translate and
+		// stay advertised.)
+		if acc.AuthType == routing.VendorAuthSubscription && acc.Vendor == routing.VendorOpenAI {
+			continue
+		}
 		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
 		if err != nil {
 			continue
