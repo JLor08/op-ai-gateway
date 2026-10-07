@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +26,29 @@ const vendorAccountTestKey = "sk-live-do-not-echo-123"
 // "plain:" path -- the same wiring the RAM-mode gateway uses.
 func newVendorAccountTestService(t *testing.T, now time.Time) (*Service, *routing.MemoryStore) {
 	t.Helper()
-	return newServerTestServiceWithCipher(t, now, nil, true)
+	return newVendorAccountTestServiceWithCipher(t, now, nil, true)
+}
+
+// newVendorAccountTestServiceWithCipher is newServerTestServiceWithCipher with
+// the vendor_accounts_enabled master flag switched ON: every vendor-account
+// service method is refused while it is off (ErrVendorAccountsDisabled), so the
+// tests of the methods' own behaviour run with the area enabled.
+func newVendorAccountTestServiceWithCipher(t *testing.T, now time.Time, cipher *capture.Cipher, volatile bool) (*Service, *routing.MemoryStore) {
+	t.Helper()
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, volatile)
+	setVendorAccountsEnabled(t, svc, true)
+	return svc, routeStore
+}
+
+// setVendorAccountsEnabled gives svc a fresh in-memory settings store (the
+// shared test constructor wires none) holding the master flag.
+func setVendorAccountsEnabled(t *testing.T, svc *Service, enabled bool) {
+	t.Helper()
+	settings := NewMemorySystemSettings()
+	if err := settings.SetSystemSetting(context.Background(), vendorAccountsEnabledKey, strconv.FormatBool(enabled), time.Time{}); err != nil {
+		t.Fatalf("SetSystemSetting: %v", err)
+	}
+	svc.settings = settings
 }
 
 func createTestVendorAccount(t *testing.T, svc *Service, principal auth.Token, req CreateVendorAccountRequest) VendorAccountDTO {
@@ -111,7 +134,7 @@ func TestCreateVendorAccountAPIKeyRoundTrip(t *testing.T) {
 func TestCreateVendorAccountSealsWithCipher(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	cipher := newTestCipher(t)
-	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	svc, routeStore := newVendorAccountTestServiceWithCipher(t, now, cipher, false)
 
 	dto := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Sealed"))
 
@@ -132,7 +155,7 @@ func TestCreateVendorAccountSealsWithCipher(t *testing.T) {
 // persisting a plaintext key; nothing is written.
 func TestCreateVendorAccountKeylessDiskStoreRefuses(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
-	svc, routeStore := newServerTestServiceWithCipher(t, now, nil, false)
+	svc, routeStore := newVendorAccountTestServiceWithCipher(t, now, nil, false)
 
 	_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), apiKeyAccountRequest("Keyless"))
 	if !errors.Is(err, capture.ErrKeyRequired) {
@@ -550,7 +573,7 @@ func TestUpdateVendorAccountWhitespaceOnlyKeyIsRejectedNotCleared(t *testing.T) 
 // (mirrors the create-path assertion).
 func TestUpdateVendorAccountKeylessDiskStoreRefusesReplacementKey(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
-	svc, routeStore := newServerTestServiceWithCipher(t, now, nil, false)
+	svc, routeStore := newVendorAccountTestServiceWithCipher(t, now, nil, false)
 	ctx := context.Background()
 	// A key-less api_key account has nothing to seal, so it is creatable here.
 	created := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
@@ -754,5 +777,90 @@ func TestCreateVendorAccountSeedAndCleanupFailureAreBothReported(t *testing.T) {
 	_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), apiKeyAccountRequest("Double fault"))
 	if !errors.Is(err, boom) || !errors.Is(err, stuck) {
 		t.Fatalf("create err = %v, want both the seeding and the cleanup error", err)
+	}
+}
+
+// With the master flag OFF every vendor-account method refuses with
+// ErrVendorAccountsDisabled before it reads, writes or authorizes anything --
+// including for a principal who owns an existing account and for a missing id
+// (a disabled area must not even confirm whether an account exists).
+func TestVendorAccountMethodsRefuseWhileTheMasterFlagIsOff(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	existing := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Created while enabled"))
+	setVendorAccountsEnabled(t, svc, false)
+
+	ctx := context.Background()
+	name := "renamed"
+	calls := map[string]func() error{
+		"create": func() error {
+			_, err := svc.CreateVendorAccount(ctx, ownerToken(), apiKeyAccountRequest("Should not exist"))
+			return err
+		},
+		"list": func() error {
+			_, err := svc.ListVendorAccounts(ctx, ownerToken())
+			return err
+		},
+		"get": func() error {
+			_, err := svc.GetVendorAccount(ctx, ownerToken(), existing.ID)
+			return err
+		},
+		"get unknown id": func() error {
+			_, err := svc.GetVendorAccount(ctx, ownerToken(), "va_missing")
+			return err
+		},
+		"update": func() error {
+			_, err := svc.UpdateVendorAccount(ctx, ownerToken(), existing.ID, UpdateVendorAccountRequest{Name: &name})
+			return err
+		},
+		"delete": func() error {
+			_, err := svc.DeleteVendorAccount(ctx, ownerToken(), existing.ID)
+			return err
+		},
+		"create without a user identity": func() error {
+			_, err := svc.CreateVendorAccount(ctx, auth.Token{}, apiKeyAccountRequest("Anonymous"))
+			return err
+		},
+	}
+	for label, call := range calls {
+		if err := call(); !errors.Is(err, ErrVendorAccountsDisabled) {
+			t.Fatalf("%s while disabled: err = %v, want ErrVendorAccountsDisabled", label, err)
+		}
+	}
+
+	// Nothing was written or removed: the one account is intact and unrenamed.
+	accounts, err := routeStore.VendorAccountsByOwner(ctx, "usr_owner")
+	if err != nil {
+		t.Fatalf("VendorAccountsByOwner: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != existing.ID || accounts[0].Name != "Created while enabled" {
+		t.Fatalf("accounts after refused calls = %+v, want the single untouched account", accounts)
+	}
+
+	// Switching the flag back on restores the area, and the account is still there.
+	setVendorAccountsEnabled(t, svc, true)
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil || len(list.Data) != 1 || list.Data[0].ID != existing.ID {
+		t.Fatalf("list after re-enabling = %+v, %v, want the existing account", list, err)
+	}
+}
+
+// A service with no settings store (the flag cannot be read) is disabled too:
+// the area is opt-in, so an unreadable flag must fail closed.
+func TestVendorAccountMethodsRefuseWithoutASettingsStore(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestServiceWithCipher(t, now, nil, true)
+	if _, err := svc.CreateVendorAccount(context.Background(), ownerToken(), apiKeyAccountRequest("No store")); !errors.Is(err, ErrVendorAccountsDisabled) {
+		t.Fatalf("create without a settings store: err = %v, want ErrVendorAccountsDisabled", err)
+	}
+}
+
+// The default (flag never written) is OFF, so a fresh deployment exposes nothing.
+func TestVendorAccountMethodsRefuseByDefault(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestServiceWithCipher(t, now, nil, true)
+	svc.settings = NewMemorySystemSettings()
+	if _, err := svc.ListVendorAccounts(context.Background(), ownerToken()); !errors.Is(err, ErrVendorAccountsDisabled) {
+		t.Fatalf("list with the flag unset: err = %v, want ErrVendorAccountsDisabled", err)
 	}
 }

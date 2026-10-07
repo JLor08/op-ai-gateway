@@ -19,15 +19,38 @@ import (
 )
 
 const (
-	vaOwnerSecret = "va-owner-secret"
-	vaOtherSecret = "va-other-secret"
-	vaTestAPIKey  = "sk-live-do-not-echo-123"
+	vaOwnerSecret  = "va-owner-secret"
+	vaOtherSecret  = "va-other-secret"
+	vaSystemSecret = "va-system-secret"
+	vaTestAPIKey   = "sk-live-do-not-echo-123"
 )
 
 // newVendorAccountTestServer wires a portal Service over a memory route store
-// with two plain-bearer users (usr_va_a / usr_va_b). volatile selects the
-// RAM-mode seal path ("plain:", no cipher); false models a keyless disk store.
+// with two plain-bearer users (usr_va_a / usr_va_b) and the vendor_accounts_enabled
+// master flag switched ON (the endpoints answer 409 while it is off). volatile
+// selects the RAM-mode seal path ("plain:", no cipher); false models a keyless
+// disk store.
 func newVendorAccountTestServer(t *testing.T, volatile bool) (*Server, *routing.MemoryStore) {
+	t.Helper()
+	srv, routeStore, _ := newVendorAccountSettingsTestServer(t, volatile)
+	enableVendorAccountsFlag(t, srv)
+	return srv, routeStore
+}
+
+// enableVendorAccountsFlag turns the master flag on through the real system
+// settings endpoint, the way an operator does.
+func enableVendorAccountsFlag(t *testing.T, srv *Server) {
+	t.Helper()
+	rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"vendor_accounts_enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable flag status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// newVendorAccountSettingsTestServer is newVendorAccountTestServer with the
+// master flag left at its default (OFF), plus a system-scoped bearer
+// (vaSystemSecret) to flip it and the settings store it lives in.
+func newVendorAccountSettingsTestServer(t *testing.T, volatile bool) (*Server, *routing.MemoryStore, *portal.MemorySystemSettings) {
 	t.Helper()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	tokens := auth.NewTokenStore()
@@ -40,11 +63,16 @@ func newVendorAccountTestServer(t *testing.T, volatile bool) (*Server, *routing.
 	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_va_b", UserID: "usr_va_b", Name: "Other Token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, vaOtherSecret); err != nil {
 		t.Fatalf("CreatePlainToken other: %v", err)
 	}
+	dir.AddUser(store.User{ID: "usr_va_sys", Email: "sys@example.test", DisplayName: "System", Role: "system_admin", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_va_sys", UserID: "usr_va_sys", Name: "System Token", Status: store.TokenStatusActive, Scopes: `["gateway:use","admin","system"]`, CreatedAt: now, UpdatedAt: now}, vaSystemSecret); err != nil {
+		t.Fatalf("CreatePlainToken system: %v", err)
+	}
 	routeStore := routing.NewMemoryStore()
 	recorder := usage.NewRecorder()
-	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SettingsVolatile: volatile})
+	settings := portal.NewMemorySystemSettings()
+	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile})
 	srv := New(ServerDeps{Tokens: tokens, Usage: recorder, Routes: routeStore, Portal: svc})
-	return srv, routeStore
+	return srv, routeStore, settings
 }
 
 func vaDo(t *testing.T, srv *Server, method, path, secret, body string) *httptest.ResponseRecorder {

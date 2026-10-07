@@ -2322,6 +2322,18 @@ func (_d *APIWithTracing) UserTokens(ctx context.Context, t1 auth.Token, s1 stri
 	return _d.API.UserTokens(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 string) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountRoutingMode")
+	defer span.End()
+	return _d.API.VendorAccountRoutingMode(ctx)
+}
+
+func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsEnabled")
+	defer span.End()
+	return _d.API.VendorAccountsEnabled(ctx)
+}
+
 func (_d *APIWithTracing) VisibleUserIDs(ctx context.Context, t1 auth.Token) (m1 map[string]bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VisibleUserIDs")
 	defer span.End()

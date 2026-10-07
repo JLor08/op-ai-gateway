@@ -22,6 +22,24 @@ const (
 	codeVendorAccountDeleteFailed = "vendor_account.delete_failed"
 )
 
+// handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
+// flag (system setting vendor_accounts_enabled) is on, for any portal user
+// (gateway:use, GET-only). It returns ONLY that boolean -- no routing mode or
+// other setting -- so any user's shell can show or hide the "Anbieter" nav item
+// without being granted the system-scoped settings read. It answers while the
+// module is off (that is its purpose), and the exact-path route registered for
+// it wins over the "/api/portal/vendor-accounts/{id}" subtree (account ids are
+// "va_"-prefixed, so none can be called "enabled").
+func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireWebScope(w, r, scopeGatewayUse); !ok {
+		return
+	}
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"module_enabled": s.Portal.VendorAccountsEnabled(r.Context())})
+}
+
 // handlePortalVendorAccounts is the vendor-account ("Anbieter") collection
 // endpoint: GET lists the caller's OWN accounts, POST creates one owned by the
 // caller. Both are gated only by the session-scope check (gateway:use); the
@@ -115,6 +133,10 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 // rows (checked before sharedErrorMap). store.ErrNotFound maps to a different
 // code in other mappers, so its vendor-account row must stay here.
 var portalVendorAccountErrRows = []errRow{
+	// The vendor_accounts_enabled master flag is off: a 409, like
+	// netbird.module_disabled. The portal hides the area in that state, so this
+	// is reached by a stale tab or a direct API client.
+	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: "vendor_accounts.module_disabled", msg: "vendor accounts are not enabled"},
 	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
 	{err: portal.ErrVendorAccountNameRequired, status: http.StatusBadRequest, code: "vendor_account.name_required", msg: "vendor account name is required"},
 	{err: portal.ErrVendorAccountVendorInvalid, status: http.StatusBadRequest, code: "vendor_account.vendor_invalid", msg: "vendor account vendor is invalid"},

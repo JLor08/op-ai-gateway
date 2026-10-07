@@ -897,6 +897,16 @@ type SystemSettingsDTO struct {
 	// id; "legacy_header" keys on the explicit affinity header.
 	RouteAffinitySessionMode string `json:"route_affinity_session_mode"`
 
+	// VendorAccountsEnabled is the vendor_accounts_enabled MASTER flag for the
+	// vendor-accounts ("Anbieter") area; default false (opt-in). While off the
+	// portal hides the menu item and every vendor-account call is refused with
+	// 409 vendor_accounts.module_disabled.
+	VendorAccountsEnabled bool `json:"vendor_accounts_enabled"`
+	// VendorAccountRoutingMode is the routing precedence between a caller's own
+	// vendor accounts and the self-hosted/shared routes: "vendor_first"
+	// (default) or "fallback_only".
+	VendorAccountRoutingMode string `json:"vendor_account_routing_mode"`
+
 	// Energy-attribution defaults (purely additive — no engine consumes these
 	// yet; a later phase falls back to them when a per-mapping/per-server
 	// value is unknown). All default 0 = "unset / no default".
@@ -1054,6 +1064,13 @@ type UpdateSystemSettingsRequest struct {
 	VisionProbeMode *string `json:"vision_probe_mode"`
 
 	RouteAffinitySessionMode *string `json:"route_affinity_session_mode"`
+
+	// VendorAccountsEnabled / VendorAccountRoutingMode: nil = keep the stored
+	// value. The routing mode must be exactly "vendor_first" or "fallback_only"
+	// (after trimming), or the write is rejected with
+	// ErrVendorAccountRoutingModeInvalid.
+	VendorAccountsEnabled    *bool   `json:"vendor_accounts_enabled"`
+	VendorAccountRoutingMode *string `json:"vendor_account_routing_mode"`
 
 	// Energy-attribution defaults; nil = keep the stored value. Must be >= 0
 	// when set (0 resets to "unset / no default").
@@ -1573,12 +1590,19 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 
 		RouteAffinitySessionMode: s.RouteAffinitySessionMode(ctx),
 
+		// The vendor-accounts flag is off (zero value) and the routing mode is the
+		// default when the store is absent/unreadable.
+		VendorAccountRoutingMode: DefaultVendorAccountRoutingMode,
+
 		// SMTP defaults hold when the store is absent/unreadable.
 		SMTPPort:    DefaultSMTPPort,
 		SMTPTLSMode: DefaultSMTPTLSMode,
 	}
 	if s.settings != nil {
 		if values, err := s.settings.SystemSettings(ctx); err == nil {
+			dto.VendorAccountsEnabled = VendorAccountsEnabled(values)
+			dto.VendorAccountRoutingMode = VendorAccountRoutingMode(values)
+
 			dto.EnergyDefaultPricePerKwh = EnergyDefaultPricePerKwh(values)
 			dto.EnergyDefaultPue = EnergyDefaultPue(values)
 			dto.EnergyDefaultWhPerToken = EnergyDefaultWhPerToken(values)
@@ -1760,6 +1784,16 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 			return SystemSettingsDTO{}, ErrRouteAffinitySessionModeInvalid
 		}
 		writes = append(writes, settingWrite{routeAffinitySessionModeKey, strings.TrimSpace(*req.RouteAffinitySessionMode)})
+	}
+	if req.VendorAccountsEnabled != nil {
+		writes = append(writes, settingWrite{vendorAccountsEnabledKey, strconv.FormatBool(*req.VendorAccountsEnabled)})
+	}
+	if req.VendorAccountRoutingMode != nil {
+		mode := strings.TrimSpace(*req.VendorAccountRoutingMode)
+		if !isKnownVendorAccountRoutingMode(mode) {
+			return SystemSettingsDTO{}, ErrVendorAccountRoutingModeInvalid
+		}
+		writes = append(writes, settingWrite{vendorAccountRoutingModeKey, mode})
 	}
 	if req.EnergyDefaultPricePerKwh != nil {
 		if err := validateEnergyDefault(*req.EnergyDefaultPricePerKwh); err != nil {

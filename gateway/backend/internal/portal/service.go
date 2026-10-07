@@ -132,6 +132,12 @@ var (
 	ErrVendorAccountStatusInvalid    = errors.New("vendor_account.status_invalid")
 	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
 	ErrVendorAccountAPIKeyInvalid    = errors.New("vendor_account.api_key_invalid")
+
+	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
+	// (system setting vendor_accounts_enabled, off by default): every
+	// vendor-account service method returns it, before doing anything, while
+	// the flag is off. Mirrors ErrNetbirdModuleDisabled; mapped to a 409.
+	ErrVendorAccountsDisabled = errors.New("vendor_accounts.module_disabled")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable

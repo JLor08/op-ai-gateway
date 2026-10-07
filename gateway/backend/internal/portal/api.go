@@ -227,6 +227,8 @@ type API interface {
 	UserLimits(context.Context, string) (UserLimitsDTO, error)
 	UserPreferences(context.Context, string) (map[string]json.RawMessage, error)
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
+	VendorAccountRoutingMode(context.Context) string
+	VendorAccountsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string
 }

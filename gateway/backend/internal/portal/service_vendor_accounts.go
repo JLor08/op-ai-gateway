@@ -170,9 +170,14 @@ func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Tok
 }
 
 // ListVendorAccounts returns the calling principal's OWN accounts, oldest first.
+// Like every vendor-account method it is refused with ErrVendorAccountsDisabled
+// (before anything else) while the vendor_accounts_enabled master flag is off.
 // System scope does not widen the list: the page is a personal one and the DTO
 // carries no owner, so a cross-user list would be unattributed.
 func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) (VendorAccountListResponse, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountListResponse{}, err
+	}
 	out := make([]VendorAccountDTO, 0)
 	if principal.UserID == "" {
 		return VendorAccountListResponse{Data: out}, nil
@@ -198,8 +203,12 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 }
 
 // GetVendorAccount returns one account the principal owns (404-no-leak
-// otherwise); system scope may read any account.
+// otherwise); system scope may read any account. ErrVendorAccountsDisabled while
+// the master flag is off.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
 	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
 	if err != nil {
 		return VendorAccountDTO{}, err
@@ -207,12 +216,15 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 	return s.vendorAccountDTO(ctx, acc)
 }
 
-// CreateVendorAccount creates an account owned by the calling principal. Any
-// authenticated user may create their own (no admin requirement); a principal
+// CreateVendorAccount creates an account owned by the calling principal
+// (ErrVendorAccountsDisabled while the master flag is off). Any authenticated user may create their own (no admin requirement); a principal
 // with no user identity cannot own one. The api key is sealed BEFORE the store
 // write, so a keyless disk store fails with capture.ErrKeyRequired and persists
 // nothing.
 func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token, req CreateVendorAccountRequest) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
 	if principal.UserID == "" {
 		return VendorAccountDTO{}, ErrVendorAccountForbidden
 	}
@@ -285,7 +297,11 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 // immutable, so this loads the row, mutates only the requested fields and writes
 // it back. The write is OWNER-ONLY (system scope included), and authorization
 // runs first, so a stranger gets 404 even for an invalid body.
+// ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
 	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
 		return VendorAccountDTO{}, err
@@ -336,7 +352,11 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 // scope included); the store cascades its dependent rows (the model catalog).
 // The bool reports that a row was removed (always true on a nil error): there is
 // no best-effort side effect to flag, unlike DeleteServer.
+// ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return false, err
+	}
 	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
 		return false, err
