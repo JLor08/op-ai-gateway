@@ -55,6 +55,7 @@ type API interface {
 	CreateService(context.Context, auth.Token, CreateServiceRequest) (ServiceDTO, error)
 	CreateServiceToken(context.Context, auth.Token, string, CreateServiceTokenRequest) (CreateServiceTokenResponse, error)
 	CreateToken(context.Context, auth.Token, CreateTokenRequest) (CreateTokenResponse, error)
+	CreateVendorAccount(context.Context, auth.Token, CreateVendorAccountRequest) (VendorAccountDTO, error)
 	CurrencyUsdPerEur(context.Context) float64
 	CurrentUser(context.Context, auth.Token) (CurrentUser, error)
 	Dashboard(context.Context, auth.Token) DashboardResponse
@@ -71,6 +72,7 @@ type API interface {
 	DeleteService(context.Context, auth.Token, string) error
 	DeleteServiceToken(context.Context, auth.Token, string, string) error
 	DeleteToken(context.Context, auth.Token, string) error
+	DeleteVendorAccount(context.Context, auth.Token, string) (bool, error)
 	DemoteManager(context.Context, auth.Token, string, string) error
 	DetachProjectToken(context.Context, auth.Token, string, string) error
 	DisplayNames(context.Context, []string) map[string]string
@@ -96,6 +98,7 @@ type API interface {
 	GetServer(context.Context, auth.Token, string) (ServerDTO, error)
 	GetServerGPUBudgets(context.Context, auth.Token, string) ([]GPUBudgetDTO, error)
 	GetService(context.Context, auth.Token, string) (ServiceDTO, error)
+	GetVendorAccount(context.Context, auth.Token, string) (VendorAccountDTO, error)
 	GroupMemberCandidates(context.Context, auth.Token, string) ([]UserRefDTO, error)
 	GroupMembers(context.Context, auth.Token, string) ([]UserGroupMemberDTO, error)
 	HealthCheckIntervalSeconds(context.Context) int
@@ -111,6 +114,7 @@ type API interface {
 	ListServiceTokens(context.Context, auth.Token, string) ([]ServiceTokenDTO, error)
 	ListServices(context.Context, auth.Token) ([]ServiceDTO, error)
 	ListTokens(context.Context, auth.Token) (TokenListResponse, error)
+	ListVendorAccounts(context.Context, auth.Token) (VendorAccountListResponse, error)
 	ManageableUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	ManageModels(context.Context, auth.Token) ModelsResponse
 	MappingBenchmarks(context.Context, auth.Token, string, int) ([]BenchmarkRunDTO, error)
@@ -215,6 +219,7 @@ type API interface {
 	UpdateService(context.Context, auth.Token, string, UpdateServiceRequest) (ServiceDTO, error)
 	UpdateSystemSettings(context.Context, auth.Token, UpdateSystemSettingsRequest) (SystemSettingsDTO, error)
 	UpdateToken(context.Context, auth.Token, string, UpdateTokenRequest) (TokenDTO, error)
+	UpdateVendorAccount(context.Context, auth.Token, string, UpdateVendorAccountRequest) (VendorAccountDTO, error)
 	Usage(auth.Token, usage.Query) (usage.Page, error)
 	UsageGroups(auth.Token, usage.Query, string) ([]UsageGroupDTO, error)
 	UsageStats(auth.Token, usage.Query) (usage.Stats, error)

@@ -1228,6 +1228,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/model-group-servers", s.handlePortalModelGroupServers)
 	s.mux.HandleFunc("/api/portal/servers", s.handlePortalServers)
 	s.mux.HandleFunc("/api/portal/servers/", s.handlePortalServerItem)
+	s.mux.HandleFunc("/api/portal/vendor-accounts", s.handlePortalVendorAccounts)
+	s.mux.HandleFunc("/api/portal/vendor-accounts/", s.handlePortalVendorAccountItem)
 	s.mux.HandleFunc("/api/portal/server-admin-group-candidates", s.handleServerAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/service-admin-group-candidates", s.handleServiceAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/resource-group-admin-group-candidates", s.handleResourceGroupAdminGroupCandidates)
