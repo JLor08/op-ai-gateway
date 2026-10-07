@@ -103,8 +103,14 @@ func TestVendorAccountEndpointsCreateListGet(t *testing.T) {
 	if raw["api_key_set"] != true || raw["subscription_connected"] != false {
 		t.Fatalf("api_key_set/subscription_connected = %v/%v, want true/false (%s)", raw["api_key_set"], raw["subscription_connected"], rec.Body.String())
 	}
-	if models, ok := raw["models"].([]any); !ok || len(models) != 0 {
-		t.Fatalf("models = %#v, want an empty array", raw["models"])
+	models, ok := raw["models"].([]any)
+	if !ok || len(models) == 0 {
+		t.Fatalf("models = %#v, want the seeded OpenAI catalog", raw["models"])
+	}
+	for _, m := range models {
+		if row, _ := m.(map[string]any); row["api_flavor"] != routing.APIFlavorOpenAI {
+			t.Fatalf("model %#v, want api_flavor %q", m, routing.APIFlavorOpenAI)
+		}
 	}
 	created := vaDecode(t, rec)
 	if !strings.HasPrefix(created.ID, "va_") || created.Name != "My OpenAI" || created.Status != routing.VendorAccountStatusActive {

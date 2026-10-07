@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-// VendorAccountModelDTO is one gateway-model entry a vendor account serves. The
-// curated per-vendor catalog and the model rows behind it arrive with the
-// routing milestone; until then VendorAccountDTO.Models is always empty.
+// VendorAccountModelDTO is one gateway-model entry a vendor account serves: a
+// row of vendor_account_models, seeded from the curated per-vendor catalog
+// (VendorCatalog) when the account is created.
 type VendorAccountModelDTO struct {
 	GatewayModel  string `json:"gateway_model"`
 	UpstreamModel string `json:"upstream_model"`
@@ -67,9 +67,22 @@ type UpdateVendorAccountRequest struct {
 	APIKey *string `json:"api_key"`
 }
 
-// vendorAccountDTO maps a stored account to its credential-free view. Models is
-// always a non-nil empty slice so it serializes as [] (never null).
-func vendorAccountDTO(acc routing.VendorAccount) VendorAccountDTO {
+// vendorAccountDTO maps a stored account to its credential-free view, reading
+// the model rows the account serves from the store. Models is always a non-nil
+// slice so it serializes as [] (never null).
+func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccount) (VendorAccountDTO, error) {
+	rows, err := s.routes.VendorAccountModels(ctx, acc.ID)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	models := make([]VendorAccountModelDTO, 0, len(rows))
+	for _, row := range rows {
+		models = append(models, VendorAccountModelDTO{
+			GatewayModel:  row.GatewayModel,
+			UpstreamModel: row.UpstreamModel,
+			APIFlavor:     row.APIFlavor,
+		})
+	}
 	return VendorAccountDTO{
 		ID:                    acc.ID,
 		Vendor:                acc.Vendor,
@@ -78,10 +91,10 @@ func vendorAccountDTO(acc routing.VendorAccount) VendorAccountDTO {
 		Status:                acc.Status,
 		APIKeySet:             acc.APIKey != "",
 		SubscriptionConnected: acc.OAuthTokens != "",
-		Models:                []VendorAccountModelDTO{},
+		Models:                models,
 		CreatedAt:             acc.CreatedAt,
 		UpdatedAt:             acc.UpdatedAt,
-	}
+	}, nil
 }
 
 func normalizeVendorAccountVendor(raw string) (string, error) {
@@ -169,7 +182,11 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 		return accounts[i].ID < accounts[j].ID
 	})
 	for _, acc := range accounts {
-		out = append(out, vendorAccountDTO(acc))
+		dto, err := s.vendorAccountDTO(ctx, acc)
+		if err != nil {
+			return VendorAccountListResponse{}, err
+		}
+		out = append(out, dto)
 	}
 	return VendorAccountListResponse{Data: out}, nil
 }
@@ -181,7 +198,7 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return vendorAccountDTO(acc), nil
+	return s.vendorAccountDTO(ctx, acc)
 }
 
 // CreateVendorAccount creates an account owned by the calling principal. Any
@@ -235,7 +252,15 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err := s.routes.CreateVendorAccount(ctx, acc); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return vendorAccountDTO(acc), nil
+	// Seed the vendor's curated model catalog so the account is routable from
+	// the start. An account without its rows would silently serve nothing, so a
+	// seeding failure fails the create and removes the half-made account
+	// (best effort: the cleanup's own error is dropped in favour of the cause).
+	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, VendorCatalog(vendor)); err != nil {
+		_ = s.routes.DeleteVendorAccount(ctx, acc.ID)
+		return VendorAccountDTO{}, err
+	}
+	return s.vendorAccountDTO(ctx, acc)
 }
 
 // UpdateVendorAccount renames an account, changes its status, and/or replaces
@@ -287,12 +312,12 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 		}
 		return VendorAccountDTO{}, err
 	}
-	return vendorAccountDTO(acc), nil
+	return s.vendorAccountDTO(ctx, acc)
 }
 
 // DeleteVendorAccount removes an account the principal owns (owner-only, system
-// scope included); the store cascades its dependent rows. The bool reports that a row was removed (always true on a
-// nil error): there is no best-effort side effect to flag, unlike DeleteServer.
+// scope included); the store cascades its dependent rows (the model catalog). The
+// bool reports that a row was removed (always true on a nil error): there is no best-effort side effect to flag, unlike DeleteServer.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {

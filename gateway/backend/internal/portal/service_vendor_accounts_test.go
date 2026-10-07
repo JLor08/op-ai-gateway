@@ -11,6 +11,8 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -65,8 +67,9 @@ func TestCreateVendorAccountAPIKeyRoundTrip(t *testing.T) {
 	if !dto.APIKeySet || dto.SubscriptionConnected {
 		t.Fatalf("api_key_set/subscription_connected = %v/%v, want true/false", dto.APIKeySet, dto.SubscriptionConnected)
 	}
-	if dto.Models == nil || len(dto.Models) != 0 {
-		t.Fatalf("models = %#v, want a non-nil EMPTY slice in this milestone", dto.Models)
+	wantModels := vendorAccountModelDTOs(VendorCatalog(routing.VendorOpenAI))
+	if !reflect.DeepEqual(dto.Models, wantModels) {
+		t.Fatalf("models = %#v, want the OpenAI catalog %#v", dto.Models, wantModels)
 	}
 	if !dto.CreatedAt.Equal(now) || !dto.UpdatedAt.Equal(now) {
 		t.Fatalf("created/updated = %v/%v, want %v", dto.CreatedAt, dto.UpdatedAt, now)
@@ -80,7 +83,7 @@ func TestCreateVendorAccountAPIKeyRoundTrip(t *testing.T) {
 	if strings.Contains(string(raw), vendorAccountTestKey) {
 		t.Fatalf("dto JSON leaks the api key: %s", raw)
 	}
-	for _, field := range []string{`"api_key_set":true`, `"subscription_connected":false`, `"models":[]`, `"auth_type":"api_key"`} {
+	for _, field := range []string{`"api_key_set":true`, `"subscription_connected":false`, `"api_flavor":"openai"`, `"auth_type":"api_key"`} {
 		if !strings.Contains(string(raw), field) {
 			t.Fatalf("dto JSON %s missing %s", raw, field)
 		}
@@ -264,8 +267,8 @@ func TestListVendorAccountsReturnsOnlyThePrincipalsOwn(t *testing.T) {
 		t.Fatalf("owner list ids = %v, want %s and %s", got, a.ID, b.ID)
 	}
 	for _, dto := range list.Data {
-		if dto.Models == nil {
-			t.Fatalf("list entry %s has nil models, want an empty slice", dto.ID)
+		if len(dto.Models) == 0 {
+			t.Fatalf("list entry %s has no models, want the seeded catalog", dto.ID)
 		}
 	}
 
@@ -570,5 +573,134 @@ func TestUpdateVendorAccountKeylessDiskStoreRefusesReplacementKey(t *testing.T) 
 	name := "Renamed"
 	if dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{Name: &name}); err != nil || dto.Name != name {
 		t.Fatalf("rename on keyless store = %#v, %v", dto, err)
+	}
+}
+
+// vendorAccountModelDTOs is the DTO view the catalog rows are expected to take.
+func vendorAccountModelDTOs(models []routing.VendorAccountModel) []VendorAccountModelDTO {
+	out := make([]VendorAccountModelDTO, 0, len(models))
+	for _, m := range models {
+		out = append(out, VendorAccountModelDTO{GatewayModel: m.GatewayModel, UpstreamModel: m.UpstreamModel, APIFlavor: m.APIFlavor})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].GatewayModel < out[j].GatewayModel })
+	return out
+}
+
+// Creating an account seeds its vendor's whole curated catalog into
+// vendor_account_models, and every read of the account (Create / Get / List /
+// Update) reports it in the DTO with the vendor's own api_flavor.
+func TestCreateVendorAccountSeedsTheVendorCatalog(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		vendor, flavor string
+	}{
+		{routing.VendorOpenAI, routing.APIFlavorOpenAI},
+		{routing.VendorAnthropic, routing.APIFlavorAnthropic},
+	} {
+		t.Run(tc.vendor, func(t *testing.T) {
+			svc, routeStore := newVendorAccountTestService(t, now)
+			ctx := context.Background()
+			created := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+				Vendor: tc.vendor, AuthType: routing.VendorAuthAPIKey, Name: "Seeded", APIKey: vendorAccountTestKey,
+			})
+
+			catalog := VendorCatalog(tc.vendor)
+			if len(catalog) == 0 {
+				t.Fatalf("%s has an empty catalog", tc.vendor)
+			}
+			want := vendorAccountModelDTOs(catalog)
+			if !reflect.DeepEqual(created.Models, want) {
+				t.Fatalf("create DTO models = %#v, want %#v", created.Models, want)
+			}
+			for _, m := range created.Models {
+				if m.APIFlavor != tc.flavor {
+					t.Fatalf("model %q api_flavor = %q, want %q", m.GatewayModel, m.APIFlavor, tc.flavor)
+				}
+			}
+
+			// The rows are really in the store, under this account.
+			rows, err := routeStore.VendorAccountModels(ctx, created.ID)
+			if err != nil || len(rows) != len(catalog) {
+				t.Fatalf("stored models = %+v, %v, want %d rows", rows, err, len(catalog))
+			}
+			for _, row := range rows {
+				if row.AccountID != created.ID {
+					t.Fatalf("stored row %+v not under account %s", row, created.ID)
+				}
+			}
+
+			got, err := svc.GetVendorAccount(ctx, ownerToken(), created.ID)
+			if err != nil || !reflect.DeepEqual(got.Models, want) {
+				t.Fatalf("get models = %#v, %v, want %#v", got.Models, err, want)
+			}
+			list, err := svc.ListVendorAccounts(ctx, ownerToken())
+			if err != nil || len(list.Data) != 1 || !reflect.DeepEqual(list.Data[0].Models, want) {
+				t.Fatalf("list = %#v, %v, want one account carrying %#v", list.Data, err, want)
+			}
+			newName := "Renamed"
+			updated, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{Name: &newName})
+			if err != nil || !reflect.DeepEqual(updated.Models, want) {
+				t.Fatalf("update models = %#v, %v, want %#v", updated.Models, err, want)
+			}
+		})
+	}
+}
+
+// A subscription account is created unconnected but serves the same vendor
+// catalog, so it is routable the moment its OAuth connect completes.
+func TestCreateVendorAccountSubscriptionAlsoSeedsTheCatalog(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, _ := newVendorAccountTestService(t, now)
+	dto := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription, Name: "Claude Max",
+	})
+	if want := vendorAccountModelDTOs(VendorCatalog(routing.VendorAnthropic)); !reflect.DeepEqual(dto.Models, want) {
+		t.Fatalf("models = %#v, want %#v", dto.Models, want)
+	}
+}
+
+// Deleting the account takes its seeded model rows with it.
+func TestDeleteVendorAccountRemovesItsModelRows(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	acc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Doomed"))
+	keep := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Survivor"))
+
+	if _, err := svc.DeleteVendorAccount(ctx, ownerToken(), acc.ID); err != nil {
+		t.Fatalf("DeleteVendorAccount: %v", err)
+	}
+	if rows, err := routeStore.VendorAccountModels(ctx, acc.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("models of the deleted account = %+v, %v, want none", rows, err)
+	}
+	if rows, err := routeStore.VendorAccountModels(ctx, keep.ID); err != nil || len(rows) == 0 {
+		t.Fatalf("models of the sibling account = %+v, %v, want the seeded catalog", rows, err)
+	}
+}
+
+// failingModelsStore wraps a routing.Store so SetVendorAccountModels fails.
+type failingModelsStore struct {
+	routing.Store
+	err error
+}
+
+func (f failingModelsStore) SetVendorAccountModels(context.Context, string, []routing.VendorAccountModel) error {
+	return f.err
+}
+
+// An account whose catalog could not be seeded would be silently unroutable, so
+// a seeding failure fails the create and leaves no half-made account behind.
+func TestCreateVendorAccountSeedFailureLeavesNoAccount(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	boom := errors.New("seed boom")
+	svc.routes = failingModelsStore{Store: routeStore, err: boom}
+
+	if _, err := svc.CreateVendorAccount(context.Background(), ownerToken(), apiKeyAccountRequest("Unseedable")); !errors.Is(err, boom) {
+		t.Fatalf("create err = %v, want the seeding error", err)
+	}
+	accounts, err := routeStore.VendorAccountsByOwner(context.Background(), "usr_owner")
+	if err != nil || len(accounts) != 0 {
+		t.Fatalf("accounts after a failed seed = %+v, %v, want none", accounts, err)
 	}
 }
