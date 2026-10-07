@@ -142,6 +142,28 @@ func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.T
 	return acc, nil
 }
 
+// vendorSealError maps the keyless-disk-store refusal of the seal to
+// ErrVendorAccountConnectKeyRequired (keeping capture.ErrKeyRequired in the
+// chain); any other error passes through.
+func vendorSealError(err error) error {
+	if errors.Is(err, capture.ErrKeyRequired) {
+		return fmt.Errorf("%w: %w", ErrVendorAccountConnectKeyRequired, err)
+	}
+	return err
+}
+
+// requireVendorTokensSealable probes, with a throwaway value, that the store can
+// seal a token set (a keyless disk store cannot). The OAuth authorization code
+// is single-use, so the code-paste flow runs this before it sends the user to the
+// vendor (begin) and again before it spends the code (complete): a storage
+// problem must surface while the code is still unspent, not after the exchange.
+func (s *Service) requireVendorTokensSealable() error {
+	if _, err := capture.SealSecret(s.cipher, s.settingsVolatile, "x"); err != nil {
+		return vendorSealError(err)
+	}
+	return nil
+}
+
 // persistVendorTokens seals ts into acc's OAuthTokens, marks the account an
 // active subscription account and writes it. The token set is sealed BEFORE the
 // store write, so a keyless disk store fails with ErrVendorAccountConnectKeyRequired
@@ -149,10 +171,7 @@ func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.T
 func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) (VendorAccountDTO, error) {
 	sealed, err := vendorauth.SealTokenSet(s.cipher, s.settingsVolatile, ts)
 	if err != nil {
-		if errors.Is(err, capture.ErrKeyRequired) {
-			return VendorAccountDTO{}, fmt.Errorf("%w: %w", ErrVendorAccountConnectKeyRequired, err)
-		}
-		return VendorAccountDTO{}, err
+		return VendorAccountDTO{}, vendorSealError(err)
 	}
 	acc.OAuthTokens = sealed
 	acc.AuthType = routing.VendorAuthSubscription
@@ -167,25 +186,41 @@ func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAcc
 	return s.vendorAccountDTO(ctx, acc)
 }
 
+// ConnectVendorAccountImportRequest carries the tokens of a token import. Both
+// tokens are write-only secrets, so they travel in a struct with named fields
+// rather than as adjacent string parameters (a swap would compile). ExpiresAt is
+// an RFC 3339 time in JSON; the zero time means unknown.
+type ConnectVendorAccountImportRequest struct {
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
 // ConnectVendorAccountImport connects a subscription account from tokens the
 // user already holds. Only the access token is required; the refresh token and
 // the expiry (the zero time = unknown) are optional. There is deliberately no
-// live probe: the first real request validates the tokens. The write is
-// OWNER-ONLY and the response is the credential-free DTO
+// live probe: the first real request validates the tokens. For an OpenAI account
+// the ChatGPT account id and plan are read, best-effort, from the access token's
+// JWT claims (the dispatch needs the account id for the chatgpt-account-id
+// header), so an import yields the same token set the code-paste flow does. The
+// write is OWNER-ONLY and the response is the credential-free DTO
 // (SubscriptionConnected=true, never a token). ErrVendorAccountsDisabled while
 // the master flag is off.
-func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID, access, refresh string, expiresAt time.Time) (VendorAccountDTO, error) {
+func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID string, req ConnectVendorAccountImportRequest) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	access = strings.TrimSpace(access)
+	access := strings.TrimSpace(req.AccessToken)
 	if access == "" {
 		return VendorAccountDTO{}, ErrVendorAccountConnectTokenRequired
 	}
-	ts := vendorauth.TokenSet{AccessToken: access, RefreshToken: strings.TrimSpace(refresh)}
-	if !expiresAt.IsZero() {
-		ts.ExpiresAt = expiresAt.UTC()
+	ts := vendorauth.TokenSet{AccessToken: access, RefreshToken: strings.TrimSpace(req.RefreshToken)}
+	if !req.ExpiresAt.IsZero() {
+		ts.ExpiresAt = req.ExpiresAt.UTC()
+	}
+	if acc.Vendor == routing.VendorOpenAI {
+		ts.AccountID, ts.PlanType = vendorauth.OpenAIClaimsFromJWT(access)
 	}
 	return s.persistVendorTokens(ctx, acc, ts)
 }
@@ -194,7 +229,9 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 // account and returns the vendor authorize URL the portal opens. It generates a
 // fresh PKCE verifier and state, keeps them in memory (see vendorConnectState)
 // and puts only the challenge and the state on the URL. A second begin for the
-// same account replaces the first. OWNER-ONLY; ErrVendorAccountsDisabled while
+// same account replaces the first. A store that cannot seal the eventual token
+// set (a keyless disk store) fails here, before the user signs in, with
+// ErrVendorAccountConnectKeyRequired. OWNER-ONLY; ErrVendorAccountsDisabled while
 // the master flag is off.
 func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.Token, accountID string) (string, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
@@ -204,6 +241,9 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 	ep, ok := s.vendorConnect.endpoints(acc.Vendor)
 	if !ok {
 		return "", ErrVendorAccountVendorInvalid
+	}
+	if err := s.requireVendorTokensSealable(); err != nil {
+		return "", err
 	}
 	verifier, _, err := vendorauth.GeneratePKCE()
 	if err != nil {
@@ -242,6 +282,8 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 // ErrVendorAccountConnectUpstream; both leave the account untouched and keep the
 // pending entry, so a mistyped paste can simply be tried again (until the TTL).
 // A missing or expired entry, or a state mismatch, is ErrVendorAccountConnectState.
+// The seal probe runs before the exchange, so an unstorable result
+// (ErrVendorAccountConnectKeyRequired) never costs the user their one-time code.
 // OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal auth.Token, accountID, codeAndState string) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
@@ -260,6 +302,10 @@ func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal au
 		state = pending.state
 	} else if state != pending.state {
 		return VendorAccountDTO{}, ErrVendorAccountConnectState
+	}
+	// The code is single-use: make sure the result can be stored before spending it.
+	if err := s.requireVendorTokensSealable(); err != nil {
+		return VendorAccountDTO{}, err
 	}
 	ts, err := s.exchangeVendorCode(ctx, acc.Vendor, code, pending.verifier, state)
 	if err != nil {

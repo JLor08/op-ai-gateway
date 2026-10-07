@@ -345,7 +345,7 @@ func (_d *APIWithTracing) CompleteVendorAccountConnect(ctx context.Context, t1 a
 	return _d.API.CompleteVendorAccountConnect(ctx, t1, s1, s2)
 }
 
-func (_d *APIWithTracing) ConnectVendorAccountImport(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string, t2 time.Time) (v1 VendorAccountDTO, err error) {
+func (_d *APIWithTracing) ConnectVendorAccountImport(ctx context.Context, t1 auth.Token, s1 string, c2 ConnectVendorAccountImportRequest) (v1 VendorAccountDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ConnectVendorAccountImport")
 	defer span.End()
 	defer func() {
@@ -354,7 +354,7 @@ func (_d *APIWithTracing) ConnectVendorAccountImport(ctx context.Context, t1 aut
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.ConnectVendorAccountImport(ctx, t1, s1, s2, s3, t2)
+	return _d.API.ConnectVendorAccountImport(ctx, t1, s1, c2)
 }
 
 func (_d *APIWithTracing) CreateApplication(ctx context.Context, t1 auth.Token, s1 string, c2 CreateApplicationRequest) (a1 ApplicationDTO, err error) {

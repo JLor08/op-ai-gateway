@@ -225,6 +225,18 @@ func TestParseOpenAIIDTokenClaims(t *testing.T) {
 	}
 }
 
+func TestOpenAIClaimsFromJWT(t *testing.T) {
+	if account, plan := OpenAIClaimsFromJWT(stubJWT(t, openAIClaims("acct-7", "pro"))); account != "acct-7" || plan != "pro" {
+		t.Fatalf("got (%q, %q), want (acct-7, pro)", account, plan)
+	}
+	// A pasted token that is not a JWT (or has no claim) is not an error.
+	for _, token := range []string{"", "sk-not-a-jwt", "a.b.c", stubJWT(t, map[string]any{"sub": "u"})} {
+		if account, plan := OpenAIClaimsFromJWT(token); account != "" || plan != "" {
+			t.Fatalf("token %q: got (%q, %q), want empty", token, account, plan)
+		}
+	}
+}
+
 func TestRefreshOpenAI(t *testing.T) {
 	t.Run("re-issues tokens and identity", func(t *testing.T) {
 		idToken := stubJWT(t, openAIClaims("acct-9", "pro"))

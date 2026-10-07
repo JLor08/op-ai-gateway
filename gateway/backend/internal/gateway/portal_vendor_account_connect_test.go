@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -435,7 +436,7 @@ func TestVendorAccountConnectEndpointsRouting(t *testing.T) {
 }
 
 // A disk-backed store with no encryption key cannot seal a token set; the
-// import is a 400 about the subscription (not the api-key message) and persists
+// import and begin are a 400 about the subscription (not the api-key message) and persists
 // nothing -- never plaintext.
 func TestVendorAccountConnectImportEndpointOnAKeylessDiskStore(t *testing.T) {
 	srv, routeStore := newVendorAccountTestServer(t, false)
@@ -445,7 +446,42 @@ func TestVendorAccountConnectImportEndpointOnAKeylessDiskStore(t *testing.T) {
 	if rec.Code != http.StatusBadRequest || perfErrorCode(t, rec.Body.Bytes()) != "vendor_account.connect_key_required" {
 		t.Fatalf("import on a keyless disk store = %d %s, want 400 vendor_account.connect_key_required", rec.Code, rec.Body.String())
 	}
+	// The code-paste flow fails fast too, before the user signs in at the vendor.
+	rec = vaDo(t, srv, http.MethodPost, vaConnectPath(acc.ID, "begin"), vaOwnerSecret, "")
+	if rec.Code != http.StatusBadRequest || perfErrorCode(t, rec.Body.Bytes()) != "vendor_account.connect_key_required" {
+		t.Fatalf("begin on a keyless disk store = %d %s, want 400 vendor_account.connect_key_required", rec.Code, rec.Body.String())
+	}
 	if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
 		t.Fatalf("tokens stored without a key: %q", row.OAuthTokens)
+	}
+}
+
+// An imported OpenAI access token is a JWT; its ChatGPT account facts land in the
+// stored token set (the dispatch needs the account id), never in the response.
+func TestVendorAccountConnectImportEndpointReadsTheOpenAIAccountClaims(t *testing.T) {
+	srv, routeStore, _ := newVendorConnectTestServer(t)
+	acc := vaCreateSubscription(t, srv, vaOwnerSecret, "openai", "ChatGPT Plus")
+	claims, err := json.Marshal(map[string]any{
+		vendorauth.OpenAIAuthClaimNamespace: map[string]any{vendorauth.OpenAIClaimAccountID: "acct-http-1", vendorauth.OpenAIClaimPlanType: "plus"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
+
+	rec := vaDo(t, srv, http.MethodPost, vaConnectPath(acc.ID, "import"), vaOwnerSecret, `{"access_token":"`+jwt+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "acct-http-1") || strings.Contains(rec.Body.String(), jwt) {
+		t.Fatalf("import response leaks token material: %s", rec.Body.String())
+	}
+	row, err := routeStore.VendorAccountByID(context.Background(), acc.ID)
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	ts, err := vendorauth.OpenTokenSet(nil, row.OAuthTokens)
+	if err != nil || ts.AccountID != "acct-http-1" || ts.PlanType != "plus" {
+		t.Fatalf("stored token set = %v, %v, want account_id acct-http-1 and plan plus", ts, err)
 	}
 }

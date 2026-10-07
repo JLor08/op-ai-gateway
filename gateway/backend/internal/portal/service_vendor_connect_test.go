@@ -154,6 +154,20 @@ func pendingCount(svc *Service) int {
 	return len(svc.vendorConnect.pending)
 }
 
+// connectTestJWT is an unsigned three-segment JWT carrying the ChatGPT account
+// facts under the https://api.openai.com/auth claim, the shape of both the
+// OpenAI id_token and (as the Codex CLI stores it) the access token.
+func connectTestJWT(t *testing.T, accountID, plan string) string {
+	t.Helper()
+	claims, err := json.Marshal(map[string]any{
+		vendorauth.OpenAIAuthClaimNamespace: map[string]any{vendorauth.OpenAIClaimAccountID: accountID, vendorauth.OpenAIClaimPlanType: plan},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
+}
+
 // --- import ---------------------------------------------------------------
 
 func TestConnectVendorAccountImportSealsTheTokenSet(t *testing.T) {
@@ -164,7 +178,7 @@ func TestConnectVendorAccountImportSealsTheTokenSet(t *testing.T) {
 	}
 	expires := time.Date(2026, 10, 8, 9, 30, 0, 0, time.UTC)
 
-	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, "  "+connectTestAccess+"\n", " "+connectTestRefresh+" ", expires)
+	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: "  " + connectTestAccess + "\n", RefreshToken: " " + connectTestRefresh + " ", ExpiresAt: expires})
 	if err != nil {
 		t.Fatalf("ConnectVendorAccountImport: %v", err)
 	}
@@ -198,7 +212,7 @@ func TestConnectVendorAccountImportSealsWithTheCipher(t *testing.T) {
 	svc, routeStore := newVendorAccountTestServiceWithCipher(t, now, newTestCipher(t), false)
 	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
 
-	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, connectTestAccess, "", time.Time{}); err != nil {
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess}); err != nil {
 		t.Fatalf("ConnectVendorAccountImport: %v", err)
 	}
 	row, ts := storedTokenSet(t, routeStore, svc, acc.ID)
@@ -207,6 +221,59 @@ func TestConnectVendorAccountImportSealsWithTheCipher(t *testing.T) {
 	}
 	if ts.AccessToken != connectTestAccess || ts.RefreshToken != "" || !ts.ExpiresAt.IsZero() {
 		t.Fatalf("token set = %v, want the access token only (refresh and expiry are optional)", ts)
+	}
+}
+
+// An imported OpenAI access token is itself a JWT carrying the account id the
+// dispatch needs (the chatgpt-account-id header), so import fills AccountID and
+// PlanType from it and yields the same token set the code-paste path does.
+func TestConnectVendorAccountImportFillsTheOpenAIAccountFromTheAccessToken(t *testing.T) {
+	svc, routeStore, stub := newVendorConnectTestService(t)
+	jwt := connectTestJWT(t, "acct-123", "plus")
+
+	imported := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Imported")
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), imported.ID, ConnectVendorAccountImportRequest{AccessToken: jwt, RefreshToken: connectTestRefresh}); err != nil {
+		t.Fatalf("ConnectVendorAccountImport: %v", err)
+	}
+	_, importedSet := storedTokenSet(t, routeStore, svc, imported.ID)
+	if importedSet.AccessToken != jwt || importedSet.AccountID != "acct-123" || importedSet.PlanType != "plus" {
+		t.Fatalf("imported token set = %v, want the access token with account_id acct-123 and plan plus", importedSet)
+	}
+
+	// The code-paste path for the same identity stores the same account facts.
+	pasted := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Pasted")
+	if _, err := svc.BeginVendorAccountConnect(context.Background(), ownerToken(), pasted.ID); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	stub.respond(http.StatusOK, `{"access_token":"`+jwt+`","refresh_token":"`+connectTestRefresh+`","id_token":"`+jwt+`","expires_in":3600}`)
+	if _, err := svc.CompleteVendorAccountConnect(context.Background(), ownerToken(), pasted.ID, "openai-code"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	_, pastedSet := storedTokenSet(t, routeStore, svc, pasted.ID)
+	if pastedSet.AccountID != importedSet.AccountID || pastedSet.PlanType != importedSet.PlanType {
+		t.Fatalf("import (%v) and code-paste (%v) must agree on the account facts", importedSet, pastedSet)
+	}
+}
+
+// The claim read is best-effort: an OpenAI token that is not a JWT imports fine
+// with no account id, and an Anthropic token is never inspected.
+func TestConnectVendorAccountImportTolerantAccountClaims(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+
+	opaque := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Opaque")
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), opaque.ID, ConnectVendorAccountImportRequest{AccessToken: "sk-not-a-jwt"}); err != nil {
+		t.Fatalf("import of a non-JWT OpenAI token: %v", err)
+	}
+	if _, ts := storedTokenSet(t, routeStore, svc, opaque.ID); ts.AccessToken != "sk-not-a-jwt" || ts.AccountID != "" || ts.PlanType != "" {
+		t.Fatalf("token set = %v, want the token with no account facts", ts)
+	}
+
+	anthropic := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude")
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), anthropic.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestJWT(t, "acct-123", "plus")}); err != nil {
+		t.Fatalf("import on an anthropic account: %v", err)
+	}
+	if _, ts := storedTokenSet(t, routeStore, svc, anthropic.ID); ts.AccountID != "" || ts.PlanType != "" {
+		t.Fatalf("anthropic token set = %v, want OpenAI claims left alone", ts)
 	}
 }
 
@@ -222,7 +289,7 @@ func TestConnectVendorAccountImportReactivatesAnAccountThatNeedsReconnect(t *tes
 		t.Fatalf("UpdateVendorAccount: %v", err)
 	}
 
-	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, connectTestAccess, connectTestRefresh, time.Time{})
+	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess, RefreshToken: connectTestRefresh})
 	if err != nil {
 		t.Fatalf("ConnectVendorAccountImport: %v", err)
 	}
@@ -236,10 +303,10 @@ func TestConnectVendorAccountImportValidation(t *testing.T) {
 	sub := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude Max")
 	apiKeyAcc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Key account"))
 
-	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), sub.ID, "  \n", connectTestRefresh, time.Time{}); !errors.Is(err, ErrVendorAccountConnectTokenRequired) {
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), sub.ID, ConnectVendorAccountImportRequest{AccessToken: "  \n", RefreshToken: connectTestRefresh}); !errors.Is(err, ErrVendorAccountConnectTokenRequired) {
 		t.Fatalf("blank access token: err = %v, want ErrVendorAccountConnectTokenRequired", err)
 	}
-	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), apiKeyAcc.ID, connectTestAccess, "", time.Time{}); !errors.Is(err, ErrVendorAccountNotSubscription) {
+	if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), apiKeyAcc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess}); !errors.Is(err, ErrVendorAccountNotSubscription) {
 		t.Fatalf("api_key account: err = %v, want ErrVendorAccountNotSubscription", err)
 	}
 	for _, id := range []string{sub.ID, apiKeyAcc.ID} {
@@ -258,7 +325,7 @@ func TestConnectVendorAccountImportOnAKeylessDiskStoreIsAKeyRequiredError(t *tes
 	svc, routeStore := newVendorAccountTestServiceWithCipher(t, now, nil, false)
 	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude Max")
 
-	_, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, connectTestAccess, "", time.Time{})
+	_, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess})
 	if !errors.Is(err, ErrVendorAccountConnectKeyRequired) || !errors.Is(err, capture.ErrKeyRequired) {
 		t.Fatalf("err = %v, want ErrVendorAccountConnectKeyRequired wrapping capture.ErrKeyRequired", err)
 	}
@@ -269,6 +336,24 @@ func TestConnectVendorAccountImportOnAKeylessDiskStoreIsAKeyRequiredError(t *tes
 }
 
 // --- begin ----------------------------------------------------------------
+
+// A store that cannot seal a token set is found out before the user signs in at
+// the vendor, not after: begin fails fast with the key-required error and keeps
+// no pending state.
+func TestBeginVendorAccountConnectOnAKeylessDiskStoreFailsFast(t *testing.T) {
+	svc, _, _ := newVendorConnectTestService(t)
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude Max")
+	svc.settingsVolatile = false // a disk-backed store ...
+	svc.cipher = nil             // ... with no encryption key
+
+	_, err := svc.BeginVendorAccountConnect(context.Background(), ownerToken(), acc.ID)
+	if !errors.Is(err, ErrVendorAccountConnectKeyRequired) || !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("err = %v, want ErrVendorAccountConnectKeyRequired wrapping capture.ErrKeyRequired", err)
+	}
+	if pendingCount(svc) != 0 {
+		t.Fatal("a refused begin must not store a pending entry")
+	}
+}
 
 func TestBeginVendorAccountConnectAnthropic(t *testing.T) {
 	svc, _, stub := newVendorConnectTestService(t)
@@ -469,13 +554,7 @@ func TestCompleteVendorAccountConnectOpenAI(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	pending := pendingConnect(t, svc, acc.ID)
-	claims, err := json.Marshal(map[string]any{
-		vendorauth.OpenAIAuthClaimNamespace: map[string]any{vendorauth.OpenAIClaimAccountID: "acct-123", vendorauth.OpenAIClaimPlanType: "plus"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	idToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
+	idToken := connectTestJWT(t, "acct-123", "plus")
 	stub.respond(http.StatusOK, `{"access_token":"`+connectTestAccess+`","refresh_token":"`+connectTestRefresh+`","id_token":"`+idToken+`","expires_in":3600}`)
 
 	dto, err := svc.CompleteVendorAccountConnect(context.Background(), ownerToken(), acc.ID, "openai-code")
@@ -643,6 +722,30 @@ func TestCompleteVendorAccountConnectAfterTheTTL(t *testing.T) {
 	}
 }
 
+// The authorization code is single-use, so complete must not spend it on a vendor
+// exchange whose result could not be stored: the seal probe runs BEFORE the
+// exchange. (Here the store lost its key after begin.)
+func TestCompleteVendorAccountConnectDoesNotSpendTheCodeWhenTheTokensCannotBeSealed(t *testing.T) {
+	svc, routeStore, stub := newVendorConnectTestService(t)
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude Max")
+	if _, err := svc.BeginVendorAccountConnect(context.Background(), ownerToken(), acc.ID); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	svc.settingsVolatile = false
+	svc.cipher = nil
+
+	_, err := svc.CompleteVendorAccountConnect(context.Background(), ownerToken(), acc.ID, "a-code")
+	if !errors.Is(err, ErrVendorAccountConnectKeyRequired) || !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("err = %v, want ErrVendorAccountConnectKeyRequired wrapping capture.ErrKeyRequired", err)
+	}
+	if calls := stub.requests(); len(calls) != 0 {
+		t.Fatalf("the vendor was called %d time(s); the one-time code must not be spent on an unstorable result", len(calls))
+	}
+	if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
+		t.Fatalf("tokens stored without a key: %q", row.OAuthTokens)
+	}
+}
+
 func TestCompleteVendorAccountConnectRequiresACode(t *testing.T) {
 	svc, _, _ := newVendorConnectTestService(t)
 	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Claude Max")
@@ -697,7 +800,7 @@ func TestVendorAccountConnectIsOwnerOnly(t *testing.T) {
 		"no user identity":   {},
 		"another user (adm)": {UserID: "usr_admin", Scopes: []string{"gateway:use", "admin"}},
 	} {
-		if _, err := svc.ConnectVendorAccountImport(ctx, principal, acc.ID, connectTestAccess, "", time.Time{}); !errors.Is(err, ErrVendorAccountNotFound) {
+		if _, err := svc.ConnectVendorAccountImport(ctx, principal, acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess}); !errors.Is(err, ErrVendorAccountNotFound) {
 			t.Fatalf("%s import: err = %v, want ErrVendorAccountNotFound", label, err)
 		}
 		if _, err := svc.BeginVendorAccountConnect(ctx, principal, acc.ID); !errors.Is(err, ErrVendorAccountNotFound) {
@@ -726,7 +829,7 @@ func TestVendorAccountConnectRefusesWhileTheMasterFlagIsOff(t *testing.T) {
 	setVendorAccountsEnabled(t, svc, false)
 
 	ctx := context.Background()
-	if _, err := svc.ConnectVendorAccountImport(ctx, ownerToken(), acc.ID, connectTestAccess, "", time.Time{}); !errors.Is(err, ErrVendorAccountsDisabled) {
+	if _, err := svc.ConnectVendorAccountImport(ctx, ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess}); !errors.Is(err, ErrVendorAccountsDisabled) {
 		t.Fatalf("import: err = %v, want ErrVendorAccountsDisabled", err)
 	}
 	if _, err := svc.BeginVendorAccountConnect(ctx, ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountsDisabled) {

@@ -119,6 +119,20 @@ func openAITokenSet(status int, body []byte, fallbackRefresh string) (TokenSet, 
 	}, nil
 }
 
+// OpenAIClaimsFromJWT reads the ChatGPT account id and plan type from the
+// https://api.openai.com/auth claim of an OpenAI JWT (an id_token or an access
+// token), without verifying its signature. It is the exported face of the
+// claim parsing the code exchange and the refresh use, for a caller that holds
+// only a pasted access token (an import) and so never saw the id_token: the
+// access token is itself a JWT carrying the same claim object. Tolerant by
+// design: a token that is not a JWT, or carries no such claim, yields empty
+// strings, never an error.
+//
+// REVERSE-ENGINEERED / VERIFY LIVE.
+func OpenAIClaimsFromJWT(token string) (accountID, planType string) {
+	return parseOpenAIIDTokenClaims(token)
+}
+
 // parseOpenAIIDTokenClaims reads chatgpt_account_id and chatgpt_plan_type from
 // the https://api.openai.com/auth claim of a JWT (id_token or access token). It
 // decodes the payload without verifying the signature: the token came straight

@@ -45,7 +45,7 @@ type API interface {
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)
-	ConnectVendorAccountImport(context.Context, auth.Token, string, string, string, time.Time) (VendorAccountDTO, error)
+	ConnectVendorAccountImport(context.Context, auth.Token, string, ConnectVendorAccountImportRequest) (VendorAccountDTO, error)
 	CreateApplication(context.Context, auth.Token, string, CreateApplicationRequest) (ApplicationDTO, error)
 	CreateChat(context.Context, auth.Token, CreateChatRequest) (ChatDTO, error)
 	CreateGatewaySetupKey(context.Context, auth.Token) (string, string, error)

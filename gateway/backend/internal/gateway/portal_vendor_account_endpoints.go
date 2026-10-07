@@ -12,18 +12,17 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
 	"strings"
-	"time"
 )
 
 const (
 	msgVendorAccountNotFound = "vendor account not found"
 
-	codeVendorAccountListFailed   = "vendor_account.list_failed"
-	codeVendorAccountCreateFailed = "vendor_account.create_failed"
-	codeVendorAccountGetFailed    = "vendor_account.get_failed"
-	codeVendorAccountUpdateFailed = "vendor_account.update_failed"
-	codeVendorAccountDeleteFailed = "vendor_account.delete_failed"
-	codeVendorAccountConnectFail  = "vendor_account.connect_failed"
+	codeVendorAccountListFailed    = "vendor_account.list_failed"
+	codeVendorAccountCreateFailed  = "vendor_account.create_failed"
+	codeVendorAccountGetFailed     = "vendor_account.get_failed"
+	codeVendorAccountUpdateFailed  = "vendor_account.update_failed"
+	codeVendorAccountDeleteFailed  = "vendor_account.delete_failed"
+	codeVendorAccountConnectFailed = "vendor_account.connect_failed"
 )
 
 // handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
@@ -149,15 +148,6 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 	}
 }
 
-// vendorAccountConnectImportRequest is the body of POST
-// /api/portal/vendor-accounts/{id}/connect/import. The tokens are write-only: no
-// response carries them. expires_at is an RFC 3339 time; absent means unknown.
-type vendorAccountConnectImportRequest struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	ExpiresAt    time.Time `json:"expires_at"`
-}
-
 // vendorAccountConnectCompleteRequest is the body of POST
 // /api/portal/vendor-accounts/{id}/connect/complete: whatever the user pasted
 // back from the vendor -- a code, "code#state", or a whole callback URL.
@@ -176,14 +166,16 @@ func (s *Server) handlePortalVendorAccountConnectImport(w http.ResponseWriter, r
 	if !ok {
 		return
 	}
-	var req vendorAccountConnectImportRequest
+	// The tokens are write-only: no response carries them. expires_at is an RFC
+	// 3339 time; absent means unknown.
+	var req portal.ConnectVendorAccountImportRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 		return
 	}
-	dto, err := s.Portal.ConnectVendorAccountImport(r.Context(), token, id, req.AccessToken, req.RefreshToken, req.ExpiresAt)
+	dto, err := s.Portal.ConnectVendorAccountImport(r.Context(), token, id, req)
 	if err != nil {
-		writePortalVendorAccountError(w, err, codeVendorAccountConnectFail)
+		writePortalVendorAccountError(w, err, codeVendorAccountConnectFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
@@ -198,7 +190,7 @@ func (s *Server) handlePortalVendorAccountConnectBegin(w http.ResponseWriter, r 
 	}
 	authorizeURL, err := s.Portal.BeginVendorAccountConnect(r.Context(), token, id)
 	if err != nil {
-		writePortalVendorAccountError(w, err, codeVendorAccountConnectFail)
+		writePortalVendorAccountError(w, err, codeVendorAccountConnectFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"authorize_url": authorizeURL})
@@ -221,7 +213,7 @@ func (s *Server) handlePortalVendorAccountConnectComplete(w http.ResponseWriter,
 	}
 	dto, err := s.Portal.CompleteVendorAccountConnect(r.Context(), token, id, req.Code)
 	if err != nil {
-		writePortalVendorAccountError(w, err, codeVendorAccountConnectFail)
+		writePortalVendorAccountError(w, err, codeVendorAccountConnectFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
