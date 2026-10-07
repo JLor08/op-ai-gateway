@@ -130,11 +130,14 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'project.couple_group_invalid': 'errorProjectCoupleGroupInvalid',
   'project.couple_ambiguous': 'errorProjectCoupleAmbiguous',
   'resource_group.provision_target_invalid': 'errorResourceGroupProvisionTargetInvalid',
-  // Vendor accounts ("Anbieter"): the ten codes of writePortalVendorAccountError's
+  // Vendor accounts ("Anbieter"): the codes of writePortalVendorAccountError's
   // errRow table (gateway/portal_vendor_account_endpoints.go), read verbatim
-  // from the Go sentinels in portal/service.go. The 500 *_failed fallbacks
-  // (vendor_account.list_failed, ...) are left unmapped on purpose: they carry
-  // the server's own message, like every other *_failed fallback.
+  // from the Go sentinels in portal/service.go. The 500 *_failed fallbacks of
+  // the CRUD handlers (vendor_account.list_failed, ...) are left unmapped on
+  // purpose: they carry the server's own message, like every other *_failed
+  // fallback. vendor_account.connect_failed is the one exception: its server
+  // message is only a generic English "vendor account request failed", and the
+  // connect dialog is a step a user acts on, so it gets a localized label.
   'vendor_account.not_found': 'errorVendorAccountNotFound',
   'vendor_account.name_required': 'errorVendorAccountNameRequired',
   'vendor_account.vendor_invalid': 'errorVendorAccountVendorInvalid',
@@ -144,6 +147,18 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.api_key_not_allowed': 'errorVendorAccountApiKeyNotAllowed',
   'vendor_account.api_key_invalid': 'errorVendorAccountApiKeyInvalid',
   'vendor_account.api_key_key_required': 'errorVendorAccountApiKeyKeyRequired',
+  // Subscription connect (token import and code-paste): the sentinels of
+  // portal/service_vendor_connect.go, wired in the same errRow table. A vendor
+  // refusal of the code is a 400 (connect_rejected), never a 401 -- the portal
+  // treats a 401 from this API as an expired session.
+  'vendor_account.not_subscription': 'errorVendorAccountNotSubscription',
+  'vendor_account.connect_token_required': 'errorVendorAccountConnectTokenRequired',
+  'vendor_account.connect_code_required': 'errorVendorAccountConnectCodeRequired',
+  'vendor_account.connect_state': 'errorVendorAccountConnectState',
+  'vendor_account.connect_rejected': 'errorVendorAccountConnectRejected',
+  'vendor_account.connect_upstream_failed': 'errorVendorAccountConnectUpstream',
+  'vendor_account.connect_key_required': 'errorVendorAccountConnectKeyRequired',
+  'vendor_account.connect_failed': 'errorVendorAccountConnectFailed',
   // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
   // although the portal hides the area in that state: a stale tab or a flag
   // flipped mid-session still reaches it.

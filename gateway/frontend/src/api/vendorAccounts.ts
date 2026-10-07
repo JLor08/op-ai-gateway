@@ -15,6 +15,15 @@ import { type Fetcher, request } from './transport';
 //
 // Credentials are WRITE-ONLY: the DTO carries only the api_key_set /
 // subscription_connected booleans, never the secret.
+//
+// A subscription account is attached to a consumer subscription in one of two
+// ways, both owner-only POSTs on the item path (handlePortalVendorAccountItem,
+// internal/gateway/portal_vendor_account_endpoints.go; service side in
+// internal/portal/service_vendor_connect.go): connect/import takes tokens the
+// user already holds, connect/begin + connect/complete run the OAuth
+// code-paste flow (begin returns the vendor sign-in URL, the user pastes the
+// code the vendor shows back into complete). Every connect success answers the
+// credential-free VendorAccount with subscription_connected=true.
 export type VendorAccountVendor = 'openai' | 'anthropic';
 export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
@@ -67,6 +76,20 @@ export type UpdateVendorAccountRequest = {
   api_key?: string;
 };
 
+// POST .../connect/import body -- mirrors portal.ConnectVendorAccountImportRequest.
+// Both tokens are WRITE-ONLY secrets. Only access_token is required; the
+// refresh token and expires_at (an RFC 3339 time; omitted = unknown) are
+// optional.
+export type ConnectVendorAccountImportRequest = {
+  access_token: string;
+  refresh_token?: string;
+  expires_at?: string;
+};
+
+// POST .../connect/begin response: the vendor sign-in URL the portal opens in
+// a new tab.
+export type VendorAccountConnectBegin = { authorize_url: string };
+
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
     // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
@@ -93,5 +116,31 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(fetcher, `/api/portal/vendor-accounts/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       }),
+    // Subscription connect, path 1: attach tokens the user already holds. The
+    // backend does not probe them (the first real request validates them).
+    connectVendorAccountImport: (id: string, body: ConnectVendorAccountImportRequest) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/import`,
+        { method: 'POST', body },
+      ),
+    // Subscription connect, path 2 / step 1: start the OAuth code-paste flow.
+    // No request body; a second begin for the same account replaces the first.
+    beginVendorAccountConnect: (id: string) =>
+      request<VendorAccountConnectBegin>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/begin`,
+        { method: 'POST' },
+      ),
+    // Subscription connect, path 2 / step 2: `code` is whatever the user pasted
+    // back -- a bare code, "code#state", or a whole callback URL; the backend
+    // parses all three. A refused paste keeps the pending connect, so the
+    // caller can simply retry.
+    completeVendorAccountConnect: (id: string, code: string) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/complete`,
+        { method: 'POST', body: { code } },
+      ),
   };
 }

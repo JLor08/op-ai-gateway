@@ -2382,6 +2382,40 @@ const de = {
   vendorAccountSettingsTitle: 'Einstellungen',
   vendorAccountActionDelete: 'Löschen',
   vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
+  vendorAccountSubscriptionCreateNote:
+    'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
+  vendorConnectTitle: 'Abonnement verbinden',
+  vendorConnectIntro:
+    'Dieses Konto mit einem Abonnement verbinden (z. B. Claude Pro/Max oder ChatGPT). Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
+  vendorConnectStatusLabel: 'Verbindung',
+  vendorConnectStatusConnected: 'Verbunden',
+  vendorConnectStatusNotConnected: 'Nicht verbunden',
+  vendorConnectReconnectNote: 'Ein erneutes Verbinden ersetzt die gespeicherten Zugangsdaten.',
+  vendorConnectNeedsReconnectNote:
+    'Die gespeicherte Anmeldung konnte nicht erneuert werden. Das Konto muss neu verbunden werden.',
+  vendorConnectSuccess: 'Konto verbunden',
+  vendorConnectBrowserTitle: 'Browser-Login',
+  vendorConnectBrowserIntro:
+    'Beim Anbieter anmelden und den danach angezeigten Code hier einfügen.',
+  vendorConnectBeginAction: 'Verbinden',
+  vendorConnectBeginAgainAction: 'Neu starten',
+  vendorConnectStepOpen: '1. Anmeldung öffnen',
+  vendorConnectStepOpenNote:
+    'Die Anmeldung öffnet sich in einem neuen Tab. Danach zu diesem Tab zurückkehren.',
+  vendorConnectOpenLogin: 'Login öffnen',
+  vendorConnectStepPaste: '2. Code einfügen',
+  vendorConnectCodeLabel: 'Code',
+  vendorConnectCodeNote:
+    'Den Code einfügen, den der Anbieter nach der Anmeldung anzeigt, alternativ „Code#State“ oder die vollständige Adresse der Weiterleitung (auch wenn die Seite nicht lädt).',
+  vendorConnectCompleteAction: 'Fertigstellen',
+  vendorConnectImportTitle: 'Token-Import',
+  vendorConnectImportIntro:
+    'Bereits vorhandene Tokens einfügen, z. B. aus der Zugangsdaten-Datei eines Kommandozeilen-Clients. Sie werden nur gespeichert und nie wieder angezeigt.',
+  vendorConnectAccessTokenLabel: 'Access-Token',
+  vendorConnectRefreshTokenLabel: 'Refresh-Token (optional)',
+  vendorConnectExpiresAtLabel: 'Gültig bis (optional)',
+  vendorConnectExpiresAtNote: 'Ohne Angabe gilt das Ablaufdatum als unbekannt.',
+  vendorConnectImportAction: 'Tokens importieren',
   errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
   errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
@@ -2396,6 +2430,20 @@ const de = {
     'Zum Speichern eines API-Schlüssels ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
   errorVendorAccountsModuleDisabled:
     'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
+  errorVendorAccountNotSubscription:
+    'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
+  errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
+  errorVendorAccountConnectCodeRequired:
+    'Den Code einfügen, den der Anbieter nach der Anmeldung angezeigt hat',
+  errorVendorAccountConnectState:
+    'Für dieses Konto läuft keine Anmeldung, sie ist abgelaufen oder der eingefügte State passt nicht. Die Anmeldung neu starten.',
+  errorVendorAccountConnectRejected:
+    'Der Anbieter hat den Code abgelehnt. Den Code prüfen oder die Anmeldung neu starten.',
+  errorVendorAccountConnectUpstream:
+    'Der Anbieter ist nicht erreichbar oder hat unerwartet geantwortet. Später erneut versuchen.',
+  errorVendorAccountConnectKeyRequired:
+    'Zum Speichern eines Abonnements ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
+  errorVendorAccountConnectFailed: 'Das Konto konnte nicht verbunden werden',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optionales Anbieter-Modul: Benutzer können eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) hinterlegen.',
@@ -4846,6 +4894,38 @@ const en: PortalMessages = {
   vendorAccountSettingsTitle: 'Settings',
   vendorAccountActionDelete: 'Delete',
   vendorAccountDeleteConfirm: 'Delete this provider account?',
+  vendorAccountSubscriptionCreateNote:
+    'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
+  vendorConnectTitle: 'Connect subscription',
+  vendorConnectIntro:
+    'Connect this account to a subscription (for example Claude Pro/Max or ChatGPT). Credentials are only stored and never shown again.',
+  vendorConnectStatusLabel: 'Connection',
+  vendorConnectStatusConnected: 'Connected',
+  vendorConnectStatusNotConnected: 'Not connected',
+  vendorConnectReconnectNote: 'Connecting again replaces the stored credentials.',
+  vendorConnectNeedsReconnectNote:
+    'The stored sign-in could not be renewed. The account needs to be connected again.',
+  vendorConnectSuccess: 'Account connected',
+  vendorConnectBrowserTitle: 'Browser sign-in',
+  vendorConnectBrowserIntro: 'Sign in at the provider, then paste the code it shows afterwards.',
+  vendorConnectBeginAction: 'Connect',
+  vendorConnectBeginAgainAction: 'Start over',
+  vendorConnectStepOpen: '1. Open the sign-in',
+  vendorConnectStepOpenNote: 'The sign-in opens in a new tab. Come back to this tab afterwards.',
+  vendorConnectOpenLogin: 'Open login',
+  vendorConnectStepPaste: '2. Paste the code',
+  vendorConnectCodeLabel: 'Code',
+  vendorConnectCodeNote:
+    'Paste the code the provider shows after the sign-in, or "code#state", or the full address you were redirected to (even if that page does not load).',
+  vendorConnectCompleteAction: 'Complete',
+  vendorConnectImportTitle: 'Token import',
+  vendorConnectImportIntro:
+    "Paste tokens you already hold, for example from a command-line client's credentials file. They are only stored and never shown again.",
+  vendorConnectAccessTokenLabel: 'Access token',
+  vendorConnectRefreshTokenLabel: 'Refresh token (optional)',
+  vendorConnectExpiresAtLabel: 'Expires at (optional)',
+  vendorConnectExpiresAtNote: 'If left empty, the expiry is treated as unknown.',
+  vendorConnectImportAction: 'Import tokens',
   errorVendorAccountNotFound: 'Provider account not found',
   errorVendorAccountNameRequired: 'Provider account name is required',
   errorVendorAccountVendorInvalid: 'Invalid provider',
@@ -4860,6 +4940,19 @@ const en: PortalMessages = {
     'An encryption key is required on the gateway to store an API key',
   errorVendorAccountsModuleDisabled:
     'Provider accounts are disabled. A system administrator can enable them in the system settings.',
+  errorVendorAccountNotSubscription:
+    'Only an account with subscription authentication can be connected to a subscription',
+  errorVendorAccountConnectTokenRequired: 'An access token is required',
+  errorVendorAccountConnectCodeRequired: 'Paste the code the provider showed after the sign-in',
+  errorVendorAccountConnectState:
+    'No sign-in is in progress for this account, it has expired, or the pasted state does not match. Start the sign-in again.',
+  errorVendorAccountConnectRejected:
+    'The provider rejected the code. Check it or start the sign-in again.',
+  errorVendorAccountConnectUpstream:
+    'The provider could not be reached or answered unexpectedly. Try again later.',
+  errorVendorAccountConnectKeyRequired:
+    'An encryption key on the gateway is required to store a subscription',
+  errorVendorAccountConnectFailed: 'The account could not be connected',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optional provider module: users can store their own accounts with external AI providers (e.g. OpenAI, Anthropic).',

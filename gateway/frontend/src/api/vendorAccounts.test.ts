@@ -84,4 +84,66 @@ describe('vendorAccountsApi', () => {
     expect(init.method).toBe('DELETE');
     expect(resp.ok).toBe(true);
   });
+
+  it('POSTs the token import to .../connect/import with the id URL-encoded and omits unset optionals', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va/1' }));
+    const api = createPortalApi(fetcher);
+
+    await api.connectVendorAccountImport('va/1', { access_token: 'tok-a' });
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/connect/import');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(JSON.parse(init.body)).toEqual({ access_token: 'tok-a' });
+  });
+
+  it('sends the optional refresh token and expiry of an import when given', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va_1' }));
+    const api = createPortalApi(fetcher);
+
+    await api.connectVendorAccountImport('va_1', {
+      access_token: 'tok-a',
+      refresh_token: 'tok-r',
+      expires_at: '2026-10-08T10:00:00.000Z',
+    });
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({
+      access_token: 'tok-a',
+      refresh_token: 'tok-r',
+      expires_at: '2026-10-08T10:00:00.000Z',
+    });
+  });
+
+  it('POSTs .../connect/begin with no body and returns the authorize URL', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ authorize_url: 'https://vendor.example/authorize?x=1' }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.beginVendorAccountConnect('va_1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va_1/connect/begin');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp.authorize_url).toBe('https://vendor.example/authorize?x=1');
+  });
+
+  it('POSTs the pasted code to .../connect/complete as {code}', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ id: 'va_1', subscription_connected: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.completeVendorAccountConnect('va_1', 'abc#state');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va_1/connect/complete');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(JSON.parse(init.body)).toEqual({ code: 'abc#state' });
+    expect(resp.subscription_connected).toBe(true);
+  });
 });

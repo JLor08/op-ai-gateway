@@ -447,7 +447,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   });
 
   /**
-   * The vendor-account ("Anbieter") page's nine refusal codes, pinned as
+   * The vendor-account ("Anbieter") page's seventeen refusal codes, pinned as
    * LITERALS for the same reason as the lists above: the whole-map invariants
    * cannot catch a code STRING drifting from the backend's, and an unmapped
    * code reaches the toast as the raw English the server sent.
@@ -456,9 +456,13 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `internal/portal/service.go` (plus `CodeVendorAccountNotFound`) and the
    * `capture.ErrKeyRequired` row, all wired to these exact codes in
    * `portalVendorAccountErrRows`
-   * (`internal/gateway/portal_vendor_account_endpoints.go`). The five 500
-   * `vendor_account.*_failed` fallbacks are left unmapped on purpose: they
-   * carry the server's own message.
+   * (`internal/gateway/portal_vendor_account_endpoints.go`). The last eight are
+   * the subscription-connect ones (`internal/portal/service_vendor_connect.go`):
+   * seven errRow codes plus `connect_failed`, the connect handlers' 500
+   * fallback, which is mapped deliberately (its server message is only a
+   * generic English sentence). The five CRUD 500 `vendor_account.*_failed`
+   * fallbacks (list/create/get/update/delete) are left unmapped on purpose:
+   * they carry the server's own message.
    */
   const vendorAccountWireCodes = [
     'vendor_account.not_found',
@@ -470,6 +474,14 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'vendor_account.api_key_not_allowed',
     'vendor_account.api_key_invalid',
     'vendor_account.api_key_key_required',
+    'vendor_account.not_subscription',
+    'vendor_account.connect_token_required',
+    'vendor_account.connect_code_required',
+    'vendor_account.connect_state',
+    'vendor_account.connect_rejected',
+    'vendor_account.connect_upstream_failed',
+    'vendor_account.connect_key_required',
+    'vendor_account.connect_failed',
   ] as const;
 
   it('carries every vendor-account refusal code, by its exact wire string', () => {
@@ -479,7 +491,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         `${code} is not mapped: the operator sees raw English`,
       ).toBeDefined();
     }
-    // Both directions: a tenth `vendor_account.*` code added to the map
+    // Both directions: an eighteenth `vendor_account.*` code added to the map
     // without being named here fails too.
     expect(
       entries
@@ -490,7 +502,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   });
 
   // The master-flag 409 (`portalVendorAccountErrRows`' first row). Its code is
-  // `vendor_accounts.` (plural) -- a different prefix from the nine above -- so
+  // `vendor_accounts.` (plural) -- a different prefix from the seventeen above -- so
   // the both-directions check does not cover it: pin it on its own.
   it('maps the vendor-accounts module-disabled refusal by its exact wire string', () => {
     expect(errorLabelByCode['vendor_accounts.module_disabled']).toBe(
