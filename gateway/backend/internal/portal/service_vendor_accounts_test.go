@@ -436,3 +436,139 @@ func TestDeleteVendorAccountRemovesTheRow(t *testing.T) {
 		t.Fatalf("sibling account gone: %v", err)
 	}
 }
+
+// A vendor account is a PERSONAL credential, unlike shared infra such as a
+// server: system scope may READ any account (Get) but must not WRITE another
+// user's -- no rotating/clearing their key, renaming/disabling, or deleting.
+// A system-scope non-owner gets the same ErrVendorAccountNotFound as any other
+// stranger, and the row (including its sealed key) is left exactly as it was.
+func TestVendorAccountWritesAreOwnerOnlyEvenForSystemScope(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	owned := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Owner's"))
+	ctx := context.Background()
+	before, err := routeStore.VendorAccountByID(ctx, owned.ID)
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	str := func(s string) *string { return &s }
+
+	for name, req := range map[string]UpdateVendorAccountRequest{
+		"rename":     {Name: str("Hijacked")},
+		"disable":    {Status: str(routing.VendorAccountStatusDisabled)},
+		"rotate key": {APIKey: str("sk-attacker-key")},
+		"clear key":  {APIKey: str("")},
+	} {
+		if _, err := svc.UpdateVendorAccount(ctx, systemToken(), owned.ID, req); !errors.Is(err, ErrVendorAccountNotFound) {
+			t.Fatalf("system %s err = %v, want ErrVendorAccountNotFound", name, err)
+		}
+	}
+	if deleted, err := svc.DeleteVendorAccount(ctx, systemToken(), owned.ID); !errors.Is(err, ErrVendorAccountNotFound) || deleted {
+		t.Fatalf("system Delete = %v, %v, want false + ErrVendorAccountNotFound", deleted, err)
+	}
+
+	after, err := routeStore.VendorAccountByID(ctx, owned.ID)
+	if err != nil {
+		t.Fatalf("row after rejected system writes: %v", err)
+	}
+	if after != before {
+		t.Fatalf("row changed by rejected system writes:\n before %#v\n after  %#v", before, after)
+	}
+	// System read access is unchanged, and the owner can still write.
+	if got, err := svc.GetVendorAccount(ctx, systemToken(), owned.ID); err != nil || got.ID != owned.ID {
+		t.Fatalf("system Get = %#v, %v, want read access kept", got, err)
+	}
+	if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), owned.ID, UpdateVendorAccountRequest{Name: str("Mine")}); err != nil {
+		t.Fatalf("owner Update: %v", err)
+	}
+}
+
+// Authorization runs before body validation: a stranger (or an unknown id)
+// sending an INVALID update must see the 404 -- never a 400 that would confirm
+// the account exists.
+func TestUpdateVendorAccountStrangerWithInvalidBodyGets404(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, _ := newVendorAccountTestService(t, now)
+	owned := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Owner's"))
+	str := func(s string) *string { return &s }
+
+	invalid := map[string]UpdateVendorAccountRequest{
+		"blank name":          {Name: str("   ")},
+		"unknown status":      {Status: str("paused")},
+		"needs_reconnect":     {Status: str(routing.VendorAccountStatusNeedsReconnect)},
+		"whitespace-only key": {APIKey: str("   ")},
+	}
+	for name, req := range invalid {
+		for who, principal := range map[string]auth.Token{"stranger": otherToken(), "system": systemToken()} {
+			if _, err := svc.UpdateVendorAccount(context.Background(), principal, owned.ID, req); !errors.Is(err, ErrVendorAccountNotFound) {
+				t.Fatalf("%s with %s err = %v, want ErrVendorAccountNotFound (authz before validation)", who, name, err)
+			}
+		}
+		if _, err := svc.UpdateVendorAccount(context.Background(), ownerToken(), "va_missing", req); !errors.Is(err, ErrVendorAccountNotFound) {
+			t.Fatalf("unknown id with %s err = %v, want ErrVendorAccountNotFound", name, err)
+		}
+	}
+}
+
+// Only an explicit "" clears the api key. A whitespace-only value must not be
+// silently turned into a clear (it is almost certainly a paste slip), and must
+// leave the stored key alone.
+func TestUpdateVendorAccountWhitespaceOnlyKeyIsRejectedNotCleared(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	created := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Keyed"))
+	ctx := context.Background()
+
+	for _, blank := range []string{" ", "   ", "\t", "\n", " \r\n "} {
+		blank := blank
+		if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{APIKey: &blank}); !errors.Is(err, ErrVendorAccountAPIKeyInvalid) {
+			t.Fatalf("api_key %q err = %v, want ErrVendorAccountAPIKeyInvalid", blank, err)
+		}
+	}
+	row, err := routeStore.VendorAccountByID(ctx, created.ID)
+	if err != nil || row.APIKey != "plain:"+vendorAccountTestKey {
+		t.Fatalf("stored key after rejected whitespace updates = %q, %v, want kept", row.APIKey, err)
+	}
+	// The exact empty string still clears; nil still keeps.
+	if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{}); err != nil {
+		t.Fatalf("nil api_key: %v", err)
+	}
+	if row, _ := routeStore.VendorAccountByID(ctx, created.ID); row.APIKey == "" {
+		t.Fatalf("nil api_key cleared the key")
+	}
+	empty := ""
+	if dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{APIKey: &empty}); err != nil || dto.APIKeySet {
+		t.Fatalf("explicit empty api_key = %#v, %v, want cleared", dto, err)
+	}
+}
+
+// The seal happens on the UPDATE path too: a disk-backed store with no cipher
+// refuses a replacement key with capture.ErrKeyRequired and writes nothing
+// (mirrors the create-path assertion).
+func TestUpdateVendorAccountKeylessDiskStoreRefusesReplacementKey(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, nil, false)
+	ctx := context.Background()
+	// A key-less api_key account has nothing to seal, so it is creatable here.
+	created := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey, Name: "No key yet",
+	})
+	before, err := routeStore.VendorAccountByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+
+	key := vendorAccountTestKey
+	if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{APIKey: &key}); !errors.Is(err, capture.ErrKeyRequired) {
+		t.Fatalf("err = %v, want capture.ErrKeyRequired", err)
+	}
+	after, err := routeStore.VendorAccountByID(ctx, created.ID)
+	if err != nil || after != before {
+		t.Fatalf("row after refused update = %#v, %v, want unchanged %#v", after, err, before)
+	}
+	// Non-secret edits still work on such a store.
+	name := "Renamed"
+	if dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{Name: &name}); err != nil || dto.Name != name {
+		t.Fatalf("rename on keyless store = %#v, %v", dto, err)
+	}
+}

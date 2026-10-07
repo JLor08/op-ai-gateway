@@ -227,6 +227,7 @@ func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 		{"malformed json", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":`, http.StatusBadRequest, codeRequestInvalidJSON},
 		{"patch blank name", http.MethodPatch, itemPath, `{"name":""}`, http.StatusBadRequest, "vendor_account.name_required"},
 		{"patch bad status", http.MethodPatch, itemPath, `{"status":"needs_reconnect"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
+		{"patch whitespace-only key", http.MethodPatch, itemPath, `{"api_key":"   "}`, http.StatusBadRequest, "vendor_account.api_key_invalid"},
 		{"collection rejects PUT", http.MethodPut, "/api/portal/vendor-accounts", `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"item rejects POST", http.MethodPost, itemPath, `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"nested path is not an item", http.MethodGet, itemPath + "/connect", "", http.StatusNotFound, portal.CodeVendorAccountNotFound},
@@ -277,5 +278,51 @@ func TestVendorAccountEndpointsKeylessDiskStoreRefusesAPIKey(t *testing.T) {
 	}
 	if got := vaDecode(t, rec); got.SubscriptionConnected || got.APIKeySet {
 		t.Fatalf("subscription dto = %#v, want unconnected", got)
+	}
+}
+
+// Authorization precedes body validation: a non-owner sending a SEMANTICALLY
+// invalid PATCH gets the 404, never a 400 that would confirm the account exists.
+// (A syntactically malformed body is rejected by the JSON decoder before any
+// account lookup, for every caller alike, so it reveals nothing.)
+func TestVendorAccountEndpointsStrangerWithInvalidPatchGets404(t *testing.T) {
+	srv, routeStore := newVendorAccountTestServer(t, true)
+	created := vaCreate(t, srv, vaOwnerSecret, "Owner's")
+	path := "/api/portal/vendor-accounts/" + created.ID
+
+	for _, body := range []string{`{"name":""}`, `{"status":"paused"}`, `{"status":"needs_reconnect"}`, `{"api_key":"   "}`} {
+		rec := vaDo(t, srv, http.MethodPatch, path, vaOtherSecret, body)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("stranger PATCH %s status = %d, want 404, body = %s", body, rec.Code, rec.Body.String())
+		}
+		if code := perfErrorCode(t, rec.Body.Bytes()); code != portal.CodeVendorAccountNotFound {
+			t.Fatalf("stranger PATCH %s code = %q, want %s", body, code, portal.CodeVendorAccountNotFound)
+		}
+	}
+	row, err := routeStore.VendorAccountByID(context.Background(), created.ID)
+	if err != nil || row.Name != "Owner's" || row.APIKey != "plain:"+vaTestAPIKey {
+		t.Fatalf("row after stranger PATCHes = %#v, %v, want untouched", row, err)
+	}
+}
+
+// The seal also runs on PATCH: on a keyless disk store a replacement key is a
+// 400, not a 500, and the account is left as it was.
+func TestVendorAccountEndpointsKeylessDiskStoreRefusesReplacementKey(t *testing.T) {
+	srv, routeStore := newVendorAccountTestServer(t, false)
+	rec := vaDo(t, srv, http.MethodPost, "/api/portal/vendor-accounts", vaOwnerSecret, `{"vendor":"openai","auth_type":"api_key","name":"No key yet"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201, body = %s", rec.Code, rec.Body.String())
+	}
+	created := vaDecode(t, rec)
+
+	rec = vaDo(t, srv, http.MethodPatch, "/api/portal/vendor-accounts/"+created.ID, vaOwnerSecret, `{"api_key":"`+vaTestAPIKey+`"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := perfErrorCode(t, rec.Body.Bytes()); code != "vendor_account.api_key_key_required" {
+		t.Fatalf("code = %q, want vendor_account.api_key_key_required", code)
+	}
+	if row, err := routeStore.VendorAccountByID(context.Background(), created.ID); err != nil || row.APIKey != "" {
+		t.Fatalf("row after refused PATCH = %#v, %v, want no key stored", row, err)
 	}
 }

@@ -124,12 +124,16 @@ func (s *Service) sealVendorAPIKey(raw string) (string, error) {
 }
 
 // authorizeVendorAccount loads the account and returns ErrVendorAccountNotFound
-// unless the principal OWNS it (or holds system scope, which may read every
-// account). Like authorizeServer, an unknown id and a stranger's account are
-// indistinguishable (404-no-leak) -- but unlike a server there is no admin-group
-// or co-owner path: a vendor account is personal, so a plain admin who is not
-// the owner is a stranger too.
-func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
+// unless the principal OWNS it. With write=false (a READ) system scope is also
+// let through, so an operator can inspect any account's credential-free
+// metadata; with write=true the check is strictly owner-only. A vendor account
+// is a personal credential, not shared infrastructure like a server, so the
+// authorizeServer system bypass deliberately does not extend to writes: a
+// system-scope non-owner may not rotate or clear another user's key, rename or
+// disable the account, or delete it. As with authorizeServer, an unknown id and
+// a stranger's account are indistinguishable (404-no-leak), and a plain admin
+// who is not the owner is a stranger too.
+func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string, write bool) (routing.VendorAccount, error) {
 	acc, err := s.routes.VendorAccountByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -137,7 +141,10 @@ func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Tok
 		}
 		return routing.VendorAccount{}, err
 	}
-	if isSystem(principal) || (principal.UserID != "" && acc.OwnerUserID == principal.UserID) {
+	if principal.UserID != "" && acc.OwnerUserID == principal.UserID {
+		return acc, nil
+	}
+	if !write && isSystem(principal) {
 		return acc, nil
 	}
 	return routing.VendorAccount{}, ErrVendorAccountNotFound
@@ -167,9 +174,10 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 	return VendorAccountListResponse{Data: out}, nil
 }
 
-// GetVendorAccount returns one account the principal owns (404-no-leak otherwise).
+// GetVendorAccount returns one account the principal owns (404-no-leak
+// otherwise); system scope may read any account.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
-	acc, err := s.authorizeVendorAccount(ctx, principal, id)
+	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -233,10 +241,10 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 // UpdateVendorAccount renames an account, changes its status, and/or replaces
 // or clears its api key. The store keeps id, owner, vendor and created_at
 // immutable, so this loads the row, mutates only the requested fields and writes
-// it back. Authorization runs first, so a stranger gets 404 even for an invalid
-// body.
+// it back. The write is OWNER-ONLY (system scope included), and authorization
+// runs first, so a stranger gets 404 even for an invalid body.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
-	acc, err := s.authorizeVendorAccount(ctx, principal, id)
+	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -258,6 +266,11 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	}
 	if req.APIKey != nil {
 		apiKey := strings.TrimSpace(*req.APIKey)
+		// Only the exact empty string clears the key; a value that is blank
+		// after trimming is a paste slip and must not silently wipe the key.
+		if *req.APIKey != "" && apiKey == "" {
+			return VendorAccountDTO{}, ErrVendorAccountAPIKeyInvalid
+		}
 		if apiKey != "" && acc.AuthType != routing.VendorAuthAPIKey {
 			return VendorAccountDTO{}, ErrVendorAccountAPIKeyNotAllowed
 		}
@@ -277,11 +290,11 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	return vendorAccountDTO(acc), nil
 }
 
-// DeleteVendorAccount removes an account the principal owns; the store cascades
-// its dependent rows. The bool reports that a row was removed (always true on a
+// DeleteVendorAccount removes an account the principal owns (owner-only, system
+// scope included); the store cascades its dependent rows. The bool reports that a row was removed (always true on a
 // nil error): there is no best-effort side effect to flag, unlike DeleteServer.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
-	acc, err := s.authorizeVendorAccount(ctx, principal, id)
+	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
 		return false, err
 	}

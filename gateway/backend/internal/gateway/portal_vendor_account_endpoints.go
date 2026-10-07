@@ -121,6 +121,7 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountAuthTypeInvalid, status: http.StatusBadRequest, code: "vendor_account.auth_type_invalid", msg: "vendor account auth type is invalid"},
 	{err: portal.ErrVendorAccountStatusInvalid, status: http.StatusBadRequest, code: "vendor_account.status_invalid", msg: "vendor account status is invalid"},
 	{err: portal.ErrVendorAccountAPIKeyNotAllowed, status: http.StatusBadRequest, code: "vendor_account.api_key_not_allowed", msg: "an api key can only be set on an api_key account"},
+	{err: portal.ErrVendorAccountAPIKeyInvalid, status: http.StatusBadRequest, code: "vendor_account.api_key_invalid", msg: "api key must not be blank; send an empty string to clear it"},
 	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: "vendor_account.forbidden", msg: notAllowedMsg},
 	// capture.SealSecret returns capture.ErrKeyRequired when a non-empty api key
 	// is sealed on a disk-backed store with no encryption key: the operator's

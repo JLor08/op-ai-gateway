@@ -121,6 +121,9 @@ var (
 	// real user (no UserID to own the account).
 	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
 	// account, whose only credential is the OAuth token set.
+	// ErrVendorAccountAPIKeyInvalid rejects a whitespace-only api_key on update:
+	// only an explicit "" clears a key, so a blank value is a paste slip, not
+	// an instruction.
 	ErrVendorAccountNotFound         = errors.New(CodeVendorAccountNotFound)
 	ErrVendorAccountForbidden        = errors.New("vendor_account.forbidden")
 	ErrVendorAccountNameRequired     = errors.New("vendor_account.name_required")
@@ -128,6 +131,7 @@ var (
 	ErrVendorAccountAuthTypeInvalid  = errors.New("vendor_account.auth_type_invalid")
 	ErrVendorAccountStatusInvalid    = errors.New("vendor_account.status_invalid")
 	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
+	ErrVendorAccountAPIKeyInvalid    = errors.New("vendor_account.api_key_invalid")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable
