@@ -209,6 +209,12 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		if req.CertMeshRequireTLS != nil {
 			s.invalidateMeshRequireTLSCache()
 		}
+		// Drop the resolver's cached vendor-account flag/mode reads so a toggle of
+		// the master flag or the routing mode takes effect on the very next resolve
+		// rather than after vendorSettingsCacheTTL.
+		if req.VendorAccountsEnabled != nil || req.VendorAccountRoutingMode != nil {
+			s.invalidateVendorSettingsCache()
+		}
 		writeJSON(w, http.StatusOK, dto)
 	default:
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)

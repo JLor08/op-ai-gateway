@@ -583,6 +583,17 @@ type Server struct {
 	// varies per call (GetTTL), shorter for an error-derived miss so a transient
 	// NetBird blip self-heals fast.
 	sourcePeerIP settingCache[string]
+	// vendorEnabledCache / vendorRoutingModeCache are the TTL caches
+	// (settingCache, invalidatable mode -- ttlcache.go) backing the resolver's
+	// injected vendor-account accessors (SetVendorAccountAccessors), so the
+	// per-user vendor branch does not issue a system_settings read on EVERY
+	// resolve of the inference hot path. Both are invalidated explicitly by
+	// handleSystemSettings after a PUT that carried the vendor flag / mode
+	// (invalidateVendorSettingsCache), so an operator toggling either in the
+	// portal sees the effect on the next request rather than after the TTL; they
+	// share edgeSwitch's generation-based disarm-race guard.
+	vendorEnabledCache     settingCache[bool]
+	vendorRoutingModeCache settingCache[string]
 	// speculationSeenMu guards speculationSeen: the set of mapping ids whose
 	// routing.CapabilitySpeculationObserved verdict this PROCESS has already
 	// claimed, consulted by claimSpeculationObserved (inference_complete.go) on
@@ -865,6 +876,17 @@ func New(deps ServerDeps) *Server {
 	// upstream-auth), so it is wired here rather than in the pre-s resolver-checker block.
 	if resolver != nil {
 		resolver.SetModelWarmer(newModelWarmer(s))
+		// The per-user vendor-account branch reads the vendor_accounts_enabled
+		// master flag and the vendor_account_routing_mode through these cached
+		// accessors (invalidated on a settings PUT), so it never hits the
+		// system_settings store on the resolve hot path. Closed over s so they read
+		// the SAME caches handleSystemSettings invalidates. A resolver with no
+		// portal leaves the branch off (the accessors fail closed to disabled /
+		// vendor_first).
+		resolver.SetVendorAccountAccessors(
+			func() bool { return s.vendorAccountsEnabledCached(context.Background()) },
+			func() string { return s.vendorAccountRoutingModeCached(context.Background()) },
+		)
 	}
 	s.routes()
 	return s
