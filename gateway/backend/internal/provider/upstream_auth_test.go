@@ -47,6 +47,55 @@ func TestApplyUpstreamAuthEmptyTokenNoHeader(t *testing.T) {
 	}
 }
 
+// TestApplyUpstreamAuthExtraHeadersWithBearer proves a subscription-shaped
+// context (bearer via empty header + static extra headers) attaches BOTH the
+// Authorization bearer and every extra header.
+func TestApplyUpstreamAuthExtraHeadersWithBearer(t *testing.T) {
+	extra := map[string]string{"anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
+	ctx := WithUpstreamAuthHeaders(context.Background(), "", "oauth-access", extra)
+	req, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
+	applyUpstreamAuth(ctx, req)
+	if got := req.Header.Get("Authorization"); got != "Bearer oauth-access" {
+		t.Fatalf("Authorization = %q, want Bearer oauth-access", got)
+	}
+	if got := req.Header.Get("anthropic-version"); got != "2023-06-01" {
+		t.Fatalf("anthropic-version = %q", got)
+	}
+	if got := req.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
+		t.Fatalf("anthropic-beta = %q", got)
+	}
+}
+
+// TestApplyUpstreamAuthExtraHeadersOnly proves a context carrying ONLY extra
+// headers (no token) still attaches them and sets no credential header.
+func TestApplyUpstreamAuthExtraHeadersOnly(t *testing.T) {
+	base := context.Background()
+	ctx := WithUpstreamAuthHeaders(base, "", "", map[string]string{"anthropic-beta": "oauth-2025-04-20"})
+	if ctx == base {
+		t.Fatal("extra headers should be carried even with an empty token")
+	}
+	if _, ok := UpstreamAuthFrom(ctx); !ok {
+		t.Fatal("UpstreamAuthFrom should be ok when extra headers are present")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://example/", nil)
+	applyUpstreamAuth(ctx, req)
+	if got := req.Header.Get("anthropic-beta"); got != "oauth-2025-04-20" {
+		t.Fatalf("anthropic-beta = %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("no Authorization expected for an extra-headers-only context, got %q", got)
+	}
+}
+
+// TestWithUpstreamAuthHeadersEmptyUnchanged proves an empty token with no extra
+// headers leaves ctx untouched (the unauthenticated no-op).
+func TestWithUpstreamAuthHeadersEmptyUnchanged(t *testing.T) {
+	base := context.Background()
+	if ctx := WithUpstreamAuthHeaders(base, "x-api-key", "   ", nil); ctx != base {
+		t.Fatal("empty token + no extra headers must leave ctx unchanged")
+	}
+}
+
 func TestUpstreamAuthFromOkSemantics(t *testing.T) {
 	// Bare ctx → not ok.
 	if _, ok := UpstreamAuthFrom(context.Background()); ok {

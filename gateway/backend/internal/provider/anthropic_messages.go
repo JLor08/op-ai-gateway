@@ -33,6 +33,12 @@ const (
 	// anthropicMaxTemperature is Anthropic's upper bound for temperature (OpenAI
 	// allows up to 2, which Anthropic rejects with a 400).
 	anthropicMaxTemperature = 1.0
+	// claudeCodeSystemPrompt is the EXACT first system block the Claude-Code
+	// masquerade prepends on the subscription (OAuth) Messages path, matching what
+	// the Claude Code CLI sends. api.anthropic.com's OAuth bearer path expects this
+	// as the first system block, so it must stay BYTE-FOR-BYTE identical.
+	// REVERSE-ENGINEERED / VERIFY LIVE.
+	claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
 )
 
 // AnthropicClient is the native Anthropic Messages API (/v1/messages) client for
@@ -184,10 +190,15 @@ func (c *AnthropicClient) post(ctx context.Context, target routing.Target, body 
 // ---- request render (neutral -> Messages) ----
 
 type anthropicRequest struct {
-	Model         string             `json:"model"`
-	MaxTokens     int                `json:"max_tokens"`
-	Stream        bool               `json:"stream"`
-	System        string             `json:"system,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	Stream    bool   `json:"stream"`
+	// System is the Messages `system` field. It is a plain string for the ordinary
+	// path (nil when empty, so the field is omitted) and an ARRAY of text blocks
+	// for the Claude-Code masquerade, whose first block is exactly
+	// claudeCodeSystemPrompt. The type is `any` so one field carries both shapes;
+	// omitempty omits it only when nil, so an empty system is set to nil, not "".
+	System        any                `json:"system,omitempty"`
 	Messages      []anthropicMessage `json:"messages"`
 	Tools         []anthropicTool    `json:"tools,omitempty"`
 	ToolChoice    map[string]any     `json:"tool_choice,omitempty"`
@@ -235,7 +246,7 @@ func anthropicRequestBody(target routing.Target, req inference.Request, stream b
 		Model:     providerModel(target, req),
 		MaxTokens: req.MaxTokens,
 		Stream:    stream,
-		System:    system,
+		System:    anthropicSystemField(system, target.Masquerade),
 		Messages:  messages,
 	}
 	if body.MaxTokens <= 0 {
@@ -262,6 +273,37 @@ func anthropicRequestBody(target routing.Target, req inference.Request, stream b
 		return nil, fmt.Errorf("%w: encode request", ErrInvalidResponse)
 	}
 	return raw, nil
+}
+
+// anthropicSystemBlock is one element of the Messages `system` array — the block
+// form used for the Claude-Code masquerade (the API accepts `system` as either a
+// plain string or an array of typed text blocks).
+type anthropicSystemBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// anthropicSystemField builds the Messages `system` field from the joined system
+// text and the target's masquerade:
+//
+//   - No masquerade: the plain joined string, or nil when empty so `system` is
+//     omitted (byte-identical to the pre-masquerade behaviour).
+//   - MasqueradeClaudeCode: an ARRAY whose FIRST block is exactly
+//     claudeCodeSystemPrompt and whose second block (when the caller supplied any
+//     system text) is that text — the shape the Claude Code CLI sends on the OAuth
+//     Messages path. The exact first block is what makes the OAuth bearer accepted.
+func anthropicSystemField(system, masquerade string) any {
+	if masquerade == routing.MasqueradeClaudeCode {
+		blocks := []anthropicSystemBlock{{Type: "text", Text: claudeCodeSystemPrompt}}
+		if system != "" {
+			blocks = append(blocks, anthropicSystemBlock{Type: "text", Text: system})
+		}
+		return blocks
+	}
+	if system == "" {
+		return nil
+	}
+	return system
 }
 
 // anthropicMessages splits the neutral messages into Anthropic's top-level system
