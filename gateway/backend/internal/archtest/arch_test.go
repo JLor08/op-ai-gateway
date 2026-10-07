@@ -99,6 +99,7 @@ var allowedDeps = map[string][]string{
 		"internal/totp",
 		"internal/tracing",
 		"internal/usage",
+		"internal/vendorauth",
 	},
 	"internal/gateway/visionassets": {},
 	"internal/inference":            {},
