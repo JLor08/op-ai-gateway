@@ -84,9 +84,11 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 }
 
 // handlePortalVendorAccountItem serves "/api/portal/vendor-accounts/{id}"
-// (GET / PATCH / DELETE) and the subscription-connect sub-resources
-// "/api/portal/vendor-accounts/{id}/connect/{import|begin|complete}" (POST).
-// Any other deeper path is answered with the same 404 as an unknown id.
+// (GET / PATCH / DELETE), the subscription-connect sub-resources
+// "/api/portal/vendor-accounts/{id}/connect/{import|begin|complete}" (POST), and
+// the OPTIONAL device-code connect sub-resources
+// "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST). Any
+// other deeper path is answered with the same 404 as an unknown id.
 func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
@@ -94,6 +96,16 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/portal/vendor-accounts/"), "/")
 	parts := strings.Split(rest, "/")
+	if len(parts) == 4 && parts[0] != "" && parts[1] == "connect" && parts[2] == "device" {
+		switch parts[3] {
+		case "begin":
+			s.handlePortalVendorAccountConnectDeviceBegin(w, r, token, parts[0])
+			return
+		case "poll":
+			s.handlePortalVendorAccountConnectDevicePoll(w, r, token, parts[0])
+			return
+		}
+	}
 	if len(parts) == 3 && parts[0] != "" && parts[1] == "connect" {
 		switch parts[2] {
 		case "import":
@@ -219,6 +231,38 @@ func (s *Server) handlePortalVendorAccountConnectComplete(w http.ResponseWriter,
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// handlePortalVendorAccountConnectDeviceBegin (POST .../connect/device/begin)
+// starts the OPTIONAL Codex device-code login and returns the user_code plus the
+// verification page URL for the UI to display; the request has no body.
+func (s *Server) handlePortalVendorAccountConnectDeviceBegin(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	userCode, verificationURL, err := s.Portal.BeginVendorAccountDeviceConnect(r.Context(), token, id)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountConnectFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"user_code": userCode, "verification_url": verificationURL})
+}
+
+// handlePortalVendorAccountConnectDevicePoll (POST .../connect/device/poll) is
+// one backend poll of a begun device login; the frontend calls it on the interval.
+// It answers {"connected": bool}: false while the user has not approved yet, true
+// once the account is connected. The request has no body and no token is ever
+// returned.
+func (s *Server) handlePortalVendorAccountConnectDevicePoll(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	connected, err := s.Portal.PollVendorAccountDeviceConnect(r.Context(), token, id)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountConnectFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"connected": connected})
+}
+
 // portalVendorAccountErrRows are writePortalVendorAccountError's mapper-specific
 // rows (checked before sharedErrorMap). store.ErrNotFound maps to a different
 // code in other mappers, so its vendor-account row must stay here.
@@ -247,6 +291,10 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountConnectRejected, status: http.StatusBadRequest, code: "vendor_account.connect_rejected", msg: "the vendor rejected the code; check it or start the connect again"},
 	{err: portal.ErrVendorAccountConnectUpstream, status: http.StatusBadGateway, code: "vendor_account.connect_upstream_failed", msg: "the vendor could not be reached or answered unexpectedly; try again later"},
 	{err: portal.ErrVendorAccountConnectKeyRequired, status: http.StatusBadRequest, code: "vendor_account.connect_key_required", msg: "an encryption key is required to store a vendor subscription on a disk-backed store"},
+	// Device-code connect (OpenAI only). Both are 400s, never a 401 (the portal
+	// treats a 401 from this API as an expired session).
+	{err: portal.ErrVendorAccountDeviceUnsupported, status: http.StatusBadRequest, code: "vendor_account.device_not_supported", msg: "the device connect flow is available for OpenAI accounts only"},
+	{err: portal.ErrVendorAccountDeviceConnectState, status: http.StatusBadRequest, code: "vendor_account.device_connect_state", msg: "no device connect is in progress for this account or it has expired; start the device connect again"},
 	// capture.SealSecret returns capture.ErrKeyRequired when a non-empty api key
 	// is sealed on a disk-backed store with no encryption key: the operator's
 	// own keyless misconfiguration, a 400 rather than a 500 (the same class the
