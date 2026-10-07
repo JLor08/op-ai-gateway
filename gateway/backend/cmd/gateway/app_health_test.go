@@ -1500,7 +1500,9 @@ func TestRunAppHealthOnceSdcppCarriesTheAppCredential(t *testing.T) {
 
 	prober.sdMu.Lock()
 	defer prober.sdMu.Unlock()
-	if len(prober.sdAuth) != 1 || prober.sdAuth[0] != (provider.UpstreamAuth{Header: "X-Api-Key", Token: "sd-tok"}) {
+	// UpstreamAuth carries an ExtraHeaders map and is no longer comparable with
+	// ==; check the credential fields this probe cares about directly.
+	if len(prober.sdAuth) != 1 || prober.sdAuth[0].Header != "X-Api-Key" || prober.sdAuth[0].Token != "sd-tok" {
 		t.Fatalf("sdcpp probe credentials = %+v, want one {Header:X-Api-Key Token:sd-tok}", prober.sdAuth)
 	}
 }
