@@ -25,19 +25,46 @@ import (
 //     as ErrAuthRejected (via *StatusError.Is), which tells the caller to mark the
 //     account needs_reconnect. Transient failures (network, 5xx, 429) do NOT match
 //     ErrAuthRejected, so the caller leaves the account active and retries later.
-//
-// The OpenAI subscription variant is Milestone 5b; this function is Anthropic-only.
 func EnsureFresh(ctx context.Context, httpClient *http.Client, ep Endpoints, ts TokenSet, buffer time.Duration) (TokenSet, bool, error) {
+	return ensureFresh(ts, buffer, func(refreshToken string) (TokenSet, error) {
+		return RefreshAnthropic(ctx, httpClient, ep, refreshToken)
+	})
+}
+
+// EnsureFreshOpenAI is the OpenAI (Codex ChatGPT-subscription) analogue of
+// EnsureFresh (Milestone 5b): same staleness rule and same identity-carry-forward
+// contract, but it exchanges the refresh token through RefreshOpenAI (form-encoded
+// body) against the OpenAI token endpoint. Carrying AccountID/PlanType forward
+// matters here too: a refresh response without an id_token leaves RefreshOpenAI's
+// AccountID empty, and the chatgpt-account-id the dispatch sends on every request
+// must survive a refresh.
+//
+// CRITICAL: never call this with Anthropic endpoints (or EnsureFresh with OpenAI
+// endpoints) — an OpenAI refresh token must not be sent to the Anthropic token
+// endpoint and vice versa.
+func EnsureFreshOpenAI(ctx context.Context, httpClient *http.Client, ep Endpoints, ts TokenSet, buffer time.Duration) (TokenSet, bool, error) {
+	return ensureFresh(ts, buffer, func(refreshToken string) (TokenSet, error) {
+		return RefreshOpenAI(ctx, httpClient, ep, refreshToken)
+	})
+}
+
+// ensureFresh is the vendor-agnostic core shared by EnsureFresh and
+// EnsureFreshOpenAI: a non-stale token is returned untouched (no refresh call),
+// and a stale one is exchanged through refresh, with the vendor-side identity
+// fields (AccountID/PlanType) carried forward from the old ts whenever the refresh
+// response omits them. The only thing that varies between vendors is the refresh
+// func, so that is all this takes.
+func ensureFresh(ts TokenSet, buffer time.Duration, refresh func(refreshToken string) (TokenSet, error)) (TokenSet, bool, error) {
 	if !ts.NeedsRefresh(time.Now(), buffer) {
 		return ts, false, nil
 	}
-	fresh, err := RefreshAnthropic(ctx, httpClient, ep, ts.RefreshToken)
+	fresh, err := refresh(ts.RefreshToken)
 	if err != nil {
 		return TokenSet{}, false, err
 	}
-	// Carry the vendor-side identity fields forward: RefreshAnthropic leaves them
-	// empty, and losing them would strip the account id (and plan) the stored blob
-	// has held since connect.
+	// Carry the vendor-side identity fields forward: a refresh response that omits
+	// them would otherwise strip the account id (and plan) the stored blob has held
+	// since connect.
 	if fresh.AccountID == "" {
 		fresh.AccountID = ts.AccountID
 	}
