@@ -15,6 +15,7 @@ import {
   Activity as ActivityIcon,
   Bot,
   Boxes,
+  Cloud,
   Cpu,
   FolderKanban,
   KeyRound,
@@ -42,6 +43,7 @@ import { ModelGroupSection } from './ModelGroupSection';
 import { ServerList } from './ServerList';
 import { ResourceGroupsView } from './ResourceGroupsView';
 import { ServicesView } from './ServicesView';
+import { VendorAccountsView } from './VendorAccountsView';
 import { UsersView } from './UsersView';
 import { GroupsView } from './GroupsView';
 import { ProjectsView } from './ProjectsView';
@@ -215,6 +217,17 @@ export const viewRegistry: Record<View, ViewEntry> = {
         loading={ctx.loading}
       />
     ),
+  },
+  // Vendor accounts ("Anbieter"): every authenticated user manages their OWN
+  // accounts at external AI vendors, so the gate is unconditional. The feature
+  // flag that can hide the area is wired in a later milestone.
+  providers: {
+    id: 'providers',
+    labelKey: 'providers',
+    href: '/providers',
+    icon: Cloud,
+    gate: alwaysVisible,
+    render: (ctx) => <VendorAccountsView t={ctx.t} api={ctx.api} />,
   },
   resourceGroups: {
     id: 'resourceGroups',
