@@ -695,6 +695,33 @@ func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 	}
 }
 
+// TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath pins the translate
+// path of the two vendor-account provider kinds: a vendor_anthropic target is
+// served by the native Anthropic client at /v1/messages (not the chat-completions
+// default every other non-ollama provider falls through to), while vendor_openai
+// reuses the OpenAI-compatible client and so stays on /v1/chat/completions. A
+// wrong value here mislabels the usage row's provider_path.
+func TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath(t *testing.T) {
+	cases := []struct {
+		provider string
+		want     string
+	}{
+		{routing.ProviderVendorAnthropic, "/v1/messages"},
+		{routing.ProviderVendorOpenAI, "/v1/chat/completions"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.provider, func(t *testing.T) {
+			// openai_chat_completions: a flavor with no passthrough mode, so the
+			// provider fallbacks decide.
+			got := upstreamPath(routing.Target{Provider: tc.provider}, "openai_chat_completions")
+
+			if got != tc.want {
+				t.Fatalf("upstreamPath(%s) = %q, want %q", tc.provider, got, tc.want)
+			}
+		})
+	}
+}
+
 // plainTextErrorProxyProvider returns a non-2xx upstream response with a
 // Content-Type that is NOT application/json, and a body that must reach the
 // client byte-for-byte. It exists for

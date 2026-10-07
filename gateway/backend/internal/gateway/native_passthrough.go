@@ -130,11 +130,12 @@ func targetIsImagesOnly(target routing.Target) bool {
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
 // RESOLVED target + client API flavor: the native passthrough path when the
 // effective mode for that flavor is passthrough, otherwise the built-in
-// translation's chat-completions path (per provider — ollama speaks /api/chat, all
-// OpenAI-compatible providers speak /v1/chat/completions). It returns "" for an
+// translation's chat-completions path (per provider — ollama speaks /api/chat, the
+// native Anthropic vendor client speaks /v1/messages, all OpenAI-compatible
+// providers speak /v1/chat/completions). It returns "" for an
 // unresolved target (e.g. a resolve failure, where no upstream was called). This
 // mirrors the paths hardcoded in the provider clients (openai_compatible.go,
-// ollama.go) and in proxyNative, kept here in one gateway-visible place so the
+// ollama.go, anthropic_messages.go) and in proxyNative, kept here in one gateway-visible place so the
 // persisted usage row + the live ActiveRequest agree on the value.
 //
 // KNOWN LIMIT (cosmetic, diagnostic field only): a translate handler derives the
@@ -158,8 +159,11 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
 	}
-	if target.Provider == routing.ProviderOllama {
+	switch target.Provider {
+	case routing.ProviderOllama:
 		return "/api/chat"
+	case routing.ProviderVendorAnthropic:
+		return "/v1/messages"
 	}
 	return "/v1/chat/completions"
 }

@@ -28,6 +28,15 @@ const (
 	// type that must NOT be borrowed for this, since it is bound to its own
 	// client which does not implement provider.NativeProxyClient.
 	ProviderStableDiffusionCpp = "stable_diffusion_cpp"
+	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
+	// a vendor-account target: inference served by a hosted vendor API
+	// (api.openai.com / api.anthropic.com) instead of an on-prem application.
+	// vendor_openai speaks the OpenAI-compatible dialect and shares that client;
+	// vendor_anthropic has its own native /v1/messages client
+	// (provider.AnthropicClient), so its translate path is /v1/messages rather
+	// than /v1/chat/completions.
+	ProviderVendorOpenAI    = "vendor_openai"
+	ProviderVendorAnthropic = "vendor_anthropic"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
