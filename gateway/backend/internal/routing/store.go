@@ -209,6 +209,18 @@ type VendorAccount struct {
 	UpdatedAt   time.Time
 }
 
+// VendorAccountModel is one model a vendor account serves: the public id a
+// caller asks the gateway for (GatewayModel), the id sent to the vendor
+// (UpstreamModel) and the wire dialect used to reach it (APIFlavor, one of
+// APIFlavorOpenAI / APIFlavorAnthropic). For the vendors served today the two
+// ids coincide. (AccountID, GatewayModel) is the primary key.
+type VendorAccountModel struct {
+	AccountID     string
+	GatewayModel  string
+	UpstreamModel string
+	APIFlavor     string
+}
+
 // Service is a Service Account (Phase 1 service accounts): an autonomous
 // principal that owns 0..N service tokens (api_tokens with kind="service"),
 // managed like an AI-Server — created by an admin, then administered by its
@@ -2154,6 +2166,17 @@ type VendorAccountStore interface {
 	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
 	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
 	DeleteVendorAccount(ctx context.Context, id string) error
+
+	// VendorAccountModels returns the models accountID serves, sorted by
+	// gateway_model. Always non-nil (empty when the account has none, or does
+	// not exist).
+	VendorAccountModels(ctx context.Context, accountID string) ([]VendorAccountModel, error)
+	// SetVendorAccountModels atomically REPLACES accountID's whole model set
+	// (delete-then-insert; a rejected set leaves the previous one in place).
+	// Every row is stored under accountID whatever its own AccountID says. An
+	// unknown account is ErrNotFound (even for an empty set); a duplicate
+	// GatewayModel within the set is ErrConflict.
+	SetVendorAccountModels(ctx context.Context, accountID string, models []VendorAccountModel) error
 }
 
 // Store is the full routing persistence surface: the composition of every

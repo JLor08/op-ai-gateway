@@ -24,19 +24,30 @@ func vendorAccountChildCount(t *testing.T, s *SQLStore, table, accountID string)
 	return n
 }
 
-// seedVendorAccountChildren gives accountID one vendor_account_models row and
-// one vendor_account_usage row. The store has no writer for either table yet
-// (they arrive with the milestones that serve the model catalog and the usage
-// snapshot), so the rows go in through raw SQL -- which is also exactly what
-// the FK cascade under test has to clean up.
-func seedVendorAccountChildren(t *testing.T, s *SQLStore, accountID string, now time.Time) {
+// seedVendorAccountModels gives accountID one vendor_account_models row through
+// the store's own writer, on any driver.
+func seedVendorAccountModels(t *testing.T, s routing.Store, accountID string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := s.exec(ctx, `insert into vendor_account_models (account_id, gateway_model, upstream_model, api_flavor)
-		values (?, ?, ?, ?)`, accountID, "gpt-"+accountID, "gpt-upstream", routing.APIFlavorOpenAI); err != nil {
+	if err := s.SetVendorAccountModels(ctx, accountID, []routing.VendorAccountModel{
+		{GatewayModel: "gpt-" + accountID, UpstreamModel: "gpt-upstream", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
 		t.Fatalf("seed vendor_account_models for %s: %v", accountID, err)
 	}
-	if _, err := s.exec(ctx, `insert into vendor_account_usage (account_id, updated_at) values (?, ?)`, accountID, now); err != nil {
+	if models, err := s.VendorAccountModels(ctx, accountID); err != nil || len(models) != 1 {
+		t.Fatalf("vendor_account_models rows for %s = %v, %v before the delete, want 1", accountID, models, err)
+	}
+}
+
+// seedVendorAccountChildren gives accountID one vendor_account_models row
+// (through the store writer) and one vendor_account_usage row. The store has no
+// writer for the usage table yet (it arrives with the milestone that records
+// the usage snapshot), so that row goes in through raw SQL -- which is also
+// exactly what the FK cascade under test has to clean up.
+func seedVendorAccountChildren(t *testing.T, s *SQLStore, accountID string, now time.Time) {
+	t.Helper()
+	seedVendorAccountModels(t, s, accountID)
+	if _, err := s.exec(context.Background(), `insert into vendor_account_usage (account_id, updated_at) values (?, ?)`, accountID, now); err != nil {
 		t.Fatalf("seed vendor_account_usage for %s: %v", accountID, err)
 	}
 	if n := vendorAccountChildCount(t, s, "vendor_account_models", accountID); n != 1 {
@@ -49,15 +60,16 @@ func seedVendorAccountChildren(t *testing.T, s *SQLStore, accountID string, now 
 
 // TestRoutingStoreDeleteVendorAccountCascades pins what deleting one vendor
 // account removes. On EVERY driver the account itself goes (and its sibling
-// stays). On the SQL drivers its vendor_account_models and vendor_account_usage
-// rows go too, through their ON DELETE CASCADE FKs, while the sibling's rows
-// stay.
+// stays) and so do its vendor_account_models rows (the SQL drivers through the
+// ON DELETE CASCADE FK, the memory driver by dropping its per-account model
+// map), while the sibling's rows stay. On the SQL drivers its
+// vendor_account_usage row goes too.
 //
-// The child-row half is SQL-only by construction: routing.MemoryStore keeps no
-// model-catalog or usage-snapshot maps yet (and the store has no writer for
-// them), so there is nothing for it to cascade or for this test to read there.
-// Whichever milestone adds those maps to MemoryStore must extend
-// DeleteVendorAccount with the matching deletes and give this test a reader.
+// The usage half is SQL-only by construction: routing.MemoryStore keeps no
+// usage-snapshot map yet (and the store has no writer for one), so there is
+// nothing for it to cascade or for this test to read there. The milestone that
+// adds that map to MemoryStore must extend DeleteVendorAccount with the
+// matching delete and give this test a reader.
 func TestRoutingStoreDeleteVendorAccountCascades(t *testing.T) {
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	seedSQL := func(t *testing.T, s *SQLStore) {
@@ -76,11 +88,15 @@ func TestRoutingStoreDeleteVendorAccountCascades(t *testing.T) {
 			}
 		}
 
-		// Only the SQL drivers have child tables to populate and read.
+		// The model catalog is seeded and read through the store on every
+		// driver; the usage snapshot only exists on the SQL drivers.
 		sqlStore, isSQL := s.(*SQLStore)
 		if isSQL {
 			seedVendorAccountChildren(t, sqlStore, "va_casc", now)
 			seedVendorAccountChildren(t, sqlStore, "va_casc_bystander", now)
+		} else {
+			seedVendorAccountModels(t, s, "va_casc")
+			seedVendorAccountModels(t, s, "va_casc_bystander")
 		}
 
 		if err := s.DeleteVendorAccount(ctx, "va_casc"); err != nil {
@@ -91,6 +107,15 @@ func TestRoutingStoreDeleteVendorAccountCascades(t *testing.T) {
 		}
 		if _, err := s.VendorAccountByID(ctx, "va_casc_bystander"); err != nil {
 			t.Fatalf("deleting va_casc removed the sibling account: %v", err)
+		}
+
+		// Every driver: the deleted account's model rows are gone, the
+		// sibling's stay.
+		if models, err := s.VendorAccountModels(ctx, "va_casc"); err != nil || len(models) != 0 {
+			t.Errorf("vendor_account_models rows for the deleted account = %v, %v, want none (cascade)", models, err)
+		}
+		if models, err := s.VendorAccountModels(ctx, "va_casc_bystander"); err != nil || len(models) != 1 {
+			t.Errorf("vendor_account_models rows for the sibling account = %v, %v, want 1 (untouched)", models, err)
 		}
 
 		if !isSQL {

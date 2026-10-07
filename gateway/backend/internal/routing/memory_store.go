@@ -139,6 +139,12 @@ type MemoryStore struct {
 	// vendor accounts, migration 82), keyed by account id. Credentials are
 	// stored sealed, exactly as the SQL drivers hold them.
 	vendorAccounts map[string]VendorAccount
+	// vendorAccountModels mirrors vendor_account_models: account id -> the
+	// models that account serves (unordered on write; VendorAccountModels sorts
+	// by GatewayModel on read, like the SQL `order by gateway_model`).
+	// VendorAccountModel holds no pointers, so a copy is a plain slice copy.
+	// Deleting the account drops its whole entry (see DeleteVendorAccount).
+	vendorAccountModels map[string][]VendorAccountModel
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -175,6 +181,7 @@ func NewMemoryStore() *MemoryStore {
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 		vendorAccounts:           map[string]VendorAccount{},
+		vendorAccountModels:      map[string][]VendorAccountModel{},
 	}
 }
 
@@ -2817,11 +2824,10 @@ func (m *MemoryStore) vendorAccountsLocked(keep func(VendorAccount) bool) []Vend
 	return out
 }
 
-// DeleteVendorAccount removes the account. An unknown id is ErrNotFound. The
-// SQL driver cascades the account's model-catalog and usage-snapshot rows
-// through their FKs; the memory driver holds no such child maps yet (they
-// arrive with the milestones that add their writers), so there is nothing
-// further to drop here.
+// DeleteVendorAccount removes the account and its model rows (the SQL drivers
+// cascade them through the ON DELETE CASCADE FK). An unknown id is ErrNotFound.
+// The usage-snapshot child table still has no memory counterpart, so there is
+// nothing further to drop; the milestone that adds its map must delete it here.
 func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2829,5 +2835,45 @@ func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 		return storeerr.ErrNotFound
 	}
 	delete(m.vendorAccounts, id)
+	delete(m.vendorAccountModels, id)
+	return nil
+}
+
+// VendorAccountModels returns accountID's models sorted by GatewayModel. The
+// slice is ALWAYS non-nil (empty when there are none) and never aliases stored
+// state, matching the SQL driver's `make(..., 0)` + `order by gateway_model`.
+func (m *MemoryStore) VendorAccountModels(_ context.Context, accountID string) ([]VendorAccountModel, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rows := m.vendorAccountModels[accountID]
+	out := make([]VendorAccountModel, len(rows))
+	copy(out, rows)
+	sort.Slice(out, func(i, j int) bool { return out[i].GatewayModel < out[j].GatewayModel })
+	return out, nil
+}
+
+// SetVendorAccountModels atomically replaces accountID's whole model set
+// (mirrors the SQL delete-then-insert transaction; the in-memory assignment is
+// already atomic under m.mu, and a rejected set leaves the previous one
+// untouched, like a rolled-back transaction). The account must exist, and a
+// duplicate GatewayModel within the set is ErrConflict (the SQL composite
+// primary key).
+func (m *MemoryStore) SetVendorAccountModels(_ context.Context, accountID string, models []VendorAccountModel) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vendorAccounts[accountID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	seen := make(map[string]struct{}, len(models))
+	stored := make([]VendorAccountModel, 0, len(models))
+	for _, model := range models {
+		if _, dup := seen[model.GatewayModel]; dup {
+			return storeerr.ErrConflict
+		}
+		seen[model.GatewayModel] = struct{}{}
+		model.AccountID = accountID
+		stored = append(stored, model)
+	}
+	m.vendorAccountModels[accountID] = stored
 	return nil
 }

@@ -83,6 +83,77 @@ func (s *SQLiteStore) DeleteVendorAccount(ctx context.Context, id string) error 
 	return requireAffected(res)
 }
 
+// VendorAccountModels returns the models accountID serves, ordered by
+// gateway_model. The slice is always non-nil.
+func (s *SQLiteStore) VendorAccountModels(ctx context.Context, accountID string) ([]routing.VendorAccountModel, error) {
+	rows, err := s.query(ctx, `
+		select account_id, gateway_model, upstream_model, api_flavor
+		from vendor_account_models where account_id = ? order by gateway_model`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list vendor account models: %w", err)
+	}
+	defer rows.Close()
+	out := make([]routing.VendorAccountModel, 0)
+	for rows.Next() {
+		var m routing.VendorAccountModel
+		if err := rows.Scan(&m.AccountID, &m.GatewayModel, &m.UpstreamModel, &m.APIFlavor); err != nil {
+			return nil, fmt.Errorf("scan vendor account model: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate vendor account models: %w", err)
+	}
+	return out, nil
+}
+
+// SetVendorAccountModels atomically REPLACES accountID's whole model set
+// (delete-then-insert in one transaction, like SetRuntimeSpecGPUs). The account
+// must exist (an empty set on an unknown account is still ErrNotFound). A
+// duplicate gateway_model within the set violates the (account_id,
+// gateway_model) primary key and surfaces ErrConflict, rolling the delete back
+// so the previous set survives. Every row is written under accountID whatever
+// its own AccountID says.
+func (s *SQLiteStore) SetVendorAccountModels(ctx context.Context, accountID string, models []routing.VendorAccountModel) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set vendor account models tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, s.dl.rebind(`select count(*) from vendor_accounts where id = ?`), accountID).Scan(&exists); err != nil {
+		return fmt.Errorf("check vendor account: %w", err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from vendor_account_models where account_id = ?`), accountID); err != nil {
+		return fmt.Errorf("clear vendor account models: %w", err)
+	}
+	for _, m := range models {
+		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
+			insert into vendor_account_models (account_id, gateway_model, upstream_model, api_flavor)
+			values (?, ?, ?, ?)`),
+			accountID, m.GatewayModel, m.UpstreamModel, m.APIFlavor); err != nil {
+			// accountID was existence-checked above and no other column is an
+			// FK, so a failed insert is a duplicate (account_id, gateway_model).
+			if s.dl.isUniqueViolation(err) {
+				return ErrConflict
+			}
+			if s.dl.isForeignKeyViolation(err) {
+				// The account vanished between the check and the insert.
+				return ErrNotFound
+			}
+			return fmt.Errorf("insert vendor account model: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit vendor account models: %w", err)
+	}
+	return nil
+}
+
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
 	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.CreatedAt, &a.UpdatedAt)
