@@ -33,6 +33,7 @@ type API interface {
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
 	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
+	BeginVendorAccountDeviceConnect(context.Context, auth.Token, string) (string, string, error)
 	BenchmarkOverrideLeases(context.Context) (map[string]BenchmarkOverrideLease, error)
 	CaptureDetail(auth.Token, string) (CaptureDetail, error)
 	CertEdgeRequireHTTPSChecked(context.Context) bool
@@ -138,6 +139,7 @@ type API interface {
 	NetbirdPeers(context.Context) ([]netbird.Peer, error)
 	NetbirdPolicyContext(context.Context) NetbirdPolicyContextDTO
 	NetbirdTokenStatus(context.Context) (NetbirdTokenStatusDTO, error)
+	PollVendorAccountDeviceConnect(context.Context, auth.Token, string) (bool, error)
 	PrepareChatRun(context.Context, auth.Token, string, PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error)
 	ProbeEdgeTLS(context.Context) (EdgeProbeDTO, error)
 	ProjectCandidates(context.Context, auth.Token, string) ([]UserRefDTO, []GroupRefDTO, error)

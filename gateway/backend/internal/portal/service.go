@@ -164,6 +164,18 @@ var (
 	ErrVendorAccountConnectRejected      = errors.New("vendor_account.connect_rejected")
 	ErrVendorAccountConnectUpstream      = errors.New("vendor_account.connect_upstream_failed")
 	ErrVendorAccountConnectKeyRequired   = errors.New("vendor_account.connect_key_required")
+
+	// Device-code connect (the OPTIONAL Codex deviceauth flow; see
+	// service_vendor_device_connect.go). It reuses the connect sentinels above for
+	// a vendor refusal / upstream failure / unsealable store, and adds two of its
+	// own.
+	// ErrVendorAccountDeviceUnsupported: the device flow exists for OpenAI only,
+	// so a begin/poll on any other vendor's subscription account is refused (a 400,
+	// the subscription-account equivalent of not_subscription).
+	// ErrVendorAccountDeviceConnectState: a poll with no device connect in progress
+	// -- none was begun, or it outlived its TTL.
+	ErrVendorAccountDeviceUnsupported  = errors.New("vendor_account.device_not_supported")
+	ErrVendorAccountDeviceConnectState = errors.New("vendor_account.device_connect_state")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable
@@ -698,6 +710,10 @@ type Service struct {
 	// vendorConnect holds the subscription connect flow's endpoints, http client
 	// and in-memory pending state (see vendorConnectState).
 	vendorConnect vendorConnectState
+	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
+	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
+	// OpenAI endpoints and http client, so it needs no wiring of its own.
+	vendorDeviceConnect vendorDeviceConnectState
 	// reconcileMu serializes the store-mutating critical section of
 	// reconcileApplicationModels across all callers (manual sync + the
 	// background model_sync probe loop, which reconciles many applications

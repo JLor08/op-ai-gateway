@@ -227,6 +227,18 @@ func (_d *APIWithTracing) BeginVendorAccountConnect(ctx context.Context, t1 auth
 	return _d.API.BeginVendorAccountConnect(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) BeginVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (s2 string, s3 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BeginVendorAccountDeviceConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.BeginVendorAccountDeviceConnect(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) BenchmarkOverrideLeases(ctx context.Context) (m1 map[string]BenchmarkOverrideLease, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BenchmarkOverrideLeases")
 	defer span.End()
@@ -1309,6 +1321,18 @@ func (_d *APIWithTracing) NetbirdTokenStatus(ctx context.Context) (n1 NetbirdTok
 		}
 	}()
 	return _d.API.NetbirdTokenStatus(ctx)
+}
+
+func (_d *APIWithTracing) PollVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PollVendorAccountDeviceConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PollVendorAccountDeviceConnect(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) PrepareChatRun(ctx context.Context, t1 auth.Token, s1 string, p1 PrepareRunRequest) (ca1 []ChatAPIMessage, c2 ChatRunSettings, err error) {
