@@ -3,8 +3,6 @@
 
 package vendorauth
 
-import "net/url"
-
 // ============================================================================
 // EVERY VALUE IN THIS FILE IS REVERSE-ENGINEERED FROM THE OFFICIAL VENDOR CLIs.
 //
@@ -39,6 +37,11 @@ const (
 	AnthropicRedirectURI = "https://console.anthropic.com/oauth/code/callback"
 	// AnthropicScopes is the space-separated scope list the CLI requests.
 	AnthropicScopes = "org:create_api_key user:profile user:inference"
+	// AnthropicParamShowCode / AnthropicParamShowCodeValue are the authorize
+	// parameter that makes the callback page display the "code#state" string
+	// for pasting instead of redirecting a browser to a listener.
+	AnthropicParamShowCode      = "code"
+	AnthropicParamShowCodeValue = "true"
 	// AnthropicBeta is the anthropic-beta header value that enables OAuth
 	// bearer tokens on the Messages API. Not used by this package's flows;
 	// kept here so every Anthropic vendor constant lives in one file.
@@ -78,10 +81,12 @@ const (
 	OpenAIScopes = "openid profile email offline_access"
 
 	// Extra authorize-URL parameters the Codex CLI adds on top of standard
-	// OAuth+PKCE.
-	OpenAIParamIDTokenAddOrganizations = "id_token_add_organizations" // = "true"
-	OpenAIParamCodexCLISimplifiedFlow  = "codex_cli_simplified_flow"  // = "true"
-	OpenAIParamOriginator              = "originator"                 // = OpenAIOriginator
+	// OAuth+PKCE (added by BuildOpenAIAuthorizeURL): id_token_add_organizations
+	// and codex_cli_simplified_flow are set to "true", originator to
+	// OpenAIOriginator.
+	OpenAIParamIDTokenAddOrganizations = "id_token_add_organizations"
+	OpenAIParamCodexCLISimplifiedFlow  = "codex_cli_simplified_flow"
+	OpenAIParamOriginator              = "originator"
 	// OpenAIOriginator identifies the client to the vendor; also sent as the
 	// originator request header at dispatch time.
 	OpenAIOriginator = "codex_cli_rs"
@@ -118,9 +123,6 @@ type Endpoints struct {
 	RedirectURI string
 	// Scopes is the space-separated scope list.
 	Scopes string
-	// ExtraAuthorizeParams are appended to the authorize URL query (OpenAI's
-	// codex_cli_* parameters). Standard parameters win on a key clash.
-	ExtraAuthorizeParams url.Values
 }
 
 // DefaultAnthropicEndpoints returns the reverse-engineered Claude Code OAuth
@@ -145,10 +147,5 @@ func DefaultOpenAIEndpoints() Endpoints {
 		DeviceAuthorizeURL: OpenAIDeviceAuthorizeURL,
 		RedirectURI:        OpenAIRedirectURI,
 		Scopes:             OpenAIScopes,
-		ExtraAuthorizeParams: url.Values{
-			OpenAIParamIDTokenAddOrganizations: {"true"},
-			OpenAIParamCodexCLISimplifiedFlow:  {"true"},
-			OpenAIParamOriginator:              {OpenAIOriginator},
-		},
 	}
 }
