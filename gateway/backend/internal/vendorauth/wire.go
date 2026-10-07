@@ -24,9 +24,10 @@ var (
 	// needs reconnecting; transient failures (network, 5xx, 429) never match.
 	ErrAuthRejected = errors.New("vendorauth: vendor rejected the credentials")
 
-	// ErrBadTokenResponse marks a 2xx token-endpoint answer that is not a usable
-	// token response (not JSON, or no access_token).
-	ErrBadTokenResponse = errors.New("vendorauth: malformed token response")
+	// ErrBadTokenResponse marks a 2xx answer from a vendor OAuth endpoint that is not
+	// usable: not JSON, a token response without an access_token, or a device
+	// authorization without its codes.
+	ErrBadTokenResponse = errors.New("vendorauth: malformed OAuth response")
 )
 
 // StatusError is a non-2xx answer from a vendor OAuth endpoint. It never
