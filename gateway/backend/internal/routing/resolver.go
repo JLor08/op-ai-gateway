@@ -816,7 +816,18 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
 	for _, acc := range accounts {
+		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
+		// disabled accounts are skipped and fall through to the standard path.
 		if acc.Status != VendorAccountStatusActive {
+			continue
+		}
+		// OpenAI subscription serving is Milestone 5b (Responses-only,
+		// chatgpt-account-id header, a different upstream). Until then an OpenAI
+		// subscription account cannot serve, so it must NOT match here — skip it and
+		// let the standard path decide (ErrNoModelRoute when nothing self-hosted
+		// serves the model). Anthropic subscription and every api_key account are
+		// served below.
+		if acc.AuthType == VendorAuthSubscription && acc.Vendor != VendorAnthropic {
 			continue
 		}
 		models, err := r.store.VendorAccountModels(ctx, acc.ID)
@@ -826,6 +837,13 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		for _, m := range models {
 			if m.GatewayModel != req.Model {
 				continue
+			}
+			if acc.AuthType == VendorAuthSubscription {
+				// Anthropic subscription (OAuth): the bearer is resolved + refreshed
+				// at dispatch from the account's sealed OAuth tokens, so the target
+				// carries VendorAccountID + the Claude-Code masquerade + the required
+				// OAuth headers, and NO APIToken.
+				return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true, nil
 			}
 			return vendorAccountTarget(acc, m, req.Model, apiFlavor), true, nil
 		}
@@ -863,6 +881,49 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		// Both inbound dialects are served; the zero endpoint modes mean translate,
 		// so native-passthrough converts whichever one the caller used to the
 		// vendor's native wire format.
+		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
+	}
+}
+
+// vendorSubscriptionAnthropicTarget assembles the Target for a matched ANTHROPIC
+// SUBSCRIPTION (Claude Pro/Max OAuth) account + model row (Milestone 5a). It
+// differs from the api_key vendorAccountTarget in exactly the subscription-path
+// concerns:
+//
+//   - The bearer is NOT carried in APIToken. A subscription account holds OAuth
+//     tokens that must be opened, refreshed when stale, and attached at dispatch
+//     time; VendorAccountID names the account the dispatch layer (upstreamAuthCtx)
+//     resolves the bearer from, and APIToken/APITokenHeader stay empty.
+//   - Masquerade = claude_code makes the Anthropic client prepend the exact
+//     Claude-Code system block the OAuth Messages path requires.
+//   - ExtraHeaders carries the two headers the OAuth path needs on every call:
+//     anthropic-version and the anthropic-beta oauth opt-in. (anthropic-version is
+//     also set intrinsically by the client; repeating it here is harmless and
+//     keeps the subscription requirement explicit in one place.)
+//
+// Only Anthropic reaches here — resolveVendorAccount declines an OpenAI
+// subscription account (Milestone 5b). The values below are the live
+// REVERSE-ENGINEERED Claude Code constants; see internal/vendorauth for their
+// canonical home and the ToS caveat.
+func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+	return Target{
+		RouteID:         "vendor:" + acc.ID + ":" + model,
+		ServerID:        "",
+		Provider:        ProviderVendorAnthropic,
+		Endpoint:        "https://api.anthropic.com",
+		Model:           model,
+		ProviderModel:   m.UpstreamModel,
+		Timeout:         vendorAccountDefaultTimeout,
+		APIFlavor:       apiFlavor,
+		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:  "",
+		VendorAccountID: acc.ID,
+		Masquerade:      MasqueradeClaudeCode,
+		ExtraHeaders: map[string]string{
+			"anthropic-version": "2023-06-01",
+			"anthropic-beta":    "oauth-2025-04-20",
+		},
+		// Both inbound dialects are served via translate (zero endpoint modes).
 		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
 	}
 }
