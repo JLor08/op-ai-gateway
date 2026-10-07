@@ -116,6 +116,7 @@ var allowedDeps = map[string][]string{
 		"internal/store",
 		"internal/theme",
 		"internal/usage",
+		"internal/vendorauth",
 	},
 	"internal/provider": {
 		"internal/inference",

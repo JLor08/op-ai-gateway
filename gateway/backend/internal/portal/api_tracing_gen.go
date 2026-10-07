@@ -215,6 +215,18 @@ func (_d *APIWithTracing) AuthorizeServerManage(ctx context.Context, t1 auth.Tok
 	return _d.API.AuthorizeServerManage(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) BeginVendorAccountConnect(ctx context.Context, t1 auth.Token, s1 string) (s2 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BeginVendorAccountConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.BeginVendorAccountConnect(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) BenchmarkOverrideLeases(ctx context.Context) (m1 map[string]BenchmarkOverrideLease, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BenchmarkOverrideLeases")
 	defer span.End()
@@ -319,6 +331,30 @@ func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1
 		}
 	}()
 	return _d.API.CommitAssistant(ctx, t1, s1, a1, s2)
+}
+
+func (_d *APIWithTracing) CompleteVendorAccountConnect(ctx context.Context, t1 auth.Token, s1 string, s2 string) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CompleteVendorAccountConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CompleteVendorAccountConnect(ctx, t1, s1, s2)
+}
+
+func (_d *APIWithTracing) ConnectVendorAccountImport(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string, t2 time.Time) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ConnectVendorAccountImport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ConnectVendorAccountImport(ctx, t1, s1, s2, s3, t2)
 }
 
 func (_d *APIWithTracing) CreateApplication(ctx context.Context, t1 auth.Token, s1 string, c2 CreateApplicationRequest) (a1 ApplicationDTO, err error) {

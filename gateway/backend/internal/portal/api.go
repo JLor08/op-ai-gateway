@@ -32,6 +32,7 @@ type API interface {
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
+	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
 	BenchmarkOverrideLeases(context.Context) (map[string]BenchmarkOverrideLease, error)
 	CaptureDetail(auth.Token, string) (CaptureDetail, error)
 	CertEdgeRequireHTTPSChecked(context.Context) bool
@@ -43,6 +44,8 @@ type API interface {
 	CertificatesView(context.Context) ([]CertificateDTO, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
+	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)
+	ConnectVendorAccountImport(context.Context, auth.Token, string, string, string, time.Time) (VendorAccountDTO, error)
 	CreateApplication(context.Context, auth.Token, string, CreateApplicationRequest) (ApplicationDTO, error)
 	CreateChat(context.Context, auth.Token, CreateChatRequest) (ChatDTO, error)
 	CreateGatewaySetupKey(context.Context, auth.Token) (string, string, error)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/certissue"
@@ -21,6 +22,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/theme"
 	"op-ai-gateway/internal/usage"
+	"op-ai-gateway/internal/vendorauth"
 	"slices"
 	"sort"
 	"strconv"
@@ -138,6 +140,30 @@ var (
 	// vendor-account service method returns it, before doing anything, while
 	// the flag is off. Mirrors ErrNetbirdModuleDisabled; mapped to a 409.
 	ErrVendorAccountsDisabled = errors.New("vendor_accounts.module_disabled")
+
+	// Subscription connect (the OAuth code-paste flow and the token import).
+	// ErrVendorAccountNotSubscription: connect operates on an auth_type
+	// subscription account only (the auth type is immutable, so an api_key account
+	// can never become one).
+	// ErrVendorAccountConnectTokenRequired: an import without an access token.
+	// ErrVendorAccountConnectCodeRequired: a complete whose pasted value carries
+	// no authorization code.
+	// ErrVendorAccountConnectState: nothing to complete -- no connect was begun,
+	// it expired, or the pasted state is not the one issued by begin.
+	// ErrVendorAccountConnectRejected: the vendor refused the pasted code (a typo,
+	// an already-used or expired code). Deliberately NOT mapped to a 401: the
+	// portal treats a 401 from this API as an expired session.
+	// ErrVendorAccountConnectUpstream: the vendor could not be reached or
+	// answered with something unusable (a 5xx, a malformed reply).
+	// ErrVendorAccountConnectKeyRequired: the token set cannot be sealed -- a
+	// disk-backed store with no encryption key (wraps capture.ErrKeyRequired).
+	ErrVendorAccountNotSubscription      = errors.New("vendor_account.not_subscription")
+	ErrVendorAccountConnectTokenRequired = errors.New("vendor_account.connect_token_required")
+	ErrVendorAccountConnectCodeRequired  = errors.New("vendor_account.connect_code_required")
+	ErrVendorAccountConnectState         = errors.New("vendor_account.connect_state")
+	ErrVendorAccountConnectRejected      = errors.New("vendor_account.connect_rejected")
+	ErrVendorAccountConnectUpstream      = errors.New("vendor_account.connect_upstream_failed")
+	ErrVendorAccountConnectKeyRequired   = errors.New("vendor_account.connect_key_required")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable
@@ -467,6 +493,16 @@ type ServiceDeps struct {
 	// place an order (issueCertificate returns an error); the self_signed mode
 	// needs no challenge store at all.
 	ACMEChallenges certissue.ChallengeStore
+	// VendorAnthropicEndpoints / VendorOpenAIEndpoints are the OAuth endpoints the
+	// subscription connect flow (begin/complete) uses. The zero value (a deps
+	// literal that omits them) means the reverse-engineered vendor defaults
+	// (vendorauth.DefaultAnthropicEndpoints / DefaultOpenAIEndpoints); tests
+	// inject httptest endpoints here.
+	VendorAnthropicEndpoints vendorauth.Endpoints
+	VendorOpenAIEndpoints    vendorauth.Endpoints
+	// VendorHTTPClient performs the connect flow's token exchange. nil means a
+	// client with a 30s timeout.
+	VendorHTTPClient *http.Client
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -659,6 +695,9 @@ type Service struct {
 	// Always non-nil after NewService -- a nil deps.Themes is defaulted to an
 	// empty *theme.Registry so every reader can call its methods unguarded.
 	themes *theme.Registry
+	// vendorConnect holds the subscription connect flow's endpoints, http client
+	// and in-memory pending state (see vendorConnectState).
+	vendorConnect vendorConnectState
 	// reconcileMu serializes the store-mutating critical section of
 	// reconcileApplicationModels across all callers (manual sync + the
 	// background model_sync probe loop, which reconciles many applications
@@ -714,6 +753,18 @@ func NewService(deps ServiceDeps) *Service {
 	if themes == nil {
 		themes = &theme.Registry{}
 	}
+	vendorAnthropic := deps.VendorAnthropicEndpoints
+	if vendorAnthropic == (vendorauth.Endpoints{}) {
+		vendorAnthropic = vendorauth.DefaultAnthropicEndpoints()
+	}
+	vendorOpenAI := deps.VendorOpenAIEndpoints
+	if vendorOpenAI == (vendorauth.Endpoints{}) {
+		vendorOpenAI = vendorauth.DefaultOpenAIEndpoints()
+	}
+	vendorClient := deps.VendorHTTPClient
+	if vendorClient == nil {
+		vendorClient = &http.Client{Timeout: vendorConnectHTTPTimeout}
+	}
 	svc := &Service{
 		users:            deps.Users,
 		tokens:           deps.Tokens,
@@ -747,6 +798,11 @@ func NewService(deps ServiceDeps) *Service {
 			keyFile:                  deps.NetbirdKeyFile,
 			onDomainChanged:          deps.OnNetbirdDomainChanged,
 			tokenRotateBeforeDefault: tokenRotateDefault,
+		},
+		vendorConnect: vendorConnectState{
+			anthropic: vendorAnthropic,
+			openai:    vendorOpenAI,
+			client:    vendorClient,
 		},
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
