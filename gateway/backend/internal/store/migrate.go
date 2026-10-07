@@ -114,6 +114,7 @@ var migrations = []migration{
 	{version: 79, name: "model_mappings_drop_capability_columns", up: migration79Up},
 	{version: 80, name: "application_responses_live_timings", up: migration80Up},
 	{version: 81, name: "usage_events_billing_unit", up: migration81Up},
+	{version: 82, name: "vendor_accounts", up: migration82Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3847,4 +3848,63 @@ func migration81Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration82Up adds the per-user external vendor accounts ("Anbieter"): the
+// vendor_accounts table itself, its per-account model catalog
+// (vendor_account_models, keyed by account + gateway model name) and the
+// latest rate-limit usage snapshot scraped from vendor responses
+// (vendor_account_usage, one row per account), plus usage_events.account_id so
+// a recorded request can name the vendor account that served it (empty for the
+// ordinary AI-server path).
+//
+// owner_user_id cascades from users, and both child tables cascade from
+// vendor_accounts, so deleting a user or an account leaves no dangling rows.
+// The credential columns (api_key, oauth_tokens) hold SEALED values
+// (capture.SealSecret) -- never plaintext.
+//
+// Wide Go values need wide Postgres columns: the usage percentages are
+// 'double precision' (-1 = unknown), and the nullable reset times use
+// dl.timestampType(). baselineCreateStatements is NOT touched (frozen as of
+// v60), so the tables and the usage_events column live only here -- the same
+// discipline migration61Up and migration81Up follow.
+func migration82Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists vendor_accounts (
+			id text primary key,
+			owner_user_id text not null references users(id) on delete cascade,
+			vendor text not null,
+			auth_type text not null,
+			name text not null,
+			status text not null,
+			api_key text not null default '',
+			oauth_tokens text not null default '',
+			created_at ` + ts + ` not null,
+			updated_at ` + ts + ` not null
+		)`,
+		`create index if not exists idx_vendor_accounts_owner on vendor_accounts(owner_user_id)`,
+		`create table if not exists vendor_account_models (
+			account_id text not null references vendor_accounts(id) on delete cascade,
+			gateway_model text not null,
+			upstream_model text not null,
+			api_flavor text not null,
+			primary key (account_id, gateway_model)
+		)`,
+		`create table if not exists vendor_account_usage (
+			account_id text primary key references vendor_accounts(id) on delete cascade,
+			five_hour_pct double precision not null default -1,
+			five_hour_reset_at ` + ts + `,
+			weekly_pct double precision not null default -1,
+			weekly_reset_at ` + ts + `,
+			credit_balance text not null default '',
+			updated_at ` + ts + ` not null
+		)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return addColumnIfMissing(ctx, tx, dl, "usage_events", "account_id text not null default ''")
 }
