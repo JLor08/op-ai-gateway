@@ -110,7 +110,10 @@ type vramFixture struct {
 	// ignores cancellation entirely, which silently made the restore's
 	// cancellation guarantee untestable (see
 	// TestVRAMRestoreRunsOnACancelledRunContext).
-	mem         routing.Store
+	mem routing.Store
+	// settings is the portal's settings store, which holds the override
+	// lease the run records its drain in.
+	settings    portal.SystemSettingsStore
 	provider    *vramFakeProvider
 	notifies    func() []string
 	target      benchmarkTarget
@@ -142,6 +145,9 @@ type vramFixtureOpts struct {
 	// sqlite driver when the property under test is one MemoryStore cannot
 	// express -- above all CONTEXT CANCELLATION, which it ignores.
 	store routing.Store
+	// settings overrides the portal's settings store, which holds the
+	// override lease. Nil means portal.NewMemorySystemSettings().
+	settings portal.SystemSettingsStore
 }
 
 // forEachVRAMStore runs run against both production routing.Store backends,
@@ -262,9 +268,13 @@ func newVRAMFixture(t *testing.T, opts vramFixtureOpts) *vramFixture {
 		VRAMTotalBytes: 2 * 24576 * oneMiB, UpdatedAt: now,
 	}))
 
+	settings := opts.settings
+	if settings == nil {
+		settings = portal.NewMemorySystemSettings()
+	}
 	dir := portal.NewMemoryDirectory(nil)
 	portalSvc := portal.NewService(portal.ServiceDeps{
-		Users: dir, Groups: dir, Usage: usage.NewRecorder(), Routes: mem,
+		Users: dir, Groups: dir, Usage: usage.NewRecorder(), Routes: mem, SystemSettings: settings,
 		Clock: func() time.Time { return now },
 	})
 	var notifyMu sync.Mutex
@@ -289,7 +299,7 @@ func newVRAMFixture(t *testing.T, opts vramFixtureOpts) *vramFixture {
 	srv.AgentFeatures.Set("srv1", []string{"runtime_manager"})
 
 	f := &vramFixture{
-		srv: srv, mem: mem, provider: fake, target: benchmarkTarget{
+		srv: srv, mem: mem, settings: settings, provider: fake, target: benchmarkTarget{
 			server:  routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test"},
 			app:     app,
 			mapping: targetMapping,
@@ -722,14 +732,14 @@ func TestVRAMRunPlanWarnsOnlyOnTheAgentsOwnNeighbours(t *testing.T) {
 // WebSocket cannot shorten it.
 //
 // The delay used to be picked from AgentStreams.hasConn -- probed BEFORE the
-// drain wrote anything -- and it assumed a delivery nothing verifies.
-// PushRuntimeConfig runs in a detached goroutine and returns silently when the
-// derive or the marshal fails; AgentStreamRegistry.NotifyRuntimeConfig sends to
-// ZERO connections when the socket closed after that probe, and drops the frame
-// with a slog.Debug when a connection's send queue is full. In every one of
-// those cases the override binds only on the agent's next runtime poll, while
-// the run confirmed every idle spec two seconds after the write and reported
-// Isolated: true.
+// drain wrote anything -- and it assumed a delivery nothing verifies. A push
+// pass returns silently when the derive or the marshal fails, and its worker
+// carries on with a pass a later write owes, if any, never with a retry;
+// AgentStreamRegistry.NotifyRuntimeConfig sends to ZERO connections when the
+// socket closed after that probe, and drops the frame with a slog.Debug when a
+// connection's send queue is full. In every one of those cases the override
+// binds only on the agent's next runtime poll, while the run confirmed every
+// idle spec two seconds after the write and reported Isolated: true.
 //
 // So the bound is the one delivery mechanism that is GUARANTEED -- the poll --
 // whatever the transport looks like. hasConn still decides the operator-facing
@@ -1028,7 +1038,7 @@ func TestVRAMRestoreRunsOnACancelledRunContext(t *testing.T) {
 		}
 		cancel()
 
-		if failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
+		if failed, takenOver := f.srv.restoreBenchmarkOverrides(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
 			t.Fatalf("restore on a cancelled context reported failed=%v takenOver=%v", failed, takenOver)
 		}
 		if state := f.adminState(t, f.targetSpec); state != "" {
@@ -1038,9 +1048,9 @@ func TestVRAMRestoreRunsOnACancelledRunContext(t *testing.T) {
 }
 
 // TestVRAMRunRestoresTheFleetOnACancelledRun is the same guarantee one level
-// up, through the WHOLE run rather than through vramRestore alone: an
-// operator who cancels a VRAM run mid-flight must not be left with a fleet
-// that refuses to start.
+// up, through the WHOLE run rather than through restoreBenchmarkOverrides
+// alone: an operator who cancels a VRAM run mid-flight must not be left with a
+// fleet that refuses to start.
 //
 // Cancelling the run's context is the realistic shape (the trigger stores a
 // cancel on the run and the portal's stop button calls it), and it cancels
@@ -1104,7 +1114,7 @@ func TestVRAMRestoreReReadsSoAnOperatorEditSurvives(t *testing.T) {
 		t.Fatalf("operator edit: %v", err)
 	}
 
-	if failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
+	if failed, takenOver := f.srv.restoreBenchmarkOverrides(ctx, []string{f.targetSpec}); len(failed) != 0 || len(takenOver) != 0 {
 		t.Fatalf("restore reported failed=%v takenOver=%v", failed, takenOver)
 	}
 	after, _, err := f.mem.RuntimeSpecByID(ctx, f.targetSpec)
@@ -1124,21 +1134,24 @@ func TestVRAMRestoreReReadsSoAnOperatorEditSurvives(t *testing.T) {
 // because the portal turns one of them into an INSTRUCTION.
 //
 // If the freshly-read admin_state is no longer this run's force_stopped, the
-// restore writes nothing -- correctly, somebody else owns the field. But
+// restore writes nothing -- correctly, the override is not this run's. But
 // reporting that as restore_failed rendered "these specs are still
 // force_stopped and have to be cleared by hand", which is false (the spec is
-// force_running, or already cleared) and whose instruction STOPS a model the
-// operator had just deliberately started. A genuine write failure is the other
-// case and is the one that really does leave the override in place.
+// force_running, or carries no override) and whose instruction names an
+// override that is not there, or is not the run's. A genuine write failure is
+// the other case and is the one that can leave the override in place.
 func TestVRAMRestoreDistinguishesATakeoverFromAWriteFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		takeoverTo string
 	}{
-		// The operator hits "Force start" on the spec mid-run.
+		// A writer the run's reservation does not hold off (an operator's
+		// "Force start" served by another gateway process on the same store,
+		// say) force-starts the spec mid-run.
 		{name: "an operator started the model again", takeoverTo: "force_running"},
-		// Or "Clear override", which leaves the field at "" -- also no longer
-		// this run's, and also nothing to clear by hand.
+		// Or clears the override, which leaves the field at "" -- also no
+		// longer this run's, and also nothing to clear by hand. A drain write
+		// that failed before it stored force_stopped leaves the same "".
 		{name: "an operator cleared the override", takeoverTo: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1151,7 +1164,7 @@ func TestVRAMRestoreDistinguishesATakeoverFromAWriteFailure(t *testing.T) {
 				t.Fatalf("takeover: %v", err)
 			}
 
-			failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec})
+			failed, takenOver := f.srv.restoreBenchmarkOverrides(ctx, []string{f.targetSpec})
 			if len(failed) != 0 {
 				t.Fatalf("restore_failed = %v, want none: this spec is not still force_stopped, so telling the operator to clear it by hand would stop a model they started", failed)
 			}
@@ -1189,7 +1202,7 @@ func TestVRAMRestoreReportsAGenuineWriteFailure(t *testing.T) {
 		t.Fatalf("close sqlite: %v", err)
 	}
 
-	failed, takenOver := f.srv.vramRestore(ctx, []string{f.targetSpec})
+	failed, takenOver := f.srv.restoreBenchmarkOverrides(ctx, []string{f.targetSpec})
 	if len(failed) != 1 || failed[0] != f.targetSpec {
 		t.Fatalf("restore_failed = %v, want [%s]: the override really is still there", failed, f.targetSpec)
 	}
@@ -1202,7 +1215,7 @@ func TestVRAMRestoreReportsAGenuineWriteFailure(t *testing.T) {
 // its override with it, so it is not something an operator must clear by hand.
 func TestVRAMRestoreTreatsADeletedSpecAsRestored(t *testing.T) {
 	f := newVRAMFixture(t, vramFixtureOpts{})
-	failed, takenOver := f.srv.vramRestore(context.Background(), []string{"rspec_gone"})
+	failed, takenOver := f.srv.restoreBenchmarkOverrides(context.Background(), []string{"rspec_gone"})
 	if len(failed) != 0 || len(takenOver) != 0 {
 		t.Fatalf("restore_failed = %v, restore_taken_over = %v, want none for a deleted spec", failed, takenOver)
 	}
@@ -1332,11 +1345,13 @@ func TestVRAMRunOwnershipGuard(t *testing.T) {
 }
 
 // TestVRAMRunAlreadyResidentIsContaminationNotAShortcut: after the drain was
-// confirmed, a model that STILL reports resident is being served by something
-// the gateway did not stop. The load core would return "loaded" without
-// loading, the baseline would already contain the model, and the delta would
-// be a definitive ~0 -- so the run reports inconclusive and says why, and
-// reports NO delta.
+// confirmed, the probe (here an API-set loaded_models_path) STILL lists the
+// target once the run cleared its override. With the default probe, /running,
+// that is the target's own child up again before the run loaded it (a request
+// reached the router, or a pinned target restarted at the clear). The load
+// core returns "loaded" without loading or generating, so the run has no load
+// of its own to measure: it reports inconclusive and says why, and reports NO
+// delta.
 func TestVRAMRunAlreadyResidentIsContaminationNotAShortcut(t *testing.T) {
 	f := newVRAMFixture(t, vramFixtureOpts{})
 	f.seedLatestSample()
@@ -1539,10 +1554,10 @@ func TestVRAMRunIsolationTimeoutStillRestores(t *testing.T) {
 }
 
 // TestVRAMRunEveryAdminStateWriteNotifies is test-plan item 5 at the run
-// level: one notification per spec on the drain AND one per spec on the
-// restore. Without it the drain silently degrades into a 60 s wait, and worse,
-// a no-process spec could start mid-measurement because the refusal never
-// arrived.
+// level: one notification for the drain batch, one for the target's own
+// clear, and one for the restore batch. Without them the drain silently
+// degrades into a 60 s wait, and worse, a no-process spec could start
+// mid-measurement because the refusal never arrived.
 func TestVRAMRunEveryAdminStateWriteNotifies(t *testing.T) {
 	f := newVRAMFixture(t, vramFixtureOpts{})
 	f.seedLatestSample()
@@ -1550,8 +1565,8 @@ func TestVRAMRunEveryAdminStateWriteNotifies(t *testing.T) {
 	f.provider.onStream = func() { f.used0.Store(21500 * oneMiB) }
 
 	f.run(t)
-	if got := f.notifies(); len(got) != 4 {
-		t.Fatalf("runtime-changed notifications = %#v, want 4 (two specs drained, two restored)", got)
+	if got := f.notifies(); len(got) != 3 {
+		t.Fatalf("runtime-changed notifications = %#v, want 3 (the drain batch, the target's clear, the restore batch)", got)
 	}
 }
 

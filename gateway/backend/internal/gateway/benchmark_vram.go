@@ -29,15 +29,20 @@ const (
 	// arrived is compatible with everything on the wire.
 
 	// vramEvidenceStoppedAfterWrite: a spec that HAD a live process when the
-	// write landed is in a no-process state on an admissible frame. A stopped
+	// write landed, as the last runtime status before the write shows it
+	// (vramLiveProcessBySpec), is in a no-process state on an admissible
+	// frame. A stopped
 	// frame that predates the write proves nothing -- and neither does one from
 	// before the override is known to have landed, because a spec's own exit
 	// (an idle timeout, a crash into `crashed`/`backoff`, both of which the
 	// agent restarts from) looks identical to an applied override.
 	vramEvidenceStoppedAfterWrite = "stopped_after_write"
-	// vramEvidenceNoProcessAtWrite: the spec had no live process when the write
-	// landed, and force_stopped refuses its restart -- a claim about a document
-	// the agent has to be holding, hence the same admissibility rule.
+	// vramEvidenceNoProcessAtWrite: that status showed the spec without a live
+	// process, and force_stopped refuses its restart -- a claim about a
+	// document the agent has to be holding, hence the same admissibility rule.
+	// The label follows the state, not the child: a start_failed spec whose
+	// child a start timeout is still terminating earns it too, although the
+	// write drains that child (vramStatesNoProcess).
 	vramEvidenceNoProcessAtWrite = "no_process_at_write"
 )
 
@@ -86,9 +91,15 @@ const (
 	vramInconclusiveIsolationTimeout = "isolation_timeout"
 	vramInconclusiveBaselineUnstable = "baseline_unstable"
 	vramInconclusivePostLoadUnstable = "post_load_unstable"
-	// vramInconclusiveAlreadyResident: the target still reported resident after
-	// the drain was confirmed, so something the gateway cannot stop is serving
-	// it. A delta measured against that baseline would be ~0 and definitive.
+	// vramInconclusiveAlreadyResident: after a confirmed drain, the probe still
+	// listed the target after the run cleared its override and before it
+	// loaded anything. With the default probe, the agent router's /running,
+	// which lists only the agent's own running children, the target's own
+	// child was up again: a request reached the router, or a pinned target
+	// restarted at the clear. An API-set loaded_models_path replaces /running
+	// and answers whatever that path lists. The core then returns without
+	// loading or generating, so the run has no load of its own to measure and
+	// reports no delta.
 	vramInconclusiveAlreadyResident = "already_resident"
 	// vramInconclusiveBelowFloor: a confirmed-resident model whose headline
 	// delta is below the noise floor. No model costs ~0 MB, and 0 means
@@ -174,24 +185,45 @@ type VRAMReport struct {
 	// complete, this says how strong the evidence was allowed to be. The two
 	// are read together, which is why they travel together.
 	IsolationProof string `json:"isolation_proof,omitempty"`
-	// DrainedSpecIDs is what this run force-stopped. It is reported so the
-	// portal can name the fleet an operator must clear by hand if the gateway
-	// dies between the drain and the restore.
+	// DrainedSpecIDs is the specs the drain wrote or may have written: a drain
+	// write that failed may or may not have stored force_stopped, so it is
+	// named either way. It is reported so the portal can name the fleet that
+	// may stay force_stopped if the gateway dies between the drain and the
+	// restore, until the gateway starts again and clears it from the override
+	// lease (ReconcileBenchmarkOverrideLeases).
 	DrainedSpecIDs []string `json:"drained_spec_ids,omitempty"`
-	// RestoreFailed is the specs whose override this run could not clear, so
-	// they ARE still force_stopped and an operator has to clear them by hand.
-	// A store error, and nothing else: see RestoreTakenOver for the other way
-	// a restore can not happen.
+	// RestoreFailed is the specs whose restore write returned an error, so
+	// they may still be force_stopped: a write can also fail after it stored
+	// the cleared row (its GPU rows or its read-back failed). An operator
+	// clears the ones that still are by hand, or the next reconcile of the
+	// override lease, which keeps them all, does. A failed write, never a
+	// takeover: see RestoreTakenOver for the other way a restore can not
+	// happen.
 	RestoreFailed []string `json:"restore_failed,omitempty"`
-	// RestoreTakenOver is the specs whose admin_state was no longer this run's
-	// force_stopped when the restore re-read it, so the restore correctly
-	// wrote NOTHING: an operator's mid-run "Force start" or "Clear override".
+	// RestoreTakenOver is the specs that read another admin_state than
+	// force_stopped when the restore re-read them, so the restore wrote
+	// NOTHING and left them alone. A spec gets here in one of three ways:
+	//   - the drain's own write failed before it stored force_stopped, so the
+	//     spec never carried this run's override (DrainedSpecIDs names every
+	//     failed drain write, because such a write may have stored it);
+	//   - the run's own clear of the target's override (runVRAMProbe's step 5)
+	//     failed after it stored the cleared row -- its GPU rows or its
+	//     read-back failed, a cancelled run's context included -- so the
+	//     target is still owed to the restore, which finds it already "";
+	//   - a writer the run's reservation does not cover changed the override
+	//     during the run. The reservation refuses the portal's launch-spec
+	//     write (PutRuntimeSpec) in this gateway process only, so that writer
+	//     is another gateway process on the same store -- an operator's write
+	//     it serves, a manual speed or both run it holds, or its start-up
+	//     reconcile of the override lease -- or, narrowly, an operator's write
+	//     that passed that check just before the run took the reservation.
 	//
 	// It is a separate field because the two are separate instructions. These
-	// specs are NOT force_stopped, so telling an operator to clear them by
-	// hand -- which is what the restore_failed message says -- would stop a
-	// model they had just deliberately started. What they need to know is that
-	// the override on these specs is now somebody's own, not this run's.
+	// specs were NOT force_stopped at the restore, so telling an operator to
+	// clear them by hand -- which is what the restore_failed message says --
+	// would name an override that is not there, or one that is not this
+	// run's. What they need to know is that the run left them as it found
+	// them at the restore.
 	RestoreTakenOver []string `json:"restore_taken_over,omitempty"`
 	// Inconclusive is empty on a definitive result, else one of the
 	// vramInconclusive* reasons above.

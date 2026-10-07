@@ -215,6 +215,18 @@ func (_d *APIWithTracing) AuthorizeServerManage(ctx context.Context, t1 auth.Tok
 	return _d.API.AuthorizeServerManage(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) BenchmarkOverrideLeases(ctx context.Context) (m1 map[string]BenchmarkOverrideLease, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BenchmarkOverrideLeases")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.BenchmarkOverrideLeases(ctx)
+}
+
 func (_d *APIWithTracing) CaptureDetail(t1 auth.Token, s1 string) (c1 CaptureDetail, err error) {
 	return _d.API.CaptureDetail(t1, s1)
 }
@@ -1768,6 +1780,18 @@ func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 au
 	return _d.API.ServiceAdminGroupCandidates(ctx, t1)
 }
 
+func (_d *APIWithTracing) SetBenchmarkOverrideLease(ctx context.Context, s1 string, b1 BenchmarkOverrideLease) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkOverrideLease")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetBenchmarkOverrideLease(ctx, s1, b1)
+}
+
 func (_d *APIWithTracing) SetBenchmarkRuntimeSpecAdminState(ctx context.Context, s1 string, s2 string, s3 string) (r1 RuntimeSpecDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkRuntimeSpecAdminState")
 	defer span.End()
@@ -1778,6 +1802,30 @@ func (_d *APIWithTracing) SetBenchmarkRuntimeSpecAdminState(ctx context.Context,
 		}
 	}()
 	return _d.API.SetBenchmarkRuntimeSpecAdminState(ctx, s1, s2, s3)
+}
+
+func (_d *APIWithTracing) SetBenchmarkRuntimeSpecsAdminState(ctx context.Context, sa1 []string, s1 string, s2 string) (b1 BenchmarkSpecsOutcome, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkRuntimeSpecsAdminState")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetBenchmarkRuntimeSpecsAdminState(ctx, sa1, s1, s2)
+}
+
+func (_d *APIWithTracing) SetBenchmarkRuntimeSpecsPinned(ctx context.Context, sa1 []string, b1 bool, b2 bool) (b3 BenchmarkSpecsOutcome, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkRuntimeSpecsPinned")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetBenchmarkRuntimeSpecsPinned(ctx, sa1, b1, b2)
 }
 
 func (_d *APIWithTracing) SetCaptureSecret(t1 auth.Token, s1 string, b1 bool) (err error) {

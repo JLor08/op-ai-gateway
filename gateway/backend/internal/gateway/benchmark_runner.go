@@ -87,6 +87,18 @@ type benchmarkTarget struct {
 	// The Load starter sets it (loadTargetFor); the VRAM run copies it from
 	// its plan (vramRunPlanned.ensure) onto the target it loads.
 	loadWithoutGenerating bool
+	// mayPreStop marks a target of a manual speed or both run
+	// (benchmarkMayPreStop, called by startBenchmark): before its cold pass,
+	// the run may stop every running model of the server's agent application
+	// (preStopServer). No other constructor sets it, so a scheduled, capacity,
+	// vision, Load, VRAM or context-probe run never runs the stop-all (a VRAM
+	// run force-stops the launch specs through its own drain, vramDrain).
+	mayPreStop bool
+	// overrides is the run's override state on its server
+	// (benchmarkOverrides), shared by every target of the run. runBenchmark
+	// attaches it to each server_agent target with mayPreStop; it is nil on
+	// every other target.
+	overrides *benchmarkOverrides
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the
@@ -136,9 +148,9 @@ func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.Streami
 	// same reason: a warm pass whose whole completion arrives microseconds after the
 	// first token divides an exact output-token count by a window of ~0 and yields an
 	// implausible rate. It is WORSE here than on either sibling site: measureMapping's
-	// result flows straight into UpdateMappingBenchmarkMetrics (below), which HARD
-	// OVERWRITES mapping.GenTokensPerSecond -- not the EWMA blend
-	// UpdateMappingOpportunisticMetrics applies to a live sample. There is no damping
+	// result flows straight into UpdateMappingBenchmarkMetrics (below), which
+	// overwrites mapping.GenTokensPerSecond with every positive sample -- not the EWMA
+	// blend UpdateMappingOpportunisticMetrics applies to a live sample. There is no damping
 	// at all, so one implausible benchmark sample would replace the routing value the
 	// scorer and a model group's MinTokensPerSecond gate read outright, with nothing
 	// to average it back out.
@@ -449,66 +461,128 @@ var (
 	coldLoadCallTimeout = 30 * time.Second
 )
 
+// coldStart is ensureColdLoad's verdict for the cold pass.
+type coldStart struct {
+	// confirmed: the next request starts the target from cold, so the cold-minus-warm delta is its
+	// load time. For a server_agent target whose run stops (preStopServer) that means that no
+	// model of the application had a process and the target's own row read stopped, or that the
+	// agent reported every model the stop-all stopped without a process, the target's own row
+	// stopped with pid 0 when it had read backoff, start_failed or crashed, and the clear was
+	// written. When every row was quiet at the selection, every launch spec the run unpinned, the
+	// target aside, also read stopped with pid 0. For one whose run does not stop it means that
+	// the router does not list it, its own status row reads stopped with pid 0 or is absent, and
+	// every other row of a non-empty status snapshot reads stopped with pid 0 (agentColdStart).
+	// For any other target the loaded-models probe confirmed it absent (ensureColdLoadByEviction).
+	confirmed bool
+	// rideOutStop: the target's own force_stopped was or may have been written, so the cold
+	// pass rides the router's 503 until the clear reaches the agent (coldPassAfterStop).
+	rideOutStop bool
+}
+
 // ensureColdLoad best-effort guarantees the target model is NOT resident, so the next request
-// is a genuine cold load. Returns true only when it CONFIRMED a cold state (model verified
-// absent, or verified not-loaded to begin with). Returns false when it cannot confirm — the
-// caller then reports load-time as unknown rather than a bogus value. Never errors (all
-// failures degrade to false); throughput is measured regardless. All calls are bare (no client
+// is a genuine cold load. Its result is confirmed only when it CONFIRMED a cold state (model
+// verified absent, or verified not-loaded to begin with). It is unconfirmed when it cannot
+// confirm — the caller then reports load-time as unknown rather than a bogus value. The one
+// error is a stop-all's failed clear (preStopServer), which may leave launch specs
+// force_stopped and ends the measurement before any pass; every other failure degrades to an
+// unconfirmed start, and throughput is measured regardless. All calls are bare (no client
 // bearer token), safe because a benchmark run idle-gates + routing-excludes the server.
-func (s *Server) ensureColdLoad(ctx context.Context, tgt benchmarkTarget) bool {
+//
+// It has two branches:
+//   - A server_agent application is never evicted. The agent router has no unload route, and a
+//     sibling swap would load an unrelated model and evict the target only under a closed
+//     co-residency matrix. A manual speed or both run that may stop runs the stop-all instead
+//     (preStopServer): it stops every running model of the application, the target included,
+//     and confirms a cold state once the agent reports them all without a process. In any
+//     other run agentColdStart asks the router's loaded set and the agent's runtime status,
+//     and only a target known not to be resident confirms a cold state, and only when every
+//     other model of the application reads stopped in the agent's runtime status. A resident
+//     target, one whose residency cannot be read, and one next to a model that does not read
+//     stopped get no load time there.
+//   - Every other application goes through ensureColdLoadByEviction: an explicit unload where the
+//     provider supports it, else a sibling swap, each confirmed through the loaded-models probe.
+func (s *Server) ensureColdLoad(ctx context.Context, tgt benchmarkTarget) (coldStart, error) {
+	if tgt.app.Type == routing.ProviderServerAgent {
+		return s.agentColdStart(ctx, tgt)
+	}
+	return coldStart{confirmed: s.ensureColdLoadByEviction(ctx, tgt)}, nil
+}
+
+// ensureColdLoadByEviction is ensureColdLoad for an application that is not server_agent: it
+// confirms a model that is not loaded as cold, and evicts a loaded one, first through the
+// provider's unload and then through a sibling swap, confirming either through the
+// loaded-models probe (the application's loaded_models_path; without one it cannot confirm).
+func (s *Server) ensureColdLoadByEviction(ctx context.Context, tgt benchmarkTarget) bool {
+	path, format := routing.EffectiveLoadedModelsProbe(tgt.app)
 	lister, hasLister := s.Provider.(provider.LoadedModelLister)
-	if !hasLister || strings.TrimSpace(tgt.app.LoadedModelsPath) == "" {
+	if !hasLister || strings.TrimSpace(path) == "" {
 		return false // no way to observe loaded-state => cannot confirm cold
 	}
 	model := tgt.mapping.AppModelName
 	if strings.TrimSpace(model) == "" {
 		return false
 	}
-	probeTarget, _ := benchmarkTargetReq(tgt) // correct Provider/Endpoint/Timeout for probe+unload
-	// Defensive floor: the loaded-probe and the unload bound their HTTP call by
-	// probeTarget.Timeout; if the app carries no positive timeout, apply coldLoadCallTimeout
-	// so a wedged upstream can never hang the run (which would permanently exclude the server).
-	if probeTarget.Timeout <= 0 {
-		probeTarget.Timeout = coldLoadCallTimeout
-	}
-	// Attach the app's per-app upstream credential so the unload + loaded-probe
-	// (and the sibling-swap stream via streamOnce) carry it too (fail-open).
-	ctx = s.upstreamAuthCtx(ctx, probeTarget)
-
-	loaded, err := modelLoaded(ctx, lister, probeTarget, tgt.app, model)
+	ctx, probeTarget := s.coldProbeTarget(ctx, tgt)
+	loaded, err := modelLoaded(ctx, lister, probeTarget, path, format, model)
 	if err != nil {
 		return false
 	}
 	if !loaded {
 		return true // already cold
 	}
-	// Loaded → evict. (1) explicit unload where supported.
-	if unloader, ok := s.Provider.(provider.ModelUnloader); ok {
-		if done, _ := unloader.UnloadModel(ctx, probeTarget, model); done {
-			if s.waitModelUnloaded(ctx, lister, probeTarget, tgt.app, model) {
-				return true
-			}
-		}
+	if s.unloadForColdLoad(ctx, lister, probeTarget, path, format, model) {
+		return true
 	}
-	// (2) swap workaround: stream a sibling model on the same app to evict the target on a
-	// single-slot swapper.
-	if sib, ok := s.benchmarkSiblingModel(ctx, tgt); ok {
-		if streamer, ok := s.Provider.(provider.StreamingClient); ok {
-			sibTarget, sibReq := benchmarkTargetReq(tgt)
-			sibTarget.Model, sibTarget.ProviderModel, sibReq.Model = sib, sib, sib
-			sibReq.MaxTokens = 1                                     // minimal — we only want the swap
-			_, _, _ = s.streamOnce(ctx, streamer, sibTarget, sibReq) // best-effort; loads sib, evicts model
-			if s.waitModelUnloaded(ctx, lister, probeTarget, tgt.app, model) {
-				return true
-			}
-		}
-	}
-	return false // could not force cold
+	return s.swapForColdLoad(ctx, tgt, lister, probeTarget, path, format)
 }
 
-// modelLoaded reports whether `model` is in the app's fresh loaded set.
-func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target routing.Target, app routing.Application, model string) (bool, error) {
-	names, err := lister.LoadedModels(ctx, target, app.LoadedModelsPath, app.LoadedModelsFormat)
+// coldProbeTarget is the target the cold pass's loaded-state reads and its unload use, with the
+// context they run under. Their HTTP calls are bounded by the target's Timeout, so an application
+// without a positive timeout gets coldLoadCallTimeout: a wedged upstream can never hang the run,
+// which would permanently exclude the server. The context carries the application's per-app
+// upstream credential, so the unload, the loaded-probe and the sibling-swap stream (via
+// streamOnce) carry it too (fail-open).
+func (s *Server) coldProbeTarget(ctx context.Context, tgt benchmarkTarget) (context.Context, routing.Target) {
+	probeTarget, _ := benchmarkTargetReq(tgt)
+	if probeTarget.Timeout <= 0 {
+		probeTarget.Timeout = coldLoadCallTimeout
+	}
+	return s.upstreamAuthCtx(ctx, probeTarget), probeTarget
+}
+
+// unloadForColdLoad unloads model where the provider supports an explicit unload, and reports
+// whether the loaded-models probe then confirmed it gone.
+func (s *Server) unloadForColdLoad(ctx context.Context, lister provider.LoadedModelLister, probeTarget routing.Target, path, format, model string) bool {
+	unloader, ok := s.Provider.(provider.ModelUnloader)
+	if !ok {
+		return false
+	}
+	done, _ := unloader.UnloadModel(ctx, probeTarget, model)
+	return done && s.waitModelUnloaded(ctx, lister, probeTarget, path, format, model)
+}
+
+// swapForColdLoad is the swap workaround: it streams a sibling model on the same application to
+// evict tgt's model on a single-slot swapper, and reports whether the loaded-models probe then
+// confirmed it gone.
+func (s *Server) swapForColdLoad(ctx context.Context, tgt benchmarkTarget, lister provider.LoadedModelLister, probeTarget routing.Target, path, format string) bool {
+	sib, ok := s.benchmarkSiblingModel(ctx, tgt)
+	if !ok {
+		return false
+	}
+	streamer, ok := s.Provider.(provider.StreamingClient)
+	if !ok {
+		return false
+	}
+	sibTarget, sibReq := benchmarkTargetReq(tgt)
+	sibTarget.Model, sibTarget.ProviderModel, sibReq.Model = sib, sib, sib
+	sibReq.MaxTokens = 1                                     // minimal — we only want the swap
+	_, _, _ = s.streamOnce(ctx, streamer, sibTarget, sibReq) // best-effort; loads sib, evicts model
+	return s.waitModelUnloaded(ctx, lister, probeTarget, path, format, tgt.mapping.AppModelName)
+}
+
+// modelLoaded reports whether model is in the loaded set the lister reads from path in format.
+func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target routing.Target, path, format, model string) (bool, error) {
+	names, err := lister.LoadedModels(ctx, target, path, format)
 	if err != nil {
 		return false, err
 	}
@@ -520,12 +594,127 @@ func modelLoaded(ctx context.Context, lister provider.LoadedModelLister, target 
 	return false, nil
 }
 
+// agentColdStart is ensureColdLoad for a server_agent target. It confirms a cold start only on
+// a server where the load time can mean one thing, the model's own load on an otherwise empty
+// server.
+//   - A target of a manual speed or both run that may stop (mayPreStop, and the run's
+//     benchmarkOverrides allow stops) gets that server from the stop-all (preStopServer): every
+//     running model of the application is stopped, the target included, and the overrides are
+//     cleared again before the cold pass.
+//   - Any other target is measured as it finds the server: the target is known not to be
+//     resident and its own status row cannot delay its start (agentTargetResident), and every
+//     other model of the application reads stopped in the agent's runtime status
+//     (benchmarkOthersStopped). A neighbour that runs would be evicted inside the cold pass
+//     under a closed co-residency matrix, and one that can start by itself might start inside
+//     it. This branch writes nothing and returns no error.
+func (s *Server) agentColdStart(ctx context.Context, tgt benchmarkTarget) (coldStart, error) {
+	if tgt.mayPreStop && tgt.overrides != nil && tgt.overrides.stopsAllowed {
+		return s.preStopServer(ctx, tgt)
+	}
+	resident, known := s.agentTargetResident(ctx, tgt)
+	if !known || resident || !benchmarkOthersStopped(s.RuntimeStatus.statusSnapshot(tgt.server.ID), tgt.spec.ID) {
+		return coldStart{}, nil
+	}
+	return coldStart{confirmed: true}, nil
+}
+
+// agentTargetResident reports whether tgt's model is resident on its server_agent application,
+// and whether that is known at all. It evicts nothing and starts nothing.
+//
+// It reads the loaded set from routing.EffectiveLoadedModelsProbe: the agent router's /running,
+// or a loaded_models_path set on the application through the API. A model listed there is
+// resident. /running lists only a running child, so the agent's runtime status for tgt's spec is
+// read next (agentSpecResidency).
+//
+// known is false when there is nothing to ask (no app model name, a provider that cannot list
+// loaded models), when the loaded-set read failed, or when the spec's status cannot confirm a
+// cold start; resident is then false the way an unanswered question is false.
+func (s *Server) agentTargetResident(ctx context.Context, tgt benchmarkTarget) (resident, known bool) {
+	model := tgt.mapping.AppModelName
+	lister, ok := s.Provider.(provider.LoadedModelLister)
+	if strings.TrimSpace(model) == "" || !ok {
+		return false, false
+	}
+	ctx, probeTarget := s.coldProbeTarget(ctx, tgt)
+	path, format := routing.EffectiveLoadedModelsProbe(tgt.app)
+	loaded, err := modelLoaded(ctx, lister, probeTarget, path, format, model)
+	if err != nil {
+		return false, false
+	}
+	if loaded {
+		return true, true
+	}
+	return s.agentSpecResidency(tgt)
+}
+
+// agentSpecStateStopped is the runtime-status state of a spec with no child that waits for
+// nothing: a request for it starts a genuine cold load at once.
+const agentSpecStateStopped = "stopped"
+
+// agentSpecResidency is agentTargetResident's reading of the agent's most recent runtime-status
+// snapshot, once the router's loaded set has not listed tgt's model. The row is matched by spec
+// id, never by model name:
+//   - a state with a live process (vramStatesWithProcess: running, starting, draining), or any
+//     process id, is resident: a child /running does not list yet or no longer lists, or a
+//     start_failed child whose process is still up;
+//   - any other state than stopped cannot confirm a cold start: a request for a spec in backoff
+//     waits for its backoff timer, and that wait would land in the load time, while
+//     not_permitted and pending_vram_unknown refuse the request first;
+//   - stopped, a spec the agent has not reported yet, and a target without a spec are not
+//     resident: /running has already said so.
+func (s *Server) agentSpecResidency(tgt benchmarkTarget) (resident, known bool) {
+	if tgt.spec.ID == "" {
+		return false, true
+	}
+	for _, row := range s.RuntimeStatus.statusSnapshot(tgt.server.ID) {
+		if row.SpecID != tgt.spec.ID {
+			continue
+		}
+		switch {
+		case vramStatesWithProcess[row.State] || row.PID > 0:
+			return true, true
+		case row.State != agentSpecStateStopped:
+			return false, false
+		default:
+			return false, true
+		}
+	}
+	return false, true
+}
+
+// benchmarkOthersStopped reports whether rows is not empty and every row of it reads stopped
+// with pid 0, except the row of specID itself, which agentSpecResidency has already read. A
+// target without a spec (specID "") has no row of its own, so every row counts, one without a
+// spec id included. A neighbour in backoff, not_permitted or pending_vram_unknown has no process
+// now, but a pinned or force_running one can start one by itself: when its backoff timer fires,
+// or at the next admission wake, such as the target's own release, possibly inside the target's
+// passes. This is stricter on purpose than the stop path's benchmarkRowQuiet, which only asks
+// whether a row has a process to stop. An empty snapshot is no evidence that nothing runs. The
+// agent reports every spec of its document in every frame, so a non-empty snapshot holds every
+// spec it manages, but statusSnapshot returns nil both for a server the gateway has no runtime
+// status for yet, for example right after a gateway start, and for an agent that manages no
+// spec: no row at all cannot tell an empty server from an unknown one.
+func benchmarkOthersStopped(rows []RuntimeStatusDTO, specID string) bool {
+	if len(rows) == 0 {
+		return false
+	}
+	for _, row := range rows {
+		if specID != "" && row.SpecID == specID {
+			continue
+		}
+		if row.State != agentSpecStateStopped || row.PID != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // waitModelUnloaded polls the loaded set until `model` is absent, bounded by coldLoadMaxWait.
 // A probe error is treated as "not yet confirmed" and retried until the deadline (then false).
-func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedModelLister, target routing.Target, app routing.Application, model string) bool {
+func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedModelLister, target routing.Target, path, format, model string) bool {
 	deadline := time.Now().Add(coldLoadMaxWait)
 	for {
-		loaded, err := modelLoaded(ctx, lister, target, app, model)
+		loaded, err := modelLoaded(ctx, lister, target, path, format, model)
 		if err == nil && !loaded {
 			return true
 		}
@@ -562,8 +751,16 @@ func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget)
 }
 
 // measureMapping streams the benchmark prompt twice (cold then warm) and returns the
-// measured metrics. Cold TTFT (first request, may trigger a load/swap) minus warm TTFT
-// approximates load time; throughput comes from the warm request.
+// measured metrics. Cold TTFT (first request, may trigger a load) minus warm TTFT
+// approximates load time; throughput comes from the warm request. The load time is recorded
+// only for a cold start ensureColdLoad confirmed: unknown, never bogus. For a server_agent
+// target that is a cold start on a server where no other model of the application runs: after
+// the run's stop-all (preStopServer), or, in a run that does not stop, when every other model
+// reads stopped. So the load time does not include making room: after the stop-all only a
+// request can start a neighbour once the agent holds the lifted pins (beginBenchmarkUnpin),
+// and a stop-all that cannot tell that it does confirms only when every formerly pinned
+// neighbour reads stopped with pid 0 (benchmarkStopSet). An error from ensureColdLoad ends
+// the measurement before any pass.
 func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (BenchmarkResult, error) {
 	res := BenchmarkResult{MappingID: tgt.mapping.ID, GatewayModelName: tgt.mapping.GatewayModelName}
 	streamer, ok := s.Provider.(provider.StreamingClient)
@@ -571,13 +768,34 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 		return res, errBenchmarkNoStreaming
 	}
 	target, req := benchmarkTargetReq(tgt)
-	// Force a genuine cold start so the cold-minus-warm delta is a real load time (not
-	// first-call jitter on an already-resident model). coldConfirmed is false when a cold
-	// state could not be guaranteed/verified (no loaded-tracking configured, eviction
-	// unavailable, or verification timed out) — then we do NOT emit a load time (unknown),
-	// never a bogus value. Throughput is measured regardless.
-	coldConfirmed := s.ensureColdLoad(ctx, tgt)
-	coldTTFT, _, err := s.streamOnce(ctx, streamer, target, req)
+	// Force a genuine cold start so the cold-minus-warm delta is a real load time (not first-call
+	// jitter on an already-resident model). cold.confirmed is false when a cold state could not be
+	// guaranteed/verified (no loaded-tracking configured, eviction unavailable, or verification
+	// timed out). For a server_agent target whose run stops, it is false when the stop-all stopped
+	// nothing it had to (an ineligible spec, traffic in flight, no fresh status frame), when what
+	// it stopped was not confirmed quiet or its clear was taken over, or when a launch spec the
+	// run unpinned, the target aside, reads other than stopped with pid 0 while the run has no
+	// sign that the agent holds the lifted pins (preStopServer). For one whose run does not stop,
+	// it is false when the target is resident at the start or its residency cannot be read, when
+	// another model of its application does not read stopped in the agent's runtime status, or on
+	// a server without any runtime status. Then we do NOT emit a load time (unknown), never a
+	// bogus value. Throughput is measured regardless. An error, a stop-all's failed clear, is
+	// this target's result error, not the run's (of the stop-all's and the unpin's failures, only
+	// a failed re-pin reaches the run's error, endBenchmarkUnpin): no pass runs, and
+	// measureSpeedTarget writes nothing. When the stop-all wrote, or may have written,
+	// the target's own force_stopped (cold.rideOutStop), the cold pass rides the router's 503
+	// until the clear reaches the agent (coldPassAfterStop).
+	cold, err := s.ensureColdLoad(ctx, tgt)
+	if err != nil {
+		res.Error = err.Error()
+		return res, err
+	}
+	var coldTTFT time.Duration
+	if cold.rideOutStop {
+		coldTTFT, err = s.coldPassAfterStop(ctx, streamer, target, req)
+	} else {
+		coldTTFT, _, err = s.streamOnce(ctx, streamer, target, req)
+	}
 	if err != nil {
 		res.Error = err.Error()
 		return res, err
@@ -590,7 +808,7 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 	// Only record a load time when a cold start was CONFIRMED and BOTH passes produced a
 	// first token (a real TTFT is never exactly 0; ttft==0 from streamOnce means "no first
 	// token"), so we never record a bogus cold-minus-0 delta or a warm-vs-warm jitter delta.
-	if coldConfirmed && coldTTFT > 0 && warmTTFT > 0 && coldTTFT > warmTTFT {
+	if cold.confirmed && coldTTFT > 0 && warmTTFT > 0 && coldTTFT > warmTTFT {
 		res.LoadTimeMS = int((coldTTFT - warmTTFT).Milliseconds())
 	}
 	res.GenTokensPerSecond = usage.TokensPerSecond
@@ -609,13 +827,26 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // it never overwrites an operator's CapabilitySourceManual verdict; always appends a
 // kind=="vision" history row regardless — success or inconclusive). An empty mode is
 // treated as "speed".
+//
+// A manual speed or both run's server_agent targets (mayPreStop) share one override
+// state (benchmarkOverrides): beginBenchmarkUnpin decides once whether the run may stop
+// the server's running agent models before each agent target's cold pass
+// (preStopServer) and unpins the server's pinned launch specs for the run, and
+// endBenchmarkUnpin pins them again and rewrites the override lease at the end.
 func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID string, targets []benchmarkTarget, mode string) {
 	var runErr string
 	defer func() {
 		run.finish(runErr)
 		s.Benchmarks.publish(serverID, run.snapshot()) // terminal frame after finish so subscribers see Running=false
 	}()
+	// Registered after the finish defer, so it runs first, while the run still holds the
+	// server's reservation and operator writes to its launch specs stay refused.
+	ov := s.beginBenchmarkUnpin(ctx, run, serverID, targets)
+	defer s.endBenchmarkUnpin(ctx, run, serverID, ov, &runErr)
 	for _, tgt := range targets {
+		if tgt.mayPreStop && tgt.app.Type == routing.ProviderServerAgent {
+			tgt.overrides = ov
+		}
 		if ctx.Err() != nil {
 			runErr = "canceled"
 			return
@@ -630,82 +861,9 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 		case "capacity":
 			res = s.measureCapacityTarget(ctx, tgt, run, serverID)
 		case "both":
-			// Speed first, then capacity — capacity's UpdateMappingCapacityMetrics runs
-			// LAST so metrics_source ends "capacity". The two results are merged so the
-			// poll sees both the speed and capacity scalars for the mapping.
-			res = s.measureSpeedTarget(ctx, tgt)
-			speedErr = res.Error // capture BEFORE the merge below
-			capRes := s.measureCapacityTarget(ctx, tgt, run, serverID)
-			res.MaxConcurrency = capRes.MaxConcurrency
-			res.RecommendedConcurrency = capRes.RecommendedConcurrency
-			res.GenTokensPerSecondAtCapacity = capRes.GenTokensPerSecondAtCapacity
-			if res.Error == "" {
-				res.Error = capRes.Error
-			}
+			res, speedErr = s.measureBothTarget(ctx, tgt, run, serverID)
 		case "vision":
-			dataURL, tokens := pickVisionImage() // random embedded asset
-			res = s.measureVisionTarget(ctx, tgt, s.Portal.VisionProbeMode(ctx), dataURL, tokens)
-			if res.VisionCapable != nil {
-				// A definitive verdict is projected as the mapping's `vision`
-				// capability row, sourced CapabilitySourceVisionBenchmark
-				// (#49-3), rank 2 (routing.capabilitySourceRank): a real
-				// measurement -- the gateway sent an actual image to the
-				// actual upstream and read the actual answer -- outranks a
-				// probe (rank 1), but NOT an operator's CapabilitySourceManual
-				// verdict (rank 3). So, like every other capability writer,
-				// this reads the mapping's current rows and asks
-				// routing.WritableCapabilityRows which of them it may
-				// actually write, instead of writing unconditionally.
-				//
-				// An operator explicitly starting this run authorizes
-				// MEASURING, not overwriting whatever verdict is already on
-				// file -- a migrated pre-78 manual row is exactly as
-				// reachable here as it is for a probe (migration 78 maps a
-				// mapping whose metrics_source was 'manual' onto
-				// CapabilitySourceManual), and unconditionally overwriting it
-				// would be a net LOSS of protection versus the
-				// metrics_locked guard this table replaced. An INCONCLUSIVE
-				// probe (VisionCapable nil) writes nothing at all -- "unknown"
-				// is the absence of a row, so there is no way for it to clear
-				// a stored verdict, which the pre-row vision_capable bool
-				// could not express.
-				//
-				// Unlike the bool it replaces this write carries no
-				// metrics_locked guard, because the table does not have one:
-				// routing.MappingStore.UpsertMappingCapabilities carries the
-				// argument for why a capability is not a number an operator
-				// pins. Best-effort like the history row below: a failed read
-				// writes nothing at all (writing blind would be exactly the
-				// overwrite the rank rule forbids), and a failed write is
-				// logged and never fails the run.
-				verdict := routing.CapabilityNo
-				if *res.VisionCapable {
-					verdict = routing.CapabilityYes
-				}
-				reported := []routing.CapabilityRow{{
-					Capability: routing.CapabilityVision, Verdict: verdict,
-					Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: time.Now().UTC(),
-				}}
-				if stored, err := s.Routes.MappingCapabilities(ctx, tgt.mapping.ID); err != nil {
-					slog.Debug("vision benchmark: capability read failed", "mapping_id", tgt.mapping.ID, "err", err)
-				} else if rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored)); len(rows) > 0 {
-					if err := s.Routes.UpsertMappingCapabilities(ctx, tgt.mapping.ID, rows); err != nil {
-						slog.Debug("vision benchmark: capability write-back failed", "mapping_id", tgt.mapping.ID, "err", err)
-					}
-				}
-			}
-			// Always append a vision-history row — success (a definitive verdict) AND an
-			// inconclusive probe (VisionCapable nil, res.Error set) — mirroring how the
-			// speed path records both outcomes. Best-effort: a history-write error never
-			// fails the run.
-			_ = s.Routes.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
-				MappingID:     tgt.mapping.ID,
-				ServerID:      tgt.server.ID,
-				CreatedAt:     time.Now().UTC(),
-				Kind:          "vision",
-				VisionCapable: res.VisionCapable != nil && *res.VisionCapable,
-				Error:         res.Error,
-			})
+			res = s.runVisionTarget(ctx, tgt)
 		default: // "speed" (and empty)
 			res = s.measureSpeedTarget(ctx, tgt)
 			speedErr = res.Error
@@ -731,10 +889,302 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 	}
 }
 
-// runContextProbe warm-loads the target's model (forcing a load if not resident) then probes its
-// context size via the app's context_probe_path, and REPORTS the size through the run status. It
-// does NOT persist (the frontend fills the form field; the user saves manually). Reuses the
-// benchmark server reservation so it is mutually exclusive with benchmarks + live traffic.
+// measureBothTarget is runBenchmark's "both" mode for one target: speed first, then
+// capacity, so capacity's UpdateMappingCapacityMetrics runs LAST and metrics_source ends
+// "capacity". The two results are merged so the poll sees both the speed and capacity
+// scalars for the mapping. speedErr is the speed measurement's own error, captured before
+// the merge: the speed-history row records only it, so a successful speed benchmark whose
+// capacity ramp failed is not mislabeled as failed.
+func (s *Server) measureBothTarget(ctx context.Context, tgt benchmarkTarget, run *benchmarkRun, serverID string) (res BenchmarkResult, speedErr string) {
+	res = s.measureSpeedTarget(ctx, tgt)
+	speedErr = res.Error // capture BEFORE the merge below
+	capRes := s.measureCapacityTarget(ctx, tgt, run, serverID)
+	res.MaxConcurrency = capRes.MaxConcurrency
+	res.RecommendedConcurrency = capRes.RecommendedConcurrency
+	res.GenTokensPerSecondAtCapacity = capRes.GenTokensPerSecondAtCapacity
+	if res.Error == "" {
+		res.Error = capRes.Error
+	}
+	return res, speedErr
+}
+
+// runVisionTarget is runBenchmark's "vision" mode for one target: the image-acceptance
+// probe (measureVisionTarget), the capability write-back of a definitive verdict, and the
+// target's vision-history row.
+func (s *Server) runVisionTarget(ctx context.Context, tgt benchmarkTarget) BenchmarkResult {
+	dataURL, tokens := pickVisionImage() // random embedded asset
+	res := s.measureVisionTarget(ctx, tgt, s.Portal.VisionProbeMode(ctx), dataURL, tokens)
+	if res.VisionCapable != nil {
+		// A definitive verdict is projected as the mapping's `vision`
+		// capability row, sourced CapabilitySourceVisionBenchmark
+		// (#49-3), rank 2 (routing.capabilitySourceRank): a real
+		// measurement -- the gateway sent an actual image to the
+		// actual upstream and read the actual answer -- outranks a
+		// probe (rank 1), but NOT an operator's CapabilitySourceManual
+		// verdict (rank 3). So, like every other capability writer,
+		// this reads the mapping's current rows and asks
+		// routing.WritableCapabilityRows which of them it may
+		// actually write, instead of writing unconditionally.
+		//
+		// An operator explicitly starting this run authorizes
+		// MEASURING, not overwriting whatever verdict is already on
+		// file -- a migrated pre-78 manual row is exactly as
+		// reachable here as it is for a probe (migration 78 maps a
+		// mapping whose metrics_source was 'manual' onto
+		// CapabilitySourceManual), and unconditionally overwriting it
+		// would be a net LOSS of protection versus the
+		// metrics_locked guard this table replaced. An INCONCLUSIVE
+		// probe (VisionCapable nil) writes nothing at all -- "unknown"
+		// is the absence of a row, so there is no way for it to clear
+		// a stored verdict, which the pre-row vision_capable bool
+		// could not express.
+		//
+		// Unlike the bool it replaces this write carries no
+		// metrics_locked guard, because the table does not have one:
+		// routing.MappingStore.UpsertMappingCapabilities carries the
+		// argument for why a capability is not a number an operator
+		// pins. Best-effort like the history row below: a failed read
+		// writes nothing at all (writing blind would be exactly the
+		// overwrite the rank rule forbids), and a failed write is
+		// logged and never fails the run.
+		verdict := routing.CapabilityNo
+		if *res.VisionCapable {
+			verdict = routing.CapabilityYes
+		}
+		reported := []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: verdict,
+			Source: routing.CapabilitySourceVisionBenchmark, CheckedAt: time.Now().UTC(),
+		}}
+		if stored, err := s.Routes.MappingCapabilities(ctx, tgt.mapping.ID); err != nil {
+			slog.Debug("vision benchmark: capability read failed", "mapping_id", tgt.mapping.ID, "err", err)
+		} else if rows := routing.WritableCapabilityRows(reported, routing.CapabilityRowsByName(stored)); len(rows) > 0 {
+			if err := s.Routes.UpsertMappingCapabilities(ctx, tgt.mapping.ID, rows); err != nil {
+				slog.Debug("vision benchmark: capability write-back failed", "mapping_id", tgt.mapping.ID, "err", err)
+			}
+		}
+	}
+	// Always append a vision-history row — success (a definitive verdict) AND an
+	// inconclusive probe (VisionCapable nil, res.Error set) — mirroring how the
+	// speed path records both outcomes. Best-effort: a history-write error never
+	// fails the run.
+	_ = s.Routes.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+		MappingID:     tgt.mapping.ID,
+		ServerID:      tgt.server.ID,
+		CreatedAt:     time.Now().UTC(),
+		Kind:          "vision",
+		VisionCapable: res.VisionCapable != nil && *res.VisionCapable,
+		Error:         res.Error,
+	})
+	return res
+}
+
+// benchmarkContextAttribution says how benchmarkContextSize attributes a
+// probe answer to the target mapping.
+type benchmarkContextAttribution int
+
+const (
+	// contextByPath is the speed run's rule: a {model} path attributes the
+	// probe's answer directly (provider.PickModelContextSize), any other path
+	// by exact name.
+	contextByPath benchmarkContextAttribution = iota
+	// contextDirect is the context probe's rule: always
+	// provider.PickModelContextSize, because it has just loaded this model.
+	contextDirect
+)
+
+// benchmarkContextSource says which source answered benchmarkContextSize.
+type benchmarkContextSource int
+
+const (
+	// contextSourceNone: nothing answered, and the size is 0 (unknown).
+	contextSourceNone benchmarkContextSource = iota
+	// contextSourceProbe: the synchronous probe answered. measureSpeedTarget
+	// writes this size to the mapping.
+	contextSourceProbe
+	// contextSourceTelemetry: the agent's status stream answered. It is never
+	// written here, because the agent ingest (writeBackRuntimeContext) owns
+	// that write.
+	contextSourceTelemetry
+)
+
+// benchmarkTelemetryContextWait bounds how long benchmarkContextSize waits for
+// a fresh agent status frame. A guess to validate on hardware, like
+// vramMeasuredWaitBound: two default 1 s agent ticks plus the agent's 2 s
+// collect timeout. A var so tests can shorten it.
+var benchmarkTelemetryContextWait = 5 * time.Second
+
+// benchmarkContextSize returns the target model's context size for a benchmark
+// result, and which source gave it. Both callers ask right after a stream to
+// the model, so it is resident.
+//
+// The synchronous probe comes first (benchmarkProbeContextSize). For a
+// server_agent application the agent's own per-spec probe is the fallback
+// (benchmarkTelemetryContextSize): it covers the spec types whose child has no
+// llama.cpp-shaped /props, such as vLLM, TGI and Ollama. Nothing found is
+// (0, contextSourceNone), which the history row shows as unknown.
+func (s *Server) benchmarkContextSize(ctx context.Context, tgt benchmarkTarget, attr benchmarkContextAttribution) (int, benchmarkContextSource) {
+	if size := s.benchmarkProbeContextSize(ctx, tgt, attr); size > 0 {
+		return size, contextSourceProbe
+	}
+	if size := s.benchmarkTelemetryContextSize(ctx, tgt); size > 0 {
+		return size, contextSourceTelemetry
+	}
+	return 0, contextSourceNone
+}
+
+// benchmarkContextInBounds reports whether size is a context size a benchmark
+// accepts: positive, and no larger than benchmarkMaxContextSize.
+func benchmarkContextInBounds(size int) bool {
+	return size > 0 && size <= benchmarkMaxContextSize
+}
+
+// benchmarkProbeContextSize asks the application's effective context probe
+// path (routing.EffectiveContextProbePath) for the target model's context
+// size, with the mapping's credential (routing.SpecUpstreamAuth). For a
+// server_agent application without a stored path, on an agent that declares
+// runtime_upstream_props, that is the router's /upstream/{model}/props: it
+// forwards to the running child's /props with the credential intact, so a
+// key-protected llama.cpp child answers too. It returns 0 when there is no
+// path, the probe fails, or the answer is out of bounds. A 401 or 403 is the
+// one failure it logs: the gateway holds that credential, so the spec's token
+// is wrong.
+func (s *Server) benchmarkProbeContextSize(ctx context.Context, tgt benchmarkTarget, attr benchmarkContextAttribution) int {
+	path := routing.EffectiveContextProbePath(tgt.app, s.AgentFeatures.Has(tgt.server.ID, RuntimeUpstreamPropsFeature))
+	prober, ok := s.Provider.(provider.ModelInfoProber)
+	if !ok || path == "" {
+		return 0
+	}
+	apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
+	pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: apiToken, APITokenHeader: apiTokenHeader}
+	pctx := s.upstreamAuthCtx(ctx, pt)
+	infos, err := prober.ProbeModelInfo(pctx, pt, provider.ExpandModelPath(path, tgt.mapping.AppModelName))
+	if err != nil {
+		if errors.Is(err, provider.ErrAuthRejected) {
+			slog.Warn("benchmark: context probe rejected by the upstream (401/403): check the runtime spec's API token", "mapping_id", tgt.mapping.ID, "err", err)
+		}
+		return 0
+	}
+	direct := attr == contextDirect || strings.Contains(path, "{model}")
+	if size := benchmarkAttributedContextSize(infos, tgt.mapping.AppModelName, direct); benchmarkContextInBounds(size) {
+		return size
+	}
+	return 0
+}
+
+// The agent's context_probe values that settle the answer: "na" (the spec
+// configures no context probe) and "router" (llama-server in router mode,
+// which has no measurable context). No later frame changes either.
+const (
+	agentContextProbeNA     = "na"
+	agentContextProbeRouter = "router"
+)
+
+// benchmarkTelemetryContextSize reads the target spec's context size from the
+// agent's runtime-status stream: the size the agent's own loopback probe
+// found (ContextSize, with ContextProbe saying how that probe went). It
+// answers only for a server_agent target with a launch spec, on an agent that
+// declares runtime_model_probe, the same gate the catalog applies before it
+// trusts these fields.
+//
+// Rows are matched by spec_id, never by model name, because two specs can
+// serve the same upstream name. The snapshot answers first
+// (benchmarkSnapshotContextSize). Otherwise the first fresh frame whose row
+// is running and carries a probe result is final
+// (benchmarkFrameContextSize): the agent re-probes a failure on every
+// collect, so one fresh unreachable is as good as it gets. A done ctx, a
+// closed stream or benchmarkTelemetryContextWait ends the wait with 0.
+func (s *Server) benchmarkTelemetryContextSize(ctx context.Context, tgt benchmarkTarget) int {
+	if tgt.app.Type != routing.ProviderServerAgent || tgt.spec.ID == "" || !s.AgentFeatures.Has(tgt.server.ID, runtimeModelProbeFeature) {
+		return 0
+	}
+	snap, frames, unsub := s.RuntimeStatus.subscribe(tgt.server.ID)
+	defer unsub()
+	if size, final := benchmarkSnapshotContextSize(snap, tgt.spec.ID); final {
+		return size
+	}
+	timer := time.NewTimer(benchmarkTelemetryContextWait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-timer.C:
+			return 0
+		case frame, open := <-frames:
+			if !open {
+				return 0
+			}
+			if size, final := benchmarkFrameContextSize(frame, tgt.spec.ID); final {
+				return size
+			}
+		}
+	}
+}
+
+// benchmarkSpecStatus returns specID's row of one status frame.
+func benchmarkSpecStatus(frame []RuntimeStatusDTO, specID string) (RuntimeStatusDTO, bool) {
+	for _, row := range frame {
+		if row.SpecID == specID {
+			return row, true
+		}
+	}
+	return RuntimeStatusDTO{}, false
+}
+
+// benchmarkSnapshotContextSize decides on the snapshot a subscription starts
+// from. A running row with an in-bounds size answers. A row whose probe is
+// "na" or "router" answers 0, since no fresh frame would change it. Anything
+// else, including an unreachable probe from before the benchmark loaded the
+// model, is not final.
+func benchmarkSnapshotContextSize(snap []RuntimeStatusDTO, specID string) (size int, final bool) {
+	row, ok := benchmarkSpecStatus(snap, specID)
+	switch {
+	case !ok:
+		return 0, false
+	case row.State == "running" && benchmarkContextInBounds(row.ContextSize):
+		return row.ContextSize, true
+	case row.ContextProbe == agentContextProbeNA || row.ContextProbe == agentContextProbeRouter:
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+// benchmarkFrameContextSize decides on one fresh frame: a running row with a
+// probe result is final, with its size when in bounds and 0 otherwise.
+func benchmarkFrameContextSize(frame []RuntimeStatusDTO, specID string) (size int, final bool) {
+	row, ok := benchmarkSpecStatus(frame, specID)
+	if !ok || row.State != "running" || row.ContextProbe == "" {
+		return 0, false
+	}
+	if benchmarkContextInBounds(row.ContextSize) {
+		return row.ContextSize, true
+	}
+	return 0, true
+}
+
+// benchmarkAttributedContextSize picks the target model's size out of a probe
+// answer. direct attributes a per-model answer to the model itself
+// (provider.PickModelContextSize: a name match, else the first positive size).
+// Otherwise the answer describes whatever the upstream has loaded, so only an
+// entry named exactly like the model counts, and the last in-bounds one wins.
+func benchmarkAttributedContextSize(infos []provider.ModelInfo, model string, direct bool) int {
+	if direct {
+		return provider.PickModelContextSize(infos, model)
+	}
+	size := 0
+	for _, info := range infos {
+		if info.Name == model && benchmarkContextInBounds(info.ContextSize) {
+			size = info.ContextSize
+		}
+	}
+	return size
+}
+
+// runContextProbe warm-loads the target's model (forcing a load if not resident) then reads its
+// context size (benchmarkContextSize), and REPORTS the size through the run status. It does NOT
+// persist (the frontend fills the form field; the user saves manually). Reuses the benchmark
+// server reservation so it is mutually exclusive with benchmarks + live traffic.
 func (s *Server) runContextProbe(ctx context.Context, run *benchmarkRun, serverID string, tgt benchmarkTarget) {
 	res := BenchmarkResult{MappingID: tgt.mapping.ID, GatewayModelName: tgt.mapping.GatewayModelName}
 	// The terminal frame is published in a defer (mirroring runBenchmark's deferred finish), so it
@@ -761,58 +1211,32 @@ func (s *Server) runContextProbe(ctx context.Context, run *benchmarkRun, serverI
 		res.Error = err.Error()
 		return
 	}
-	// 2) Probe context (the model is now resident). Reuse the measureSpeedTarget probe pattern, but
-	//    always attribute directly to THIS mapping (we just loaded it): {model} expansion + the
-	//    shared PickModelContextSize (name-match preferred, else first positive). No store write.
-	if prober, ok := s.Provider.(provider.ModelInfoProber); ok && strings.TrimSpace(tgt.app.ContextProbePath) != "" {
-		apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
-		pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: apiToken, APITokenHeader: apiTokenHeader}
-		pctx := s.upstreamAuthCtx(ctx, pt)
-		probePath := provider.ExpandModelPath(tgt.app.ContextProbePath, tgt.mapping.AppModelName)
-		if infos, perr := prober.ProbeModelInfo(pctx, pt, probePath); perr == nil {
-			if ctxSize := provider.PickModelContextSize(infos, tgt.mapping.AppModelName); ctxSize > 0 && ctxSize <= benchmarkMaxContextSize {
-				res.ContextSize = ctxSize
-			}
-		}
-	}
+	// 2) Read the context size (the model is now resident), always attributed directly to THIS
+	//    mapping, because we just loaded it (contextDirect). No store write.
+	res.ContextSize, _ = s.benchmarkContextSize(ctx, tgt, contextDirect)
 }
 
 // measureSpeedTarget runs the speed benchmark for one target: measure throughput/load,
-// re-probe context, and persist (lock-respecting). It returns the BenchmarkResult; the
-// caller handles history/addResult/publish. This is the pre-CP2 per-target body.
+// read the context size (benchmarkContextSize), and persist (lock-respecting). It returns
+// the BenchmarkResult; the caller handles history/addResult/publish.
 func (s *Server) measureSpeedTarget(ctx context.Context, tgt benchmarkTarget) BenchmarkResult {
 	res, err := s.measureMapping(ctx, tgt)
 	if err == nil {
-		// Re-probe context FIRST (the model is resident from measureMapping's warm
-		// pass); UpdateMappingContextProbe sets metrics_source='probe'.
-		if prober, ok := s.Provider.(provider.ModelInfoProber); ok && strings.TrimSpace(tgt.app.ContextProbePath) != "" {
-			apiToken, apiTokenHeader := routing.SpecUpstreamAuth(tgt.spec, tgt.app)
-			pt := routing.Target{Provider: tgt.app.Type, Endpoint: routing.ApplicationEndpoint(tgt.server, tgt.app), Timeout: time.Duration(tgt.app.TimeoutMS) * time.Millisecond, APIToken: apiToken, APITokenHeader: apiTokenHeader}
-			pctx := s.upstreamAuthCtx(ctx, pt)
-			// Expand a {model} template with THIS mapping's upstream name so a per-model props endpoint is
-			// queried. The benchmark just warmed this exact model (measureMapping's warm pass), so it is
-			// resident — no loaded-registry gate is needed here (unlike the health-loop pass).
-			probePath := provider.ExpandModelPath(tgt.app.ContextProbePath, tgt.mapping.AppModelName)
-			if infos, perr := prober.ProbeModelInfo(pctx, pt, probePath); perr == nil {
-				if strings.Contains(tgt.app.ContextProbePath, "{model}") {
-					// Per-model endpoint: attribute DIRECTLY to this (resident) mapping, mirroring the
-					// health-loop {model} branch (sidesteps the reported-name match).
-					if ctxSize := provider.PickModelContextSize(infos, tgt.mapping.AppModelName); ctxSize > 0 && ctxSize <= benchmarkMaxContextSize {
-						_ = s.Routes.UpdateMappingContextProbe(ctx, tgt.mapping.ID, ctxSize, time.Now().UTC())
-						res.ContextSize = ctxSize
-					}
-				} else {
-					for _, info := range infos {
-						if info.Name == tgt.mapping.AppModelName && info.ContextSize > 0 && info.ContextSize <= benchmarkMaxContextSize {
-							_ = s.Routes.UpdateMappingContextProbe(ctx, tgt.mapping.ID, info.ContextSize, time.Now().UTC())
-							res.ContextSize = info.ContextSize
-						}
-					}
-				}
-			}
+		// Read the context FIRST (the model is resident from measureMapping's warm
+		// pass, so no loaded-registry gate is needed, unlike the health-loop pass).
+		// Only a probe answer is written here (UpdateMappingContextProbe sets
+		// metrics_source='probe'); the agent ingest already writes a telemetry
+		// answer (writeBackRuntimeContext).
+		size, src := s.benchmarkContextSize(ctx, tgt, contextByPath)
+		res.ContextSize = size
+		if src == contextSourceProbe {
+			_ = s.Routes.UpdateMappingContextProbe(ctx, tgt.mapping.ID, size, time.Now().UTC())
 		}
-		// Benchmark metrics LAST so metrics_source ends "benchmark" (this write does
-		// not touch context_size, so a probed context survives).
+		// Benchmark metrics LAST, so a run that measured a positive value ends
+		// metrics_source "benchmark"; one that measured nothing writes nothing
+		// (UpdateMappingBenchmarkMetrics), so a probed context then leaves "probe".
+		// Both writes skip a locked mapping. This write never touches
+		// context_size, so a probed context survives.
 		_ = s.Routes.UpdateMappingBenchmarkMetrics(ctx, tgt.mapping.ID, res.GenTokensPerSecond, res.PromptTokensPerSecond, res.LoadTimeMS, time.Now().UTC())
 	}
 	return res

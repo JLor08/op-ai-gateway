@@ -125,8 +125,9 @@ const probeImagesOnlyHintId = 'mapping-probe-context-hint';
 /**
  * The context-size probe's button, on the edit form only (the create form has
  * no mapping to probe yet). Disabled while a probe runs, while the server is
- * busy, without a `context_probe_path`, and for an images-only mapping: the
- * probe loads the model with a chat prompt, which the gateway refuses for it
+ * busy, without a `context_probe_path` unless the gateway derives the probe
+ * (`contextProbeDerived`), and for an images-only mapping: the probe loads the
+ * model with a chat prompt, which the gateway refuses for it
  * (`benchmark.images_only`). That last reason shows nowhere else on the form,
  * so the button is described by a hint that names it.
  */
@@ -136,6 +137,7 @@ function ContextProbeButton({
   probing,
   serverBusy,
   contextProbePath,
+  contextProbeDerived = false,
   onProbe,
 }: Readonly<{
   t: Translation;
@@ -143,6 +145,12 @@ function ContextProbeButton({
   probing: boolean;
   serverBusy: boolean;
   contextProbePath: string;
+  /**
+   * true when the gateway derives the context probe itself (a server_agent
+   * application); the probe button is then enabled even when
+   * `contextProbePath` is empty.
+   */
+  contextProbeDerived?: boolean;
   onProbe: (target: PortalModelMapping) => void;
 }>) {
   if (!row) return null;
@@ -153,7 +161,12 @@ function ContextProbeButton({
         type="button"
         variant="outlined"
         size="small"
-        disabled={probing || serverBusy || contextProbePath.trim() === '' || imagesOnly}
+        disabled={
+          probing ||
+          serverBusy ||
+          (!contextProbeDerived && contextProbePath.trim() === '') ||
+          imagesOnly
+        }
         aria-describedby={imagesOnly ? probeImagesOnlyHintId : undefined}
         startIcon={probing ? <CircularProgress size={16} color="inherit" /> : undefined}
         onClick={() => onProbe(row)}
@@ -184,8 +197,11 @@ function ContextProbeButton({
  * hydration and a fourteen-key body; a fifteenth metric added to one copy is
  * invisible, unlike a missing column.
  *
- * One flag, `appNameReadOnly`, and it is an OWNERSHIP boundary rather than a
- * convenience -- read its comment before touching it.
+ * Two flags tell the two screens apart. `appNameReadOnly` is an OWNERSHIP
+ * boundary rather than a convenience -- read its comment before touching it.
+ * `contextProbeDerived` offers the context probe without an application
+ * `context_probe_path`, because the gateway derives a `server_agent`
+ * application's probe itself.
  *
  * INITIALISATION is lazy from `row` and never re-synced from props: the caller
  * forces a fresh mask with `key={row?.id ?? 'create'}`. A `useEffect` sync is
@@ -197,6 +213,7 @@ export function MappingForm({
   api,
   serverId,
   contextProbePath,
+  contextProbeDerived = false,
   row,
   appNameReadOnly = false,
   busy,
@@ -208,8 +225,17 @@ export function MappingForm({
   api: Pick<PortalApi, 'activeBenchmarks' | 'benchmarkStatus' | 'probeMappingContext'>;
   /** Scope of the "is this server busy" poll that gates the probe button. */
   serverId: string;
-  /** The owning application's `context_probe_path`; '' disables the probe button. */
+  /**
+   * The owning application's `context_probe_path`; '' disables the probe
+   * button unless `contextProbeDerived` is set.
+   */
   contextProbePath: string;
+  /**
+   * true when the gateway derives the context probe itself (a server_agent
+   * application); the probe button is then enabled even when
+   * `contextProbePath` is empty.
+   */
+  contextProbeDerived?: boolean;
   /** The mapping being edited, or null for the create form (no probe button). */
   row: PortalModelMapping | null;
   /**
@@ -343,7 +369,8 @@ export function MappingForm({
   }, [api, serverId, editingId]);
 
   // Manual context-size probe: warm-load the model + read its context via the app's
-  // context_probe_path, then fill the field (no auto-save). POST → poll the benchmark
+  // context_probe_path (or the probe the gateway derives for a server_agent
+  // application), then fill the field (no auto-save). POST → poll the benchmark
   // status to completion → read this mapping's reported context_size. Errors / 0 →
   // toast, field unchanged.
   async function probeContext(target: PortalModelMapping) {
@@ -488,6 +515,7 @@ export function MappingForm({
           probing={probing}
           serverBusy={serverBusy}
           contextProbePath={contextProbePath}
+          contextProbeDerived={contextProbeDerived}
           onProbe={(target) => void probeContext(target)}
         />
         <Field

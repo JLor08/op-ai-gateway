@@ -344,12 +344,19 @@ type Server struct {
 	SessionMaxAge       time.Duration
 	PublicURL           string
 	streamIdleTimeout   time.Duration
-	// pushRuntimeConfigTimeout bounds PushRuntimeConfig's store read. A
-	// per-instance field, not a package var, so a `-race` test can shrink its
-	// own without writing memory the push goroutine reads (issue #53). Defaulted
-	// in New; a bare &Server{} leaves it zero and PushRuntimeConfig falls back to
-	// defaultPushRuntimeConfigTimeout.
+	// pushRuntimeConfigTimeout bounds the store read of each push pass
+	// (pushRuntimeConfigPass). A per-instance field, not a package var, so a
+	// `-race` test can shrink its own without writing memory a push worker
+	// reads (issue #53). Defaulted in New; a bare &Server{} leaves it zero and
+	// pushRuntimeConfigPass falls back to defaultPushRuntimeConfigTimeout.
 	pushRuntimeConfigTimeout time.Duration
+	// pushRuntimeConfigSpacing is how long a server's push worker waits after
+	// a pass that enqueued a frame before its next pass for that server
+	// (defaultPushRuntimeConfigSpacing says why). Per instance like
+	// pushRuntimeConfigTimeout, and defaulted in New. A bare &Server{} leaves
+	// it zero, which means no spacing; unlike the timeout there is no
+	// fallback, because 0 is a valid value.
+	pushRuntimeConfigSpacing time.Duration
 	selfBaseURL              string
 	Cipher                   *capture.Cipher
 	captureMaxBytes          int
@@ -595,6 +602,12 @@ type Server struct {
 	// (a fresh process re-observes the fact from the next completion it relays).
 	speculationSeenMu sync.Mutex
 	speculationSeen   map[string]struct{}
+
+	// runtimePush runs PushRuntimeConfig as at most one worker per server
+	// (runtimeConfigPusher). By value and usable at its zero value, like
+	// speculationSeenMu above, so a Server built directly (bypassing New)
+	// pushes through it too.
+	runtimePush runtimeConfigPusher
 }
 
 // portalProvisioningGate adapts portal.API's AllowedServerIDs onto the
@@ -800,6 +813,7 @@ func New(deps ServerDeps) *Server {
 		PublicURL:                   deps.PublicURL,
 		streamIdleTimeout:           deps.StreamIdleTimeout,
 		pushRuntimeConfigTimeout:    defaultPushRuntimeConfigTimeout,
+		pushRuntimeConfigSpacing:    defaultPushRuntimeConfigSpacing,
 		selfBaseURL:                 deps.SelfBaseURL,
 		Cipher:                      deps.Cipher,
 		captureMaxBytes:             captureMaxBytes,

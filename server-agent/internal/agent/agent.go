@@ -189,7 +189,22 @@ import (
 // "runtime_ensure", the name the gateway checks before it sends the route,
 // because a router without it cannot be told apart by trying (it answers 404
 // runtime.model_not_managed, as for an unmanaged model).
-const Version = "0.8.0"
+//
+// 0.8.0 -> 0.8.1: a runtime-config wake that arrives while a sync runs is
+// no longer dropped. triggerRuntimeSync owes one trailing sync with the
+// latest payload, so two pushed documents closer together than one sync
+// end on the second instead of resting on the first until the next push
+// or the 60 s poll. And a start that finishes wakes admission for queued
+// requests and pinned specs (the runtime owner's wakeAfterStart), so a
+// request queued behind an unpinned start that had no waiter of its own,
+// or a pinned spec waiting behind it, is admitted once that start is up,
+// instead of waiting for an unrelated release, exit or Apply (and failing
+// with runtime.admission_blocked at its admission wait). PATCH, and the
+// rule decides it: agent.Features gains no entry. Both are bugfixes an
+// operator observes, and nothing on the gateway waits on either: an older
+// agent rests on the older document until the next push or the poll, and
+// leaves such a request queued until the next release, exit or Apply.
+const Version = "0.8.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -575,13 +590,11 @@ type Agent struct {
 	// from runtimeDriver (see runtimeTransitionsWaker); nil when there is no
 	// driver, or the driver does not implement it.
 	runtimeTransitions <-chan struct{}
-	// runtimeSyncing serializes runtime-config syncs: the periodic ticker,
-	// the wake channel, and a direct call to Sync can all fire arbitrarily
-	// close together, and this CompareAndSwap guarantees at most one Sync
-	// runs at a time -- the exact same single-flight discipline
-	// certSyncing/trustSyncing already use, and the pattern the task brief
-	// calls "the AGENT's trigger pattern, not the Driver's own".
-	runtimeSyncing atomic.Bool
+	// runtimeSync serializes runtime-config syncs and owes one more sync to
+	// a wake that arrives during one: the periodic ticker, the wake channel
+	// and the startup call can all fire arbitrarily close together. See
+	// runtimeSyncState and triggerRuntimeSync.
+	runtimeSync runtimeSyncState
 	// runtimeReportResender is the optional periodic file-mode-report
 	// resend hook derived from runtimeDriver (see the interface doc above);
 	// nil when there is no driver, or the driver does not implement it.
@@ -995,27 +1008,88 @@ func (a *Agent) flushRuntimeLogs(ctx context.Context) {
 	}
 }
 
-// triggerRuntimeSync starts one runtime-config sync in its own goroutine
-// unless one is already running -- copies triggerCertSync's single-flight
-// CompareAndSwap coalescing discipline verbatim (see that function's doc
-// for the full rationale): a burst of ticker+wake+transition signals
-// arriving close together must never run two syncs concurrently, and must
-// never block Run's select loop on however long a sync takes.
+// runtimeSyncState is triggerRuntimeSync's bookkeeping. All three fields
+// change only under mu.
 //
-// A pushed payload lost to single-flight coalescing (data arrives while a
-// sync is already in flight, so this call is a no-op) is safe: the next
-// tick calls Sync again with a nil payload, and the driver's own
-// source.Load()/GatewaySource re-fetches or reads the source's own
-// already-cached latest document regardless -- nothing pushed is ever
-// silently dropped for good.
+// THE ONE-CRITICAL-SECTION RULE. runRuntimeSyncs clears running in the SAME
+// critical section that finds nothing owed. Split in two, a wake that lands
+// between "nothing owed" and "no longer running" is recorded as owed with
+// no goroutine left to run it, and the agent rests on an older document
+// until a later wake or the poll. The window is a few instructions wide, so no
+// test can force a wake into it. TestTriggerRuntimeSyncEndsOnTheLaterOfTwoOrderedWakes
+// aims a wake at it in every one of its rounds, which catches a split in
+// nearly every plain go test run on a machine with more than one CPU;
+// TestTriggerRuntimeSyncEndsOnTheLastWakeUnderABurst catches one only by
+// chance, more often under -race.
+type runtimeSyncState struct {
+	mu      sync.Mutex
+	running bool            // a sync goroutine exists
+	owed    bool            // a wake arrived while it ran
+	next    json.RawMessage // that wake's payload; latest wins, and nil means "resync over HTTP"
+}
+
+// triggerRuntimeSync starts a runtime-config sync in its own goroutine, or,
+// when one is already running, owes it exactly one more sync. Two rules
+// hold, and both are load-bearing:
+//
+//   - At most one Sync runs at a time, and Run's select loop never waits on
+//     one: a slow or stuck gateway must not stall the telemetry cadence.
+//   - A wake that arrives during a sync is not dropped. Until 0.8.1 it was:
+//     the trigger used triggerCertSync's single-flight CompareAndSwap, whose
+//     wake is a doorbell without content, but a runtime-config wake carries
+//     a whole document. The running sync applied the document it started
+//     with, and the agent rested on that one until the next push or the
+//     60 s poll, so of two pushed documents closer together than one sync
+//     (at least one features round trip) the second was lost.
+//
+// Any number of wakes during one sync coalesce into ONE trailing sync, with
+// the payload of the LAST of them. Latest-wins is the wake channel's own rule
+// (client.WSSender.wakeRuntimeConfig drains, then sends) carried across the
+// sync: every pushed document is a whole desired state, so the newest one
+// received supersedes the rest, and a nil (a reconnect, the poll ticker) is
+// "resync over HTTP", which must win over an earlier pushed document because
+// a reconnect may have missed pushes. The trailing sync is therefore exactly
+// the sync the last wake would have started had it arrived a moment later.
+// The agent does not order documents itself: it applies the last one it
+// received.
+//
+// A cancelled ctx ends the chain: ctx is Run's, so Run is returning (it does
+// not wait for the sync goroutine), and a trailing sync then would only
+// reconcile a runtime that is being shut down.
 func (a *Agent) triggerRuntimeSync(ctx context.Context, data json.RawMessage) {
-	if a.runtimeDriver == nil || !a.runtimeSyncing.CompareAndSwap(false, true) {
+	if a.runtimeDriver == nil {
 		return
 	}
-	go func() {
-		defer a.runtimeSyncing.Store(false)
+	s := &a.runtimeSync
+	s.mu.Lock()
+	if s.running {
+		s.owed = true
+		s.next = data
+		s.mu.Unlock()
+		return
+	}
+	s.running = true
+	s.mu.Unlock()
+	go a.runRuntimeSyncs(ctx, data)
+}
+
+// runRuntimeSyncs runs one Sync, then each sync owed to a wake that arrived
+// during the previous one, and exits with nothing owed. Only
+// triggerRuntimeSync starts it, and only while no other one runs.
+func (a *Agent) runRuntimeSyncs(ctx context.Context, data json.RawMessage) {
+	s := &a.runtimeSync
+	for {
 		a.runtimeDriver.Sync(ctx, data)
-	}()
+		s.mu.Lock()
+		if !s.owed || ctx.Err() != nil {
+			s.running, s.owed, s.next = false, false, nil
+			s.mu.Unlock()
+			return
+		}
+		data = s.next
+		s.owed, s.next = false, nil
+		s.mu.Unlock()
+	}
 }
 
 // newCertTicker builds the periodic certificate-poll ticker, or -- when

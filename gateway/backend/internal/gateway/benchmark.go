@@ -23,6 +23,31 @@ type BenchmarkStatus struct {
 	CurrentConcurrency int               `json:"current_concurrency,omitempty"`
 	Error              string            `json:"error,omitempty"`
 	Results            []BenchmarkResult `json:"results,omitempty"`
+	// UnpinnedSpecIDs names the launch specs a manual speed or both run unpinned
+	// for its duration, or may have (beginBenchmarkUnpin): the specs its unpin
+	// batch wrote, or, after a batch that failed, the specs its immediate
+	// re-pin could not pin again. Such a spec is one the batch wrote, or one
+	// whose failed unpin may have stored pinned = false or may never have
+	// unpinned it, and the failed re-pin may itself have stored pinned = true.
+	// It is the audit set the portal names. Set at most once, before the first
+	// target, and never mutated afterwards (snapshot shares the slice).
+	UnpinnedSpecIDs []string `json:"unpinned_spec_ids,omitempty"`
+	// RepinFailed names the launch specs whose re-pin failed when the run
+	// ended (a store error). They may still be unpinned: a failed write may
+	// have stored pinned = true, or never have reached the row. An operator
+	// checks and pins them by hand; the override lease retries them at the next
+	// gateway start and at the next manual speed or both run on this server
+	// that passes its start gates (beginBenchmarkUnpin).
+	RepinFailed []string `json:"repin_failed,omitempty"`
+	// StoppedSpecIDs names every launch spec a stop-all of this run
+	// (preStopServer) force-stopped, or may have, before a measurement: the
+	// union over its stop batches of the specs written and the specs whose
+	// write failed, which may have stored the override or may never have
+	// stopped the spec. A spec a batch found gone or carrying another
+	// admin_state is not named. It is the audit set the portal names. It only
+	// grows; setStopped replaces the slice and never mutates it (snapshot
+	// shares it).
+	StoppedSpecIDs []string `json:"stopped_spec_ids,omitempty"`
 }
 
 // BenchmarkResult is one model mapping's measured metrics from a benchmark run.
@@ -48,8 +73,8 @@ type BenchmarkResult struct {
 	// reached no number, and WHY is the operator's next action. The nested
 	// shape mirrors routing.CapacityReport; what is deliberately NOT copied is
 	// VisionCapable's nil-means-both contract above, because "no result" and
-	// "no result because the model was already being served by something we
-	// could not stop" send an operator to two different places. See
+	// "no result because the model's own process was up again before the run
+	// loaded it" send an operator to two different places. See
 	// benchmark_vram.go for the report itself.
 	//
 	// Held by POINTER, and a report attached to a result is IMMUTABLE from
@@ -203,6 +228,30 @@ func (run *benchmarkRun) addResult(res BenchmarkResult) {
 	run.status.Results = append(run.status.Results, res)
 	run.status.Done = len(run.status.Results)
 	run.status.CurrentConcurrency = 0
+	run.mu.Unlock()
+}
+
+// setStopped replaces the run's StoppedSpecIDs with ids, which the caller
+// never mutates afterwards.
+func (run *benchmarkRun) setStopped(ids []string) {
+	run.mu.Lock()
+	run.status.StoppedSpecIDs = ids
+	run.mu.Unlock()
+}
+
+// setUnpinned replaces the run's UnpinnedSpecIDs with ids, which the caller
+// never mutates afterwards.
+func (run *benchmarkRun) setUnpinned(ids []string) {
+	run.mu.Lock()
+	run.status.UnpinnedSpecIDs = ids
+	run.mu.Unlock()
+}
+
+// setRepinFailed records the launch specs whose re-pin failed when the run
+// ended.
+func (run *benchmarkRun) setRepinFailed(ids []string) {
+	run.mu.Lock()
+	run.status.RepinFailed = ids
 	run.mu.Unlock()
 }
 

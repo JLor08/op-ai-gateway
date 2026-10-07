@@ -118,14 +118,22 @@ type VRAMReportDTO struct {
 	// says which standard failed.
 	IsolationProof string   `json:"isolation_proof,omitempty"`
 	DrainedSpecIDs []string `json:"drained_spec_ids,omitempty"`
-	// RestoreFailed is the specs whose override the run could not clear, so
-	// they ARE still force_stopped and need clearing by hand. RestoreTakenOver
-	// is the disjoint other case: the spec's admin_state was no longer the
-	// run's force_stopped when the restore re-read it, because an operator
-	// force-started it or cleared the override mid-run -- so the restore wrote
-	// nothing and there is nothing to clear. Two fields because they are two
-	// instructions, and giving the second one the first one's message tells an
-	// operator to stop a model they just started.
+	// RestoreFailed is the specs whose restore write returned an error, so
+	// they may still be force_stopped (a write can fail after it stored the
+	// cleared row): an operator clears the ones that still are by hand, or the
+	// next reconcile of the override lease does. RestoreTakenOver is the
+	// disjoint other case: the spec read another admin_state than force_stopped
+	// when the restore re-read it, so the restore wrote nothing and left it
+	// alone. Either the run's own writes never stored force_stopped or already
+	// cleared it -- the drain's write failed before it stored it, or the clear
+	// of the target's override failed after it stored the cleared row, which
+	// leaves the target owed to the restore -- or a writer the run's
+	// reservation does not cover changed the override during the run: the
+	// reservation refuses PutRuntimeSpec in the run's own gateway process only
+	// (the gateway's VRAMReport.RestoreTakenOver names those writers). Two
+	// fields because they are two instructions: a taken-over spec is not
+	// force_stopped, so giving it the first one's message would send an
+	// operator to clear an override that is not there, or is not the run's.
 	RestoreFailed    []string `json:"restore_failed,omitempty"`
 	RestoreTakenOver []string `json:"restore_taken_over,omitempty"`
 	Inconclusive     string   `json:"inconclusive,omitempty"`

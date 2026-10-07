@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MappingForm, type MappingFormValues } from './MappingForm';
 import { ToastProvider } from './shared/ToastProvider';
@@ -53,6 +53,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       appNameReadOnly?: boolean;
       row?: PortalModelMapping | null;
       contextProbePath?: string;
+      contextProbeDerived?: boolean;
       benchmarkStatus?: () => Promise<BenchmarkStatus>;
     } = {},
   ) {
@@ -69,6 +70,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           api={api}
           serverId="srv_1"
           contextProbePath={opts.contextProbePath ?? ''}
+          contextProbeDerived={opts.contextProbeDerived}
           row={nextRow}
           appNameReadOnly={opts.appNameReadOnly}
           busy={false}
@@ -403,6 +405,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(button).toBeEnabled());
       expect(button).not.toHaveAccessibleDescription();
       expect(screen.queryByText(t.mappingProbeContextImagesOnly)).not.toBeInTheDocument();
+    });
+
+    it('disables the probe without a context_probe_path', async () => {
+      renderForm({ contextProbePath: '', row: makeMapping({ images_only: false }) });
+      // Let the busy poll answer first, so the assertion reads the settled
+      // button.
+      await act(async () => {});
+      expect(screen.getByRole('button', { name: t.mappingProbeContext })).toBeDisabled();
+    });
+
+    // A server_agent application carries no context_probe_path: the gateway
+    // derives the probe from the agent router or the agent's telemetry.
+    it('offers the probe without a context_probe_path when the gateway derives it', async () => {
+      renderForm({
+        contextProbePath: '',
+        contextProbeDerived: true,
+        row: makeMapping({ images_only: false }),
+      });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      await waitFor(() => expect(button).toBeEnabled());
+      expect(button).not.toHaveAccessibleDescription();
+    });
+
+    it('still disables a derived probe for an images-only mapping', async () => {
+      renderForm({
+        contextProbePath: '',
+        contextProbeDerived: true,
+        row: makeMapping({ images_only: true }),
+      });
+      await act(async () => {});
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextImagesOnly);
     });
 
     // The create form has no mapping to probe yet.

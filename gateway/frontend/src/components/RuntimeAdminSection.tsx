@@ -547,13 +547,14 @@ function narrowReportConfig(config: unknown): ReportConfig {
 
 // The override actions' PUT body. putRuntimeSpec takes the ENTIRE spec
 // (Omit<RuntimeSpec, 'configured' | 'id' | 'mapping_id'>), never a patch, so
-// the body is built by spreading the ACTUAL loaded spec and replacing exactly
-// one field. A synthesized or defaulted body would silently overwrite the
-// operator's configured binary/args/env/gpus/timeouts on a single override
-// click -- the same full-replace hazard as the co-residency and GPU-budget
-// writes (task-21 review). The rest-spread is deliberate over an explicit
-// field list: a field added to RuntimeSpec later carries through by itself
-// instead of being silently dropped here.
+// the body is built by spreading the spec as the action has just read it
+// (`readSpecForWrite`) and replacing exactly one field. A synthesized or
+// defaulted body would silently overwrite the operator's configured
+// binary/args/env/gpus/timeouts on a single override click -- the same
+// full-replace hazard as the co-residency and GPU-budget writes (task-21
+// review). The rest-spread is deliberate over an explicit field list: a field
+// added to RuntimeSpec later carries through by itself instead of being
+// silently dropped here.
 function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequest {
   // api_token_set/app_api_token_set/app_api_token_header and the RuntimeSpec
   // Type block's own effective_type/resolved_metrics_path/
@@ -1390,7 +1391,8 @@ export function RuntimeAdminSection({
   /**
    * Per-mapping ordering for `specsById`. Every write to that cache goes
    * through `commitSpecCache`/`forgetSpecCache` and every read through
-   * `commitSpecRead`; nothing else may call `setSpecsById`.
+   * `commitSpecRead`; nothing else may call `setSpecsById`, and those three
+   * keep `cachedSpecsRef` in step with it.
    *
    * `specsById` is a cache of server truth, and the three override/restart
    * writes deliberately update it ABOVE their run token (fix round 2, N1) so a
@@ -1455,6 +1457,10 @@ export function RuntimeAdminSection({
    */
   const specWriteSeqRef = useRef<Map<string, number>>(new Map());
   const specCommittedSeqRef = useRef<Map<string, number>>(new Map());
+  // The entries of `specsById` as the last accepted commit left them. Code
+  // that runs between renders reads the cache here (`readSpecForWrite`):
+  // `specsById` in its closure is the copy of the render it started in.
+  const cachedSpecsRef = useRef<Map<string, RuntimeSpec>>(new Map());
   /** Issues the next write ticket for this mapping's cache entry. */
   function beginSpecWrite(mappingId: string): number {
     const ticket = (specWriteSeqRef.current.get(mappingId) ?? 0) + 1;
@@ -1469,11 +1475,13 @@ export function RuntimeAdminSection({
   }
   function commitSpecCache(mappingId: string, ticket: number, spec: RuntimeSpec) {
     if (!acceptSpecWrite(mappingId, ticket)) return;
+    cachedSpecsRef.current.set(mappingId, spec);
     setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
   }
   /** The mapping-delete half: the entry is gone, and that fact is ordered too. */
   function forgetSpecCache(mappingId: string, ticket: number) {
     if (!acceptSpecWrite(mappingId, ticket)) return;
+    cachedSpecsRef.current.delete(mappingId);
     setSpecsById((cur) => {
       const next = { ...cur };
       delete next[mappingId];
@@ -1497,9 +1505,12 @@ export function RuntimeAdminSection({
   function beginSpecRead(mappingId: string): number {
     return specCommittedSeqRef.current.get(mappingId) ?? 0;
   }
-  function commitSpecRead(mappingId: string, seen: number, spec: RuntimeSpec) {
-    if ((specCommittedSeqRef.current.get(mappingId) ?? 0) !== seen) return;
+  /** Commits a read unless a write committed inside it; true when it did. */
+  function commitSpecRead(mappingId: string, seen: number, spec: RuntimeSpec): boolean {
+    if ((specCommittedSeqRef.current.get(mappingId) ?? 0) !== seen) return false;
+    cachedSpecsRef.current.set(mappingId, spec);
     setSpecsById((cur) => ({ ...cur, [mappingId]: spec }));
+    return true;
   }
 
   // ---- Area 2: co-residency matrix --------------------------------------
@@ -1997,6 +2008,14 @@ export function RuntimeAdminSection({
       mountedRef.current = false;
     };
   }, []);
+  /** Whether override write `run` is over: unmounted, or abandoned. */
+  function overrideRunOver(run: number): boolean {
+    return !mountedRef.current || overrideRunRef.current !== run;
+  }
+  /** Whether restart sequence `run` is over: unmounted, or abandoned. */
+  function restartRunOver(run: number): boolean {
+    return !mountedRef.current || restartRunRef.current !== run;
+  }
   // Any admin_state write while a restart runs would fight the sequence, so
   // ALL override actions lock, not just the restart one (the visibly-disabled
   // idiom areas 2/3 already use for coresidencyBusy/limitsBusy).
@@ -2075,11 +2094,15 @@ export function RuntimeAdminSection({
     // nothing, and reports success.
     if (row.state === 'stopped' && frameSeqRef.current > restart.waitFrom) {
       // A spec DELETE for this mapping still in flight holds the clear: the
-      // cache keeps the configured document until the DELETE answers, and
-      // the spec PUT is an upsert, so a clear handled after the DELETE would
-      // create the deleted spec again. The next frame decides once it has
-      // settled: a committed delete leaves `emptySpec` for finishRestart to
-      // report as vanished, a failed one leaves the spec to clear. The
+      // clear's own read can still answer the configured document while the
+      // DELETE is in flight, and the spec PUT is an upsert, so a clear handled
+      // after the DELETE would create the deleted spec again. This check
+      // holds a clear whose DELETE was confirmed before it started;
+      // finishRestart checks again after its read, for a DELETE confirmed
+      // while the read was in flight, and puts the flow back in `waiting`. A
+      // frame after the DELETE has settled decides: after a committed delete
+      // the clear finds configured: false and finishRestart reports the spec
+      // vanished, after a failed one the spec is still there to clear. The
       // deadline above still bounds the wait.
       if (specDeletesInFlight(restart.mappingId)) return;
       void finishRestart(restart);
@@ -2109,6 +2132,31 @@ export function RuntimeAdminSection({
     if (spec.admin_state === '') setRestartNotice(null);
   }
 
+  /**
+   * The spec as the server stores it now, read for one override write to
+   * build its body from. The cache is loaded once per mapping, and only this
+   * section's own reads and writes refresh it, so it can be older than the
+   * stored document: a benchmark run unpins the server's pinned specs for its
+   * duration and pins them again after it, and a body built from a cache
+   * loaded during the run would write `pinned: false` back. Committed to the
+   * cache like any other read, ordered against this mapping's writes
+   * (`commitSpecRead`).
+   *
+   * Returns the newest spec this section knows. That is the read, unless a
+   * write of this section committed while it was in flight: the cache then
+   * refuses the read, and the cache's current entry is the newer document.
+   * After a form save that is the saved document, so the body keeps what the
+   * form changed. After a spec delete it is the unconfigured document, and
+   * after a mapping delete there is no entry, which reads as the unconfigured
+   * document too; either way the caller writes nothing.
+   */
+  async function readSpecForWrite(mappingId: string): Promise<RuntimeSpec> {
+    const seen = beginSpecRead(mappingId);
+    const fresh = await api.runtimeSpec(mappingId);
+    if (commitSpecRead(mappingId, seen, fresh)) return fresh;
+    return cachedSpecsRef.current.get(mappingId) ?? emptySpec(mappingId);
+  }
+
   async function setOverride(spec: RuntimeSpec, adminState: string) {
     // A timeout/aborted notice tells the operator an override was left in
     // place; acting on any override is exactly the moment it stops being
@@ -2116,22 +2164,39 @@ export function RuntimeAdminSection({
     // restart or a server switch.
     setRestartNotice(null);
     const run = ++overrideRunRef.current;
-    const ticket = beginSpecWrite(spec.mapping_id);
     setOverrideBusy(true);
     // Bounds the lock. `overrideBusy` disables EVERY action on EVERY row, and
     // nothing else in the stack ever gives up on the request (no
     // AbortController in api/transport.ts), so without this a single PUT that
     // never settles freezes the whole table until the page is reloaded.
     const watchdog = setTimeout(() => {
-      if (!mountedRef.current || overrideRunRef.current !== run) return;
+      if (overrideRunOver(run)) return;
       overrideRunRef.current += 1; // abandon: a late response must stay silent
       setOverrideBusy(false);
       showError(t.runtimeWriteTimeout);
     }, OVERRIDE_WRITE_TIMEOUT_MS);
     try {
+      // The body comes from a fresh read, inside the watchdog's bound, or,
+      // when the cache refused that read because a write of this section
+      // committed while it was in flight, from the newer document that write
+      // left in the cache (`readSpecForWrite`). A read that fails aborts the
+      // write through the catch below, and one that lands after the watchdog
+      // gave the write up sends nothing: the operator has already been told
+      // it was abandoned. The ticket is issued when the PUT is sent, so a
+      // write that commits during the read is the older one.
+      const fresh = await readSpecForWrite(spec.mapping_id);
+      if (overrideRunOver(run)) return;
+      // Nothing is written for a spec that is being deleted or is no longer
+      // configured: the spec PUT is an upsert, so it would create the spec
+      // again. A spec DELETE may still be in flight (one confirmed during the
+      // read, say), or may have committed during the read and left the
+      // unconfigured document in the cache (`readSpecForWrite`). The action
+      // then ends without a toast.
+      if (specDeletesInFlight(spec.mapping_id) || !fresh.configured) return;
+      const ticket = beginSpecWrite(spec.mapping_id);
       const updated = await api.putRuntimeSpec(
         spec.mapping_id,
-        specBodyWithAdminState(spec, adminState),
+        specBodyWithAdminState(fresh, adminState),
       );
       if (!mountedRef.current) return;
       // ABOVE the run-token guard, deliberately. `specsById` is a cache of
@@ -2175,7 +2240,6 @@ export function RuntimeAdminSection({
     const live = statusRowsRef.current.find((r) => r.spec_id === specId);
     if (live === undefined || !restartableStates.has(live.state)) return;
     const run = ++restartRunRef.current;
-    const ticket = beginSpecWrite(spec.mapping_id);
     absentSinceRef.current = null;
     setRestartNotice(null);
     setRestart({
@@ -2186,9 +2250,24 @@ export function RuntimeAdminSection({
       waitFrom: frameSeqRef.current,
     });
     try {
+      // From a fresh read inside the stop deadline, or from the newer cached
+      // document when the cache refused it, as in `setOverride`, with the
+      // ticket issued when the PUT is sent. A failed read ends the sequence
+      // through the catch below; a read that lands after the deadline gave
+      // the sequence up writes nothing.
+      const fresh = await readSpecForWrite(spec.mapping_id);
+      if (restartRunOver(run)) return;
+      // As in `setOverride`, nothing is written for a spec that is being
+      // deleted or is no longer configured. The sequence ends without a
+      // notice: it has forced nothing down.
+      if (specDeletesInFlight(spec.mapping_id) || !fresh.configured) {
+        setRestart((cur) => (cur?.specId === specId ? null : cur));
+        return;
+      }
+      const ticket = beginSpecWrite(spec.mapping_id);
       const updated = await api.putRuntimeSpec(
         spec.mapping_id,
-        specBodyWithAdminState(spec, 'force_stopped'),
+        specBodyWithAdminState(fresh, 'force_stopped'),
       );
       if (!mountedRef.current) return;
       // Read the watermark HERE, not inside the updater below: the updater may
@@ -2204,7 +2283,7 @@ export function RuntimeAdminSection({
       if (restartRunRef.current !== run) return;
       setRestart((cur) => (cur?.specId === specId ? { ...cur, phase: 'waiting', waitFrom } : cur));
     } catch (err) {
-      if (!mountedRef.current || restartRunRef.current !== run) return;
+      if (restartRunOver(run)) return;
       showError(formatPortalError(err, t));
       setRestart((cur) => (cur?.specId === specId ? null : cur));
     }
@@ -2212,30 +2291,47 @@ export function RuntimeAdminSection({
 
   async function finishRestart(flow: RestartFlow) {
     const run = restartRunRef.current;
-    // Re-read the spec by MAPPING id (captured when the flow started), not by
-    // the stream's spec id: the clear PUT must not depend on the spec-id join
-    // still resolving, and it must still be the actual stored document.
-    const spec = specsById[flow.mappingId];
-    // Gone from the cache, deleted while the restart waited (a delete commits
-    // emptySpec, configured: false), or deleted and created again, which gives
-    // the mapping a spec with another id: in each case the spec this restart
-    // forced down is gone. PUTting the empty document would only earn a
-    // refusal, and clearing the new spec would overwrite an override the
-    // operator set on it.
-    if (spec === undefined || !spec.configured || spec.id !== flow.specId) {
-      setRestart(null);
-      setRestartNotice('vanished');
-      return;
-    }
-    // Its own, much shorter deadline: from here the sequence waits on one
-    // HTTP round trip writing one document, not on a process lifecycle.
+    // Its own, much shorter deadline: from here the sequence waits on two
+    // HTTP round trips, the read and the clear, not on a process lifecycle.
+    // Set before the read, so the next frame finds the flow past `waiting`
+    // and does not start a second clear.
     setRestart({
       ...flow,
       phase: 'clearing',
       deadline: Date.now() + OVERRIDE_WRITE_TIMEOUT_MS,
     });
-    const ticket = beginSpecWrite(flow.mappingId);
+    let heldForDelete = false;
     try {
+      // Re-read the spec by MAPPING id (captured when the flow started), not
+      // by the stream's spec id: the clear PUT must not depend on the spec-id
+      // join still resolving. And from the server, not the cache, for the
+      // reason given at `readSpecForWrite`, unless the cache refused the read
+      // because a write of this section committed while it was in flight: the
+      // newer document that write left in the cache is then the one cleared.
+      // A failed read ends the sequence through the catch below; one that
+      // lands after the deadline gave the sequence up writes nothing.
+      const spec = await readSpecForWrite(flow.mappingId);
+      if (restartRunOver(run)) return;
+      // A spec DELETE confirmed while the read was in flight holds the clear,
+      // as the stream effect holds one confirmed before it: the read may
+      // still have answered the configured document. The flow goes back to
+      // `waiting`, and a frame after the DELETE has settled decides.
+      if (specDeletesInFlight(flow.mappingId)) {
+        heldForDelete = true;
+        setRestart(flow);
+        return;
+      }
+      // Deleted while the restart waited (configured: false, from the read or
+      // from the cache entry a delete committed during it), or deleted and
+      // created again, which gives the mapping a spec with another id: in
+      // each case the spec this restart forced down is gone.
+      // PUTting the empty document would only earn a refusal, and clearing the
+      // new spec would overwrite an override the operator set on it.
+      if (!spec.configured || spec.id !== flow.specId) {
+        setRestartNotice('vanished');
+        return;
+      }
+      const ticket = beginSpecWrite(flow.mappingId);
       const updated = await api.putRuntimeSpec(flow.mappingId, specBodyWithAdminState(spec, ''));
       if (!mountedRef.current) return;
       // Same reasoning as the other two writes: an abandoned clear PUT that
@@ -2248,7 +2344,8 @@ export function RuntimeAdminSection({
     } catch (err) {
       if (mountedRef.current && restartRunRef.current === run) showError(formatPortalError(err, t));
     } finally {
-      if (mountedRef.current && restartRunRef.current === run) setRestart(null);
+      // A clear held for a delete is back in `waiting` and still running.
+      if (!heldForDelete && mountedRef.current && restartRunRef.current === run) setRestart(null);
     }
   }
 
@@ -3133,8 +3230,12 @@ export function RuntimeAdminSection({
         // too: an override PUT still in flight for this mapping must not
         // resurrect the spec that has just been deleted.
         const ticket = beginSpecWrite(id);
-        // Counted while in flight so a waiting restart holds its clear PUT
-        // until the DELETE has settled (the stream effect above).
+        // Counted while in flight, so that no override write that has not sent
+        // its PUT yet sends one before the DELETE has settled: a waiting
+        // restart holds its clear (the stream effect above), and each override
+        // write checks after its read: `setOverride` and `startRestart`, for
+        // which that is the only check, then write nothing, and `finishRestart`,
+        // which the stream effect checked before its read, holds its clear.
         specDeletesInFlightRef.current.set(id, (specDeletesInFlightRef.current.get(id) ?? 0) + 1);
         try {
           await api.deleteRuntimeSpec(id);
@@ -3912,10 +4013,17 @@ export function RuntimeAdminSection({
             api={api}
             serverId={server.id}
             contextProbePath={application.context_probe_path ?? ''}
+            // One difference from the ordinary mapping screen: this screen only
+            // ever shows a server_agent application, whose context probe the
+            // gateway derives itself (the agent router's
+            // /upstream/{model}/props, or the agent's telemetry). The
+            // application form clears its context_probe_path, so the probe
+            // does not wait for one.
+            contextProbeDerived
             row={mappingEdit}
-            // The one difference from the ordinary mapping screen, and it is an
-            // ownership boundary: this application HAS a runtime spec, and the
-            // spec owns the application model name (its `upstream_model`).
+            // The other difference, and it is an ownership boundary: this
+            // application HAS a runtime spec, and the spec owns the application
+            // model name (its `upstream_model`).
             appNameReadOnly
             busy={busy}
             onSubmit={(values) => void saveMappingFromTab(mappingEdit.id, values)}

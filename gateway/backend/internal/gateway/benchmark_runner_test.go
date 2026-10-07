@@ -1150,9 +1150,10 @@ func TestMeasureMappingStreamsWithSpecToken(t *testing.T) {
 	}
 }
 
-// TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe covers the OTHER two Target
-// builders (benchmark_runner.go's warm-load benchmarkTargetReq call AND its own
-// context-probe `pt := routing.Target{...}` literal): both must carry the spec token.
+// TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe covers the context probe's two
+// Target builders (the warm-load benchmarkTargetReq call AND benchmarkProbeContextSize's
+// probe target) for an application that sets its own context_probe_path: both must
+// carry the spec token.
 func TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe(t *testing.T) {
 	fake := &benchProbingProvider{
 		benchFakeProvider: benchFakeProvider{usage: inference.Usage{OutputTokens: 20, TokensPerSecond: 55}},
@@ -1182,8 +1183,11 @@ func TestRunContextProbeUsesSpecTokenForWarmLoadAndProbe(t *testing.T) {
 	}
 }
 
-// TestMeasureSpeedTargetContextProbeUsesSpecToken covers the THIRD Target builder: the
-// re-probe `pt := routing.Target{...}` literal inside measureSpeedTarget.
+// TestMeasureSpeedTargetContextProbeUsesSpecToken covers the speed run's context
+// probe target (benchmarkProbeContextSize) for the application the portal stores: a
+// server_agent application without a context_probe_path, on an agent that declares
+// runtime_upstream_props, is probed on the router's /upstream/{model}/props with the
+// spec's token.
 func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
@@ -1191,7 +1195,7 @@ func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
 	if err := mem.CreateAIServer(ctx, routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := mem.CreateApplication(ctx, routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, ContextProbePath: "/props", APIToken: "enc:app-token", APITokenHeader: "Authorization", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := mem.CreateApplication(ctx, routing.Application{ID: "app1", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8100, Scheme: "http", TimeoutMS: 30000, APIToken: "enc:app-token", APITokenHeader: "Authorization", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map1", ApplicationID: "app1", GatewayModelName: "gw-model", AppModelName: "up-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -1203,17 +1207,23 @@ func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
 		probeName:         "up-model",
 		probeContext:      8192,
 	}
-	srv := &Server{Provider: fake, Routes: mem}
+	srv := &Server{Provider: fake, Routes: mem, AgentFeatures: NewAgentFeaturesRegistry()}
+	srv.AgentFeatures.Set("srv1", []string{RuntimeUpstreamPropsFeature})
 
-	tgt := benchServerAgentTarget()
-	tgt.app.ContextProbePath = "/props"
+	tgt := benchServerAgentTarget() // ContextProbePath "", the portal's shape
 
 	res := srv.measureSpeedTarget(ctx, tgt)
 	if res.Error != "" {
 		t.Fatalf("measureSpeedTarget error = %q, want empty", res.Error)
 	}
+	if fake.probedPath != "/upstream/up-model/props" {
+		t.Fatalf("context-probe path = %q, want /upstream/up-model/props", fake.probedPath)
+	}
 	if fake.probedTarget.APIToken != "enc:spec-token" {
 		t.Fatalf("context-probe APIToken = %q, want enc:spec-token", fake.probedTarget.APIToken)
+	}
+	if res.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192", res.ContextSize)
 	}
 }
 

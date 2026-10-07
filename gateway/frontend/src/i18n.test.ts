@@ -785,6 +785,79 @@ describe('benchmark i18n keys', () => {
   });
 });
 
+// A benchmark result with a load time of 0 names it as not measured, and the
+// server_agent probe-field note says where the gateway takes the loaded state
+// and the context size from.
+describe('benchmark load-time and server_agent probe-note i18n keys', () => {
+  it('defines both keys in de and en with their exact texts', () => {
+    const keys = [
+      'benchmarkResultLoadTimeNotMeasured',
+      'applicationProbeFieldsDisabledNote',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.benchmarkResultLoadTimeNotMeasured).toBe('Ladezeit nicht gemessen');
+    expect(messages.en.benchmarkResultLoadTimeNotMeasured).toBe('load time not measured');
+    expect(messages.de.applicationProbeFieldsDisabledNote).toBe(
+      'Bei server_agent-Anwendungen leitet das Gateway Ladezustand und Kontextgröße selbst ab: den Ladezustand aus /running des Agent-Routers, die Kontextgröße je Modell aus dessen Runtime-Spezifikation (über /upstream/{model}/props oder die Telemetrie des Agents). Dieses Feld ist hier gesperrt und wird beim Speichern geleert.',
+    );
+    expect(messages.en.applicationProbeFieldsDisabledNote).toBe(
+      "For server_agent applications the gateway derives loaded state and context size itself: loaded state from the agent router's /running, context size per model from its runtime spec (through /upstream/{model}/props or the agent's telemetry). This field is locked here and cleared on save.",
+    );
+  });
+});
+
+// A manual speed or both run names the specs it unpinned for its duration,
+// the ones it could not pin again and the ones it stopped before a
+// measurement. A failed unpin or stop write may or may not have stored its
+// value, and a spec deleted during the run, or whose application is no longer
+// server_agent, is gone at the re-pin rather than in repin_failed, so none of
+// the texts claims more than the lists guarantee.
+describe('benchmark unpin and stop notice i18n keys', () => {
+  it('defines the four keys in de and en with their exact texts', () => {
+    const keys = [
+      'benchmarkUnpinnedDuringRun',
+      'benchmarkUnpinnedAfterRun',
+      'benchmarkRepinFailed',
+      'benchmarkStoppedForMeasurement',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.de.benchmarkUnpinnedDuringRun).toBe(
+      'Diese Runtime-Spezifikationen sind für diesen Lauf vorübergehend nicht gepinnt (oder sind es möglicherweise) und werden danach wieder gepinnt:',
+    );
+    expect(messages.en.benchmarkUnpinnedDuringRun).toBe(
+      'These runtime specs are unpinned for this run only (or may be) and are pinned again when it ends:',
+    );
+    expect(messages.de.benchmarkUnpinnedAfterRun).toBe(
+      'Diese Runtime-Spezifikationen waren für den Lauf nicht gepinnt und sind wieder gepinnt, außer während des Laufs gelöschte und solche, deren Anwendung nicht mehr server_agent ist:',
+    );
+    expect(messages.en.benchmarkUnpinnedAfterRun).toBe(
+      'These runtime specs were unpinned for the run and are pinned again, except any deleted during the run or whose application is no longer server_agent:',
+    );
+    expect(messages.de.benchmarkRepinFailed).toBe(
+      'Diese Runtime-Spezifikationen sind nach dem Lauf möglicherweise noch nicht wieder gepinnt. Prüfen Sie sie im Runtime-Bereich und pinnen Sie sie dort bei Bedarf von Hand:',
+    );
+    expect(messages.en.benchmarkRepinFailed).toBe(
+      'These runtime specs may still be unpinned after the run. Check them in the runtime section and pin them by hand where needed:',
+    );
+    expect(messages.de.benchmarkStoppedForMeasurement).toBe(
+      'Diese Runtime-Spezifikationen hat der Lauf vor einer Messung gestoppt (oder es versucht). Gepinnte starten nach dem Lauf wieder, alle anderen bei ihrer nächsten Anfrage:',
+    );
+    expect(messages.en.benchmarkStoppedForMeasurement).toBe(
+      'The run stopped these runtime specs before a measurement (or tried to). Pinned ones start again after the run, all others on their next request:',
+    );
+  });
+});
+
 describe('images-only and Load-refusal i18n keys', () => {
   for (const locale of ['de', 'en'] as readonly Locale[]) {
     const t = messages[locale];
@@ -2835,6 +2908,65 @@ describe('VRAM-benchmark portal i18n keys', () => {
   it('labels the unified-memory figure as system RAM in both locales', () => {
     expect(messages.de.benchmarkVramUnifiedMemory).toMatch(/System-RAM/);
     expect(messages.en.benchmarkVramUnifiedMemory).toMatch(/system RAM/);
+  });
+});
+
+// The VRAM run records its drain in the benchmark override lease, which the
+// gateway settles when it starts again: the drained note says so instead of
+// sending the operator to clear the overrides by hand, and the restore-failed
+// alert keeps "by hand" and names the gateway's own retry at its next start
+// (a later manual speed or both run retries too, but only once it has passed
+// its own start gates, so the text does not promise it). A drain write
+// that failed may or may not have stored force_stopped, and a restore write
+// that failed may have stored the cleared row, so neither text claims the
+// stop as certain. The taken-over alert names every cause that can happen, and
+// only those: while the run holds the server, this gateway refuses the
+// operator's launch-spec writes, so only the run's own writes (a stop never
+// stored, or the target's clear that failed after it stored the cleared row),
+// another gateway process on the same store, or a write that passed that check
+// just before the run took the server leave a spec without the run's
+// force_stopped.
+describe('VRAM drain and restore-failure i18n texts', () => {
+  it('pins both texts in de and en', () => {
+    expect(messages.de.benchmarkVramDrainedNote).toBe(
+      'Diese Specs wurden für die Messung auf force_stopped gesetzt (oder der Lauf hat es versucht) und danach wiederhergestellt. Stirbt der Gateway zwischen Anhalten und Wiederherstellen, bleiben die angehaltenen Specs angehalten, bis der Gateway wieder startet: Dann entfernt er die Overrides selbst.',
+    );
+    expect(messages.en.benchmarkVramDrainedNote).toBe(
+      'These specs were set to force_stopped for the measurement (or the run tried to) and restored afterwards. If the gateway dies between the drain and the restore, the stopped ones stay stopped until the gateway starts again, which then clears the overrides itself.',
+    );
+    expect(messages.de.benchmarkVramRestoreFailed).toBe(
+      'Diese Specs stehen möglicherweise weiterhin auf force_stopped und müssen dann von Hand zurückgesetzt werden. Der Gateway versucht es außerdem bei seinem nächsten Start erneut.',
+    );
+    expect(messages.en.benchmarkVramRestoreFailed).toBe(
+      'These specs may still be force_stopped, and those that are have to be cleared by hand. The gateway also retries at its next start.',
+    );
+  });
+
+  it('pins the already-resident text in de and en', () => {
+    expect(messages.de.benchmarkVramInconclusiveAlreadyResident).toBe(
+      'Nachdem der Lauf alle Modelle angehalten und den Override dieses Modells aufgehoben hatte, meldete der Agent den eigenen Prozess dieses Modells wieder als laufend, bevor der Lauf es geladen hat – gestartet durch eine Anfrage direkt an den Agenten oder durch den Pin des Modells. Der Lauf hat es nicht selbst geladen und meldet deshalb keine Zahl. Stellen Sie sicher, dass sonst nichts Anfragen an dieses Modell sendet, und messen Sie erneut.',
+    );
+    expect(messages.en.benchmarkVramInconclusiveAlreadyResident).toBe(
+      "After the run had stopped every model and cleared this model's override, the agent reported the model's own process running again before the run loaded it — started by a request sent straight to the agent, or by the model's pin. The run did not load it itself, so it reports no number. Make sure nothing else sends requests to this model, then measure again.",
+    );
+  });
+
+  it('pins the residency-unknown text in de and en', () => {
+    expect(messages.de.benchmarkVramWarningResidencyUnknown).toBe(
+      'Der Lauf konnte nicht prüfen, ob der eigene Prozess dieses Modells schon wieder lief, bevor der Lauf es geladen hat: Die Liste der laufenden Modelle beim Agenten (/running oder ein über die API gesetzter loaded_models_path) ließ sich nicht abfragen. Die Basis wurde gemessen, während alle Modelle des Agenten angehalten waren; die Zahl enthält diesen Prozess also in jedem Fall. Lief er schon, hat ihn eine Anfrage direkt an den Agenten oder der Pin des Modells gestartet, und eine solche Anfrage kann die Messung beeinflusst haben. Stellen Sie sicher, dass sonst nichts Anfragen an dieses Modell sendet, und messen Sie im Zweifel erneut.',
+    );
+    expect(messages.en.benchmarkVramWarningResidencyUnknown).toBe(
+      "The run could not check whether this model's own process was already running again before the run loaded it: the agent's list of running models (/running, or a loaded_models_path set on the application through the API) could not be read. The baseline was taken while every model on the agent was stopped, so the number includes this process either way. If it was already running, a request sent straight to the agent or the model's own pin started it, and such a request may have influenced the measurement. Make sure nothing else sends requests to this model, and measure again if in doubt.",
+    );
+  });
+
+  it('pins the taken-over text in de and en', () => {
+    expect(messages.de.benchmarkVramRestoreTakenOver).toBe(
+      'Bei diesen Specs hat die Wiederherstellung das force_stopped des Laufs nicht vorgefunden und sie deshalb unberührt gelassen: Entweder haben die eigenen Schreibzugriffe des Laufs das Anhalten für sie nie gespeichert oder schon wieder aufgehoben, oder ein Schreibzugriff, den der Lauf nicht sperren kann, hat den Override während des Laufs geändert – ein anderer Gateway-Prozess auf derselben Datenbank oder eine Änderung, die genau beim Start des Laufs gespeichert wurde. Sie standen bei der Wiederherstellung NICHT auf force_stopped, und es gibt nichts von Hand zurückzusetzen. Prüfen Sie nur, ob der jetzt gesetzte Override der gewünschte ist.',
+    );
+    expect(messages.en.benchmarkVramRestoreTakenOver).toBe(
+      "The restore did not find the run's force_stopped on these specs and left them alone: either the run's own writes never stored the stop for them or already cleared it, or a write the run cannot block changed the override during the run — another gateway process on the same database, or a change saved just as the run started. They were NOT force_stopped at the restore, and there is nothing to clear by hand. Just check that the override now set on them is the one you want.",
+    );
   });
 });
 

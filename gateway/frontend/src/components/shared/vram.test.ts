@@ -211,10 +211,9 @@ describe('vram label keys', () => {
       expect(messages[locale][vramWarningLabelKey('undeclared_gpu_allocation')]).toMatch(
         /GPU[- ](row|Zeile)/i,
       );
-      // The contamination check the run could not MAKE -- an application with
-      // no loaded-models endpoint, which is most agent-managed ones. Without
-      // naming that endpoint the operator only ever sees the wrong reason (a
-      // sub-floor delta) for a model something else was already serving.
+      // The residency check the run could not make: its query of the agent's
+      // running models failed. The text names the API-set loaded_models_path,
+      // which replaces /running and is the one cause an operator can remove.
       expect(messages[locale][vramWarningLabelKey('residency_unknown')]).toMatch(
         /loaded_models_path/,
       );

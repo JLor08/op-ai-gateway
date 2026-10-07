@@ -413,6 +413,19 @@ export type BenchmarkStatus = {
   current_concurrency?: number;
   error?: string;
   results?: BenchmarkResult[];
+  // The launch specs a manual speed or both run unpinned for its duration, or
+  // may have, set once before its first target. After the run, the ids not in
+  // repin_failed are pinned again, except any deleted during the run or whose
+  // application is no longer server_agent: the re-pin finds them gone.
+  unpinned_spec_ids?: string[];
+  // The unpinned specs whose re-pin failed. They may still be unpinned (a
+  // failed write may still have stored the pin); an operator checks them and
+  // pins them by hand in the runtime section.
+  repin_failed?: string[];
+  // Every launch spec the run force-stopped before a measurement, or may have
+  // (a stop write that failed is named either way). Pinned ones start again
+  // with the re-pin, the others on their next request.
+  stopped_spec_ids?: string[];
 };
 
 // One level of a capacity ramp (mirrors the Go CapacityLevelDTO).
@@ -472,8 +485,10 @@ export type VRAMGPUItemDTO = {
 // through `isolation_evidence` (spec id -> why this run believes that spec was
 // not running), where a missing entry means NOT confirmed, and weigh it with
 // `isolation_proof` (what established that the run's overrides had landed at
-// all). `drained_spec_ids` is what the run force-stopped. `inconclusive` empty = a definitive result; any
-// value means there is NO number to apply.
+// all). `drained_spec_ids` is what the run force-stopped or may have: a drain
+// write that failed may or may not have stored the override, so it is named
+// either way. `inconclusive` empty = a definitive result; any value means there
+// is NO number to apply.
 export type VRAMReportDTO = {
   isolated: boolean;
   isolation_evidence?: Record<string, string>;
@@ -489,12 +504,21 @@ export type VRAMReportDTO = {
   drained_spec_ids?: string[];
   // The two disjoint ways a restore can not have happened, and they are two
   // different instructions. `restore_failed`: the write itself failed, so
-  // these specs ARE still force_stopped and an operator has to clear them by
-  // hand. `restore_taken_over`: the spec's override was no longer the run's
-  // when the restore re-read it — an operator force-started the model or
-  // cleared the override mid-run — so the run wrote nothing and there is
-  // nothing to clear. Rendering the second with the first's message tells an
-  // operator to stop a model they just deliberately started.
+  // these specs may still be force_stopped (a write can fail after it stored
+  // the cleared row): an operator clears the ones that still are by hand, or
+  // the next reconcile of the override lease does. `restore_taken_over`: the
+  // spec read another admin_state than the run's force_stopped when the
+  // restore re-read it, so the run wrote nothing and there is nothing to
+  // clear. Either the run's own writes never stored the override or already
+  // cleared it (the drain's write failed before it stored it, or the clear of
+  // the target's override failed after it stored the cleared row), or a writer
+  // the run's reservation does not hold off changed it during the run: the
+  // reservation refuses the operator's launch-spec write in the run's
+  // own gateway process only, so that writer is another gateway process on the
+  // same store, or an operator's write that passed that check just before the
+  // run took the server. Rendering the second with the first's message would
+  // send an operator to clear an override that is not there, or is not the
+  // run's.
   restore_failed?: string[];
   restore_taken_over?: string[];
   inconclusive?: string;

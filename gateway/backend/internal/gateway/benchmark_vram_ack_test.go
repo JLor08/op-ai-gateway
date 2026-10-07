@@ -67,7 +67,7 @@ func (f *vramFixture) declareAck() {
 // would be applying.
 func (f *vramFixture) drainAll(t *testing.T) []string {
 	t.Helper()
-	drained, err := f.srv.vramDrain(context.Background(), []string{f.siblingSpec, f.targetSpec})
+	drained, err := f.srv.vramDrain(context.Background(), "srv1", []string{f.siblingSpec, f.targetSpec})
 	if err != nil {
 		t.Fatalf("vramDrain: %v", err)
 	}

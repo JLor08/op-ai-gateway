@@ -27,10 +27,14 @@ import (
 // worse than no figure at all.
 const (
 	// vramInconclusiveIsolationLost: this run's isolation did not hold for the
-	// whole run, so the report may not claim it. The commonest route is an
-	// operator's own "Force start" on a drained sibling -- nothing disables
-	// those actions while a run holds the server reservation -- but a request
-	// straight to the agent's own router port does it too.
+	// whole run, so the report may not claim it. While the run holds the
+	// server reservation, this gateway refuses the portal's launch-spec write
+	// (PutRuntimeSpec), so a drained sibling's override can be taken over only
+	// by a writer the reservation does not hold off: another gateway process
+	// on the same store, or, narrowly, an operator's write that passed that
+	// check just before the run took the reservation. A spec created after the
+	// enumeration was never drained, and a request straight to the agent's own
+	// router port can start it.
 	//
 	// TWO PRODUCERS, one reason, because the operator's next action is the
 	// same for both -- something outside the run changed the fleet, so find it

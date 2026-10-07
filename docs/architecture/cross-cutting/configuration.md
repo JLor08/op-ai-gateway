@@ -61,7 +61,9 @@ The agent's most important default is its collection `interval` (1s, floor 250ms
 |---|---|---|---|
 | Memory | `memory` (default, or empty) | None — volatile, gone on process exit | Local development, quick demos, CI |
 | SQLite | `sqlite` | Single file (`OP_AI_GATEWAY_SQLITE_PATH`) | Single-node bundled deployment |
-| PostgreSQL | `postgres` | External Postgres (`OP_AI_GATEWAY_POSTGRES_DSN`) | Multi-replica / HA deployment |
+| PostgreSQL | `postgres` | External Postgres (`OP_AI_GATEWAY_POSTGRES_DSN`) | Deployment on an external database, one gateway process per store (below) |
+
+One gateway process per store is assumed, PostgreSQL included: a benchmark run's server reservation lives only in the process that runs it, so another gateway process on the same store routes requests to that server and, when it starts, settles the run's override lease as a leftover ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks), [Agent-Managed Model Runtime §11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
 
 An unrecognized driver value is a fatal startup error. SQLite and PostgreSQL run the **same forward-only migration set** through the dialect seam; `OP_AI_GATEWAY_AUTO_MIGRATE` (default `true`) applies any pending migrations transactionally at startup. The memory driver has no migrations — its schema is whatever the in-process seed code builds.
 

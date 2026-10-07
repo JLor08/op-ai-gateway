@@ -6,7 +6,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
@@ -76,9 +75,9 @@ const (
 	// improve isolation -- those processes are outside the agent's control
 	// either way -- and would make the feature unusable on exactly those
 	// deployments. A STATIC neighbour cancels out of the delta; a MOVING one
-	// trips the stability gate; one serving the target model itself is caught
-	// as already-resident -- WHERE THAT CHECK IS AVAILABLE AT ALL, see
-	// vramWarningResidencyUnknown.
+	// trips the stability gate; the residency check asks, by default, the
+	// agent's /running, which lists only its own children, so it does not see
+	// such a neighbour.
 	vramWarningNonManagedApplications = "non_managed_applications"
 	// vramWarningPostTransportAgent: no open agent WebSocket, so nothing this
 	// run writes reaches the agent before its next runtime poll -- the drain
@@ -96,20 +95,21 @@ const (
 	// weakening of the EVIDENCE, though -- the proof is the same either way;
 	// what it changes is only how long the fleet is held.
 	vramWarningPostTransportAgent = "post_transport_agent"
-	// vramWarningResidencyUnknown: the run could not check whether the target
-	// model was ALREADY being served by something it had not stopped, so the
-	// already_resident signal was unavailable rather than negative.
+	// vramWarningResidencyUnknown: the run could not check whether the
+	// target's own child was ALREADY up again before it loaded the target, so
+	// the already_resident signal was unavailable rather than negative.
 	//
-	// That check is the loaded-models probe, and it needs an application-level
-	// `loaded_models_path` -- operator-entered, with no default, and empty on
-	// most agent-managed applications, whose child sits behind the agent's own
-	// router. Without it modelResident answers "not resident" for a model that
-	// may well be resident: the baseline then already contains the model and
-	// the ~0 delta surfaces at the floor gate as below_floor, whose next
-	// action ("the window missed the allocation, measure again when the server
-	// is quiet") fails identically every time. This warning is what keeps the
-	// operator from acting on that wrong reason. It also covers a probe that
-	// ERRORED, for the same reason: an unanswered question is not a no.
+	// That check is the loaded-models probe (modelResident). A server_agent
+	// application always has one, the agent router's /running
+	// (routing.EffectiveLoadedModelsProbe), so for this run's agent-managed
+	// targets the warning means the probe ERRORED or the mapping has no app
+	// model name; an application that is not server_agent has one only
+	// through its operator-entered `loaded_models_path`. Either way
+	// modelResident answers "not resident" for a model that may well be
+	// resident again, and the run loads and measures the target without
+	// knowing whether its own child was already up
+	// (vramInconclusiveAlreadyResident). This warning says so: an unanswered
+	// question is not a no.
 	vramWarningResidencyUnknown = "residency_unknown"
 	// vramWarningFirstGenerationNotMeasured: the target is images-only, so the
 	// run started it through the agent router's ensure route and it never
@@ -147,16 +147,17 @@ var (
 	// shorter for a WS-connected agent: it used to be two values, picked by
 	// AgentStreams.hasConn -- two seconds with an open socket, the poll interval
 	// otherwise. That gave the WS push the standing of a delivery, and it has
-	// none. The push runs in a detached goroutine that returns silently when
-	// the derive or the marshal fails, and NotifyRuntimeConfig sends to zero
-	// connections when the socket closed after the probe or drops the frame
-	// with a slog.Debug when a send queue is full -- in each case the override
-	// binds on the next poll anyway, while the run had already confirmed the
-	// fleet and reported Isolated: true. The probe was also taken BEFORE the
-	// drain wrote anything, so even a truthful answer said nothing about the
-	// transport at write time. An acknowledgement is the opposite of that probe
-	// in every respect: it is sent AFTER the agent reconciled, it names the
-	// document, and it cannot be true of a document the agent is not holding.
+	// none. A push pass returns silently when the derive or the marshal fails,
+	// and its worker carries on with a pass a later write owes, if any, never
+	// with a retry. NotifyRuntimeConfig sends to zero connections when the
+	// socket closed after the probe or drops the frame with a slog.Debug when a
+	// send queue is full -- in each case the override binds on the next poll
+	// anyway, while the run had already confirmed the fleet and reported
+	// Isolated: true. The probe was also taken BEFORE the drain wrote anything,
+	// so even a truthful answer said nothing about the transport at write time.
+	// An acknowledgement is the opposite of that probe in every respect: it is
+	// sent AFTER the agent reconciled, it names the document, and it cannot be
+	// true of a document the agent is not holding.
 	//
 	// The poll is the one delivery mechanism that is guaranteed: the agent
 	// re-fetches the whole document on every poll and on every reconnect, so
@@ -236,11 +237,21 @@ var (
 	vramStatesWithProcess = map[string]bool{
 		"running": true, "starting": true, "draining": true,
 	}
-	// vramStatesNoProcess: a spec here has NO live process, so a
-	// force_stopped write does nothing at all -- no state change, no frame.
-	// It is already isolated and must be CONFIRMED, never awaited: waiting
-	// for a transition that will never arrive is what turns an
-	// already-quiet server into an isolation timeout.
+	// vramStatesNoProcess: a spec here has NO live process for a
+	// force_stopped write to drain (start_failed aside, below), so the write
+	// gives the run no transition to wait for. It is already isolated and
+	// must be CONFIRMED, never awaited: waiting for a transition that may
+	// never arrive is what turns an already-quiet server into an isolation
+	// timeout.
+	//
+	// The write does not always leave the state as it is. The agent applies
+	// it as a changed spec, and a changed spec without a process moves from
+	// crashed, start_failed or backoff to stopped (backoff's retry timer
+	// cancelled), a state change that sends a frame; stopped, not_permitted
+	// and pending_vram_unknown stay as they are. Either way the state is in
+	// this set. start_failed can also still hold the child a start timeout is
+	// terminating: the write drains that child, so once the agent has applied
+	// it, its frames show the spec draining until the child is gone.
 	vramStatesNoProcess = map[string]bool{
 		"stopped": true, "pending_vram_unknown": true, "not_permitted": true,
 		"crashed": true, "start_failed": true, "backoff": true,
@@ -567,7 +578,7 @@ func (s *Server) vramLiveProcessBySpec(serverID string) map[string]bool {
 // is allowed to prove anything. A literal that is both written and compared
 // against in two files is exactly the one worth naming once.
 //
-// It is a value of portal's own closed admin_state set (putRuntimeSpec's
+// It is a value of portal's own closed admin_state set (validateRuntimeSpecShape's
 // "", "force_running", "force_stopped" switch), mirrored here rather than
 // exported for the same reason vramStatesNoProcess mirrors the agent's state
 // set: a closed set is worth stating independently on the side that reads it.
@@ -576,8 +587,8 @@ func (s *Server) vramLiveProcessBySpec(serverID string) map[string]bool {
 const vramAdminStateForceStopped = "force_stopped"
 
 // vramDrain writes admin_state: force_stopped to every spec, THE TARGET AMONG
-// THEM, and returns what it actually wrote so the caller's deferred restore
-// clears exactly that set.
+// THEM, as one batch, and returns what it wrote or may have written, sorted,
+// so the caller's deferred restore clears exactly that set.
 //
 // Writing it only to the RUNNING specs would leave a window in which a
 // request through the agent's own router starts an idle one mid-measurement;
@@ -588,16 +599,36 @@ const vramAdminStateForceStopped = "force_stopped"
 //
 // The write is compare-and-set against "" (the enumeration already refused
 // any pre-existing override), so a concurrent operator override between the
-// enumeration and the write is refused rather than clobbered. On any failure
-// it stops and returns what it drained plus the error: the caller restores
-// that set and reports the failure.
-func (s *Server) vramDrain(ctx context.Context, specIDs []string) ([]string, error) {
-	drained := make([]string, 0, len(specIDs))
+// enumeration and the write is refused rather than clobbered.
+//
+// ONE BATCH, ONE DOCUMENT. SetBenchmarkRuntimeSpecsAdminState notifies once,
+// after its last write, so the agent is sent one document that drains the
+// whole fleet. A write per spec sends one document per spec, most of them
+// partial, and an agent before 0.8.1, whose sync is single-flight, drops a
+// document that arrives while it applies the previous one: it can rest on
+// the first, partial document until its next poll, even when every document
+// arrives in order.
+//
+// THE BATCH GOES ON PAST A FAILED SPEC, and drained is Written plus Failed. A
+// failed write may already have stored the override before a later step of
+// that same write failed (its GPU rows), so the restore has to clear it too.
+// For a failed write that never stored it, the restore's compare-and-set finds
+// "", writes nothing, and reports the spec as taken over (RestoreTakenOver). A
+// spec the compare-and-set refused, or one that is gone, carries nothing of
+// this run's and is not drained. When not every spec was written, the error is
+// that of the first spec in specIDs order that was not: the caller restores
+// drained and reports that failure. Every failed write is a Warn of its own,
+// with serverID and its error, because only that one error reaches the caller.
+func (s *Server) vramDrain(ctx context.Context, serverID string, specIDs []string) ([]string, error) {
+	out, _ := s.Portal.SetBenchmarkRuntimeSpecsAdminState(ctx, specIDs, "", vramAdminStateForceStopped)
+	drained := benchmarkUnion(out.Written, out.Failed)
+	for _, id := range out.Failed {
+		slog.Warn("benchmark: could not force-stop a launch spec for the VRAM run", "server_id", serverID, "spec_id", id, "err", out.Errs[id])
+	}
 	for _, specID := range specIDs {
-		if _, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, specID, "", vramAdminStateForceStopped); err != nil {
+		if err, notWritten := out.Errs[specID]; notWritten {
 			return drained, err
 		}
-		drained = append(drained, specID)
 	}
 	return drained, nil
 }
@@ -735,9 +766,10 @@ type vramIsolationResult struct {
 //
 // THE PARTITION, and why both halves are still needed. Once a frame is
 // admissible, a spec that HAD a live process is waited for until a no-process
-// state appears; a spec that had NO live process produces no state change and
-// no frame of its own -- a force_stopped write against it does nothing -- so it
-// can only be CONFIRMED, never awaited. Waiting for a transition that will
+// state appears; a spec that had NO live process has nothing for a
+// force_stopped write to drain, so it can only be CONFIRMED, never awaited. The
+// write moves some of those states to stopped and leaves the others as they
+// are (vramStatesNoProcess says which), and waiting for a transition that may
 // never arrive is what turns an already-quiet server into an isolation timeout.
 //
 // This function owns only the LOOP -- the subscription, the pending set, the
@@ -854,8 +886,10 @@ type vramIsolationGate struct {
 	// the difference is worth stating because the obvious reading overclaims.
 	// While the agent keeps reporting an ETag already in this set, appliedOurDocument
 	// returns on the set membership and derives nothing -- so a mid-wait
-	// revocation (an operator's "Clear override" on a drained sibling) is
-	// invisible to this gate until the agent reports the NEW document's digest.
+	// revocation (a write that clears a drained sibling's override, from a
+	// writer the run's reservation does not hold off: see admitCurrentDocument)
+	// is invisible to this gate until the agent reports the NEW document's
+	// digest.
 	// That is not a hole, because of what the accepted value still says at the
 	// moment the frame arrives: the agent is holding a document that stops the
 	// fleet, so it has not started the released sibling yet. The revocation is
@@ -975,10 +1009,20 @@ func (g *vramIsolationGate) appliedOurDocument(ctx context.Context) bool {
 // document still force-stops every enumerated spec.
 //
 // That check is what makes re-derivation a proof rather than a convenience. Its
-// FALSE branch is the case an operator's mid-wait "Clear override" or "Force
-// start" produces: the agent then applies a document that lets the sibling
-// start, reports it dutifully, and accepting that acknowledgement would report
-// isolated:true for a run whose isolation had already been revoked.
+// FALSE branch is either of two mid-wait changes. One is a write that clears or
+// replaces a drained spec's override. The run's reservation refuses the
+// portal's launch-spec write (PutRuntimeSpec) in this gateway process only, so
+// that write comes from another gateway process on the same store -- an
+// operator's write it serves, a run it holds, or its start-up reconcile of the
+// override lease -- or, narrowly, from an operator's write that passed that
+// check just before the run took the reservation. The agent then applies a
+// document that lets the sibling start, reports it dutifully, and accepting
+// that acknowledgement would report isolated:true for a run whose isolation
+// had already been revoked. The other is a drained spec missing from the
+// document (vramDocumentDrains), which needs no such writer: the reservation
+// does not gate a DELETE (the portal's serverIsBenchmarking), so an
+// operator's delete that this same process serves takes a spec out of the
+// document as well, and a disable from one of the writers above does too.
 //
 // It reports whether the document was DERIVED AT ALL -- not whether its ETag
 // was admitted -- and the caller uses that to decide whether an
@@ -1077,64 +1121,4 @@ func vramFrameEvidence(frame []RuntimeStatusDTO, pending map[string]struct{}, li
 		found[specID] = vramEvidenceNoProcessAtWrite
 	}
 	return found
-}
-
-// vramRestore clears every override this run set, back to exactly "" -- the
-// only value it ever has to restore, because the run refused to start against
-// a pre-existing one.
-//
-// It runs on a context DERIVED FROM but not cancelled with the run's
-// (context.WithoutCancel plus its own deadline), because the run's context is
-// cancelled precisely when the restore matters most: when the run finishes,
-// errors, or is cancelled by the operator.
-//
-// Each spec is RE-READ immediately before it is written, inside the
-// compare-and-set writer. A full-document replace of a spec captured BEFORE
-// the run would revert every field an operator edited DURING it -- and a
-// launch spec is exactly what an operator opens while a model is stopped.
-//
-// IT RETURNS TWO SETS, BECAUSE "THE RESTORE DID NOT HAPPEN" MEANS TWO
-// DIFFERENT THINGS AND THE PORTAL TURNS ONE OF THEM INTO AN INSTRUCTION.
-//
-//   - takenOver: the freshly-read admin_state is no longer this run's
-//     force_stopped, so nothing is written -- somebody else owns the field
-//     now. That is an operator's mid-run "Force start" (force_running) or
-//     "Clear override" (""), and in BOTH the spec is no longer force-stopped.
-//     Reporting it as a failure rendered "these specs are still force_stopped
-//     and have to be cleared by hand": false, and an instruction that STOPS a
-//     model the operator had just deliberately started.
-//   - failed: the write itself could not be made -- a store error. This is the
-//     one case where the override really is still in place and really does
-//     need clearing by hand.
-//
-// The compare-and-set already returns the distinction
-// (portal.ErrRuntimeSpecAdminStateConflict); it was being thrown away.
-//
-// A DELETED spec is neither -- its override went with it.
-//
-// This is a deliberate divergence from the portal's own start/stop
-// discipline, which chose NOT to clear an override on a timeout because it
-// cannot tell a wedged child from a slow one. A benchmark can: it created
-// these overrides, so leaving them is strictly worse than clearing them.
-func (s *Server) vramRestore(ctx context.Context, drained []string) (failed, takenOver []string) {
-	if len(drained) == 0 {
-		return nil, nil
-	}
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
-	defer cancel()
-	for _, specID := range drained {
-		_, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(restoreCtx, specID, vramAdminStateForceStopped, "")
-		switch {
-		case err == nil:
-		case errors.Is(err, portal.ErrRuntimeSpecNotFound):
-			// The spec was deleted mid-run; its override went with it.
-		case errors.Is(err, portal.ErrRuntimeSpecAdminStateConflict):
-			slog.Info("vram benchmark: an admin override was taken over during the run", "spec_id", specID)
-			takenOver = append(takenOver, specID)
-		default:
-			slog.Warn("vram benchmark: could not restore an admin override", "spec_id", specID, "err", err)
-			failed = append(failed, specID)
-		}
-	}
-	return failed, takenOver
 }

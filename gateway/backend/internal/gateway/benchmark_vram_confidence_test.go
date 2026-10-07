@@ -42,8 +42,9 @@ func TestVRAMRunRefusesANumberWhenIsolationBrokeDuringTheLoad(t *testing.T) {
 	f.seedLatestSample()
 	f.drive(t)
 	f.provider.onStream = func() {
-		// The target costs 21000 MiB. A sibling force-started by a portal
-		// click during the load allocates another 3000 MiB on the same card.
+		// The target costs 21000 MiB. A sibling started during the load (its
+		// override taken over by a writer the reservation does not hold off)
+		// allocates another 3000 MiB on the same card.
 		f.used0.Store((500 + 21000 + 3000) * oneMiB)
 		f.setStatuses(
 			RuntimeStatusDTO{

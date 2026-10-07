@@ -6,7 +6,10 @@ package gateway
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"time"
 )
 
@@ -54,9 +57,10 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //  1. re-check the two VOLATILE reachability gates, which an agent report can
 //     flip between the trigger and here, and for an ensure plan the agent's
 //     runtime_ensure, which it can flip the same way;
-//  2. read which specs have a process to stop, then drain EVERY enabled spec
-//     including the target -- a baseline taken while the target is resident
-//     measures nothing at all;
+//  2. record the drain in the server's override lease (vramOpenLease), read
+//     which specs have a process to stop, then drain EVERY enabled spec
+//     including the target, in one batch -- a baseline taken while the target
+//     is resident measures nothing at all;
 //  3. confirm the drain against this run's own evidence, never against a 200
 //     from a write;
 //  4. baseline: K consecutive stable samples, or inconclusive;
@@ -68,10 +72,15 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //     router's ensure route, and the report says the first generation is not
 //     in the number (vramWarningFirstGenerationNotMeasured);
 //  6. a target that reports RESIDENT after a confirmed drain is contamination,
-//     not a shortcut: something the gateway could not stop is serving it;
+//     not a shortcut: the run has no load of its own to measure. With the
+//     default probe, the agent router's /running, which lists only the
+//     agent's own running children, the target's own child is up again before
+//     the run loaded it -- a request reached the router, or a pinned target
+//     restarted at the clear; an API-set loaded_models_path replaces /running
+//     and answers whatever that path lists;
 //  7. settle, then the same stability gate, then the floor gate;
 //  8. restore every override, target included, on a context that is not this
-//     run's.
+//     run's, and rewrite the lease to what the restore could not clear.
 //
 // Like runLoadModel and runContextProbe it does NOT call Release: the
 // terminal status must LINGER so the frontend's poll can read the result.
@@ -102,6 +111,15 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 		res.Error = vramEnsureUnsupported().Error()
 		return
 	}
+	// The override lease. The drain is recorded before a single spec is
+	// written, so a gateway that dies before the restore clears the overrides
+	// when it starts again (ReconcileBenchmarkOverrideLeases). A lease the run
+	// cannot read or write drains nothing.
+	carried, err := s.vramOpenLease(ctx, serverID, plan.specIDs)
+	if err != nil {
+		res.Error = err.Error()
+		return
+	}
 
 	// (2) Which specs even have a process to stop, read BEFORE the write.
 	liveAtWrite := s.vramLiveProcessBySpec(serverID)
@@ -110,12 +128,13 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	// two reads of the plan -- see vramIsolationPolicyOf for why that is the
 	// one divergence this feature may not have.
 	policy := vramIsolationPolicyOf(plan)
-	drained, drainErr := s.vramDrain(ctx, plan.specIDs)
-	// DrainedSpecIDs is the AUDIT set -- everything this run force-stopped,
-	// the target included -- because that is what the portal must name if the
-	// gateway dies before the restore. pendingRestore is the separate,
-	// shrinking set of overrides still to clear: the target leaves it the
-	// moment the run clears its override to load it.
+	drained, drainErr := s.vramDrain(ctx, serverID, plan.specIDs)
+	// DrainedSpecIDs is the AUDIT set -- everything this run force-stopped or
+	// may have force-stopped (a write that failed after it stored the
+	// override), the target included -- because that is what the portal must
+	// name if the gateway dies before the restore. pendingRestore is the
+	// separate, shrinking set of overrides still to clear: the target leaves
+	// it the moment the run clears its override to load it.
 	report = &VRAMReport{
 		DrainedSpecIDs: drained,
 		Warnings:       plan.warnings,
@@ -128,15 +147,42 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	pendingRestore := drained
 	// The restore defer is registered as soon as anything MIGHT have been
 	// written, so it runs on every exit from here on -- including a panic
-	// mid-unwind -- and before the terminal defer publishes the report.
+	// mid-unwind -- and before the terminal defer publishes the report. The
+	// lease follows it: the row keeps only what the restore could not clear,
+	// and is released when that is nothing and nothing was carried over.
+	//
+	// The restore is restoreBenchmarkOverrides, which a speed run's stop uses
+	// as well: one batch back to exactly "" -- the only value this run ever
+	// has to restore, because the plan refused any pre-existing override -- on
+	// a context that is not cancelled with the run's, because the run's is
+	// cancelled precisely when the restore matters most. Each spec is re-read
+	// inside the compare-and-set writer, so an operator's edit made while the
+	// model was stopped survives. A spec that reads another admin_state than
+	// force_stopped at the restore is taken over (RestoreTakenOver), never
+	// failed: it is not force_stopped, so telling the operator to clear it by
+	// hand would be false (VRAMReport.RestoreTakenOver says how a spec gets
+	// there). A spec that is gone (deleted, or its application retyped) is
+	// neither. Clearing on every exit, a timeout included, deliberately
+	// diverges from the portal's own start/stop discipline, which cannot tell
+	// a wedged child from a slow one: this run wrote these overrides, so
+	// leaving them is strictly worse.
 	defer func() {
-		report.RestoreFailed, report.RestoreTakenOver = s.vramRestore(ctx, pendingRestore)
+		report.RestoreFailed, report.RestoreTakenOver = s.restoreBenchmarkOverrides(ctx, pendingRestore)
+		s.vramRecordLease(ctx, serverID, carried, report.RestoreFailed)
 	}()
+	// From the drain batch's return on, the lease names what the drain wrote
+	// or may have written instead of every spec the plan enumerated. A spec
+	// the compare-and-set refused carries an override that is not this run's
+	// -- one an operator set between the plan at the trigger and the
+	// reservation -- and a reconcile that cleared it would undo that
+	// operator's decision.
+	s.vramRecordLease(ctx, serverID, carried, drained)
 	if drainErr != nil {
-		// The write itself failed -- a concurrent operator override, a spec
+		// Not every spec was written -- a concurrent operator override, a spec
 		// deleted or retyped between the enumeration and the write, or a store
 		// error. The isolation was never achieved, so there is no number; the
-		// report survives only to name what the run had already drained.
+		// report survives only to name what the run drained or may have
+		// drained, which the restore clears.
 		report.Inconclusive = vramInconclusiveRunFailed
 		res.Error = drainErr.Error()
 		return
@@ -180,7 +226,10 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 
 	// (5) Clear the TARGET's override only. Its siblings stay force_stopped,
 	// so the target starts alone without any admission arithmetic having to
-	// be trusted.
+	// be trusted. A clear that fails leaves the target owed to the restore,
+	// and one that failed after it stored the cleared row (its GPU rows or
+	// its read-back failed) is then reported taken over: the restore finds ""
+	// (VRAMReport.RestoreTakenOver).
 	if _, err := s.Portal.SetBenchmarkRuntimeSpecAdminState(ctx, plan.targetSpecID, "force_stopped", ""); err != nil {
 		report.Inconclusive = vramInconclusiveRunFailed
 		res.Error = err.Error()
@@ -188,9 +237,14 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	}
 	// The target's override is gone, so the deferred restore must not try to
 	// clear it again -- the compare-and-set would correctly refuse, and the
-	// spec would be reported as a restore failure it is not. DrainedSpecIDs
-	// keeps naming it: this run did force-stop it.
+	// spec would be reported as taken over when this run cleared it itself.
+	// DrainedSpecIDs keeps naming it: this run did force-stop it.
 	pendingRestore = vramWithout(pendingRestore, plan.targetSpecID)
+	// The lease follows the clear, and only the clear: of this run's
+	// overrides, the row now names only those the restore still owes, next to
+	// what it carried over. Narrowed before the clear, a crash in between
+	// would leave the target force_stopped with no entry to clear it.
+	s.vramRecordLease(ctx, serverID, carried, pendingRestore)
 
 	// (6) What the load proved about contamination, and about whether it could
 	// be asked at all. An ensure plan's target is loaded without generating.
@@ -222,6 +276,59 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	report.GPUs = gpus
 	report.Warnings = append(report.Warnings, warnings...)
 	report.Inconclusive = inconclusive
+}
+
+// vramOpenLease reads serverID's leftover override lease and records the drain
+// in it before a single spec is written: what it carried over, unchanged, plus
+// every spec the drain is about to force-stop (specIDs). It returns what it
+// carried over, which every later rewrite of this run keeps.
+//
+// The run does not settle a leftover itself. Its plan refused every enabled
+// spec that still carries an override, so a leftover clear entry for one is
+// already stale, and a re-pin in the middle of the run would add a pinned
+// sibling the plan refused. The leftover waits for the next reconcile of the
+// lease.
+//
+// An error means nothing may be drained: without the row's content the run
+// could not rewrite it without losing what it names, and no override is
+// written without a lease entry that names it. A failed write may still have
+// stored the row (a commit whose answer was lost), so the row is then put back
+// to what was carried over.
+func (s *Server) vramOpenLease(ctx context.Context, serverID string, specIDs []string) (portal.BenchmarkOverrideLease, error) {
+	leases, err := s.Portal.BenchmarkOverrideLeases(ctx)
+	if err != nil {
+		return portal.BenchmarkOverrideLease{}, err
+	}
+	carried := leases[serverID]
+	if err := s.Portal.SetBenchmarkOverrideLease(ctx, serverID, vramLeaseWith(carried, specIDs)); err != nil {
+		s.vramRecordLease(ctx, serverID, carried, nil)
+		return portal.BenchmarkOverrideLease{}, err
+	}
+	return carried, nil
+}
+
+// vramRecordLease rewrites serverID's override lease row to what this run
+// still owes, owed, besides what it carried over (vramLeaseWith). It writes on
+// a context of its own, bounded by vramRestoreTimeout and not cancelled with
+// the run, because the row has to follow the restore of a cancelled run too.
+// A failure is a Warn: the row then keeps an earlier, larger set, and the
+// reconciler's compare-and-set skips every spec whose override is already
+// cleared.
+func (s *Server) vramRecordLease(ctx context.Context, serverID string, carried portal.BenchmarkOverrideLease, owed []string) {
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vramRestoreTimeout)
+	defer cancel()
+	if err := s.Portal.SetBenchmarkOverrideLease(lctx, serverID, vramLeaseWith(carried, owed)); err != nil {
+		slog.Warn("vram benchmark: could not update the override lease; the row may name more than the run still owes", "server_id", serverID, "err", err)
+	}
+}
+
+// vramLeaseWith is the lease row while a VRAM run owes owed: what it carried
+// over, with owed added to the overrides to clear, sorted and without
+// duplicates.
+func vramLeaseWith(carried portal.BenchmarkOverrideLease, owed []string) portal.BenchmarkOverrideLease {
+	ids := slices.Concat(carried.ClearForceStopped, owed)
+	slices.Sort(ids)
+	return portal.BenchmarkOverrideLease{Repin: carried.Repin, ClearForceStopped: slices.Compact(ids)}
 }
 
 // vramPublishOutcome is the run's terminal bookkeeping: attach the report to
@@ -357,25 +464,28 @@ func (v vramResidency) apply(report *VRAMReport, res *BenchmarkResult) bool {
 }
 
 // vramRecordResidency reduces ensureResidentForRun's three-value answer to one
-// question: was the target ALREADY being served by something this run did not
-// stop?
+// question: was the target's own child ALREADY up again before the run loaded
+// it?
 //
 // The three answers, and why each earns what it does:
 //
 //   - THE CHECK COULD NOT BE MADE -- no loaded-models probe on this
-//     application, or the probe failed. "Not resident" is then an unanswered
-//     question rather than a no, and the caveat is the only thing standing
-//     between the operator and the wrong next action: an undetected
-//     already-resident model surfaces as a sub-floor delta, whose message
-//     sends them to retry a run that fails identically.
+//     application, no app model name on the mapping, or the probe failed.
+//     "Not resident" is then an unanswered question rather than a no: the run
+//     loads and measures the target without knowing whether its child was
+//     already up again, and the caveat says so.
 //   - THE LOAD FAILED. Nothing was measured, so run_failed with the load's own
 //     error -- and the caveat, if the probe was also unavailable, still goes on
 //     the report.
-//   - THE MODEL IS RESIDENT. A contamination SIGNAL, not a shortcut: the drain
-//     was confirmed, so a model that still reports resident is being served by
-//     something this gateway did not stop -- a non-managed application on the
-//     same host, most likely. A delta measured against that baseline would be
-//     ~0 and definitive, which is worse than no number.
+//   - THE MODEL IS RESIDENT. A contamination SIGNAL, not a shortcut: after a
+//     confirmed drain, the probe still lists the target after the run cleared
+//     its override and before it loaded anything. With the default probe, the
+//     agent router's /running, which lists only the agent's own running
+//     children, the target's own child is up again: a request reached the
+//     router, or a pinned target restarted at the clear. An API-set
+//     loaded_models_path replaces /running and answers whatever that path
+//     lists. The core then returns without loading or generating, so the run
+//     has no load of its own to measure and reports no delta.
 //
 // It takes ensureResidentForRun's results positionally so the call reads as one
 // expression at the call site; it makes no probe of its own.
@@ -398,9 +508,8 @@ func vramRecordResidency(alreadyResident, residencyProbed bool, err error) vramR
 //
 // Step 3 proved it once, before the baseline, and every window since only ever
 // constrained movement INSIDE itself -- so a sibling started anywhere in
-// between (a portal "Force start", a request straight to the agent's own
-// router) left both windows individually stable and had its whole allocation
-// added to delta_mb.
+// between (vramInconclusiveIsolationLost says how one can start) left both
+// windows individually stable and had its whole allocation added to delta_mb.
 //
 // It writes both fields that answer for the isolation, because the two must
 // not drift: each lost spec's own evidence becomes restarted_during_run, so

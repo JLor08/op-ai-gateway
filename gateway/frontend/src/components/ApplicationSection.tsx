@@ -465,13 +465,15 @@ export function ApplicationSection({
       ...(applicationSendsLiveTimings(liveTimingsKind)
         ? { responses_live_timings_enabled: liveTimings }
         : {}),
-      // A server_agent application's model discovery/loaded-state/context
-      // probing all run on the agent side (the runtime spec's own Type +
-      // metrics/context-probe overrides, RuntimeAdminSection) -- these three
-      // gateway-side probe fields are unused for it and forced empty here so
-      // a stale value from an earlier non-agent type never lingers on the
-      // stored row. Mirrors the form's own disabled={type === 'server_agent'}
-      // on the three fields below.
+      // For a server_agent application the gateway derives these three probe
+      // values itself: the loaded state from the agent router's /running, and
+      // the context size per model through /upstream/{model}/props or the
+      // agent's telemetry, following the mapping's runtime spec
+      // (RuntimeAdminSection). A stored value would take the place of the
+      // derived one, so they are forced empty here and a stale value from an
+      // earlier non-agent type never lingers on the stored row. Mirrors the
+      // form's own disabled={type === 'server_agent'} on the three fields
+      // below.
       loaded_models_path: type === 'server_agent' ? '' : loadedModelsPath.trim(),
       loaded_models_format: type === 'server_agent' ? '' : loadedModelsFormat,
       context_probe_path: type === 'server_agent' ? '' : contextProbePath.trim(),

@@ -77,8 +77,8 @@ var liveTimingsCapableKinds = map[string]struct{}{
 // portal.CreateApplication asks once and uses the answer twice, to pick the
 // stored default and to refuse an explicit true. portal.UpdateApplication asks
 // twice: once to refuse an asserted true, and once to clear a stored true that
-// an incapable retype left behind. portal.putRuntimeSpec asks in its own
-// refusal arm, judging the spec's EFFECTIVE type. The fifth caller is issue
+// an incapable retype left behind. portal.validateRuntimeSpecRequest asks in
+// its own refusal arm, judging the spec's EFFECTIVE type. The fifth caller is issue
 // #81's part-2 gate, gateway.wantsResponsesLiveTimings, which re-asks about the
 // EFFECTIVE kind of an already-resolved target -- and that gate IS wired into
 // the request path: gateway.proxyNative consults it for every native
@@ -95,10 +95,10 @@ var liveTimingsCapableKinds = map[string]struct{}{
 // portal.normalizeApplicationType trims its own input (it switches over
 // strings.TrimSpace(raw), so every value it returns is already trimmed),
 // while portal.validRuntimeSpecType trims nothing at all -- the trim lives in
-// its caller instead: portal.putRuntimeSpec, the only function that calls it,
-// binds specType from strings.TrimSpace(req.Type) BEFORE validating it and
-// stores that same trimmed local as the spec's Type. Either way a caller on a
-// write path has nothing left to trim.
+// its caller instead: portal.validateRuntimeSpecShape, the only function that
+// calls it, binds specType from strings.TrimSpace(req.Type) BEFORE validating
+// it, and the runtime-spec write stores that same trimmed value as the spec's
+// Type. Either way a caller on a write path has nothing left to trim.
 func LiveTimingsCapableKind(kind string) bool {
 	_, ok := liveTimingsCapableKinds[kind]
 	return ok

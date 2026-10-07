@@ -358,17 +358,30 @@ func (s *SQLiteStore) UpdateMappingContextProbe(ctx context.Context, id string, 
 }
 
 // UpdateMappingBenchmarkMetrics sets a mapping's measured throughput + load time +
-// provenance from a benchmark run. The metrics_locked = 0 guard makes the lock
-// atomic in SQL: a locked (or missing) row matches 0 rows and is left untouched,
-// which is a benign no-op (not an error). Only the four metric columns + provenance
-// are written, so a concurrent edit of other fields cannot be clobbered.
+// provenance from a benchmark run. A run writes only what it measured: a value
+// of 0 or below means not measured and keeps the stored column. A call that
+// measured nothing writes nothing, provenance included. The metrics_locked = 0
+// guard makes the lock atomic in SQL: a locked (or missing) row matches 0 rows
+// and is left untouched, which is a benign no-op (not an error); a call that
+// measured nothing matches 0 rows the same way. Only the three metric columns +
+// provenance are written, so a concurrent edit of other fields cannot be
+// clobbered.
 func (s *SQLiteStore) UpdateMappingBenchmarkMetrics(ctx context.Context, id string, genTPS, promptTPS float64, loadMS int, at time.Time) error {
+	// Every placeholder is cast, for the reason UpdateMappingOpportunisticMetrics
+	// gives: Postgres cannot type a bare placeholder in a comparison. The rates
+	// are double precision and load_time_ms is an integer column.
 	_, err := s.exec(ctx, `
 		update model_mappings
-		set gen_tokens_per_second = ?, prompt_tokens_per_second = ?, load_time_ms = ?,
-			metrics_source = ?, metrics_updated_at = ?
-		where id = ? and metrics_locked = 0`,
-		genTPS, promptTPS, loadMS, "benchmark", at, id,
+		set gen_tokens_per_second = case when cast(? as double precision) > 0
+		                                 then cast(? as double precision) else gen_tokens_per_second end,
+		    prompt_tokens_per_second = case when cast(? as double precision) > 0
+		                                    then cast(? as double precision) else prompt_tokens_per_second end,
+		    load_time_ms = case when cast(? as integer) > 0
+		                        then cast(? as integer) else load_time_ms end,
+		    metrics_source = ?, metrics_updated_at = ?
+		where id = ? and metrics_locked = 0
+		  and (cast(? as double precision) > 0 or cast(? as double precision) > 0 or cast(? as integer) > 0)`,
+		genTPS, genTPS, promptTPS, promptTPS, loadMS, loadMS, "benchmark", at, id, genTPS, promptTPS, loadMS,
 	)
 	if err != nil {
 		return fmt.Errorf("update mapping benchmark metrics: %w", err)

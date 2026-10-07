@@ -115,11 +115,11 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 const runtimeConfigAckFeature = "runtime_config_ack"
 
 // defaultPushRuntimeConfigTimeout bounds the s.Portal.AgentRuntimeConfig store
-// read PushRuntimeConfig performs. It is the DEFAULT for the per-instance
-// Server.pushRuntimeConfigTimeout field (set in New, overridable on one Server),
-// not a package-level var: a var shared with the goroutine PushRuntimeConfig
-// spawns was a data race under `go test -race` (issue #53), since a test
-// shrinking it wrote the very memory the push goroutine read. A per-instance
+// read each push pass performs (pushRuntimeConfigPass). It is the DEFAULT for
+// the per-instance Server.pushRuntimeConfigTimeout field (set in New,
+// overridable on one Server), not a package-level var: a var shared with the
+// push worker was a data race under `go test -race` (issue #53), since a test
+// shrinking it wrote the very memory the worker read. A per-instance
 // field -- the pattern activeRegistry already uses for `now func() time.Time` --
 // lets a test drive its own timeout down to milliseconds without touching shared
 // state. 5s matches capture.go's persistCapture timeout for its SaveCapture
@@ -130,6 +130,22 @@ const runtimeConfigAckFeature = "runtime_config_ack"
 // budgets for).
 const defaultPushRuntimeConfigTimeout = 5 * time.Second
 
+// defaultPushRuntimeConfigSpacing is how long a server's push worker waits
+// after a pass that enqueued a frame before it runs the next pass for that
+// server. It is the DEFAULT for the per-instance Server.pushRuntimeConfigSpacing
+// field (set in New). An agent before 0.8.1 runs its runtime sync
+// single-flight: a document that arrives while a sync is in flight is
+// dropped, and the agent rests on the older one until the next push or its
+// 60s poll. A sync is at least one round trip to the gateway, so two
+// documents sent back to back lose the second; 250ms covers a sync shorter
+// than that. From 0.8.1 the agent owes a trailing sync to such a document and
+// needs no spacing, but the gateway tells agents apart by feature flags,
+// never by version (ADR-025), and no flag names the trailing sync, so every
+// agent gets the spacing. It is not an ordering mechanism (the order comes
+// from the worker), and the first document after a quiet period is not
+// delayed.
+const defaultPushRuntimeConfigSpacing = 250 * time.Millisecond
+
 // PushRuntimeConfig is the gateway half of the WS push path (agent-runtime-
 // manager design spec §10, Phase 2 Task 8): a best-effort, feature-gated
 // push of serverID's CURRENT runtime-config document -- the SAME
@@ -138,6 +154,38 @@ const defaultPushRuntimeConfigTimeout = 5 * time.Second
 // reaches a connected agent immediately instead of waiting for the agent's
 // next Task-7 poll. See AgentStreamRegistry.NotifyRuntimeConfig for why the
 // frame carries the WHOLE document rather than a command or a delta.
+//
+// It returns at once. The work runs on s.runtimePush, at most one worker per
+// server (runtimeConfigPusher): a document is derived only after the previous
+// one for the server was enqueued, so every connection receives the server's
+// documents in derive order, and after every call a pass whose derive starts
+// after it runs to completion, so the last document reflects the latest write.
+// Calls that arrive while a pass runs coalesce into one more pass, and after a
+// pass that enqueued a frame the worker waits s.pushRuntimeConfigSpacing
+// before the next one (defaultPushRuntimeConfigSpacing says why). Each pass is
+// pushRuntimeConfigPass.
+//
+// The intended caller is the portal write-path hook (portal.ServiceDeps.
+// OnRuntimeConfigChanged / Service.SetRuntimeConfigChangedHook), wired to this
+// method in cmd/gateway/main.go's buildGatewayServer via the
+// gateway.ServerDeps.SetRuntimeConfigChangedHook handoff (buildRuntime hands
+// portalService's own setter forward through ServerDeps, since portalService
+// is constructed before this Server is, and the setter needs a bound
+// PushRuntimeConfig -- see that ServerDeps field's doc for the full
+// construction-order rationale). The hook's contract is "synchronous but
+// guaranteed fast" because it fires from inside a runtime-spec CRUD write
+// that still holds its own serializing lock -- the store read (s.Portal.
+// AgentRuntimeConfig) and JSON marshal a pass performs are both too slow to
+// do inline there. This method takes one leaf mutex and at most starts a
+// goroutine.
+func (s *Server) PushRuntimeConfig(serverID string) {
+	s.runtimePush.notify(serverID, s.pushRuntimeConfigSpacing, s.pushRuntimeConfigPass)
+}
+
+// pushRuntimeConfigPass is one pass of serverID's push worker: it derives the
+// server's current document, marshals it and enqueues it on every open
+// connection of the server, and reports whether at least one connection took
+// the frame (the worker spaces only such a pass).
 //
 // Two fail-closed preconditions gate delivery, checked before any store
 // read: the connected agent must have DECLARED the runtime_manager feature
@@ -148,57 +196,43 @@ const defaultPushRuntimeConfigTimeout = 5 * time.Second
 // an error; it is simply nothing to push (the next poll or reconnect is
 // always the backstop).
 //
-// Runs entirely in a goroutine: the intended caller is the portal write-path
-// hook (portal.ServiceDeps.OnRuntimeConfigChanged / Service.
-// SetRuntimeConfigChangedHook), wired to this method in
-// cmd/gateway/main.go's buildGatewayServer via the
-// gateway.ServerDeps.SetRuntimeConfigChangedHook handoff (buildRuntime hands
-// portalService's own setter forward through ServerDeps, since portalService
-// is constructed before this Server is, and the setter needs a bound
-// PushRuntimeConfig -- see that ServerDeps field's doc for the full
-// construction-order rationale). The hook's contract is "synchronous but
-// guaranteed fast" because it fires from inside a runtime-spec CRUD write
-// that still holds its own serializing lock -- the store read (s.Portal.
-// AgentRuntimeConfig) and JSON marshal this method performs are both too
-// slow to do inline there.
-//
 // The store read is bounded by pushRuntimeConfigTimeout (never
-// context.Background() unbounded): one goroutine is spawned per portal
-// write, so an unbounded call stuck on lock contention or a wedged query
-// would accumulate goroutines without limit under sustained write pressure.
+// context.Background() unbounded): the worker runs one pass at a time, so a
+// store read that never returned would hold the server's worker for good, and
+// every later push for that server would wait behind it. A failed or
+// timed-out derive enqueues nothing and is not retried; a pass a later call
+// owes still runs, and the agent's poll backs it up.
 //
 // Nil-safe throughout (a nil s.Portal, s.AgentFeatures, s.RuntimeStatus, or
 // s.AgentStreams all degrade to "nothing pushed," never a panic), matching
 // every other best-effort notifier in this package.
-func (s *Server) PushRuntimeConfig(serverID string) {
-	go func() {
-		if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) {
-			return
-		}
-		if s.Portal == nil {
-			return
-		}
-		timeout := s.pushRuntimeConfigTimeout
-		if timeout <= 0 {
-			// A bare &Server{} built without New (a fixture pattern this
-			// package supports) leaves the field zero; fall back to the
-			// default rather than an instantly-expiring 0.
-			timeout = defaultPushRuntimeConfigTimeout
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		dto, err := s.Portal.AgentRuntimeConfig(ctx, serverID)
-		if err != nil {
-			slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
-			return
-		}
-		b, err := json.Marshal(dto)
-		if err != nil {
-			slog.Debug("push runtime config: marshal failed", "server_id", serverID, "err", err)
-			return
-		}
-		s.AgentStreams.NotifyRuntimeConfig(serverID, b)
-	}()
+func (s *Server) pushRuntimeConfigPass(serverID string) (sent bool) {
+	if !s.AgentFeatures.Has(serverID, "runtime_manager") || s.RuntimeStatus.IsFileMode(serverID) {
+		return false
+	}
+	if s.Portal == nil {
+		return false
+	}
+	timeout := s.pushRuntimeConfigTimeout
+	if timeout <= 0 {
+		// A bare &Server{} built without New (a fixture pattern this
+		// package supports) leaves the field zero; fall back to the
+		// default rather than an instantly-expiring 0.
+		timeout = defaultPushRuntimeConfigTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	dto, err := s.Portal.AgentRuntimeConfig(ctx, serverID)
+	if err != nil {
+		slog.Debug("push runtime config: derive failed", "server_id", serverID, "err", err)
+		return false
+	}
+	b, err := json.Marshal(dto)
+	if err != nil {
+		slog.Debug("push runtime config: marshal failed", "server_id", serverID, "err", err)
+		return false
+	}
+	return s.AgentStreams.NotifyRuntimeConfig(serverID, b) > 0
 }
 
 // --- Task 9: file-mode runtime report ingest --------------------------------

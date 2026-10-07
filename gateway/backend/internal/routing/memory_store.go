@@ -1205,8 +1205,11 @@ func (m *MemoryStore) DeleteMappingCapability(_ context.Context, mappingID, capa
 }
 
 // UpdateMappingBenchmarkMetrics sets a mapping's measured throughput + load time +
-// provenance from a benchmark run, only while it is unlocked. A missing or locked
-// mapping is a benign no-op (mirrors the SQL metrics_locked = 0 guard).
+// provenance from a benchmark run, only while it is unlocked. A run writes only
+// what it measured: a value of 0 or below means not measured and keeps the stored
+// column. A call that measured nothing writes nothing, provenance included. A
+// missing or locked mapping is a benign no-op (mirrors the SQL metrics_locked = 0
+// guard).
 func (m *MemoryStore) UpdateMappingBenchmarkMetrics(_ context.Context, id string, genTPS, promptTPS float64, loadMS int, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1214,9 +1217,18 @@ func (m *MemoryStore) UpdateMappingBenchmarkMetrics(_ context.Context, id string
 	if !ok || mapping.MetricsLocked {
 		return nil
 	}
-	mapping.GenTokensPerSecond = genTPS
-	mapping.PromptTokensPerSecond = promptTPS
-	mapping.LoadTimeMS = loadMS
+	if genTPS <= 0 && promptTPS <= 0 && loadMS <= 0 {
+		return nil
+	}
+	if genTPS > 0 {
+		mapping.GenTokensPerSecond = genTPS
+	}
+	if promptTPS > 0 {
+		mapping.PromptTokensPerSecond = promptTPS
+	}
+	if loadMS > 0 {
+		mapping.LoadTimeMS = loadMS
+	}
 	mapping.MetricsSource = "benchmark"
 	t := at
 	mapping.MetricsUpdatedAt = &t

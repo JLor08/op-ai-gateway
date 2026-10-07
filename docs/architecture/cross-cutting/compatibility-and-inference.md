@@ -454,7 +454,7 @@ governed by a three-state `routing.EndpointMode`
 An absent or blank mode defaults to `passthrough`
 (`routing.EndpointModePassthrough`) — substituted at write time by the portal
 service, on an application's create and on every runtime-spec write
-(`putRuntimeSpec`) — for every application type, because every supported
+(`writeRuntimeSpec`) — for every application type, because every supported
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
 
@@ -897,6 +897,19 @@ next run. A Load of a spec whose `admin_state` is already `force_stopped` is
 refused before the reservation, with 409 `benchmark.spec_force_stopped`; one
 stored after that check, which the router answers with an immediate 503, keeps
 the Load retrying until the deadline.
+
+**A speed run's cold pass after a stop of its own target runs through the same
+loop.** When a manual speed or both run has force-stopped its own target before
+the cold pass ([Agent-Managed Model Runtime
+§11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)),
+the router answers 503 `runtime.admission_blocked` until the clear reaches the
+agent. The cold pass is then `loadUntilServable` around one stream per attempt
+(`coldPassAfterStop`), under the same bound and with each attempt's first-data
+budget cut the same way, and it records the time to first token of the attempt
+that was served, which includes the whole start. A failure reads
+`cold pass after the benchmark's stop: <provider error text>`. Every other cold
+pass is one stream: a model server that answers 503 while it loads would lose
+part of its load from the served attempt's time to first token.
 
 **An images-only agent child is loaded through the router's ensure route
 instead.** For a Load or VRAM probe of such a mapping on an agent that declares

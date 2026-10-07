@@ -20,8 +20,8 @@ import (
 // independently. A name that states a fact about one side alone need only be
 // on that side's list: capability_source_sdcpp is on this list only, and the
 // agent-declared gpu_selection, runtime_api_token, runtime_model_probe,
-// runtime_upstream_props and runtime_ensure (runtimeEnsureFeature) are on
-// the agent's only.
+// runtime_upstream_props (RuntimeUpstreamPropsFeature) and runtime_ensure
+// (runtimeEnsureFeature) are on the agent's only.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
 // runtime_logs is declared here for completeness of the negotiation contract
@@ -57,6 +57,18 @@ var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runti
 // only. The agent sends that source only when this name is declared (its
 // gatewayFeatureCapabilitySourceSdcpp).
 const capabilitySourceSdcppFeature = "capability_source_sdcpp"
+
+// RuntimeUpstreamPropsFeature is the agent-declared capability naming the
+// runtime router's GET /upstream/{model}/props passthrough
+// (routing.AgentRouterContextProbePath). It is on the agent's list only, not
+// on gatewayAgentFeatures. A probe through that route goes only to an agent
+// with positive evidence the route exists -- fail-closed, the
+// PushRuntimeConfig precedent -- because an older agent answers 404
+// runtime.model_not_managed for every such probe, forever, and silent no-op
+// traffic each cadence tick is exactly what a capability gate exists to
+// prevent. It is exported for the app-health loop in cmd/gateway, which
+// checks it too.
+const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

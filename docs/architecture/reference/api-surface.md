@@ -245,6 +245,21 @@ closed set, `{"images_only"}`, omitted otherwise. A Load's result carries
 of the checks are in [Agent-Managed Model Runtime
 §11.9](../cross-cutting/agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping).
 
+A manual `speed` or `both` run on a server with a `server_agent` application
+can carry three more lists on `BenchmarkStatus`, each omitted when empty
+([Agent-Managed Model Runtime
+§11.10](../cross-cutting/agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)):
+`unpinned_spec_ids`, the launch specs the run unpinned for its duration, or may
+have, set once before its first target; `stopped_spec_ids`, every launch spec a
+stop of the run force-stopped, or may have, before a measurement, which only
+grows; and `repin_failed`, the launch specs the run could not pin again at its
+end. A failed re-pin also adds
+`launch specs may still be unpinned after the benchmark: <ids>; pin them in the runtime section`
+to the run's `error`, after any earlier text and a `; `, and a clear that
+failed after a stop makes the target's `results[].error`
+`launch specs may still be force_stopped after the benchmark: <ids>; clear the overrides in the runtime section`.
+A scheduled run sets none of them.
+
 #### Agent-managed model runtime
 
 All of these authorize **inside `portal.Service`** with the model-mapping write
@@ -480,7 +495,8 @@ the three valid values; GPU index `>= 0`, unique, `vram_estimate_mb >= 0`; and e
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `visible_devices_mode`
 (`"env"` | `"args"`, empty on the request defaults to `"env"` in
-`putRuntimeSpec`, and the GET always echoes the resolved value, never empty).
+`validateRuntimeSpecRequest`, and the GET always echoes the resolved value,
+never empty).
 `set_visible_devices` adds four refusals of its own, all returned **before any
 mutation** and all validated regardless of whether `set_visible_devices` is
 even on for the mode-value check:

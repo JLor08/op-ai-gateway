@@ -60,15 +60,23 @@ var (
 	// ErrRuntimeSpecServerBenchmarking rejects a launch-spec write while a
 	// benchmark run holds that server's reservation. See serverIsBenchmarking.
 	ErrRuntimeSpecServerBenchmarking = errors.New("runtime_spec.server_benchmarking")
-	// ErrRuntimeSpecAdminStateConflict rejects a
-	// SetBenchmarkRuntimeSpecAdminState whose freshly-read admin_state is not
-	// the value the caller said it was replacing. This endpoint class is a
-	// read-modify-write with no If-Match and no row version, and the VRAM
-	// benchmark's deferred restore is the caller that needs the guard: without
-	// it, a restore minutes after the drain would hand a concurrent operator's
-	// override straight back to "". The caller records the spec as
-	// restore-failed instead -- somebody else owns the field now.
+	// ErrRuntimeSpecAdminStateConflict rejects a benchmark admin-state write
+	// (SetBenchmarkRuntimeSpecAdminState, SetBenchmarkRuntimeSpecsAdminState)
+	// whose freshly-read admin_state is not the value the caller said it was
+	// replacing. This endpoint class is a read-modify-write with no If-Match
+	// and no row version, and every restore of a benchmark's force_stopped
+	// needs the guard: the speed run's stop-all clear, the VRAM benchmark's
+	// deferred restore, and the override-lease reconciler. Without it, a
+	// restore after the stop would hand a concurrent operator's override
+	// straight back to "". The caller reports the spec as taken over instead,
+	// not as restore-failed -- somebody else owns the field now, or the
+	// caller's own writes never stored the override or already cleared it (a
+	// write can fail before it stores its row, or after).
 	ErrRuntimeSpecAdminStateConflict = errors.New("runtime_spec.admin_state_conflict")
+	// ErrRuntimeSpecPinnedConflict: SetBenchmarkRuntimeSpecsPinned found a
+	// stored pinned other than the expected value, and wrote nothing for that
+	// spec.
+	ErrRuntimeSpecPinnedConflict = errors.New("runtime_spec.pinned_conflict")
 	// ErrRuntimeSpecEndpointModeInvalid rejects a responses_mode/messages_mode
 	// that is not one of the three EndpointMode values. HTTP 400.
 	ErrRuntimeSpecEndpointModeInvalid = errors.New("runtime_spec.endpoint_mode_invalid")
@@ -505,7 +513,7 @@ type PutRuntimeSpecRequest struct {
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
 	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
-	// Absent (empty/"") defaults to both/passthrough — see putRuntimeSpec;
+	// Absent (empty/"") defaults to both/passthrough — see validateRuntimeSpecRequest;
 	// the backend does NOT inherit the parent server_agent application's
 	// values; the portal form starts a spec's first write from them instead
 	// (runtimeSpecTemplate: Create, and Edit of a spec-less mapping).
@@ -525,7 +533,7 @@ type PutRuntimeSpecRequest struct {
 	// absent field on such a kind is simply cleared.
 	ResponsesLiveTimingsEnabled *bool `json:"responses_live_timings_enabled,omitempty"`
 	// VisibleDevicesMode: see RuntimeSpecDTO's doc. Absent (empty/"")
-	// defaults to "env" — see putRuntimeSpec.
+	// defaults to "env" — see validateRuntimeSpecRequest.
 	VisibleDevicesMode string `json:"visible_devices_mode"`
 	// APITokenMode / APITokenHeaderSource / APITokenHeader: see
 	// RuntimeSpecDTO's doc. Absent (empty/"") defaults to "app" for both mode
@@ -534,7 +542,7 @@ type PutRuntimeSpecRequest struct {
 	APITokenHeaderSource string `json:"api_token_header_source"`
 	APITokenHeader       string `json:"api_token_header"`
 	// APIToken is write-only: nil = keep, "" = clear, value = replace-and-seal.
-	// Sealing/rotation happens in putRuntimeSpec's write path --
+	// Sealing/rotation happens in the write path (runtimeSpecAPIToken) --
 	// validateRuntimeSpecAPIToken only validates the shape of the request
 	// around it.
 	APIToken *string `json:"api_token"`
@@ -617,12 +625,13 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 	}
 	// Checked AFTER authorization, so a caller with no claim to this mapping
 	// learns nothing about the server behind it -- and only on this
-	// principal-carrying path, never inside the shared putRuntimeSpec body,
-	// which the benchmark run's own drain and restore also go through.
+	// principal-carrying path, never inside the shared write
+	// (putRuntimeSpec, writeRuntimeSpec), which the benchmark run's own
+	// writers also go through.
 	if s.serverIsBenchmarking(server.ID) {
 		return RuntimeSpecDTO{}, ErrRuntimeSpecServerBenchmarking
 	}
-	return s.putRuntimeSpec(ctx, mapping, app, server, req)
+	return s.putRuntimeSpec(ctx, mapping, app, server, req, "")
 }
 
 // serverIsBenchmarking reports whether a benchmark run currently holds
@@ -640,9 +649,10 @@ func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 // The reservation is the right fact to gate on and not a new one: it is
 // already what excludes the server from gateway routing while a run is in
 // flight, it is already at most one run per server, and a run that dies
-// releases it. What it deliberately does NOT gate is the run's own writer
-// (SetBenchmarkRuntimeSpecAdminState, which is the caller that took the
-// reservation), a write to any OTHER server, or a DELETE -- deleting a spec
+// releases it. What it deliberately does NOT gate is the run's own writers
+// (SetBenchmarkRuntimeSpecAdminState, SetBenchmarkRuntimeSpecsAdminState and
+// SetBenchmarkRuntimeSpecsPinned: the run that calls them is the one that took
+// the reservation), a write to any OTHER server, or a DELETE -- deleting a spec
 // mid-run drains it rather than starting it, and the restore already treats a
 // deleted spec as restored.
 func (s *Service) serverIsBenchmarking(serverID string) bool {
@@ -650,92 +660,128 @@ func (s *Service) serverIsBenchmarking(serverID string) bool {
 }
 
 // putRuntimeSpec is PutRuntimeSpec's whole body with the AUTHORIZATION
-// removed and the resolved mapping/application/server handed in. It is the
-// one implementation of the full-document upsert -- validation, defaulting,
-// the VRAM ownership rule, and the notification -- so a second caller cannot
-// end up with a subtly different write.
+// removed and the resolved mapping/application/server handed in: the shared
+// full-document upsert (writeRuntimeSpec) and the notification it owes. Keeping
+// both in one place means a second caller cannot end up with a subtly
+// different write.
 //
 // Its callers, and what authorized each: PutRuntimeSpec (the portal
 // principal, via authorizeMapping) and SetBenchmarkRuntimeSpecAdminState (the
 // benchmark trigger request, gated before the run started -- see that
-// method's doc for why the run itself carries no principal).
-func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest) (RuntimeSpecDTO, error) {
+// method's doc for why the run itself carries no principal). writeRuntimeSpec
+// has one more caller, setBenchmarkRuntimeSpecs, the shared body of the two
+// batched benchmark writers, which notifies after the batch's last write, once
+// for each server a write stored to, instead of once per spec.
+//
+// expectSpecID is "" for PutRuntimeSpec, which creates the spec on a
+// mapping's first write. Every benchmark writer passes the id it resolved the
+// spec by, and then the write refuses a spec that is gone or replaced when it
+// re-reads the mapping: when that read finds no spec, or one with another id,
+// it returns ErrRuntimeSpecNotFound and stores nothing. Without that, a DELETE
+// between the writer's read by id and this read by mapping would let the
+// upsert create a new spec under a new id -- a pinned one, for a re-pin, which
+// the agent would start right after the operator deleted it. The guard
+// narrows that window to the gap between the re-read and the upsert, and does
+// not close it (see priorRuntimeSpec).
+//
+// The notification fires exactly when writeRuntimeSpec reports stored: once
+// UpsertRuntimeSpec has succeeded, also when the GPU-row write or the
+// read-back after it fails.
+func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, server routing.AIServer, req PutRuntimeSpecRequest, expectSpecID string) (RuntimeSpecDTO, error) {
+	dto, stored, err := s.writeRuntimeSpec(ctx, mapping, app, req, expectSpecID)
+	if stored {
+		s.notifyRuntimeChanged(server.ID)
+	}
+	return dto, err
+}
+
+// writeRuntimeSpec is the one implementation of the full-document upsert:
+// the application-type gate, every request validation and default
+// (validateRuntimeSpecRequest), the read of the stored spec with the VRAM
+// ownership rule and the expectSpecID guard (priorRuntimeSpec), the row
+// (runtimeSpecRow) and its GPU rows (runtimeSpecGPURows).
+//
+// It never notifies. Every caller owes the notification for what it stored
+// (THE RULE on notifyRuntimeChanged), and stored says whether there is one to
+// owe: it is true as soon as UpsertRuntimeSpec has succeeded, because the
+// upserted row is already part of the runtime-config document, so a failed
+// SetRuntimeSpecGPUs or a failed read-back after it reports stored alongside
+// its error. An error before the upsert stored nothing.
+func (s *Service) writeRuntimeSpec(ctx context.Context, mapping routing.ModelMapping, app routing.Application, req PutRuntimeSpecRequest, expectSpecID string) (dto RuntimeSpecDTO, stored bool, err error) {
 	if app.Type != routing.ProviderServerAgent {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecNotServerAgent
+		return RuntimeSpecDTO{}, false, ErrRuntimeSpecNotServerAgent
 	}
 	// Validate everything that can fail BEFORE mutating/persisting anything.
-	binary := strings.TrimSpace(req.Binary)
-	// Absolute on POSIX *or* on Windows -- the agent's own filepath.IsAbs is
-	// the authority and this is its early-feedback mirror; see
-	// runtimeSpecBinaryIsAbsolute.
-	if !runtimeSpecBinaryIsAbsolute(binary) {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecBinaryRequired
+	fields, err := validateRuntimeSpecRequest(req)
+	if err != nil {
+		return RuntimeSpecDTO{}, false, err
 	}
-	if req.ListenPort < 0 || req.HealthTimeoutSeconds < 0 || req.StartupTimeoutSeconds < 0 ||
-		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecTuningInvalid
+	prior, err := s.priorRuntimeSpec(ctx, mapping.ID, expectSpecID)
+	if err != nil {
+		return RuntimeSpecDTO{}, false, err
 	}
-	adminState := strings.TrimSpace(req.AdminState)
-	switch adminState {
-	case "", "force_running", "force_stopped":
-	default:
-		return RuntimeSpecDTO{}, ErrRuntimeSpecAdminStateInvalid
+	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
+	if err != nil {
+		return RuntimeSpecDTO{}, false, err
 	}
-	if err := validateRuntimeSpecGPUs(req.GPUs); err != nil {
-		return RuntimeSpecDTO{}, err
+	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
+		return RuntimeSpecDTO{}, false, err
 	}
-	for k := range req.Env {
-		if !runtimeSpecEnvKeyPattern.MatchString(k) {
-			return RuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
-		}
+	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
+		return RuntimeSpecDTO{}, true, err
 	}
-	if err := validateRuntimeSpecVisibleDevices(req); err != nil {
-		return RuntimeSpecDTO{}, err
+	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
+	if err != nil {
+		return RuntimeSpecDTO{}, true, err
 	}
-	if err := validateRuntimeSpecAPIToken(req); err != nil {
-		return RuntimeSpecDTO{}, err
-	}
-	specType := strings.TrimSpace(req.Type)
-	if !validRuntimeSpecType(specType) {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecTypeInvalid
-	}
-	metricsPath := strings.TrimSpace(req.MetricsPath)
-	contextProbePath := strings.TrimSpace(req.ContextProbePath)
-	// SSRF guard: an operator-supplied probe-path override is only ever
-	// appended to the agent's own "http://127.0.0.1:PORT" loopback base, so it
-	// MUST be a safe relative path. Reject anything that could re-anchor the
-	// URL's Host (@userinfo, //authority, a scheme) or smuggle whitespace/
-	// control bytes -- see safeRelativeProbePath and the two sentinels' docs.
-	if !safeRelativeProbePath(metricsPath) {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecMetricsPathInvalid
-	}
-	if !safeRelativeProbePath(contextProbePath) {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecContextProbePathInvalid
+	dto, err = runtimeSpecDTO(spec, storedGPUs, app)
+	return dto, true, err
+}
+
+// runtimeSpecFields is a PutRuntimeSpecRequest after
+// validateRuntimeSpecRequest: every column of the stored row that the request
+// alone decides, trimmed, defaulted and encoded.
+type runtimeSpecFields struct {
+	binary             string
+	adminState         string
+	specType           string
+	metricsPath        string
+	contextProbePath   string
+	responsesMode      routing.EndpointMode
+	messagesMode       routing.EndpointMode
+	flavors            []string
+	liveTimingsCapable bool // the spec's EFFECTIVE kind can honour responses_live_timings_enabled
+	visibleMode        routing.VisibleDevicesMode
+	args               string // JSON
+	env                string // JSON
+	healthPath         string
+	healthTimeout      int
+	startupTimeout     int
+}
+
+// validateRuntimeSpecRequest runs every request validation of a runtime-spec
+// write, in a fixed order, and resolves the request-only columns of the row.
+// It reads no store, so a body it refuses has persisted nothing. The order is
+// part of the API: a doubly-invalid body reports the first refusal it meets,
+// so a check moved within this function or validateRuntimeSpecShape changes
+// an answer.
+func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, error) {
+	f, err := validateRuntimeSpecShape(req)
+	if err != nil {
+		return runtimeSpecFields{}, err
 	}
 	// Endpoint-mode + flavor validation, defaulting absent fields (spec
 	// §5.4/§12: the backend does NOT read the parent app to inherit -- the
 	// portal form starts a spec's first write from the parent; the backend
 	// only supplies a sane default when a field is absent or empty, on every
 	// write). See TestPutRuntimeSpecDoesNotInheritAppModes.
-	respMode := routing.EndpointModePassthrough
-	if strings.TrimSpace(req.ResponsesMode) != "" {
-		m, ok := validEndpointMode(req.ResponsesMode)
-		if !ok {
-			return RuntimeSpecDTO{}, ErrRuntimeSpecEndpointModeInvalid
-		}
-		respMode = m
-	}
-	msgMode := routing.EndpointModePassthrough
-	if strings.TrimSpace(req.MessagesMode) != "" {
-		m, ok := validEndpointMode(req.MessagesMode)
-		if !ok {
-			return RuntimeSpecDTO{}, ErrRuntimeSpecEndpointModeInvalid
-		}
-		msgMode = m
-	}
-	flavors, err := normalizeRuntimeSpecFlavors(req.APIFlavors)
+	f.responsesMode, f.messagesMode, err = runtimeSpecEndpointModes(req)
 	if err != nil {
-		return RuntimeSpecDTO{}, err
+		return runtimeSpecFields{}, err
+	}
+	f.flavors, err = normalizeRuntimeSpecFlavors(req.APIFlavors)
+	if err != nil {
+		return runtimeSpecFields{}, err
 	}
 	// The spec's OWN effective kind decides whether the live-timings opt-in
 	// can be honest here: the explicit Type when set, else detected from the
@@ -748,71 +794,74 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	// LiveTimingsCapableKind("") is false, so asking about the raw type would
 	// refuse an explicit true on a {"binary": ".../llama-server"} spec -- the
 	// commonest managed configuration there is -- and, in the resolution
-	// below, silently default it OFF. It would also refuse the VRAM
+	// (runtimeSpecRow), silently default it OFF. It would also refuse the VRAM
 	// benchmark's own deferred restore, which replays a stored Type of ""
 	// verbatim through putRequestFromDTO alongside an explicit true.
 	//
 	// An EXPLICIT true on a kind that cannot honour it is refused, naming that
 	// kind. Judged over THIS document's kind rather than over a type change:
-	// a PUT is a full document and carries no retype signal -- hadExisting
-	// says a row was there, never that its kind changed -- and a first write
-	// asserting true on an incapable kind has to be refused too, though no
-	// transition is involved in it at all.
+	// a PUT is a full document and carries no retype signal -- the read of the
+	// stored row says a row was there, never that its kind changed -- and a
+	// first write asserting true on an incapable kind has to be refused too,
+	// though no transition is involved in it at all.
 	//
-	// POSITION, deliberately: LAST of this function's request validations.
-	// Every check a body could already fail on -- the binary, the tuning
-	// values, admin_state, the GPU rows, the env keys, the four
-	// visible-devices checks, the four api_token shapes, validRuntimeSpecType,
-	// both probe paths, both endpoint modes and the flavors -- runs above this
-	// and RETURNS rather than falling through, so this brand-new check can
-	// never rewrite the answer to a body that was already invalid for a
-	// SHIPPED reason. Two refusals that turn on STATE rather than on the body
-	// are above it as well, so they are safe for the same reason without
-	// belonging to that list: this function's opening server_agent gate on the
-	// parent application's type, and PutRuntimeSpec's benchmark-reservation
-	// 409, which never enters this shared body at all.
+	// POSITION, deliberately: LAST of the request validations. Every check a
+	// body could already fail on -- the binary, the tuning values,
+	// admin_state, the GPU rows, the env keys, the four visible-devices
+	// checks, the four api_token shapes, validRuntimeSpecType, both probe
+	// paths (all in validateRuntimeSpecShape), both endpoint modes and the
+	// flavors -- runs above this and RETURNS rather than falling through, so
+	// this brand-new check can never rewrite the answer to a body that was
+	// already invalid for a SHIPPED reason. Two refusals that turn on STATE
+	// rather than on the body are above it as well, so they are safe for the
+	// same reason without belonging to that list: writeRuntimeSpec's opening
+	// server_agent gate on the parent application's type, and PutRuntimeSpec's
+	// benchmark-reservation 409, which never enters the shared write at all.
 	//
 	// Placed beside the type check instead, a doubly-invalid body reported this
 	// 400 where it used to report runtime_spec.metrics_path_invalid,
 	// runtime_spec.endpoint_mode_invalid or runtime_spec.flavor_invalid.
 	//
-	// Exactly one REQUEST-REFUSING rejection is left below it in this function:
-	// capture.SealSecret's keyless-store failure (capture.ErrKeyRequired -> 400
-	// runtime_spec.api_token_key_required), returned from either token branch
-	// that seals, "random" or "set". It is write-path preparation rather than a
-	// request validation, and it is also the ONE place the two surfaces order
-	// things differently -- recorded here rather than smoothed over:
-	// CreateApplication and UpdateApplication both put their live-timings
-	// refusal BELOW their own capture.SealSecret call, so a body pairing an
-	// impossible true with an api_token on a keyless store reports the seal
-	// failure there and this 400 here. Which of the two such a body gets is
-	// cosmetic -- neither path persists anything either way -- and the
-	// request-SHAPE validation of the token pair has already run above.
+	// Exactly one REQUEST-REFUSING rejection is left after it on the write
+	// path: capture.SealSecret's keyless-store failure (capture.ErrKeyRequired
+	// -> 400 runtime_spec.api_token_key_required), returned from either token
+	// branch of runtimeSpecAPIToken that seals, "random" or "set". It is
+	// write-path preparation rather than a request validation, and it is also
+	// the ONE place the two surfaces order things differently -- recorded here
+	// rather than smoothed over: CreateApplication and UpdateApplication both
+	// put their live-timings refusal BELOW their own capture.SealSecret call,
+	// so a body pairing an impossible true with an api_token on a keyless store
+	// reports the seal failure there and this 400 here. Which of the two such a
+	// body gets is cosmetic -- neither path persists anything either way -- and
+	// the request-SHAPE validation of the token pair has already run above.
 	//
 	// The two json.Marshal error returns for args/env below are not a second
 	// rejection: no request body can reach them, because a []string and a
 	// map[string]string have no shape encoding/json rejects. Every other return
-	// down there -- the store reads and writes, the secret generation, the DTO
-	// mapper's corrupt-stored-row pair -- reports a failure of the SERVER or of
-	// an already-stored row, never of this request.
+	// after this function -- the store reads and writes, the expectSpecID
+	// guard's ErrRuntimeSpecNotFound (the spec a benchmark writer resolved is
+	// gone), the secret generation, the DTO mapper's corrupt-stored-row pair --
+	// reports a failure of the SERVER or of an already-stored row, never of
+	// this request.
 	//
 	// One sentinel, 400 in every shape. Because the document always carries
 	// the Type/Binary the kind is resolved from, the refused kind is always one
 	// THIS request supplied, so there is no well-formed-but-conflicting shape
-	// here for the application side's 409 sentinel to answer. hadExisting is
-	// read below for the default-versus-preserve decision only, never here.
-	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: specType, Binary: binary})
-	liveTimingsCapable := routing.LiveTimingsCapableKind(string(effectiveSpecKind))
-	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !liveTimingsCapable {
-		return RuntimeSpecDTO{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
+	// here for the application side's 409 sentinel to answer. The stored row
+	// is read later (priorRuntimeSpec), for the default-versus-preserve
+	// decision only, never here.
+	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: f.specType, Binary: f.binary})
+	f.liveTimingsCapable = routing.LiveTimingsCapableKind(string(effectiveSpecKind))
+	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !f.liveTimingsCapable {
+		return runtimeSpecFields{}, fmt.Errorf("%w: responses_live_timings_enabled cannot be true for a runtime spec of effective type %q",
 			ErrRuntimeSpecResponsesLiveTimingsUnsupported, string(effectiveSpecKind))
 	}
 	// VisibleDevicesMode: an omitted mode defaults to "env" (today's
 	// behavior); a bad value is a LATER task's validation (mode validation
 	// is not wired up yet — this resolves the stored typed value only).
-	visibleMode := routing.VisibleDevicesModeEnv
+	f.visibleMode = routing.VisibleDevicesModeEnv
 	if strings.TrimSpace(req.VisibleDevicesMode) != "" {
-		visibleMode = routing.VisibleDevicesMode(strings.TrimSpace(req.VisibleDevicesMode))
+		f.visibleMode = routing.VisibleDevicesMode(strings.TrimSpace(req.VisibleDevicesMode))
 	}
 	args := req.Args
 	if args == nil {
@@ -820,7 +869,7 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
+		return runtimeSpecFields{}, ErrRuntimeSpecArgsInvalid
 	}
 	env := req.Env
 	if env == nil {
@@ -828,111 +877,205 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	}
 	envJSON, err := json.Marshal(env)
 	if err != nil {
-		return RuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
+		return runtimeSpecFields{}, ErrRuntimeSpecEnvInvalid
 	}
-	healthPath := strings.TrimSpace(req.HealthPath)
-	if healthPath == "" {
-		healthPath = runtimeSpecHealthPathDefault(effectiveSpecKind)
+	f.args, f.env = string(argsJSON), string(envJSON)
+	f.healthPath = strings.TrimSpace(req.HealthPath)
+	if f.healthPath == "" {
+		f.healthPath = runtimeSpecHealthPathDefault(effectiveSpecKind)
 	}
-	healthTimeout := req.HealthTimeoutSeconds
-	if healthTimeout == 0 {
-		healthTimeout = defaultRuntimeSpecHealthTimeoutSeconds
+	f.healthTimeout = req.HealthTimeoutSeconds
+	if f.healthTimeout == 0 {
+		f.healthTimeout = defaultRuntimeSpecHealthTimeoutSeconds
 	}
-	startupTimeout := req.StartupTimeoutSeconds
-	if startupTimeout == 0 {
-		startupTimeout = defaultRuntimeSpecStartupTimeoutSeconds
+	f.startupTimeout = req.StartupTimeoutSeconds
+	if f.startupTimeout == 0 {
+		f.startupTimeout = defaultRuntimeSpecStartupTimeoutSeconds
 	}
-	// Read-then-upsert: an existing spec's id/created_at are preserved, and
-	// its stored GPU rows are the source of truth for VRAMMeasuredMB (the
-	// VRAM ownership rule above) — never what the request sent.
-	existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mapping.ID)
+	return f, nil
+}
+
+// validateRuntimeSpecShape is the first half of validateRuntimeSpecRequest:
+// the binary, the tuning values, admin_state, the GPU rows, the env keys, the
+// visible-devices and api_token shapes, the type and both probe paths, in that
+// order. It returns the trimmed values it validated.
+func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, error) {
+	binary := strings.TrimSpace(req.Binary)
+	// Absolute on POSIX *or* on Windows -- the agent's own filepath.IsAbs is
+	// the authority and this is its early-feedback mirror; see
+	// runtimeSpecBinaryIsAbsolute.
+	if !runtimeSpecBinaryIsAbsolute(binary) {
+		return runtimeSpecFields{}, ErrRuntimeSpecBinaryRequired
+	}
+	if req.ListenPort < 0 || req.HealthTimeoutSeconds < 0 || req.StartupTimeoutSeconds < 0 ||
+		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 {
+		return runtimeSpecFields{}, ErrRuntimeSpecTuningInvalid
+	}
+	adminState := strings.TrimSpace(req.AdminState)
+	switch adminState {
+	case "", "force_running", "force_stopped":
+	default:
+		return runtimeSpecFields{}, ErrRuntimeSpecAdminStateInvalid
+	}
+	if err := validateRuntimeSpecGPUs(req.GPUs); err != nil {
+		return runtimeSpecFields{}, err
+	}
+	for k := range req.Env {
+		if !runtimeSpecEnvKeyPattern.MatchString(k) {
+			return runtimeSpecFields{}, ErrRuntimeSpecEnvInvalid
+		}
+	}
+	if err := validateRuntimeSpecVisibleDevices(req); err != nil {
+		return runtimeSpecFields{}, err
+	}
+	if err := validateRuntimeSpecAPIToken(req); err != nil {
+		return runtimeSpecFields{}, err
+	}
+	specType := strings.TrimSpace(req.Type)
+	if !validRuntimeSpecType(specType) {
+		return runtimeSpecFields{}, ErrRuntimeSpecTypeInvalid
+	}
+	metricsPath := strings.TrimSpace(req.MetricsPath)
+	contextProbePath := strings.TrimSpace(req.ContextProbePath)
+	// SSRF guard: an operator-supplied probe-path override is only ever
+	// appended to the agent's own "http://127.0.0.1:PORT" loopback base, so it
+	// MUST be a safe relative path. Reject anything that could re-anchor the
+	// URL's Host (@userinfo, //authority, a scheme) or smuggle whitespace/
+	// control bytes -- see safeRelativeProbePath and the two sentinels' docs.
+	if !safeRelativeProbePath(metricsPath) {
+		return runtimeSpecFields{}, ErrRuntimeSpecMetricsPathInvalid
+	}
+	if !safeRelativeProbePath(contextProbePath) {
+		return runtimeSpecFields{}, ErrRuntimeSpecContextProbePathInvalid
+	}
+	return runtimeSpecFields{
+		binary:           binary,
+		adminState:       adminState,
+		specType:         specType,
+		metricsPath:      metricsPath,
+		contextProbePath: contextProbePath,
+	}, nil
+}
+
+// runtimeSpecEndpointModes resolves responses_mode and messages_mode, in that
+// order: an absent or empty mode is passthrough, and any other value must be
+// one of the three EndpointMode values (ErrRuntimeSpecEndpointModeInvalid).
+func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages routing.EndpointMode, err error) {
+	responses = routing.EndpointModePassthrough
+	if strings.TrimSpace(req.ResponsesMode) != "" {
+		m, ok := validEndpointMode(req.ResponsesMode)
+		if !ok {
+			return "", "", ErrRuntimeSpecEndpointModeInvalid
+		}
+		responses = m
+	}
+	messages = routing.EndpointModePassthrough
+	if strings.TrimSpace(req.MessagesMode) != "" {
+		m, ok := validEndpointMode(req.MessagesMode)
+		if !ok {
+			return "", "", ErrRuntimeSpecEndpointModeInvalid
+		}
+		messages = m
+	}
+	return responses, messages, nil
+}
+
+// runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
+// stored spec: the row itself (ok is false when there is none) and its
+// measured VRAM per GPU index.
+type runtimeSpecPrior struct {
+	spec            routing.RuntimeSpec
+	ok              bool
+	measuredByIndex map[int]int
+}
+
+// priorRuntimeSpec is the read half of the read-then-upsert: an existing
+// spec's id/created_at are preserved, and its stored GPU rows are the source
+// of truth for VRAMMeasuredMB (the VRAM ownership rule on PutRuntimeSpec) —
+// never what the request sent.
+//
+// With expectSpecID set (a benchmark writer, see putRuntimeSpec), the mapping
+// must still hold that very spec when this read runs; otherwise the write is
+// ErrRuntimeSpecNotFound and stores nothing. A missing row reads as the zero
+// spec (the store's absent-read contract), whose empty id never equals a
+// resolved one, so the one comparison refuses a deleted spec and one created
+// anew alike.
+//
+// The guard narrows the race and does not close it, and that is an accepted
+// limit: a DELETE of the spec that lands after this read and before
+// writeRuntimeSpec's upsert -- across the GPU-row read below, the token seal
+// and the clock read -- lets the upsert, which keys on mapping_id, store the
+// spec again under the resolved id, and a delete-and-recreate in that gap has
+// its new spec overwritten. Closing it needs a conditional update-by-id store
+// write, which the store does not have.
+func (s *Service) priorRuntimeSpec(ctx context.Context, mappingID, expectSpecID string) (runtimeSpecPrior, error) {
+	existing, hadExisting, err := s.routes.RuntimeSpecByMapping(ctx, mappingID)
 	if err != nil {
-		return RuntimeSpecDTO{}, err
+		return runtimeSpecPrior{}, err
 	}
-	measuredByIndex := map[int]int{}
-	if hadExisting {
-		existingGPUs, err := s.routes.RuntimeSpecGPUs(ctx, existing.ID)
-		if err != nil {
-			return RuntimeSpecDTO{}, err
-		}
-		for _, g := range existingGPUs {
-			measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
-		}
+	if expectSpecID != "" && existing.ID != expectSpecID {
+		return runtimeSpecPrior{}, ErrRuntimeSpecNotFound
 	}
-	// The live-timings opt-in. !hadExisting is what "create" means on a
+	prior := runtimeSpecPrior{spec: existing, ok: hadExisting, measuredByIndex: map[int]int{}}
+	if !hadExisting {
+		return prior, nil
+	}
+	existingGPUs, err := s.routes.RuntimeSpecGPUs(ctx, existing.ID)
+	if err != nil {
+		return runtimeSpecPrior{}, err
+	}
+	for _, g := range existingGPUs {
+		prior.measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
+	}
+	return prior, nil
+}
+
+// runtimeSpecRow builds the row writeRuntimeSpec upserts: the request's
+// validated fields, the live-timings opt-in and the sealed API token (both
+// depend on the stored row), and the stored row's id and created_at when
+// there is one.
+func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) (routing.RuntimeSpec, error) {
+	// The live-timings opt-in. !prior.ok is what "create" means on a
 	// full-document upsert, so a first write takes the kind-dependent default
 	// while a later save of an existing spec that omits the key keeps the
 	// stored value -- re-saving a llama.cpp spec never re-enables a flag the
 	// operator turned off, nor clears one they turned on.
 	//
 	// The two arms below are the pointer's whole point. A non-nil value is the
-	// caller's, already validated above (a true here implies a capable kind,
-	// or putRuntimeSpec has already returned). A nil against a document whose
-	// kind cannot honour the flag CLEARS it, so a PUT that retypes an
-	// llama_cpp spec to ollama cannot leave a stale true behind -- and since
-	// the caller said nothing about the flag, the clear contradicts nothing
-	// they asked for. That is the asymmetry of this feature: the assertion is
-	// refused, the non-mention is normalised.
+	// caller's, already validated (a true here implies a capable kind, or
+	// validateRuntimeSpecRequest has already refused it). A nil against a
+	// document whose kind cannot honour the flag CLEARS it, so a PUT that
+	// retypes an llama_cpp spec to ollama cannot leave a stale true behind --
+	// and since the caller said nothing about the flag, the clear contradicts
+	// nothing they asked for. That is the asymmetry of this feature: the
+	// assertion is refused, the non-mention is normalised.
 	//
-	// liveTimingsCapable is the local the refusal above computed, from the
-	// EFFECTIVE kind. Do not recompute it from specType here: that is how an
+	// f.liveTimingsCapable is what the refusal computed, from the EFFECTIVE
+	// kind. Do not recompute it from specType here: that is how an
 	// auto-detect llama-server spec ends up defaulting off.
-	liveTimings := liveTimingsCapable
-	if hadExisting {
-		liveTimings = existing.ResponsesLiveTimingsEnabled
+	liveTimings := f.liveTimingsCapable
+	if prior.ok {
+		liveTimings = prior.spec.ResponsesLiveTimingsEnabled
 	}
 	switch {
 	case req.ResponsesLiveTimingsEnabled != nil:
 		liveTimings = *req.ResponsesLiveTimingsEnabled
-	case !liveTimingsCapable:
+	case !f.liveTimingsCapable:
 		liveTimings = false
 	}
-	// Per-spec API token (design §2): compute the SEALED value to persist
-	// STRICTLY BEFORE the store write, so a keyless-disk seal rejection
-	// (capture.ErrKeyRequired) returns without persisting anything -- no
-	// plaintext token, no half-applied mode. Mirrors service_applications.go's
-	// write-only *string sentinel exactly: nil = keep the stored (already
-	// sealed) value, "" seals to "" = clear, a value replaces-and-seals. Mode
-	// "random" generates a fresh secret on first write or when rotate is asked;
-	// modes "app"/"off" store no per-spec token. Validation
-	// (validateRuntimeSpecAPIToken, above) has already run -- this only seals.
-	mode := req.APITokenMode
-	if mode == "" {
-		mode = string(routing.RuntimeAPITokenModeApp)
-	}
-	sealedToken := existing.APIToken // keep by default (existing = the loaded spec, "" when none)
-	switch routing.RuntimeAPITokenMode(mode) {
-	case routing.RuntimeAPITokenModeRandom:
-		if existing.APIToken == "" || req.APITokenRotate {
-			rawToken, err := generateSecret()
-			if err != nil {
-				return RuntimeSpecDTO{}, err
-			}
-			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, rawToken)
-			if err != nil {
-				return RuntimeSpecDTO{}, err // ErrKeyRequired on a keyless disk store => 400, nothing persisted
-			}
-			sealedToken = sealed
-		}
-	case routing.RuntimeAPITokenModeSet:
-		if req.APIToken != nil { // nil = keep the stored token untouched
-			sealed, err := capture.SealSecret(s.cipher, s.settingsVolatile, *req.APIToken)
-			if err != nil {
-				return RuntimeSpecDTO{}, err
-			}
-			sealedToken = sealed // "" seals to "" = cleared
-		}
-	default: // app, off -- no per-spec token stored
-		sealedToken = ""
+	mode, sealedToken, err := s.runtimeSpecAPIToken(req, prior.spec.APIToken)
+	if err != nil {
+		return routing.RuntimeSpec{}, err
 	}
 	headerSource := req.APITokenHeaderSource
 	if headerSource == "" {
 		headerSource = string(routing.RuntimeAPITokenHeaderSourceApp)
 	}
 	// APITokenHeader is only meaningful for a custom source (its shape was
-	// validated above via checkHeaderName); an "app" source inherits the
-	// application's header at request-auth time (routing.SpecUpstreamAuth via
-	// effectiveAPITokenHeader) and stores none here.
+	// validated by validateRuntimeSpecAPIToken via checkHeaderName); an "app"
+	// source inherits the application's header at request-auth time
+	// (routing.SpecUpstreamAuth via effectiveAPITokenHeader) and stores none
+	// here.
 	headerName := ""
 	if routing.RuntimeAPITokenHeaderSource(headerSource) == routing.RuntimeAPITokenHeaderSourceCustom {
 		headerName = strings.TrimSpace(req.APITokenHeader)
@@ -940,63 +1083,98 @@ func (s *Service) putRuntimeSpec(ctx context.Context, mapping routing.ModelMappi
 	now := s.clock().UTC()
 	spec := routing.RuntimeSpec{
 		ID:                          "rspec_" + compactRandomHex(16),
-		MappingID:                   mapping.ID,
+		MappingID:                   mappingID,
 		Enabled:                     req.Enabled,
-		Binary:                      binary,
-		Args:                        string(argsJSON),
-		Env:                         string(envJSON),
+		Binary:                      f.binary,
+		Args:                        f.args,
+		Env:                         f.env,
 		WorkDir:                     strings.TrimSpace(req.WorkDir),
 		ListenPort:                  req.ListenPort,
-		HealthPath:                  healthPath,
-		HealthTimeoutSeconds:        healthTimeout,
-		StartupTimeoutSeconds:       startupTimeout,
+		HealthPath:                  f.healthPath,
+		HealthTimeoutSeconds:        f.healthTimeout,
+		StartupTimeoutSeconds:       f.startupTimeout,
 		IdleTimeoutSeconds:          req.IdleTimeoutSeconds,
 		AdmissionWaitTimeoutSeconds: req.AdmissionWaitTimeoutSeconds,
 		Pinned:                      req.Pinned,
-		AdminState:                  adminState,
+		AdminState:                  f.adminState,
 		VRAMLocked:                  req.VRAMLocked,
 		SetVisibleDevices:           req.SetVisibleDevices,
-		VisibleDevicesMode:          visibleMode,
+		VisibleDevicesMode:          f.visibleMode,
 		APITokenMode:                mode,
 		APIToken:                    sealedToken,
 		APITokenHeaderSource:        headerSource,
 		APITokenHeader:              headerName,
-		APIFlavors:                  flavors,
-		ResponsesMode:               respMode,
-		MessagesMode:                msgMode,
+		APIFlavors:                  f.flavors,
+		ResponsesMode:               f.responsesMode,
+		MessagesMode:                f.messagesMode,
 		ResponsesLiveTimingsEnabled: liveTimings,
-		Type:                        specType,
-		MetricsPath:                 metricsPath,
-		ContextProbePath:            contextProbePath,
+		Type:                        f.specType,
+		MetricsPath:                 f.metricsPath,
+		ContextProbePath:            f.contextProbePath,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
-	if hadExisting {
-		spec.ID = existing.ID
-		spec.CreatedAt = existing.CreatedAt
+	if prior.ok {
+		spec.ID = prior.spec.ID
+		spec.CreatedAt = prior.spec.CreatedAt
 	}
-	if err := s.routes.UpsertRuntimeSpec(ctx, spec); err != nil {
-		return RuntimeSpecDTO{}, err
+	return spec, nil
+}
+
+// runtimeSpecAPIToken resolves the per-spec API token (design §2): the mode,
+// "app" when absent, and the SEALED value to persist, computed STRICTLY
+// BEFORE the store write, so a keyless-disk seal rejection
+// (capture.ErrKeyRequired) returns without persisting anything -- no
+// plaintext token, no half-applied mode. stored is the stored spec's
+// (already sealed) token, "" when there is none. Mirrors
+// service_applications.go's write-only *string sentinel exactly: nil = keep
+// the stored value, "" seals to "" = clear, a value replaces-and-seals. Mode
+// "random" generates a fresh secret on first write or when rotate is asked;
+// modes "app"/"off" store no per-spec token. Validation
+// (validateRuntimeSpecAPIToken) has already run -- this only seals.
+func (s *Service) runtimeSpecAPIToken(req PutRuntimeSpecRequest, stored string) (mode, sealed string, err error) {
+	mode = req.APITokenMode
+	if mode == "" {
+		mode = string(routing.RuntimeAPITokenModeApp)
 	}
-	gpuRows := make([]routing.RuntimeSpecGPU, 0, len(req.GPUs))
-	for i, g := range req.GPUs {
-		gpuRows = append(gpuRows, routing.RuntimeSpecGPU{
-			SpecID:         spec.ID,
+	switch routing.RuntimeAPITokenMode(mode) {
+	case routing.RuntimeAPITokenModeRandom:
+		if stored != "" && !req.APITokenRotate {
+			return mode, stored, nil
+		}
+		rawToken, err := generateSecret()
+		if err != nil {
+			return "", "", err
+		}
+		sealed, err = capture.SealSecret(s.cipher, s.settingsVolatile, rawToken)
+		return mode, sealed, err // ErrKeyRequired on a keyless disk store => 400, nothing persisted
+	case routing.RuntimeAPITokenModeSet:
+		if req.APIToken == nil { // nil = keep the stored token untouched
+			return mode, stored, nil
+		}
+		sealed, err = capture.SealSecret(s.cipher, s.settingsVolatile, *req.APIToken)
+		return mode, sealed, err // "" seals to "" = cleared
+	default: // app, off -- no per-spec token stored
+		return mode, "", nil
+	}
+}
+
+// runtimeSpecGPURows builds a spec's GPU rows from the request: the request
+// array order becomes the stored Position, and VRAMMeasuredMB is the stored
+// value for an index that already had a row and 0 for a brand-new one (the
+// VRAM ownership rule on PutRuntimeSpec).
+func runtimeSpecGPURows(specID string, gpus []RuntimeSpecGPUDTO, measuredByIndex map[int]int) []routing.RuntimeSpecGPU {
+	rows := make([]routing.RuntimeSpecGPU, 0, len(gpus))
+	for i, g := range gpus {
+		rows = append(rows, routing.RuntimeSpecGPU{
+			SpecID:         specID,
 			GPUIndex:       g.Index,
-			Position:       i, // request array order becomes the stored order
+			Position:       i,
 			VRAMEstimateMB: g.VRAMEstimateMB,
-			VRAMMeasuredMB: measuredByIndex[g.Index], // 0 for a brand-new index; preserved otherwise
+			VRAMMeasuredMB: measuredByIndex[g.Index],
 		})
 	}
-	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, gpuRows); err != nil {
-		return RuntimeSpecDTO{}, err
-	}
-	s.notifyRuntimeChanged(server.ID)
-	storedGPUs, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
-	if err != nil {
-		return RuntimeSpecDTO{}, err
-	}
-	return runtimeSpecDTO(spec, storedGPUs, app)
+	return rows
 }
 
 // DeleteRuntimeSpec removes mappingID's runtime spec. ErrRuntimeSpecNotFound
@@ -1074,7 +1252,7 @@ func argsHaveDevicePlaceholder(args []string) bool {
 
 // validVisibleDevicesMode validates a raw visible_devices_mode at the DTO
 // edge (mirrors validEndpointMode). Empty is valid and defaults to "env" in
-// putRuntimeSpec; any other non-env/args value is rejected.
+// validateRuntimeSpecRequest; any other non-env/args value is rejected.
 func validVisibleDevicesMode(raw string) (routing.VisibleDevicesMode, bool) {
 	switch m := routing.VisibleDevicesMode(strings.TrimSpace(raw)); m {
 	case "", routing.VisibleDevicesModeEnv, routing.VisibleDevicesModeArgs:
@@ -1110,7 +1288,7 @@ func validVisibleDevicesMode(raw string) (routing.VisibleDevicesMode, bool) {
 // the request IS the resulting spec.
 func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 	// The mode value is validated regardless of the flag: a malformed enum is
-	// a malformed request. Empty defaults to "env" (resolved in putRuntimeSpec).
+	// a malformed request. Empty defaults to "env" (resolved in validateRuntimeSpecRequest).
 	mode, ok := validVisibleDevicesMode(req.VisibleDevicesMode)
 	if !ok {
 		return ErrRuntimeSpecVisibleDevicesModeInvalid
@@ -1142,7 +1320,7 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 // routing.RuntimeAPITokenMode values. Unlike validVisibleDevicesMode, empty
 // is NOT accepted here -- callers normalize "" to "app" themselves before
 // calling this (see validateRuntimeSpecAPIToken), the same way the sealing
-// logic in putRuntimeSpec needs the resolved mode, not the raw request value.
+// logic in runtimeSpecAPIToken needs the resolved mode, not the raw request value.
 func validRuntimeAPITokenMode(s string) bool {
 	switch routing.RuntimeAPITokenMode(s) {
 	case routing.RuntimeAPITokenModeOff, routing.RuntimeAPITokenModeSet,
@@ -1224,7 +1402,7 @@ func specHasAPITokenPlaceholder(env map[string]string, args []string) bool {
 // validateRuntimeSpecAPIToken validates api_token_mode, the ${API_TOKEN}
 // placeholder requirement that mode implies, and api_token_header_source/
 // api_token_header. It does NOT look at api_token or api_token_rotate --
-// those drive sealing/rotation in putRuntimeSpec's write path, a persistence
+// those drive sealing/rotation in the write path (runtimeSpecAPIToken), a persistence
 // concern this pure request-shape validator has no business with -- and it
 // does NOT read the parent application's own token: there is no app_unset
 // error, mode "app" is valid regardless of whether the app has a token
@@ -1823,14 +2001,19 @@ func anyStableDiffusionSpecNotImagesOnly(app routing.Application, specs []routin
 // UpdateApplication / DeleteApplication, via
 // notifyRuntimeChangedForApplication; (3) CreateMapping / UpdateMapping /
 // DeleteMapping / reconcileApplicationModels, via
-// notifyRuntimeChangedForMapping; (4) PutRuntimeSpec / DeleteRuntimeSpec;
-// (5) SetCoResidency; (6) SetServerGPUBudgets.
+// notifyRuntimeChangedForMapping; (4) PutRuntimeSpec / DeleteRuntimeSpec, and
+// the benchmark run's own launch-spec writers: SetBenchmarkRuntimeSpecAdminState
+// once per stored write, through putRuntimeSpec, and
+// SetBenchmarkRuntimeSpecsPinned / SetBenchmarkRuntimeSpecsAdminState from
+// setBenchmarkRuntimeSpecs, after the batch's last write, once for each server
+// a write stored to; (5) SetCoResidency; (6) SetServerGPUBudgets.
 //
 // The "never which field" half is the load-bearing half. A "relevant fields"
 // allow-list inside a write path would be a second, uncompiled copy of
 // AgentRuntimeConfig's derivation, and it would rot the moment that
 // derivation grows a field -- while over-notifying is cheap and idempotent
-// (one goroutine, and gateway.Server.PushRuntimeConfig fail-closes on "no
+// (at most one coalesced pass of the server's push worker, which
+// gateway.Server.PushRuntimeConfig runs, and that pass fail-closes on "no
 // runtime_manager agent connected for this server" before it reads anything;
 // the agent then re-fetches and its driver applies only on a real ETag
 // change). Under-notifying is the actual bug.

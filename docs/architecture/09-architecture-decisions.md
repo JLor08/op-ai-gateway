@@ -294,7 +294,12 @@ drives as the sequence `force_stopped` → observe `stopped` → clear. There is
 restart endpoint, and the sequence therefore carries the whole correctness
 burden (bounded wait, completion on a transition rather than a state, and no
 silent clearing on timeout). A genuinely imperative action would need its own
-frame type behind its own feature flag.
+frame type behind its own feature flag. A benchmark that writes an override
+itself — the VRAM run's drain and a manual speed run's stop-all
+([ADR-047](#adr-047--a-manual-speed-run-measures-every-agent-model-on-an-emptied-server-it-stops-the-servers-running-models-before-each-cold-pass-and-lifts-the-servers-pins-for-the-run)) —
+clears it on every exit, because it created it, and records it in the override
+lease that the gateway reconciles at start; the portal's own discipline is
+unchanged.
 → [Agent-Managed Model Runtime §11.2](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-027 — Model secrets never enter the gateway
@@ -324,7 +329,7 @@ own scope** — which row it writes, and for an application-owned row whether th
 application is the server's `server_agent` one — never from which field the
 request carried. A per-path "runtime-relevant fields" filter was rejected: it is
 an uncompiled duplicate of the document's derivation in another file, which rots
-the first time that derivation grows a field. **Consequence:** twelve call sites
+the first time that derivation grows a field. **Consequence:** fifteen call sites
 notify, some redundantly; over-notification is licensed by one fail-closed map
 lookup at the delivery point plus the agent's ETag-based idempotence; the 60 s
 agent poll is the backstop, so a missed notification degrades to "the change
@@ -2647,3 +2652,314 @@ second reads as a failure.
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [HTTP API Surface](reference/api-surface.md#benchmark-load-and-context-probe-runs).
+
+## ADR-047 — A manual speed run measures every agent model on an emptied server: it stops the server's running models before each cold pass and lifts the server's pins for the run
+**Context:** the speed benchmark's load time is its cold pass's time to first
+token minus its warm pass's, so the model has to be cold when the cold pass
+starts. For a `server_agent` application nothing made it cold. The portal
+stores the application's gateway-side probe fields empty, and the gateway
+derives the agent router's own routes in their place ([Agent-Managed Model
+Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)),
+but the router has no unload route: it answers the unload that the cold pass
+sends to other application types with 404 `runtime.model_not_managed`. So an
+agent model that was resident when a run started recorded no load time. Desired
+state can stop a model, but pins get in the way: a pinned child restarts as soon
+as its `force_stopped` is cleared, so its measured load comes out too small, and
+under a closed co-residency matrix a pinned neighbour blocks a cold target,
+because the agent never evicts a pinned child. And where a cold target did
+start, its time to first token included the exit of every neighbour it had to
+evict: measured, 3.5 s for a model whose own load took 1.5 s, next to a
+neighbour that took 2 s to exit. The column would then hold two meanings for
+one model, depending on what ran beside it.
+
+**Decision (a): the stop-all.** Before each agent target's cold pass
+(`preStopServer`), the run force-stops, in one batched write, every model of the
+server's agent application that has a process or reports a state the gateway
+does not recognize, and the target itself whenever its own status row reads
+anything other than `stopped`: a request for a spec in `backoff` waits for its
+backoff timer, and that wait would land in the load time. The stop completes on
+the first status frame received after the write in which every row is quiet
+(`benchmarkRowQuiet`: a state without a process, and pid 0) and, when the
+target read `backoff`, `start_failed` or `crashed` at selection, the target's
+own row reads `stopped`, because the agent resets those states when it
+applies the stop's document, which can be as late as its poll; all within
+`benchmarkStopWaitBound` (120 s). The unpin goes out without a wait, so the
+agent may still hold a formerly pinned neighbour pinned: a stop-set row that
+was not quiet and turns quiet in the wait is the run's sign that the agent
+holds the lifted pins, and without such a row every formerly pinned
+neighbour, the target aside, already has to read `stopped` with pid 0. Two
+narrow misses remain: a process that exits by itself inside the stop
+document's delivery window is taken for that sign, and only the specs this
+run unpinned are judged. The clear is one batched write as soon as the wait
+ends, on a context that is not cancelled with the run, and
+[ADR-048](#adr-048--the-runtime-config-push-is-one-worker-per-server-a-document-is-derived-only-after-the-previous-one-was-enqueued-the-last-reflects-the-latest-write-and-frames-are-spaced)'s
+serializer delivers its document after the stop's. The portal's restart
+([ADR-026](#adr-026--gatewayagent-control-is-desired-state-not-commands))
+completes on a transition; this stop completes on a state, whatever caused it.
+That is sound only because an unpinned child without `force_running` and
+without a process starts only on a request, and the reservation sends it none:
+routing skips a server a benchmark holds, and so does the model warmer. The
+stop-all is bounded and clears on every exit. It never stops while every frame
+of its 5 s selection window shows traffic in flight: a stop cuts off a stream
+that outlasts the agent's 10 s drain, and the client sees a clean end of
+stream, not an error. When the target itself was stopped, the cold pass
+rides the router's 503 `runtime.admission_blocked` through the load loop
+(`coldPassAfterStop`) until the clear reaches the agent, and keeps the time to
+first token of the attempt that was served, which includes the whole start. The
+stop runs per target, not once per run: each measured model stays resident
+after its warm pass, so one stop before the first target would let the second
+target's cold start evict the first and count that exit again.
+
+**(b) Manual speed and both runs only, and one meaning for the column.** Only a
+manual run in mode `speed` or `both` stops and unpins (`startBenchmark`, behind
+`AuthorizeBenchmarkScope`). Scheduled runs never do, and neither does any other
+run kind; the VRAM run keeps its own drain. Every run that measures a load
+time, stopping or not, confirms one only when no other model of the application
+has a process or can start one by itself, short of the two narrow misses (a)
+names. On the target's own row: without a stop it reads `stopped` or it has no
+row; with one it is quiet, and it has to read `stopped` only when it had read
+`backoff`, `start_failed` or `crashed` at selection — `not_permitted` and
+`pending_vram_unknown` wait behind no timer either way. Without a stop, every
+other row of a non-empty runtime status also has to read `stopped` with pid 0
+(`benchmarkOthersStopped`): without the unpin, a pinned neighbour in `backoff`
+has no process now but restarts when its timer fires. So the column has one
+meaning, the model's own load on an otherwise empty server, and a run that
+cannot confirm keeps the last value.
+
+**(c) The temporary unpin.** At run start, the run lifts the pin of every
+enabled pinned spec of the server's agent application, measured or not, in one
+batched write (`SetBenchmarkRuntimeSpecsPinned`) with one notification and no
+wait. A pinned neighbour holds its VRAM, the agent never evicts it, and the
+stop-all cannot stop it, because it would restart at the clear. After the whole
+run, still inside the reservation, the run pins exactly those specs again
+(`endBenchmarkUnpin`). Every spec write of the run is a compare-and-set: a spec
+whose value changed in between is left alone, and a spec deleted before the
+write re-reads it is gone and is not created again. A DELETE that lands between
+that re-read and the upsert still stores the spec again under its old id,
+because the upsert keys on `mapping_id` and the store has no conditional update
+by id (an accepted limit, `priorRuntimeSpec`).
+
+**(d) The override lease and its reconciler.** Before it writes them, the run
+records the pins it owes and the `force_stopped` overrides it owes in one
+`system_settings` row per server, `benchmark_override_lease:<server_id>`, and it
+rewrites the row as it settles them; an empty row releases it. A
+compare-and-set reconciler clears and re-pins whatever an earlier run left
+behind, because it died or could not release the row, and logs what it settles
+at Warn: at gateway start (`ReconcileBenchmarkOverrideLeases`, before the
+listeners and the benchmark scheduler start), and at the next manual speed or
+both run on that server, once that run has passed its own start gates. The
+clear goes first, because a spec that stays `force_stopped` refuses every
+request, while one that stays unpinned still serves on demand. The VRAM run
+records its drain in the same row.
+
+**(e) Gates.** Nothing is unpinned or stopped in file mode, without
+`runtime_manager`, while any enabled spec on the server carries `force_running`
+(it restarts at once after any stop and thrashes with the target), or when the
+lease row cannot be read or written. A target is not stopped while every frame
+of its selection window shows traffic in flight, while its stop set holds a spec
+that the store's re-read shows pinned, disabled, unknown or carrying an
+override, or while it has no status row. After a stop wait expired or a clear
+failed, the run stops nothing more.
+
+**Consequence: the load time is the model's own load on an otherwise empty
+server, and the models that ran pay for it.** It resolves to the agent's 500 ms
+health poll, and, short of (a)'s two narrow misses, no run records a load time
+that includes making room. Every model that runs when an agent target starts
+is stopped for that measurement. After the run only the last target and the
+formerly pinned specs are up, and every other model pays one full load on its
+next request, because the run does not restart it. A scheduled run records a
+load time only on an otherwise empty server, so at most one per run. While a
+run holds the server, the runtime section shows every pin lifted, and each
+stopped model `force_stopped` for the stop wait, 5 ms to about 5 s over
+WebSocket; the agent holds the override up to 0.25 s longer, until the clear's
+document goes out. Two crash windows remain, the stop's and the unpin's: a
+gateway that dies inside one leaves the overrides or the lifted pins in place
+until it starts again against the same store, and the lease then puts them
+back ([Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
+
+**The VRAM run's refusal of a pinned sibling is unchanged.** The VRAM run does
+not lift pins: silently breaking an operator's standing instruction for a
+benchmark is a worse surprise than refusing and naming it. The speed run meets
+that reason differently, because it never lifts a pin or stops a model
+silently. A Warn log names every lifted pin, and the benchmark panel names
+every lifted and every stopped spec (`unpinned_spec_ids`, `stopped_spec_ids`).
+The run puts each one back, and a failed re-pin (`repin_failed`) is the run's
+error, while a failed clear is only the target's own result error.
+
+**Fit with the other ADRs.**
+[ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions):
+only named feature flags are read. ADR-026: the benchmark is a second writer of
+`admin_state` that clears on every exit, because it created the override, and
+it completes on a state for the reason in (a).
+[ADR-028](#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field):
+both batched writers (`SetBenchmarkRuntimeSpecsAdminState`,
+`SetBenchmarkRuntimeSpecsPinned`) notify by their write scope, once per server
+they stored to, after their last write; the lease row is not an input of the
+runtime-config document and does not notify.
+[ADR-029](#adr-029--runtime-domain-writes-are-full-document-replaces-gated-on-their-own-get):
+the runtime section's override actions read their spec before they write it,
+which applies "gated on its own GET" to the document the write replaces; a
+cache loaded during a run carries the lifted pin, and the next override click
+would otherwise undo the re-pin.
+[ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)
+is unchanged.
+[ADR-046](#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request):
+exposure is unchanged, because no route is added. ADR-048: the run relies on
+the serializer for the order of its documents, so it needs no delay of its own
+between its writes.
+
+**Rejected:** **an unload route on the router** — it exposes a one-request
+stop on a router that authenticates nothing, which ends ADR-046's "exposure is
+unchanged", and it needs an agent release. — **An unload generation in the
+desired-state document** — it has no crash window, but needs a migration, an
+agent release and an ADR of its own; it is the follow-up if unattended stops
+are ever needed. — **One stop-all per run** — the second target's cold start
+evicts the first and counts that exit. — **Stopping every enabled spec** — a
+spec without a process has nothing to stop, so it only widens the override's
+footprint and what a crash leaves behind. — **One write per spec
+for the stop** — one document per spec, and an agent before 0.8.1, whose sync
+is single-flight, can end on a partial one. — **The VRAM run's isolation wait
+(`vramAwaitIsolation`)** — its acknowledgement proof or blind 60 s delay keeps
+an isolation in force across a long measurement, and the stop needs quiet for a
+moment only. — **A literal `stopped` for the stop wait** — up to 60 s more for
+a child that crashed while draining and sits in `backoff`. — **Stopping a spec
+with traffic in flight** — it ends a direct client's stream, silently. —
+**Measuring a pinned target as it is** — the clear restarts it, so its load
+comes out too small. — **Skipping pinned targets** — a pinned model would never
+get a load time. — **A lazy unpin per target** — a pinned neighbour would stay
+pinned, and the stop-all could not stop it. — **Per-spec unpins** — one
+document per spec, the same partial-document risk a batched write avoids. —
+**An acknowledgement gate** — an acknowledgement proves
+that the agent once held a document, not that no older one follows it, and
+only agents that declare it would benefit. — **A delay of one push bound
+between the run's writes** — it guards timing, not order, and stays wrong when
+a derive outlives its bound. — **Clearing `force_running` for the run** — it is
+not a pin, and the model restarts at once. — **Restarting the stopped models
+after the run** — it needs the ensure route, races user traffic once the
+reservation is released, and under a closed matrix cannot rebuild the set that
+ran before. — **Holding the reservation until the re-pinned models run** —
+minutes of excluded traffic for a display metric.
+→ [Agent-Managed Model Runtime
+§9](cross-cutting/agent-runtime-manager.md#9-keeping-the-agent-current-the-notification-rule),
+[§11.2](cross-cutting/agent-runtime-manager.md#112-restart-is-a-sequence-not-an-endpoint),
+[§11.6](cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs),
+[§11.9](cross-cutting/agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping),
+[§11.10](cross-cutting/agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease),
+[Routing & Model Selection
+§7](cross-cutting/routing-and-model-selection.md#7-model-selection-metrics),
+[Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks),
+[HTTP API Surface](reference/api-surface.md#benchmark-load-and-context-probe-runs).
+
+## ADR-048 — The runtime-config push is one worker per server: a document is derived only after the previous one was enqueued, the last reflects the latest write, and frames are spaced
+**Context:** every portal write that can change a server's runtime-config
+document notifies the server's agent
+([ADR-028](#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field)),
+and the notification ran `PushRuntimeConfig` as one goroutine per write. Each
+goroutine derived the document with several store reads under a 5 s bound and
+then enqueued it on every open connection of the server, and nothing ordered
+two of them. When a stop was written and its derive was still running as a
+clear was written, the clear's goroutine enqueued its document first and the
+stop's goroutine enqueued the stale one last. The connection's queue and the
+agent's sequential read loop delivered both faithfully, and the agent, which
+adopts every document whose ETag differs from its own, ended on the stop while
+the store held the clear, until its next 60 s poll. A wedged store also
+accumulated one goroutine per write. A second loss sits at the agent and is
+not about order: an agent before 0.8.1 runs its runtime sync single-flight, so
+a document that arrives while a sync runs is dropped, and two documents closer
+together than one sync lose the second even when they arrive in order. A sync
+includes a features round trip to the gateway, so a burst of documents sent
+back to back left such an agent on the first, partial one; agent 0.8.1 owes a
+trailing sync to such a document instead. The POST transport never had either
+problem: it never pushes, and every poll derives at request time.
+`TestRuntimeConfigPushOrdersDocumentsByDerive` and
+`TestRuntimeConfigPushEndsOnTheStoreDocumentAfterAPortalBurst` pin the fix.
+
+**Decision: `PushRuntimeConfig` hands the server id to a per-server worker
+(`runtimeConfigPusher`, `internal/gateway/runtime_config_push.go`).** The hook
+keeps its signature and its wiring.
+- **(a) Order.** Passes for one server never overlap: a worker's map entry is
+  created before its goroutine starts and deleted by that goroutine in the exit
+  check that finds no pass owed, both under one leaf mutex. So document k+1 is
+  derived only after document k was enqueued, dropped or failed to derive, and
+  every connection of the server receives the documents in derive order.
+- **(b) Latest wins.** A notification comes after its write's commit. It either
+  starts a worker, whose first derive begins after it, or marks the running
+  worker dirty before that worker's exit check, which owes one more pass whose
+  derive starts after the check. So after every write a pass that sees it runs
+  to completion; intermediate documents may be skipped. A derive is several
+  separate reads, so a pass that runs alongside a write can send a partial
+  document, and such a document is always followed by another pass. The dirty
+  check and the delete from the map are one critical section: split, a
+  notification between them is lost.
+- **(c) The hook stays fast.** A notification takes one leaf mutex and at most
+  starts a goroutine. Goroutines are bounded at one per server with pending
+  work, and an idle server keeps no state.
+- **Spacing.** After a pass that enqueued a frame on at least one connection,
+  the worker waits `pushRuntimeConfigSpacing` (250 ms, per `Server`) before its
+  next pass, and notifications in that window coalesce into that next pass. The
+  first document after a quiet period goes out at once, and a pass that sent
+  nothing (no connection, the POST transport, a refused gate) is not spaced.
+  The spacing covers a sync shorter than 250 ms on an agent before 0.8.1; it is
+  not an ordering mechanism, because the order is structural (a). It applies to
+  every agent, with no feature flag: from 0.8.1 the agent owes a trailing sync
+  and does not need it, but older agents stay in the field, and the gateway
+  tells agents apart by feature flags, never by version
+  ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)).
+  A flag would save at most 250 ms per document.
+- **The derive bound stays 5 s per pass** (`pushRuntimeConfigTimeout`). A
+  failed or timed-out derive enqueues nothing and is not retried; a pass a later
+  notification owes still runs, and the poll backs it up.
+- **No dedup.** A notification that lands after a derive already read its write
+  yields one redundant frame, which the agent ignores by ETag. Dedup would need
+  per-server ETag memory, and it would skip the re-enqueue that repairs a frame
+  a full queue dropped.
+
+**Consequences:** a caller that writes the document several times in a row
+needs no delay of its own between the writes to keep their order, and the
+documents every connection receives follow the writes' order, at least 250 ms
+apart; a write that lands while a pass or its spacing wait runs is folded into
+the next document.
+A manual speed run's stop-all
+([ADR-047](#adr-047--a-manual-speed-run-measures-every-agent-model-on-an-emptied-server-it-stops-the-servers-running-models-before-each-cold-pass-and-lifts-the-servers-pins-for-the-run))
+relies on this order: it waits for no earlier document to land before it
+writes, and holds no clear back for a minimum gap after its stop.
+A wedged store delays later pushes for its server, behind one 5 s derive,
+instead of letting them overtake it, and coalescing keeps that backlog to one
+pass. A document can cost up to 250 ms when it follows another within 250 ms.
+Workers are detached and not awaited at shutdown, as the goroutines were. What
+remains for the poll and the reconnect resync: a sync longer than the spacing
+on an agent before 0.8.1, a full send queue that drops the newest frame, a
+failed derive, a server without an open connection, and the agent's own VRAM
+writeback, which deliberately does not notify ([Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks)). From agent 0.8.1
+the single-flight drop is gone: `triggerRuntimeSync` owes one trailing sync,
+with the latest payload, to a document that arrives during a sync
+(`TestRuntimeWakeDuringASyncEndsOnTheLatestDocument`).
+
+**It fits ADR-026 and ADR-028.** The document stays desired state, never a
+command, and every frame stays self-contained and idempotent
+([ADR-026](#adr-026--gatewayagent-control-is-desired-state-not-commands)). The
+notification rule is unchanged; only its delivery is serialized
+([ADR-028](#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field)).
+
+**Rejected:** **A delay in each caller between two writes, one push bound
+long** — it guards timing, not order, and stays wrong whenever a derive outlives
+its bound. — **A debounce** — it delays every first click. — **Holding one lock
+across the pass** — it blocks the hook and serializes all servers. — **Gating
+sends on `runtime_config_ack`** — only agents that acknowledge benefit, the
+acknowledgement trails by a telemetry sample, and the agent's VRAM writeback
+makes the two ETags diverge. — **A per-connection latest slot for
+`runtime_config`** — it would remove the full-queue residual, but it changes the
+frame path that the log and certificate frames share, for a case that needs a
+2 to 5 s socket stall. — **Skipping the derive when no connection is open** —
+it saves one store read and makes a pass behave differently with and without a
+connection. — **Routing the poll through the serializer** — a poll response and
+a WebSocket frame travel on different channels, so a shared lock orders nothing
+at the agent.
+→ [Agent-Managed Model Runtime
+§8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache),
+[§9](cross-cutting/agent-runtime-manager.md#9-keeping-the-agent-current-the-notification-rule),
+[Risks & Technical Debt
+§11.1](11-risks-and-technical-debt.md#111-operational-risks).

@@ -473,12 +473,13 @@ const de = {
     '„{model}“ wird durch den Upstream-Modellnamen ersetzt (nur geladene Modelle).',
   applicationContextProbeNote:
     'Optional. Endpoint für die Kontextgröße (llama.cpp „/props“). Leer = aus.',
-  // server_agent: die drei gateway-seitigen Sonden sind für diesen Typ
-  // sinnlos (der Agent erkennt geladene Modelle und misst den Kontext
-  // selbst, über die Runtime-Spec der Zuordnung) -- die Felder werden
-  // deaktiviert und dieser Hinweis erklärt, warum.
+  // server_agent: Das Gateway leitet die Werte der drei Sondenfelder selbst
+  // ab, den Ladezustand aus /running des Agent-Routers und die Kontextgröße
+  // je Modell über /upstream/{model}/props oder die Telemetrie des Agents.
+  // Die Felder bleiben deaktiviert und werden beim Speichern geleert; dieser
+  // Hinweis sagt, woher die Werte stattdessen kommen.
   applicationProbeFieldsDisabledNote:
-    'Bei server_agent-Anwendungen übernimmt der Agent Modell-Erkennung und Kontext-Messung selbst (siehe die Runtime-Spezifikation der jeweiligen Zuordnung) – dieses Feld wird hier nicht verwendet und beim Speichern geleert.',
+    'Bei server_agent-Anwendungen leitet das Gateway Ladezustand und Kontextgröße selbst ab: den Ladezustand aus /running des Agent-Routers, die Kontextgröße je Modell aus dessen Runtime-Spezifikation (über /upstream/{model}/props oder die Telemetrie des Agents). Dieses Feld ist hier gesperrt und wird beim Speichern geleert.',
   applicationPathSuffixLabel: 'App-Pfad-Erweiterung',
   applicationApiTokenLabel: 'API-Token',
   applicationApiTokenNote:
@@ -1139,6 +1140,7 @@ const de = {
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
+  benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
   benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
   // agent-gesteuerte Modell auf dem Server anhält, genau eines lädt und eine
@@ -1165,11 +1167,23 @@ const de = {
     'Der Lauf hat die Messphase nicht erreicht: es wurde nichts angehalten und nichts gemessen.',
   benchmarkVramDrained: 'Angehaltene Launch-Specs',
   benchmarkVramDrainedNote:
-    'Diese Specs wurden für die Messung auf force_stopped gesetzt und danach wiederhergestellt. Stirbt der Gateway zwischen Anhalten und Wiederherstellen, bleiben sie angehalten, bis der Override von Hand entfernt wird.',
+    'Diese Specs wurden für die Messung auf force_stopped gesetzt (oder der Lauf hat es versucht) und danach wiederhergestellt. Stirbt der Gateway zwischen Anhalten und Wiederherstellen, bleiben die angehaltenen Specs angehalten, bis der Gateway wieder startet: Dann entfernt er die Overrides selbst.',
+  // Ein manueller Geschwindigkeits- oder Beide-Lauf mit einem server_agent-Ziel
+  // hebt für seine Dauer jedes Pinning dieser Anwendung auf und hält vor der
+  // Messung jedes Agent-Ziels die laufenden Modelle an. Diese Hinweise nennen
+  // die betroffenen Specs, im Lauf und danach.
+  benchmarkUnpinnedDuringRun:
+    'Diese Runtime-Spezifikationen sind für diesen Lauf vorübergehend nicht gepinnt (oder sind es möglicherweise) und werden danach wieder gepinnt:',
+  benchmarkUnpinnedAfterRun:
+    'Diese Runtime-Spezifikationen waren für den Lauf nicht gepinnt und sind wieder gepinnt, außer während des Laufs gelöschte und solche, deren Anwendung nicht mehr server_agent ist:',
+  benchmarkRepinFailed:
+    'Diese Runtime-Spezifikationen sind nach dem Lauf möglicherweise noch nicht wieder gepinnt. Prüfen Sie sie im Runtime-Bereich und pinnen Sie sie dort bei Bedarf von Hand:',
+  benchmarkStoppedForMeasurement:
+    'Diese Runtime-Spezifikationen hat der Lauf vor einer Messung gestoppt (oder es versucht). Gepinnte starten nach dem Lauf wieder, alle anderen bei ihrer nächsten Anfrage:',
   benchmarkVramRestoreFailed:
-    'Diese Specs stehen weiterhin auf force_stopped und müssen von Hand zurückgesetzt werden.',
+    'Diese Specs stehen möglicherweise weiterhin auf force_stopped und müssen dann von Hand zurückgesetzt werden. Der Gateway versucht es außerdem bei seinem nächsten Start erneut.',
   benchmarkVramRestoreTakenOver:
-    'Bei diesen Specs wurde der Override während des Laufs von außen geändert – jemand hat das Modell gestartet oder den Override entfernt. Der Lauf hat sie deshalb unberührt gelassen: sie stehen NICHT auf force_stopped, und es gibt nichts von Hand zurückzusetzen. Prüfen Sie nur, ob der jetzt gesetzte Override der gewünschte ist.',
+    'Bei diesen Specs hat die Wiederherstellung das force_stopped des Laufs nicht vorgefunden und sie deshalb unberührt gelassen: Entweder haben die eigenen Schreibzugriffe des Laufs das Anhalten für sie nie gespeichert oder schon wieder aufgehoben, oder ein Schreibzugriff, den der Lauf nicht sperren kann, hat den Override während des Laufs geändert – ein anderer Gateway-Prozess auf derselben Datenbank oder eine Änderung, die genau beim Start des Laufs gespeichert wurde. Sie standen bei der Wiederherstellung NICHT auf force_stopped, und es gibt nichts von Hand zurückzusetzen. Prüfen Sie nur, ob der jetzt gesetzte Override der gewünschte ist.',
   benchmarkVramWarnings: 'Einschränkungen',
   benchmarkVramWarningNonManaged:
     'Dieser Server betreibt außerdem aktive Anwendungen, die der Agent nicht anhalten kann. Solange deren Verbrauch konstant bleibt, fällt er aus der Differenz heraus; ändert er sich während der Messung, ist die Zahl unzuverlässig.',
@@ -1178,7 +1192,7 @@ const de = {
   benchmarkVramWarningUndeclaredGpu:
     'Das Modell hat auch auf einer GPU Speicher belegt, die diese Launch-Spec nicht deklariert – ohne set_visible_devices sieht der Prozess alle Karten. Die Zahlen je Karte sind korrekt, aber die Spec beschreibt das Modell unvollständig: legen Sie die fehlende GPU-Zeile an und messen Sie erneut.',
   benchmarkVramWarningResidencyUnknown:
-    'Der Lauf konnte nicht prüfen, ob das Modell schon von etwas anderem bedient wird: dieser Anwendung fehlt ein Endpunkt für geladene Modelle (loaded_models_path), oder die Abfrage schlug fehl. Eine dadurch unentdeckte Fremdbelegung erscheint als zu kleine Differenz – hinterlegen Sie den Endpunkt, wenn Sie diese Prüfung brauchen.',
+    'Der Lauf konnte nicht prüfen, ob der eigene Prozess dieses Modells schon wieder lief, bevor der Lauf es geladen hat: Die Liste der laufenden Modelle beim Agenten (/running oder ein über die API gesetzter loaded_models_path) ließ sich nicht abfragen. Die Basis wurde gemessen, während alle Modelle des Agenten angehalten waren; die Zahl enthält diesen Prozess also in jedem Fall. Lief er schon, hat ihn eine Anfrage direkt an den Agenten oder der Pin des Modells gestartet, und eine solche Anfrage kann die Messung beeinflusst haben. Stellen Sie sicher, dass sonst nichts Anfragen an dieses Modell sendet, und messen Sie im Zweifel erneut.',
   benchmarkVramWarningFirstGenerationNotMeasured:
     'Das Modell erzeugt nur Bilder und wurde deshalb gestartet, ohne etwas zu generieren. Speicher, den der Server erst bei der ersten Generierung belegt, fehlt in dieser Zahl – sie kann zu niedrig sein.',
   benchmarkVramWarningUnknown: 'Eine Einschränkung, die dieser Portal-Build nicht kennt.',
@@ -1203,7 +1217,7 @@ const de = {
   benchmarkVramInconclusivePostLoadUnstable:
     'Nach dem Laden war der VRAM-Verbrauch nicht stabil: während der Messung hat sich etwas anderes verändert. Messen Sie erneut, wenn der Server ruhig ist.',
   benchmarkVramInconclusiveAlreadyResident:
-    'Das Modell wurde trotz nachgewiesener Isolation weiterhin als geladen gemeldet: etwas, das der Gateway nicht anhalten kann, bedient es – meist eine nicht verwaltete Anwendung auf demselben Host. Beenden Sie diesen Prozess und messen Sie erneut.',
+    'Nachdem der Lauf alle Modelle angehalten und den Override dieses Modells aufgehoben hatte, meldete der Agent den eigenen Prozess dieses Modells wieder als laufend, bevor der Lauf es geladen hat – gestartet durch eine Anfrage direkt an den Agenten oder durch den Pin des Modells. Der Lauf hat es nicht selbst geladen und meldet deshalb keine Zahl. Stellen Sie sicher, dass sonst nichts Anfragen an dieses Modell sendet, und messen Sie erneut.',
   benchmarkVramInconclusiveBelowFloor:
     'Die gemessene Differenz liegt unterhalb des Rauschens. Kein Modell kostet ~0 MB, die Zahl wäre also falsch: messen Sie erneut, wenn der Server ruhig ist.',
   benchmarkVramInconclusiveNoSamples:
@@ -2979,12 +2993,13 @@ const en: PortalMessages = {
     '"{model}" is replaced with the upstream model name (loaded models only).',
   applicationContextProbeNote:
     'Optional. Endpoint for context size (llama.cpp "/props"). Empty = off.',
-  // server_agent: the three gateway-side probes are meaningless for this
-  // type (the agent detects loaded models and measures context itself, over
-  // the mapping's own runtime spec) -- the fields are disabled and this note
-  // says why.
+  // server_agent: the gateway derives the values of the three probe fields
+  // itself, the loaded state from the agent router's /running and the
+  // context size per model through /upstream/{model}/props or the agent's
+  // telemetry. The fields stay disabled and are cleared on save; this note
+  // says where the values come from instead.
   applicationProbeFieldsDisabledNote:
-    "For server_agent applications the agent handles model discovery and context measurement itself (see the mapping's own runtime spec) — this field is unused here and cleared on save.",
+    "For server_agent applications the gateway derives loaded state and context size itself: loaded state from the agent router's /running, context size per model from its runtime spec (through /upstream/{model}/props or the agent's telemetry). This field is locked here and cleared on save.",
   applicationPathSuffixLabel: 'App path suffix',
   applicationApiTokenLabel: 'API token',
   applicationApiTokenNote:
@@ -3601,6 +3616,7 @@ const en: PortalMessages = {
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
+  benchmarkResultLoadTimeNotMeasured: 'load time not measured',
   benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
   // UNKNOWN in this feature, and every "no result" names the operator's next
@@ -3623,10 +3639,23 @@ const en: PortalMessages = {
     'The run never reached the measurement phase: nothing was stopped and nothing was measured.',
   benchmarkVramDrained: 'Force-stopped launch specs',
   benchmarkVramDrainedNote:
-    'These specs were set to force_stopped for the measurement and restored afterwards. If the gateway dies between the drain and the restore they stay stopped until someone clears the override by hand.',
-  benchmarkVramRestoreFailed: 'These specs are still force_stopped and have to be cleared by hand.',
+    'These specs were set to force_stopped for the measurement (or the run tried to) and restored afterwards. If the gateway dies between the drain and the restore, the stopped ones stay stopped until the gateway starts again, which then clears the overrides itself.',
+  // See the German block: a manual speed or both run with a server_agent
+  // target lifts every pin of that application for its duration and stops the
+  // running models before each agent target's measurement. These notices name
+  // the specs concerned, during and after it.
+  benchmarkUnpinnedDuringRun:
+    'These runtime specs are unpinned for this run only (or may be) and are pinned again when it ends:',
+  benchmarkUnpinnedAfterRun:
+    'These runtime specs were unpinned for the run and are pinned again, except any deleted during the run or whose application is no longer server_agent:',
+  benchmarkRepinFailed:
+    'These runtime specs may still be unpinned after the run. Check them in the runtime section and pin them by hand where needed:',
+  benchmarkStoppedForMeasurement:
+    'The run stopped these runtime specs before a measurement (or tried to). Pinned ones start again after the run, all others on their next request:',
+  benchmarkVramRestoreFailed:
+    'These specs may still be force_stopped, and those that are have to be cleared by hand. The gateway also retries at its next start.',
   benchmarkVramRestoreTakenOver:
-    'Somebody changed the override on these specs during the run — the model was started, or the override cleared. The run left them alone: they are NOT force_stopped and there is nothing to clear by hand. Just check that the override now set on them is the one you want.',
+    "The restore did not find the run's force_stopped on these specs and left them alone: either the run's own writes never stored the stop for them or already cleared it, or a write the run cannot block changed the override during the run — another gateway process on the same database, or a change saved just as the run started. They were NOT force_stopped at the restore, and there is nothing to clear by hand. Just check that the override now set on them is the one you want.",
   benchmarkVramWarnings: 'Caveats',
   benchmarkVramWarningNonManaged:
     'This server also hosts active applications the agent cannot stop. As long as their usage stays constant it cancels out of the delta; if it changes during the measurement the number is unreliable.',
@@ -3635,7 +3664,7 @@ const en: PortalMessages = {
   benchmarkVramWarningUndeclaredGpu:
     'The model also allocated on a GPU this launch spec does not declare — without set_visible_devices the process sees every card. The per-card numbers are correct, but the spec describes the model incompletely: add the missing GPU row, then measure again.',
   benchmarkVramWarningResidencyUnknown:
-    'The run could not check whether something else is already serving this model: this application has no loaded-models endpoint (loaded_models_path), or the probe failed. A contamination missed that way shows up as a too-small delta instead — configure the endpoint if you need that check.',
+    "The run could not check whether this model's own process was already running again before the run loaded it: the agent's list of running models (/running, or a loaded_models_path set on the application through the API) could not be read. The baseline was taken while every model on the agent was stopped, so the number includes this process either way. If it was already running, a request sent straight to the agent or the model's own pin started it, and such a request may have influenced the measurement. Make sure nothing else sends requests to this model, and measure again if in doubt.",
   benchmarkVramWarningFirstGenerationNotMeasured:
     'The model serves images only, so it was started without generating anything. Memory the server allocates only on its first generation is missing from this number, which can be too low.',
   benchmarkVramWarningUnknown: 'A caveat this portal build does not know.',
@@ -3660,7 +3689,7 @@ const en: PortalMessages = {
   benchmarkVramInconclusivePostLoadUnstable:
     'VRAM usage was not stable after the load: something else changed during the measurement. Measure again once the server is quiet.',
   benchmarkVramInconclusiveAlreadyResident:
-    'The model still reported as loaded even though the isolation was proven, so something this gateway cannot stop is serving it — most likely a non-managed application on the same host. Stop that process, then measure again.',
+    "After the run had stopped every model and cleared this model's override, the agent reported the model's own process running again before the run loaded it — started by a request sent straight to the agent, or by the model's pin. The run did not load it itself, so it reports no number. Make sure nothing else sends requests to this model, then measure again.",
   benchmarkVramInconclusiveBelowFloor:
     'The measured delta is below the noise floor. No model costs ~0 MB, so the number would be wrong: measure again once the server is quiet.',
   benchmarkVramInconclusiveNoSamples:

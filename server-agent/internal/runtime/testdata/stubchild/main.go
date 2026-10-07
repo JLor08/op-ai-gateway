@@ -6,9 +6,10 @@
 // endpoint, echoes /v1/echo request bodies, writes two flushed chunks with a
 // configurable gap at /v1/chunked (proving/exercising no-buffering and
 // verbatim-splice behavior in the router), returns a fixed non-2xx status at
-// /v1/fail, and supports a configurable startup delay and a scripted crash
-// -- just enough real exec/health-poll/exit-code/streaming surface to drive
-// the process manager's and router's tests without a real model runtime.
+// /v1/fail, and supports a configurable startup delay, a health gate the
+// test opens by creating a file, and a scripted crash -- just enough real
+// exec/health-poll/exit-code/streaming surface to drive the process
+// manager's and router's tests without a real model runtime.
 //
 // Never part of the module's production build: "testdata" directories are
 // excluded from `go build ./...`, `go vet ./...`, and internal/archtest's
@@ -40,6 +41,7 @@ func main() {
 	cwdLog := flag.String("cwd-log", "", "if set, write this process's ACTUAL working directory (os.Getwd) -- the only way to observe from the parent's test where the manager launched the child, which is what proves R2's empty-work_dir default (cmd.Dir = the binary's own directory)")
 	requestLog := flag.String("request-log", "", "if set, append one line \"<METHOD> <PATH>\" per HTTP request this process receives, before answering it -- proves from the child's side which requests reached it, independent of the router's and the manager's own bookkeeping")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
+	healthGate := flag.String("health-gate", "", "if set, /health answers 503 until this file exists (and -health-delay has passed) -- lets a test hold a child in starting for exactly as long as it needs, and end the load at a moment it chooses, instead of guessing a delay")
 	flag.Parse()
 
 	// -ignore-sigterm exists so a test can observe manager state while a
@@ -101,7 +103,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if time.Since(start) < *healthDelay {
+		if time.Since(start) < *healthDelay || !healthGateOpen(*healthGate) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -179,6 +181,16 @@ func main() {
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("stubchild: listen %s: %v", addr, err)
 	}
+}
+
+// healthGateOpen reports whether -health-gate lets /health answer 200: always
+// without a gate, and once the gate file exists with one.
+func healthGateOpen(gate string) bool {
+	if gate == "" {
+		return true
+	}
+	_, err := os.Stat(gate)
+	return err == nil
 }
 
 // logRequests appends "<METHOD> <PATH>" to path for every request before next

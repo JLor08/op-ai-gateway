@@ -20,6 +20,7 @@ import (
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/sample"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -1021,9 +1022,8 @@ func TestCollectOnceCarriesProxyRoutes(t *testing.T) {
 }
 
 // fakeRuntimeDriver is a runtimeDriver test double: it counts Sync calls,
-// records the last pushed payload, can optionally block a Sync call until
-// the test releases it (proving single-flight coalescing, mirroring
-// fakeCertSyncer exactly), and returns a configurable Status slice. It also
+// records the last pushed payload, and returns a configurable Status slice
+// (steppedRuntimeDriver below is the one that holds a Sync open). It also
 // satisfies runtimeTransitionsWaker via its own trans channel field, which
 // NewFromDeps discovers via a type assertion exactly like Deps.Poster's
 // certWaker/trustWaker.
@@ -1032,8 +1032,6 @@ type fakeRuntimeDriver struct {
 	calls       int
 	lastPushed  json.RawMessage
 	statuses    []runtimectl.Status
-	block       bool
-	release     chan struct{}
 	trans       chan struct{}
 	active      atomic.Bool // fix round 1, I3: defaults to false, matching the real Driver's honest "not yet negotiated" zero value
 	resendCalls int
@@ -1041,18 +1039,14 @@ type fakeRuntimeDriver struct {
 }
 
 func newFakeRuntimeDriver() *fakeRuntimeDriver {
-	return &fakeRuntimeDriver{release: make(chan struct{})}
+	return &fakeRuntimeDriver{}
 }
 
 func (f *fakeRuntimeDriver) Sync(_ context.Context, pushed json.RawMessage) {
 	f.mu.Lock()
 	f.calls++
 	f.lastPushed = pushed
-	block := f.block
 	f.mu.Unlock()
-	if block {
-		<-f.release
-	}
 }
 
 func (f *fakeRuntimeDriver) Status() []runtimectl.Status {
@@ -1068,14 +1062,6 @@ func (f *fakeRuntimeDriver) setStatuses(s []runtimectl.Status) {
 	f.statuses = s
 	f.mu.Unlock()
 }
-
-func (f *fakeRuntimeDriver) setBlocking(b bool) {
-	f.mu.Lock()
-	f.block = b
-	f.mu.Unlock()
-}
-
-func (f *fakeRuntimeDriver) unblock() { close(f.release) }
 
 func (f *fakeRuntimeDriver) count() int {
 	f.mu.Lock()
@@ -1374,33 +1360,484 @@ func TestRuntimeWakePassesPushedPayloadToSync(t *testing.T) {
 	<-done
 }
 
-// TestTriggerRuntimeSyncCoalescesConcurrentSignals mirrors
-// TestTriggerCertSyncCoalescesConcurrentSignals verbatim, for
-// triggerRuntimeSync's own single-flight CompareAndSwap.
-func TestTriggerRuntimeSyncCoalescesConcurrentSignals(t *testing.T) {
-	drv := newFakeRuntimeDriver()
-	drv.setBlocking(true)
-	a := &Agent{cfg: config.Config{}, runtimeDriver: drv}
+// steppedRuntimeDriver is a runtimeDriver whose every Sync announces its
+// payload on entered and then waits for one value on proceed, so a test
+// decides exactly when each sync ends. It records every payload in call
+// order and the highest number of Syncs that ever ran at once.
+type steppedRuntimeDriver struct {
+	entered chan json.RawMessage
+	proceed chan struct{}
 
-	a.triggerRuntimeSync(context.Background(), nil)
-	// Deterministic, not a race: runtimeSyncing is set synchronously by
-	// CompareAndSwap inside the first call, strictly before it spawns its
-	// goroutine, and no goroutine scheduling occurs between these two
-	// sequential calls on this single test goroutine.
-	a.triggerRuntimeSync(context.Background(), nil)
+	mu          sync.Mutex
+	pushes      []string
+	inFlight    int
+	maxInFlight int
+}
 
-	waitUntil(t, time.Second, func() bool { return drv.count() >= 1 })
-	time.Sleep(30 * time.Millisecond)
-	if got := drv.count(); got != 1 {
-		t.Fatalf("Sync call count while blocked = %d, want exactly 1 (both signals must coalesce into one in-flight sync)", got)
+func newSteppedRuntimeDriver() *steppedRuntimeDriver {
+	return &steppedRuntimeDriver{entered: make(chan json.RawMessage), proceed: make(chan struct{})}
+}
+
+func (d *steppedRuntimeDriver) Sync(_ context.Context, pushed json.RawMessage) {
+	d.mu.Lock()
+	d.inFlight++
+	d.maxInFlight = max(d.maxInFlight, d.inFlight)
+	d.pushes = append(d.pushes, string(pushed))
+	d.mu.Unlock()
+	d.entered <- pushed
+	<-d.proceed
+	d.mu.Lock()
+	d.inFlight--
+	d.mu.Unlock()
+}
+
+func (d *steppedRuntimeDriver) Status() []runtimectl.Status { return nil }
+func (d *steppedRuntimeDriver) Active() bool                { return false }
+
+// expectSync waits for the next Sync to start and fails unless it carries want
+// ("" for a nil payload, the "resync over HTTP" wake).
+func (d *steppedRuntimeDriver) expectSync(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-d.entered:
+		if string(got) != want {
+			t.Fatalf("Sync started with payload %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no Sync started; want one with payload %q", want)
+	}
+}
+
+// finish ends the Sync that expectSync last saw start.
+func (d *steppedRuntimeDriver) finish(t *testing.T) {
+	t.Helper()
+	select {
+	case d.proceed <- struct{}{}:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no Sync was waiting to finish")
+	}
+}
+
+func (d *steppedRuntimeDriver) record() (pushes []string, maxInFlight int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.pushes...), d.maxInFlight
+}
+
+// runtimeSyncIdle reports whether no runtime sync runs and none is owed: once
+// it holds, no goroutine is left that could start another Sync.
+func runtimeSyncIdle(a *Agent) bool {
+	a.runtimeSync.mu.Lock()
+	defer a.runtimeSync.mu.Unlock()
+	return !a.runtimeSync.running && !a.runtimeSync.owed
+}
+
+// TestTriggerRuntimeSyncOwesOneSyncToWakesDuringASync pins the trailing sync:
+// wakes that arrive while a sync runs are not dropped but coalesce into
+// exactly one more sync, with the payload of the last of them; a wake during
+// that trailing sync owes one of its own; and no two Syncs ever overlap.
+// Until 0.8.1 the second and later wakes were simply dropped, and the agent
+// rested on the older document until the next push or the 60 s poll.
+func TestTriggerRuntimeSyncOwesOneSyncToWakesDuringASync(t *testing.T) {
+	drv := newSteppedRuntimeDriver()
+	a := &Agent{runtimeDriver: drv}
+	ctx := context.Background()
+
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d1"}`))
+	drv.expectSync(t, `{"etag":"d1"}`)
+	// Three wakes during d1's sync, the poll ticker's nil among them. They
+	// are recorded synchronously, on this goroutine, so this is not a race.
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d2"}`))
+	a.triggerRuntimeSync(ctx, nil)
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d3"}`))
+	a.runtimeSync.mu.Lock()
+	running, owed, next := a.runtimeSync.running, a.runtimeSync.owed, string(a.runtimeSync.next)
+	a.runtimeSync.mu.Unlock()
+	if !running || !owed || next != `{"etag":"d3"}` {
+		t.Fatalf("after three wakes during a sync: running=%v owed=%v next=%q, want true true {\"etag\":\"d3\"} (owed to the running sync, latest wins)", running, owed, next)
 	}
 
-	drv.unblock()
-	waitUntil(t, time.Second, func() bool { return !a.runtimeSyncing.Load() })
+	drv.finish(t)
+	drv.expectSync(t, `{"etag":"d3"}`) // one trailing sync, with the latest wake
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d4"}`))
+	drv.finish(t)
+	drv.expectSync(t, `{"etag":"d4"}`) // the trailing sync owed its own wake one more
+	drv.finish(t)
+	waitUntil(t, time.Second, func() bool { return runtimeSyncIdle(a) })
 
-	drv.setBlocking(false)
-	a.triggerRuntimeSync(context.Background(), nil)
-	waitUntil(t, time.Second, func() bool { return drv.count() == 2 })
+	pushes, maxInFlight := drv.record()
+	if want := []string{`{"etag":"d1"}`, `{"etag":"d3"}`, `{"etag":"d4"}`}; !reflect.DeepEqual(pushes, want) {
+		t.Fatalf("Sync payloads = %q, want %q", pushes, want)
+	}
+	if maxInFlight != 1 {
+		t.Fatalf("%d Syncs ran at once, want at most 1", maxInFlight)
+	}
+
+	// Nothing is stuck: a later wake starts a fresh sync of its own.
+	a.triggerRuntimeSync(ctx, nil)
+	drv.expectSync(t, "")
+	drv.finish(t)
+	waitUntil(t, time.Second, func() bool { return runtimeSyncIdle(a) })
+}
+
+// TestTriggerRuntimeSyncTrailingSyncKeepsALateNil pins the other half of
+// latest-wins: a nil that arrives after a pushed document during a sync (a
+// reconnect, which may have missed pushes, or the poll ticker) makes the
+// trailing sync resync over HTTP rather than apply the earlier document.
+func TestTriggerRuntimeSyncTrailingSyncKeepsALateNil(t *testing.T) {
+	drv := newSteppedRuntimeDriver()
+	a := &Agent{runtimeDriver: drv}
+	ctx := context.Background()
+
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d1"}`))
+	drv.expectSync(t, `{"etag":"d1"}`)
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d2"}`))
+	a.triggerRuntimeSync(ctx, nil)
+	drv.finish(t)
+	drv.expectSync(t, "")
+	drv.finish(t)
+	waitUntil(t, time.Second, func() bool { return runtimeSyncIdle(a) })
+
+	if pushes, _ := drv.record(); !reflect.DeepEqual(pushes, []string{`{"etag":"d1"}`, ""}) {
+		t.Fatalf("Sync payloads = %q, want [d1, nil]", pushes)
+	}
+}
+
+// TestTriggerRuntimeSyncRunsNoTrailingSyncAfterCancel: once Run's context is
+// cancelled the agent is shutting down, and a wake still owed is not run.
+func TestTriggerRuntimeSyncRunsNoTrailingSyncAfterCancel(t *testing.T) {
+	drv := newSteppedRuntimeDriver()
+	a := &Agent{runtimeDriver: drv}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d1"}`))
+	drv.expectSync(t, `{"etag":"d1"}`)
+	a.triggerRuntimeSync(ctx, json.RawMessage(`{"etag":"d2"}`))
+	cancel()
+	drv.finish(t)
+	waitUntil(t, time.Second, func() bool { return runtimeSyncIdle(a) })
+
+	if pushes, _ := drv.record(); !reflect.DeepEqual(pushes, []string{`{"etag":"d1"}`}) {
+		t.Fatalf("Sync payloads = %q, want only d1 (no trailing sync after cancel)", pushes)
+	}
+}
+
+// TestTriggerRuntimeSyncEndsOnTheLastWakeUnderABurst hammers the trigger
+// while syncs run on their own goroutine, with scheduling jitter and no
+// blocking. First one producer, Run's own shape: whatever the interleaving,
+// the last Sync carries the last wake, Syncs never overlap, and they apply
+// the wakes in order. Then four producers at once, which only contend the
+// lock harder: a final wake after they stop must still be the last Sync. A
+// release of "running" outside the critical section that finds nothing owed
+// -- a wake landing between the two is recorded as owed with no goroutine
+// left to run it -- fails it only by chance, because no single interleaving
+// can force a wake into that window;
+// TestTriggerRuntimeSyncEndsOnTheLaterOfTwoOrderedWakes aims one at it in
+// every round.
+func TestTriggerRuntimeSyncEndsOnTheLastWakeUnderABurst(t *testing.T) {
+	const n = 500
+	for round := 0; round < 20; round++ {
+		drv := &orderedRuntimeDriver{}
+		a := &Agent{runtimeDriver: drv}
+		ctx := context.Background()
+		for i := 1; i <= n; i++ {
+			a.triggerRuntimeSync(ctx, json.RawMessage(strconv.Itoa(i)))
+			if i%3 == 0 {
+				runtime.Gosched()
+			}
+		}
+		waitUntil(t, 2*time.Second, func() bool { return runtimeSyncIdle(a) })
+		last, maxInFlight, ordered := drv.result()
+		if last != n || maxInFlight != 1 || !ordered {
+			t.Fatalf("one producer, round %d: last Sync payload %d (want %d), %d Syncs at once (want 1), in order %v", round, last, n, maxInFlight, ordered)
+		}
+	}
+	for round := 0; round < 20; round++ {
+		drv := &orderedRuntimeDriver{}
+		a := &Agent{runtimeDriver: drv}
+		ctx := context.Background()
+		// A wake is owed only to a running sync: owed without running is
+		// a wake nobody will run. A watcher checks that throughout.
+		var orphaned atomic.Bool
+		stop := make(chan struct{})
+		watched := make(chan struct{})
+		go func() {
+			defer close(watched)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				a.runtimeSync.mu.Lock()
+				if a.runtimeSync.owed && !a.runtimeSync.running {
+					orphaned.Store(true)
+				}
+				a.runtimeSync.mu.Unlock()
+				runtime.Gosched()
+			}
+		}()
+		var wg sync.WaitGroup
+		for p := 0; p < 4; p++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 1; i <= n; i++ {
+					a.triggerRuntimeSync(ctx, json.RawMessage(strconv.Itoa(i)))
+					runtime.Gosched()
+				}
+			}()
+		}
+		wg.Wait()
+		a.triggerRuntimeSync(ctx, json.RawMessage(strconv.Itoa(n+1)))
+		waitUntil(t, 2*time.Second, func() bool { return runtimeSyncIdle(a) })
+		close(stop)
+		<-watched
+		if orphaned.Load() {
+			t.Fatalf("four producers, round %d: a wake was owed while no sync ran", round)
+		}
+		if last, maxInFlight, _ := drv.result(); last != n+1 || maxInFlight != 1 {
+			t.Fatalf("four producers, round %d: last Sync payload %d (want the final wake %d), %d Syncs at once (want 1)", round, last, n+1, maxInFlight)
+		}
+	}
+}
+
+// TestTriggerRuntimeSyncEndsOnTheLaterOfTwoOrderedWakes aims a second wake at
+// the end of the sync the first one started, round after round: one producer
+// sends two wakes in order, yielding between them on every other round, while
+// four goroutines contend the lock and check that a wake is never owed while
+// no sync runs. Each round must end on the second wake. A runRuntimeSyncs that
+// finds nothing owed and clears running in two critical sections fails it
+// whenever a wake lands between the two, which no single round can force; over
+// all its rounds, on a machine with more than one CPU, one nearly always does.
+func TestTriggerRuntimeSyncEndsOnTheLaterOfTwoOrderedWakes(t *testing.T) {
+	const rounds = 20000
+	drv := &orderedRuntimeDriver{}
+	a := &Agent{runtimeDriver: drv}
+	ctx := context.Background()
+	var orphaned atomic.Bool
+	stop := make(chan struct{})
+	var contenders sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		contenders.Add(1)
+		go func() {
+			defer contenders.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				a.runtimeSync.mu.Lock()
+				if a.runtimeSync.owed && !a.runtimeSync.running {
+					orphaned.Store(true)
+				}
+				a.runtimeSync.mu.Unlock()
+				runtime.Gosched()
+			}
+		}()
+	}
+	defer func() { close(stop); contenders.Wait() }()
+	for r := 1; r <= rounds; r++ {
+		a.triggerRuntimeSync(ctx, json.RawMessage(strconv.Itoa(2*r-1)))
+		if r%2 == 0 {
+			runtime.Gosched()
+		}
+		a.triggerRuntimeSync(ctx, json.RawMessage(strconv.Itoa(2*r)))
+		deadline := time.Now().Add(2 * time.Second)
+		for !runtimeSyncIdle(a) {
+			if orphaned.Load() {
+				t.Fatalf("round %d: a wake was owed while no sync ran", r)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: the sync chain never ended", r)
+			}
+			runtime.Gosched()
+		}
+		if last, maxInFlight, _ := drv.result(); last != 2*r || maxInFlight != 1 {
+			t.Fatalf("round %d: last Sync payload %d (want the second wake %d), %d Syncs at once (want 1)", r, last, 2*r, maxInFlight)
+		}
+	}
+}
+
+// orderedRuntimeDriver is a non-blocking runtimeDriver for the burst tests: it
+// yields inside every Sync, and records the last payload, whether payloads
+// only ever increased, and the most Syncs that ran at once.
+type orderedRuntimeDriver struct {
+	mu          sync.Mutex
+	last        int
+	ordered     bool
+	started     bool
+	inFlight    int
+	maxInFlight int
+}
+
+func (d *orderedRuntimeDriver) Sync(_ context.Context, pushed json.RawMessage) {
+	n, _ := strconv.Atoi(string(pushed))
+	d.mu.Lock()
+	d.inFlight++
+	d.maxInFlight = max(d.maxInFlight, d.inFlight)
+	if !d.started {
+		d.started, d.ordered = true, true
+	} else if n <= d.last {
+		d.ordered = false
+	}
+	d.last = n
+	d.mu.Unlock()
+	runtime.Gosched()
+	d.mu.Lock()
+	d.inFlight--
+	d.mu.Unlock()
+}
+
+func (d *orderedRuntimeDriver) Status() []runtimectl.Status { return nil }
+func (d *orderedRuntimeDriver) Active() bool                { return false }
+
+func (d *orderedRuntimeDriver) result() (last, maxInFlight int, ordered bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.last, d.maxInFlight, d.ordered
+}
+
+// runtimeAndCertWakePoster delivers runtime-config wakes and, on a second
+// channel, certificate wakes. With both channels unbuffered and no certSync,
+// a certificate wake is a no-op case of Run's select whose send returns only
+// once Run is back in that select -- a barrier proving Run has finished
+// handling the runtime wake it received before.
+type runtimeAndCertWakePoster struct {
+	capturePoster
+	wake chan json.RawMessage
+	cert chan struct{}
+}
+
+func (p *runtimeAndCertWakePoster) RuntimeUpdates() <-chan json.RawMessage { return p.wake }
+func (p *runtimeAndCertWakePoster) CertUpdates() <-chan struct{}           { return p.cert }
+
+func (p *runtimeAndCertWakePoster) deliver(t *testing.T, doc json.RawMessage) {
+	t.Helper()
+	select {
+	case p.wake <- doc:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run never received the runtime-config wake")
+	}
+}
+
+func (p *runtimeAndCertWakePoster) barrier(t *testing.T) {
+	t.Helper()
+	select {
+	case p.cert <- struct{}{}:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run never came back to its select")
+	}
+}
+
+// TestRuntimeWakeDuringASyncIsSyncedAfterIt is the trailing sync end to end
+// through Run's select loop: a pushed document that arrives while the
+// previous one's sync runs is synced right after it, not left to the poll.
+func TestRuntimeWakeDuringASyncIsSyncedAfterIt(t *testing.T) {
+	poster := &runtimeAndCertWakePoster{wake: make(chan json.RawMessage), cert: make(chan struct{})}
+	drv := newSteppedRuntimeDriver()
+	a := NewFromDeps(config.Config{Interval: time.Hour, SystemReportInterval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	drv.expectSync(t, "") // the startup sync
+	drv.finish(t)
+	poster.deliver(t, json.RawMessage(`{"etag":"d1"}`))
+	drv.expectSync(t, `{"etag":"d1"}`)
+	poster.deliver(t, json.RawMessage(`{"etag":"d2"}`))
+	poster.barrier(t) // Run has handed d2 to triggerRuntimeSync while d1's sync runs
+	drv.finish(t)
+	drv.expectSync(t, `{"etag":"d2"}`)
+	drv.finish(t)
+	waitUntil(t, time.Second, func() bool { return runtimeSyncIdle(a) })
+
+	cancel()
+	<-done
+}
+
+// TestRuntimeWakeDuringASyncEndsOnTheLatestDocument is the defect's own shape
+// against the real Driver, GatewaySource and Manager: two pushed documents
+// closer together than one sync (whose features round trip the fake gateway
+// holds open) must leave the manager on the second. Until 0.8.1 it stayed on
+// the first until the next push or the 60 s poll.
+func TestRuntimeWakeDuringASyncEndsOnTheLatestDocument(t *testing.T) {
+	doc := func(etag, adminState string) json.RawMessage {
+		return json.RawMessage(`{"router_listen":0,"specs":[{"id":"rs_1","model":"m1","upstream_model":"m1","binary":"/not/allowed/server","args":[],"env":{},"gpus":[],"health_path":"/health","admin_state":"` + adminState + `"}],"coresident":[],"gpu_budgets":[],"etag":"` + etag + `"}`)
+	}
+	var hold atomic.Bool
+	var featureFetches atomic.Int64
+	held := make(chan struct{}, 1)
+	release := make(chan struct{})
+	// releaseFeatures ends the hold: the held features round trip answers,
+	// and no later one is held. The test calls it once d2 has reached the
+	// trigger, and a deferred call ends the hold on every other way out, a
+	// t.Fatal included, because gw.Close waits for the handler.
+	releaseFeatures := sync.OnceFunc(func() {
+		hold.Store(false)
+		close(release)
+	})
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/v1/features":
+			featureFetches.Add(1)
+			if hold.Load() {
+				held <- struct{}{}
+				<-release
+			}
+			_, _ = w.Write([]byte(`{"features":["runtime_manager"]}`))
+		case "/api/agent/v1/runtime-config":
+			_, _ = w.Write(doc("doc0", ""))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer gw.Close()
+	m := runtimectl.NewManager(runtimectl.ManagerOptions{Policy: runtimectl.LocalPolicy{}, Getenv: func(string) string { return "" }})
+	defer m.Close()
+	src := runtimectl.NewGatewaySource(gw.URL, "tok", nil, filepath.Join(t.TempDir(), "runtime-cache.json"))
+	drv := runtimectl.NewDriver(m, src, runtimectl.NewFeaturesClient(gw.URL, "tok", nil), nil, "")
+	defer drv.Close()
+	poster := &runtimeAndCertWakePoster{wake: make(chan json.RawMessage), cert: make(chan struct{})}
+	a := NewFromDeps(config.Config{Interval: time.Hour, SystemReportInterval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := a.Run(ctx); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+	defer func() { cancel(); <-done }()
+	// Deferred last, so it runs first: before the deferred cancel waits for
+	// Run, whose sync may be the one held, and before gw.Close.
+	defer releaseFeatures()
+
+	waitUntil(t, 3*time.Second, func() bool { return m.AppliedETag() == "doc0" && runtimeSyncIdle(a) })
+	hold.Store(true)
+	poster.deliver(t, doc("d1", ""))
+	select {
+	case <-held: // d1's sync is in its features round trip
+	case <-time.After(2 * time.Second):
+		t.Fatal("d1's sync never reached the gateway")
+	}
+	poster.deliver(t, doc("d2", "force_stopped"))
+	poster.barrier(t) // d2 reached triggerRuntimeSync during d1's sync
+	releaseFeatures()
+	waitUntil(t, 3*time.Second, func() bool { return runtimeSyncIdle(a) })
+
+	if got := m.AppliedETag(); got != "d2" {
+		t.Fatalf("manager holds %q after two pushes during one sync, want the later d2", got)
+	}
+	if got := featureFetches.Load(); got != 3 {
+		t.Fatalf("features fetches = %d, want 3 (startup, d1, the trailing sync for d2)", got)
+	}
 }
 
 // TestNewRuntimeTickerNilWithoutDriver proves the nil-channel discipline:

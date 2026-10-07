@@ -175,17 +175,17 @@ func (f *ctxDoneSignalingPortal) AgentRuntimeConfig(ctx context.Context, _ strin
 
 // TestPushRuntimeConfigBoundsThePortalReadWithATimeout is the Important-3
 // review fix's covering test: PushRuntimeConfig must never hand
-// s.Portal.AgentRuntimeConfig a context.Background() with no deadline --
-// one goroutine is spawned per portal write, so a stuck store read
-// (lock contention, a wedged query) would otherwise accumulate goroutines
-// without bound under sustained write pressure.
+// s.Portal.AgentRuntimeConfig a context.Background() with no deadline -- a
+// server's push worker runs one pass at a time, so a stuck store read (lock
+// contention, a wedged query) would otherwise hold that worker for good, and
+// every later push for the server would wait behind it.
 //
 // This Server's pushRuntimeConfigTimeout is shrunk to milliseconds so the test
-// does not sleep out the real 5s production budget: if PushRuntimeConfig bounds
-// the call correctly, ctxDoneSignalingPortal's ctx.Done() fires almost
+// does not sleep out the real 5s production budget: if the pass bounds the
+// call correctly, ctxDoneSignalingPortal's ctx.Done() fires almost
 // immediately; if a regression reintroduced context.Background(), ctx.Done()
 // would never fire and this test would time out waiting for `returned`. The
-// timeout is set on the instance, not a shared package var the push goroutine
+// timeout is set on the instance, not a shared package var the push worker
 // also reads, so `go test -race` stays clean (issue #53).
 func TestPushRuntimeConfigBoundsThePortalReadWithATimeout(t *testing.T) {
 	const serverID = "mock-host-qwen"

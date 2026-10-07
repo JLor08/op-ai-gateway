@@ -1534,8 +1534,11 @@ type MappingStore interface {
 	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
 	// UpdateMappingBenchmarkMetrics sets a mapping's measured throughput + load time
 	// from a benchmark run, atomically and ONLY when metrics_locked is false (a no-op,
-	// non-error, when the mapping is missing or locked). Touches only these four
-	// columns + provenance, so it cannot clobber a concurrent edit of other fields.
+	// non-error, when the mapping is missing or locked). A run writes only what it
+	// measured: a value of 0 or below means not measured and keeps the stored column.
+	// A call that measured nothing writes nothing, provenance included. Touches only
+	// these three columns + provenance, so it cannot clobber a concurrent edit of
+	// other fields.
 	UpdateMappingBenchmarkMetrics(ctx context.Context, id string, genTPS, promptTPS float64, loadMS int, at time.Time) error
 	// UpdateMappingOpportunisticMetrics EWMA-updates gen/prompt tok/s from a live sample,
 	// atomically and ONLY when metrics_locked is false (no-op, non-error, when missing or
@@ -1960,7 +1963,8 @@ type RuntimeSpecGPU struct {
 	// (0-based, dense per spec). It is the sole ordering contract: both stores
 	// read the rows `order by position`, and the DTO/wire layers keep the
 	// resulting ARRAY order (no position field crosses the wire). The portal's
-	// putRuntimeSpec sets Position = the index in the received req.GPUs array;
+	// runtime-spec write (runtimeSpecGPURows) sets Position = the index in the
+	// received req.GPUs array;
 	// SetRuntimeSpecGPUs persists it verbatim (it does not renumber).
 	Position       int
 	VRAMEstimateMB int

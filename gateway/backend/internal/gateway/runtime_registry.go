@@ -365,9 +365,10 @@ func (r *runtimeStatusRegistry) publish(serverID string, statuses []RuntimeStatu
 //
 // It is a READ OF STATE, never of an edge, and that distinction is the whole
 // reason it exists: a force_stopped write against a spec with no live process
-// produces no state change and no frame, so nothing downstream can wait for a
-// transition there -- but every spec IS present in every status frame, so its
-// state is readable. The VRAM benchmark's isolation reads this once, before
+// has nothing to drain, and from stopped, not_permitted or pending_vram_unknown
+// it produces no state change and no frame, so nothing downstream can wait for
+// a transition there -- but every spec IS present in every status frame, so
+// its state is readable. The VRAM benchmark's isolation reads this once, before
 // its own write, to learn which specs even HAVE a process to stop.
 func (r *runtimeStatusRegistry) statusSnapshot(serverID string) []RuntimeStatusDTO {
 	if r == nil || serverID == "" {

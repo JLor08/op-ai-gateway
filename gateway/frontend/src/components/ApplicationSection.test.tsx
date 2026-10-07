@@ -602,12 +602,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe('45000');
     });
 
-    // The three gateway-side probe fields (loaded-models path/format,
-    // context-probe path) are the agent's own job for a server_agent
-    // application (its mapping's runtime spec Type + metrics/context-probe
-    // overrides, RuntimeAdminSection) -- disabled here so an operator cannot
-    // set a value that is silently ignored, and cleared on save so a value
-    // left over from an earlier non-agent type never lingers on the row.
+    // For a server_agent application the gateway derives the three probe
+    // values (loaded-models path/format, context-probe path) itself: loaded
+    // state from the agent router's /running, context size per model through
+    // /upstream/{model}/props or the agent's telemetry. The fields are
+    // disabled here, and cleared on save so a value left over from an earlier
+    // non-agent type never takes the place of the derived one.
     it('disables the three probe fields and sends them empty on create when the type is server_agent', async () => {
       const { created } = renderSection();
       openCreate();
@@ -626,6 +626,22 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(created[0].loaded_models_path).toBe('');
       expect(created[0].loaded_models_format).toBe('');
       expect(created[0].context_probe_path).toBe('');
+    });
+
+    // The note under the disabled fields says where the gateway takes the
+    // loaded state and the context size from; it never calls the fields
+    // unused.
+    it('explains in the probe-field note that the gateway derives the values from the agent router', async () => {
+      renderSection();
+      openCreate();
+      await selectType('server_agent');
+
+      const notes = screen.getAllByText(t.applicationProbeFieldsDisabledNote);
+      expect(notes.length).toBeGreaterThan(0);
+      for (const note of notes) {
+        expect(note).toHaveTextContent('/running');
+        expect(note).not.toHaveTextContent(/nicht verwendet|unused/);
+      }
     });
 
     it('disables the probe fields and clears stale values on save when editing a server_agent app', async () => {
