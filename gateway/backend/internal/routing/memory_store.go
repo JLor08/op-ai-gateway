@@ -2782,6 +2782,38 @@ func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) er
 	return nil
 }
 
+// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens + updated_at of an
+// existing account (the narrow dispatch-time refresh writer; see the store
+// interface). An unknown id is ErrNotFound. UpdatedAt is advanced to the store
+// clock so the write is observable, mirroring the SQL driver's updated_at = now.
+func (m *MemoryStore) SetVendorAccountOAuthTokens(_ context.Context, accountID, sealed string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.OAuthTokens = sealed
+	cur.UpdatedAt = time.Now().UTC()
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
+	return nil
+}
+
+// SetVendorAccountStatus writes ONLY the status + updated_at of an existing
+// account (the narrow needs_reconnect writer). An unknown id is ErrNotFound.
+func (m *MemoryStore) SetVendorAccountStatus(_ context.Context, accountID, status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.Status = status
+	cur.UpdatedAt = time.Now().UTC()
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
+	return nil
+}
+
 // VendorAccountByID returns the account or ErrNotFound.
 func (m *MemoryStore) VendorAccountByID(_ context.Context, id string) (VendorAccount, error) {
 	m.mu.RLock()

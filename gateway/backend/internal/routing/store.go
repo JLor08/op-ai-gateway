@@ -2171,6 +2171,18 @@ type RuntimeStore interface {
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
+	// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens column (plus
+	// updated_at) of an existing account. It exists alongside the full-row
+	// UpdateVendorAccount so a dispatch-time token refresh persists the resealed
+	// blob without clobbering a concurrent rename/status change: the two writers
+	// touch disjoint columns. sealed is the already-sealed envelope (enc:/plain:).
+	// An unknown id is ErrNotFound.
+	SetVendorAccountOAuthTokens(ctx context.Context, accountID, sealed string) error
+	// SetVendorAccountStatus writes ONLY the status column (plus updated_at) of an
+	// existing account — the narrow writer the dispatch path uses to flip an
+	// account to needs_reconnect after a refresh rejection, again without
+	// clobbering a concurrent full-row update. An unknown id is ErrNotFound.
+	SetVendorAccountStatus(ctx context.Context, accountID, status string) error
 	VendorAccountByID(ctx context.Context, id string) (VendorAccount, error)
 	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
 	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)

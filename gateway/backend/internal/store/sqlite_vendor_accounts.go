@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"time"
 )
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
@@ -44,6 +45,39 @@ func (s *SQLiteStore) UpdateVendorAccount(ctx context.Context, a routing.VendorA
 		return fmt.Errorf("update vendor account: %w", err)
 	}
 	return requireAffected(result)
+}
+
+// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens + updated_at columns
+// of an existing account. It is the narrow dispatch-time refresh writer: it
+// leaves auth_type, name, status and api_key untouched so a token refresh cannot
+// clobber a concurrent rename or status change (unlike full-row
+// UpdateVendorAccount). sealed is the already-sealed envelope. An unknown id is
+// ErrNotFound.
+func (s *SQLiteStore) SetVendorAccountOAuthTokens(ctx context.Context, accountID, sealed string) error {
+	res, err := s.exec(ctx, `
+		update vendor_accounts
+		set oauth_tokens = ?, updated_at = ?
+		where id = ?`,
+		sealed, time.Now().UTC(), accountID)
+	if err != nil {
+		return fmt.Errorf("set vendor account oauth tokens: %w", err)
+	}
+	return requireAffected(res)
+}
+
+// SetVendorAccountStatus writes ONLY the status + updated_at columns of an
+// existing account — the narrow needs_reconnect writer, touching no credential
+// or identity column. An unknown id is ErrNotFound.
+func (s *SQLiteStore) SetVendorAccountStatus(ctx context.Context, accountID, status string) error {
+	res, err := s.exec(ctx, `
+		update vendor_accounts
+		set status = ?, updated_at = ?
+		where id = ?`,
+		status, time.Now().UTC(), accountID)
+	if err != nil {
+		return fmt.Errorf("set vendor account status: %w", err)
+	}
+	return requireAffected(res)
 }
 
 // VendorAccountByID returns the account or ErrNotFound.

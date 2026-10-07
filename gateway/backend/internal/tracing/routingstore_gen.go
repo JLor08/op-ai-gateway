@@ -1216,6 +1216,30 @@ func (_d *RoutingStoreWithTracing) SetVendorAccountModels(ctx context.Context, a
 	return _d.Store.SetVendorAccountModels(ctx, accountID, models)
 }
 
+func (_d *RoutingStoreWithTracing) SetVendorAccountOAuthTokens(ctx context.Context, accountID string, sealed string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetVendorAccountOAuthTokens")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetVendorAccountOAuthTokens(ctx, accountID, sealed)
+}
+
+func (_d *RoutingStoreWithTracing) SetVendorAccountStatus(ctx context.Context, accountID string, status string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetVendorAccountStatus")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetVendorAccountStatus(ctx, accountID, status)
+}
+
 func (_d *RoutingStoreWithTracing) TelemetryByServer(ctx context.Context, serverID string) (s1 _sourceRouting.ServerTelemetry, b1 bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.TelemetryByServer")
 	defer span.End()
