@@ -72,7 +72,7 @@ func newDispatchCipher(t *testing.T) *capture.Cipher {
 	return cipher
 }
 
-func seedSubscriptionAccount(t *testing.T, store *routing.MemoryStore, cipher *capture.Cipher, id string, ts vendorauth.TokenSet) string {
+func seedSubscriptionAccount(t *testing.T, store *routing.MemoryStore, cipher *capture.Cipher, id, vendor string, ts vendorauth.TokenSet) string {
 	t.Helper()
 	sealed, err := vendorauth.SealTokenSet(cipher, false, ts)
 	if err != nil {
@@ -80,7 +80,7 @@ func seedSubscriptionAccount(t *testing.T, store *routing.MemoryStore, cipher *c
 	}
 	now := time.Now().UTC()
 	if err := store.CreateVendorAccount(context.Background(), routing.VendorAccount{
-		ID: id, OwnerUserID: "u1", Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription,
+		ID: id, OwnerUserID: "u1", Vendor: vendor, AuthType: routing.VendorAuthSubscription,
 		Name: id, Status: routing.VendorAccountStatusActive, OAuthTokens: sealed, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateVendorAccount: %v", err)
@@ -106,7 +106,7 @@ func TestSubscriptionDispatchAttachesBearerHeadersAndMasquerade(t *testing.T) {
 	stub := newAnthropicMessagesStub(t)
 	cipher := newDispatchCipher(t)
 	store := routing.NewMemoryStore()
-	seedSubscriptionAccount(t, store, cipher, "acc_sub", vendorauth.TokenSet{
+	seedSubscriptionAccount(t, store, cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
 		AccessToken: "live-access", RefreshToken: "live-refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "acct-1",
 	})
 	s := &Server{Cipher: cipher, Routes: store}
@@ -155,7 +155,7 @@ func TestSubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
 	stub := newAnthropicMessagesStub(t)
 	cipher := newDispatchCipher(t)
 	store := routing.NewMemoryStore()
-	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub", vendorauth.TokenSet{
+	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
 		AccessToken: "stale-access", RefreshToken: "stale-refresh",
 		ExpiresAt: time.Now().Add(10 * time.Second), // within the 2m buffer => stale
 		AccountID: "acct-7", PlanType: "max",
@@ -224,7 +224,7 @@ func TestSubscriptionDispatchRejectionMarksNeedsReconnect(t *testing.T) {
 	stub := newAnthropicMessagesStub(t)
 	cipher := newDispatchCipher(t)
 	store := routing.NewMemoryStore()
-	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub", vendorauth.TokenSet{
+	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
 		AccessToken: "stale-access", RefreshToken: "dead-refresh",
 		ExpiresAt: time.Now().Add(-time.Second), // expired
 	})
@@ -287,7 +287,7 @@ func TestSubscriptionDispatchRejectionMarksNeedsReconnect(t *testing.T) {
 func TestSubscriptionDispatchConcurrentRefreshSingleFlights(t *testing.T) {
 	cipher := newDispatchCipher(t)
 	store := routing.NewMemoryStore()
-	seedSubscriptionAccount(t, store, cipher, "acc_sub", vendorauth.TokenSet{
+	seedSubscriptionAccount(t, store, cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
 		AccessToken: "stale-access", RefreshToken: "stale-refresh",
 		ExpiresAt: time.Now().Add(5 * time.Second), // stale
 	})
@@ -333,4 +333,270 @@ func firstPrefix(s string) string {
 		return s[:8]
 	}
 	return s
+}
+
+// --- OpenAI subscription (Milestone 5b) ------------------------------------
+
+// chatGPTBackendStub is an httptest stand-in for chatgpt.com/backend-api/codex's
+// Responses endpoint. It records the inbound path + headers + body and returns a
+// minimal Responses SSE stream so the relay can be checked byte-for-byte.
+type chatGPTBackendStub struct {
+	srv       *httptest.Server
+	gotPath   string
+	gotHeader http.Header
+	gotBody   []byte
+	sse       string
+}
+
+func newChatGPTBackendStub(t *testing.T) *chatGPTBackendStub {
+	t.Helper()
+	st := &chatGPTBackendStub{sse: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_oai\",\"usage\":{\"input_tokens\":4,\"output_tokens\":6,\"total_tokens\":10}}}\n\n"}
+	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st.gotPath = r.URL.Path
+		st.gotHeader = r.Header.Clone()
+		st.gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, st.sse)
+	}))
+	t.Cleanup(st.srv.Close)
+	return st
+}
+
+// openAISubscriptionTarget builds the hand-shaped target the routing resolver
+// produces for an OpenAI subscription account (vendorSubscriptionOpenAITarget),
+// pointed at the given backend endpoint. Endpoint is the stub URL so the relay is
+// local; the production value is https://chatgpt.com/backend-api/codex.
+func openAISubscriptionTarget(accountID, endpoint string) routing.Target {
+	return routing.Target{
+		RouteID:         "vendor:" + accountID + ":gpt-5-codex",
+		Provider:        routing.ProviderVendorOpenAI,
+		Endpoint:        endpoint,
+		Model:           "gpt-5-codex",
+		ProviderModel:   "gpt-5-codex-upstream",
+		Timeout:         30 * time.Second,
+		APIFlavor:       routing.APIFlavorOpenAI,
+		VendorAccountID: accountID,
+		ExtraHeaders: map[string]string{
+			"OpenAI-Beta": "responses=experimental",
+			"originator":  "codex_cli_rs",
+		},
+		APIFlavors:    []string{routing.APIFlavorOpenAI},
+		ResponsesMode: routing.EndpointModePassthrough,
+	}
+}
+
+// openAIResponsesBody is a rich Codex-style Responses body (the translate parser
+// would drop `tools`; passthrough must forward it verbatim, model aside).
+const openAIResponsesBody = `{"model":"gpt-5-codex","stream":true,"input":"hi","tools":[{"type":"function","name":"shell"}]}`
+
+// TestEndpointModeForOpenAISubscriptionResponsesPath pins the path seam: an OpenAI
+// SUBSCRIPTION target resolves the Responses path to /responses (the ChatGPT
+// backend's own path, joined onto the .../codex endpoint), while a non-subscription
+// Responses target keeps the OpenAI-platform /v1/responses. upstreamPath agrees, so
+// the usage ProviderPath matches what the upstream was actually called with.
+func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
+	sub := openAISubscriptionTarget("acc_sub_oai", "https://chatgpt.com/backend-api/codex")
+	if path, mode := endpointModeFor(sub, "openai_responses"); path != "/responses" || mode != routing.EndpointModePassthrough {
+		t.Fatalf("endpointModeFor(openai subscription) = (%q, %q), want (/responses, passthrough)", path, mode)
+	}
+	if got := upstreamPath(sub, "openai_responses"); got != "/responses" {
+		t.Fatalf("upstreamPath(openai subscription) = %q, want /responses", got)
+	}
+	// A self-hosted/api-key Responses target (no VendorAccountID) keeps /v1/responses.
+	plain := routing.Target{Provider: routing.ProviderVLLM, ResponsesMode: routing.EndpointModePassthrough}
+	if path, _ := endpointModeFor(plain, "openai_responses"); path != "/v1/responses" {
+		t.Fatalf("endpointModeFor(plain responses) = %q, want /v1/responses", path)
+	}
+}
+
+// TestOpenAISubscriptionDispatchAttachesBearerAccountIDAndHeaders proves the full
+// serving path for an un-stale OpenAI subscription token: the request reaches the
+// ChatGPT backend at /responses with the bearer, the chatgpt-account-id header, the
+// two static Codex headers, and the model rewritten to the upstream name; the
+// Responses SSE is relayed verbatim and no token leaks.
+func TestOpenAISubscriptionDispatchAttachesBearerAccountIDAndHeaders(t *testing.T) {
+	stub := newChatGPTBackendStub(t)
+	cipher := newDispatchCipher(t)
+	store := routing.NewMemoryStore()
+	seedSubscriptionAccount(t, store, cipher, "acc_sub_oai", routing.VendorOpenAI, vendorauth.TokenSet{
+		AccessToken: "live-access", RefreshToken: "live-refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "acct-oai-1", PlanType: "pro",
+	})
+	s := &Server{Cipher: cipher, Routes: store}
+	target := openAISubscriptionTarget("acc_sub_oai", stub.srv.URL)
+
+	// Build the upstream request exactly as proxyNative would: the real path seam
+	// and the real model rewrite, so this exercises production code, not a fixture.
+	ctx := s.upstreamAuthCtx(context.Background(), target)
+	path := upstreamPath(target, "openai_responses")
+	upstreamBody := rewriteModelField([]byte(openAIResponsesBody), target.ProviderModel)
+	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody)
+	if err != nil {
+		t.Fatalf("ProxyNative: %v", err)
+	}
+	relayed, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if stub.gotPath != "/responses" {
+		t.Fatalf("upstream path = %q, want /responses", stub.gotPath)
+	}
+	if got := stub.gotHeader.Get("Authorization"); got != "Bearer live-access" {
+		t.Fatalf("Authorization = %q, want Bearer live-access", got)
+	}
+	if got := stub.gotHeader.Get("Chatgpt-Account-Id"); got != "acct-oai-1" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want acct-oai-1", got)
+	}
+	if got := stub.gotHeader.Get("Openai-Beta"); got != "responses=experimental" {
+		t.Fatalf("Openai-Beta = %q, want responses=experimental", got)
+	}
+	if got := stub.gotHeader.Get("Originator"); got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q, want codex_cli_rs", got)
+	}
+	// Model rewritten to the upstream name; every other field preserved verbatim.
+	var probe struct {
+		Model string          `json:"model"`
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(stub.gotBody, &probe); err != nil {
+		t.Fatalf("upstream body not JSON: %v: %s", err, stub.gotBody)
+	}
+	if probe.Model != "gpt-5-codex-upstream" {
+		t.Fatalf("upstream model = %q, want gpt-5-codex-upstream (rewritten)", probe.Model)
+	}
+	if !strings.Contains(string(probe.Tools), "shell") {
+		t.Fatalf("upstream body dropped the tools field: %s", stub.gotBody)
+	}
+	// The Responses SSE is relayed byte-for-byte.
+	if string(relayed) != stub.sse {
+		t.Fatalf("relayed body = %q, want the upstream SSE verbatim", relayed)
+	}
+	// Security: no token leaks into the relayed stream or the captured headers.
+	if strings.Contains(string(relayed), "live-access") || strings.Contains(string(relayed), "live-refresh") {
+		t.Fatal("a token leaked into the relayed stream")
+	}
+	if strings.Contains(strings.Join(stub.gotHeader["Chatgpt-Account-Id"], ","), "live-") {
+		t.Fatal("a token leaked into a captured header")
+	}
+}
+
+// TestOpenAISubscriptionDispatchRefreshesResealsAndPersists proves a near-expiry
+// OpenAI token is refreshed via the FORM-ENCODED OpenAI endpoint (vendorOpenAIEndpoints),
+// resealed and persisted, the account id carried forward, and the refreshed bearer
+// plus that account id reach the ChatGPT backend.
+func TestOpenAISubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
+	stub := newChatGPTBackendStub(t)
+	cipher := newDispatchCipher(t)
+	store := routing.NewMemoryStore()
+	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub_oai", routing.VendorOpenAI, vendorauth.TokenSet{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(10 * time.Second), // within the 2m buffer => stale
+		AccountID: "acct-oai-7", PlanType: "pro",
+	})
+
+	// A FORM-ENCODED OpenAI token endpoint (not JSON — the Anthropic shape) that
+	// rotates the token set and carries NO id_token, so the account id must be
+	// carried forward from the stored set.
+	var sentRefresh, sentGrant, gotContentType string
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		_ = r.ParseForm()
+		sentRefresh = r.PostForm.Get("refresh_token")
+		sentGrant = r.PostForm.Get("grant_type")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`)
+	}))
+	defer oauth.Close()
+	ep := vendorauth.DefaultOpenAIEndpoints()
+	ep.TokenURL = oauth.URL
+	s := &Server{Cipher: cipher, Routes: store, vendorOpenAIEndpoints: ep}
+	target := openAISubscriptionTarget("acc_sub_oai", stub.srv.URL)
+
+	ctx := s.upstreamAuthCtx(context.Background(), target)
+	if _, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody)); err != nil {
+		t.Fatalf("ProxyNative: %v", err)
+	}
+
+	if gotContentType != "application/x-www-form-urlencoded" {
+		t.Fatalf("token endpoint Content-Type = %q, want form-encoded (OpenAI shape)", gotContentType)
+	}
+	if sentGrant != "refresh_token" || sentRefresh != "stale-refresh" {
+		t.Fatalf("token form = grant_type=%q refresh_token=%q, want refresh_token/stale-refresh", sentGrant, sentRefresh)
+	}
+	if got := stub.gotHeader.Get("Authorization"); got != "Bearer fresh-access" {
+		t.Fatalf("Authorization = %q, want Bearer fresh-access (refreshed)", got)
+	}
+	if got := stub.gotHeader.Get("Chatgpt-Account-Id"); got != "acct-oai-7" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want acct-oai-7 (carried forward)", got)
+	}
+
+	// The stored OAuthTokens changed and now opens to the refreshed set.
+	acc, err := store.VendorAccountByID(context.Background(), "acc_sub_oai")
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	if acc.OAuthTokens == originalSealed {
+		t.Fatal("stored OAuthTokens did not change after a refresh")
+	}
+	reopened, err := vendorauth.OpenTokenSet(cipher, acc.OAuthTokens)
+	if err != nil {
+		t.Fatalf("OpenTokenSet: %v", err)
+	}
+	if reopened.AccessToken != "fresh-access" || reopened.RefreshToken != "fresh-refresh" {
+		t.Fatal("persisted tokens are not the refreshed set")
+	}
+	if reopened.AccountID != "acct-oai-7" {
+		t.Fatalf("persisted AccountID = %q, want acct-oai-7 (carried forward)", reopened.AccountID)
+	}
+	if acc.Status != routing.VendorAccountStatusActive {
+		t.Fatalf("status = %q, want active after a successful refresh", acc.Status)
+	}
+}
+
+// TestOpenAISubscriptionDispatchRejectionMarksNeedsReconnect proves a dead OpenAI
+// refresh token flips the account to needs_reconnect and the request proceeds
+// WITHOUT a bearer or an account id (no panic); the static Codex headers still ride.
+func TestOpenAISubscriptionDispatchRejectionMarksNeedsReconnect(t *testing.T) {
+	cipher := newDispatchCipher(t)
+	store := routing.NewMemoryStore()
+	originalSealed := seedSubscriptionAccount(t, store, cipher, "acc_sub_oai", routing.VendorOpenAI, vendorauth.TokenSet{
+		AccessToken: "stale-access", RefreshToken: "dead-refresh",
+		ExpiresAt: time.Now().Add(-time.Second), // expired
+	})
+
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"refresh token revoked"}`)
+	}))
+	defer oauth.Close()
+	ep := vendorauth.DefaultOpenAIEndpoints()
+	ep.TokenURL = oauth.URL
+	s := &Server{Cipher: cipher, Routes: store, vendorOpenAIEndpoints: ep}
+	target := openAISubscriptionTarget("acc_sub_oai", "http://unused.example")
+
+	ctx := s.upstreamAuthCtx(context.Background(), target)
+
+	auth, ok := provider.UpstreamAuthFrom(ctx)
+	if !ok {
+		t.Fatal("expected the static Codex headers to still be carried")
+	}
+	if auth.Token != "" {
+		t.Fatal("a bearer must NOT be carried after a refresh rejection")
+	}
+	if auth.ExtraHeaders["chatgpt-account-id"] != "" {
+		t.Fatalf("no chatgpt-account-id must be carried after a rejection, got %q", auth.ExtraHeaders["chatgpt-account-id"])
+	}
+	if auth.ExtraHeaders["OpenAI-Beta"] != "responses=experimental" {
+		t.Fatalf("static Codex headers lost after rejection: %+v", auth.ExtraHeaders)
+	}
+
+	acc, err := store.VendorAccountByID(context.Background(), "acc_sub_oai")
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	if acc.Status != routing.VendorAccountStatusNeedsReconnect {
+		t.Fatalf("status = %q, want needs_reconnect", acc.Status)
+	}
+	if acc.OAuthTokens != originalSealed {
+		t.Fatal("status flip must not rewrite the OAuth tokens column")
+	}
 }

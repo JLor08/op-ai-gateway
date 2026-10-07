@@ -648,9 +648,16 @@ type Server struct {
 	// vendorAnthropicEndpoints are the OAuth endpoints used to refresh an Anthropic
 	// subscription account's access token at dispatch. Left zero it falls back to
 	// vendorauth.DefaultAnthropicEndpoints() (anthropicRefreshEndpoints); a test
-	// overrides TokenURL to an httptest server. (OpenAI subscription refresh is
-	// Milestone 5b.)
+	// overrides TokenURL to an httptest server.
 	vendorAnthropicEndpoints vendorauth.Endpoints
+
+	// vendorOpenAIEndpoints are the OAuth endpoints used to refresh an OpenAI
+	// (Codex ChatGPT-subscription) account's access token at dispatch (Milestone
+	// 5b). Left zero it falls back to vendorauth.DefaultOpenAIEndpoints()
+	// (openAIRefreshEndpoints); a test overrides TokenURL to an httptest server.
+	// Kept separate from vendorAnthropicEndpoints so an OpenAI refresh token is
+	// NEVER sent to the Anthropic token endpoint, and vice versa.
+	vendorOpenAIEndpoints vendorauth.Endpoints
 }
 
 // portalProvisioningGate adapts portal.API's AllowedServerIDs onto the
@@ -1812,29 +1819,59 @@ const vendorTokenRefreshBuffer = 2 * time.Minute
 
 // subscriptionAuthCtx resolves (and refreshes when stale) the OAuth bearer for a
 // subscription target's vendor account and threads it — plus the target's static
-// extra headers (anthropic-version, anthropic-beta) — onto ctx. Fail-open: on any
-// failure the request proceeds WITHOUT a bearer (the upstream 401s) rather than
-// crashing; a refresh REJECTION additionally flips the account to needs_reconnect.
-// The static headers are attached even when no bearer is available, so the
-// upstream's error is about auth, not a missing API version; they carry no secret.
+// extra headers (Anthropic: anthropic-version/anthropic-beta; OpenAI: OpenAI-Beta/
+// originator) — onto ctx. For an OpenAI subscription target it ALSO attaches the
+// per-account chatgpt-account-id header the ChatGPT backend needs, resolved from
+// the sealed tokens alongside the bearer. Fail-open: on any failure the request
+// proceeds WITHOUT a bearer (the upstream 401/403s) rather than crashing; a refresh
+// REJECTION additionally flips the account to needs_reconnect. The static headers
+// are attached even when no bearer is available, so the upstream's error is about
+// auth, not a missing API version; they carry no secret.
 func (s *Server) subscriptionAuthCtx(ctx context.Context, target routing.Target) context.Context {
-	access, ok := s.resolveSubscriptionBearer(ctx, target.VendorAccountID)
+	access, accountID, ok := s.resolveSubscriptionBearer(ctx, target.VendorAccountID)
 	if !ok {
 		return provider.WithUpstreamAuthHeaders(ctx, "", "", target.ExtraHeaders)
 	}
-	return provider.WithUpstreamAuthHeaders(ctx, "", access, target.ExtraHeaders)
+	extra := target.ExtraHeaders
+	if target.Provider == routing.ProviderVendorOpenAI {
+		// COPY the shared target map before adding the per-account header — the
+		// resolved Target (and its ExtraHeaders) is shared across requests and must
+		// never be mutated. An empty account id is fail-open: the request goes
+		// upstream without the header and the ChatGPT backend answers 401/403.
+		extra = copyStringMap(target.ExtraHeaders)
+		if accountID != "" {
+			extra["chatgpt-account-id"] = accountID
+		} else {
+			slog.Debug("openai subscription target has no account id; proceeding without the chatgpt-account-id header", "account", target.VendorAccountID)
+		}
+	}
+	return provider.WithUpstreamAuthHeaders(ctx, "", access, extra)
+}
+
+// copyStringMap returns a shallow copy of m (nil → a fresh empty map, so the
+// caller can always write into the result). Used to add a per-request header to a
+// shared Target.ExtraHeaders without mutating the shared map.
+func copyStringMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // resolveSubscriptionBearer loads accountID's sealed OAuth tokens, refreshes them
 // under the PER-ACCOUNT lock when they are near expiry, persists the resealed
 // blob through the narrow writer when they changed, and returns the usable access
-// token. ok is false (and no bearer is served) on every failure; a refresh
-// rejection also marks the account needs_reconnect. The whole sequence runs under
-// lockVendorAccount(accountID) so concurrent dispatches for one account single-
-// flight the refresh instead of each burning the refresh token.
-func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string) (string, bool) {
+// token plus the account id (the chatgpt-account-id an OpenAI target sends). ok is
+// false (and no bearer is served) on every failure; a refresh rejection also marks
+// the account needs_reconnect. The refresh is VENDOR-AWARE — the Anthropic token
+// goes only to the Anthropic token endpoint and the OpenAI token only to the
+// OpenAI one. The whole sequence runs under lockVendorAccount(accountID) so
+// concurrent dispatches for one account single-flight the refresh instead of each
+// burning the refresh token.
+func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string) (string, string, bool) {
 	if s.Routes == nil {
-		return "", false
+		return "", "", false
 	}
 	unlock := s.lockVendorAccount(accountID)
 	defer unlock()
@@ -1842,15 +1879,27 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 	acc, err := s.Routes.VendorAccountByID(ctx, accountID)
 	if err != nil {
 		slog.Debug("subscription account lookup failed; proceeding without bearer", "account", accountID, "err", err)
-		return "", false
+		return "", "", false
 	}
 	ts, err := vendorauth.OpenTokenSet(s.Cipher, acc.OAuthTokens)
 	if err != nil {
 		// A redacted log only — never the sealed blob or any token field.
 		slog.Debug("subscription token open failed; proceeding without bearer", "account", accountID)
-		return "", false
+		return "", "", false
 	}
-	fresh, changed, err := vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	// Branch on the account's vendor so the refresh token is only ever exchanged
+	// against its OWN token endpoint (a cross-vendor refresh would leak the token to
+	// the wrong host and always fail).
+	var (
+		fresh   vendorauth.TokenSet
+		changed bool
+	)
+	switch acc.Vendor {
+	case routing.VendorOpenAI:
+		fresh, changed, err = vendorauth.EnsureFreshOpenAI(ctx, nil, s.openAIRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	default:
+		fresh, changed, err = vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	}
 	if err != nil {
 		if errors.Is(err, vendorauth.ErrAuthRejected) {
 			// The refresh token is dead: the account must be reconnected. Flip the
@@ -1858,10 +1907,10 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 			if serr := s.Routes.SetVendorAccountStatus(ctx, accountID, routing.VendorAccountStatusNeedsReconnect); serr != nil {
 				slog.Debug("mark subscription account needs_reconnect failed", "account", accountID, "err", serr)
 			}
-			return "", false
+			return "", "", false
 		}
 		slog.Debug("subscription token refresh failed; proceeding without bearer", "account", accountID, "err", err)
-		return "", false
+		return "", "", false
 	}
 	if changed {
 		if sealed, serr := vendorauth.SealTokenSet(s.Cipher, s.settingsVolatile, fresh); serr != nil {
@@ -1871,9 +1920,18 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 		}
 	}
 	if fresh.AccessToken == "" {
-		return "", false
+		return "", "", false
 	}
-	return fresh.AccessToken, true
+	// The account id (sent as chatgpt-account-id for an OpenAI target) comes from
+	// the token set; when a refresh response omitted it, fall back to the claim
+	// baked into the access-token JWT itself. Harmless for Anthropic — its access
+	// token is not an OpenAI JWT, so this yields "" and Anthropic dispatch never
+	// reads the value anyway.
+	accID := fresh.AccountID
+	if accID == "" {
+		accID, _ = vendorauth.OpenAIClaimsFromJWT(fresh.AccessToken)
+	}
+	return fresh.AccessToken, accID, true
 }
 
 // lockVendorAccount acquires the per-account refresh mutex and returns its
@@ -1903,6 +1961,18 @@ func (s *Server) anthropicRefreshEndpoints() vendorauth.Endpoints {
 		return vendorauth.DefaultAnthropicEndpoints()
 	}
 	return s.vendorAnthropicEndpoints
+}
+
+// openAIRefreshEndpoints returns the OAuth endpoints used to refresh an OpenAI
+// (Codex ChatGPT-subscription) token, defaulting to the live reverse-engineered
+// endpoints when unset (a Server built directly leaves the field zero; a test
+// overrides it to an httptest server). The OpenAI analogue of
+// anthropicRefreshEndpoints.
+func (s *Server) openAIRefreshEndpoints() vendorauth.Endpoints {
+	if s.vendorOpenAIEndpoints.TokenURL == "" {
+		return vendorauth.DefaultOpenAIEndpoints()
+	}
+	return s.vendorOpenAIEndpoints
 }
 
 // serverName resolves a routing target's server ID to its human-readable

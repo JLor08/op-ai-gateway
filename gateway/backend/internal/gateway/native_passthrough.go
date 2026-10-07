@@ -68,6 +68,15 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case "openai_responses":
+		// An OpenAI SUBSCRIPTION target (Milestone 5b) forwards to the ChatGPT
+		// backend, whose Responses endpoint is .../backend-api/codex/responses — the
+		// Codex CLI's own path, NOT the OpenAI-platform /v1/responses. The Endpoint
+		// already carries the .../codex prefix, so the path is the bare /responses.
+		// Every other Responses upstream (self-hosted llama.cpp/vLLM, an api_key
+		// OpenAI app) keeps the standard /v1/responses.
+		if target.Provider == routing.ProviderVendorOpenAI && target.VendorAccountID != "" {
+			return "/responses", target.ResponsesMode
+		}
 		return "/v1/responses", target.ResponsesMode
 	case "anthropic_messages":
 		return "/v1/messages", target.MessagesMode
