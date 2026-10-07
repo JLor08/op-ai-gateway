@@ -45,6 +45,9 @@ export type ExternalThemeData = {
   hasLogo: boolean;
 };
 
+// The two valid vendor_account_routing_mode values (see SystemSettings).
+export type VendorAccountRoutingMode = 'vendor_first' | 'fallback_only';
+
 export type SystemSettings = {
   theme: string;
   available_themes: ThemeOption[];
@@ -74,6 +77,15 @@ export type SystemSettings = {
   // "accept" = the upstream accepted an image without erroring is enough;
   // "verify" = additionally verify the model's answer reflects the image content.
   vision_probe_mode: string;
+  // Vendor accounts ("Anbieter") MASTER flag, off by default (opt-in). While off
+  // the "Anbieter" nav item is hidden and every vendor-account call answers 409
+  // vendor_accounts.module_disabled.
+  vendor_accounts_enabled: boolean;
+  // Routing precedence between a user's own vendor accounts and the
+  // self-hosted/shared routes: "vendor_first" (default; the own account wins
+  // when it serves the requested model) or "fallback_only" (used only when no
+  // self-hosted/shared route serves the model).
+  vendor_account_routing_mode: VendorAccountRoutingMode;
   // Energy-attribution defaults (purely additive — no engine consumes these
   // yet; a later phase falls back to them when a per-mapping/per-server value
   // is unknown). All default 0 = "unset / no default".
@@ -475,6 +487,10 @@ export function systemApi(fetcher: Fetcher) {
       totp_mode?: string;
       route_affinity_session_mode?: string;
       vision_probe_mode?: string;
+      // Vendor accounts master flag + routing precedence (unknown routing mode
+      // is rejected with 400 system.vendor_account_routing_mode_invalid).
+      vendor_accounts_enabled?: boolean;
+      vendor_account_routing_mode?: VendorAccountRoutingMode;
       // Energy-attribution defaults (0 resets to "unset / no default").
       energy_default_price_per_kwh?: number;
       energy_default_pue?: number;

@@ -2394,6 +2394,19 @@ const de = {
     'Der API-Schlüssel darf nicht leer sein; zum Entfernen die Schaltfläche „Schlüssel löschen“ verwenden',
   errorVendorAccountApiKeyKeyRequired:
     'Zum Speichern eines API-Schlüssels ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
+  errorVendorAccountsModuleDisabled:
+    'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
+  // System settings: the vendor-accounts master flag and the routing precedence.
+  systemVendorAccountsIntro:
+    'Optionales Anbieter-Modul: Benutzer können eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) hinterlegen.',
+  systemVendorAccountsEnabledLabel: 'Anbieter aktivieren',
+  systemVendorAccountsEnabledNote:
+    'Aus (Standard): Der Menüpunkt „Anbieter“ ist ausgeblendet und alle Anbieter-Funktionen sind deaktiviert. Bereits angelegte Konten bleiben erhalten.',
+  systemVendorAccountRoutingModeLabel: 'Vorrang bei der Anbieter-Auswahl',
+  systemVendorAccountRoutingModeNote:
+    'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
+  vendorRoutingModeVendorFirst: 'Eigenes Anbieter-Konto zuerst',
+  vendorRoutingModeFallbackOnly: 'Anbieter-Konto nur als Ausweichlösung',
   settingsResourceProvisioningEnforceLabel: 'Ressourcengruppen-Bereitstellung erzwingen',
   settingsResourceProvisioningEnforceHelp:
     'Aus: bereitgestellte Ziele sind eine zusätzliche Freigabe (Opt-in). An: nur bereitgestellte Benutzer/Gruppen/Dienste dürfen die Server der Ressourcengruppe nutzen (Deny-by-default).',
@@ -4845,6 +4858,19 @@ const en: PortalMessages = {
     'The API key must not be blank; use the "Clear key" button to remove it',
   errorVendorAccountApiKeyKeyRequired:
     'An encryption key is required on the gateway to store an API key',
+  errorVendorAccountsModuleDisabled:
+    'Provider accounts are disabled. A system administrator can enable them in the system settings.',
+  // System settings: the vendor-accounts master flag and the routing precedence.
+  systemVendorAccountsIntro:
+    'Optional provider module: users can store their own accounts with external AI providers (e.g. OpenAI, Anthropic).',
+  systemVendorAccountsEnabledLabel: 'Enable providers',
+  systemVendorAccountsEnabledNote:
+    'Off (default): the "Providers" menu item is hidden and all provider features are disabled. Existing accounts are kept.',
+  systemVendorAccountRoutingModeLabel: 'Provider routing precedence',
+  systemVendorAccountRoutingModeNote:
+    "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",
+  vendorRoutingModeVendorFirst: 'Own provider account first',
+  vendorRoutingModeFallbackOnly: 'Provider account as fallback only',
   settingsResourceProvisioningEnforceLabel: 'Enforce resource-group provisioning',
   settingsResourceProvisioningEnforceHelp:
     "Off: provisioned targets are an additional grant (opt-in). On: only provisioned users/groups/services may use the resource group's servers (deny-by-default).",

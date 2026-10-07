@@ -266,6 +266,12 @@ let chatStreamMode: 'normal' | 'reasoning' | 'error' | 'abort' | 'pending' = 'no
 // not yet fully configured).
 let netbirdModuleEnabledMock = false;
 let netbirdRawCheckboxMock: boolean | null = null;
+// Drives GET /api/portal/vendor-accounts/enabled (the vendor-accounts master
+// flag, boolean-only, readable by every authenticated user). Defaults false --
+// the backend default (opt-in) -- so only the providers nav tests opt in. A
+// saved vendor_accounts_enabled in the System-settings PUT below flips it, like
+// the NetBird checkbox, so the shell's post-save re-fetch sees the new value.
+let vendorAccountsEnabledMock = false;
 // Drives CurrentUser.system_admin_mode on the mocked /api/auth/session +
 // /api/portal/me responses. A system_admin session starts NOT elevated
 // (matches the backend default), so only tests that specifically need the
@@ -302,6 +308,7 @@ beforeEach(() => {
   chatStreamMode = 'normal';
   netbirdModuleEnabledMock = false;
   netbirdRawCheckboxMock = null;
+  vendorAccountsEnabledMock = false;
   systemAdminModeMock = false;
   window.sessionStorage.clear();
   // The reworked Chat persists its transcript + settings to localStorage. jsdom
@@ -563,6 +570,14 @@ beforeEach(() => {
           effective_policy_scope: '',
           deny_by_default: false,
         });
+      }
+      // Vendor accounts ("Anbieter"): the master flag the shell gates the nav item
+      // on, and the (empty) account list the providers view loads once it is open.
+      if (path === '/api/portal/vendor-accounts/enabled') {
+        return jsonResponse({ module_enabled: vendorAccountsEnabledMock });
+      }
+      if (path === '/api/portal/vendor-accounts' && (!init?.method || init.method === 'GET')) {
+        return jsonResponse({ data: [] });
       }
       if (path === '/v1/chat/completions' && init?.method === 'POST') {
         const body = JSON.parse(String(init?.body)) as { model: string };
@@ -1120,10 +1135,15 @@ beforeEach(() => {
           capture_enabled?: boolean;
           health_check_interval_seconds?: number;
           netbird_enabled?: boolean;
+          vendor_accounts_enabled?: boolean;
         };
         // Reflect a saved NetBird enable toggle so the App's onSaved re-fetch of
         // /api/portal/netbird/enabled returns the new module_enabled (live nav update).
         if (body.netbird_enabled !== undefined) netbirdRawCheckboxMock = body.netbird_enabled;
+        // Same for the vendor-accounts master flag.
+        if (body.vendor_accounts_enabled !== undefined) {
+          vendorAccountsEnabledMock = body.vendor_accounts_enabled;
+        }
         return jsonResponse({
           theme: body.theme ?? 'default',
           available_themes: [{ id: 'default', name: 'Default' }],
@@ -2771,6 +2791,77 @@ describe('App', () => {
     expect(screen.queryByLabelText(messages.de.settingsNetbirdOnly)).not.toBeInTheDocument();
   });
 
+  it('hides the providers (vendor accounts) nav item from every role while the master flag is off (the default)', async () => {
+    for (const role of ['user', 'admin', 'system_admin']) {
+      currentRole = role;
+      systemAdminModeMock = role === 'system_admin';
+      const { unmount } = renderApp();
+      await screen.findByText('Dev User');
+      // Let the flag probe settle before asserting absence, so the assertion is
+      // about the fetched value rather than a not-yet-run effect.
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith(
+          '/api/portal/vendor-accounts/enabled',
+          expect.anything(),
+        ),
+      );
+      expect(screen.queryByRole('link', { name: messages.de.providers })).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('shows the providers nav item + view to a plain user once the master flag is on (no admin gate)', async () => {
+    vendorAccountsEnabledMock = true;
+    currentRole = 'user';
+    renderApp();
+    await screen.findByText('Dev User');
+    await gotoNav(messages.de.providers);
+    expect(
+      await screen.findByRole('heading', { level: 1, name: messages.de.providers }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(messages.de.vendorAccountListEmpty)).toBeInTheDocument();
+  });
+
+  it('keeps the providers nav item hidden when the flag probe fails (fail closed)', async () => {
+    vendorAccountsEnabledMock = true;
+    const baseFetch = fetch as unknown as (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => Promise<Response>;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === '/api/portal/vendor-accounts/enabled') {
+          return jsonResponse({ error: { code: 'internal', message: 'boom' } }, 500);
+        }
+        return baseFetch(input, init);
+      }),
+    );
+    renderApp();
+    await screen.findByText('Dev User');
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith('/api/portal/vendor-accounts/enabled', expect.anything()),
+    );
+    expect(screen.queryByRole('link', { name: messages.de.providers })).not.toBeInTheDocument();
+  });
+
+  it('reveals the providers nav item live after enabling the flag in System settings and saving', async () => {
+    vendorAccountsEnabledMock = false;
+    currentRole = 'system_admin';
+    systemAdminModeMock = true;
+    renderApp();
+    await screen.findByText('Dev User');
+    expect(screen.queryByRole('link', { name: messages.de.providers })).not.toBeInTheDocument();
+
+    await gotoNav(messages.de.system);
+    fireEvent.click(await screen.findByLabelText(messages.de.systemVendorAccountsEnabledLabel));
+    fireEvent.click(screen.getByRole('button', { name: messages.de.save }));
+    await screen.findByText(messages.de.systemSaved);
+
+    // onSaved re-reads the flag: the item appears without a reload or navigation.
+    expect(await screen.findByRole('link', { name: messages.de.providers })).toBeInTheDocument();
+  });
+
   it('reveals the NetBird nav item live after toggling the enable checkbox on and saving (no manual refresh)', async () => {
     netbirdRawCheckboxMock = false;
     netbirdModuleEnabledMock = false;
@@ -2847,6 +2938,8 @@ describe('App', () => {
       totp_mode: 'off',
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
+      vendor_accounts_enabled: false,
+      vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
       energy_default_price_unit: 'eur_cent',
       currency_usd_per_eur: 0,
@@ -2936,6 +3029,8 @@ describe('App', () => {
       totp_mode: 'off',
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
+      vendor_accounts_enabled: false,
+      vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
       energy_default_price_unit: 'eur_cent',
       currency_usd_per_eur: 0,
@@ -2987,6 +3082,8 @@ describe('App', () => {
       totp_mode: 'off',
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
+      vendor_accounts_enabled: false,
+      vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
       energy_default_price_unit: 'eur_cent',
       currency_usd_per_eur: 0,
@@ -3059,6 +3156,8 @@ describe('App', () => {
       totp_mode: 'off',
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
+      vendor_accounts_enabled: false,
+      vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
       energy_default_price_unit: 'eur_cent',
       currency_usd_per_eur: 0,

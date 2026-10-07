@@ -12,6 +12,19 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 describe('vendorAccountsApi', () => {
+  it('reads the boolean-only master flag from /enabled (not the {id} item route)', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ module_enabled: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.vendorAccountsEnabled();
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/vendor-accounts/enabled', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(resp).toEqual({ module_enabled: true });
+  });
+
   it('lists the caller accounts from the {data:[...]} envelope', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [{ id: 'va_1' }] }));
     const api = createPortalApi(fetcher);

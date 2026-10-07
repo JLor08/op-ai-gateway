@@ -39,6 +39,8 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     totp_mode: 'off',
     route_affinity_session_mode: 'client_session',
     vision_probe_mode: 'accept',
+    vendor_accounts_enabled: false,
+    vendor_account_routing_mode: 'vendor_first',
     energy_default_price_per_kwh: 0,
     energy_default_pue: 0,
     energy_default_wh_per_token: 0,
@@ -358,6 +360,71 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.save }));
       await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
       expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({ vision_probe_mode: 'verify' });
+    });
+  });
+
+  describe(`SystemSettings vendor accounts [${locale}]`, () => {
+    it('shows the master toggle OFF and the routing precedence on vendor_first by default', async () => {
+      renderSystemSettings(makeSettings());
+      const toggle = (await screen.findByLabelText(
+        t.systemVendorAccountsEnabledLabel,
+      )) as HTMLInputElement;
+      expect(toggle.checked).toBe(false);
+      // The help text explains what off means; the select shows the default label.
+      expect(screen.getByText(t.systemVendorAccountsEnabledNote)).toBeInTheDocument();
+      expect(screen.getByText(t.systemVendorAccountRoutingModeNote)).toBeInTheDocument();
+      expect(screen.getByLabelText(t.systemVendorAccountRoutingModeLabel)).toHaveTextContent(
+        t.vendorRoutingModeVendorFirst,
+      );
+    });
+
+    it('reflects the stored values', async () => {
+      renderSystemSettings(
+        makeSettings({
+          vendor_accounts_enabled: true,
+          vendor_account_routing_mode: 'fallback_only',
+        }),
+      );
+      const toggle = (await screen.findByLabelText(
+        t.systemVendorAccountsEnabledLabel,
+      )) as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+      expect(screen.getByLabelText(t.systemVendorAccountRoutingModeLabel)).toHaveTextContent(
+        t.vendorRoutingModeFallbackOnly,
+      );
+    });
+
+    it('sends the stored values unchanged on a save that does not touch them', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const save = await screen.findByRole('button', { name: t.save });
+      await waitFor(() => expect(save).not.toBeDisabled());
+      fireEvent.click(save);
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_accounts_enabled: false,
+        vendor_account_routing_mode: 'vendor_first',
+      });
+    });
+
+    it('saves the enabled toggle and the chosen routing precedence, then notifies the shell', async () => {
+      const { updateSystemSettings, onSaved } = renderSystemSettings(makeSettings());
+      fireEvent.click(await screen.findByLabelText(t.systemVendorAccountsEnabledLabel));
+      fireEvent.mouseDown(await screen.findByLabelText(t.systemVendorAccountRoutingModeLabel));
+      fireEvent.click(await screen.findByRole('option', { name: t.vendorRoutingModeFallbackOnly }));
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_accounts_enabled: true,
+        vendor_account_routing_mode: 'fallback_only',
+      });
+      // onSaved is what makes the shell re-read the flag, so the nav item follows live.
+      await waitFor(() => expect(onSaved).toHaveBeenCalled());
+      // The saved values stay shown after the form resets its pending state.
+      await waitFor(() =>
+        expect(
+          (screen.getByLabelText(t.systemVendorAccountsEnabledLabel) as HTMLInputElement).checked,
+        ).toBe(true),
+      );
     });
   });
 

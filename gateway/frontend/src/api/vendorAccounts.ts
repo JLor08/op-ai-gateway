@@ -69,6 +69,15 @@ export type UpdateVendorAccountRequest = {
 
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
+    // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
+    // off by default). Portal-scoped (any authenticated user, gateway:use) and
+    // boolean-only -- no routing mode or other setting leaks -- so it gates the
+    // "Anbieter" nav item / view for every user the way netbirdEnabled's
+    // module_enabled and certificatesEnabled gate theirs. It answers while the
+    // module is off; every other vendor-account call then answers 409
+    // vendor_accounts.module_disabled.
+    vendorAccountsEnabled: () =>
+      request<{ module_enabled: boolean }>(fetcher, '/api/portal/vendor-accounts/enabled'),
     // The caller's OWN accounts, oldest first -- system scope does not widen
     // the list (the page is a personal one and the DTO carries no owner).
     vendorAccounts: () =>

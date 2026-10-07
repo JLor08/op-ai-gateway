@@ -130,7 +130,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'project.couple_group_invalid': 'errorProjectCoupleGroupInvalid',
   'project.couple_ambiguous': 'errorProjectCoupleAmbiguous',
   'resource_group.provision_target_invalid': 'errorResourceGroupProvisionTargetInvalid',
-  // Vendor accounts ("Anbieter"): the nine codes of writePortalVendorAccountError's
+  // Vendor accounts ("Anbieter"): the ten codes of writePortalVendorAccountError's
   // errRow table (gateway/portal_vendor_account_endpoints.go), read verbatim
   // from the Go sentinels in portal/service.go. The 500 *_failed fallbacks
   // (vendor_account.list_failed, ...) are left unmapped on purpose: they carry
@@ -144,6 +144,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.api_key_not_allowed': 'errorVendorAccountApiKeyNotAllowed',
   'vendor_account.api_key_invalid': 'errorVendorAccountApiKeyInvalid',
   'vendor_account.api_key_key_required': 'errorVendorAccountApiKeyKeyRequired',
+  // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
+  // although the portal hides the area in that state: a stale tab or a flag
+  // flipped mid-session still reaches it.
+  'vendor_accounts.module_disabled': 'errorVendorAccountsModuleDisabled',
   // The plaintext gate's two arming-precondition refusals. Both are mapped, not
   // just the newer one: an operator seeing one translated and its sibling in raw
   // English would read the pair as inconsistent.

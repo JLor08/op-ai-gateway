@@ -63,6 +63,8 @@ function settingsFixture(overrides: Partial<SystemSettingsDTO> = {}): SystemSett
     totp_mode: 'off',
     route_affinity_session_mode: 'client_session',
     vision_probe_mode: 'accept',
+    vendor_accounts_enabled: false,
+    vendor_account_routing_mode: 'vendor_first',
     energy_default_price_per_kwh: 0,
     energy_default_pue: 0,
     energy_default_wh_per_token: 0,

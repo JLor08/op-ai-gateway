@@ -489,6 +489,15 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ).toEqual(vendorAccountWireCodes.slice().sort());
   });
 
+  // The master-flag 409 (`portalVendorAccountErrRows`' first row). Its code is
+  // `vendor_accounts.` (plural) -- a different prefix from the nine above -- so
+  // the both-directions check does not cover it: pin it on its own.
+  it('maps the vendor-accounts module-disabled refusal by its exact wire string', () => {
+    expect(errorLabelByCode['vendor_accounts.module_disabled']).toBe(
+      'errorVendorAccountsModuleDisabled',
+    );
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is

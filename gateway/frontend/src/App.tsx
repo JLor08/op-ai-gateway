@@ -84,6 +84,11 @@ export default function App() {
   // Gates the "certificates" nav item + view the same way (module-enabled +
   // system_admin, checked separately at the render gate).
   const [certificatesModuleEnabled, setCertificatesModuleEnabled] = useState(false);
+  // Gates the "providers" (vendor accounts) nav item + view: the
+  // vendor_accounts_enabled master flag, off by default. Unlike the two module
+  // flags above there is no admin requirement -- every user manages their own
+  // accounts once it is on.
+  const [vendorAccountsEnabled, setVendorAccountsEnabled] = useState(false);
   const t = messages[locale];
   const tRef = useRef(t);
   tRef.current = t;
@@ -273,6 +278,23 @@ export default function App() {
     if (authState === 'authenticated') refreshCertificatesModule();
   }, [authState, refreshCertificatesModule]);
 
+  // Vendor accounts ("Anbieter") nav item + view gate: the same pattern again
+  // (portal-scoped, boolean-only, resolves for any authenticated user), except
+  // that no role check follows at the render gate. A load/network error leaves
+  // the flag false, so the item stays hidden. SystemSettings calls this after a
+  // save (onSystemSettingsSaved) so toggling the flag shows/hides the item live.
+  const refreshVendorAccountsModule = useCallback(() => {
+    api
+      .vendorAccountsEnabled()
+      .then((r) => setVendorAccountsEnabled(Boolean(r.module_enabled)))
+      .catch(() => {
+        /* not reachable → the "Anbieter" nav item stays hidden */
+      });
+  }, [api]);
+  useEffect(() => {
+    if (authState === 'authenticated') refreshVendorAccountsModule();
+  }, [authState, refreshVendorAccountsModule]);
+
   // System-admin mode auto-drop: while elevated with a known expiry, schedule a
   // session refetch right at that deadline so the UI de-elevates itself (every
   // systemAdminMode-gated nav item/view re-gates) without waiting for the next
@@ -388,6 +410,7 @@ export default function App() {
     systemAdminMode,
     netbirdModuleEnabled,
     certificatesModuleEnabled,
+    vendorAccountsEnabled,
   };
   const renderCtx: ViewRenderCtx = {
     ...gateCtx,
@@ -412,6 +435,7 @@ export default function App() {
     onSystemSettingsSaved: () => {
       refreshNetbirdModule();
       refreshCertificatesModule();
+      refreshVendorAccountsModule();
     },
     onSelectLocale: selectLocale,
   };
@@ -518,6 +542,7 @@ export default function App() {
                 expanded={navExpanded}
                 netbirdModuleEnabled={netbirdModuleEnabled}
                 certificatesModuleEnabled={certificatesModuleEnabled}
+                vendorAccountsEnabled={vendorAccountsEnabled}
                 systemAdminMode={systemAdminMode}
                 t={t}
               />
