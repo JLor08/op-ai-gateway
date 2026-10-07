@@ -92,6 +92,34 @@ const (
 	OpenAIClaimPlanType  = "chatgpt_plan_type"
 )
 
+// OpenAI Codex device-code login. This is the CLI's BESPOKE "deviceauth"
+// protocol, NOT the generic RFC 8628 device grant, so an RFC 8628 client cannot
+// talk to it. Reverse-engineered from the Codex CLI source
+// (codex-rs/login/src/device_code_auth.rs). The issuer is the OpenAI auth host
+// (auth.openai.com, the same host as OpenAIAuthorizeURL); the paths below hang
+// off it. See internal/vendorauth/openai_device.go for the flow.
+//
+// REVERSE-ENGINEERED / VERIFY LIVE.
+const (
+	// OpenAIDeviceUsercodeURL starts a device login: POST {issuer}/api/accounts/
+	// deviceauth/usercode with {"client_id"} answers {device_auth_id, user_code,
+	// interval}.
+	OpenAIDeviceUsercodeURL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+	// OpenAIDeviceTokenURL is polled for the authorization: POST {issuer}/api/
+	// accounts/deviceauth/token with {device_auth_id, user_code}. HTTP 403 or 404
+	// means "not yet"; a 2xx carries {authorization_code, code_challenge,
+	// code_verifier}.
+	OpenAIDeviceTokenURL = "https://auth.openai.com/api/accounts/deviceauth/token"
+	// OpenAIDeviceVerificationURL is the human page the user opens to type the
+	// user_code. It is a fixed page ({issuer}/codex/device), not a field of the
+	// usercode response.
+	OpenAIDeviceVerificationURL = "https://auth.openai.com/codex/device"
+	// OpenAIDeviceCallbackRedirect is the redirect_uri sent on the final
+	// authorization-code exchange ({issuer}/deviceauth/callback). It differs from
+	// the loopback OpenAIRedirectURI the code-paste flow uses.
+	OpenAIDeviceCallbackRedirect = "https://auth.openai.com/deviceauth/callback"
+)
+
 // Endpoints carries every vendor-specific OAuth parameter the flow functions
 // read: the HTTP URLs plus the client id, redirect URI, scopes and extra
 // authorize parameters. It is named for its main purpose (pointing the flows at
@@ -113,6 +141,22 @@ type Endpoints struct {
 	RedirectURI string
 	// Scopes is the space-separated scope list.
 	Scopes string
+
+	// Device-code login fields (OpenAI Codex deviceauth only; empty for a vendor
+	// without a device flow, such as Anthropic). Kept overridable here so a live
+	// operator can correct a rotated path and the unit tests can point them at an
+	// httptest server. REVERSE-ENGINEERED / VERIFY LIVE.
+	//
+	// DeviceUsercodeURL starts a device login (the usercode endpoint).
+	DeviceUsercodeURL string
+	// DeviceTokenURL is polled for the authorization (the deviceauth token
+	// endpoint, distinct from TokenURL).
+	DeviceTokenURL string
+	// DeviceVerificationURL is the human verification page returned to the UI for
+	// display; this package never fetches it.
+	DeviceVerificationURL string
+	// DeviceCallbackRedirect is the redirect_uri for the device code exchange.
+	DeviceCallbackRedirect string
 }
 
 // DefaultAnthropicEndpoints returns the reverse-engineered Claude Code OAuth
@@ -131,10 +175,14 @@ func DefaultAnthropicEndpoints() Endpoints {
 // VERIFY LIVE.
 func DefaultOpenAIEndpoints() Endpoints {
 	return Endpoints{
-		ClientID:     OpenAIClientID,
-		AuthorizeURL: OpenAIAuthorizeURL,
-		TokenURL:     OpenAITokenURL,
-		RedirectURI:  OpenAIRedirectURI,
-		Scopes:       OpenAIScopes,
+		ClientID:               OpenAIClientID,
+		AuthorizeURL:           OpenAIAuthorizeURL,
+		TokenURL:               OpenAITokenURL,
+		RedirectURI:            OpenAIRedirectURI,
+		Scopes:                 OpenAIScopes,
+		DeviceUsercodeURL:      OpenAIDeviceUsercodeURL,
+		DeviceTokenURL:         OpenAIDeviceTokenURL,
+		DeviceVerificationURL:  OpenAIDeviceVerificationURL,
+		DeviceCallbackRedirect: OpenAIDeviceCallbackRedirect,
 	}
 }

@@ -13,24 +13,10 @@ import (
 	"time"
 )
 
-// Why there is no device-code login here (a note for a future device-UI
-// milestone, not a TODO for this file): the Codex CLI's device flow is NOT the
-// generic RFC 8628 grant, so an RFC 8628 client cannot talk to it. Per a review
-// of the Codex CLI source (codex-rs/login/src/device_code_auth.rs; not
-// re-verified live), it is a bespoke protocol against the issuer:
-//
-//  1. POST {issuer}/api/accounts/deviceauth/usercode answers
-//     {device_auth_id, user_code, interval}.
-//  2. The user opens the verification page {issuer}/codex/device and enters
-//     user_code.
-//  3. Poll POST {issuer}/api/accounts/deviceauth/token with
-//     {device_auth_id, user_code}; HTTP 403 or 404 means "not yet", and a 2xx
-//     answer carries authorization_code, code_challenge and code_verifier.
-//  4. Finish with a normal authorization-code exchange (ExchangeOpenAICode)
-//     using those values and redirect_uri={issuer}/deviceauth/callback.
-//
-// OpenAI subscription connect uses the code-paste flow below instead
-// (BuildOpenAIAuthorizeURL, then ExchangeOpenAICode).
+// This file holds the OpenAI code-paste connect flow (BuildOpenAIAuthorizeURL,
+// then ExchangeOpenAICode) and the shared token/claim helpers. The bespoke Codex
+// device-code login -- a separate, optional connect method that also works
+// remotely -- lives in openai_device.go.
 
 // BuildOpenAIAuthorizeURL returns the URL the user opens to sign in to
 // auth.openai.com and approve the gateway: the standard OAuth+PKCE parameters
