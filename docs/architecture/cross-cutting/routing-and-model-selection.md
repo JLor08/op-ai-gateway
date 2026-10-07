@@ -1199,11 +1199,11 @@ gated by `metrics_locked` (a manually-pinned mapping never auto-overwrites):
 
 | Source | `metrics_source` | What it measures | Trigger |
 |---|---|---|---|
-| **Benchmark run** | `"benchmark"` | cold-minus-warm load time, generation/prompt tok/s (`measureMapping` / `measureSpeedTarget`) | manual or scheduled (below) |
+| **Benchmark run** | `"benchmark"` | cold-minus-warm load time, generation/prompt tok/s (`measureMapping` / `measureSpeedTarget`). A run writes only what it measured; 0 means not measured: a 0 keeps the stored column, and a run that measured nothing writes nothing, `metrics_source` and `metrics_updated_at` included (`UpdateMappingBenchmarkMetrics`). The run's history row still records the 0 ([Risks & Technical Debt §11.1](../11-risks-and-technical-debt.md#111-operational-risks)) | manual or scheduled (below) |
 | **Opportunistic EWMA** | `"opportunistic"` | gen/prompt tok/s, blended (α=0.2) from every successful **real** inference on an app with `OpportunisticMetricsEnabled` | every live request, no explicit run |
-| **Context probe** | `"probe"` (context-size fields only — no throughput or capacity field is touched) | usable context window: via the application's `context_probe_path` (e.g. llama.cpp `/props`), **or**, for a `server_agent` mapping, the agent's per-child probe against the mapping's runtime spec's own resolved `context_probe_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | during a benchmark's warm pass, standalone (`startContextProbe`), or — the agent path — every telemetry cycle the agent reports a changed value |
+| **Context probe** | `"probe"` (context-size fields only — no throughput or capacity field is touched) | usable context window: via the application's `context_probe_path` (e.g. llama.cpp `/props`), **or**, for a `server_agent` mapping, the agent's per-child probe against the mapping's runtime spec's own resolved `context_probe_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | during a speed run (`measureSpeedTarget`), on the application's health cadence for a loaded model (the context pass in `cmd/gateway/app_health.go`), or — the agent path — every telemetry cycle the agent reports a changed value. The standalone context probe (`startContextProbe`) only reports its answer in the run's result, and the portal fills the form field without saving, so it writes nothing. A benchmark reads two sources ([Agent-Managed Model Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)): the synchronous probe on the application's effective path, which for a `server_agent` application without one is the router's `/upstream/{model}/props`, and then the agent's telemetry for the mapping's spec. Only the first is written by the benchmark; the telemetry value is the agent path's own write |
 
-Both context-probe triggers land through the **same** store method
+Every context-probe writer lands through the **same** store method
 (`UpdateMappingContextProbe`), which is why they share one `metrics_source`
 value — there is no separate provenance for "the agent measured this" versus
 "the application-level probe measured this", and no `"agent"` value exists.
@@ -1219,8 +1219,8 @@ Observability](telemetry-usage-observability.md#832-shared-ingest-core)).
 
 | Mode | How it starts | Notes |
 |---|---|---|
-| Manual | `POST` on a server/application/mapping scope (`startBenchmark`, `internal/gateway/benchmark_endpoints.go`) | 202 + status; 409 if a run is already in flight on that server, or the server has live in-flight traffic (idle-gated); a mapping scope whose mapping is images-only is refused with 409 `benchmark.images_only`, and an application or server scope skips such mappings, recording each as `skipped` ([Agent-Managed Model Runtime §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)) |
-| Scheduled | `Application.BenchmarkScheduleEnabled` + `BenchmarkScheduleIntervalSeconds` (floored at 60s), driven by `StartBenchmarkScheduler`'s 1-minute tick (`internal/gateway/benchmark_scheduler.go`) | speed-only, per-app cadence, idle-gated exactly like manual, skips `metrics_locked` mappings and every mapping whose effective flavors serve only images (a speed benchmark is a chat prompt; a `server_agent` child is judged by its spec, and one whose spec cannot be read is skipped for that pass) |
+| Manual | `POST` on a server/application/mapping scope (`startBenchmark`, `internal/gateway/benchmark_endpoints.go`) | 202 + status; 409 if a run is already in flight on that server, or the server has live in-flight traffic (idle-gated); a mapping scope whose mapping is images-only is refused with 409 `benchmark.images_only`, and an application or server scope skips such mappings, recording each as `skipped` ([Agent-Managed Model Runtime §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)); a `speed` or `both` run whose targets include a `server_agent` mapping lifts every pin of that application for the run and stops every running agent model before each agent target's measurement, unless one of its gates turns the stops off, so an agent model's load time is its own load on an otherwise empty server ([Agent-Managed Model Runtime §11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)) |
+| Scheduled | `Application.BenchmarkScheduleEnabled` + `BenchmarkScheduleIntervalSeconds` (floored at 60s), driven by `StartBenchmarkScheduler`'s 1-minute tick (`internal/gateway/benchmark_scheduler.go`) | speed-only, per-app cadence, idle-gated exactly like manual, skips `metrics_locked` mappings and every mapping whose effective flavors serve only images (a speed benchmark is a chat prompt; a `server_agent` child is judged by its spec, and one whose spec cannot be read is skipped for that pass); it never stops or unpins an agent model, and a `server_agent` mapping gets a load time only when its model is cold at the start and every other model of the application reads `stopped` with no process id in a non-empty runtime status from the agent, so at most one per run ([Agent-Managed Model Runtime §11.10](agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)); otherwise the mapping keeps its stored load time |
 | Opportunistic | no run at all — an ambient side effect of `OpportunisticMetricsEnabled` on served traffic | see table above |
 
 A benchmark **measurement kind** (`runBenchmark`'s `mode` argument — distinct
@@ -1229,7 +1229,12 @@ from the trigger modes above) selects what a run does per mapping: `"speed"`
 `"both"` (speed then capacity, so `metrics_source` ends `"capacity"`), or
 `"vision"` (an image-acceptance probe, out of this chapter's scope). Exactly
 one benchmark runs per server at a time (`BenchmarkRegistry.TryStart`); the
-server is excluded from routing (`ServerBusy`) for its duration.
+server is excluded from routing (`ServerBusy`) for its duration, and the model
+warmer drops every candidate on it the same way (`unreservedCandidates`). A
+warm there would start a model while the run measures, and could load a speed
+run's target between its cold check and its cold request, which makes the
+measured load time too small. A candidate on another server is warmed,
+because routing would send the request there.
 
 **A history row's `kind` is a wider set than the mode argument**, because a run
 that is not a per-target fan-out gets its own endpoint and single-target runner

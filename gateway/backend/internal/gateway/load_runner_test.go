@@ -12,6 +12,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -603,4 +604,75 @@ func TestStartLoadModel(t *testing.T) {
 	if code := post("ld_map"); code != http.StatusAccepted {
 		t.Fatalf("idle: status = %d, want 202", code)
 	}
+}
+
+// TestLoadShortCircuitsAResidentAgentModel: the load core asks a server_agent
+// application in the shape the portal stores through the agent router's
+// /running, so a model that already runs is reported resident and is not
+// loaded again.
+func TestLoadShortCircuitsAResidentAgentModel(t *testing.T) {
+	f := newFakeAgentRouter(t, fakeAgentRouterOpts{models: []string{"qwen"}})
+	f.setRunning("qwen", true)
+	srv := &Server{Provider: newFakeAgentProvider()}
+
+	alreadyResident, probed, err := srv.ensureResidentForRun(context.Background(), portalShapedAgentTarget(f))
+	if err != nil {
+		t.Fatalf("ensureResidentForRun err = %v", err)
+	}
+	if !alreadyResident || !probed {
+		t.Fatalf("alreadyResident, probed = %v, %v; want true, true: /running lists qwen", alreadyResident, probed)
+	}
+	if got := fakeAgentPaths(f.requests()); !slices.Equal(got, []string{"GET /running"}) {
+		t.Fatalf("requests = %v, want exactly [GET /running]: no load stream for a resident model", got)
+	}
+}
+
+// TestLoadedRegistryWritersKeepTheRawField: reflectLoadedAfterLoad writes the
+// gateway-poll half of the loaded-model registry, and for a server_agent
+// application the agent's own report is the truth there. So it reads only an
+// application's own loaded_models_path, never the agent router's /running the
+// resolver supplies, and a portal-shaped agent application gets no entry.
+func TestLoadedRegistryWritersKeepTheRawField(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a portal-shaped agent application", func(t *testing.T) {
+		f := newFakeAgentRouter(t, fakeAgentRouterOpts{running: []string{"qwen"}})
+		loaded := NewLoadedModelRegistry()
+		srv := &Server{Provider: newFakeAgentProvider(), LoadedModels: loaded}
+		ch, unsub := loaded.Subscribe()
+		defer unsub()
+		tgt := portalShapedAgentTarget(f)
+		target, _ := benchmarkTargetReq(tgt)
+
+		srv.reflectLoadedAfterLoad(ctx, target, tgt)
+
+		if got := f.requests(); len(got) != 0 {
+			t.Fatalf("requests = %v, want none", fakeAgentPaths(got))
+		}
+		if got := loaded.LoadedAppModels(tgt.app.ID, tgt.server.ID); got != nil {
+			t.Fatalf("LoadedAppModels = %v, want nil: no gateway-poll entry", got)
+		}
+		select {
+		case <-ch:
+			t.Fatal("subscriber signalled, want no registry write")
+		default:
+		}
+	})
+	t.Run("an API-set loaded_models_path is still read", func(t *testing.T) {
+		f := newFakeAgentRouter(t, fakeAgentRouterOpts{running: []string{"qwen"}})
+		loaded := NewLoadedModelRegistry()
+		srv := &Server{Provider: newFakeAgentProvider(), LoadedModels: loaded}
+		tgt := portalShapedAgentTarget(f)
+		tgt.app.LoadedModelsPath = "/running"
+		tgt.app.LoadedModelsFormat = "llama_swap"
+		target, _ := benchmarkTargetReq(tgt)
+
+		srv.reflectLoadedAfterLoad(ctx, target, tgt)
+
+		if got := fakeAgentPaths(f.requests()); !slices.Equal(got, []string{"GET /running"}) {
+			t.Fatalf("requests = %v, want exactly [GET /running]", got)
+		}
+		if got := loaded.LoadedAppModels(tgt.app.ID, tgt.server.ID); !slices.Equal(got, []string{"qwen"}) {
+			t.Fatalf("LoadedAppModels = %v, want [qwen]", got)
+		}
+	})
 }

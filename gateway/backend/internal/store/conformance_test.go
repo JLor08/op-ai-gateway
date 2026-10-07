@@ -4479,7 +4479,10 @@ func TestConformanceUpdateMappingContextProbe(t *testing.T) {
 // TestConformanceUpdateMappingBenchmarkMetrics verifies the benchmark-metrics
 // write path: it stamps gen/prompt throughput + load time + provenance
 // ("benchmark") only while the mapping is unlocked, and is a benign no-op when
-// the mapping is locked or missing, on both dialects.
+// the mapping is locked or missing, on both dialects. Between the two it runs
+// the keep-last cases (checkBenchmarkMetricsKeepLast): a value of 0 or below
+// keeps the stored column, and a call with nothing above 0 writes nothing,
+// provenance included.
 func TestConformanceUpdateMappingBenchmarkMetrics(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -4539,6 +4542,8 @@ func TestConformanceUpdateMappingBenchmarkMetrics(t *testing.T) {
 		if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(benchAt) {
 			t.Fatalf("MetricsUpdatedAt = %v, want %v", got.MetricsUpdatedAt, benchAt)
 		}
+
+		checkBenchmarkMetricsKeepLast(t, s, "m1")
 
 		// Lock the mapping (manual pin) via UpdateMapping.
 		mapping.GenTokensPerSecond = 1

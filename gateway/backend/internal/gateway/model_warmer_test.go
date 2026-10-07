@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"testing"
 	"time"
 )
@@ -81,6 +82,40 @@ func TestModelWarmerSkipsLoadedModel(t *testing.T) {
 
 	if got := fake.streamedModels(); len(got) != 0 {
 		t.Fatalf("a resident model was warmed anyway: streamed = %v", got)
+	}
+}
+
+// TestModelWarmerSkipsAResidentPortalShapedAgentModel: the warmer asks a
+// server_agent application in the shape the portal stores through the agent
+// router's /running, so a model that already runs is not warmed.
+func TestModelWarmerSkipsAResidentPortalShapedAgentModel(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	f := newFakeAgentRouter(t, fakeAgentRouterOpts{running: []string{"qwen"}})
+	tgt := portalShapedAgentTarget(f)
+	server, app := tgt.server, tgt.app
+	server.Provider, server.Endpoint, server.Status, server.HealthStatus = routing.ProviderMock, "mock://srv1", routing.ServerStatusActive, routing.HealthHealthy
+	server.CreatedAt, server.UpdatedAt, app.CreatedAt, app.UpdatedAt = now, now, now, now
+	mem := routing.NewMemoryStore()
+	if err := mem.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := mem.CreateApplication(ctx, app); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map1", ApplicationID: app.ID, GatewayModelName: "warm-agent", AppModelName: "qwen", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "rs_map1", MappingID: "map1", Enabled: true, Binary: "/opt/bin/llama-server", Args: "[]", Env: "{}", APIFlavors: []string{routing.APIFlavorOpenAI}, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	w := newModelWarmer(&Server{Provider: newFakeAgentProvider(), Routes: mem})
+
+	w.Warm(ctx, "warm-agent")
+	waitWarmIdle(t, w, "warm-agent")
+
+	if got := fakeAgentPaths(f.requests()); !slices.Equal(got, []string{"GET /running"}) {
+		t.Fatalf("requests = %v, want exactly [GET /running]: a resident model is not warmed", got)
 	}
 }
 
@@ -171,4 +206,79 @@ func TestModelWarmerSkipsAnImagesOnlyAgentChild(t *testing.T) {
 	if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-shared-text" {
 		t.Fatalf("streamed = %v, want exactly [up-shared-text] (the text sibling)", got)
 	}
+}
+
+// warmerTwoServerStore seeds two mock servers, srv-a and srv-b, each with one
+// openai application. The gateway model "twin" has a mapping on each server:
+// map-a -> "up-a" on srv-a, which ActiveMappingsForModel returns first, and
+// map-b -> "up-b" on srv-b. The gateway model "solo" has a single mapping,
+// map-c -> "up-solo" on srv-a.
+func warmerTwoServerStore(t *testing.T) *routing.MemoryStore {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	for i, srvID := range []string{"srv-a", "srv-b"} {
+		if err := mem.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".example.test", Provider: routing.ProviderMock, Endpoint: "mock://" + srvID, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer %s: %v", srvID, err)
+		}
+		if err := mem.CreateApplication(ctx, routing.Application{ID: "app-" + srvID, ServerID: srvID, Type: routing.ProviderMock, Port: 8100 + i, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication %s: %v", srvID, err)
+		}
+	}
+	for _, m := range []struct{ id, appID, gateway, upstream string }{
+		{"map-a", "app-srv-a", "twin", "up-a"},
+		{"map-b", "app-srv-b", "twin", "up-b"},
+		{"map-c", "app-srv-a", "solo", "up-solo"},
+	} {
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: m.id, ApplicationID: m.appID, GatewayModelName: m.gateway, AppModelName: m.upstream, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", m.id, err)
+		}
+	}
+	return mem
+}
+
+// TestModelWarmerSkipsAServerWithABenchmark: routing sends no request to a
+// server a benchmark holds, so the warmer must not load a model there either.
+// With the first candidate's server reserved, the warm goes to the candidate
+// on the other server; with the only candidate's server reserved, nothing is
+// streamed.
+func TestModelWarmerSkipsAServerWithABenchmark(t *testing.T) {
+	reserve := func(t *testing.T, serverID string) *BenchmarkRegistry {
+		t.Helper()
+		reg := NewBenchmarkRegistry()
+		if _, ok := reg.TryStart(serverID, "server", "speed", 1, time.Now(), func() {}); !ok {
+			t.Fatalf("TryStart(%s) refused", serverID)
+		}
+		return reg
+	}
+
+	t.Run("the candidate on the other server is warmed", func(t *testing.T) {
+		mem := warmerTwoServerStore(t)
+		cands, err := mem.ActiveMappingsForModel(context.Background(), "twin", routing.APIFlavorOpenAI)
+		if err != nil || len(cands) != 2 || cands[0].Server.ID != "srv-a" {
+			t.Fatalf("seed: candidates = %+v, err = %v; want two, srv-a first", cands, err)
+		}
+		fake := newColdLister(nil)
+		w := newModelWarmer(&Server{Provider: fake, Routes: mem, Benchmarks: reserve(t, "srv-a")})
+
+		w.Warm(context.Background(), "twin")
+		waitWarmIdle(t, w, "twin")
+
+		if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-b" {
+			t.Fatalf("streamed = %v, want exactly [up-b] (srv-a is reserved)", got)
+		}
+	})
+
+	t.Run("a single candidate on a reserved server is not warmed", func(t *testing.T) {
+		fake := newColdLister(nil)
+		w := newModelWarmer(&Server{Provider: fake, Routes: warmerTwoServerStore(t), Benchmarks: reserve(t, "srv-a")})
+
+		w.Warm(context.Background(), "solo")
+		waitWarmIdle(t, w, "solo")
+
+		if got := fake.streamedModels(); len(got) != 0 {
+			t.Fatalf("streamed = %v, want nothing on a reserved server", got)
+		}
+	})
 }

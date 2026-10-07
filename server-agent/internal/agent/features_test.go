@@ -276,9 +276,11 @@ func TestFeaturesDeclareRuntimeEnsure(t *testing.T) {
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
-	// followed. 0.8.0 is MINOR because agent.Features gains runtime_ensure
-	// (see the Version constant's own block).
-	if Version != "0.8.0" {
-		t.Fatalf("Version = %q, want 0.8.0 (agent.Features gains runtime_ensure, so the bump from 0.7.4 is MINOR)", Version)
+	// followed. 0.8.0 was MINOR because agent.Features gained
+	// runtime_ensure; 0.8.1 is PATCH because it gains nothing (see the
+	// Version constant's own block). runtime_ensure's Since stays 0.8.0: a
+	// Since records the version a feature shipped in.
+	if Version != "0.8.1" {
+		t.Fatalf("Version = %q, want 0.8.1 (agent.Features gains no entry, so the bump from 0.8.0 is PATCH)", Version)
 	}
 }

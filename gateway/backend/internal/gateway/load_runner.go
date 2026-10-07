@@ -66,22 +66,28 @@ func (s *Server) runLoadModel(ctx context.Context, run *benchmarkRun, serverID s
 // as vramWarningFirstGenerationNotMeasured.
 //
 // THE alreadyResident RETURN IS A CONTAMINATION SIGNAL, not a convenience.
-// The core short-circuits on a resident model, so a caller that has just
-// confirmed the model STOPPED and still gets true is being told that
-// something it could not stop is serving that model. The load run ignores the
-// value (it only wants the model up); the VRAM run reports inconclusive on
-// it, because a delta measured against a baseline that already contains the
-// model is a definitive ~0.
+// The core short-circuits on a resident model: it returns without loading or
+// generating. The load run ignores the value (it only wants the model up).
+// The VRAM run gets true only after a confirmed drain, when the probe still
+// lists the target after the run cleared its override and before it loaded
+// anything. With the default probe, the agent router's /running, which lists
+// only the agent's own running children, the target's own child is up again:
+// a request reached the router, or a pinned target restarted at the clear. An
+// API-set loaded_models_path replaces /running and answers whatever that path
+// lists. The run then has no load of its own to measure, so it reports
+// inconclusive and no delta.
 //
 // residencyProbed IS THE OTHER HALF OF THAT SIGNAL, and it exists because
 // "not resident" and "could not tell" are not the same answer. The probe
-// needs an application-level loaded_models_path (operator-entered, no
-// default) and a mapping-level app model name, and it can fail outright -- and
-// in each of those cases alreadyResident is false for a model that may well
-// be resident. A caller that treats the signal as load-bearing has to know
+// needs a loaded-models path (routing.EffectiveLoadedModelsProbe: a
+// server_agent application always has the agent router's /running, any other
+// application only an operator-entered loaded_models_path) and a
+// mapping-level app model name, and it can fail outright -- and in each of
+// those cases alreadyResident is false for a model that may well be
+// resident. A caller that treats the signal as load-bearing has to know
 // which of the two it got: the VRAM run reports the unavailability as a
-// caveat, because otherwise the contamination surfaces as a sub-floor delta
-// whose stated next action can never work.
+// caveat, because otherwise "not resident" would stand in for an answer it
+// never got.
 func (s *Server) ensureResidentForRun(ctx context.Context, tgt benchmarkTarget) (alreadyResident, residencyProbed bool, err error) {
 	target, req := benchmarkTargetReq(tgt)
 	req.MaxTokens = 1 // minimal — we only want the model loaded
@@ -289,17 +295,24 @@ func loadEnsureHint(code string, spec routing.RuntimeSpec) string {
 // modelResident best-effort reports whether tgt's upstream model is already
 // loaded on tgt's server, and whether the question was ANSWERED at all.
 //
+// It asks the loaded-models path routing.EffectiveLoadedModelsProbe resolves:
+// a server_agent application always has one, the agent router's /running
+// (unless an API-set loaded_models_path overrides it), and any other
+// application only its operator-entered loaded_models_path. The Load, the VRAM
+// run and the model warmer all ask through here.
+//
 // probed is false when there is nothing to ask (no LoadedModelLister, no
-// application loaded_models_path, no mapping app model name) or when the ask
-// failed. resident is then false as well, but it is false the way an
-// unanswered question is false -- see ensureResidentForRun's residencyProbed.
+// loaded-models path, no mapping app model name) or when the ask failed.
+// resident is then false as well, but it is false the way an unanswered
+// question is false -- see ensureResidentForRun's residencyProbed.
 func (s *Server) modelResident(ctx context.Context, target routing.Target, tgt benchmarkTarget) (resident, probed bool) {
+	path, format := routing.EffectiveLoadedModelsProbe(tgt.app)
 	lister, ok := s.Provider.(provider.LoadedModelLister)
-	if !ok || strings.TrimSpace(tgt.app.LoadedModelsPath) == "" || strings.TrimSpace(tgt.mapping.AppModelName) == "" {
+	if !ok || strings.TrimSpace(path) == "" || strings.TrimSpace(tgt.mapping.AppModelName) == "" {
 		return false, false
 	}
 	probeCtx := s.upstreamAuthCtx(ctx, target)
-	loaded, err := modelLoaded(probeCtx, lister, target, tgt.app, tgt.mapping.AppModelName)
+	loaded, err := modelLoaded(probeCtx, lister, target, path, format, tgt.mapping.AppModelName)
 	if err != nil {
 		return false, false
 	}
@@ -309,6 +322,12 @@ func (s *Server) modelResident(ctx context.Context, target routing.Target, tgt b
 // reflectLoadedAfterLoad best-effort re-probes the app's loaded set and writes it to the gateway-poll
 // registry, so the model-servers SSE flips the row to loaded immediately instead of waiting for the
 // next health-poll pass. No-op when the app has no loaded-models endpoint / no registry.
+//
+// It reads the application's own loaded_models_path, not routing.EffectiveLoadedModelsProbe, like
+// the health loop's loaded pass: both write the loaded-model registry, and for a server_agent
+// application the agent's report is the truth there. LoadedAppModels ignores an empty agent report,
+// so a one-shot gateway-poll entry for an agent application would stay "loaded" for as long as the
+// agent reports nothing loaded.
 func (s *Server) reflectLoadedAfterLoad(ctx context.Context, target routing.Target, tgt benchmarkTarget) {
 	if s.LoadedModels == nil {
 		return

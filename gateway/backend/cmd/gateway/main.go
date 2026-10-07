@@ -423,6 +423,12 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetBenchmarkReservationHook != nil {
 		deps.SetBenchmarkReservationHook(srv.Benchmarks.ServerBusy)
 	}
+	// Settle what a benchmark run left behind when the process died: the
+	// force_stopped overrides and lifted pins it recorded in the override
+	// lease. Synchronous, and before the scheduler and the listeners start, so
+	// no run and no operator write can interleave; no agent is connected yet,
+	// so an agent sees only the final document.
+	srv.ReconcileBenchmarkOverrideLeases(context.Background())
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the

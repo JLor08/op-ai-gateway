@@ -483,7 +483,11 @@ the repository:
 
 Deliberate limits: attribution is by **line**, so a finding your change causes
 elsewhere without touching that line is not attributed, and coverage is not
-considered — for those, read the quality gate itself.
+considered — for those, read the quality gate itself. `go:S3776` (cognitive
+complexity) anchors its finding on the function's declaration line, so a body
+that grows past the threshold under an unchanged signature is not attributed
+either: re-derive each changed function's score with `gocognit`, the
+`origin/main` blob against the branch's.
 
 Operational notes (encoded in `sonar-project.properties` comments):
 

@@ -125,8 +125,9 @@ type Driver struct {
 	logs *LogStore
 
 	// syncMu serializes Sync's body. internal/agent's own triggerRuntimeSync
-	// already single-flights calls via CompareAndSwap (this package's
-	// trigger pattern is the AGENT's, not this Driver's own -- see the
+	// already runs at most one Sync at a time (a single-flight that owes one
+	// trailing sync to a wake arriving during it; this package's trigger
+	// pattern is the AGENT's, not this Driver's own -- see the
 	// package doc), but Sync is exported and directly callable by any
 	// future caller (as driver_test.go does), so this guards against two
 	// Syncs racing each other's applied/active bookkeeping and router

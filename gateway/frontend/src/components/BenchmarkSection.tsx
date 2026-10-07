@@ -119,22 +119,26 @@ function vramMb(value: number | undefined): string {
  * what it measured (or WHY it reached no number), and which launch specs it
  * force-stopped.
  *
- * Three rules are in the markup rather than only in the comments:
+ * Four rules are in the markup rather than only in the comments:
  *
  *  - an INCONCLUSIVE report renders its reason as the next action and NO
  *    table. It is a first-class outcome, not an error and not a zero, so there
  *    is deliberately no cell that could read "0 MB";
  *  - `delta_mb` and `measured_mb` stand side by side in two columns and are
  *    never averaged: they are different quantities (see the DTO);
- *  - the drained set is always named. If the gateway dies between the drain and
- *    the restore, those specs stay `force_stopped` until an operator clears
- *    them by hand, and this list plus `restore_failed` is the only place they
- *    are ever told which ones;
+ *  - the drained set is always named: every spec the drain wrote or may have
+ *    written. If the gateway dies between the drain and the restore, the
+ *    stopped ones stay `force_stopped` until it starts again and
+ *    clears the overrides its benchmark override lease names, and until then
+ *    this list plus `restore_failed` is the only place an operator is ever
+ *    told which ones;
  *  - `restore_failed` and `restore_taken_over` get DIFFERENT alerts, because
- *    they are different instructions. Only the first names specs that are
- *    still `force_stopped`; the second names specs whose override somebody
- *    else set during the run, and telling an operator to clear those by hand
- *    would stop a model they had just deliberately started.
+ *    they are different instructions. Only the first names specs that may
+ *    still be `force_stopped`; the second names specs that were not
+ *    `force_stopped` at the restore (the run's own writes never stored it or
+ *    already cleared it, or a writer the run's reservation does not hold off
+ *    changed the override), and telling an operator to clear those by hand
+ *    would name an override that is not there, or is not the run's.
  */
 function VramReportView({
   t,
@@ -238,9 +242,9 @@ function VramReportView({
       )}
       {/*
         A takeover is NOT the failure above and must not read like it: these
-        specs are no longer force_stopped, so "clear them by hand" would stop a
-        model the operator had just deliberately started. Severity "info", and
-        its own sentence.
+        specs were not force_stopped at the restore, so "clear them by hand"
+        would name an override that is not there, or is not the run's.
+        Severity "info", and its own sentence.
       */}
       {restoreTakenOver.length > 0 && (
         <Alert severity="info">
@@ -289,7 +293,9 @@ function VramOutcome({ t, result }: Readonly<{ t: Translation; result: Benchmark
 
 /** One result line: a skip takes priority (a skipped result's numbers are
  * zeros, not a measurement), then an error, then a vision-capability probe
- * result, then a capacity-ramp result, else the plain speed reading. */
+ * result, then a capacity-ramp result, else the plain speed reading. A load
+ * time of 0 in that reading means the run measured none, so it reads as not
+ * measured, never as 0 ms. */
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.error) return r.error;
@@ -299,14 +305,16 @@ function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.max_concurrency) {
     return `${t.benchmarkMaxConcurrency} ${r.max_concurrency}, ${t.benchmarkRecommendedConcurrency} ${r.recommended_concurrency}`;
   }
-  return `${r.gen_tokens_per_second} tok/s, ${r.load_time_ms} ms`;
+  const load = r.load_time_ms > 0 ? `${r.load_time_ms} ms` : t.benchmarkResultLoadTimeNotMeasured;
+  return `${r.gen_tokens_per_second} tok/s, ${load}`;
 }
 
 /**
  * The live-progress panel — MOVED verbatim from MappingSection's inline panel
  * (the done/total header + current_concurrency + one line per per-model result),
  * re-homed to read from a `status: BenchmarkStatus` prop instead of MappingSection
- * state. Renders only while `status.running`.
+ * state. Renders only while `status.running`. The specs the run unpinned and
+ * the ones it stopped are named at its top (`PinNotice`).
  */
 function RunningPanel({ t, status }: Readonly<{ t: Translation; status: BenchmarkStatus }>) {
   return (
@@ -321,6 +329,7 @@ function RunningPanel({ t, status }: Readonly<{ t: Translation; status: Benchmar
         bgcolor: 'action.hover',
       }}
     >
+      <PinNotice t={t} status={status} />
       <Typography variant="subtitle2" component="h3">
         {t.benchmarkLive} — {t.benchmarkProgress}: {status.done}/{status.total}
         {status.current_concurrency
@@ -381,6 +390,75 @@ function UnmeasuredNotice({
       ))}
     </Box>
   );
+}
+
+/** One alert that names launch spec ids, one line each; nothing for none. */
+function SpecIdsAlert({
+  severity,
+  text,
+  ids,
+}: Readonly<{ severity: 'info' | 'warning'; text: string; ids: readonly string[] }>) {
+  if (ids.length === 0) return null;
+  return (
+    <Alert severity={severity} sx={{ mb: 1.5 }}>
+      <Typography variant="body2">{text}</Typography>
+      {ids.map((id) => (
+        <Typography key={id} variant="body2">
+          {id}
+        </Typography>
+      ))}
+    </Alert>
+  );
+}
+
+/**
+ * What a manual speed or both run did to the server's other models, named by
+ * launch spec id like the VRAM report's drained list. An unpin is never
+ * silent: while the run is live this names the specs it unpinned for its
+ * duration and the ones it stopped (or tried to) before a measurement. After
+ * the run the unpinned set splits into the specs pinned again (info; its text
+ * excepts any spec deleted during the run or whose application is no longer
+ * server_agent, which the re-pin finds gone and `repin_failed` does not name)
+ * and the ones the run could not pin again (`repin_failed`, a warning: they
+ * may still be unpinned, so an operator checks and pins them by hand), and the
+ * stopped specs stay named, because the ones among them that are not pinned
+ * start again only on their next request. Each list is its own alert, and an
+ * empty or absent list renders nothing.
+ */
+function PinNotice({ t, status }: Readonly<{ t: Translation; status: BenchmarkStatus }>) {
+  const unpinned = status.unpinned_spec_ids ?? [];
+  const repinFailed = status.repin_failed ?? [];
+  const stopped = status.stopped_spec_ids ?? [];
+  if (status.running) {
+    return (
+      <>
+        <SpecIdsAlert severity="info" text={t.benchmarkUnpinnedDuringRun} ids={unpinned} />
+        <SpecIdsAlert severity="info" text={t.benchmarkStoppedForMeasurement} ids={stopped} />
+      </>
+    );
+  }
+  const pinnedAgain = unpinned.filter((id) => !repinFailed.includes(id));
+  return (
+    <>
+      <SpecIdsAlert severity="info" text={t.benchmarkUnpinnedAfterRun} ids={pinnedAgain} />
+      <SpecIdsAlert severity="warning" text={t.benchmarkRepinFailed} ids={repinFailed} />
+      <SpecIdsAlert severity="info" text={t.benchmarkStoppedForMeasurement} ids={stopped} />
+    </>
+  );
+}
+
+/**
+ * A FINISHED run's `PinNotice`, shown where the live panel was. The panel,
+ * and the notice at its top, close the moment `running` flips false. This one
+ * has its own condition and does not sit inside `UnmeasuredNotice`: a run
+ * that measured every mapping can still have unpinned and stopped specs.
+ */
+function FinishedPinNotice({
+  t,
+  status,
+}: Readonly<{ t: Translation; status: BenchmarkStatus | null }>) {
+  if (!status || status.running) return null;
+  return <PinNotice t={t} status={status} />;
 }
 
 /**
@@ -809,6 +887,7 @@ export function BenchmarkSection({
         <VramOutcome key={r.mapping_id} t={t} result={r} />
       ))}
       {unmeasuredResults.length > 0 && <UnmeasuredNotice t={t} results={unmeasuredResults} />}
+      <FinishedPinNotice t={t} status={liveStatus} />
       {running ? (
         <RunningPanel t={t} status={liveStatus!} />
       ) : (

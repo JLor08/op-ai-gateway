@@ -45,13 +45,13 @@ import "testing"
 //     can reach a stored Type, by two DIFFERENT mechanisms and not by one
 //     shared one: portal.normalizeApplicationType trims inside its own switch
 //     (it switches over strings.TrimSpace(raw)), whereas
-//     portal.validRuntimeSpecType trims nothing -- portal.putRuntimeSpec, the
-//     only function that calls it, binds specType from
-//     strings.TrimSpace(req.Type) before validating it and stores that same
-//     trimmed local as the spec's Type. Its own doc comment says "callers pass
-//     req.Type through untouched", which is about the EMPTY value being a
-//     legitimate stored kind, not about whitespace; reading it as "it trims"
-//     is the trap.
+//     portal.validRuntimeSpecType trims nothing -- portal.validateRuntimeSpecShape,
+//     the only function that calls it, binds specType from
+//     strings.TrimSpace(req.Type) before validating it, and the runtime-spec
+//     write stores that same trimmed value as the spec's Type. Its own doc
+//     comment says "callers pass req.Type through untouched", which is about
+//     the EMPTY value being a legitimate stored kind, not about whitespace;
+//     reading it as "it trims" is the trap.
 func TestLiveTimingsCapableKind(t *testing.T) {
 	cases := []struct {
 		kind string

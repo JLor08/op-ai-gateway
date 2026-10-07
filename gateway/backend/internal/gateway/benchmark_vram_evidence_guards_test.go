@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/routing"
 	"testing"
 	"time"
@@ -257,30 +258,36 @@ func TestVRAMRunNoWatchedCardIsInconclusiveNotZero(t *testing.T) {
 
 // --- a contamination check that could not be made --------------------------
 
+// vramListErrProvider is the VRAM fixture's provider with a loaded-models
+// probe that fails, so the run's already_resident question goes unanswered.
+type vramListErrProvider struct{ *vramFakeProvider }
+
+func (vramListErrProvider) LoadedModels(context.Context, routing.Target, string, string) ([]string, error) {
+	return nil, errors.New("loaded-models probe failed")
+}
+
 // TestVRAMRunSaysWhenItCouldNotCheckForContamination is the honesty half of
 // the already_resident signal: it is documented as load-bearing ("a
-// contamination SIGNAL, not a convenience"), and on most agent-managed
-// applications it cannot fire at all.
+// contamination SIGNAL, not a convenience"), and it can go unanswered.
 //
 // modelResident answers false when the provider is no LoadedModelLister, when
-// the application has no loaded_models_path (operator-entered, with NO
-// default -- so it is empty unless somebody filled it in, and the child of a
-// server_agent application sits behind the agent's router), when the mapping
-// has no app model name, or on any probe error. ensureResidentForRun then
-// reported alreadyResident=false, the run measured through the contamination,
-// the baseline already contained the model, and the ~0 delta fell out at the
-// floor gate as `below_floor` -- whose next action is "the window missed the
-// allocation, measure again when the server is quiet", which fails
-// identically every time. The reason an operator needed was
-// already_resident's: something the gateway cannot stop is serving this model.
+// the application has no loaded-models path (a server_agent application always
+// has the agent router's /running; any other application only an
+// operator-entered loaded_models_path), when the mapping has no app model
+// name, or on any probe error. ensureResidentForRun then reports
+// alreadyResident=false, and the run loads and measures the target without
+// knowing whether the target's own child was already up again, which is what
+// already_resident would have said.
 //
 // A signal that is unavailable must be REPORTED as unavailable, so the run
-// carries the caveat rather than letting a wrong reason stand in for it.
+// carries the caveat rather than letting "not resident" stand in for an
+// answer it never got.
 func TestVRAMRunSaysWhenItCouldNotCheckForContamination(t *testing.T) {
-	t.Run("the target application has no loaded-models probe", func(t *testing.T) {
+	t.Run("the loaded-models probe errored", func(t *testing.T) {
 		f := newVRAMFixture(t, vramFixtureOpts{})
 		f.seedLatestSample()
 		f.drive(t)
+		f.srv.Provider = vramListErrProvider{f.provider}
 		f.provider.onStream = func() { f.used0.Store(21500 * oneMiB) }
 
 		res := vramOneResult(t, f.run(t))

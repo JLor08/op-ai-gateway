@@ -32,6 +32,7 @@ type API interface {
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
+	BenchmarkOverrideLeases(context.Context) (map[string]BenchmarkOverrideLease, error)
 	CaptureDetail(auth.Token, string) (CaptureDetail, error)
 	CertEdgeRequireHTTPSChecked(context.Context) bool
 	CertMeshRequireTLSChecked(context.Context) bool
@@ -176,7 +177,10 @@ type API interface {
 	ServerPerfHistory(context.Context, auth.Token, string, time.Duration) ([]routing.TelemetrySample, error)
 	ServerRuntimeReportView(context.Context, auth.Token, string) (ServerRuntimeReportViewDTO, error)
 	ServiceAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	SetBenchmarkOverrideLease(context.Context, string, BenchmarkOverrideLease) error
 	SetBenchmarkRuntimeSpecAdminState(context.Context, string, string, string) (RuntimeSpecDTO, error)
+	SetBenchmarkRuntimeSpecsAdminState(context.Context, []string, string, string) (BenchmarkSpecsOutcome, error)
+	SetBenchmarkRuntimeSpecsPinned(context.Context, []string, bool, bool) (BenchmarkSpecsOutcome, error)
 	SetCaptureSecret(auth.Token, string, bool) error
 	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
 	SetManagerPermissions(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool) error

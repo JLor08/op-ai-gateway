@@ -330,6 +330,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByRole('button', { name: t.benchmarkStart })).not.toBeInTheDocument();
     });
 
+    // A load_time_ms of 0 means the run measured no load time, not a load of
+    // 0 ms, so the line names it as not measured.
+    it('says the load time was not measured when a result carries load_time_ms 0', async () => {
+      const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+        onStatus({
+          running: true,
+          server_id: 'srv_1',
+          scope: 'application',
+          total: 2,
+          done: 1,
+          results: [
+            {
+              mapping_id: 'm1',
+              gateway_model_name: 'gw',
+              gen_tokens_per_second: 42,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+            },
+          ],
+        });
+        return () => {};
+      }) as unknown as PortalApi['subscribeBenchmark'];
+
+      renderSection({ kind: 'server' }, { subscribeBenchmark });
+
+      const line =
+        locale === 'de'
+          ? 'gw: 42 tok/s, Ladezeit nicht gemessen'
+          : 'gw: 42 tok/s, load time not measured';
+      expect(await screen.findByText(line)).toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s, 0 ms/)).not.toBeInTheDocument();
+    });
+
     it('shows ONLY the vision verdict for a vision result row — no meaningless speed metrics', async () => {
       const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
         onStatus({
@@ -722,9 +755,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText('21000')).toBeInTheDocument();
       expect(screen.getByText(t.benchmarkVramFingerprintUuid)).toBeInTheDocument();
       // The named risk: what the run force-stopped is on screen, so an operator
-      // whose gateway died mid-run knows which specs to clear by hand.
+      // whose gateway died mid-run knows which specs stay stopped until it
+      // starts again.
       expect(screen.getByText(/spec_a/)).toHaveTextContent('spec_b');
       expect(screen.getByText(t.benchmarkVramDrainedNote)).toBeInTheDocument();
+    });
+
+    // The run records its drain in the benchmark override lease, which the
+    // gateway settles when it starts again. So the drained note names that
+    // remedy instead of sending the operator to clear the overrides by hand,
+    // while a restore that FAILED may still need a hand and says that the
+    // gateway retries it as well.
+    it('says a drain left behind is cleared when the gateway starts again, and a failed restore by hand', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_1', name: 'gw-model' },
+        {
+          ...withMapping,
+          ...finishedVramRun({
+            vram: vramReport({
+              drained_spec_ids: ['spec_a', 'spec_b'],
+              restore_failed: ['spec_b'],
+            }),
+          }),
+        },
+      );
+      const note = await screen.findByText(t.benchmarkVramDrainedNote);
+      expect(note).not.toHaveTextContent(/von Hand|by hand/);
+      expect(note).toHaveTextContent(locale === 'de' ? /wieder startet/ : /starts again/);
+      const failed = screen.getByText(t.benchmarkVramRestoreFailed, { exact: false });
+      expect(failed).toHaveTextContent('spec_b');
+      expect(failed).toHaveTextContent(locale === 'de' ? /von Hand/ : /by hand/);
+      expect(failed).toHaveTextContent(locale === 'de' ? /nächsten Start/ : /next start/);
     });
 
     it('says WHICH proof the isolation rested on', async () => {
@@ -775,9 +836,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.benchmarkVramRestoreTakenOver, { exact: false })).toBeNull();
     });
 
-    // A spec whose override somebody TOOK OVER mid-run is not a spec that was
-    // left force_stopped, and it must not read like one: "clear these by hand"
-    // would stop a model the operator had just deliberately started.
+    // A spec the restore found TAKEN OVER (it was not force_stopped at the
+    // restore) is not a spec that was left force_stopped, and it must not read
+    // like one: "clear these by hand" would name an override that is not
+    // there, or is not the run's.
     it('separates a taken-over override from one it could not restore', async () => {
       renderSection(
         { kind: 'mapping', id: 'map_1', name: 'gw-model' },
@@ -1164,6 +1226,155 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       } finally {
         warn.mockRestore();
       }
+    });
+  });
+
+  // A manual speed or both run unpins the server's pinned specs for its
+  // duration and stops every running one before each measurement. Neither is
+  // silent: the live panel names both sets, and once the run has finished the
+  // area names the specs pinned again, the ones that could not be pinned
+  // again (a warning: they may still be unpinned until an operator pins
+  // them), and the stopped ones, whether or not any mapping went unmeasured.
+  describe(`BenchmarkSection unpin and stop notices [${locale}]`, { timeout: 15_000 }, () => {
+    const measured: BenchmarkResult = {
+      mapping_id: 'map_1',
+      gateway_model_name: 'gw-model',
+      gen_tokens_per_second: 42,
+      prompt_tokens_per_second: 0,
+      load_time_ms: 1000,
+    };
+
+    function delivering(status: Partial<BenchmarkStatus>): Overrides {
+      return {
+        subscribeBenchmark: vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+          onStatus({ ...idle, scope: 'application', mode: 'speed', ...status });
+          return () => {};
+        }) as unknown as PortalApi['subscribeBenchmark'],
+      };
+    }
+
+    // The alert whose first line is `text`, and the spec ids it names, one per
+    // line.
+    function alertWith(text: string, container: HTMLElement = document.body): HTMLElement {
+      const alert = within(container).getByText(text).closest<HTMLElement>('[role="alert"]');
+      if (alert === null) throw new Error(`no alert carries: ${text}`);
+      return alert;
+    }
+    function namedIds(alert: HTMLElement): string[] {
+      return within(alert)
+        .getAllByText(/^rs_/)
+        .map((node) => node.textContent ?? '');
+    }
+
+    it('names the unpinned and the stopped specs at the top of the live panel', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: true,
+          total: 2,
+          done: 1,
+          results: [measured],
+          unpinned_spec_ids: ['rs_a', 'rs_b'],
+          stopped_spec_ids: ['rs_a', 'rs_c'],
+        }),
+      );
+      const panel = await screen.findByLabelText(t.benchmarkLive);
+
+      const unpinned = alertWith(t.benchmarkUnpinnedDuringRun, panel);
+      expect(unpinned).toHaveClass('MuiAlert-colorInfo');
+      expect(namedIds(unpinned)).toEqual(['rs_a', 'rs_b']);
+      const stopped = alertWith(t.benchmarkStoppedForMeasurement, panel);
+      expect(stopped).toHaveClass('MuiAlert-colorInfo');
+      expect(namedIds(stopped)).toEqual(['rs_a', 'rs_c']);
+      // At the top of the panel, and only there while the run is live.
+      expect(panel.firstElementChild).toBe(unpinned);
+      expect(screen.getAllByText(t.benchmarkUnpinnedDuringRun)).toHaveLength(1);
+      expect(screen.queryByText(t.benchmarkUnpinnedAfterRun)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.benchmarkRepinFailed)).not.toBeInTheDocument();
+    });
+
+    it('names the pinned-again, the not-pinned-again and the stopped specs after the run', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: false,
+          total: 1,
+          done: 1,
+          results: [measured],
+          unpinned_spec_ids: ['rs_a', 'rs_b'],
+          repin_failed: ['rs_b'],
+          stopped_spec_ids: ['rs_c'],
+        }),
+      );
+      await screen.findByRole('button', { name: t.benchmarkStart });
+      expect(screen.queryByLabelText(t.benchmarkLive)).not.toBeInTheDocument();
+      // Every mapping was measured, so there is no unmeasured notice to sit in.
+      expect(screen.queryByLabelText(t.benchmarkNotMeasured)).not.toBeInTheDocument();
+
+      const pinnedAgain = alertWith(t.benchmarkUnpinnedAfterRun);
+      expect(pinnedAgain).toHaveClass('MuiAlert-colorInfo');
+      expect(namedIds(pinnedAgain)).toEqual(['rs_a']);
+      const repinFailed = alertWith(t.benchmarkRepinFailed);
+      expect(repinFailed).toHaveClass('MuiAlert-colorWarning');
+      expect(namedIds(repinFailed)).toEqual(['rs_b']);
+      const stopped = alertWith(t.benchmarkStoppedForMeasurement);
+      expect(stopped).toHaveClass('MuiAlert-colorInfo');
+      expect(namedIds(stopped)).toEqual(['rs_c']);
+      expect(screen.queryByText(t.benchmarkUnpinnedDuringRun)).not.toBeInTheDocument();
+    });
+
+    // Each of the three lists shows the finished notice on its own.
+    const singleLists: {
+      field: string;
+      lists: Partial<BenchmarkStatus>;
+      key: 'benchmarkUnpinnedAfterRun' | 'benchmarkRepinFailed' | 'benchmarkStoppedForMeasurement';
+    }[] = [
+      {
+        field: 'unpinned_spec_ids',
+        lists: { unpinned_spec_ids: ['rs_a'] },
+        key: 'benchmarkUnpinnedAfterRun',
+      },
+      { field: 'repin_failed', lists: { repin_failed: ['rs_a'] }, key: 'benchmarkRepinFailed' },
+      {
+        field: 'stopped_spec_ids',
+        lists: { stopped_spec_ids: ['rs_a'] },
+        key: 'benchmarkStoppedForMeasurement',
+      },
+    ];
+    it.each(singleLists)('shows the finished notice for $field alone', async ({ lists, key }) => {
+      renderSection(
+        { kind: 'server' },
+        delivering({ running: false, total: 1, done: 1, results: [measured], ...lists }),
+      );
+      await screen.findByRole('button', { name: t.benchmarkStart });
+      expect(namedIds(alertWith(t[key]))).toEqual(['rs_a']);
+      expect(screen.getAllByRole('alert')).toHaveLength(1);
+    });
+
+    it('shows no notice for a run that unpinned and stopped nothing', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: false,
+          total: 1,
+          done: 1,
+          results: [measured],
+          unpinned_spec_ids: [],
+          repin_failed: [],
+          stopped_spec_ids: [],
+        }),
+      );
+      await screen.findByRole('button', { name: t.benchmarkStart });
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
+    });
+
+    it('shows no notice in the live panel of a run that unpinned and stopped nothing', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({ running: true, total: 2, done: 1, results: [measured], stopped_spec_ids: [] }),
+      );
+      await screen.findByLabelText(t.benchmarkLive);
+      expect(screen.queryAllByRole('alert')).toHaveLength(0);
     });
   });
 }

@@ -853,20 +853,60 @@ What the resolved paths are actually *used for* — the per-child probe cycle
 itself, and the three sample fields it fills — is [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)
 below.
 
-**This makes three of a `server_agent` application's own gateway-side probe
-fields redundant for it, and the portal treats them as such.** An ordinary
-application's `context_probe_path`/`loaded_models_path`/
+**A `server_agent` application's three gateway-side probe fields are cleared
+by the portal, and the gateway derives their effective values itself.** An
+ordinary application's `context_probe_path`/`loaded_models_path`/
 `loaded_models_format` drive the gateway's own app-level context probe and
 model-status poller against the application's single upstream (§7 of
-[Routing & Model Selection](routing-and-model-selection.md#7-model-selection-metrics));
-a `server_agent` application has no single upstream to probe that way — model
-discovery, loaded state and now context size all come from each managed
-child's own runtime spec instead. The application editor therefore
-**disables and clears** those three fields specifically for `type ===
-'server_agent'`, so a value left over from an earlier, different application
-type never lingers unread on the stored row. `capacity_probe_path` is the one
-sibling field this does **not** apply to: it stays backend-only (feeding the
-capacity benchmark, [Routing & Model Selection
+[Routing & Model Selection](routing-and-model-selection.md#7-model-selection-metrics)).
+A `server_agent` application has no single upstream to probe that way: its
+upstream is the agent's router, whose routes are fixed
+([§4.1](#41-control-routes)), and model discovery and context size come per
+model, from each managed child's own runtime spec. The application editor
+therefore **disables and clears** those three fields specifically for
+`type === 'server_agent'`, so a value left over from an earlier, different
+application type never lingers unread on the stored row. Two pure resolvers
+in `internal/routing/application_probes.go` supply what the fields would say:
+
+- `EffectiveLoadedModelsProbe` returns the stored `loaded_models_path` and
+  `loaded_models_format` when the path is set. Otherwise it returns
+  `/running` and `llama_swap` for a `server_agent` application, with no
+  feature gate, because every agent router serves that route. A failed ask
+  gives "cannot confirm", never a wrong answer.
+- `EffectiveContextProbePath` returns the stored `context_probe_path` when it
+  is set. Otherwise it returns `/upstream/{model}/props` for a `server_agent`
+  application whose agent declares `runtime_upstream_props`
+  ([§7](#7-feature-negotiation)), because an older router answers that probe
+  with 404 forever.
+- Neither knows the spec type. A child that is not llama.cpp answers the
+  router's `/props` passthrough with 404, and the benchmark then falls back to
+  the agent's own probe
+  ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
+
+The readers that go through the resolvers are the speed benchmark's cold
+check ([§11.9](#119-manual-runs-on-an-images-only-mapping)), the residency
+check the Load and the VRAM run share (`modelResident`,
+[§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)),
+the model warmer's skip-if-loaded check, the context-size read of the speed
+benchmark and of the standalone context probe (`startContextProbe`), and app
+health's `{model}` context pass. The two gateway-side writers of the
+loaded-model registry, the ones that probe for themselves, stay on the raw
+stored field: app health's loaded pass and the load core's
+`reflectLoadedAfterLoad` (the Load and the VRAM run). The third writer is the
+agent ingest, which stores the agent's own report (`SetAgentReport`). For a
+`server_agent` application the agent's own report is the registry's truth, and
+an entry from a one-shot gateway poll would stay "loaded" for as long as the
+agent reports an empty set.
+
+An application-level value set through the API still wins over the derived
+one. That is an API-only escape hatch, and the next save from the form clears
+it. The supported per-model override is the runtime spec's own
+`context_probe_path` (above), which the agent's own probe uses. The
+application DTO echoes only the stored values: the context source differs per
+spec and per agent feature, so no application-level value would be true.
+
+`capacity_probe_path` is the one sibling field this does **not** apply to: it
+stays backend-only (feeding the capacity benchmark, [Routing & Model Selection
 §6.1](routing-and-model-selection.md#61-cp1cp2--the-capacity-benchmark-engine))
 and was never surfaced in the application editor at all, for any application
 type.
@@ -1069,13 +1109,12 @@ fact about this runtime is, and why:
   prompts skip it too: the benchmark scheduler and the model warmer judge a
   mapping by its effective flavors ([Routing & Model Selection
   §7](routing-and-model-selection.md#7-model-selection-metrics)), and a speed
-  benchmark's cold pass never picks it as the sibling it streams to evict its
-  target. No run an operator starts by hand sends it one either: a context
+  benchmark's cold pass on a `server_agent` application streams to no sibling
+  at all. No run an operator starts by hand sends it one either: a context
   probe or a mapping-scope benchmark of such a mapping is refused with 409
   `benchmark.images_only`, an application- or server-scope benchmark skips it,
-  a cold pass passes it over as a sibling, and a Load or a VRAM probe starts
-  the child through the router's ensure route without generating, on an agent
-  that declares `runtime_ensure`
+  and a Load or a VRAM probe starts the child through the router's ensure
+  route without generating, on an agent that declares `runtime_ensure`
   ([§11.9](#119-manual-runs-on-an-images-only-mapping)).
   A spec that keeps `openai` stays a text candidate its
   upstream cannot serve, so an `sd-server` spec lists `openai_images` alone
@@ -1170,6 +1209,27 @@ must not read a 200 as evidence that any model process exists.
 `LoadedModelsFormat: "llama_swap"` detection works unchanged — and it is a
 second, independent source of loaded-state truth beside telemetry, not
 redundant with it.
+
+**The gateway reads `/running` and `/upstream/{model}/props` itself for a
+`server_agent` application**, through the resolvers of
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation), because
+the portal stores the application's own probe fields empty. `GET /running`
+answers the speed benchmark's cold check
+([§11.9](#119-manual-runs-on-an-images-only-mapping)), the residency check the
+Load and the VRAM run share
+([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+and the model warmer's skip-if-loaded check. `GET /upstream/{model}/props`
+answers the context-size read of the speed benchmark and of the standalone
+context probe (`startContextProbe`), beside app health's `{model}` pass
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)). That
+makes the benchmark a second consumer of
+[ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)'s
+passthrough, on the same terms: it attaches the mapping's own
+`routing.SpecUpstreamAuth` credential, and it asks only an agent that
+declares `runtime_upstream_props`. None of these reads starts a child or
+writes the loaded-model registry: `/running` is a status read, and the router
+answers `/upstream/{model}/props` for a cold child with
+`runtime.model_not_running` (§4.3).
 
 **`/upstream/{model}/props` is the router's first path-parameter dispatch —
 a new contract BESIDE §4.2's byte-for-byte body dispatch, not a change to
@@ -2098,7 +2158,11 @@ which is what actually bounds `starting`), the winner finishes loading and
 serves, and only then becomes evictable. This is **not** the same guard as
 `pinned`: `pinned` is permanent, while `starting` is a state every process
 passes through exactly once per generation and always leaves — healthy, start
-timeout, or exit.
+timeout, or exit. An unpinned winner that came up with no request of its own
+— a `force_running` spec, or an on-demand start whose callers all left while
+it loaded — is evictable the moment it is healthy, and no release follows, so a
+loser with a queued request, or a pinned one, is retried when that start
+finishes (below).
 
 **A spec evicted *for* another spec's queued request gives that spec first
 refusal on the freed slot.** The victim records who it was drained for, and
@@ -2116,13 +2180,30 @@ a `pinned` or `force_running` spec has no waiter at all, so a wake keyed on
 "has a pending request" would leave it Stopped after a `Wait` until some
 unrelated config `Apply` happened to retry it.
 
+**The retry when a start finishes is the one exception: it covers queued
+requests and pinned specs only** (`wakeAfterStart`, `manager.go`). A spec with
+a queued request comes up busy unless all its callers left while it loaded,
+and a pinned one is never evicted, so each exec this retry causes is for a
+queued request or a pinned spec, and the retry cannot loop without traffic. A
+`force_running` spec without a waiter is retried at the next release, exit or
+config `Apply`: two such specs that may not run together would otherwise evict
+each other at load speed, with no traffic at all. The retry runs after the
+start has served its own waiters, so a start that had them is busy when it
+decides, and a request queued for another spec waits for their release. An
+agent before 0.8.1 runs no retry there: a request queued behind an unpinned
+start without a waiter of its own waits for an unrelated release, exit or
+`Apply`, and fails at its `admission_wait_timeout_seconds` if none comes
+first, or waits until one comes or its caller gives up when that is `0`; a
+pinned spec behind such a start stays `stopped` until one comes.
+
 **`Admit` never returns a partial eviction list.** If any blocker anywhere in
 the pipeline is non-evictable — busy, or pinned outside the unknown-VRAM
 short-circuit — the whole decision becomes `Wait` with an empty evict set,
 because evicting only some blockers destroys running work for no admission gain.
 
-If everything blocking the candidate is busy or pinned, the request **queues**
-and is re-evaluated on every completion, failing at the spec's
+If everything blocking the candidate is busy, pinned or still loading, the
+request **queues** and is re-evaluated on every release, exit, config `Apply`
+and finished start, failing at the spec's
 `admission_wait_timeout_seconds` with `runtime.admission_blocked`. `0` means wait
 until the client disconnects — the same semantics as the gateway's
 `admission_queue_timeout_seconds`, and the reason `0` must not be read as "no
@@ -2214,8 +2295,9 @@ launch-affecting field of a running spec changes, its child is relaunched (see
 below). The **admission arithmetic** (per-GPU budgets, co-residency,
 `runtime_max_processes`) is not: it is evaluated only when a request arrives for
 a spec that is **not currently running**, plus a re-attempt for queued waiters
-when a release frees resources, and nothing re-evaluates it for processes
-already up. So:
+when a release or an exit frees resources, when a changed document is applied
+and when a start finishes, and nothing re-evaluates it for processes already
+up. So:
 
 | A pushed configuration change | Effect |
 |---|---|
@@ -2500,8 +2582,8 @@ the same rule.
 
 `runtime_upstream_props` is not the only entry in this registry the
 **gateway** gates real behavior on, fail-closed. `runtime_manager` itself
-does: `PushRuntimeConfig` returns early unless the agent has declared it
-([§9](#9-keeping-the-agent-current-the-notification-rule)). So does
+does: each push pass (`pushRuntimeConfigPass`) returns early unless the agent
+has declared it ([§9](#9-keeping-the-agent-current-the-notification-rule)). So does
 `runtime_config_ack`, which decides which standard of proof a VRAM-isolation
 wait may apply ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
 And so does `runtime_model_probe` — not just the ingest write gate above, but
@@ -2780,7 +2862,7 @@ Delivery is layered, and the layering is the whole reliability story:
 
 | Layer | Role |
 |---|---|
-| WS `runtime_config` frame | Latency optimisation. Carries the **complete document plus its ETag** as payload — never a delta, never a command. Every frame is self-contained, idempotent and last-wins; the agent applies it only if the ETag differs. A full per-connection queue drops the frame (logged at Debug) with no error. |
+| WS `runtime_config` frame | Latency optimisation. Carries the **complete document plus its ETag** as payload — never a delta, never a command. Every frame is self-contained, idempotent and last-wins; the agent applies it only if the ETag differs. The gateway pushes through **one worker per server** (`runtimeConfigPusher`, `internal/gateway/runtime_config_push.go`): a document is derived only after the previous one for the server was enqueued, so every connection gets the server's documents **in derive order**, and after every portal write a document derived after it follows, so the **last one reflects the latest write**. Writes during a pass or its spacing wait coalesce into one more document. After a pass that enqueued a frame the worker waits 250 ms (`pushRuntimeConfigSpacing`) before its next pass, so two documents for one server leave at least 250 ms apart; the first after a quiet period leaves at once. An agent before 0.8.1 can still end on an older document: its runtime sync is single-flight, so a document that arrives while a sync runs is dropped, and the agent rests on the older one until the next push or its poll. From 0.8.1 the agent owes a trailing sync instead (below). The spacing covers a sync shorter than 250 ms on an agent before 0.8.1 and applies to every agent, because the gateway cannot tell them apart without a feature flag ([ADR-048](../09-architecture-decisions.md#adr-048--the-runtime-config-push-is-one-worker-per-server-a-document-is-derived-only-after-the-previous-one-was-enqueued-the-last-reflects-the-latest-write-and-frames-are-spaced); [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)). A full per-connection queue drops the frame (logged at Debug) with no error. |
 | `GET /api/agent/v1/runtime-config` | The authoritative path: startup, every reconnect, POST-transport agents, and the 60 s poll backstop. A missed frame is harmless by construction. |
 | On-disk cache | The last known-good document, loaded at construction **strictly before any gateway contact**, so managed processes start after a host reboot while the gateway is unreachable. |
 
@@ -2809,6 +2891,20 @@ treat every `nil` that way regardless of origin: the reconnect hook sends one
 deliberately, and a syntactically valid but contract-malformed frame
 (`{"type":"runtime_config"}` with no `data`) also decodes to `nil`. Nil is
 therefore not proof that a reconnect happened.
+
+**The agent loop syncs one document at a time, and a wake that arrives during
+a sync is owed one trailing sync** (`triggerRuntimeSync`,
+`server-agent/internal/agent/agent.go`). However many wakes arrive during one
+sync, they coalesce into that one trailing sync, and it carries the payload of
+the last of them: a later `nil` wins over an earlier pushed document, as a
+resync over HTTP, because a reconnect may have missed pushes, and a pushed
+document after a `nil` wins too, as it does on the channel. Before 0.8.1 the
+agent dropped such a wake and rested on the older document until the next
+push, a reconnect or the 60 s poll, so of two documents closer together than
+one sync — at least one features round trip — the second was lost. The
+gateway's 250 ms push spacing exists for those agents. The 60 s poll stays the
+backstop for a frame that never reaches the agent: one a full send queue
+drops, or one on a connection that goes away.
 
 Four rules on the config-source side, each with a total failure behind it:
 
@@ -3132,12 +3228,18 @@ This closed list is what makes the rule checkable, and it shows why an
 application row or a mapping *rename* is a runtime-config change at all —
 non-obvious, since neither looks like a runtime object.
 
-**Twelve call sites**, by row: `UpdateServer` (1);
+**Fifteen call sites**, by row: `UpdateServer` (1);
 `CreateApplication` / `UpdateApplication` / `DeleteApplication` (2, via
 `notifyRuntimeChangedForApplication`); `CreateMapping` / `UpdateMapping` /
 `DeleteMapping` / `reconcileApplicationModels` (3, via
-`notifyRuntimeChangedForMapping`); `PutRuntimeSpec` / `DeleteRuntimeSpec` (4);
-`SetCoResidency` (5); `SetServerGPUBudgets` (6). All are **best-effort**: they
+`notifyRuntimeChangedForMapping`); `PutRuntimeSpec` / `DeleteRuntimeSpec` and
+the benchmark run's own three launch-spec writers (4); `SetCoResidency` (5);
+`SetServerGPUBudgets` (6). Of the benchmark writers,
+`SetBenchmarkRuntimeSpecAdminState` notifies once per stored write, through
+`putRuntimeSpec`, the shared write `PutRuntimeSpec` uses too, and the batched
+`SetBenchmarkRuntimeSpecsPinned` and `SetBenchmarkRuntimeSpecsAdminState`
+notify from `setBenchmarkRuntimeSpecs` after the batch's last write, once for
+each server a write stored to. All are **best-effort**: they
 return no error and must never turn a successful write into a failed request
 (the hook is nil in tests that do not care).
 
@@ -3152,16 +3254,22 @@ both non-gates are asserted by tests so a later narrowing fails rather than
 passes quietly.
 
 **What licenses all that over-notification** is a single fail-closed guard at
-the delivery point: `PushRuntimeConfig` returns early unless the agent has
-declared `runtime_manager` and is not in file mode — a **map lookup**, taken
-before any store read. It asks the accurate question ("is there an agent that
-could act on this?") more cheaply than any caller-side gate could ask the
-approximate one. Remove or weaken it and the deliberate over-notification
-upstream stops being harmless. Beyond it, the push reads the document under a
-5 s bound (never `context.Background()`, because one goroutine is spawned per
-portal write and an unbounded call could accumulate goroutines under sustained
-write pressure) and runs in its own goroutine so a portal write never blocks on
-delivery. 5 s matches the `persistCapture` precedent rather than
+the delivery point: each push pass (`pushRuntimeConfigPass`) returns early
+unless the agent has declared `runtime_manager` and is not in file mode — a
+**map lookup**, taken before any store read. It asks the accurate question ("is
+there an agent that could act on this?") more cheaply than any caller-side gate
+could ask the approximate one. Remove or weaken it and the deliberate
+over-notification upstream stops being harmless. Beyond it, the push runs on
+**one worker per server**, never inline, so a portal write never blocks on
+delivery: the hook only starts the server's worker or marks it as owing one
+more pass. Notifications that arrive during a pass or its spacing wait coalesce
+into the one pass they owe, so a sustained burst of writes costs at most one
+pass per cycle of a pass and its 250 ms spacing wait, not one pass per write,
+and never one goroutine per write ([ADR-048](../09-architecture-decisions.md#adr-048--the-runtime-config-push-is-one-worker-per-server-a-document-is-derived-only-after-the-previous-one-was-enqueued-the-last-reflects-the-latest-write-and-frames-are-spaced)).
+Each pass reads the document under a 5 s bound (never `context.Background()`,
+because the worker runs one pass at a time, and a store read that never
+returned would hold the server's worker for good, with every later push for the
+server waiting behind it). 5 s matches the `persistCapture` precedent rather than
 `model_warmer.go`'s 60 s, because the document is a bounded local assembly over
 a handful of store reads, not a network round trip that may wait for a model to
 load.
@@ -3234,6 +3342,12 @@ than an agent fault:
 - Renaming a mapping's `gateway_model_name` left inference under the **new** name
   404-ing at the agent's router while the old name still routed.
 - `runtime_max_processes` reached the agent only on the poll.
+
+On an agent before 0.8.1 the same signature can also follow two quick writes,
+and then it is an agent fault, not a missing notification: when the agent's
+sync outlasts the push spacing, such an agent drops a document that arrives
+during a sync ([§8.1](#81-gateway-mode-push-poll-and-a-disk-cache)). From
+0.8.1 that cause is gone.
 
 Finally: **the runtime-config document is derived for the server that owns the
 agent token the agent authenticates with.** The development seed
@@ -3624,6 +3738,46 @@ gate that stops showing a fabricated `0` for the two probe-derived numbers
 explains why the context SIZE is not gated this way, being a persisted
 mapping value rather than a probe result).
 
+**What a benchmark records as a model's context size.** A speed or both run
+and the standalone context probe (`startContextProbe`) read the size right
+after they stream to the model, so the child is running
+(`benchmarkContextSize`). Two sources answer, in order:
+
+1. **The synchronous probe.** The gateway asks the application's effective
+   context probe path (`routing.EffectiveContextProbePath`) with the mapping's
+   own credential (`routing.SpecUpstreamAuth`). For a `server_agent`
+   application whose stored `context_probe_path` is empty, which is what the
+   portal stores, that is the router's `/upstream/{model}/props`
+   ([§4.1](#41-control-routes)) on an agent that declares
+   `runtime_upstream_props`. The router forwards to the running child's
+   `/props` with the credential intact, so a key-protected llama.cpp child
+   answers too. A `401`/`403` is logged at `Warn` as a wrong spec token. A
+   speed run writes this answer to the mapping (`UpdateMappingContextProbe`);
+   the standalone context probe only reports it.
+2. **The agent's telemetry**, when the probe gave nothing, for a
+   `server_agent` mapping with a launch spec on an agent that declares
+   `runtime_model_probe`. The spec's status row is matched by `spec_id`,
+   never by model name. A running row with a size answers at once, and a
+   `na` or `router` probe ends the lookup at 0. Otherwise the benchmark waits
+   up to `benchmarkTelemetryContextWait` (5 s) for the first fresh frame whose
+   row is running with a probe result, and that frame is final: its size, or
+   0. The agent re-probes a failure on every collect, so one fresh
+   `unreachable` is final. This value goes into the result and the history
+   row only; the mapping's column belongs to the ingest's write-back
+   (`writeBackRuntimeContext`).
+
+Nothing found is recorded as 0, which the history shows as "—". Per spec type:
+
+| Spec type | Synchronous probe (`/upstream/{model}/props`) | Agent telemetry | Field | Stays unknown |
+|---|---|---|---|---|
+| `llama_cpp` | yes, with or without `--api-key`; needs `runtime_upstream_props` (0.7.0) | the fallback; needs `runtime_model_probe` (0.6.0) and a child without a key | `default_generation_settings.n_ctx` (per slot) | router mode (`context_probe: router`); a key-protected child behind a 0.6.x agent; agents before 0.6.0 |
+| `vllm` | the child answers 404, so telemetry decides | `/v1/models` | `data[].max_model_len` | any child started with `--api-key` ([§13](#13-known-limitations-and-accepted-risks)) |
+| `tgi` | 404, so telemetry decides | `/info`, public even with a key | `max_total_tokens` | agents before 0.6.0 |
+| `ollama` | 404, so telemetry decides | `POST /api/show`; Ollama has no auth | `model_info.<arch>.context_length`: the model maximum, the column's documented meaning | agents before 0.6.0 |
+| `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
+| `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
+| Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
+
 The registry's `subscribe` copies the current snapshot **and** registers the
 subscriber channel under a single lock acquisition, so no publish between the two
 can be lost (the `serverPerfRegistry` discipline). Delivery is non-blocking: a
@@ -3891,11 +4045,25 @@ retry.
 
 Three more rules on this screen generalise:
 
-- **An `admin_state` write builds its PUT body by rest-spreading the actual
-  loaded spec** and replacing the one field, never by assembling an explicit
+- **An `admin_state` write builds its PUT body by rest-spreading the spec it
+  has just read** and replacing the one field, never by assembling an explicit
   field list — so a field added to the spec later carries through instead of
-  being silently defaulted. A status row whose spec is not loaded therefore
-  offers **no** override actions rather than synthesising a body. A test that
+  being silently defaulted. "Force start", "Force stop", "Clear override" and
+  both writes of a restart (§11.2) read the spec with their own GET inside the
+  action, once the override actions are locked and within the same bound as
+  the write, and a failed GET writes nothing — and so does a spec that read as
+  deleted, or still being deleted, since the write is an upsert that would
+  otherwise create it again. When one of this screen's own writes to the spec
+  commits while that GET is in flight, the cache refuses the read, and the body
+  comes from the newer document that write left in the cache instead. The
+  per-mapping cache alone would not do: it is loaded once per mapping and
+  refreshed only by this screen's own spec reads and writes, so a cache loaded
+  while a benchmark run had lifted the server's pins still carries
+  `pinned: false` after the run, and the next override click would undo the
+  run's re-pin
+  ([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
+  A status row whose spec is not loaded still offers **no** override actions
+  rather than synthesising a body. A test that
   asserts only that `admin_state` came out right passes against a body that has
   quietly reset the operator's binary path, args, timeouts and GPU rows.
 - **When a control's meaning depends on state that may be unknown, the unknown
@@ -3951,9 +4119,10 @@ no endpoint, the sequence carries all the correctness burden:
   clear PUT back-to-back with the stop PUT — releasing a process the in-flight
   write was about to stop. A monotonic frame watermark captured when the
   `force_stopped` write *resolves* is what fixes it.
-- The mapping id (the write key) is captured at flow start and the clearing step
-  re-reads the spec from the per-mapping cache, so the final write depends
-  neither on a stream join still resolving nor on a synthesized body. The
+- The mapping id (the write key) is captured at flow start, and the clearing
+  step reads the spec by that id with its own GET (§11.1), so the final write
+  depends neither on a stream join still resolving, nor on a synthesized body,
+  nor on a cached document older than the wait. The
   deadline is **absolute**, so re-arming on each phase change cannot extend the
   overall bound.
 - A row vanishing from the stream gets an 8 s grace period before the sequence
@@ -3969,11 +4138,13 @@ no endpoint, the sequence carries all the correctness burden:
   again, with no override. While a spec DELETE for the flow's mapping is in
   flight, a `stopped` frame therefore does not complete the sequence; a later
   frame does, once the DELETE has settled. The clearing step sends no PUT, and
-  shows the same notice as a vanished row, when the cached document is no
+  shows the same notice as a vanished row, when the document it reads is no
   longer configured (the delete committed) or carries another spec id (the spec
   was deleted and created again, and its `admin_state` is the operator's new
-  choice). A failed DELETE leaves the spec in the cache, and the clear goes
-  ahead.
+  choice). A failed DELETE leaves the spec in place, and the clear goes ahead.
+  A DELETE confirmed while this read was itself in flight holds the clear
+  instead: the flow returns to `waiting`, and the next frame once the DELETE
+  has settled decides between the two outcomes above.
 - **On timeout the override is deliberately not cleared.** The portal cannot
   distinguish a wedged child from a merely slow one, and clearing would hand
   control back to normal policy at an unknown moment. The notice states plainly
@@ -3998,12 +4169,15 @@ this screen.
 > exists. A change to any of those four must be checked against the portal's
 > bound, and vice versa.
 
-Every `admin_state` write is additionally bounded client-side by a 30 s watchdog,
+The `admin_state` writes of Force start, Force stop and Clear override, and a
+restart's clear, are additionally bounded client-side by a 30 s watchdog,
 because the portal's HTTP transport has no `AbortController`: nothing else ever
 gives up on a request, so a PUT that never settles would leave the busy flag set
 for the life of the page, disabling every action on every row with no escape but
-a reload. It is deliberately far shorter than the restart bound — this one bounds
-a single gateway round trip writing one document, that one bounds an agent-side
+a reload. It also covers the action's own read of the spec (§11.1). A restart's
+stop write and its read are bounded by the restart's 120 s instead. It is
+deliberately far shorter than the restart bound — this one bounds two gateway
+round trips, a read and the write of one document, that one bounds an agent-side
 process lifecycle. Each flow also carries a run token, so a response landing
 after its bound cannot toast success, re-lock the table, or resurrect a sequence
 the operator has been told is over — **but the token must gate only the
@@ -5021,7 +5195,7 @@ window. `PUT /api/portal/mappings/{id}/runtime-spec` therefore answers **409
 for that mapping's server — the same reservation that already excludes the
 server from gateway routing, checked *after* authorization so it leaks nothing,
 and only on the principal-carrying path: the run's own drain and restore go
-through the benchmark writer and must not refuse themselves. A write to another
+through the benchmark writers and must not refuse themselves. A write to another
 server, and a DELETE (which drains a spec rather than starting one, and which
 the restore already treats as restored), are not gated.
 
@@ -5048,18 +5222,21 @@ begin until then and the server is held for correspondingly longer; the run
 says so rather than refusing). Two more warn on a **result** rather than before
 it: `undeclared_gpu_allocation` — see *Which cards are watched* below — and
 `residency_unknown`, which is the honesty half of the `already_resident`
-signal. That signal is the loaded-models probe, and it needs an
-application-level `loaded_models_path`: operator-entered, with **no default**,
-and empty on most agent-managed applications, whose child sits behind the
-agent's own router. Without it (or when the probe errors) the run gets "not
-resident" for a model that may well be resident, the baseline already contains
-it, and the ~0 delta surfaces at the floor gate as `below_floor` — whose next
-action, *"the window missed the allocation, measure again when the server is
-quiet"*, fails identically every time. So the run reports the check as
-**unavailable** rather than letting the wrong reason stand in for it. A fifth
-rides an ensure plan from the start: `first_generation_not_measured`. Such a
-run measures the child once it is up and its health check passes, and what
-`sd-server` allocates on top when it first generates has not been measured
+signal. That signal is the loaded-models probe: the agent router's
+`GET /running`, which the gateway derives when the application's
+`loaded_models_path` is empty
+([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), or a
+`loaded_models_path` set on the application through the API. When the probe
+fails, the run gets "not resident" for a model that may well be resident
+again, and it loads and measures the target without knowing whether the
+target's own child was already up: the baseline was taken with the target
+stopped, so such a child is still in the number; what the run cannot rule out
+is someone else's request on it. So the run reports the check as
+**unavailable** rather than letting "not resident" stand in for an answer it
+never got. A fifth rides an ensure plan from the start:
+`first_generation_not_measured`. Such a run measures the child once it is up
+and its health check passes, and what `sd-server` allocates on top when it
+first generates has not been measured
 ([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
 It is a warning and not an inconclusive reason because warnings do not gate the
 apply affordance: the number is real, and it is offered with its caveat.
@@ -5069,13 +5246,24 @@ succeeds and stops nothing, so a write's success proves nothing anywhere. The
 run holds per-spec evidence it produced itself, reported alongside the boolean
 as `isolation_evidence` so the claim can be audited:
 
-- `stopped_after_write` — a spec that **had** a live process when the write
-  landed is in a no-process state on an admissible frame.
-- `no_process_at_write` — the spec had **no** live process, so a `force_stopped`
-  write against it does nothing at all: no state change, no frame
-  ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)). It can only be
-  *confirmed*, never awaited — waiting for a transition that will never arrive
-  is what turns an already-quiet server into an isolation timeout.
+- `stopped_after_write` — a spec that the last runtime status before the write
+  showed with a live process (`running`, `starting` or `draining`) is in a
+  no-process state on an admissible frame.
+- `no_process_at_write` — that status showed the spec in **no** such state, so
+  the run expects no process for the `force_stopped` write to drain and no
+  transition to wait for. The agent applies the write as a changed spec. Without
+  a child, it resets `backoff`, `start_failed` and `crashed` to `stopped` (a
+  backoff timer is cancelled), a state change that sends a frame, and leaves
+  `stopped`, `not_permitted` and `pending_vram_unknown` as they are
+  ([§11.2](#112-restart-is-a-sequence-not-an-endpoint)), so the spec stays in a
+  no-process state. The one exception is a `start_failed` spec whose child a
+  start timeout is still terminating: the write drains that child, with no
+  reset, and the spec reads `draining` until the child is gone. It still earns
+  this label, which follows the state the status showed, not the child. Either
+  way the spec is *confirmed* by the first admissible frame that shows it in a
+  no-process state, never awaited as a transition — waiting for a transition
+  that may never arrive is what turns an already-quiet server into an isolation
+  timeout.
 
 **Neither value is recorded from a frame the wait has not ADMITTED, and there
 are two standards of admissibility.** The report says which one it used, as
@@ -5141,9 +5329,13 @@ deriving the document once, immediately after the drain; whenever the reported
 value is one it has not answered yet, it re-derives and admits the new digest —
 **but only after checking that the fresh document still force-stops every
 enumerated spec.** That check is what makes re-derivation a proof rather than a
-convenience, and its false branch is a real case: an operator's mid-wait "Force
-start" or "Clear override" produces a document that lets a sibling start, the
-agent applies and reports it dutifully, and accepting it would claim
+convenience, and its false branch is a real case: a mid-wait write that clears
+or replaces a drained spec's override produces a document that lets a sibling
+start. This gateway refuses the launch-spec write while the run holds the
+server, so that write comes from another gateway process on the same store, or,
+narrowly, from an operator's write that passed the reservation check just
+before the run took the server. The agent applies and reports the document
+dutifully, and accepting it would claim
 `isolated: true` for a run whose isolation had already been revoked. A spec
 **missing** from the document fails the check too, which is the fail-closed
 direction rather than an oversight: a spec deleted or disabled mid-wait is no
@@ -5205,8 +5397,9 @@ had not earned, and both worth keeping because each looked reasonable:
   branch — the stronger label for exactly the case the delay exists for.)
 - *The delay was picked from the transport.* Two seconds for a WS-connected
   agent, the poll interval otherwise. That gave the WS push the standing of a
-  delivery, and it has none: `PushRuntimeConfig` runs in a detached goroutine
-  that returns silently when the derive or the marshal fails, and
+  delivery, and it has none: a push pass (`pushRuntimeConfigPass`) returns
+  silently when the derive or the marshal fails, and its worker carries on with
+  a pass a later write owes, if any, never with a retry; and
   `NotifyRuntimeConfig` sends to **zero** connections when the socket closed
   after the probe or drops the frame with a `slog.Debug` when a send queue is
   full — in each case the override binds on the next poll anyway. The probe was
@@ -5306,13 +5499,17 @@ says **why**, because the operator's next action differs per reason:
 count is worth stating because this list has twice gone stale behind the code
 it describes. Six of them are worth naming here:
 
-- **`already_resident`** — after a *confirmed* drain, a model that still
-  reports resident is being served by something the gateway could not stop
-  (a non-managed application on the same host, most likely). The resident
-  short-circuit is a contamination **signal**, not a shortcut. It is only
-  available where the target's application carries a `loaded_models_path`;
-  where it does not, the run says so with `residency_unknown` rather than
-  reporting a negative it did not establish.
+- **`already_resident`** — after a *confirmed* drain, the loaded-models probe
+  still reports the target resident when the run asks, right after it cleared
+  the target's override and before it loaded anything. The resident
+  short-circuit is a contamination **signal**, not a shortcut. The probe asks
+  the agent's router, at `GET /running` unless the application carries a
+  `loaded_models_path` set through the API
+  ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), and
+  `/running` lists only the agent's own children in state `running`
+  ([§4.1](#41-control-routes)): the signal means that child is up again
+  before the run loaded it. When the probe fails, the run says so with
+  `residency_unknown` rather than reporting a negative it did not establish.
 - **`below_floor`** — no model costs ~0 MB, so a headline delta under the noise
   floor can only mean the window missed the allocation or something else
   absorbed it.
@@ -5489,20 +5686,33 @@ false, which is exactly when a VRAM run produces its single result (the runner
 publishes it in its terminal defer), so the finished result is rendered in the
 panel's place: the two numbers side by side, the isolation claim, and — always
 — the **drained set** plus any `restore_failed`. If the gateway dies between the
-drain and the restore, those spec ids are what an operator needs, and no other
-screen shows them.
+drain and the restore, it clears those overrides when it starts again (below);
+until then those spec ids are what an operator needs, and no other screen shows
+them.
 
 **A restore that did not happen has two meanings, and they are two fields.**
-`restore_failed` is a **write failure** — those specs really are still
-`force_stopped` and an operator has to clear them by hand, which is what the
-portal's message says. `restore_taken_over` is the disjoint other case: the
+`restore_failed` is a **write failure** — those specs may still be
+`force_stopped` (a write can fail after it stored the cleared row), and an
+operator has to clear the ones that still are by hand, which is what the
+portal's message says. They stay in the server's benchmark override lease, so
+the gateway also retries them at its next start, and at the next manual speed
+or both run on the server once that run has passed its own start gates; the
+message names only the start.
+`restore_taken_over` is the disjoint other case: the
 restore re-reads each spec inside its compare-and-set, and when the
 `admin_state` it finds is no longer this run's `force_stopped` it writes
-**nothing** — an operator hit *Force start* (`force_running`) or *Clear
-override* (`""`) while the run held the field. Collapsing the second into the
-first rendered "these specs are still `force_stopped` and have to be cleared by
-hand" for a spec that is not force-stopped at all, and following that
-instruction **stops a model the operator had just deliberately started**. So
+**nothing**. Either the run's own writes never stored the override or already
+cleared it — the drain's write failed before it stored it, or the clear of the
+target's override failed after it stored the cleared row, which leaves the
+target owed to the restore — or a writer the run's reservation does not hold
+off changed it while the run held the field: this gateway refuses the
+launch-spec write during the run, so that writer is another gateway process on
+the same store, or, narrowly, an
+operator's write that passed the reservation check just before the run took
+the server. Collapsing the second into the first rendered "these specs are
+still `force_stopped` and have to be cleared by hand" for a spec that is not
+force-stopped at all, and that instruction **names an override that is not
+there, or one that is not the run's**. So
 they get separate fields, separate sentences and separate severities — the
 takeover is `info`: nothing needs undoing, only confirming.
 
@@ -5583,16 +5793,23 @@ for the operator's own field. A fifth gate is applied **per card** rather than
 per run — the fingerprint comparison above — because a run can be perfectly
 valid and still be describing hardware that has since moved.
 
-**The writer, and the principal it does not have.** A benchmark run holds no
+**The writers, and the principal they do not have.** A benchmark run holds no
 `auth.Token`: the trigger's principal is consumed by
 `AuthorizeBenchmarkScope` and dropped, and `benchmarkTarget`/`benchmarkRun`
-have no field for one. `admin_state` is row 4 of the runtime-config document
-([§11.1](#111-writes-are-full-document-replaces-gated-on-their-own-get)), so
-every write of it owes a `notifyRuntimeChanged` — the sole trigger for the
-agent push — and a write that skipped it would reach a WS-connected agent no
-sooner than its 60 s poll. The run therefore uses one **principal-free**
-`portal.API` method, `SetBenchmarkRuntimeSpecAdminState`, documented with who
-authorized it (its caller: the trigger request, gated before the run started).
+have no field for one. `admin_state` and `pinned` are fields of a runtime
+spec, row 4 of the runtime-config document's inputs
+([§9](#9-keeping-the-agent-current-the-notification-rule)), so every write of
+either owes a `notifyRuntimeChanged` — the sole trigger for the agent push —
+and a write that skipped it would reach a WS-connected agent no sooner than its
+60 s poll. The benchmark runs therefore use three **principal-free**
+`portal.API` methods, each documented with who authorized it:
+
+| Writer | Callers | Their gate |
+|---|---|---|
+| `SetBenchmarkRuntimeSpecAdminState`, one spec | this run's clear of its target's override, before the load | `startVRAMProbe`: `AuthorizeBenchmarkScope` and the six refusals above |
+| `SetBenchmarkRuntimeSpecsAdminState`, a batch with one notification | this run's drain and restore; a manual speed or both run's stop-all and its clear ([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)); the override-lease reconciler | `startVRAMProbe`'s for the first; `AuthorizeBenchmarkScope` in `startBenchmark` for the second; none of its own for the reconciler, which only undoes, by compare-and-set, what such a run wrote |
+| `SetBenchmarkRuntimeSpecsPinned`, a batch with one notification | a manual speed or both run's unpin and re-pin; the override-lease reconciler | `AuthorizeBenchmarkScope` in `startBenchmark`; the reconciler's, as above |
+
 Capturing the trigger's token instead would compile, but every authorization
 there re-derives from store rows, so the **deferred restore** — minutes later,
 with the whole server force-stopped — could be refused because the user was
@@ -5600,6 +5817,20 @@ removed from the server's owners or the mapping was deleted mid-run. A
 safety-critical restore must not have an authorization failure mode.
 Synthesizing a system principal was the other option and is worse: no
 production code in this tree fabricates one.
+
+**The drain and the restore are one batched write each.** Written one spec at a
+time, each write would notify, and the agent would get one document per spec,
+most of them partial. The push serializer keeps such a burst in order
+([§9](#9-keeping-the-agent-current-the-notification-rule)), but an agent before
+0.8.1 syncs single-flight, so a burst that arrives back to back can leave it on
+the first, partial document until its next poll. A batch notifies once, after its
+last write, and so reaches the agent as one whole document. The drain is a
+compare-and-set against `""` over every enabled spec. It goes on past a spec
+whose write fails, and the drained set it reports is every spec it wrote or may
+have written — a failed write may have stored the override before its GPU
+write failed — so the restore covers that spec too. When not every spec was
+written, the run reports the error of the first one in plan order and measures
+nothing.
 
 **The restore, and the three traps it avoids.** It runs in a `defer` on a
 context **derived from but not cancelled with** the run's, because the run's
@@ -5610,17 +5841,38 @@ revert every field an operator edited *during* it, and a launch spec is exactly
 what an operator opens while a model is stopped. And the write is
 **compare-and-set**: if the freshly-read `admin_state` is no longer this run's
 `force_stopped`, nothing is written and the spec is reported in
-`restore_failed`, because somebody else owns the field now. A spec **deleted**
-mid-run is not a restore failure — its override went with it. On an isolation
-**timeout** the run abandons the measurement, still attempts the restore, and
-reports both facts; that is a deliberate divergence from §11.2, which chose not
-to clear an override on timeout because the portal cannot tell a wedged child
-from a slow one — a benchmark can, because it created them.
+`restore_taken_over`: somebody else owns the field now, or the run's own writes
+never stored the override (a failed drain write) or already cleared it (a clear
+of the target's override that failed after it stored the cleared row). A spec
+**deleted** mid-run is not a restore failure — its override went with it — and
+neither is one whose application was retyped away from `server_agent`, whose
+specs leave the runtime-config document; a Warn names such a spec, because its
+stored override would act again if the application were retyped back. On an
+isolation **timeout** the run abandons the measurement, still attempts the
+restore, and reports both facts; that is a deliberate divergence from §11.2,
+which chose not to clear an override on timeout because the portal cannot tell
+a wedged child from a slow one — a benchmark can, because it created them.
 
-The remaining exposure is recorded as a risk rather than solved: **if the
-gateway process dies between the drain and the restore, every model on that
-server stays `force_stopped` until an operator clears it by hand**
+**If the gateway process dies between the drain and the restore, every model on
+that server stays `force_stopped` until the gateway starts again**
 ([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
+Graceful restarts are included, because runs are not awaited on shutdown. So
+the run records its overrides in the server's benchmark override lease
+([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease))
+before it drains: the planned set first, the drained set right after the
+drain, what the restore still owes once the target's own override is cleared,
+and after the restore only `restore_failed`. Anything an earlier run left in
+the row is carried over unchanged, and the row is released once nothing is
+left. The gateway clears exactly the recorded overrides by compare-and-set
+when it starts again, before it listens, and so does the next manual speed or
+both run on the server, once it has passed its own start gates, before its own
+writes. The VRAM run never settles a leftover itself: its plan already refuses
+every spec that still carries an override. A store error on the lease read or on the first lease write ends
+the run with that error before anything is drained. What remains is the window
+while the gateway is down, and for good if it never starts against the same
+store again. The deferred agent-side "measure now, isolated" capability is
+still the only design with no window at all, because the agent would both own
+and restore its own transient state.
 
 ### 11.7 Live runtime state on the Models catalog
 
@@ -5967,15 +6219,41 @@ read failed would block readable siblings, and recording the skip inside the run
 loop would write history rows.
 
 **No cold pass swaps to one.** A speed or both run measures a text mapping's
-load time from a cold start, and when its model is resident and the application
-cannot unload it, the cold pass evicts it by streaming a one-token chat prompt
-to a sibling on the same application (`benchmarkSiblingModel`), the eviction a
-single-slot swapper performs. That sibling is chosen by the same rule: one that
-serves only images is passed over, and so is one whose spec cannot be read,
-since whether it serves only images is then unknown. With no other sibling the
-pass cannot confirm a cold start, and the run records no load time, as when the
-application has no sibling at all. The scheduler's speed runs take the same
-path.
+load time from a cold start. For a `server_agent` application the cold pass
+never unloads and never swaps: the router has no unload route, and a swap would
+load an unrelated model and evict the target only under a closed co-residency
+matrix. A manual speed or both run stops the server's running models instead,
+before each agent target's cold pass, and measures the target's own load on the
+emptied server
+([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
+A run that does not stop — a scheduled run, or a manual one whose stops are
+off — asks whether the target is resident, through the router's `/running` (or
+a `loaded_models_path` set on the application through the API) and the agent's
+runtime status. A target that is cold at the start gets a load time only on an
+otherwise empty server: `/running` does not list it, the agent reports its spec
+`stopped`, has not reported it yet, or it has no spec, and every other row of a
+non-empty runtime status for the server reads `stopped` with no process id. A
+model that runs next to the target could be evicted inside the cold pass, and a
+pinned or `force_running` one in `backoff`, `not_permitted` or
+`pending_vram_unknown` can start by itself when its backoff timer fires or at
+the next admission wake; either would put a second meaning into the load time.
+No runtime status at all is no evidence that nothing runs, for example right
+after a gateway start. A resident target gets none: one
+`/running` lists, or one whose spec the agent reports `running`, `starting` or
+`draining`, or with a process id. Neither does a target whose spec is in any
+other state, such as `backoff`: a request for it waits for the backoff timer,
+and that wait would land in the load time. Nor does a target whose loaded state
+cannot be read. For any other application, a resident model the
+application cannot unload is evicted by streaming a one-token chat prompt to a
+sibling on the same application (`benchmarkSiblingModel`), the eviction a
+single-slot swapper performs. `benchmarkSiblingModel` would pass over a sibling
+that serves only images or whose spec cannot be read, but only a `server_agent`
+mapping has a spec of its own: on any other application every sibling serves
+the application's flavors, as the text target does, so none is passed over.
+Without a sibling the pass cannot confirm a cold start, and the run records no
+load time. The scheduler's speed runs take the same path but never stop, so a
+scheduled run records a `server_agent` model's load time only on an otherwise
+empty server.
 
 **The images-only Load.** The load core keeps its already-resident
 short-circuit, then calls the provider's `RuntimeEnsurer` inside the same
@@ -6035,6 +6313,351 @@ that run at application or server scope, and a Load or VRAM probe of it takes
 the ensure route, which starts any managed child. A `force_stopped` stored
 after the check leaves a Load retrying the router's 503 until the loop's bound.
 
+### 11.10 Load time of an agent model: the stop-all, the temporary unpin and the override lease
+
+A speed or both run records a mapping's load time as the cold pass's time to
+first token minus the warm pass's ([Routing & Model Selection
+§7](routing-and-model-selection.md#7-model-selection-metrics)). For a
+`server_agent` model that number is **the model's own load on an otherwise
+empty server**. The router has no unload route ([§4.1](#41-control-routes)),
+and a cold target's first request evicts every neighbour the co-residency
+matrix does not let it share the GPU with, so the neighbours' exits land in its
+time to first token: with a neighbour that took 2 s to exit, the cold pass
+measured 3.5 s for a model whose own load is 1.5 s. A pinned neighbour blocks
+the target outright, because the agent never evicts a pinned child. So a manual
+speed or both run gets to an empty server through desired state: it lifts the
+server's pins for the run, and before each agent target's cold pass it
+force-stops every running model of the application in one write and clears
+that write again before the cold request. The decision and what it costs are
+[ADR-047](../09-architecture-decisions.md#adr-047--a-manual-speed-run-measures-every-agent-model-on-an-emptied-server-it-stops-the-servers-running-models-before-each-cold-pass-and-lifts-the-servers-pins-for-the-run).
+
+**One meaning for the column, whether a run stops or not.** A cold start is
+confirmed only when no other model of the server's agent application has a
+process or can start one by itself when the cold pass starts. On the target's
+own row: without a stop it reads `stopped` or it has no row; with one it is
+quiet, and it has to read `stopped` only when it had read `backoff`,
+`start_failed` or `crashed` at selection — `not_permitted` and
+`pending_vram_unknown` wait behind no timer either way. A run that does not
+stop — a scheduled run, or a manual run whose stops are off (below) —
+therefore needs more than a cold target
+([§11.9](#119-manual-runs-on-an-images-only-mapping)):
+every other row of a non-empty runtime-status snapshot has to read `stopped`
+with process id 0 (`benchmarkOthersStopped`). `backoff`, `not_permitted` and
+`pending_vram_unknown` do not count: a pinned or `force_running` neighbour in
+one of them has no process now but starts one by itself, when its backoff timer
+fires or at the next admission wake, possibly inside the target's passes. An
+empty snapshot is no evidence either: the agent reports every spec of its
+document in every frame, so no row at all means that the gateway holds no
+runtime status for the server yet, as right after a gateway start, or that the
+agent manages no spec at all. Otherwise the result carries no load time, and
+the mapping keeps its last one. Without this rule, keep-last would let a
+scheduled run write a value that includes an eviction over a manual run's
+own-load value, and one column would carry two meanings. The cost: each
+measured model stays resident for the next target, so a scheduled run over
+several agent models records at most one load time.
+
+**Who stops, and who never does.** Only a manual speed or both run, behind
+`AuthorizeBenchmarkScope`: `startBenchmark` sets `mayPreStop` on every runnable
+target of such a run. A scheduled run, the Load, the standalone context probe
+and the model warmer never stop or unpin anything. The VRAM benchmark keeps
+its own drain ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs))
+and never unpins: it refuses a pinned sibling instead.
+
+**The temporary unpin, once per run.** `beginBenchmarkUnpin` runs after the
+run's finish defer is registered and before its first target. The server's
+pins are every enabled spec with `pinned = true` of the server's one
+`server_agent` application, measured or not: a pinned neighbour holds its
+VRAM, the agent never evicts it, and a stop of a pinned spec cannot hold,
+because the clear restarts it at once. The unpin never touches
+`force_running`, which is the `admin_state` override and not `pinned`. Each of
+these ends it, in this order, and then nothing is unpinned or stopped for the
+whole run:
+
+1. the run has no agent target with `mayPreStop`;
+2. the agent is in file mode or does not declare `runtime_manager`, where a
+   write changes nothing;
+3. the application's specs cannot be read;
+4. an enabled spec carries `admin_state = force_running`. Such a spec restarts
+   at once after any stop, so it would thrash with a stopped target. Under a
+   closed matrix, behind an agent before 0.8.1, the target's warm request can
+   also hang behind it, because such an agent wakes no queued admission when
+   that spec finishes starting
+   ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks));
+   from 0.8.1 the warm request waits for that spec's restart and the target's
+   own reload instead ([§5.4](#54-eviction-queueing-and-drain)), unless that
+   spec is pinned as well: a pinned process is never evicted, so while it runs
+   no agent version admits the target's request;
+5. the override lease cannot be read, or a leftover lease for the server cannot
+   be settled (below);
+6. the lease cannot be written before the unpin.
+
+With no pinned spec there is nothing to unpin, and stops are on. Otherwise a
+Warn log names the set (`benchmark: unpinning the server's pinned launch specs
+for the run; they are pinned again when it ends`), and one batched write,
+`SetBenchmarkRuntimeSpecsPinned` with the compare-and-set `true` → `false`,
+unpins them all with one notification. When that write fails for any spec, the
+run pins the written and the failed specs again at once — a failed write may
+have stored `pinned = false` before its GPU write failed — and turns stops off
+for the run. When the write wrote fewer specs than the lease names, because it
+found one changed or gone, the run rewrites the lease to the specs it wrote,
+which releases it when that is none: a reconcile would otherwise pin again a
+spec an operator had unpinned. The benchmark panel names the unpinned specs
+(`unpinned_spec_ids`).
+
+**The re-pin, once per run.** `endBenchmarkUnpin` is registered right after the
+unpin, so it runs before the finish defer releases the reservation, and
+operator writes to the server's launch specs stay refused (409
+`runtime_spec.server_benchmarking`) until the re-pin is written. One batched
+write pins exactly the unpinned specs again, by compare-and-set `false` →
+`true`, on a context that is not cancelled with the run. A spec deleted
+meanwhile took its pin with it (short of a DELETE that lands inside the write
+itself, see
+[ADR-047 (c)](../09-architecture-decisions.md#adr-047--a-manual-speed-run-measures-every-agent-model-on-an-emptied-server-it-stops-the-servers-running-models-before-each-cold-pass-and-lifts-the-servers-pins-for-the-run)),
+and one that is already pinned again is left alone. A spec that cannot be
+pinned again (a store error) stays in the lease, is named in `repin_failed`,
+and adds
+`launch specs may still be unpinned after the benchmark: <ids>; pin them in the runtime section`
+to the run's error. A formerly pinned spec that was stopped, idle-unloaded or
+evicted during the run starts at the re-pin. Under a closed matrix it evicts
+the idle last target, and when two formerly pinned specs cannot co-reside,
+which of them runs afterwards can change. The reservation is released once the
+writes are done, not when the reloads finish.
+
+**The stop-all, before each agent target's cold pass.** Each measured model
+stays resident after its warm pass, so one stop at run start would let target
+2's cold start evict target 1 and count that exit as load time again.
+`preStopServer` therefore runs for every agent target while stops are on:
+
+1. **A fresh selection frame.** It waits up to `benchmarkTelemetryContextWait`
+   (5 s) for the first runtime-status frame in which no row has a request in
+   flight. A release emits no frame of its own, so the snapshot right after the
+   previous target's passes can still show one. A spec that keeps traffic in
+   flight through the whole window is never stopped, because a stop would end a
+   direct client's stream as a silent, clean EOF; the target then gets no
+   load time.
+2. **The stop set**: every row that is not quiet — `running`, `starting` or
+   `draining`, any row with a process id, and any state this gateway does not
+   recognize — plus the target whenever its own row reads anything other than
+   `stopped`. A target in `backoff` would otherwise wait out its backoff timer
+   inside the cold pass, and the agent resets it to `stopped` when it applies
+   the stop's document. Any other quiet row (`benchmarkRowQuiet`: a no-process
+   state *and* process id 0, because `start_failed` can still carry a live
+   child) is not written: a spec without a process has nothing to stop, and
+   writing it would only widen what a crash leaves behind. An empty stop set
+   writes nothing and waits for nothing.
+3. **Eligibility**, from one fresh read of the application's specs, before
+   anything is written. A failed check skips the stop for this target only,
+   with an Info log that names the reason: the target gets no load time, and
+   stops stay on for the next one:
+
+   | Check, for the target and for every spec in the stop set | Reason |
+   |---|---|
+   | the read succeeds | `spec_unreadable` |
+   | the store knows the spec | `unknown_spec` |
+   | the spec is enabled | `disabled` |
+   | it is not pinned in this read, because a pinned spec restarts at the clear | `pinned` |
+   | it carries no `admin_state` override | `admin_override` |
+   | the agent is still in gateway mode and declares `runtime_manager`, which telemetry can change | `isolation_unavailable` |
+
+   A target without a spec (`no_spec`), a frame without the target's row
+   (`no_status`), a window with traffic throughout (`in_flight`), no frame at
+   all (`no_frame`) and a cancelled run (`canceled`) skip the stop the same
+   way.
+4. **The lease entry** names the stop set before the write. When the lease
+   cannot be written, nothing is stopped for this target.
+5. **One batched stop**: `SetBenchmarkRuntimeSpecsAdminState` with the
+   compare-and-set `""` → `force_stopped`, and one notification. The panel names
+   every spec a stop wrote or may have written (`stopped_spec_ids`).
+6. **The wait** (`benchmarkAwaitQuiet`) subscribes after the write and returns
+   on the first frame that has a row for every spec of the stop set and in
+   which every row is quiet: `backoff` with process id 0 counts, `start_failed`
+   only with process id 0. The target's own row is the exception: when it read
+   `backoff`, `start_failed` or `crashed` in the selection frame, the wait also
+   needs it to read `stopped`. The agent resets those states to `stopped` when
+   it applies the stop, and a backoff timer that fires without a start leaves
+   the spec `stopped`; until then, a request for the target would queue behind
+   its backoff timer, and that wait would land in the load time. A row outside
+   the stop set that starts ends the wait at once (`late_start`); only a direct
+   router client, a waiter queued before the run, or a formerly pinned spec
+   that the agent still holds pinned can start one. The bound is
+   `benchmarkStopWaitBound`, 120 s: the 60 s poll that delivers the write to
+   an agent without a WebSocket, plus the drain. When it expires, stops are off
+   for the rest of the run, so a child that never exits costs the bound once.
+   When not every spec of the stop set was written, the run does not wait for
+   the set. After such a partial write, or after a late start ended the wait,
+   the stop may not have reached the agent yet, so when the target's own stop
+   was written the run waits, within the same bound, only for the target's own
+   row to read quiet (`benchmarkAwaitSpecQuiet`): a target that still ran would
+   otherwise serve the cold pass itself, and its stop would land before the
+   warm pass. An expiry of that wait turns stops off as well.
+7. **The clear**, at once and on every exit: one batched write,
+   `restoreBenchmarkOverrides` with the compare-and-set `force_stopped` → `""`,
+   on a context that is not cancelled with the run, before the cold pass. It
+   covers every spec the stop wrote or may have written, a failed write
+   included. A spec deleted or retyped meanwhile is gone, and one that no
+   longer reads `force_stopped` — somebody else changed the override, or the
+   stop's failed write never stored it — is left alone and logged, and the
+   target then gets no load time. A clear that fails on a store error makes the
+   target's result the error
+   `launch specs may still be force_stopped after the benchmark: <ids>; clear the overrides in the runtime section`,
+   runs no speed pass, keeps the failed specs in the lease, and turns stops
+   off for the rest of the run. In mode both the capacity ramp still runs.
+8. **The cold pass.** When the target's own override was or may have been
+   written, the router answers 503 `runtime.admission_blocked` until the clear
+   reaches the agent, so the cold pass rides it through the load loop
+   (`coldPassAfterStop`, [API Compatibility & Inference
+   §7.2](compatibility-and-inference.md#72-the-benchmark-stream-watchdog)). The
+   loop keeps the time to first token of the attempt that was served, which
+   includes the whole start. A target that was not in the stop set is served
+   at once, with one plain stream. The load-time gate is unchanged: a confirmed
+   cold start, and a cold pass slower than the warm one.
+
+**Why a quiet frame is enough.** The portal's restart completes on a
+transition ([ADR-026](../09-architecture-decisions.md#adr-026--gatewayagent-control-is-desired-state-not-commands));
+the stop-all completes on a state, whatever caused it. That is sound only
+because a spec without a process, without `pinned` and without `force_running`
+starts only on a request, and during the reservation routing sends none and
+the model warmer skips the server. The run has unpinned every pinned spec and
+does not stop at all next to `force_running`, so a quiet neighbour stays down.
+The order of the documents comes from the push serializer
+([§9](#9-keeping-the-agent-current-the-notification-rule),
+[ADR-048](../09-architecture-decisions.md#adr-048--the-runtime-config-push-is-one-worker-per-server-a-document-is-derived-only-after-the-previous-one-was-enqueued-the-last-reflects-the-latest-write-and-frames-are-spaced)):
+the clear's document is derived only after the stop's was enqueued, on the same
+queue, and goes out at least `pushRuntimeConfigSpacing` (250 ms) after it, so a
+stop can never land after its clear, and the run needs no delay of its own
+between its writes. What the serializer does not cover is a document skipped
+on the way: one that an agent before 0.8.1 drops because it arrives during a
+sync, or a frame a full send queue drops
+([§8.1](#81-gateway-mode-push-poll-and-a-disk-cache)). A dropped stop makes
+the wait last until the next push or the agent's poll, and a dropped clear
+makes the cold pass ride the 503 until then: slow, never wrong. Every document
+after the unpin carries `pinned = false`, but the run does not wait for the
+unpin to reach the agent, so when the agent has not applied the unpin's
+document yet, or the document was skipped, a formerly pinned neighbour
+without a process is still pinned at the agent and can restart by itself, as
+when its backoff timer fires. The
+run takes a row of the stop set that was not quiet — a process, or a state
+this gateway does not recognize — and turns quiet in the wait as the sign that
+the agent has applied the stop's document, which carries the lifted pins; a
+stop set without such a row gives no such sign. So when a target's stop set
+has no such row, its start is confirmed only when every formerly pinned
+neighbour, the target aside, reads `stopped` with process id 0 in the
+selection frame; otherwise the target gets no load time (reason
+`formerly_pinned`), keeps its stored value, and an Info
+log names those neighbours. The rule has two known limits. A process that
+exits by itself inside the stop document's delivery window, as an idle unload
+or a crash does, is taken for the stop, and a formerly pinned neighbour still
+pinned at the agent can then restart inside the cold pass; that needs both at
+once. And the rule judges only the specs the run unpinned, so a spec someone
+else unpinned just before or during the run, whose document the agent has not
+applied yet, is not judged.
+
+**When stops are off**, every agent target is measured under the rule for runs
+without a stop (above). They are off for the whole run after a failed unpin,
+in file mode, without `runtime_manager`, when the launch specs could not be
+read, next to a `force_running` spec, and when the lease could not be read,
+settled or written at run start; and for every later target after a stop wait
+expired or a clear failed. A skip for one
+target — traffic in flight throughout the selection window, no frame, no spec
+or no status row for the target, a failed eligibility check, or a lease entry
+that could not be written — gives that target no load time, and the next
+target is stopped again.
+
+**Waits and bounds of one agent target:**
+
+| Wait | Bound | On expiry |
+|---|---|---|
+| the selection frame | `benchmarkTelemetryContextWait`, 5 s; usually one agent interval, about 1 s | no stop and no load time for this target; stops stay on |
+| the stop wait | `benchmarkStopWaitBound`, 120 s. Over WebSocket its real length is the slowest exit: a few milliseconds for an idle child, 5 s for one that ignores SIGTERM, 10 s for one that drains a request that started after the selection frame; up to about 60 s more over the POST transport | no load time; the overrides are cleared, and stops are off for the rest of the run |
+| the push spacing | `pushRuntimeConfigSpacing`, 250 ms between two documents for the server. Not a wait of the run: the cold pass rides the 503 meanwhile | none |
+| the clear | `vramRestoreTimeout`, 30 s, on a context that is not cancelled with the run | the failed-clear error; stops are off for the rest of the run |
+| the cold pass | the load loop's bound, the larger of 5 minutes and the first-data budget: 10 minutes at the default `timeout_ms` of 600000 | `cold pass after the benchmark's stop: <provider error text>` |
+
+A target with nothing to stop costs only the selection frame. One with
+something to stop costs the selection frame, plus the longer of the stop wait
+and the spacing, plus its own full load when it was resident; a cold target
+pays that load either way. Over the POST transport the stop and the clear each
+wait for a 60 s poll.
+
+**After the run.** A formerly pinned spec that still runs is untouched, and
+the others start at the re-pin. Every other model the run stopped stays
+stopped until its next request, which pays one full load, or, when its clear
+failed, until its override is cleared. The run does not restart them: that
+would need the ensure route, would race user traffic once the reservation is
+released, and under a closed matrix could not reproduce the set that ran
+before the run. So after a run only the last target and the formerly pinned
+specs are up.
+
+**The override lease.** A process that dies mid-run skips every deferred clear
+and re-pin, and a graceful restart is no exception, because runs are not
+awaited on shutdown. So before it writes an override, the run records what it
+will owe in one `system_settings` row per server, under the key
+`benchmark_override_lease:<server_id>`, with the value
+`{"repin":[…],"clear_force_stopped":[…]}` (`portal.BenchmarkOverrideLease`,
+written through `SetBenchmarkOverrideLease` and read through
+`BenchmarkOverrideLeases`). The empty string means no lease. No HTTP route and
+no settings view exposes the key, and the row is not an input of the
+runtime-config document, so writing it owes no notification
+([ADR-028](../09-architecture-decisions.md#adr-028--runtime-config-notifications-are-gated-by-write-scope-not-by-changed-field)).
+The run rewrites the whole row each time:
+
+| When | `repin` | `clear_force_stopped` |
+|---|---|---|
+| before the unpin | every pinned spec | nothing |
+| after an unpin that wrote fewer specs than it named | what it wrote | nothing |
+| after a failed unpin's immediate re-pin | what is still unpinned | nothing |
+| before each stop | the unpinned set | what is still owed, plus the stop set |
+| after each clear | the unpinned set | only the specs whose clear failed |
+| after the re-pin | only the specs whose re-pin failed | only the failed clears |
+
+A row with both lists empty is released. The run rewrites the row at its end
+whenever it wrote it at all, so an entry that a failed write left behind is not
+left for the next reconcile. The VRAM benchmark records its drain in the same
+row ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+
+**The reconciler** (`reconcileBenchmarkOverrideLease`) settles a leftover row
+in two batched writes, under a 30 s bound. First it clears the
+`clear_force_stopped` entries by compare-and-set `force_stopped` → `""`, then it
+pins the `repin` entries again by compare-and-set `false` → `true`: a spec that
+stays `force_stopped` refuses every request, while one that stays unpinned
+still serves on demand. Each write that lands is logged at Warn with its spec
+ids. A spec deleted or retyped is gone (short of a DELETE that lands inside
+the write itself, see ADR-047 (c)), and one whose value is no longer what the
+run wrote is left alone. The row is then rewritten to what failed, which
+releases it when nothing did. It runs in two places:
+
+- at gateway start (`ReconcileBenchmarkOverrideLeases`), from
+  `buildGatewayServer`, before the benchmark scheduler starts and before any
+  listener does, so no operator write and no run can interleave, and no agent
+  sees the order of the two writes;
+- at the start of a manual speed or both run, for its own server, inside the
+  reservation, once the run's first gates have passed. When that leaves
+  anything behind, the run unpins and stops nothing.
+
+The compare-and-set is what makes this safe: while a run holds the server,
+operator writes to its launch specs are refused, so a `force_stopped` or
+`pinned = false` on a leased spec is a benchmark's own, unless the row names a
+spec whose override was already cleared or whose pin was already restored
+(below). A spec that was never written, or that has changed since, is a no-op
+conflict.
+
+What the lease does not cover: the window stays open while the gateway is
+down, and for good if it never starts against the same store again. One
+gateway process per store is assumed, as the reservation already assumes:
+another gateway process on the same store sees neither the run's reservation
+nor its lease as live, so one that starts during a run clears that run's stops
+and re-pins its specs mid-run, as does a manual speed or both run it holds on
+the server once that run passes its start gates, and it routes requests to the
+server and accepts writes to its launch specs meanwhile. In memory mode the
+lease is lost with every other piece of state. And a row that failed to
+release, or one that keeps a clear or a re-pin which failed (it stays in the
+row whether or not the write stored its row, and also once the operator has
+fixed the spec by hand, as the benchmark panel asks), still names specs whose
+override is already cleared or whose pin is already restored, so an
+operator's later, deliberate `force_stopped` or unpin of one of them is undone
+at the next reconcile
+([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+
 ## 12. The timeout budget
 
 Five bounds sit on one request to a cold managed model, and they are only
@@ -6069,9 +6692,9 @@ heartbeats as the general cold-load fix:
   Claude Code use — whose idle watchdog is byte-based, and nginx's own 3600 s
   timer.
 - **They help the gateway's own benchmark streams, up to a bound.** The load
-  run, the context probe, the VRAM probe, the speed, capacity and vision
-  benchmarks, and the sibling swap of the speed benchmark's cold pass count
-  every SSE comment line as a sign of life until the first event, but only up
+  run, the context probe, the VRAM probe, and the speed, capacity and vision
+  benchmarks count every SSE comment line as a sign of life until the first
+  event, but only up
   to the **first-data budget**: the larger of `timeout_ms` and the idle
   budget, 600 s by default for `server_agent`. A child still silent after that
   ends the stream with `provider.timeout`. There is no credit
@@ -6199,6 +6822,39 @@ operator meets first:
   the directory check, is the boundary.
 - **The feature ships no metrics** of its own beyond the telemetry sample and the
   status stream.
+- **A key-protected vLLM child gets no context size in a benchmark**
+  ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)). The
+  agent's loopback probe carries no credential
+  ([ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)),
+  and the router's `/upstream` allowlist forwards only `/props`, which vLLM
+  does not serve. Closing it means widening that allowlist to
+  `GET /v1/models`, behind a new agent feature and with its own ADR, because
+  the allowlist is a security boundary. Two shortcuts were rejected: a
+  gateway-side `POST /tokenize` counts as a use of the model and relies on an
+  endpoint vLLM leaves unguarded, and parsing `--max-model-len` out of the
+  launch args records a guess, not an observation.
+- **A gateway that dies during a manual speed or both run leaves the run's
+  overrides in the store until it starts again**
+  ([§11.10](#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)).
+  There are two windows. The unpin's lasts from the run's start to its end:
+  every formerly pinned model can be idle-unloaded or evicted meanwhile, and
+  loses its start at agent boot. Each stop-all's lasts from its stop write to
+  its clear: every model it stopped refuses to start. Graceful restarts and
+  deploys are included, because runs are not awaited on shutdown. Before it
+  writes, the run records what it owes in the server's benchmark override
+  lease, and a reconciler settles a leftover lease by compare-and-set, at
+  gateway start before the listeners and at the next manual speed or both run
+  on that server once that run has passed its own start gates, and logs every
+  spec it clears or pins again at Warn. The VRAM benchmark's drain has the
+  same window and the same remedy
+  ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)).
+  The windows stay open while the gateway is down, one gateway process per
+  store is assumed, and a lease that failed to release, or one that keeps a
+  clear or a re-pin which failed (it stays in the row whether or not the write
+  stored its row, and also once the operator has fixed the spec by hand, as
+  the benchmark panel asks), can undo an operator's later, deliberate
+  `force_stopped` or unpin at the next reconcile
+  ([§11.1 of the risk register](../11-risks-and-technical-debt.md#111-operational-risks)).
 - **The runtime-spec API token cannot secure three of the backends it can be
   attached to.** Ollama has no native inbound-auth mechanism at all, LM
   Studio's token is a GUI-only toggle with no headless equivalent, and

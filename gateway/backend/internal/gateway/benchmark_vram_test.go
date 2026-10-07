@@ -17,9 +17,8 @@ import (
 // phase") and a non-nil VRAM carrying an Inconclusive reason ("it ran and
 // reached no number") must be told apart by a consumer that only sees the
 // serialized status. This is deliberately NOT VisionCapable's nil-means-both
-// contract: "no result" and "no result because the model was already being
-// served by something we could not stop" send an operator to two different
-// places.
+// contract: "no result" and "no result because the model's own process was up
+// again before the run loaded it" send an operator to two different places.
 func TestBenchmarkResultVRAMNilVersusInconclusive(t *testing.T) {
 	// (1) A run that never measured: the key is absent entirely.
 	notRun, err := json.Marshal(BenchmarkResult{MappingID: "map1", Error: "isolation refused"})

@@ -2278,8 +2278,8 @@ diluted it back out.
 **The benchmark runner's own copy of this floor (`benchmark_runner.go`'s
 `streamOnce`) matters MORE than either of the two above, because its result
 is never blended.** `measureMapping` feeds `streamOnce`'s output straight into
-`UpdateMappingBenchmarkMetrics`, which **hard-overwrites**
-`mapping.GenTokensPerSecond` — not the EWMA blend
+`UpdateMappingBenchmarkMetrics`, which **overwrites**
+`mapping.GenTokensPerSecond` with every positive sample — not the EWMA blend
 `UpdateMappingOpportunisticMetrics` applies to a live sample. A single
 implausible benchmark sample (the same "completion arrives microseconds after
 the first token" condition the other two sites suppress) would therefore

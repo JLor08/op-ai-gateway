@@ -367,6 +367,14 @@ function renderSection(
 ) {
   const mappings = opts.mappings ?? [];
   const specsByMappingId = opts.specsByMappingId ?? {};
+  // What the fake backend stores per mapping id: the spec GET answers it, a
+  // spec PUT replaces it, and a spec or mapping DELETE removes it. The
+  // override actions read the spec again before each write, so a read after
+  // a write has to see that write, as it does against the real backend. One
+  // difference is kept: after a mapping DELETE the GET answers the
+  // unconfigured document, where the real backend answers 404 for a mapping
+  // it no longer has.
+  const storedSpecs: Record<string, RuntimeSpec> = { ...specsByMappingId };
   // One value for the initial render AND both rerender helpers: a helper that
   // silently swapped the application back to the module default would make a
   // mid-flow rerender change a fact the test did not mean to change.
@@ -425,10 +433,11 @@ function renderSection(
     }),
     deleteMapping: vi.fn(async (id: string) => {
       deletedMappingIds.push(id);
+      delete storedSpecs[id];
       return { ok: true };
     }),
     runtimeSpec: vi.fn(
-      async (mappingId: string) => specsByMappingId[mappingId] ?? unconfiguredSpec(mappingId),
+      async (mappingId: string) => storedSpecs[mappingId] ?? unconfiguredSpec(mappingId),
     ),
     putRuntimeSpec: vi.fn(async (mappingId: string, body: PutRuntimeSpecRequest) => {
       putSpecs.push({ mappingId, body });
@@ -438,7 +447,7 @@ function renderSection(
       // (normalizeFlavors, the mode defaults in putRuntimeSpec): an empty
       // flavor list comes back as both text flavors, an empty mode as
       // passthrough. Echoing the body verbatim hid exactly that widening.
-      return makeSpec({
+      const stored = makeSpec({
         configured: true,
         mapping_id: mappingId,
         id: specsByMappingId[mappingId]?.id,
@@ -447,9 +456,12 @@ function renderSection(
         responses_mode: body.responses_mode || 'passthrough',
         messages_mode: body.messages_mode || 'passthrough',
       });
+      storedSpecs[mappingId] = stored;
+      return stored;
     }),
     deleteRuntimeSpec: vi.fn(async (id: string) => {
       deletedSpecIds.push(id);
+      delete storedSpecs[id];
       return { ok: true };
     }),
     runtimeCoresidency: vi.fn(() => {
@@ -594,6 +606,8 @@ function renderSection(
   );
   return {
     fakeApi,
+    /** What the fake backend stores per mapping id (see its declaration). */
+    storedSpecs,
     created,
     updatedMappings,
     putSpecs,
@@ -1822,9 +1836,6 @@ describe('RuntimeAdminSection reloads the mappings after a spec write', { timeou
           api_flavors: ['openai'],
         }),
       },
-      // The probe button is gated on the application's probe path, and the
-      // module default has none: without one it is disabled either way.
-      application: { ...application, context_probe_path: '/props' },
     });
     await screen.findByText('gw-model');
     // What the gateway answers once the spec names openai_images only -- and
@@ -3138,12 +3149,11 @@ describe('RuntimeAdminSection admin overrides', () => {
     expect(putSpecs[0].body).toEqual(expectedBody(spec, ''));
   });
 
-  // An override replays the cached document as is, and the cache holds what
-  // the last PUT answered. For a spec stored with [] and "" (no form save
-  // produces one) the first override sends them back unchanged; the backend
-  // stores them as both text flavors with passthrough, so the next override
-  // replays that.
-  it('replays a stored [] and "" as is, then the widened document the PUT answered', async () => {
+  // An override replays the document its own read returns, as is. For a spec
+  // stored with [] and "" (no form save produces one) the first override
+  // sends them back unchanged; the backend stores them as both text flavors
+  // with passthrough, so the next override reads and replays that.
+  it('replays a stored [] and "" as is, then the widened document the PUT stored', async () => {
     const spec = fullSpec({
       api_flavors: [],
       responses_mode: '' as EndpointMode,
@@ -3283,6 +3293,43 @@ describe('RuntimeAdminSection admin overrides', () => {
     expect(fakeApi.putRuntimeSpec).not.toHaveBeenCalled();
   });
 });
+
+// Opens the confirm dialog on the specs tab and confirms a spec delete whose
+// DELETE stays in flight until the test settles it. A settled delete removes
+// the stored spec, as the fake's own DELETE does.
+async function deleteSpecHeldOpen(
+  fakeApi: ReturnType<typeof renderSection>['fakeApi'],
+  deletedSpecIds: string[],
+  storedSpecs: Record<string, RuntimeSpec>,
+) {
+  let settle: (outcome: 'ok' | 'fail') => void = () => {};
+  fakeApi.deleteRuntimeSpec.mockImplementationOnce((id: string) => {
+    deletedSpecIds.push(id);
+    return new Promise<{ ok: boolean }>((resolve, reject) => {
+      settle = (outcome) => {
+        if (outcome === 'fail') {
+          reject(new Error('delete failed'));
+          return;
+        }
+        delete storedSpecs[id];
+        resolve({ ok: true });
+      };
+    });
+  });
+  fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+  await waitForEnabledButton(t.runtimeSpecDelete);
+  fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
+  fireEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
+  );
+  await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
+  return (outcome: 'ok' | 'fail') =>
+    act(async () => {
+      settle(outcome);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+}
 
 describe('RuntimeAdminSection restart sequence', () => {
   function setupRestart(rowState = 'running') {
@@ -3474,12 +3521,11 @@ describe('RuntimeAdminSection restart sequence', () => {
     await waitFor(() => expect(putSpecs).toHaveLength(2));
   });
 
-  // Delete stays available while a restart waits. The delete commits
-  // emptySpec (configured: false) to the cache, and a later `stopped` frame
-  // for the old spec id would then PUT that empty document back: the backend
-  // refuses it (no binary), so the operator saw an error for a write nobody
-  // asked for. A spec that is no longer configured has vanished, like one
-  // that is gone from the cache.
+  // Delete stays available while a restart waits. After the delete, the
+  // clear's read for a later `stopped` frame of the old spec id answers
+  // emptySpec (configured: false), and PUTting that empty document back would
+  // earn a refusal (no binary): an error for a write nobody asked for. A spec
+  // that is no longer configured has vanished.
   it('does not replay a spec deleted while the restart waited', async () => {
     const { putSpecs, stream, deletedSpecIds } = setupRestart();
     await openStatusTab();
@@ -3501,45 +3547,17 @@ describe('RuntimeAdminSection restart sequence', () => {
     expect(putSpecs).toHaveLength(1);
   });
 
-  // Opens the confirm dialog on the specs tab and confirms a spec delete whose
-  // DELETE stays in flight until the test settles it.
-  async function deleteSpecHeldOpen(
-    fakeApi: ReturnType<typeof renderSection>['fakeApi'],
-    deletedSpecIds: string[],
-  ) {
-    let settle: (outcome: 'ok' | 'fail') => void = () => {};
-    fakeApi.deleteRuntimeSpec.mockImplementationOnce((id: string) => {
-      deletedSpecIds.push(id);
-      return new Promise<{ ok: boolean }>((resolve, reject) => {
-        settle = (outcome) =>
-          outcome === 'ok' ? resolve({ ok: true }) : reject(new Error('delete failed'));
-      });
-    });
-    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
-    await waitForEnabledButton(t.runtimeSpecDelete);
-    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecDelete }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: t.runtimeSpecDelete }),
-    );
-    await waitFor(() => expect(deletedSpecIds).toEqual(['map_1']));
-    return (outcome: 'ok' | 'fail') =>
-      act(async () => {
-        settle(outcome);
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-  }
-
   // The spec PUT is an upsert: a clear PUT handled after the DELETE creates
   // the deleted spec again, with no override, so the agent may start it. The
-  // cache still holds the configured document until the DELETE answers, so
-  // the clear waits for it; the next frame then finds the spec vanished.
+  // clear's read can still answer the configured document until the DELETE
+  // answers, so the clear waits for it; the next frame then finds the spec
+  // vanished.
   it('holds the clear while a spec delete is in flight, then reports the spec vanished', async () => {
-    const { fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    const { fakeApi, putSpecs, stream, deletedSpecIds, storedSpecs } = setupRestart();
     await openStatusTab();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
-    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
 
     // The `stopped` frame lands inside the DELETE's round trip.
     stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
@@ -3559,11 +3577,11 @@ describe('RuntimeAdminSection restart sequence', () => {
   // sequence clears its override rather than leaving the model
   // admission-blocked behind a vanished notice.
   it('clears the override after all when the in-flight delete fails', async () => {
-    const { spec, fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    const { spec, fakeApi, putSpecs, stream, deletedSpecIds, storedSpecs } = setupRestart();
     await openStatusTab();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
-    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
 
     stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
     await act(async () => {
@@ -3583,22 +3601,21 @@ describe('RuntimeAdminSection restart sequence', () => {
   // restart forced down. Its admin_state is the operator's new choice, so
   // the old sequence must not clear it.
   it('does not clear the override of a spec created again after the delete', async () => {
-    const { fakeApi, putSpecs, stream, deletedSpecIds } = setupRestart();
+    const { fakeApi, putSpecs, stream, deletedSpecIds, storedSpecs } = setupRestart();
     await openStatusTab();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeRestart }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
-    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds);
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
     await settleDelete('ok');
 
-    // The mapping has no spec row now, and the new one gets its own id.
-    fakeApi.runtimeSpec.mockImplementation(async (mappingId: string) =>
-      unconfiguredSpec(mappingId),
-    );
+    // The mapping has no spec row now, and the new one gets its own id, which
+    // is also what the clear's read then answers.
     const recordPut = fakeApi.putRuntimeSpec.getMockImplementation()!;
-    fakeApi.putRuntimeSpec.mockImplementationOnce(async (mappingId, body) => ({
-      ...(await recordPut(mappingId, body)),
-      id: 'spec_2',
-    }));
+    fakeApi.putRuntimeSpec.mockImplementationOnce(async (mappingId, body) => {
+      const createdAgain = { ...(await recordPut(mappingId, body)), id: 'spec_2' };
+      storedSpecs[mappingId] = createdAgain;
+      return createdAgain;
+    });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
     fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
       target: { value: '/usr/local/bin/llama-server' },
@@ -3613,6 +3630,471 @@ describe('RuntimeAdminSection restart sequence', () => {
     });
     expect(putSpecs).toHaveLength(2);
     expect(screen.getByText(t.runtimeRestartVanished)).toBeInTheDocument();
+  });
+});
+
+// The override writes PUT the whole document, and the spec cache is loaded
+// once per mapping. A benchmark run unpins the server's pinned specs for its
+// duration and pins them again afterwards, so a cache loaded during the run
+// says `pinned: false`, and a body built from it would undo the re-pin. Each
+// write therefore reads the spec first, inside its own bound, and builds its
+// body from what the read returns.
+describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 15_000 }, () => {
+  function setup() {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: fullSpec({ pinned: false }) },
+      statusRows: [makeStatus({ spec_id: 'spec_1', state: 'running' })],
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  // A spec read that stays in flight until the test lands it.
+  function holdNextSpecRead(fakeApi: ReturnType<typeof renderSection>['fakeApi']) {
+    let land: (spec: RuntimeSpec) => void = () => {};
+    fakeApi.runtimeSpec.mockImplementationOnce(
+      () =>
+        new Promise<RuntimeSpec>((resolve) => {
+          land = resolve;
+        }),
+    );
+    return (spec: RuntimeSpec) =>
+      act(async () => {
+        land(spec);
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      });
+  }
+
+  it('Force stop PUTs the pinned value the server holds, not the cached one', async () => {
+    const { fakeApi, storedSpecs, putSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeForceStop);
+    // The run has ended and pinned the spec again; the cache still says false.
+    storedSpecs.map_1 = fullSpec({ pinned: true });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.pinned).toBe(true);
+    expect(putSpecs[0].body).toEqual(expectedBody(fullSpec({ pinned: true }), 'force_stopped'));
+    expect(fakeApi.runtimeSpec).toHaveBeenLastCalledWith('map_1');
+  });
+
+  it('Force stop PUTs nothing when its read fails, says why and releases the lock', async () => {
+    const { fakeApi, putSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeForceStop);
+    fakeApi.runtimeSpec.mockRejectedValueOnce(new Error('runtime spec unavailable'));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+
+    expect(await screen.findByText('runtime spec unavailable')).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.runtimeForceStart })).not.toHaveAttribute(
+        'aria-disabled',
+      ),
+    );
+  });
+
+  // The read is committed to the cache like any other read, so the row shows
+  // what it found even when the write it was made for then fails.
+  it('shows what Force stop read even when its write then fails', async () => {
+    const { fakeApi, storedSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeForceStop);
+    storedSpecs.map_1 = fullSpec({ pinned: false, admin_state: 'force_running' });
+    fakeApi.putRuntimeSpec.mockRejectedValueOnce(new Error('write refused'));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+
+    expect(await screen.findByText('write refused')).toBeInTheDocument();
+    expect(fakeApi.putRuntimeSpec).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole('button', { name: t.runtimeClearOverride })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: t.runtimeForceStart })).not.toBeInTheDocument();
+  });
+
+  // A form save that commits while the read is in flight makes the cache
+  // refuse the read, so the action builds its body on the saved document the
+  // cache holds, not on the refused snapshot, and what the form changed
+  // survives. A write takes its cache ticket when it is sent, after its read,
+  // so the form save is the older write, and the override's answer, which
+  // the server now holds, still becomes the row.
+  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+    '%s builds on a form save that commits during its read and keeps its answer in the row',
+    async (action) => {
+      const { fakeApi, putSpecs, storedSpecs } = setup();
+      await openStatusTab();
+      await waitForEnabledButton(t[action]);
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t[action] }));
+
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
+        target: { value: '/opt/llama/bin/llama-server' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.admin_state).toBe('');
+      const saved = storedSpecs.map_1;
+      expect(saved.binary).toBe('/opt/llama/bin/llama-server');
+      await screen.findByRole('button', { name: t.runtimeSpecCreate });
+
+      // Served before the save, so it still carries the old binary.
+      await landRead(fullSpec({ pinned: false }));
+      await waitFor(() => expect(putSpecs).toHaveLength(2));
+      expect(putSpecs[1].body).toEqual(expectedBody(saved, 'force_stopped'));
+
+      await openStatusTab();
+      expect(
+        await screen.findByRole('button', { name: t.runtimeClearOverride }),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.runtimeForceStop })).not.toBeInTheDocument();
+    },
+  );
+
+  // A read that commits after the form save is newer than the save, and the
+  // cache keeps it for the writes too (`commitSpecRead` puts it in the entry
+  // `readSpecForWrite` falls back on). Here the spec is pinned again outside
+  // this section after the save, and an Edit opened and cancelled reads it, so
+  // the action whose own read the save made the cache refuse keeps the pin
+  // rather than writing the save's `pinned: false` back.
+  it('Force stop builds on a read that committed after the form save, not on the save', async () => {
+    const { fakeApi, putSpecs, storedSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeForceStop);
+    const landRead = holdNextSpecRead(fakeApi);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/llama/bin/llama-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.pinned).toBe(false);
+    await screen.findByRole('button', { name: t.runtimeSpecCreate });
+
+    const repinned = { ...storedSpecs.map_1, pinned: true };
+    storedSpecs.map_1 = repinned;
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByRole('button', { name: t.save });
+    expect(fakeApi.runtimeSpec.mock.calls).toHaveLength(readsBefore + 1);
+    fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+    await screen.findByRole('button', { name: t.runtimeSpecCreate });
+
+    // Served before the save, so the cache refuses it.
+    await landRead(fullSpec({ pinned: false }));
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body).toEqual(expectedBody(repinned, 'force_stopped'));
+    expect(putSpecs[1].body.pinned).toBe(true);
+  });
+
+  it('Restart stops the spec with the document the server holds', async () => {
+    const { storedSpecs, putSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    storedSpecs.map_1 = fullSpec({ pinned: true });
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body).toEqual(expectedBody(fullSpec({ pinned: true }), 'force_stopped'));
+  });
+
+  it('Restart clears the override with the document the server holds once the spec stopped', async () => {
+    const { storedSpecs, putSpecs, stream } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.pinned).toBe(false);
+    // Pinned again while the sequence waited for `stopped`: the cache holds
+    // the force_stopped write's answer, which still says false.
+    const repinned = { ...storedSpecs.map_1, pinned: true };
+    storedSpecs.map_1 = repinned;
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(putSpecs[1].body).toEqual(expectedBody(repinned, ''));
+    expect(putSpecs[1].body.pinned).toBe(true);
+  });
+
+  it('Restart PUTs nothing when its first read fails, and ends the sequence', async () => {
+    const { fakeApi, putSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fakeApi.runtimeSpec.mockRejectedValueOnce(new Error('runtime spec unavailable'));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+
+    expect(await screen.findByText('runtime spec unavailable')).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+    await waitFor(() =>
+      expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument(),
+    );
+  });
+
+  it('Restart sends no clear when the read before it fails, and ends the sequence', async () => {
+    const { fakeApi, putSpecs, stream } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    fakeApi.runtimeSpec.mockRejectedValueOnce(new Error('runtime spec unavailable'));
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+
+    expect(await screen.findByText('runtime spec unavailable')).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(1);
+    await waitFor(() =>
+      expect(screen.queryByText(t.runtimeRestartClearing)).not.toBeInTheDocument(),
+    );
+  });
+
+  // The clear's flow leaves `waiting` before its read, so a further `stopped`
+  // frame that lands while the read is in flight starts no second clear.
+  it('starts one clear however many stopped frames land during its read', async () => {
+    const { fakeApi, putSpecs, stream } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const landRead = holdNextSpecRead(fakeApi);
+    const readsBefore = fakeApi.runtimeSpec.mock.calls.length;
+
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    await landRead(fullSpec({ pinned: false, admin_state: 'force_stopped' }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(2));
+    expect(fakeApi.runtimeSpec.mock.calls.length - readsBefore).toBe(1);
+    await act(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(putSpecs).toHaveLength(2);
+  });
+
+  // A spec DELETE confirmed while an action's read is in flight. The read can
+  // still answer the configured document, and the spec PUT is an upsert, so a
+  // write built on it would create the deleted spec again. The action writes
+  // nothing and ends, whether the DELETE is still in flight when the read
+  // lands or has already committed (the cache then holds the unconfigured
+  // document, which the action takes over the refused read).
+  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+    '%s writes nothing while a spec delete confirmed during its read is in flight',
+    async (action) => {
+      const { fakeApi, putSpecs, deletedSpecIds, storedSpecs } = setup();
+      await openStatusTab();
+      await waitForEnabledButton(t[action]);
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t[action] }));
+      const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
+
+      await landRead(fullSpec({ pinned: false }));
+      expect(putSpecs).toHaveLength(0);
+
+      await settleDelete('ok');
+      await openStatusTab();
+      await waitFor(() =>
+        expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument(),
+      );
+      expect(putSpecs).toHaveLength(0);
+    },
+  );
+
+  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+    '%s writes nothing when a spec delete commits during its read',
+    async (action) => {
+      const { fakeApi, putSpecs, deletedSpecIds, storedSpecs } = setup();
+      await openStatusTab();
+      await waitForEnabledButton(t[action]);
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t[action] }));
+      const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
+      await settleDelete('ok');
+
+      // Served before the DELETE, so it still says configured.
+      await landRead(fullSpec({ pinned: false }));
+
+      expect(putSpecs).toHaveLength(0);
+      await openStatusTab();
+      await waitFor(() =>
+        expect(screen.queryByText(t.runtimeRestartStopping)).not.toBeInTheDocument(),
+      );
+      expect(putSpecs).toHaveLength(0);
+    },
+  );
+
+  // A mapping delete leaves no cache entry at all, which the action reads as
+  // the unconfigured document too.
+  it('Force stop writes nothing when the spec and then its mapping are deleted during its read', async () => {
+    const { fakeApi, putSpecs, deletedSpecIds, deletedMappingIds, storedSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeForceStop);
+    const landRead = holdNextSpecRead(fakeApi);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
+    await settleDelete('ok');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingDelete }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: t.mappingDelete }),
+    );
+    await waitFor(() => expect(deletedMappingIds).toEqual(['map_1']));
+
+    await landRead(fullSpec({ pinned: false }));
+
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  // The clear's read with a spec DELETE confirmed while it is in flight: the
+  // clear sends nothing and goes back to waiting, and a frame after the
+  // DELETE has settled decides. The spec is gone by then, so nothing creates
+  // it again.
+  it('holds a clear whose read a spec delete overtook, then reports the spec vanished', async () => {
+    const { fakeApi, putSpecs, stream, deletedSpecIds, storedSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const landRead = holdNextSpecRead(fakeApi);
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    expect(await screen.findByText(t.runtimeRestartClearing)).toBeInTheDocument();
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
+
+    await landRead(fullSpec({ pinned: false, admin_state: 'force_stopped' }));
+    expect(putSpecs).toHaveLength(1);
+
+    await settleDelete('ok');
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    expect(await screen.findByText(t.runtimeRestartVanished)).toBeInTheDocument();
+    await act(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  it('sends no clear when a spec delete commits during its read', async () => {
+    const { fakeApi, putSpecs, stream, deletedSpecIds, storedSpecs } = setup();
+    await openStatusTab();
+    await waitForEnabledButton(t.runtimeRestart);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const landRead = holdNextSpecRead(fakeApi);
+    stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+    expect(await screen.findByText(t.runtimeRestartClearing)).toBeInTheDocument();
+    const settleDelete = await deleteSpecHeldOpen(fakeApi, deletedSpecIds, storedSpecs);
+    await settleDelete('ok');
+
+    // Served before the DELETE, so it still says configured.
+    await landRead(fullSpec({ pinned: false, admin_state: 'force_stopped' }));
+
+    expect(await screen.findByText(t.runtimeRestartVanished)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(1);
+  });
+
+  // An action whose section unmounts while its read is in flight sends
+  // nothing when the read then lands.
+  it.each(['runtimeForceStop', 'runtimeRestart'] as const)(
+    '%s sends nothing when the section unmounts during its read',
+    async (action) => {
+      const { fakeApi, putSpecs, detachSection } = setup();
+      await openStatusTab();
+      await waitForEnabledButton(t[action]);
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t[action] }));
+
+      detachSection();
+      await landRead(fullSpec({ pinned: true }));
+
+      expect(putSpecs).toHaveLength(0);
+    },
+  );
+
+  // Each read runs inside its write's existing bound. A read that lands after
+  // the bound gave the write up sends nothing: the operator has already been
+  // told it was abandoned, and the lock is free for another action.
+  it('sends no Force stop whose read landed after the watchdog gave it up', async () => {
+    vi.useFakeTimers();
+    try {
+      const { fakeApi, putSpecs } = setup();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeForceStop }));
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeWriteTimeout)).toBeInTheDocument();
+
+      await landRead(fullSpec({ pinned: true }));
+
+      expect(putSpecs).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends no Restart stop whose read landed after the stop deadline gave it up', async () => {
+    vi.useFakeTimers();
+    try {
+      const { fakeApi, putSpecs } = setup();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      const landRead = holdNextSpecRead(fakeApi);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        vi.advanceTimersByTime(RESTART_STOP_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
+
+      await landRead(fullSpec({ pinned: true }));
+
+      expect(putSpecs).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends no Restart clear whose read landed after the clear deadline gave it up', async () => {
+    vi.useFakeTimers();
+    try {
+      const { fakeApi, putSpecs, stream } = setup();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole('tab', { name: t.runtimeLiveStatus }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeRestart }));
+      await act(async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      });
+      expect(putSpecs).toHaveLength(1);
+      const landRead = holdNextSpecRead(fakeApi);
+      stream.push([makeStatus({ spec_id: 'spec_1', state: 'stopped' })]);
+      await act(async () => {
+        vi.advanceTimersByTime(OVERRIDE_WRITE_TIMEOUT_MS + 1000);
+        await Promise.resolve();
+      });
+      expect(screen.getByText(t.runtimeRestartClearTimeout)).toBeInTheDocument();
+
+      await landRead(fullSpec({ pinned: false, admin_state: 'force_stopped' }));
+
+      expect(putSpecs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -5541,13 +6023,16 @@ describe('RuntimeAdminSection a spec save clears the restart notice (fix round 1
       expect(screen.getByText(t.runtimeRestartTimeout)).toBeInTheDocument();
 
       // Do exactly that: open the spec form (whose admin_state field hydrates
-      // to "automatic" from the GET) and save.
+      // from its own GET to the force_stopped the restart stored), clear the
+      // override there and save.
       fireEvent.click(screen.getByRole('tab', { name: t.runtimeSpecs }));
       fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
       });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecAdminState }));
+      fireEvent.click(screen.getByRole('option', { name: t.runtimeClearOverride }));
       fireEvent.click(screen.getByRole('button', { name: t.save }));
       await act(async () => {
         await Promise.resolve();
@@ -6657,8 +7142,8 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
 
     const { updatedMappings } = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
-      // The probe button is gated on the APPLICATION's probe path, and the
-      // module default has none.
+      // An application path set through the API, which the gateway's probe
+      // uses ahead of the one it derives.
       application: { ...application, context_probe_path: '/props' },
       probeMappingContext,
       benchmarkStatus,
@@ -6682,6 +7167,52 @@ describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
     );
     // Fill only -- the operator still saves. Identical to the ordinary screen.
     expect(updatedMappings).toHaveLength(0);
+  });
+
+  // The application form clears all three probe fields for server_agent, so
+  // this is the application every portal-created agent carries. The gateway
+  // derives its context probe, and the button does not wait for a path.
+  it('offers the context probe for an application without a context_probe_path', async () => {
+    const benchmarkStatus = vi.fn(async () => ({
+      running: false,
+      server_id: 'srv_1',
+      scope: 'context-probe',
+      total: 1,
+      done: 1,
+      results: [
+        {
+          mapping_id: 'map_1',
+          gateway_model_name: 'gw-model',
+          gen_tokens_per_second: 0,
+          prompt_tokens_per_second: 0,
+          load_time_ms: 0,
+          context_size: 32768,
+        },
+      ],
+    })) as unknown as PortalApi['benchmarkStatus'];
+
+    const { fakeApi } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      application: {
+        ...application,
+        loaded_models_path: '',
+        loaded_models_format: '',
+        context_probe_path: '',
+      },
+      benchmarkStatus,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(screen.getByRole('tab', { name: t.runtimeMappingTab }));
+    fireEvent.click(await screen.findByRole('button', { name: t.mappingEdit }));
+
+    const probeBtn = await screen.findByRole('button', { name: t.mappingProbeContext });
+    await waitFor(() => expect(probeBtn).toBeEnabled());
+    fireEvent.click(probeBtn);
+
+    await waitFor(() => expect(fakeApi.probeMappingContext).toHaveBeenCalledWith('map_1'));
+    await waitFor(() =>
+      expect((screen.getByLabelText(t.mappingContextSize) as HTMLInputElement).value).toBe('32768'),
+    );
   });
 
   it('toggles a mapping status with a status-only PATCH', async () => {

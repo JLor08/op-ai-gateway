@@ -71,6 +71,10 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // benign either way: a view that became images-only is prompted and its
 // result records the failure, and one that stopped being images-only is
 // skipped for this run.
+//
+// A speed or both run is the one run that may stop the server's running agent
+// models before it measures (benchmarkMayPreStop, preStopServer): this
+// starter's AuthorizeBenchmarkScope is the gate that authorizes those writes.
 func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token auth.Token, scope, id, mode string) {
 	server, views, err := s.Portal.AuthorizeBenchmarkScope(r.Context(), token, scope, id)
 	if err != nil {
@@ -108,6 +112,7 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 	for _, res := range part.recorded {
 		run.addResult(res)
 	}
+	benchmarkMayPreStop(part.runnable, mode)
 	go func() {
 		defer cancel()
 		s.runBenchmark(ctx, run, server.ID, part.runnable, mode)
@@ -117,7 +122,7 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 
 // startContextProbe authorizes the mapping, reserves its server (mutually exclusive with
 // benchmarks + excluded from routing), idle-gates, and launches a background context-size probe
-// that warm-loads the model then reads its context via the app's context_probe_path. 202 + the
+// that warm-loads the model then reads its context size (benchmarkContextSize). 202 + the
 // initial status; 409 if the server is busy or has in-flight requests. The result is REPORTED via
 // the status poll (results[].context_size), NOT persisted.
 //

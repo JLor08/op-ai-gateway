@@ -273,10 +273,11 @@ func (r *AgentStreamRegistry) NotifyCertUpdate(serverID, fingerprint string) {
 
 // NotifyRuntimeConfig is the gateway's push half of the agent-runtime-manager
 // design's WS delivery path (see Server.PushRuntimeConfig, agent_runtime.go,
-// for the feature-gate + async wrapper that calls this): every open agent
-// connection for serverID gets a runtime_config frame whose payload IS THE
-// WHOLE AgentRuntimeConfigDTO document, already marshaled by the caller --
-// never a command, never a delta. This is a deliberate design choice
+// whose per-server worker calls this from its feature-gated pass,
+// pushRuntimeConfigPass): every open agent connection for serverID gets a
+// runtime_config frame whose payload IS THE WHOLE AgentRuntimeConfigDTO
+// document, already marshaled by the caller -- never a command, never a
+// delta. This is a deliberate design choice
 // (rejected alternative: a command frame like "start spec X", which a WS
 // reconnect could simply lose, forcing acks/retries/dedup on top of a
 // persisted desired-state document that has to exist anyway): every frame is
@@ -292,14 +293,19 @@ func (r *AgentStreamRegistry) NotifyCertUpdate(serverID, fingerprint string) {
 // connection all fail silently -- a notification failure must never surface
 // as anything the caller (a portal runtime-spec write) has to handle. An
 // empty/nil payload is a no-op: there is nothing meaningful to push.
-func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.RawMessage) {
+//
+// enqueued is the number of connections that took the frame: 0 for a nil
+// registry, an empty server id or payload, a failed marshal, a server with no
+// open connection, or a frame every queue dropped. The push worker spaces its
+// next pass only after a pass that enqueued at least one frame.
+func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.RawMessage) (enqueued int) {
 	if r == nil || serverID == "" || len(payload) == 0 {
-		return
+		return 0
 	}
 	b, err := marshalStreamFrame("runtime_config", payload)
 	if err != nil {
 		slog.Debug("agent stream: runtime_config marshal failed", "server_id", serverID, "err", err)
-		return
+		return 0
 	}
 	r.mu.RLock()
 	set := r.conns[serverID]
@@ -313,8 +319,11 @@ func (r *AgentStreamRegistry) NotifyRuntimeConfig(serverID string, payload json.
 	for _, c := range conns {
 		if !c.enqueue(b) {
 			slog.Debug("agent stream: runtime_config queue full, frame dropped", "server_id", serverID)
+			continue
 		}
+		enqueued++
 	}
+	return enqueued
 }
 
 // runtimeLogWatchFrame is the ENTIRE wire payload of a runtime_log_config

@@ -1424,11 +1424,13 @@ func (o *owner) admitAndStart(specID string) {
 	case dec.Reason == StatePendingVRAMUnknown:
 		o.setPendingVRAMUnknown(st, dec.Message)
 	case dec.Wait:
-		// Leave st queued; a future completion event elsewhere re-triggers
-		// this via wakeAdmissionCandidates. The state is deliberately
-		// unchanged -- the spec is waiting, not failed -- but a Wait that
-		// carries a message records it, because that is the one Wait nothing
-		// need ever resolve. See noteAdmissionWait.
+		// Leave st queued; a later release, exit or Apply re-triggers this
+		// via wakeAdmissionCandidates, and so does a start that finishes,
+		// via wakeAfterStart, for a queued request or a pinned spec only (see
+		// there). The state is deliberately unchanged -- the spec is waiting,
+		// not failed -- but a Wait that carries a message records it, because
+		// that is the one Wait nothing need ever resolve. See
+		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
 	case len(dec.Evict) > 0:
 		for _, victimID := range dec.Evict {
@@ -2034,6 +2036,10 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// load. The housekeeping beat then keeps it current as the KV cache
 		// grows. Non-blocking -- see dispatchMeasurement.
 		o.dispatchMeasurement()
+		// After succeedPending on purpose: a start that served waiters is
+		// busy for this wake, so a request queued for another spec Waits for
+		// their release instead of evicting the process just handed out.
+		o.wakeAfterStart()
 		return
 	}
 
@@ -2384,7 +2390,9 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 // (no live process), not in an active crash-backoff wait, and WANTS to be up
 // -- called after any event that could plausibly have freed a resource
 // another spec's admission decision depends on (a release, a process actually
-// exiting, a config Apply).
+// exiting, a config Apply). A start that finishes changes an admission input
+// too, without freeing anything, and has its own narrower wake:
+// wakeAfterStart.
 //
 // "Wants to be up" is admitAndStart's own wantUp rule, not "has a queued
 // request": a PINNED or force_running spec wants to be up with no waiter at
@@ -2395,7 +2403,11 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 // call admitAndStart for it again. That was a latent hole before C3 and a
 // guaranteed one after it (the Starting clause makes Wait strictly more
 // likely), so the wake loop has to cover every spec that wants to be up, not
-// only the ones with someone waiting.
+// only the ones with someone waiting. The "still loading" case is retried
+// when that start finishes, by wakeAfterStart, for a pinned spec and for one
+// with a queued request; a force_running spec without a waiter waits for the
+// next release, exit or Apply, because waking it there lets two such specs
+// evict each other at load speed (see wakeAfterStart).
 //
 // Order is oldest-queued-request-first, not Go's randomized map order: when
 // one freed slot cannot satisfy everyone, the request that has been waiting
@@ -2403,9 +2415,50 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 // sort last -- nobody is waiting on them, and they will be retried by the
 // next event either way.
 func (o *owner) wakeAdmissionCandidates() {
+	o.wakeAdmission(wantsWake)
+}
+
+// wakeAfterStart is the admission wake for a start that has just finished.
+//
+// Leaving StateStarting changes an admission input without freeing anything:
+// the process stays, but from this moment it is evictable when idle and
+// unpinned (isEvictable's Starting clause no longer holds), and no exit,
+// release or Apply follows to say so. A start that served waiters is covered
+// later by their releases, because succeedPending has made the process busy.
+// An unpinned start without one -- a force_running spec's, or an on-demand
+// one whose every caller left while it loaded -- is covered by nothing else.
+// Until 0.8.1 no wake ran here: a request queued for another spec behind
+// such a start waited for an unrelated release, exit or Apply, and failed at
+// its admission_wait_timeout_seconds if none came first (when that is 0, it
+// waited until one came or its caller gave up), and a pinned spec behind it
+// stayed stopped until one came.
+//
+// It retries only the candidates whose start the next such wake cannot undo
+// while a caller still needs it: a spec with a queued request comes up busy
+// unless every caller left while it loaded (succeedPending serves the
+// requests still queued), and a pinned spec is never evicted. So every start
+// this wake causes is for a queued request or a pinned spec, and it cannot
+// loop without traffic. A force_running spec without a waiter is left to the
+// next release, exit or Apply. Woken here, two force_running specs that
+// cannot run together would evict each other with no event in between, one
+// full model load per turn and no end: the storm isEvictable's Starting
+// clause ends, at load speed.
+func (o *owner) wakeAfterStart() {
+	o.wakeAdmission(wantsWakeAfterStart)
+}
+
+// wantsWakeAfterStart is wakeAfterStart's selection rule: wantsWake, narrowed
+// to a spec with a queued request or a pinned one. See wakeAfterStart.
+func wantsWakeAfterStart(st *specState) bool {
+	return wantsWake(st) && (len(st.pending) > 0 || st.spec.Pinned)
+}
+
+// wakeAdmission retries admission for every spec that want selects, oldest
+// queued request first (see wakeAdmissionCandidates).
+func (o *owner) wakeAdmission(want func(*specState) bool) {
 	candidates := make([]wakeCandidate, 0, len(o.specs))
 	for id, st := range o.specs {
-		if !wantsWake(st) {
+		if !want(st) {
 			continue
 		}
 		c := wakeCandidate{id: id}
@@ -2424,8 +2477,8 @@ func (o *owner) wakeAdmissionCandidates() {
 	}
 }
 
-// wakeCandidate is one spec wakeAdmissionCandidates has selected for a
-// retry, carried alongside the queue time of its OLDEST waiter -- the zero
+// wakeCandidate is one spec wakeAdmission has selected for a retry,
+// carried alongside the queue time of its OLDEST waiter -- the zero
 // time when it has none, which is the pinned/force_running case.
 type wakeCandidate struct {
 	id       string
@@ -2449,7 +2502,7 @@ func wantsWake(st *specState) bool {
 	return len(st.pending) > 0 || st.spec.Pinned || st.spec.AdminState == "force_running"
 }
 
-// lessByQueueAge is wakeAdmissionCandidates' wake order: oldest queued
+// lessByQueueAge is wakeAdmission's wake order: oldest queued
 // request first, specs with no waiter at all last, and the spec ID as a final
 // tiebreak so the order is total. That last clause is load-bearing rather
 // than tidiness -- leaving equal keys to fall back on Go's randomized map

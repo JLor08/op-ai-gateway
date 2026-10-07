@@ -561,6 +561,153 @@ func TestRoutingStoreOpportunisticMetricsEWMA(t *testing.T) {
 	})
 }
 
+// --- Benchmark metrics: keep-last parity + locked/missing no-op -------------
+
+// benchmarkMetricsStore is the part of a mapping store the keep-last cases
+// use. *SQLStore and every routing.Store satisfy it, so the dialect suite and
+// the memory-vs-SQL suite run the same cases.
+type benchmarkMetricsStore interface {
+	MappingByID(ctx context.Context, id string) (routing.ModelMapping, error)
+	UpdateMappingBenchmarkMetrics(ctx context.Context, id string, genTPS, promptTPS float64, loadMS int, at time.Time) error
+	UpdateMappingContextProbe(ctx context.Context, id string, contextSize int, at time.Time) error
+}
+
+// checkBenchmarkMetricsKeepLast runs the keep-last cases of
+// UpdateMappingBenchmarkMetrics against mapping id, which must exist and be
+// unlocked. It starts from 50 / 900 / 1234 (gen / prompt / load) and checks
+// that a value of 0 or below keeps its stored column, and that a call with
+// nothing above 0 leaves metrics_source and metrics_updated_at alone as well.
+// A context probe stamps its own provenance ("probe") before the calls that
+// measure nothing, so a write of "benchmark" there is visible.
+func checkBenchmarkMetricsKeepLast(t *testing.T, s benchmarkMetricsStore, id string) {
+	t.Helper()
+	ctx := context.Background()
+	at := func(minute int) time.Time { return time.Date(2026, 9, 30, 10, minute, 0, 0, time.UTC) }
+	write := func(gen, prompt float64, load int, when time.Time) {
+		t.Helper()
+		if err := s.UpdateMappingBenchmarkMetrics(ctx, id, gen, prompt, load, when); err != nil {
+			t.Fatalf("UpdateMappingBenchmarkMetrics(%v, %v, %d): %v", gen, prompt, load, err)
+		}
+	}
+	want := func(step string, gen, prompt float64, load int, source string, when time.Time) {
+		t.Helper()
+		got, err := s.MappingByID(ctx, id)
+		if err != nil {
+			t.Fatalf("%s: MappingByID: %v", step, err)
+		}
+		if got.GenTokensPerSecond != gen || got.PromptTokensPerSecond != prompt || got.LoadTimeMS != load {
+			t.Fatalf("%s: gen / prompt / load = %v / %v / %d, want %v / %v / %d",
+				step, got.GenTokensPerSecond, got.PromptTokensPerSecond, got.LoadTimeMS, gen, prompt, load)
+		}
+		if got.MetricsSource != source {
+			t.Fatalf("%s: MetricsSource = %q, want %q", step, got.MetricsSource, source)
+		}
+		if got.MetricsUpdatedAt == nil || !got.MetricsUpdatedAt.Equal(when) {
+			t.Fatalf("%s: MetricsUpdatedAt = %v, want %v", step, got.MetricsUpdatedAt, when)
+		}
+	}
+
+	write(50, 900, 1234, at(0))
+	want("a write that measured everything", 50, 900, 1234, "benchmark", at(0))
+
+	write(42, 0, 0, at(1))
+	want("a write that measured only the generation rate", 42, 900, 1234, "benchmark", at(1))
+
+	if err := s.UpdateMappingContextProbe(ctx, id, 8192, at(2)); err != nil {
+		t.Fatalf("UpdateMappingContextProbe: %v", err)
+	}
+	want("a context probe", 42, 900, 1234, "probe", at(2))
+
+	write(0, 0, 0, at(3))
+	want("a write that measured nothing", 42, 900, 1234, "probe", at(2))
+
+	write(-1, -1, -1, at(4))
+	want("a write of only negative values", 42, 900, 1234, "probe", at(2))
+
+	write(0, 0, 1500, at(5))
+	want("a write that measured only the load time", 42, 900, 1500, "benchmark", at(5))
+
+	write(-5, 950, -7, at(6))
+	want("negative values beside a measured prompt rate", 42, 950, 1500, "benchmark", at(6))
+
+	got, err := s.MappingByID(ctx, id)
+	if err != nil {
+		t.Fatalf("MappingByID: %v", err)
+	}
+	if got.ContextSize != 8192 {
+		t.Fatalf("ContextSize = %d, want 8192 (a benchmark-metrics write never touches context_size)", got.ContextSize)
+	}
+}
+
+// TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured runs the
+// keep-last cases through routing.Store on every backend, so MemoryStore's
+// copy of the rule is held to the SQL one, and then the locked and missing
+// no-ops.
+func TestRoutingStoreUpdateMappingBenchmarkMetricsKeepsUnmeasured(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv1", Name: "S1", Domain: "srv1.example.test", Provider: routing.ProviderOllama,
+			Endpoint: "http://srv1.example.test:11434", Status: routing.ServerStatusActive,
+			HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app1", ServerID: "srv1", Type: "ollama", Port: 11434, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+			TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		mapping := routing.ModelMapping{
+			ID: "m1", ApplicationID: "app1", GatewayModelName: "gpt-4o-mini",
+			AppModelName: "up", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateMapping(ctx, mapping); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		checkBenchmarkMetricsKeepLast(t, s, "m1")
+
+		// A locked mapping keeps its pinned values and provenance.
+		lockedAt := time.Date(2026, 9, 30, 11, 0, 0, 0, time.UTC)
+		mapping.GenTokensPerSecond = 1
+		mapping.PromptTokensPerSecond = 1
+		mapping.LoadTimeMS = 1
+		mapping.MetricsLocked = true
+		mapping.MetricsSource = "manual"
+		mapping.MetricsUpdatedAt = &lockedAt
+		mapping.UpdatedAt = lockedAt
+		if err := s.UpdateMapping(ctx, mapping); err != nil {
+			t.Fatalf("lock mapping: %v", err)
+		}
+		if err := s.UpdateMappingBenchmarkMetrics(ctx, "m1", 999, 999, 999, lockedAt.Add(time.Hour)); err != nil {
+			t.Fatalf("UpdateMappingBenchmarkMetrics (locked): %v", err)
+		}
+		locked, err := s.MappingByID(ctx, "m1")
+		if err != nil {
+			t.Fatalf("MappingByID (locked): %v", err)
+		}
+		if locked.GenTokensPerSecond != 1 || locked.PromptTokensPerSecond != 1 || locked.LoadTimeMS != 1 {
+			t.Fatalf("locked gen / prompt / load = %v / %v / %d, want 1 / 1 / 1 (a benchmark must not overwrite a lock)",
+				locked.GenTokensPerSecond, locked.PromptTokensPerSecond, locked.LoadTimeMS)
+		}
+		if locked.MetricsSource != "manual" {
+			t.Fatalf("locked MetricsSource = %q, want manual (a benchmark must not overwrite a lock)", locked.MetricsSource)
+		}
+
+		// A missing mapping is a benign no-op.
+		if err := s.UpdateMappingBenchmarkMetrics(ctx, "does-not-exist", 42, 42, 42, lockedAt); err != nil {
+			t.Fatalf("UpdateMappingBenchmarkMetrics (missing) = %v, want nil (benign no-op)", err)
+		}
+	})
+}
+
 // --- Capability rows and metrics_locked (#49-3) -----------------------------
 
 // TestUpsertMappingCapabilitiesIgnoresMetricsLock is the load-bearing test for

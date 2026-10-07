@@ -102,7 +102,7 @@ what these five tables are for, and §4 below for their field semantics.
 
 | Table | Purpose |
 |---|---|
-| `system_settings` | A generic key/value store for portal-wide settings (SMTP config, NetBird token, feature toggles, …). |
+| `system_settings` | A generic key/value store for portal-wide settings (SMTP config, NetBird token, feature toggles, …). It also holds runtime-managed keys that no settings form edits, such as the per-server benchmark override lease, `benchmark_override_lease:<server_id>` ([Agent-Managed Model Runtime §11.10](../cross-cutting/agent-runtime-manager.md#1110-load-time-of-an-agent-model-the-stop-all-the-temporary-unpin-and-the-override-lease)). |
 | `user_ui_preferences` | Per-user opaque JSON preferences, keyed by `(user_id, key)`. |
 
 ### Migration bookkeeping

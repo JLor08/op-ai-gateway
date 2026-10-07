@@ -30,24 +30,6 @@ var (
 	appHealthProbeConcurrency = 8
 )
 
-// runtimeUpstreamPropsFeature is the agent-DECLARED capability naming the
-// runtime router's GET /upstream/{model}/props passthrough (issue #58). The
-// {model} probe pass below only sends such probes at an agent with positive
-// evidence the route exists -- fail-closed, the PushRuntimeConfig precedent
-// -- because an older agent answers 404 runtime.model_not_managed for every
-// such probe, forever, and silent no-op traffic each cadence tick is
-// exactly what a capability gate exists to prevent.
-const runtimeUpstreamPropsFeature = "runtime_upstream_props"
-
-// serverAgentPropsProbePath is the implicit {model}-template probe path for
-// a server_agent application whose operator left app.ContextProbePath
-// empty: the agent's router forwards it to the RUNNING child's /props with
-// the request's credential intact, so the pass recovers the live-progress
-// verdict of an api-key-protected child (issue #58) -- the case the agent's
-// own token-less loopback probe conclusively cannot determine. An
-// operator-set ContextProbePath always wins over this default.
-const serverAgentPropsProbePath = "/upstream/{model}/props"
-
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
 // and *routing.MemoryStore both satisfy it.
 type healthStore interface {
@@ -782,6 +764,14 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 	// the cleanup below does not drop a not-yet-due app's last-probe time.
 	// Skipped entirely for an off-mesh server under netbird_only so this pass
 	// never dials it.
+	//
+	// It reads the stored app.LoadedModelsPath, never
+	// routing.EffectiveLoadedModelsProbe, because it writes the loaded-model
+	// registry (SetGatewayProbe). For a server_agent application the agent's
+	// own report is the truth there, and LoadedAppModels ignores an empty
+	// agent report, so a gateway-poll entry would keep a model "loaded" for
+	// as long as the agent reports nothing loaded. A server_agent application
+	// saved in the portal has the field empty and is skipped here.
 	if r.loaded != nil && !offMesh {
 		lister, hasLister := r.prober.(provider.LoadedModelLister)
 		for i := range active {
@@ -835,8 +825,10 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		}
 	}
 
-	// Context-size probe pass: for every active application that declares a
-	// ContextProbePath, GET it on the application's own cadence (llama.cpp
+	// Context-size probe pass: for every active application with a context
+	// probe path (routing.EffectiveContextProbePath: its own ContextProbePath,
+	// or the agent router's per-model /props passthrough for a server_agent
+	// application), GET it on the application's own cadence (llama.cpp
 	// /props), match each reported model to a mapping by AppModelName, and
 	// persist its context_size (metrics_source "probe"). Like the loaded pass
 	// this is independent of the health-check mode and runs on its own "ctx:"+id
@@ -865,16 +857,12 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		ctxProber, hasCtxProber := r.prober.(provider.ModelInfoProber)
 		for i := range active {
 			app := active[i]
-			probePath := strings.TrimSpace(app.ContextProbePath)
-			if probePath == "" && app.Type == routing.ProviderServerAgent &&
-				hasAgentFeature(r.agents, server.ID, runtimeUpstreamPropsFeature) {
-				// server_agent implicit default (issue #58): probe the router's
-				// GET-only /props passthrough per loaded mapping. Fail-closed on
-				// the agent's declared capability -- an agent without the route
-				// would 404 every probe -- and an operator-set ContextProbePath
-				// above always wins.
-				probePath = serverAgentPropsProbePath
-			}
+			// A server_agent application with an empty ContextProbePath probes
+			// the router's GET-only /props passthrough per loaded mapping, but
+			// only when its agent declared the route: an agent without it
+			// would 404 every probe. An operator-set ContextProbePath always
+			// wins.
+			probePath := routing.EffectiveContextProbePath(app, hasAgentFeature(r.agents, server.ID, gateway.RuntimeUpstreamPropsFeature))
 			if !hasCtxProber || probePath == "" {
 				continue
 			}

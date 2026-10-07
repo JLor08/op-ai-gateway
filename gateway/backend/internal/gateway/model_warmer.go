@@ -31,8 +31,9 @@ const (
 // modelWarmer implements routing.ModelWarmer: a best-effort, non-blocking, deduplicated
 // background load of a gateway model's best candidate (the climb_up load-ahead). It streams
 // a 1-token request DIRECTLY through the provider (like a benchmark) so it records NO usage,
-// no billing, and never touches the Active registry. Every upstream call is timeout-bounded
-// so a stalled upstream can't leak a goroutine. Both maps are guarded by mu. Nil-safe.
+// no billing, and never touches the Active registry. Like routing, it leaves out a server a
+// benchmark holds (unreservedCandidates). Every upstream call is timeout-bounded so a stalled
+// upstream can't leak a goroutine. Both maps are guarded by mu. Nil-safe.
 type modelWarmer struct {
 	srv      *Server
 	mu       sync.Mutex
@@ -73,10 +74,11 @@ func (w *modelWarmer) Warm(_ context.Context, gatewayModelName string) {
 	go w.warmOnce(name)
 }
 
-// warmOnce resolves the model's best (first reachable) candidate, skips warming a model that
-// is already resident, else streams a 1-token request to force the load. All failures degrade
-// silently (Debug-logged). Bounded by warmCallTimeout. On exit it clears the in-flight marker
-// and records the cooldown timestamp so a repeat Warm within warmCooldown is skipped.
+// warmOnce resolves the model's best (first reachable) candidate on a server no benchmark
+// holds, skips warming a model that is already resident (modelResident), else streams a
+// 1-token request to force the load. All failures degrade silently (Debug-logged). Bounded by
+// warmCallTimeout. On exit it clears the in-flight marker and records the cooldown timestamp
+// so a repeat Warm within warmCooldown is skipped.
 func (w *modelWarmer) warmOnce(name string) {
 	defer func() {
 		w.mu.Lock()
@@ -113,8 +115,9 @@ func (w *modelWarmer) warmOnce(name string) {
 		}
 	}
 	cands = w.textCandidates(ctx, cands)
+	cands = w.unreservedCandidates(cands)
 	if len(cands) == 0 {
-		return // nothing to warm (not a real model, no active mapping, or images only)
+		return // nothing to warm (not a real model, no active mapping, images only, or every server reserved)
 	}
 	cand := w.pickCandidate(cands)
 	// The one benchmarkTarget built WITHOUT Server.benchmarkTargetFor: the
@@ -136,13 +139,10 @@ func (w *modelWarmer) warmOnce(name string) {
 	req.MaxTokens = 1 // minimal — we only want the model loaded
 
 	// Skip warming a model that is already resident (a load-ahead of a loaded model is wasted
-	// work). Best-effort: a probe error falls through to the warm.
-	if lister, ok := s.Provider.(provider.LoadedModelLister); ok &&
-		strings.TrimSpace(bt.app.LoadedModelsPath) != "" && strings.TrimSpace(bt.mapping.AppModelName) != "" {
-		probeCtx := s.upstreamAuthCtx(ctx, target)
-		if loaded, err := modelLoaded(probeCtx, lister, target, bt.app, bt.mapping.AppModelName); err == nil && loaded {
-			return
-		}
+	// work). Best-effort: a question modelResident could not answer (nothing to ask, or a
+	// probe error) falls through to the warm.
+	if resident, _ := s.modelResident(ctx, target, bt); resident {
+		return
 	}
 
 	// Force the load. streamOnce attaches the per-app upstream credential, runs the always-on
@@ -166,6 +166,24 @@ func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.Mappin
 			continue
 		}
 		if !imagesOnly {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// unreservedCandidates drops the candidates on a server a benchmark holds
+// (BenchmarkRegistry.ServerBusy), keeping the order. It is the exclusion routing applies
+// (Resolver.affinityServer and Resolver.selectCandidate): a warm on a reserved server would
+// start a model while a benchmark measures there, and it could load a benchmark target
+// between the run's cold check and its cold request, which makes the recorded load time too
+// small. A remaining candidate on another server is warmed as before, because routing would
+// send the request there. The warm does not register in Active, and the check is made once,
+// before the pick: a warm already past it when a run reserves the server goes on.
+func (w *modelWarmer) unreservedCandidates(cands []routing.MappingCandidate) []routing.MappingCandidate {
+	out := cands[:0:0]
+	for _, c := range cands {
+		if !w.srv.Benchmarks.ServerBusy(c.Server.ID) {
 			out = append(out, c)
 		}
 	}

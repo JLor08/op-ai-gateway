@@ -129,3 +129,16 @@ func TestAgentFeaturesEndpointAuthAndMethod(t *testing.T) {
 		}
 	})
 }
+
+// TestRuntimeUpstreamPropsFeatureIsAgentDeclaredOnly pins the literal the
+// agent declares for its router's props passthrough (its features.go) and
+// that the name stays off the gateway's own list: it states a fact about the
+// agent alone, and the gateway only reads it off the agent's declared set.
+func TestRuntimeUpstreamPropsFeatureIsAgentDeclaredOnly(t *testing.T) {
+	if RuntimeUpstreamPropsFeature != "runtime_upstream_props" {
+		t.Fatalf("RuntimeUpstreamPropsFeature = %q, want the agent's literal %q", RuntimeUpstreamPropsFeature, "runtime_upstream_props")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeUpstreamPropsFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeUpstreamPropsFeature)
+	}
+}

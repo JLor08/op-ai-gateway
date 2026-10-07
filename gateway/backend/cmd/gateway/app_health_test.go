@@ -294,9 +294,11 @@ type fakeProber struct {
 	calls map[string]int
 	down  map[string]bool
 	// loaded maps an endpoint to the models the loaded-model probe should report;
-	// loadedErr marks endpoints whose loaded-model probe should fail.
-	loaded    map[string][]string
-	loadedErr map[string]bool
+	// loadedErr marks endpoints whose loaded-model probe should fail;
+	// loadedCalls counts every LoadedModels call.
+	loaded      map[string][]string
+	loadedErr   map[string]bool
+	loadedCalls int
 	// modelInfo maps an endpoint to the model info the context probe should report;
 	// modelInfoErr marks endpoints whose context probe should fail.
 	modelInfo    map[string][]provider.ModelInfo
@@ -373,10 +375,18 @@ func (f *fakeProber) ctxProbeCallCount() int {
 func (f *fakeProber) LoadedModels(_ context.Context, target routing.Target, _ string, _ string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.loadedCalls++
 	if f.loadedErr[target.Endpoint] {
 		return nil, fmt.Errorf("loaded probe failed: %s", target.Endpoint)
 	}
 	return f.loaded[target.Endpoint], nil
+}
+
+// loadedCallCount returns how many times LoadedModels was called.
+func (f *fakeProber) loadedCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loadedCalls
 }
 
 func (f *fakeProber) Probe(_ context.Context, target routing.Target, _ string) error {
@@ -1613,11 +1623,12 @@ func serverAgentApp(id, serverID string, port int) routing.Application {
 // TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping
 // proves the issue #58 implicit default: a server_agent application with no
 // operator-set ContextProbePath, whose agent declared
-// runtimeUpstreamPropsFeature, gets probed at serverAgentPropsProbePath
-// (/upstream/{model}/props) per loaded mapping -- exactly like an explicit
-// {model}-template ContextProbePath would. A second, otherwise-identical
-// cycle must not re-issue the live-progress write (the same no-rewrite
-// property TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAn-
+// gateway.RuntimeUpstreamPropsFeature, gets probed at
+// routing.AgentRouterContextProbePath (/upstream/{model}/props) per loaded
+// mapping -- exactly like an explicit {model}-template ContextProbePath
+// would. A second, otherwise-identical cycle must not re-issue the
+// live-progress write (the same no-rewrite property
+// TestRunAppHealthOnceLiveProgressSupportPersistsOnceNotAgainOnAn-
 // IdenticalCycle proves for the explicit-path case above).
 func TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping(t *testing.T) {
 	shrinkRetryGap(t)
@@ -1631,7 +1642,7 @@ func TestRunAppHealthOnceServerAgentImplicitPropsPathProbesPerLoadedMapping(t *t
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"up"}) // "up" is loaded
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
@@ -1711,7 +1722,7 @@ func TestRunAppHealthOnceServerAgentOperatorPathWins(t *testing.T) {
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"up"})
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
@@ -1782,7 +1793,7 @@ func TestRunAppHealthOnceServerAgentProbeCarriesSpecToken(t *testing.T) {
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"a", "b"})
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	runner := &appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}
 	runner.runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
@@ -1826,7 +1837,7 @@ func TestRunAppHealthOnceServerAgentAuthRejectedLogsAndNeverWrites(t *testing.T)
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"up"})
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -1886,7 +1897,7 @@ func TestRunAppHealthOnceServerAgentSpecReadFailureFallsBackToAppToken(t *testin
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"up"})
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	// The read failure itself must be logged (distinct from the misconfigured-
 	// token signal test 2 checks): this is what makes the assertion below
@@ -1934,12 +1945,46 @@ func TestRunAppHealthOnceNonServerAgentNeverGetsImplicitPath(t *testing.T) {
 	reg := gateway.NewAppHealthRegistry(nil)
 	loaded := gateway.NewLoadedModelRegistry()
 	loaded.SetGatewayProbe("a1", []string{"up"})
-	bundle := fakeAgentBundle{features: map[string][]string{"s1": {runtimeUpstreamPropsFeature}}}
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
 
 	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
 	if n := prober.ctxProbeCallCount(); n != 0 {
 		t.Fatalf("ProbeModelInfo called %d times for a non-server_agent app with an empty ContextProbePath, want 0 (the implicit path is type-gated, not feature-only)", n)
+	}
+}
+
+// TestAppHealthLoadedPassSkipsAPortalShapedAgentApp pins that the loaded pass
+// reads the stored LoadedModelsPath and never the agent router's derived
+// /running: a server_agent application saved in the portal (all three probe
+// fields empty) gets no LoadedModels call and no gateway-poll registry write,
+// even though its router would answer and its agent declares the props route.
+// For such an application the agent's own report is the loaded-state truth,
+// and a gateway-poll entry would outlive an empty agent report.
+func TestAppHealthLoadedPassSkipsAPortalShapedAgentApp(t *testing.T) {
+	shrinkRetryGap(t)
+	app := serverAgentApp("a1", "s1", 8001)
+	st := newHealthTestStore(app)
+	prober := newFakeProber()
+	prober.loaded["http://s1.local:8001"] = []string{"qwen"}
+	reg := gateway.NewAppHealthRegistry(nil)
+	loaded := gateway.NewLoadedModelRegistry()
+	changed, unsubscribe := loaded.Subscribe()
+	defer unsubscribe()
+	bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
+
+	(&appHealthRunner{store: st, prober: prober, syncer: nil, registry: reg, loaded: loaded, agents: bundle, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	if n := prober.loadedCallCount(); n != 0 {
+		t.Fatalf("LoadedModels called %d times for a portal-shaped server_agent app, want 0 (the loaded pass reads the stored field only)", n)
+	}
+	select {
+	case <-changed:
+		t.Fatalf("the loaded pass wrote the registry (SetGatewayProbe) for a portal-shaped server_agent app, want no write")
+	default:
+	}
+	if got := loaded.LoadedAppModels("a1", "s1"); got != nil {
+		t.Fatalf("loaded models = %v, want nil (no gateway-poll entry for a portal-shaped server_agent app)", got)
 	}
 }
 

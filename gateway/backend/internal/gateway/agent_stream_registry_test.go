@@ -556,8 +556,8 @@ func TestNotifyRuntimeConfigDeliversFullPayload(t *testing.T) {
 
 // TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking mirrors
 // TestNotifyCertUpdateNeverBlocksOnAFullQueue: the push must never stall its
-// caller (PushRuntimeConfig's goroutine) regardless of how full or stuck a
-// given connection's queue is.
+// caller (the push worker's pass) regardless of how full or stuck a given
+// connection's queue is, and a dropped frame does not count as enqueued.
 func TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking(t *testing.T) {
 	r := NewAgentStreamRegistry()
 	c := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
@@ -566,8 +566,9 @@ func TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking(t *testing.T) {
 		c.enqueue([]byte("x"))
 	}
 	done := make(chan struct{})
+	var enqueued int
 	go func() {
-		r.NotifyRuntimeConfig("srv-full-rc", json.RawMessage(`{"etag":"x"}`))
+		enqueued = r.NotifyRuntimeConfig("srv-full-rc", json.RawMessage(`{"etag":"x"}`))
 		close(done)
 	}()
 	select {
@@ -576,16 +577,24 @@ func TestNotifyRuntimeConfigDropsOnFullQueueWithoutBlocking(t *testing.T) {
 		t.Fatal("NotifyRuntimeConfig blocked on a full queue -- it must be safe to call from a hook " +
 			"that itself must never be slowed down by a stuck agent peer")
 	}
+	if enqueued != 0 {
+		t.Fatalf("enqueued = %d on a full queue, want 0: a dropped frame was not sent", enqueued)
+	}
 }
 
 // TestAgentStreamRegistryNotifyRuntimeConfigUnknownServerAndNilRegistryAreNoOps
 // mirrors the cert_update nil-registry/unknown-server contract.
 func TestAgentStreamRegistryNotifyRuntimeConfigUnknownServerAndNilRegistryAreNoOps(t *testing.T) {
 	r := NewAgentStreamRegistry()
-	r.NotifyRuntimeConfig("never-registered", json.RawMessage(`{"etag":"x"}`)) // must not panic
+	// Neither call may panic, and neither enqueues anything.
+	if got := r.NotifyRuntimeConfig("never-registered", json.RawMessage(`{"etag":"x"}`)); got != 0 {
+		t.Fatalf("enqueued = %d for a server without a connection, want 0", got)
+	}
 
 	var nilRegistry *AgentStreamRegistry
-	nilRegistry.NotifyRuntimeConfig("anything", json.RawMessage(`{"etag":"x"}`)) // must not panic
+	if got := nilRegistry.NotifyRuntimeConfig("anything", json.RawMessage(`{"etag":"x"}`)); got != 0 {
+		t.Fatalf("enqueued = %d on a nil registry, want 0", got)
+	}
 }
 
 // TestNotifyRuntimeConfigEmptyPayloadIsNoOp: an empty/nil payload must never
@@ -595,7 +604,9 @@ func TestNotifyRuntimeConfigEmptyPayloadIsNoOp(t *testing.T) {
 	r := NewAgentStreamRegistry()
 	c := &agentStreamConn{out: make(chan []byte, agentStreamQueueCapacity)}
 	r.add("srv-empty-rc", c)
-	r.NotifyRuntimeConfig("srv-empty-rc", nil)
+	if got := r.NotifyRuntimeConfig("srv-empty-rc", nil); got != 0 {
+		t.Fatalf("enqueued = %d for an empty payload, want 0", got)
+	}
 	select {
 	case raw := <-c.out:
 		t.Fatalf("an empty payload must not be enqueued, got %s", raw)
@@ -616,7 +627,9 @@ func TestNotifyRuntimeConfigBroadcastsToEveryConnectionForTheServer(t *testing.T
 	r.add("srv-multi-rc", b)
 	r.add("srv-other-rc", other)
 
-	r.NotifyRuntimeConfig("srv-multi-rc", json.RawMessage(`{"etag":"x"}`))
+	if got := r.NotifyRuntimeConfig("srv-multi-rc", json.RawMessage(`{"etag":"x"}`)); got != 2 {
+		t.Fatalf("enqueued = %d, want 2: one per connection of the server", got)
+	}
 	for name, c := range map[string]*agentStreamConn{"a": a, "b": b} {
 		select {
 		case <-c.out:

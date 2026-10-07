@@ -69,9 +69,7 @@ type logDriver struct {
 }
 
 func newLogDriver() *logDriver {
-	d := &logDriver{applied: make(chan struct{}, 16)}
-	d.release = make(chan struct{})
-	return d
+	return &logDriver{applied: make(chan struct{}, 16)}
 }
 
 func (d *logDriver) SetLogWatch(raw json.RawMessage) {
