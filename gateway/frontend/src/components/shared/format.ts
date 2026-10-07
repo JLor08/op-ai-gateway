@@ -130,6 +130,20 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'project.couple_group_invalid': 'errorProjectCoupleGroupInvalid',
   'project.couple_ambiguous': 'errorProjectCoupleAmbiguous',
   'resource_group.provision_target_invalid': 'errorResourceGroupProvisionTargetInvalid',
+  // Vendor accounts ("Anbieter"): the nine codes of writePortalVendorAccountError's
+  // errRow table (gateway/portal_vendor_account_endpoints.go), read verbatim
+  // from the Go sentinels in portal/service.go. The 500 *_failed fallbacks
+  // (vendor_account.list_failed, ...) are left unmapped on purpose: they carry
+  // the server's own message, like every other *_failed fallback.
+  'vendor_account.not_found': 'errorVendorAccountNotFound',
+  'vendor_account.name_required': 'errorVendorAccountNameRequired',
+  'vendor_account.vendor_invalid': 'errorVendorAccountVendorInvalid',
+  'vendor_account.auth_type_invalid': 'errorVendorAccountAuthTypeInvalid',
+  'vendor_account.status_invalid': 'errorVendorAccountStatusInvalid',
+  'vendor_account.forbidden': 'errorVendorAccountForbidden',
+  'vendor_account.api_key_not_allowed': 'errorVendorAccountApiKeyNotAllowed',
+  'vendor_account.api_key_invalid': 'errorVendorAccountApiKeyInvalid',
+  'vendor_account.api_key_key_required': 'errorVendorAccountApiKeyKeyRequired',
   // The plaintext gate's two arming-precondition refusals. Both are mapped, not
   // just the newer one: an operator seeing one translated and its sibling in raw
   // English would read the pair as inconsistent.

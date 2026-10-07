@@ -446,6 +446,49 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ).toEqual(completionWireCodes.slice().sort());
   });
 
+  /**
+   * The vendor-account ("Anbieter") page's nine refusal codes, pinned as
+   * LITERALS for the same reason as the lists above: the whole-map invariants
+   * cannot catch a code STRING drifting from the backend's, and an unmapped
+   * code reaches the toast as the raw English the server sent.
+   *
+   * Declared in Go as the `ErrVendorAccount*` sentinels in
+   * `internal/portal/service.go` (plus `CodeVendorAccountNotFound`) and the
+   * `capture.ErrKeyRequired` row, all wired to these exact codes in
+   * `portalVendorAccountErrRows`
+   * (`internal/gateway/portal_vendor_account_endpoints.go`). The five 500
+   * `vendor_account.*_failed` fallbacks are left unmapped on purpose: they
+   * carry the server's own message.
+   */
+  const vendorAccountWireCodes = [
+    'vendor_account.not_found',
+    'vendor_account.name_required',
+    'vendor_account.vendor_invalid',
+    'vendor_account.auth_type_invalid',
+    'vendor_account.status_invalid',
+    'vendor_account.forbidden',
+    'vendor_account.api_key_not_allowed',
+    'vendor_account.api_key_invalid',
+    'vendor_account.api_key_key_required',
+  ] as const;
+
+  it('carries every vendor-account refusal code, by its exact wire string', () => {
+    for (const code of vendorAccountWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the operator sees raw English`,
+      ).toBeDefined();
+    }
+    // Both directions: a tenth `vendor_account.*` code added to the map
+    // without being named here fails too.
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('vendor_account.'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(vendorAccountWireCodes.slice().sort());
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is

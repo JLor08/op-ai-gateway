@@ -20,6 +20,7 @@ export type View =
   | 'usage'
   | 'models'
   | 'servers'
+  | 'providers'
   | 'resourceGroups'
   | 'services'
   | 'users'

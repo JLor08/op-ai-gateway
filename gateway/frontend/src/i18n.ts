@@ -2351,6 +2351,49 @@ const de = {
   resourceGroupProvisionKindAdminGroup: 'Verwaltungsgruppe',
   resourceGroupProvisionKindService: 'Dienst',
   errorResourceGroupProvisionTargetInvalid: 'Das gewählte Ziel ist ungültig oder nicht sichtbar.',
+  // Vendor accounts ("Anbieter"): the user's own accounts at external AI
+  // vendors. The error* labels each carry exactly one backend code
+  // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
+  providers: 'Anbieter',
+  providersIntro:
+    'Eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) verwalten. Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
+  vendorAccountListTitle: 'Anbieter-Konten',
+  vendorAccountListEmpty: 'Noch keine Anbieter-Konten angelegt.',
+  vendorAccountCreate: 'Anbieter-Konto anlegen',
+  vendorAccountNameLabel: 'Name',
+  vendorAccountVendorLabel: 'Anbieter',
+  vendorAccountAuthTypeLabel: 'Authentifizierung',
+  vendorAccountStatusLabel: 'Status',
+  vendorAccountColVendor: 'Anbieter',
+  vendorAccountColAuthType: 'Authentifizierung',
+  vendorAccountColCredential: 'Zugangsdaten',
+  vendorAccountCredentialSet: 'Hinterlegt',
+  vendorAccountCredentialMissing: 'Fehlt',
+  vendorAccountStatusNeedsReconnect: 'Neu verbinden',
+  vendorOpenAI: 'OpenAI',
+  vendorAnthropic: 'Anthropic',
+  vendorAuthApiKey: 'API-Schlüssel',
+  vendorAuthSubscription: 'Abonnement',
+  vendorAccountApiKeyLabel: 'API-Schlüssel',
+  vendorAccountApiKeySetPlaceholder: '•••• gesetzt',
+  vendorAccountApiKeyClear: 'Schlüssel löschen',
+  vendorAccountApiKeyNote:
+    'Der Schlüssel wird nur gespeichert und nie wieder angezeigt. Einen neuen Schlüssel eingeben, um ihn zu ersetzen.',
+  vendorAccountSettingsTitle: 'Einstellungen',
+  vendorAccountActionDelete: 'Löschen',
+  vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
+  errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
+  errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
+  errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
+  errorVendorAccountAuthTypeInvalid: 'Ungültige Authentifizierungsart',
+  errorVendorAccountStatusInvalid: 'Ungültiger Status des Anbieter-Kontos',
+  errorVendorAccountForbidden: 'Anbieter-Konten können nur mit einem Benutzerkonto angelegt werden',
+  errorVendorAccountApiKeyNotAllowed:
+    'Ein API-Schlüssel kann nur bei einem Konto mit API-Schlüssel-Authentifizierung gesetzt werden',
+  errorVendorAccountApiKeyInvalid:
+    'Der API-Schlüssel darf nicht leer sein; zum Entfernen die Schaltfläche „Schlüssel löschen“ verwenden',
+  errorVendorAccountApiKeyKeyRequired:
+    'Zum Speichern eines API-Schlüssels ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
   settingsResourceProvisioningEnforceLabel: 'Ressourcengruppen-Bereitstellung erzwingen',
   settingsResourceProvisioningEnforceHelp:
     'Aus: bereitgestellte Ziele sind eine zusätzliche Freigabe (Opt-in). An: nur bereitgestellte Benutzer/Gruppen/Dienste dürfen die Server der Ressourcengruppe nutzen (Deny-by-default).',
@@ -4759,6 +4802,49 @@ const en: PortalMessages = {
   resourceGroupProvisionKindAdminGroup: 'Admin group',
   resourceGroupProvisionKindService: 'Service',
   errorResourceGroupProvisionTargetInvalid: 'The selected target is invalid or not visible.',
+  // Vendor accounts ("Anbieter"): the user's own accounts at external AI
+  // vendors. The error* labels each carry exactly one backend code
+  // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
+  providers: 'Providers',
+  providersIntro:
+    'Manage your own accounts with external AI providers (e.g. OpenAI, Anthropic). Credentials are only stored and never shown again.',
+  vendorAccountListTitle: 'Provider accounts',
+  vendorAccountListEmpty: 'No provider accounts yet.',
+  vendorAccountCreate: 'Add provider account',
+  vendorAccountNameLabel: 'Name',
+  vendorAccountVendorLabel: 'Provider',
+  vendorAccountAuthTypeLabel: 'Authentication',
+  vendorAccountStatusLabel: 'Status',
+  vendorAccountColVendor: 'Provider',
+  vendorAccountColAuthType: 'Authentication',
+  vendorAccountColCredential: 'Credentials',
+  vendorAccountCredentialSet: 'Stored',
+  vendorAccountCredentialMissing: 'Missing',
+  vendorAccountStatusNeedsReconnect: 'Reconnect',
+  vendorOpenAI: 'OpenAI',
+  vendorAnthropic: 'Anthropic',
+  vendorAuthApiKey: 'API key',
+  vendorAuthSubscription: 'Subscription',
+  vendorAccountApiKeyLabel: 'API key',
+  vendorAccountApiKeySetPlaceholder: '•••• set',
+  vendorAccountApiKeyClear: 'Clear key',
+  vendorAccountApiKeyNote:
+    'The key is only stored and never shown again. Enter a new key to replace it.',
+  vendorAccountSettingsTitle: 'Settings',
+  vendorAccountActionDelete: 'Delete',
+  vendorAccountDeleteConfirm: 'Delete this provider account?',
+  errorVendorAccountNotFound: 'Provider account not found',
+  errorVendorAccountNameRequired: 'Provider account name is required',
+  errorVendorAccountVendorInvalid: 'Invalid provider',
+  errorVendorAccountAuthTypeInvalid: 'Invalid authentication type',
+  errorVendorAccountStatusInvalid: 'Invalid provider account status',
+  errorVendorAccountForbidden: 'Provider accounts can only be created with a user account',
+  errorVendorAccountApiKeyNotAllowed:
+    'An API key can only be set on an account with API-key authentication',
+  errorVendorAccountApiKeyInvalid:
+    'The API key must not be blank; use the "Clear key" button to remove it',
+  errorVendorAccountApiKeyKeyRequired:
+    'An encryption key is required on the gateway to store an API key',
   settingsResourceProvisioningEnforceLabel: 'Enforce resource-group provisioning',
   settingsResourceProvisioningEnforceHelp:
     "Off: provisioned targets are an additional grant (opt-in). On: only provisioned users/groups/services may use the resource group's servers (deny-by-default).",

@@ -4,12 +4,12 @@
 // This module is a barrel: every DTO type + endpoint-method factory used to
 // live in one ~3500-line file. They now live in domain modules under ./api/
 // (transport primitives, auth, tokens, users, groups, resourceGroups,
-// projects, servers, services, models, usage, system, netbird, chat); this
-// file re-exports every one of them unchanged and composes createPortalApi
-// by spreading each domain's factory. `PortalApi = ReturnType<typeof
-// createPortalApi>` stays structurally identical to before the split, so
-// every existing `import { X } from '../api'` site keeps compiling with no
-// changes.
+// projects, servers, services, models, usage, system, netbird, chat, runtime,
+// vendorAccounts); this file re-exports every one of them unchanged and
+// composes createPortalApi by spreading each domain's factory. `PortalApi =
+// ReturnType<typeof createPortalApi>` stays structurally identical to before
+// the split, so every existing `import { X } from '../api'` site keeps
+// compiling with no changes.
 
 import { type Fetcher } from './api/transport';
 import { authApi } from './api/auth';
@@ -26,6 +26,7 @@ import { systemApi } from './api/system';
 import { netbirdApi } from './api/netbird';
 import { chatApi } from './api/chat';
 import { runtimeApi } from './api/runtime';
+import { vendorAccountsApi } from './api/vendorAccounts';
 
 export { PortalApiError, buildQueryString } from './api/transport';
 
@@ -43,6 +44,7 @@ export * from './api/system';
 export * from './api/netbird';
 export * from './api/chat';
 export * from './api/runtime';
+export * from './api/vendorAccounts';
 
 export function createPortalApi(fetcher: Fetcher = fetch) {
   return {
@@ -60,6 +62,7 @@ export function createPortalApi(fetcher: Fetcher = fetch) {
     ...netbirdApi(fetcher),
     ...chatApi(fetcher),
     ...runtimeApi(fetcher),
+    ...vendorAccountsApi(fetcher),
   };
 }
 
