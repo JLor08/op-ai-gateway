@@ -14,8 +14,8 @@ import "op-ai-gateway/internal/routing"
 // particular serves whatever the consumer plan currently exposes, so treat every
 // id here as a best-effort snapshot to be re-verified (Milestone 5 spike), not a
 // contract. An account keeps the rows it was seeded with: a change here only
-// affects accounts created afterwards; existing accounts are rewritten with
-// SetVendorAccountModels.
+// affects accounts created afterwards. Existing accounts' rows can be rewritten
+// with SetVendorAccountModels, but no backfill exists yet.
 var (
 	openAIModels    = []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3"}
 	anthropicModels = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"}

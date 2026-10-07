@@ -678,14 +678,28 @@ func TestDeleteVendorAccountRemovesItsModelRows(t *testing.T) {
 	}
 }
 
-// failingModelsStore wraps a routing.Store so SetVendorAccountModels fails.
+// failingModelsStore wraps a routing.Store so SetVendorAccountModels fails, and
+// models a SQL driver's context handling: DeleteVendorAccount refuses a context
+// that is already done (the in-memory store ignores its context). deleteErr, when
+// set, makes the delete itself fail so a double fault can be observed.
 type failingModelsStore struct {
 	routing.Store
-	err error
+	err       error
+	deleteErr error
 }
 
 func (f failingModelsStore) SetVendorAccountModels(context.Context, string, []routing.VendorAccountModel) error {
 	return f.err
+}
+
+func (f failingModelsStore) DeleteVendorAccount(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.Store.DeleteVendorAccount(ctx, id)
 }
 
 // An account whose catalog could not be seeded would be silently unroutable, so
@@ -702,5 +716,43 @@ func TestCreateVendorAccountSeedFailureLeavesNoAccount(t *testing.T) {
 	accounts, err := routeStore.VendorAccountsByOwner(context.Background(), "usr_owner")
 	if err != nil || len(accounts) != 0 {
 		t.Fatalf("accounts after a failed seed = %+v, %v, want none", accounts, err)
+	}
+}
+
+// The most plausible reason a seed fails on a SQL driver is that the request
+// context died (client disconnect, timeout). The cleanup must not share that
+// context, or it fails the same way and strands an account with no models. The
+// context here is already cancelled, and the wrapper's delete refuses a done
+// context like a SQL driver does, so only a detached cleanup can remove the row.
+func TestCreateVendorAccountSeedFailureCleanupSurvivesACancelledContext(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	boom := errors.New("seed boom")
+	svc.routes = failingModelsStore{Store: routeStore, err: boom}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := svc.CreateVendorAccount(ctx, ownerToken(), apiKeyAccountRequest("Doomed by its context"))
+	if !errors.Is(err, boom) {
+		t.Fatalf("create err = %v, want the original seeding error", err)
+	}
+	accounts, listErr := routeStore.VendorAccountsByOwner(context.Background(), "usr_owner")
+	if listErr != nil || len(accounts) != 0 {
+		t.Fatalf("accounts after a failed seed on a cancelled context = %+v, %v, want none (the cleanup must run detached)", accounts, listErr)
+	}
+}
+
+// When the cleanup fails too, both faults are visible in the returned error: the
+// account stays behind unseeded, and the caller must be able to tell.
+func TestCreateVendorAccountSeedAndCleanupFailureAreBothReported(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	boom := errors.New("seed boom")
+	stuck := errors.New("delete boom")
+	svc.routes = failingModelsStore{Store: routeStore, err: boom, deleteErr: stuck}
+
+	_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), apiKeyAccountRequest("Double fault"))
+	if !errors.Is(err, boom) || !errors.Is(err, stuck) {
+		t.Fatalf("create err = %v, want both the seeding and the cleanup error", err)
 	}
 }

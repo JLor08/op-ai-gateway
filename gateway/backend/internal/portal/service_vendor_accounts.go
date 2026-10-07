@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -14,6 +15,11 @@ import (
 	"strings"
 	"time"
 )
+
+// vendorAccountCleanupTimeout bounds the removal of a vendor account whose model
+// catalog could not be seeded (see CreateVendorAccount). The cleanup runs on a
+// context detached from the request, so this is its only deadline.
+const vendorAccountCleanupTimeout = 5 * time.Second
 
 // VendorAccountModelDTO is one gateway-model entry a vendor account serves: a
 // row of vendor_account_models, seeded from the curated per-vendor catalog
@@ -254,10 +260,21 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	}
 	// Seed the vendor's curated model catalog so the account is routable from
 	// the start. An account without its rows would silently serve nothing, so a
-	// seeding failure fails the create and removes the half-made account
-	// (best effort: the cleanup's own error is dropped in favour of the cause).
+	// seeding failure fails the create and removes the half-made account.
+	//
+	// The most plausible reason a seed fails on a SQL driver is that ctx died
+	// (the client went away, the request timed out); a cleanup on that same ctx
+	// would fail identically and strand an unroutable account no one backfills.
+	// So the cleanup runs on a context of its own: severed from ctx's
+	// cancellation and bounded by vendorAccountCleanupTimeout. If it fails too,
+	// the account is left behind unseeded and BOTH faults are returned, so the
+	// double fault is visible rather than dropped.
 	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, VendorCatalog(vendor)); err != nil {
-		_ = s.routes.DeleteVendorAccount(ctx, acc.ID)
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vendorAccountCleanupTimeout)
+		defer cancel()
+		if delErr := s.routes.DeleteVendorAccount(cctx, acc.ID); delErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove unseeded vendor account %s: %w", acc.ID, delErr))
+		}
 		return VendorAccountDTO{}, err
 	}
 	return s.vendorAccountDTO(ctx, acc)
@@ -316,8 +333,9 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 }
 
 // DeleteVendorAccount removes an account the principal owns (owner-only, system
-// scope included); the store cascades its dependent rows (the model catalog). The
-// bool reports that a row was removed (always true on a nil error): there is no best-effort side effect to flag, unlike DeleteServer.
+// scope included); the store cascades its dependent rows (the model catalog).
+// The bool reports that a row was removed (always true on a nil error): there is
+// no best-effort side effect to flag, unlike DeleteServer.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
