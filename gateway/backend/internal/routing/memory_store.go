@@ -135,6 +135,10 @@ type MemoryStore struct {
 	// assignment is a full copy (mirrors certificates above). Deleting a
 	// mapping cascades its whole entry (see deleteMappingLocked).
 	mappingCapabilities map[string]map[string]CapabilityRow
+	// vendorAccounts mirrors the vendor_accounts table (per-user external AI
+	// vendor accounts, migration 82), keyed by account id. Credentials are
+	// stored sealed, exactly as the SQL drivers hold them.
+	vendorAccounts map[string]VendorAccount
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -170,6 +174,7 @@ func NewMemoryStore() *MemoryStore {
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
+		vendorAccounts:           map[string]VendorAccount{},
 	}
 }
 
@@ -2302,6 +2307,10 @@ func sortedByFirstSeen(byID map[string]time.Time) []string {
 	return out
 }
 
+// copyVendorAccount is a plain value copy: VendorAccount holds no pointers,
+// slices or maps, so a stored/returned account never aliases the caller's.
+func copyVendorAccount(a VendorAccount) VendorAccount { return a }
+
 func copyAIServer(host AIServer) AIServer {
 	host.LastSeenAt = copyTimePtr(host.LastSeenAt)
 	return host
@@ -2730,4 +2739,95 @@ func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID st
 	defer m.mu.RUnlock()
 	report, ok := m.runtimeReports[serverID]
 	return report, ok, nil
+}
+
+// --- VendorAccountStore: per-user external AI vendor accounts (migration 82) ---
+
+// CreateVendorAccount stores a new account; a duplicate id is ErrConflict,
+// mirroring the vendor_accounts primary key.
+func (m *MemoryStore) CreateVendorAccount(_ context.Context, a VendorAccount) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vendorAccounts[a.ID]; ok {
+		return storeerr.ErrConflict
+	}
+	m.vendorAccounts[a.ID] = copyVendorAccount(a)
+	return nil
+}
+
+// UpdateVendorAccount replaces every mutable column of an existing account
+// (owner, vendor and created_at are immutable, as in the SQL driver). An
+// unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[a.ID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.AuthType = a.AuthType
+	cur.Name = a.Name
+	cur.Status = a.Status
+	cur.APIKey = a.APIKey
+	cur.OAuthTokens = a.OAuthTokens
+	cur.UpdatedAt = a.UpdatedAt
+	m.vendorAccounts[a.ID] = copyVendorAccount(cur)
+	return nil
+}
+
+// VendorAccountByID returns the account or ErrNotFound.
+func (m *MemoryStore) VendorAccountByID(_ context.Context, id string) (VendorAccount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	a, ok := m.vendorAccounts[id]
+	if !ok {
+		return VendorAccount{}, storeerr.ErrNotFound
+	}
+	return copyVendorAccount(a), nil
+}
+
+// VendorAccounts lists every account, ordered by id.
+func (m *MemoryStore) VendorAccounts(_ context.Context) ([]VendorAccount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.vendorAccountsLocked(func(VendorAccount) bool { return true }), nil
+}
+
+// VendorAccountsByOwner lists the accounts owned by userID, ordered by id.
+func (m *MemoryStore) VendorAccountsByOwner(_ context.Context, userID string) ([]VendorAccount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.vendorAccountsLocked(func(a VendorAccount) bool { return a.OwnerUserID == userID }), nil
+}
+
+// vendorAccountsLocked returns the accounts matching keep, sorted by id.
+// Callers must hold m.mu (read or write).
+func (m *MemoryStore) vendorAccountsLocked(keep func(VendorAccount) bool) []VendorAccount {
+	ids := make([]string, 0, len(m.vendorAccounts))
+	for id, a := range m.vendorAccounts {
+		if keep(a) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	out := make([]VendorAccount, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, copyVendorAccount(m.vendorAccounts[id]))
+	}
+	return out
+}
+
+// DeleteVendorAccount removes the account. An unknown id is ErrNotFound. The
+// SQL driver cascades the account's model-catalog and usage-snapshot rows
+// through their FKs; the memory driver holds no such child maps yet (they
+// arrive with the milestones that add their writers), so there is nothing
+// further to drop here.
+func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vendorAccounts[id]; !ok {
+		return storeerr.ErrNotFound
+	}
+	delete(m.vendorAccounts, id)
+	return nil
 }

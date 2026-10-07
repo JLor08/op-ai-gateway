@@ -176,6 +176,39 @@ type AIServer struct {
 	UpdatedAt          time.Time
 }
 
+const (
+	VendorOpenAI    = "openai"
+	VendorAnthropic = "anthropic"
+
+	VendorAuthAPIKey       = "api_key"
+	VendorAuthSubscription = "subscription"
+
+	VendorAccountStatusActive         = "active"
+	VendorAccountStatusDisabled       = "disabled"
+	VendorAccountStatusNeedsReconnect = "needs_reconnect"
+)
+
+// VendorAccount is a per-user external AI vendor account ("Anbieter"): either a
+// plain API key or a consumer-subscription OAuth connection. Credentials are
+// SEALED (enc:/plain:); routing never decrypts them. Distinct from the
+// provider-adapter "Provider*" constants and from AIServer.
+type VendorAccount struct {
+	ID          string
+	OwnerUserID string
+	Vendor      string // VendorOpenAI | VendorAnthropic
+	AuthType    string // VendorAuthAPIKey | VendorAuthSubscription
+	Name        string
+	Status      string // VendorAccountStatus*
+	// APIKey holds the sealed API key when AuthType == api_key, else "".
+	APIKey string
+	// OAuthTokens holds the sealed JSON token blob when AuthType == subscription,
+	// else "". Shape (plaintext, before sealing): {access, refresh, expires_at,
+	// account_id, plan_type, scope}. See internal/vendorauth.TokenSet.
+	OAuthTokens string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 // Service is a Service Account (Phase 1 service accounts): an autonomous
 // principal that owns 0..N service tokens (api_tokens with kind="service"),
 // managed like an AI-Server — created by an admin, then administered by its
@@ -2105,6 +2138,24 @@ type RuntimeStore interface {
 	ServerRuntimeReportByServer(ctx context.Context, serverID string) (ServerRuntimeReport, bool, error)
 }
 
+// VendorAccountStore is per-user external-vendor-account CRUD. Credentials ride
+// sealed; the cipher-holding layers open them at dispatch.
+//
+// UpdateVendorAccount rewrites auth_type, name, status, api_key, oauth_tokens
+// and updated_at; the account's identity — id, owner_user_id, vendor and
+// created_at — is immutable, so every driver ignores a changed value there. An
+// unknown id is ErrNotFound on Update and Delete, a duplicate id is ErrConflict
+// on Create. Deleting an account (or its owning user) cascades its dependent
+// rows.
+type VendorAccountStore interface {
+	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
+	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
+	VendorAccountByID(ctx context.Context, id string) (VendorAccount, error)
+	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
+	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
+	DeleteVendorAccount(ctx context.Context, id string) error
+}
+
 // Store is the full routing persistence surface: the composition of every
 // role-scoped sub-interface above, grouped by concern. *MemoryStore (this
 // package) and *store.SQLStore implement Store by implementing each
@@ -2128,6 +2179,7 @@ type Store interface {
 	LimitsStore
 	CertificateStore
 	RuntimeStore
+	VendorAccountStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.
