@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useState, type SubmitEvent } from 'react';
-import { Box, Button } from '@mui/material';
+import { Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
@@ -20,14 +20,15 @@ import { ConfirmDialog } from './shared/ConfirmDialog';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
 type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 
-// The vendors a user can create an account for. The API-key path is the only
-// one the page offers today; the subscription auth type (and its OAuth connect
-// flow) is a later milestone, so there is deliberately no auth-type choice and
-// no connect action here.
+// The vendors and authentication types a user can create an account for. An
+// api_key account is created with its key; a subscription account is created
+// disconnected and connected from its detail view (VendorSubscriptionConnect).
 const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic'];
+const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
 
 function vendorLabel(t: Translation, vendor: string): string {
   switch (vendor) {
@@ -94,6 +95,10 @@ function hasCredential(account: VendorAccount): boolean {
  * field starts empty and shows a "set" placeholder; a typed value replaces the
  * stored key, the Clear button commits "" on Save, and an untouched field
  * omits `api_key` from the PATCH so the stored key is kept.
+ *
+ * A subscription account has no key: it is created disconnected (the create
+ * form then opens its detail view) and connected from the detail view's
+ * "connect subscription" panel, which only ever sees `subscription_connected`.
  */
 export function VendorAccountsView({
   t,
@@ -102,7 +107,13 @@ export function VendorAccountsView({
   t: Translation;
   api: Pick<
     PortalApi,
-    'vendorAccounts' | 'createVendorAccount' | 'updateVendorAccount' | 'deleteVendorAccount'
+    | 'vendorAccounts'
+    | 'createVendorAccount'
+    | 'updateVendorAccount'
+    | 'deleteVendorAccount'
+    | 'connectVendorAccountImport'
+    | 'beginVendorAccountConnect'
+    | 'completeVendorAccountConnect'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -128,6 +139,8 @@ export function VendorAccountsView({
   const [name, setName] = useState('');
   const [status, setStatus] = useState('active');
   const [vendor, setVendor] = useState<string>('openai');
+  // Create only: api_key | subscription (immutable once created).
+  const [authType, setAuthType] = useState<string>('api_key');
   // Create: the plain api-key field. Detail: the write-only replace input
   // (empty = keep the stored key) and the pending-clear flag.
   const [apiKey, setApiKey] = useState('');
@@ -141,6 +154,7 @@ export function VendorAccountsView({
   function openCreate() {
     setName('');
     setVendor('openai');
+    setAuthType('api_key');
     resetKeyInput();
     setMode('create');
   }
@@ -162,14 +176,19 @@ export function VendorAccountsView({
     event.preventDefault();
     setBusy(true);
     try {
-      const created = await api.createVendorAccount({
-        vendor,
-        auth_type: 'api_key',
-        name,
-        api_key: apiKey,
-      });
+      // A subscription account carries no key: it is created disconnected.
+      const created = await api.createVendorAccount(
+        authType === 'subscription'
+          ? { vendor, auth_type: 'subscription', name }
+          : { vendor, auth_type: 'api_key', name, api_key: apiKey },
+      );
       setAccountsData((current) => [...(current ?? []), created]);
-      backToList();
+      if (created.auth_type === 'subscription') {
+        // Straight to the detail view, where the account is connected.
+        openDetail(created);
+      } else {
+        backToList();
+      }
     } catch (err) {
       showError(formatPortalError(err, t));
     } finally {
@@ -204,6 +223,15 @@ export function VendorAccountsView({
     } finally {
       setBusy(false);
     }
+  }
+
+  // A connect succeeded: the account now reads as connected (and active), so
+  // refresh it everywhere the view holds it. Only the status select is re-seeded
+  // from the server; an unsaved rename in the settings form is left alone.
+  function accountConnected(updated: VendorAccount) {
+    setAccountsData((current) => (current ?? []).map((a) => (a.id === updated.id ? updated : a)));
+    setMode({ kind: 'detail', account: updated });
+    setStatus(updated.status);
   }
 
   async function removeAccount(id: string) {
@@ -273,8 +301,9 @@ export function VendorAccountsView({
 
   const listLabels = listTableLabels(t, { empty: t.vendorAccountListEmpty });
 
-  // Create sub-view: vendor + name + the (plain, required) api key. Created
-  // accounts are api_key accounts; the subscription type arrives later.
+  // Create sub-view: vendor + authentication + name, and the (plain, required)
+  // api key for an api_key account. A subscription account has no key field: it
+  // is created disconnected and connected from its detail view.
   if (mode === 'create') {
     return (
       <>
@@ -301,6 +330,22 @@ export function VendorAccountsView({
                 </option>
               ))}
             </SelectField>
+            <SelectField
+              id="vendor-account-auth-type"
+              label={t.vendorAccountAuthTypeLabel}
+              value={authType}
+              onChange={(e) => {
+                setAuthType(e.target.value);
+                // Never carry a typed key into a subscription account.
+                resetKeyInput();
+              }}
+            >
+              {AUTH_TYPES.map((a) => (
+                <option value={a} key={a}>
+                  {authTypeLabel(t, a)}
+                </option>
+              ))}
+            </SelectField>
             <Field
               id="vendor-account-name"
               label={t.vendorAccountNameLabel}
@@ -308,16 +353,22 @@ export function VendorAccountsView({
               onChange={(e) => setName(e.target.value)}
               required
             />
-            <Field
-              id="vendor-account-api-key"
-              type="password"
-              label={t.vendorAccountApiKeyLabel}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              autoComplete="new-password"
-              helperText={t.vendorAccountApiKeyNote}
-              required
-            />
+            {authType === 'subscription' ? (
+              <Typography color="text.secondary" variant="body2">
+                {t.vendorAccountSubscriptionCreateNote}
+              </Typography>
+            ) : (
+              <Field
+                id="vendor-account-api-key"
+                type="password"
+                label={t.vendorAccountApiKeyLabel}
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                autoComplete="new-password"
+                helperText={t.vendorAccountApiKeyNote}
+                required
+              />
+            )}
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <Button type="submit" variant="contained" disabled={busy}>
                 {t.vendorAccountCreate}
@@ -332,8 +383,9 @@ export function VendorAccountsView({
     );
   }
 
-  // Detail sub-view: rename / status / key rotation + delete. Vendor and auth
-  // type are immutable server-side, so they are shown read-only.
+  // Detail sub-view: rename / status / key rotation + delete, plus the connect
+  // panel of a subscription account. Vendor and auth type are immutable
+  // server-side, so they are shown read-only.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
     const keyStored = account.api_key_set && !keyCleared;
@@ -443,6 +495,17 @@ export function VendorAccountsView({
             </Box>
           </Box>
         </Panel>
+
+        {account.auth_type === 'subscription' && (
+          <Box sx={{ mt: 3 }}>
+            <VendorSubscriptionConnect
+              t={t}
+              account={account}
+              api={api}
+              onConnected={accountConnected}
+            />
+          </Box>
+        )}
 
         <ConfirmDialog
           open={confirmingDeleteId !== ''}

@@ -26,7 +26,22 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
   };
 }
 
-afterEach(cleanup);
+const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize?client_id=x&state=s1';
+
+// A subscription account that has not been connected yet.
+const SUBSCRIPTION: Partial<VendorAccount> = {
+  id: 'va_sub',
+  vendor: 'anthropic',
+  auth_type: 'subscription',
+  name: 'Team Claude Max',
+  api_key_set: false,
+  subscription_connected: false,
+};
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
@@ -37,6 +52,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       createVendorAccount?: PortalApi['createVendorAccount'];
       updateVendorAccount?: PortalApi['updateVendorAccount'];
       deleteVendorAccount?: PortalApi['deleteVendorAccount'];
+      connectVendorAccountImport?: PortalApi['connectVendorAccountImport'];
+      beginVendorAccountConnect?: PortalApi['beginVendorAccountConnect'];
+      completeVendorAccountConnect?: PortalApi['completeVendorAccountConnect'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -48,6 +66,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             makeVendorAccount({
               id: 'va_created',
               vendor: body.vendor as VendorAccount['vendor'],
+              auth_type: body.auth_type as VendorAccount['auth_type'],
               name: body.name,
               api_key_set: Boolean(body.api_key),
             })),
@@ -64,6 +83,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ),
       deleteVendorAccount: vi.fn<PortalApi['deleteVendorAccount']>(
         opts.deleteVendorAccount ?? (async () => ({ ok: true })),
+      ),
+      // The connect calls answer the credential-free DTO, connected and active
+      // (what the backend's persistVendorTokens writes).
+      connectVendorAccountImport: vi.fn<PortalApi['connectVendorAccountImport']>(
+        opts.connectVendorAccountImport ??
+          (async (id: string) =>
+            makeVendorAccount({
+              ...SUBSCRIPTION,
+              id,
+              api_key_set: false,
+              subscription_connected: true,
+            })),
+      ),
+      beginVendorAccountConnect: vi.fn<PortalApi['beginVendorAccountConnect']>(
+        opts.beginVendorAccountConnect ?? (async () => ({ authorize_url: AUTHORIZE_URL })),
+      ),
+      completeVendorAccountConnect: vi.fn<PortalApi['completeVendorAccountConnect']>(
+        opts.completeVendorAccountConnect ??
+          (async (id: string) =>
+            makeVendorAccount({
+              ...SUBSCRIPTION,
+              id,
+              api_key_set: false,
+              subscription_connected: true,
+            })),
       ),
     };
     const view = render(
@@ -179,12 +223,66 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
-    it('offers only the api-key path: no subscription auth type, no connect button', async () => {
+    it('offers an authentication choice that defaults to api key, with the key field', async () => {
       renderView({ accounts: [] });
       await openCreate();
 
-      expect(screen.queryByText(t.vendorAuthSubscription)).not.toBeInTheDocument();
-      expect(screen.queryByLabelText(t.vendorAccountAuthTypeLabel)).not.toBeInTheDocument();
+      expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveTextContent(
+        t.vendorAuthApiKey,
+      );
+      expect(document.getElementById('vendor-account-api-key')).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorAccountSubscriptionCreateNote)).not.toBeInTheDocument();
+    });
+
+    async function chooseAuthType(optionName: string) {
+      fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+      fireEvent.click(await screen.findByRole('option', { name: optionName }));
+      // The menu closes with a transition; wait it out so the select's label is
+      // unambiguous again for the next query.
+      await waitFor(() => expect(screen.queryByRole('listbox')).not.toBeInTheDocument());
+    }
+    const chooseSubscription = () => chooseAuthType(t.vendorAuthSubscription);
+
+    it('creates a subscription account with no key field, then opens its detail to connect', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseSubscription();
+      // No key field for a subscription account, only the note that explains why.
+      expect(document.getElementById('vendor-account-api-key')).not.toBeInTheDocument();
+      expect(screen.getByText(t.vendorAccountSubscriptionCreateNote)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+        target: { value: 'Team Claude Max' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      // A disconnected subscription account: no api_key at all (not even "").
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'openai',
+        auth_type: 'subscription',
+        name: 'Team Claude Max',
+      });
+      expect('api_key' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
+
+      // Straight to the detail view of the new account, not yet connected.
+      expect(await screen.findByText(t.vendorConnectTitle)).toBeInTheDocument();
+      expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+      expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Team Claude Max');
+    });
+
+    it('does not carry a typed key into a subscription account and back', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+      fireEvent.change(document.getElementById('vendor-account-api-key')!, {
+        target: { value: 'sk-leftover' },
+      });
+
+      await chooseSubscription();
+      await chooseAuthType(t.vendorAuthApiKey);
+
+      expect(document.getElementById('vendor-account-api-key')).toHaveValue('');
     });
 
     it('does not keep a typed key when the form is cancelled and reopened', async () => {
@@ -376,6 +474,375 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await screen.findByRole('button', { name: t.vendorAccountCreate }),
       ).toBeInTheDocument();
       expect(screen.queryByText('Work OpenAI')).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`VendorAccountsView subscription connect [${locale}]`, () => {
+    function renderSubscription(
+      overrides: Partial<VendorAccount> = {},
+      opts: Parameters<typeof renderView>[0] = {},
+    ) {
+      return renderView({
+        ...opts,
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, ...overrides })],
+      });
+    }
+
+    async function openDetail() {
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    const refusal = (code: string) => async () => {
+      throw new PortalApiError(400, code, 'raw server text');
+    };
+
+    describe('connection state', () => {
+      it('offers no connect panel and keeps the key field on an api_key account', async () => {
+        renderView();
+        await openDetail();
+
+        expect(screen.queryByText(t.vendorConnectTitle)).not.toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorAccountApiKeyLabel)).toBeInTheDocument();
+      });
+
+      it('shows a disconnected subscription as not connected, with both methods and no key field', async () => {
+        renderSubscription();
+        await openDetail();
+
+        expect(screen.getByText(t.vendorConnectTitle)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toHaveAttribute(
+          'data-status',
+          'standby',
+        );
+        expect(screen.queryByText(t.vendorConnectReconnectNote)).not.toBeInTheDocument();
+        // Method 1: browser sign-in; method 2: token import.
+        expect(screen.getByRole('button', { name: t.vendorConnectBeginAction })).toBeEnabled();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+        // A subscription account has no api key to rotate.
+        expect(document.getElementById('vendor-account-detail-api-key')).not.toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveValue(
+          t.vendorAuthSubscription,
+        );
+      });
+
+      it('shows a connected subscription as connected and says that connecting again replaces it', async () => {
+        renderSubscription({ subscription_connected: true });
+        await openDetail();
+
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.queryByText(t.vendorConnectStatusNotConnected)).not.toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectReconnectNote)).toBeInTheDocument();
+      });
+
+      it('flags a connected subscription the gateway can no longer renew', async () => {
+        renderSubscription({ subscription_connected: true, status: 'needs_reconnect' });
+        await openDetail();
+
+        const chip = screen
+          .getAllByText(t.vendorAccountStatusNeedsReconnect)
+          .find((el) => el.getAttribute('data-status') === 'watch');
+        expect(chip).toBeDefined();
+        expect(screen.getByText(t.vendorConnectNeedsReconnectNote)).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorConnectReconnectNote)).not.toBeInTheDocument();
+      });
+    });
+
+    describe('token import', () => {
+      const ACCESS = 'at-secret-access';
+      const REFRESH = 'rt-secret-refresh';
+
+      function fillAccess(value = ACCESS) {
+        fireEvent.change(screen.getByLabelText(t.vendorConnectAccessTokenLabel), {
+          target: { value },
+        });
+      }
+
+      it('masks the token fields and keeps the import disabled until an access token is typed', async () => {
+        renderSubscription();
+        await openDetail();
+
+        for (const label of [t.vendorConnectAccessTokenLabel, t.vendorConnectRefreshTokenLabel]) {
+          const input = screen.getByLabelText(label);
+          expect(input).toHaveAttribute('type', 'password');
+          expect(input).toHaveAttribute('autocomplete', 'new-password');
+          expect(input).toHaveValue('');
+        }
+        const importButton = screen.getByRole('button', { name: t.vendorConnectImportAction });
+        expect(importButton).toBeDisabled();
+        fillAccess();
+        expect(importButton).toBeEnabled();
+      });
+
+      it('sends the tokens and expiry, shows connected, and never renders a token', async () => {
+        const { fakeApi, container } = renderSubscription();
+        await openDetail();
+
+        fillAccess();
+        fireEvent.change(screen.getByLabelText(t.vendorConnectRefreshTokenLabel), {
+          target: { value: `  ${REFRESH}  ` },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorConnectExpiresAtLabel), {
+          target: { value: '2026-10-08T10:30' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        // The local wall-clock time of the field goes out as an RFC 3339 instant.
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledWith('va_sub', {
+          access_token: ACCESS,
+          refresh_token: REFRESH,
+          expires_at: new Date('2026-10-08T10:30').toISOString(),
+        });
+
+        // Connected now, and the success toast says so.
+        expect(await screen.findByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+        // Write-only: the inputs are emptied and no token is anywhere in the DOM.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectExpiresAtLabel)).toHaveValue('');
+        expect(container.innerHTML).not.toContain(ACCESS);
+        expect(container.innerHTML).not.toContain(REFRESH);
+        expect(screen.queryByDisplayValue(ACCESS)).not.toBeInTheDocument();
+      });
+
+      it('sends only the access token when the optional fields are left empty', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        fillAccess();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        const body = fakeApi.connectVendorAccountImport.mock.calls[0][1];
+        expect(body).toEqual({ access_token: ACCESS });
+        expect('refresh_token' in body).toBe(false);
+        expect('expires_at' in body).toBe(false);
+      });
+
+      it('lists the connected account as stored after an import', async () => {
+        renderSubscription();
+        await openDetail();
+        fillAccess();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+        await screen.findByText(t.vendorConnectStatusConnected);
+
+        fireEvent.click(screen.getByRole('button', { name: t.providers }));
+        const row = (await screen.findByText('Team Claude Max')).closest('tr')!;
+        expect(within(row).getByText(t.vendorAccountCredentialSet)).toBeInTheDocument();
+      });
+
+      it('re-seeds the status select from the connected account but keeps an unsaved rename', async () => {
+        renderSubscription({ status: 'needs_reconnect', subscription_connected: true });
+        await openDetail();
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Renamed, not saved' },
+        });
+        fillAccess();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        // The import answered active (a connect clears needs_reconnect).
+        await screen.findByText(t.vendorConnectStatusConnected);
+        expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(t.statusActive);
+        expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Renamed, not saved');
+      });
+
+      it('shows a refused import as a localized toast and keeps what was typed', async () => {
+        const { fakeApi } = renderSubscription(
+          {},
+          {
+            connectVendorAccountImport: refusal('vendor_account.connect_key_required'),
+          },
+        );
+        await openDetail();
+
+        fillAccess();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_key_required: ${t.errorVendorAccountConnectKeyRequired}`,
+          ),
+        ).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(ACCESS);
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+      });
+    });
+
+    describe('browser sign-in', () => {
+      it('hides the open and paste steps until the connect has begun', async () => {
+        renderSubscription();
+        await openDetail();
+
+        expect(screen.queryByRole('button', { name: t.vendorConnectOpenLogin })).toBeNull();
+        expect(screen.queryByLabelText(t.vendorConnectCodeLabel)).toBeNull();
+        expect(screen.queryByRole('button', { name: t.vendorConnectCompleteAction })).toBeNull();
+      });
+
+      it('begins, opens the sign-in URL in a new tab on its own click, then completes with the pasted code', async () => {
+        const open = vi.spyOn(window, 'open').mockReturnValue(null);
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+        await waitFor(() =>
+          expect(fakeApi.beginVendorAccountConnect).toHaveBeenCalledWith('va_sub'),
+        );
+
+        // Two clear steps: open the sign-in, then paste the code. Begin itself
+        // opens nothing (a popup after an async call would be blocked).
+        expect(open).not.toHaveBeenCalled();
+        expect(await screen.findByText(t.vendorConnectStepOpen)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectStepPaste)).toBeInTheDocument();
+        // The begin button is now a restart.
+        expect(screen.queryByRole('button', { name: t.vendorConnectBeginAction })).toBeNull();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectBeginAgainAction }),
+        ).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectOpenLogin }));
+        expect(open).toHaveBeenCalledTimes(1);
+        expect(open).toHaveBeenCalledWith(AUTHORIZE_URL, '_blank', 'noopener');
+
+        // Nothing to complete until something is pasted.
+        const complete = screen.getByRole('button', { name: t.vendorConnectCompleteAction });
+        expect(complete).toBeDisabled();
+        fireEvent.change(screen.getByLabelText(t.vendorConnectCodeLabel), {
+          target: { value: '  abc123#state-1  ' },
+        });
+        expect(complete).toBeEnabled();
+        fireEvent.click(complete);
+
+        await waitFor(() => expect(fakeApi.completeVendorAccountConnect).toHaveBeenCalledTimes(1));
+        expect(fakeApi.completeVendorAccountConnect).toHaveBeenCalledWith(
+          'va_sub',
+          'abc123#state-1',
+        );
+
+        // Connected; the flow's steps and the pasted code are gone.
+        expect(await screen.findByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+        expect(screen.queryByLabelText(t.vendorConnectCodeLabel)).toBeNull();
+        expect(screen.queryByRole('button', { name: t.vendorConnectOpenLogin })).toBeNull();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectBeginAction }),
+        ).toBeInTheDocument();
+      });
+
+      it('passes a pasted callback URL through untouched for the backend to parse', async () => {
+        const { fakeApi } = renderSubscription({}, {});
+        await openDetail();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+        const field = await screen.findByLabelText(t.vendorConnectCodeLabel);
+
+        const callback = 'http://localhost:1455/auth/callback?code=xyz&state=s1';
+        fireEvent.change(field, { target: { value: callback } });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectCompleteAction }));
+
+        await waitFor(() => expect(fakeApi.completeVendorAccountConnect).toHaveBeenCalledTimes(1));
+        expect(fakeApi.completeVendorAccountConnect).toHaveBeenCalledWith('va_sub', callback);
+      });
+
+      it('keeps the form and the pasted code after a rejected code so the user can retry', async () => {
+        let attempts = 0;
+        const completeVendorAccountConnect = vi.fn<PortalApi['completeVendorAccountConnect']>(
+          async (id) => {
+            attempts += 1;
+            if (attempts === 1) {
+              throw new PortalApiError(400, 'vendor_account.connect_rejected', 'raw server text');
+            }
+            return makeVendorAccount({
+              ...SUBSCRIPTION,
+              id,
+              api_key_set: false,
+              subscription_connected: true,
+            });
+          },
+        );
+        renderSubscription({}, { completeVendorAccountConnect });
+        await openDetail();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+        const field = await screen.findByLabelText(t.vendorConnectCodeLabel);
+        fireEvent.change(field, { target: { value: 'typo-code' } });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectCompleteAction }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_rejected: ${t.errorVendorAccountConnectRejected}`,
+          ),
+        ).toBeInTheDocument();
+        // Still on step 2, still not connected, the paste is still there.
+        expect(screen.getByLabelText(t.vendorConnectCodeLabel)).toHaveValue('typo-code');
+        expect(screen.getByRole('button', { name: t.vendorConnectOpenLogin })).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText(t.vendorConnectCodeLabel), {
+          target: { value: 'right-code' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectCompleteAction }));
+
+        await waitFor(() => expect(completeVendorAccountConnect).toHaveBeenCalledTimes(2));
+        expect(completeVendorAccountConnect).toHaveBeenLastCalledWith('va_sub', 'right-code');
+        expect(await screen.findByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+      });
+
+      it('starts over: a second begin clears the stale pasted code', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+        fireEvent.change(await screen.findByLabelText(t.vendorConnectCodeLabel), {
+          target: { value: 'stale' },
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAgainAction }));
+
+        await waitFor(() => expect(fakeApi.beginVendorAccountConnect).toHaveBeenCalledTimes(2));
+        await waitFor(() =>
+          expect(screen.getByLabelText(t.vendorConnectCodeLabel)).toHaveValue(''),
+        );
+      });
+
+      it('shows a refused begin as a localized toast and offers no sign-in', async () => {
+        renderSubscription(
+          {},
+          { beginVendorAccountConnect: refusal('vendor_account.connect_key_required') },
+        );
+        await openDetail();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_key_required: ${t.errorVendorAccountConnectKeyRequired}`,
+          ),
+        ).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.vendorConnectOpenLogin })).toBeNull();
+      });
+
+      it('never offers to open a URL that is not a web address', async () => {
+        const open = vi.spyOn(window, 'open').mockReturnValue(null);
+        renderSubscription(
+          {},
+          {
+            beginVendorAccountConnect: async () => ({ authorize_url: 'javascript:alert(1)' }),
+          },
+        );
+        await openDetail();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAction }));
+
+        expect(await screen.findByText(t.errorRequestFailed)).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.vendorConnectOpenLogin })).toBeNull();
+        expect(open).not.toHaveBeenCalled();
+      });
     });
   });
 }
