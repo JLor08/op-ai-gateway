@@ -343,6 +343,15 @@ type resolverStore interface {
 	// guard test in internal/portal, so adding it here costs nothing but this
 	// line.
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
+	// VendorAccountsByOwner and VendorAccountModels are the per-user vendor-account
+	// surface resolveVendorAccount reads: the owner's accounts (sorted by id) and,
+	// for one account, the gateway models it serves (sorted by GatewayModel). Both
+	// are already on routing.Store and both drivers (*MemoryStore, *store.SQLStore)
+	// implement them, so widening this narrow interface stays compile-safe and
+	// needs no tracing-decorator regeneration (the decorator wraps routing.Store,
+	// which already declares them).
+	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
+	VendorAccountModels(ctx context.Context, accountID string) ([]VendorAccountModel, error)
 }
 
 type Resolver struct {
@@ -360,7 +369,32 @@ type Resolver struct {
 	groups            GroupResolver
 	warmer            ModelWarmer
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
+	// vendorEnabled / vendorRoutingMode gate and steer the per-user vendor-account
+	// branch (resolveVendorAccount). Both are injected by the gateway from a CACHED
+	// read of the vendor_accounts_enabled master flag and the
+	// vendor_account_routing_mode setting (SetVendorAccountAccessors). Both are
+	// nil-safe: a nil vendorEnabled means the whole branch is OFF (the no-op
+	// invariant — a resolver built without these accessors is byte-identical to
+	// today), and a nil / unknown vendorRoutingMode means vendor_first.
+	vendorEnabled     func() bool
+	vendorRoutingMode func() string
 }
+
+// Vendor-account routing modes, mirrored as local string literals so routing
+// does not import internal/portal (which would be an import cycle — the portal
+// package imports routing). They must stay equal to portal's
+// VendorRoutingModeVendorFirst / VendorRoutingModeFallbackOnly.
+const (
+	vendorRoutingModeVendorFirst  = "vendor_first"
+	vendorRoutingModeFallbackOnly = "fallback_only"
+)
+
+// vendorAccountDefaultTimeout is the per-request upstream timeout a vendor-account
+// Target carries. Vendor APIs (api.openai.com / api.anthropic.com) are hosted and
+// can be slow on a cold large-model request, so this is generous relative to the
+// on-prem default; it is a fixed default because a vendor account has no per-app
+// TimeoutMS column of its own.
+const vendorAccountDefaultTimeout = 120 * time.Second
 
 func NewResolver(store resolverStore, clock func() time.Time, checker ReachabilityChecker) *Resolver {
 	if clock == nil {
@@ -425,6 +459,38 @@ func (r *Resolver) SetModelWarmer(w ModelWarmer) { r.warmer = w }
 // extracted ClientSessionID. Safe to call live (atomic).
 func (r *Resolver) SetAffinitySessionMode(legacy bool) { r.legacyAffinity.Store(legacy) }
 
+// SetVendorAccountAccessors installs the two accessors that gate and steer the
+// per-user vendor-account branch: enabled reports the vendor_accounts_enabled
+// master flag, mode reports the vendor_account_routing_mode. The gateway wires
+// these from a CACHED read of system settings (invalidated on a settings PUT),
+// so resolveVendorAccount never issues a settings store read on the hot path.
+// Leaving them unset (nil) keeps the branch OFF (nil enabled) and the mode at
+// vendor_first (nil mode) — the no-op invariant a resolver built without them
+// relies on. Mirrors the other optional-dependency setters above.
+func (r *Resolver) SetVendorAccountAccessors(enabled func() bool, mode func() string) {
+	r.vendorEnabled = enabled
+	r.vendorRoutingMode = mode
+}
+
+// vendorOn reports whether the vendor-account branch is enabled. Nil-safe: a
+// resolver with no enabled accessor is OFF.
+func (r *Resolver) vendorOn() bool {
+	return r.vendorEnabled != nil && r.vendorEnabled()
+}
+
+// vendorMode reports the effective vendor routing mode, defaulting to
+// vendor_first for a nil accessor or any value that is not fallback_only (a
+// lenient read matching portal's own default-on-unknown behaviour).
+func (r *Resolver) vendorMode() string {
+	if r.vendorRoutingMode == nil {
+		return vendorRoutingModeVendorFirst
+	}
+	if r.vendorRoutingMode() == vendorRoutingModeFallbackOnly {
+		return vendorRoutingModeFallbackOnly
+	}
+	return vendorRoutingModeVendorFirst
+}
+
 // resolveTracer is resolved ONCE from the OTel global provider (installed by
 // internal/tracing.Setup) and reused per call, so Resolve avoids the two
 // process-global tracer-provider lookup mutexes otel.Tracer(name) takes on every
@@ -455,6 +521,45 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	if req.ServerOverrideID != "" {
 		return r.resolveServerOverride(ctx, req, apiFlavor)
 	}
+	// Vendor-account precedence (Milestone 3). The master flag + routing mode are
+	// read through the injected accessors (nil-safe → OFF / vendor_first), and the
+	// branch only ever matches a USER principal's OWN active account serving the
+	// requested model (see resolveVendorAccount). A server-override request never
+	// reaches here (handled above), so a vendor account can never shadow an
+	// explicit override.
+	//   - vendor_first: an own account wins before any self-hosted/shared route, so
+	//     it is tried right after the override short-circuit.
+	//   - fallback_only: self-hosted/shared wins; the account is tried only where
+	//     the standard path has NO route (every ErrNoModelRoute exit — locked
+	//     group, affinity, and fresh selection — funnels through the one check
+	//     below, because resolveStandard returns ErrNoModelRoute at each of them).
+	mode := r.vendorMode()
+	if mode == vendorRoutingModeVendorFirst {
+		if target, ok, err := r.resolveVendorAccount(ctx, token, req, apiFlavor); err != nil {
+			return Target{}, err
+		} else if ok {
+			return target, nil
+		}
+	}
+	target, err := r.resolveStandard(ctx, token, req, apiFlavor, now)
+	if mode == vendorRoutingModeFallbackOnly && errors.Is(err, ErrNoModelRoute) {
+		if vendorTarget, ok, verr := r.resolveVendorAccount(ctx, token, req, apiFlavor); verr != nil {
+			return Target{}, verr
+		} else if ok {
+			return vendorTarget, nil
+		}
+	}
+	return target, err
+}
+
+// resolveStandard is the self-hosted/shared resolution path: model-group dispatch,
+// route affinity, then fresh candidate selection (ActiveMappingsForModel →
+// filterProvisioned → filterServesEndpoint → filterCapable → selectCandidate →
+// targetFrom). It is everything Resolve did below the server-override short-circuit
+// before the vendor-account branch was layered on top; extracting it verbatim lets
+// Resolve wrap it with the vendor precedence without duplicating any of its
+// ErrNoModelRoute exits. now and apiFlavor are passed in, computed once by Resolve.
+func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string, now time.Time) (Target, error) {
 	affinitySession := req.ClientSessionID
 	if r.legacyAffinity.Load() {
 		affinitySession = req.SessionID
@@ -644,6 +749,98 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 			r.reservation.touch(selected.Server.ID, affinityID(key), now)
 		}
 		return target, nil
+	}
+}
+
+// resolveVendorAccount resolves the request against the PRINCIPAL's own vendor
+// accounts (Milestone 3). It returns (Target, true, nil) on a match, (Target{},
+// false, nil) for no match, and a non-nil error only on a store failure.
+//
+// It matches only when EVERY precondition holds, each a deliberate guard:
+//   - r.vendorOn(): the vendor_accounts_enabled master flag is on. Off → the
+//     whole branch is invisible (the no-op invariant).
+//   - token.UserID != "": the principal is a USER. A SERVICE token (UserID=="")
+//     owns no vendor accounts and must never borrow a user's — service dispatch
+//     is a later milestone.
+//   - req.ServerOverrideID == "": a server-override request is a distinct routing
+//     path (handled before this is ever called) and must never land on a vendor.
+//     Re-checked here so the guarantee holds at this method's own boundary.
+//   - len(req.RequiredCapabilities) == 0: capability-gated routing (vision/image
+//     verdicts) is a self-hosted-mapping concern; a vendor Target carries no
+//     per-capability verdicts, so such a request skips the branch entirely.
+//   - apiFlavor != APIFlavorOpenAIImages: the images relay has no vendor path in
+//     this milestone (the Target serves the text flavors via translate only).
+//
+// The matched Target is built BY HAND (not via targetFrom, which only knows
+// self-hosted mappings): the sealed account API key is carried as APIToken (the
+// cipher-holding gateway layer opens it exactly as for an app credential), the
+// provider + endpoint + auth header are chosen from the account's vendor, and the
+// effective flavors are [openai, anthropic] with the endpoint modes left zero
+// (translate) so the native-passthrough layer translates either inbound dialect
+// to the vendor's native wire format. Accounts are iterated in the store's
+// deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
+// account with a model row whose GatewayModel equals the request model wins.
+func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
+	if !r.vendorOn() ||
+		token.UserID == "" ||
+		req.ServerOverrideID != "" ||
+		len(req.RequiredCapabilities) > 0 ||
+		apiFlavor == APIFlavorOpenAIImages {
+		return Target{}, false, nil
+	}
+	accounts, err := r.store.VendorAccountsByOwner(ctx, token.UserID)
+	if err != nil {
+		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
+	}
+	for _, acc := range accounts {
+		if acc.Status != VendorAccountStatusActive {
+			continue
+		}
+		models, err := r.store.VendorAccountModels(ctx, acc.ID)
+		if err != nil {
+			return Target{}, false, fmt.Errorf("resolve vendor account models: %w", err)
+		}
+		for _, m := range models {
+			if m.GatewayModel != req.Model {
+				continue
+			}
+			return vendorAccountTarget(acc, m, req.Model, apiFlavor), true, nil
+		}
+	}
+	return Target{}, false, nil
+}
+
+// vendorAccountTarget assembles the Target for a matched vendor account + model
+// row. Split out from resolveVendorAccount so the construction is testable on its
+// own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
+// one table. The provider/endpoint/auth-header triple is the only thing the
+// account's vendor decides; everything else is the same for both.
+func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+	provider := ProviderVendorOpenAI
+	endpoint := "https://api.openai.com"
+	tokenHeader := ""
+	if acc.Vendor == VendorAnthropic {
+		provider = ProviderVendorAnthropic
+		endpoint = "https://api.anthropic.com"
+		// The native Anthropic client authenticates with x-api-key, not the
+		// Authorization: Bearer default the OpenAI-compatible client uses.
+		tokenHeader = "x-api-key"
+	}
+	return Target{
+		RouteID:        "vendor:" + acc.ID + ":" + model,
+		ServerID:       "",
+		Provider:       provider,
+		Endpoint:       endpoint,
+		Model:          model,
+		ProviderModel:  m.UpstreamModel,
+		Timeout:        vendorAccountDefaultTimeout,
+		APIFlavor:      apiFlavor,
+		APIToken:       acc.APIKey, // still sealed; upstreamAuthCtx opens it, as for an app credential
+		APITokenHeader: tokenHeader,
+		// Both inbound dialects are served; the zero endpoint modes mean translate,
+		// so native-passthrough converts whichever one the caller used to the
+		// vendor's native wire format.
+		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
 	}
 }
 
