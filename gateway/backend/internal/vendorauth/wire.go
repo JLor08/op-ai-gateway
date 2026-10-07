@@ -25,8 +25,7 @@ var (
 	ErrAuthRejected = errors.New("vendorauth: vendor rejected the credentials")
 
 	// ErrBadTokenResponse marks a 2xx answer from a vendor OAuth endpoint that is not
-	// usable: not JSON, a token response without an access_token, or a device
-	// authorization without its codes.
+	// usable: not JSON, or a token response without an access_token.
 	ErrBadTokenResponse = errors.New("vendorauth: malformed OAuth response")
 )
 

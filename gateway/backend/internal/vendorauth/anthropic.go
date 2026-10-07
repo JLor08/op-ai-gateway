@@ -24,17 +24,21 @@ func BuildAnthropicAuthorizeURL(ep Endpoints, verifier, state string) string {
 	return appendQuery(ep.AuthorizeURL, q)
 }
 
-// ExchangeAnthropicCode trades an authorization code (plus the PKCE verifier
-// that produced the challenge in the authorize URL) for tokens by POSTing a JSON
-// body to ep.TokenURL. ExpiresAt is time.Now() plus the response's expires_in.
-// A 401/403 or OAuth invalid_grant answer matches ErrAuthRejected.
+// ExchangeAnthropicCode trades an authorization code for tokens by POSTing a JSON
+// body to ep.TokenURL. verifier is the PKCE verifier whose challenge went into
+// the authorize URL, and state is the state value from the pasted "code#state"
+// string (the caller splits it and checks it against the state it issued; it is
+// sent on so a vendor that wants it in the exchange body gets it). code and
+// state are whitespace-trimmed as pasted input. ExpiresAt is time.Now() plus the
+// response's expires_in. A 401/403 or OAuth invalid_grant answer matches
+// ErrAuthRejected.
 //
-// REVERSE-ENGINEERED / VERIFY LIVE: the real endpoint may additionally require
-// the state in the exchange body.
-func ExchangeAnthropicCode(ctx context.Context, httpClient *http.Client, ep Endpoints, code, verifier string) (TokenSet, error) {
+// REVERSE-ENGINEERED / VERIFY LIVE.
+func ExchangeAnthropicCode(ctx context.Context, httpClient *http.Client, ep Endpoints, code, verifier, state string) (TokenSet, error) {
 	return anthropicToken(ctx, httpClient, ep, map[string]string{
 		"grant_type":    "authorization_code",
 		"code":          strings.TrimSpace(code),
+		"state":         strings.TrimSpace(state),
 		"redirect_uri":  ep.RedirectURI,
 		"client_id":     ep.ClientID,
 		"code_verifier": verifier,

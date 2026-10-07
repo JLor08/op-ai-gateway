@@ -7,43 +7,30 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
-var (
-	// ErrDeviceCodeExpired means the device code can no longer be redeemed: the
-	// vendor answered expired_token, or the poll window ran out. Start over with
-	// OpenAIDeviceAuthorize.
-	ErrDeviceCodeExpired = errors.New("vendorauth: device code expired")
-
-	// ErrDeviceCodeDenied means the user declined the authorization (access_denied).
-	ErrDeviceCodeDenied = errors.New("vendorauth: device authorization denied")
-)
-
-const (
-	// deviceCodeGrantType is the RFC 8628 grant_type for redeeming a device code.
-	deviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code"
-
-	// defaultDeviceInterval and defaultDeviceExpiresIn are the RFC 8628 defaults
-	// applied when the vendor omits interval (5s) or expires_in (RFC: required;
-	// 15 minutes here is only a fallback for a non-conforming answer).
-	defaultDeviceInterval  = 5 * time.Second
-	defaultDeviceExpiresIn = 900
-)
-
-// slowDownStep is how much PollOpenAIDeviceToken lengthens its interval on a
-// slow_down answer (RFC 8628 §3.5). A variable only so tests can shrink it.
-var slowDownStep = 5 * time.Second
-
-// maxDevicePollWindow caps how long one PollOpenAIDeviceToken call polls
-// regardless of the caller's context, so a caller that forgets a deadline cannot
-// poll forever. A variable only so tests can shrink it.
-var maxDevicePollWindow = 15 * time.Minute
+// Why there is no device-code login here (a note for a future device-UI
+// milestone, not a TODO for this file): the Codex CLI's device flow is NOT the
+// generic RFC 8628 grant, so an RFC 8628 client cannot talk to it. Per a review
+// of the Codex CLI source (codex-rs/login/src/device_code_auth.rs; not
+// re-verified live), it is a bespoke protocol against the issuer:
+//
+//  1. POST {issuer}/api/accounts/deviceauth/usercode answers
+//     {device_auth_id, user_code, interval}.
+//  2. The user opens the verification page {issuer}/codex/device and enters
+//     user_code.
+//  3. Poll POST {issuer}/api/accounts/deviceauth/token with
+//     {device_auth_id, user_code}; HTTP 403 or 404 means "not yet", and a 2xx
+//     answer carries authorization_code, code_challenge and code_verifier.
+//  4. Finish with a normal authorization-code exchange (ExchangeOpenAICode)
+//     using those values and redirect_uri={issuer}/deviceauth/callback.
+//
+// OpenAI subscription connect uses the code-paste flow below instead
+// (BuildOpenAIAuthorizeURL, then ExchangeOpenAICode).
 
 // BuildOpenAIAuthorizeURL returns the URL the user opens to sign in to
 // auth.openai.com and approve the gateway: the standard OAuth+PKCE parameters
@@ -91,124 +78,6 @@ func RefreshOpenAI(ctx context.Context, httpClient *http.Client, ep Endpoints, r
 		"refresh_token": {refreshToken},
 		"client_id":     {ep.ClientID},
 	}, refreshToken)
-}
-
-// OpenAIDeviceAuthorize starts an RFC 8628 device-code login: it POSTs the
-// client id and scopes to ep.DeviceAuthorizeURL and returns the device code to
-// poll with, the short user code to show, the page the user opens to enter it,
-// the minimum poll interval in seconds (default 5) and the code lifetime in
-// seconds (default 900).
-//
-// UNVERIFIED: the endpoint, and whether the Codex client id may use the device
-// flow at all, are guesses; see OpenAIDeviceAuthorizeURL. A 404 here most likely
-// means the flow is not offered, in which case fall back to the
-// BuildOpenAIAuthorizeURL code-paste flow.
-func OpenAIDeviceAuthorize(ctx context.Context, httpClient *http.Client, ep Endpoints) (deviceCode, userCode, verificationURI string, interval int, expiresIn int, err error) {
-	status, body, err := postForm(ctx, httpClient, ep.DeviceAuthorizeURL, url.Values{
-		"client_id": {ep.ClientID},
-		"scope":     {ep.Scopes},
-	})
-	if err != nil {
-		return "", "", "", 0, 0, err
-	}
-	if status < 200 || status > 299 {
-		return "", "", "", 0, 0, newStatusError(status, body)
-	}
-	var resp struct {
-		DeviceCode              string      `json:"device_code"`
-		UserCode                string      `json:"user_code"`
-		VerificationURI         string      `json:"verification_uri"`
-		VerificationURL         string      `json:"verification_url"`
-		VerificationURIComplete string      `json:"verification_uri_complete"`
-		Interval                json.Number `json:"interval"`
-		ExpiresIn               json.Number `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", "", "", 0, 0, fmt.Errorf("%w: device authorization: %v", ErrBadTokenResponse, err)
-	}
-	verification := firstNonEmpty(resp.VerificationURI, resp.VerificationURL, resp.VerificationURIComplete)
-	if resp.DeviceCode == "" || resp.UserCode == "" || verification == "" {
-		return "", "", "", 0, 0, fmt.Errorf("%w: device authorization lacks a device_code, user_code or verification page", ErrBadTokenResponse)
-	}
-	interval = positiveInt(resp.Interval, int(defaultDeviceInterval/time.Second))
-	expiresIn = positiveInt(resp.ExpiresIn, defaultDeviceExpiresIn)
-	return resp.DeviceCode, resp.UserCode, verification, interval, expiresIn, nil
-}
-
-// PollOpenAIDeviceToken redeems a device code by polling ep.TokenURL every
-// interval (waiting one interval before the first request, since the user has
-// only just been shown the code). authorization_pending keeps polling;
-// slow_down also lengthens the interval by 5s (RFC 8628 §3.5). It returns
-// ErrDeviceCodeExpired when the vendor says expired_token or the poll window
-// (15 minutes, a hard ceiling independent of the caller) runs out, and
-// ErrDeviceCodeDenied on access_denied. A caller-side cancellation or deadline
-// returns that context error, so derive a context from OpenAIDeviceAuthorize's
-// expiresIn (context.WithTimeout) to stop exactly when the code does. Any other
-// answer ends the poll with a *StatusError (the caller may call again with the
-// same device code); success parses like ExchangeOpenAICode.
-//
-// UNVERIFIED: see OpenAIDeviceAuthorizeURL.
-func PollOpenAIDeviceToken(ctx context.Context, httpClient *http.Client, ep Endpoints, deviceCode string, interval time.Duration) (TokenSet, error) {
-	if interval <= 0 {
-		interval = defaultDeviceInterval
-	}
-	polling, cancel := context.WithTimeout(ctx, maxDevicePollWindow)
-	defer cancel()
-	form := url.Values{
-		"grant_type":  {deviceCodeGrantType},
-		"device_code": {deviceCode},
-		"client_id":   {ep.ClientID},
-	}
-	for {
-		if err := sleepContext(polling, interval); err != nil {
-			return TokenSet{}, pollInterrupted(ctx)
-		}
-		status, body, err := postForm(polling, httpClient, ep.TokenURL, form)
-		if err != nil {
-			if polling.Err() != nil {
-				return TokenSet{}, pollInterrupted(ctx)
-			}
-			return TokenSet{}, err
-		}
-		if status >= 200 && status <= 299 {
-			return openAITokenSet(status, body, "")
-		}
-		se := newStatusError(status, body)
-		// Judge by the OAuth error code before the HTTP status: some deployments
-		// signal "not yet" with a 403, which must not read as a rejection.
-		switch se.Code {
-		case "authorization_pending":
-		case "slow_down":
-			interval += slowDownStep
-		case "expired_token":
-			return TokenSet{}, ErrDeviceCodeExpired
-		case "access_denied":
-			return TokenSet{}, ErrDeviceCodeDenied
-		default:
-			return TokenSet{}, se
-		}
-	}
-}
-
-// pollInterrupted explains why the poll loop stopped on its own context: the
-// caller's cancellation or deadline wins; otherwise our window ran out.
-func pollInterrupted(caller context.Context) error {
-	if err := caller.Err(); err != nil {
-		return err
-	}
-	return ErrDeviceCodeExpired
-}
-
-// sleepContext waits d or until ctx is done.
-func sleepContext(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
 }
 
 // postForm sends form as an application/x-www-form-urlencoded body.
@@ -282,13 +151,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-// positiveInt returns n as an int when it is a positive number, else fallback.
-func positiveInt(n json.Number, fallback int) int {
-	f, err := n.Float64()
-	if err != nil || f < 1 {
-		return fallback
-	}
-	return int(f)
 }

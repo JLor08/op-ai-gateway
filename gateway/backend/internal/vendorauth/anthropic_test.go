@@ -107,6 +107,7 @@ func TestExchangeAnthropicCode(t *testing.T) {
 		want := map[string]string{
 			"grant_type":    "authorization_code",
 			"code":          "the-code",
+			"state":         "the-state",
 			"redirect_uri":  AnthropicRedirectURI,
 			"client_id":     AnthropicClientID,
 			"code_verifier": "the-verifier",
@@ -122,7 +123,7 @@ func TestExchangeAnthropicCode(t *testing.T) {
 		writeJSON(w, 200, `{"token_type":"Bearer","access_token":"sk-ant-oat01-A","refresh_token":"sk-ant-ort01-R","expires_in":28800,"scope":"user:inference user:profile"}`)
 	})
 	before := time.Now()
-	ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "the-code", "the-verifier")
+	ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "the-code", "the-verifier", "the-state")
 	after := time.Now()
 	if err != nil {
 		t.Fatalf("ExchangeAnthropicCode: %v", err)
@@ -138,14 +139,14 @@ func TestExchangeAnthropicCode(t *testing.T) {
 	}
 }
 
-func TestExchangeAnthropicCodeTrimsPastedCode(t *testing.T) {
+func TestExchangeAnthropicCodeTrimsPastedCodeAndState(t *testing.T) {
 	ep, _ := anthropicStub(t, func(w http.ResponseWriter, body map[string]string) {
-		if body["code"] != "the-code" {
-			t.Errorf("code = %q, want it trimmed", body["code"])
+		if body["code"] != "the-code" || body["state"] != "the-state" {
+			t.Errorf("code = %q, state = %q, want both trimmed", body["code"], body["state"])
 		}
 		writeJSON(w, 200, `{"access_token":"A","expires_in":60}`)
 	})
-	if _, err := ExchangeAnthropicCode(context.Background(), nil, ep, "  the-code\n", "v"); err != nil {
+	if _, err := ExchangeAnthropicCode(context.Background(), nil, ep, "  the-code\n", "v", "  the-state\n"); err != nil {
 		t.Fatalf("ExchangeAnthropicCode: %v", err)
 	}
 }
@@ -205,7 +206,7 @@ func TestAnthropicErrorMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ep, _ := anthropicStub(t, func(w http.ResponseWriter, _ map[string]string) { writeJSON(w, tc.status, tc.body) })
-			ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "SECRET-CODE", "SECRET-VERIFIER")
+			ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "SECRET-CODE", "SECRET-VERIFIER", "SECRET-STATE")
 			if err == nil {
 				t.Fatalf("got %+v, want an error", ts)
 			}
@@ -224,7 +225,7 @@ func TestAnthropicErrorMapping(t *testing.T) {
 			if !errors.As(err, &se) || se.Status != tc.status {
 				t.Errorf("error is not a *StatusError carrying HTTP %d: %v", tc.status, err)
 			}
-			for _, secret := range []string{"SECRET-CODE", "SECRET-VERIFIER"} {
+			for _, secret := range []string{"SECRET-CODE", "SECRET-VERIFIER", "SECRET-STATE"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Errorf("error leaks request secret %q: %v", secret, err)
 				}
@@ -249,7 +250,7 @@ func TestAnthropicMalformedSuccessResponses(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ep, _ := anthropicStub(t, func(w http.ResponseWriter, _ map[string]string) { writeJSON(w, 200, body) })
-			_, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "c", "v")
+			_, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "c", "v", "s")
 			if !errors.Is(err, ErrBadTokenResponse) {
 				t.Fatalf("err = %v, want ErrBadTokenResponse", err)
 			}
@@ -261,7 +262,7 @@ func TestAnthropicMissingExpiresInLeavesExpiryUnknown(t *testing.T) {
 	ep, _ := anthropicStub(t, func(w http.ResponseWriter, _ map[string]string) {
 		writeJSON(w, 200, `{"access_token":"A"}`)
 	})
-	ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "c", "v")
+	ts, err := ExchangeAnthropicCode(context.Background(), http.DefaultClient, ep, "c", "v", "s")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +275,7 @@ func TestAnthropicHonoursContextCancellation(t *testing.T) {
 	ep, _ := anthropicStub(t, func(w http.ResponseWriter, _ map[string]string) { writeJSON(w, 200, `{"access_token":"A"}`) })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := ExchangeAnthropicCode(ctx, http.DefaultClient, ep, "c", "v")
+	_, err := ExchangeAnthropicCode(ctx, http.DefaultClient, ep, "c", "v", "s")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

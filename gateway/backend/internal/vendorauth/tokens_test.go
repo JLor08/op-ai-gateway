@@ -4,8 +4,10 @@
 package vendorauth
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"op-ai-gateway/internal/capture"
 	"strings"
 	"testing"
@@ -161,5 +163,35 @@ func TestTokenSetNeverFormatsSecrets(t *testing.T) {
 				t.Fatalf("fmt %s leaks %q: %s", format, secret, out)
 			}
 		}
+	}
+}
+
+// TestTokenSetLogValueNeverEmitsSecrets guards structured logging: slog resolves
+// a LogValuer before handing the value to a handler, so neither the JSON nor the
+// text handler may see (or marshal) the real token fields.
+func TestTokenSetLogValueNeverEmitsSecrets(t *testing.T) {
+	ts := sampleTokenSet()
+	handlers := map[string]func(*bytes.Buffer) slog.Handler{
+		"json": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+	}
+	for name, newHandler := range handlers {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(newHandler(&buf))
+			logger.Info("connected", "tokens", ts, slog.Any("again", ts))
+			out := buf.String()
+			for _, secret := range []string{ts.AccessToken, ts.RefreshToken} {
+				if strings.Contains(out, secret) {
+					t.Fatalf("slog %s output leaks %q: %s", name, secret, out)
+				}
+			}
+			if !strings.Contains(out, "redacted") || !strings.Contains(out, ts.AccountID) {
+				t.Fatalf("slog %s output should carry the redacted summary, got: %s", name, out)
+			}
+		})
+	}
+	if got := ts.LogValue().String(); got != ts.String() {
+		t.Fatalf("LogValue = %q, want the same redacted text as String() = %q", got, ts.String())
 	}
 }

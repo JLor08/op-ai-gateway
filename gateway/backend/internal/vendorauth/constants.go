@@ -60,22 +60,14 @@ const (
 	OpenAIClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	// OpenAIAuthorizeURL is where the user signs in and approves access.
 	OpenAIAuthorizeURL = "https://auth.openai.com/oauth/authorize"
-	// OpenAITokenURL exchanges a code / device code / refresh token for tokens.
+	// OpenAITokenURL exchanges a code / refresh token for tokens.
 	// This package sends form-encoded bodies (standard OAuth); the Codex CLI
 	// may use JSON for some grants. VERIFY LIVE.
 	OpenAITokenURL = "https://auth.openai.com/oauth/token"
-	// OpenAIDeviceAuthorizeURL is the RFC 8628 device-authorization endpoint.
-	//
-	// UNVERIFIED: this URL is a standard-OAuth guess. The official CLI is
-	// believed to use a bespoke device-auth endpoint rather than RFC 8628 (and
-	// the response shape may differ), and the device flow may not be enabled
-	// for the Codex client id at all. Treat the whole device-code path as
-	// unproven until a live test confirms it; the authorization-code flow with
-	// OpenAIRedirectURI is the fallback.
-	OpenAIDeviceAuthorizeURL = "https://auth.openai.com/oauth/device/code"
 	// OpenAIRedirectURI is the loopback callback the Codex CLI registers. The
-	// gateway cannot listen there, so the code-paste fallback has the user copy
-	// the failed-redirect URL's code back by hand.
+	// gateway cannot listen there, so the connect flow is code-paste: the user
+	// authorizes, the browser lands on a dead loopback URL, and the user copies
+	// the code from that URL back by hand.
 	OpenAIRedirectURI = "http://localhost:1455/auth/callback"
 	// OpenAIScopes is the space-separated scope list the CLI requests.
 	OpenAIScopes = "openid profile email offline_access"
@@ -115,10 +107,8 @@ type Endpoints struct {
 	// AuthorizeURL is the browser authorization endpoint (never fetched by this
 	// package; only used to build the URL the user opens).
 	AuthorizeURL string
-	// TokenURL is the token endpoint for the code, refresh and device grants.
+	// TokenURL is the token endpoint for the code and refresh grants.
 	TokenURL string
-	// DeviceAuthorizeURL is the device-authorization endpoint (OpenAI only).
-	DeviceAuthorizeURL string
 	// RedirectURI is the registered redirect_uri.
 	RedirectURI string
 	// Scopes is the space-separated scope list.
@@ -138,14 +128,13 @@ func DefaultAnthropicEndpoints() Endpoints {
 }
 
 // DefaultOpenAIEndpoints returns the reverse-engineered Codex OAuth endpoints.
-// DeviceAuthorizeURL is UNVERIFIED. VERIFY LIVE.
+// VERIFY LIVE.
 func DefaultOpenAIEndpoints() Endpoints {
 	return Endpoints{
-		ClientID:           OpenAIClientID,
-		AuthorizeURL:       OpenAIAuthorizeURL,
-		TokenURL:           OpenAITokenURL,
-		DeviceAuthorizeURL: OpenAIDeviceAuthorizeURL,
-		RedirectURI:        OpenAIRedirectURI,
-		Scopes:             OpenAIScopes,
+		ClientID:     OpenAIClientID,
+		AuthorizeURL: OpenAIAuthorizeURL,
+		TokenURL:     OpenAITokenURL,
+		RedirectURI:  OpenAIRedirectURI,
+		Scopes:       OpenAIScopes,
 	}
 }

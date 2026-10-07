@@ -4,7 +4,7 @@
 // Package vendorauth implements the OAuth mechanics for connecting a consumer
 // SUBSCRIPTION account (Anthropic Claude Pro/Max, OpenAI ChatGPT/Codex) as an
 // external vendor account: PKCE and state generation, authorize-URL
-// construction, authorization-code and device-code token exchange, token
+// construction, authorization-code (code-paste) token exchange, token
 // refresh, and the sealed TokenSet credential blob.
 //
 // WARNING: this whole path is REVERSE-ENGINEERED from the official vendor CLIs

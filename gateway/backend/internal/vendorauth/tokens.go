@@ -6,6 +6,7 @@ package vendorauth
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"op-ai-gateway/internal/capture"
 	"time"
 )
@@ -38,8 +39,9 @@ func (ts TokenSet) NeedsRefresh(now time.Time, buffer time.Duration) bool {
 	return !ts.ExpiresAt.IsZero() && now.Add(buffer).After(ts.ExpiresAt)
 }
 
-// String redacts the secrets so a stray %v / %s / slog attribute of a TokenSet
-// cannot spill a bearer or refresh token into a log.
+// String redacts the secrets so a stray %v / %s of a TokenSet cannot spill a
+// bearer or refresh token into a log. (TokenSet deliberately has no MarshalJSON:
+// sealing needs the real fields; structured loggers are covered by LogValue.)
 func (ts TokenSet) String() string {
 	return fmt.Sprintf("TokenSet{access:%s refresh:%s expires_at:%s account_id:%q plan_type:%q scope:%q}",
 		redacted(ts.AccessToken), redacted(ts.RefreshToken), ts.ExpiresAt.Format(time.RFC3339),
@@ -48,6 +50,10 @@ func (ts TokenSet) String() string {
 
 // GoString makes %#v redact the same way String does.
 func (ts TokenSet) GoString() string { return ts.String() }
+
+// LogValue implements slog.LogValuer so a log/slog handler (JSON or text) logs
+// the redacted summary instead of reflecting over the real token fields.
+func (ts TokenSet) LogValue() slog.Value { return slog.StringValue(ts.String()) }
 
 func redacted(secret string) string {
 	if secret == "" {
