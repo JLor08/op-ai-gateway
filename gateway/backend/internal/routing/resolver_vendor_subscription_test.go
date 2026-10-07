@@ -175,6 +175,24 @@ func TestVendorSubscriptionOpenAINeedsReconnectDoesNotMatch(t *testing.T) {
 	}
 }
 
+// TestVendorSubscriptionUnknownVendorDoesNotMatch proves the subscription
+// target branch is FAIL-CLOSED: a subscription account with an unknown vendor
+// value matches NO account (continue), rather than silently defaulting to the
+// OpenAI or Anthropic target and misrouting its sealed token. The openai_responses
+// flavor is used so the request clears the account-level gate and the rejection is
+// the target branch's fail-closed default itself, not the gate.
+func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_x", "mystery-vendor", "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex", APIFlavorOpenAI)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_responses"}); !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("Resolve(unknown subscription vendor) = %v, want ErrNoModelRoute (fail-closed, no misroute)", err)
+	}
+}
+
 // vendorSubscriptionTargetMayBeZero names the fields the subscription ANTHROPIC
 // target legitimately leaves zero (the subscription analogue of
 // vendorTargetMayBeZero). Crucially ExtraHeaders/Masquerade/VendorAccountID are

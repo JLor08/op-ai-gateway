@@ -1889,7 +1889,10 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 	}
 	// Branch on the account's vendor so the refresh token is only ever exchanged
 	// against its OWN token endpoint (a cross-vendor refresh would leak the token to
-	// the wrong host and always fail).
+	// the wrong host and always fail). FAIL-CLOSED: an unknown vendor serves no
+	// bearer rather than defaulting to one vendor's endpoint — a default-based
+	// branch here would, on a future third vendor, send its sealed token to the
+	// wrong host.
 	var (
 		fresh   vendorauth.TokenSet
 		changed bool
@@ -1897,8 +1900,11 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 	switch acc.Vendor {
 	case routing.VendorOpenAI:
 		fresh, changed, err = vendorauth.EnsureFreshOpenAI(ctx, nil, s.openAIRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
-	default:
+	case routing.VendorAnthropic:
 		fresh, changed, err = vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	default:
+		slog.Debug("subscription account has an unknown vendor; proceeding without bearer", "account", accountID, "vendor", acc.Vendor)
+		return "", "", false
 	}
 	if err != nil {
 		if errors.Is(err, vendorauth.ErrAuthRejected) {

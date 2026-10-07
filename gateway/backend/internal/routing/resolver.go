@@ -815,6 +815,7 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
+nextAccount:
 	for _, acc := range accounts {
 		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 		// disabled accounts are skipped and fall through to the standard path.
@@ -845,14 +846,21 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 				// Subscription (OAuth): the bearer is resolved + refreshed at dispatch
 				// from the account's sealed OAuth tokens, so the target carries
 				// VendorAccountID and the vendor's required headers, and NO APIToken.
-				if acc.Vendor == VendorAnthropic {
+				// FAIL-CLOSED: only a KNOWN subscription vendor builds a target; an
+				// unknown one matches no account (continue) rather than defaulting to
+				// either vendor's target, which would misroute its sealed token.
+				switch acc.Vendor {
+				case VendorAnthropic:
 					// Anthropic: translate either inbound dialect to Messages; carries
 					// the Claude-Code masquerade + the OAuth version/beta headers.
 					return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true, nil
+				case VendorOpenAI:
+					// OpenAI: native passthrough of the inbound Responses request to the
+					// ChatGPT backend (reached only for openai_responses, gated above).
+					return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor), true, nil
+				default:
+					continue nextAccount
 				}
-				// OpenAI: native passthrough of the inbound Responses request to the
-				// ChatGPT backend (reached only for openai_responses, gated above).
-				return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor), true, nil
 			}
 			return vendorAccountTarget(acc, m, req.Model, apiFlavor), true, nil
 		}

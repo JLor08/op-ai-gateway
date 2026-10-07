@@ -551,6 +551,35 @@ func TestOpenAISubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
 	}
 }
 
+// TestSubscriptionDispatchUnknownVendorServesNoBearer proves resolveSubscriptionBearer
+// is FAIL-CLOSED: a subscription account with an unknown vendor value serves no
+// bearer and no account id, so its sealed token can never be sent to the wrong
+// vendor's token endpoint. A near-expiry token makes the point sharper — a
+// default-based branch would have tried to refresh it against one vendor's host.
+func TestSubscriptionDispatchUnknownVendorServesNoBearer(t *testing.T) {
+	cipher := newDispatchCipher(t)
+	store := routing.NewMemoryStore()
+	seedSubscriptionAccount(t, store, cipher, "acc_sub_x", "mystery-vendor", vendorauth.TokenSet{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(10 * time.Second), // stale: a default branch would refresh
+		AccountID: "acct-x",
+	})
+	s := &Server{Cipher: cipher, Routes: store}
+
+	access, accountID, ok := s.resolveSubscriptionBearer(context.Background(), "acc_sub_x")
+	if ok || access != "" || accountID != "" {
+		t.Fatalf("resolveSubscriptionBearer(unknown vendor) = (%q, %q, %v), want (\"\", \"\", false) — fail-closed", access, accountID, ok)
+	}
+	// The account is left untouched (no needs_reconnect flip, no refresh attempted).
+	acc, err := store.VendorAccountByID(context.Background(), "acc_sub_x")
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	if acc.Status != routing.VendorAccountStatusActive {
+		t.Fatalf("status = %q, want active (an unknown vendor is not a dead refresh token)", acc.Status)
+	}
+}
+
 // TestOpenAISubscriptionDispatchRejectionMarksNeedsReconnect proves a dead OpenAI
 // refresh token flips the account to needs_reconnect and the request proceeds
 // WITHOUT a bearer or an account id (no panic); the static Codex headers still ride.
