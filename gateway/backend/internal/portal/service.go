@@ -2350,6 +2350,19 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 				}
 			}
+			// Owner overlay: fold in the principal's own vendor-account models
+			// (Milestone 3) so the chat picker and /api/v0/models show exactly what
+			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
+			// suppress==true is Models() (the picker / inference discovery); the
+			// admin management surface (ManageModels(), suppress==false) shows the
+			// system's real models and must not be filled with one principal's
+			// personal vendor models. A vendor model name that coincides with an
+			// existing one is unioned into that row (deduped); a vendor-only name
+			// gets a fresh row that the assembly below renders with the zero listing
+			// data (not loaded, offered-on 0, context unknown), Visibility "shown".
+			if suppress {
+				s.overlayVendorModels(ctx, token, flavors)
+			}
 			ids := make([]string, 0, len(flavors))
 			for id := range flavors {
 				ids = append(ids, id)
@@ -3859,7 +3872,17 @@ func isSeedAPIFlavor(flavor string) bool {
 // same three layers (see the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
-	return sets, err
+	if err != nil {
+		return sets, err
+	}
+	// Owner overlay: fold in the principal's own vendor-account models (Milestone
+	// 3) so the per-flavor listings (/v1/models, the Anthropic list) advertise
+	// exactly what resolveVendorAccount will dispatch for them. Applied here, on
+	// the public method ModelsForFlavor consumes, rather than inside
+	// modelFlavorSetsWithPreSuppress, so the preSuppress-reading callers (the
+	// unknown-model redirect's reachability set) are left untouched.
+	s.overlayVendorModels(ctx, token, sets)
+	return sets, nil
 }
 
 // modelFlavorSetsWithPreSuppress is modelFlavorSets plus the second map its
