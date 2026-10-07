@@ -25,6 +25,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/tracing"
 	"op-ai-gateway/internal/usage"
+	"op-ai-gateway/internal/vendorauth"
 	"slices"
 	"strings"
 	"sync"
@@ -116,6 +117,12 @@ type ServerDeps struct {
 	CaptureMaxBytes int
 	CaptureEnabled  func() bool
 	CaptureOverride func() bool
+	// SettingsVolatile is true only for the memory driver (a RAM-only settings
+	// store). It is the volatile flag the dispatch path passes to SealTokenSet
+	// when it reseals a refreshed subscription OAuth token: with a cipher it
+	// seals enc:, and on the keyless memory driver (volatile) it seals plain:
+	// instead of failing. Mirrors portal.ServiceDeps.SettingsVolatile.
+	SettingsVolatile bool
 	// AppHealth is the per-application reachability registry, populated by the
 	// background app-health probe loop and consumed by Phase 3 (routing + model
 	// offering). gateway.New copies it; a nil value gets a fresh registry.
@@ -619,6 +626,31 @@ type Server struct {
 	// speculationSeenMu above, so a Server built directly (bypassing New)
 	// pushes through it too.
 	runtimePush runtimeConfigPusher
+
+	// settingsVolatile mirrors ServerDeps.SettingsVolatile — the volatile flag the
+	// subscription dispatch path passes to vendorauth.SealTokenSet when it reseals
+	// a refreshed OAuth token (enc: with a cipher, plain: on the keyless memory
+	// driver). Zero value (false) is the disk-driver default.
+	settingsVolatile bool
+
+	// vendorRefreshMu guards vendorRefreshLocks, the per-account mutex map that
+	// SERIALIZES OAuth-token refresh for one subscription account across concurrent
+	// dispatches (subscriptionAuthCtx). Without it two near-simultaneous requests
+	// for the same account could both refresh — burning the (often single-use)
+	// refresh token and racing the reseal. A short-lived map guarded by this mutex,
+	// lazily created, usable at the zero value like speculationSeenMu above so a
+	// Server built directly (bypassing New) still locks. The per-account mutexes
+	// are never deleted: they are bounded by the number of distinct subscription
+	// accounts this process has dispatched (small) and each holds one map key.
+	vendorRefreshMu    sync.Mutex
+	vendorRefreshLocks map[string]*sync.Mutex
+
+	// vendorAnthropicEndpoints are the OAuth endpoints used to refresh an Anthropic
+	// subscription account's access token at dispatch. Left zero it falls back to
+	// vendorauth.DefaultAnthropicEndpoints() (anthropicRefreshEndpoints); a test
+	// overrides TokenURL to an httptest server. (OpenAI subscription refresh is
+	// Milestone 5b.)
+	vendorAnthropicEndpoints vendorauth.Endpoints
 }
 
 // portalProvisioningGate adapts portal.API's AllowedServerIDs onto the
@@ -827,6 +859,7 @@ func New(deps ServerDeps) *Server {
 		pushRuntimeConfigSpacing:    defaultPushRuntimeConfigSpacing,
 		selfBaseURL:                 deps.SelfBaseURL,
 		Cipher:                      deps.Cipher,
+		settingsVolatile:            deps.SettingsVolatile,
 		captureMaxBytes:             captureMaxBytes,
 		CaptureEnabled:              deps.CaptureEnabled,
 		CaptureOverride:             deps.CaptureOverride,
@@ -1739,24 +1772,137 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, apierror.Response("request.not_found", "not found", ""))
 }
 
-// upstreamAuthCtx decorates ctx with the per-application upstream credential
-// decrypted from target.APIToken (sealed enc:/plain:) so the provider layer
-// attaches it to the upstream request. Fail-open: an empty token or a decrypt
-// error logs at Debug and returns ctx unchanged (the upstream will 401 on a real
-// misconfiguration; we never crash or refuse the request over it). The CLIENT
-// bearer token is never involved — this is a separate gateway-held credential.
+// upstreamAuthCtx decorates ctx with the per-request upstream credential + any
+// static extra headers so the provider layer attaches them to the upstream call.
+// Two shapes:
+//
+//   - A SUBSCRIPTION target (target.VendorAccountID != "") carries no APIToken;
+//     its OAuth bearer is resolved — and refreshed when stale — at dispatch from
+//     the named account's sealed tokens (subscriptionAuthCtx).
+//   - Every other target carries its credential sealed in target.APIToken
+//     (enc:/plain:), decrypted here, plus any target.ExtraHeaders.
+//
+// Fail-open throughout: an empty/undecryptable token logs at Debug and proceeds
+// without a credential (the upstream 401s on a real misconfiguration; we never
+// crash or refuse the request over it). The CLIENT bearer token is never
+// involved — this is a separate gateway-held credential.
 func (s *Server) upstreamAuthCtx(ctx context.Context, target routing.Target) context.Context {
-	if target.APIToken == "" {
-		return ctx
+	if target.VendorAccountID != "" {
+		return s.subscriptionAuthCtx(ctx, target)
 	}
-	token, err := capture.OpenSecret(s.Cipher, target.APIToken)
-	if err != nil || token == "" {
+	token := ""
+	if target.APIToken != "" {
+		opened, err := capture.OpenSecret(s.Cipher, target.APIToken)
 		if err != nil {
 			slog.Debug("upstream api token decrypt failed; proceeding without auth", "route", target.RouteID, "err", err)
+		} else {
+			token = opened
 		}
-		return ctx
 	}
-	return provider.WithUpstreamAuth(ctx, target.APITokenHeader, token)
+	// WithUpstreamAuthHeaders returns ctx unchanged when there is nothing to
+	// attach (empty token AND no extra headers), preserving the no-op for an
+	// unauthenticated app.
+	return provider.WithUpstreamAuthHeaders(ctx, target.APITokenHeader, token, target.ExtraHeaders)
+}
+
+// vendorTokenRefreshBuffer is how far ahead of a subscription access token's
+// expiry the dispatch path refreshes it, so an in-flight request does not race
+// the moment of expiry.
+const vendorTokenRefreshBuffer = 2 * time.Minute
+
+// subscriptionAuthCtx resolves (and refreshes when stale) the OAuth bearer for a
+// subscription target's vendor account and threads it — plus the target's static
+// extra headers (anthropic-version, anthropic-beta) — onto ctx. Fail-open: on any
+// failure the request proceeds WITHOUT a bearer (the upstream 401s) rather than
+// crashing; a refresh REJECTION additionally flips the account to needs_reconnect.
+// The static headers are attached even when no bearer is available, so the
+// upstream's error is about auth, not a missing API version; they carry no secret.
+func (s *Server) subscriptionAuthCtx(ctx context.Context, target routing.Target) context.Context {
+	access, ok := s.resolveSubscriptionBearer(ctx, target.VendorAccountID)
+	if !ok {
+		return provider.WithUpstreamAuthHeaders(ctx, "", "", target.ExtraHeaders)
+	}
+	return provider.WithUpstreamAuthHeaders(ctx, "", access, target.ExtraHeaders)
+}
+
+// resolveSubscriptionBearer loads accountID's sealed OAuth tokens, refreshes them
+// under the PER-ACCOUNT lock when they are near expiry, persists the resealed
+// blob through the narrow writer when they changed, and returns the usable access
+// token. ok is false (and no bearer is served) on every failure; a refresh
+// rejection also marks the account needs_reconnect. The whole sequence runs under
+// lockVendorAccount(accountID) so concurrent dispatches for one account single-
+// flight the refresh instead of each burning the refresh token.
+func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string) (string, bool) {
+	if s.Routes == nil {
+		return "", false
+	}
+	unlock := s.lockVendorAccount(accountID)
+	defer unlock()
+
+	acc, err := s.Routes.VendorAccountByID(ctx, accountID)
+	if err != nil {
+		slog.Debug("subscription account lookup failed; proceeding without bearer", "account", accountID, "err", err)
+		return "", false
+	}
+	ts, err := vendorauth.OpenTokenSet(s.Cipher, acc.OAuthTokens)
+	if err != nil {
+		// A redacted log only — never the sealed blob or any token field.
+		slog.Debug("subscription token open failed; proceeding without bearer", "account", accountID)
+		return "", false
+	}
+	fresh, changed, err := vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	if err != nil {
+		if errors.Is(err, vendorauth.ErrAuthRejected) {
+			// The refresh token is dead: the account must be reconnected. Flip the
+			// status (narrow writer) and serve no bearer, so the request fails cleanly.
+			if serr := s.Routes.SetVendorAccountStatus(ctx, accountID, routing.VendorAccountStatusNeedsReconnect); serr != nil {
+				slog.Debug("mark subscription account needs_reconnect failed", "account", accountID, "err", serr)
+			}
+			return "", false
+		}
+		slog.Debug("subscription token refresh failed; proceeding without bearer", "account", accountID, "err", err)
+		return "", false
+	}
+	if changed {
+		if sealed, serr := vendorauth.SealTokenSet(s.Cipher, s.settingsVolatile, fresh); serr != nil {
+			slog.Debug("subscription token reseal failed; serving refreshed token without persisting", "account", accountID)
+		} else if perr := s.Routes.SetVendorAccountOAuthTokens(ctx, accountID, sealed); perr != nil {
+			slog.Debug("subscription token persist failed; serving refreshed token without persisting", "account", accountID, "err", perr)
+		}
+	}
+	if fresh.AccessToken == "" {
+		return "", false
+	}
+	return fresh.AccessToken, true
+}
+
+// lockVendorAccount acquires the per-account refresh mutex and returns its
+// unlock. The guarding map is lazily created so a Server built directly (bypassing
+// New) still locks, mirroring speculationSeen's lazy init.
+func (s *Server) lockVendorAccount(accountID string) func() {
+	s.vendorRefreshMu.Lock()
+	if s.vendorRefreshLocks == nil {
+		s.vendorRefreshLocks = map[string]*sync.Mutex{}
+	}
+	mu := s.vendorRefreshLocks[accountID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.vendorRefreshLocks[accountID] = mu
+	}
+	s.vendorRefreshMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// anthropicRefreshEndpoints returns the OAuth endpoints used to refresh an
+// Anthropic subscription token, defaulting to the live reverse-engineered
+// endpoints when unset (a Server built directly leaves the field zero; a test
+// overrides it to an httptest server).
+func (s *Server) anthropicRefreshEndpoints() vendorauth.Endpoints {
+	if s.vendorAnthropicEndpoints.TokenURL == "" {
+		return vendorauth.DefaultAnthropicEndpoints()
+	}
+	return s.vendorAnthropicEndpoints
 }
 
 // serverName resolves a routing target's server ID to its human-readable

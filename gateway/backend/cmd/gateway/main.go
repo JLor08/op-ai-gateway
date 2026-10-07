@@ -1081,6 +1081,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CertEdgeRequireHTTPSDisable:     cfg.CertEdgeRequireHTTPSDisable,
 		CertMeshRequireTLSDisable:       cfg.CertMeshRequireTLSDisable,
 		Cipher:                          b.Cipher,
+		SettingsVolatile:                b.SettingsVolatile,
 		Captures:                        b.Captures,
 		CaptureMaxBytes:                 b.CaptureMaxBytes,
 		CaptureEnabled:                  func() bool { return captureFlagsHook().Enabled },
