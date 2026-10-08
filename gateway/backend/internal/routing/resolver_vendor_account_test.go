@@ -329,11 +329,10 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 		reqFlavor    string
 		wantProvider string
 	}{
-		{"openai account, openai_chat", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "openai_chat", ProviderVendorOpenAI},
 		{"openai account, openai_chat_completions", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "openai_chat_completions", ProviderVendorOpenAI},
 		{"openai account, anthropic_messages", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "anthropic_messages", ProviderVendorOpenAI},
 		{"anthropic account, openai_responses", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "openai_responses", ProviderVendorAnthropic},
-		{"anthropic account, openai_chat", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "openai_chat", ProviderVendorAnthropic},
+		{"anthropic account, openai_chat_completions", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "openai_chat_completions", ProviderVendorAnthropic},
 		{"anthropic account, anthropic_messages", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages", ProviderVendorAnthropic},
 	}
 	for _, tc := range cases {

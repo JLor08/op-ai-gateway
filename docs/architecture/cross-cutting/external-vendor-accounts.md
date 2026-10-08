@@ -421,8 +421,9 @@ The subscription path splits by the inbound request shape:
 
 The ChatGPT backend is far stricter than the public Responses API, so the
 subscription translate client always sends what the Codex CLI always sends,
-whatever the inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE): `store: false` (a
-body without `store` defaults to `true`, which the subscription backend rejects
+whatever the inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE):
+`store: false` (a body without `store` defaults to `true`, which the
+subscription backend rejects
 with a 400), `include: ["reasoning.encrypted_content"]` (so reasoning round-trips
 while nothing is stored), and a `reasoning` object — the request's effort, else
 `medium` (a portal chat carries none, and the subscription catalog is the
@@ -463,21 +464,23 @@ to the serving account (§5).
   path.
 - **Behaviour change (VERIFY-LIVE).** A model that the platform serves only over
   Chat Completions — for example `gpt-4o-search-preview` or
-  `gpt-4o-audio-preview` — worked for a Responses client through the old translate path and
-  would now **fail** on `/v1/responses`, where OpenAI answers for it. This is the
-  expected cost of forwarding to the real Responses endpoint, not a regression to
-  chase in the relay. Such ids are not excluded by the discovery heuristic (§6.1),
-  so they can appear in an account's catalog. Which models the platform's
-  `/v1/responses` accepts is OpenAI's to change and has not been checked against
-  a live key; chat completions to the same model are unaffected.
-- **Create-only.** Only `POST /v1/responses` is registered. The follow-up routes
-  `GET`/`DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel` and
-  `GET /v1/responses/{id}/input_items` are not registered on the gateway and
-  answer 404, so a client that stores a response and later fetches, cancels or
-  lists its input items through the gateway cannot. The translate path never
-  supported them either; proxying them is a documented follow-up, not part of
-  this passthrough. `previous_response_id` itself rides the create body and so
-  reaches OpenAI intact.
+  `gpt-4o-audio-preview` — worked for a Responses client through the old
+  translate path and would now **fail** on `/v1/responses`, where OpenAI rejects
+  it. This is the expected cost of forwarding to the real Responses endpoint,
+  not a regression to chase in the relay. Such ids are not excluded by the
+  discovery heuristic (§6.1), so they can appear in an account's catalog. Which
+  models the platform's `/v1/responses` accepts is OpenAI's to change and has
+  not been checked against a live key; chat completions to the same model are
+  unaffected.
+- **Create-only.** Only `POST /v1/responses` (and its `/openai/v1/responses`
+  alias) is registered. The follow-up routes `GET`/`DELETE /v1/responses/{id}`,
+  `POST /v1/responses/{id}/cancel` and `GET /v1/responses/{id}/input_items` are
+  not registered on the gateway and answer 404, so a client that stores a
+  response and later fetches, cancels or lists its input items through the
+  gateway cannot. The translate path never supported them either; proxying them
+  is a documented follow-up, not part of this passthrough.
+  `previous_response_id` itself rides the create body and so reaches OpenAI
+  intact.
 
 ### 4.3 Credential resolution at the edge
 
@@ -781,9 +784,10 @@ Two behaviours to know:
 - On the native-passthrough path (an OpenAI subscription's or an OpenAI api-key
   account's `/v1/responses`, §4.2) the gateway rewrites only the request's `model`
   field to the bare slug. The vendor's response is relayed verbatim and there is
-  no response-side rewrite, so its `model` field echoes the **bare** slug, not the prefixed name the client
-  asked for. A recorded usage event keeps the requested (prefixed) name as its
-  model and the bare slug as the provider model.
+  no response-side rewrite, so its `model` field echoes the **bare** slug, not
+  the prefixed name the client asked for. A recorded usage event keeps the
+  requested (prefixed) name as its model and the bare slug as the provider
+  model.
 
 ### 6.6 The `client_version` knob
 

@@ -427,12 +427,14 @@ func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
 		t.Fatalf("upstreamPath(api-key openai vendor) = %q, want /v1/responses (passthrough, not the chat-completions translate path)", got)
 	}
 
-	// The same account reached over a chat request still TRANSLATES: the mode is not
-	// passthrough, so upstreamPath keeps the OpenAI-compatible client's
+	// The same account reached over a chat request still TRANSLATES: the resolver
+	// leaves ResponsesMode zero on the target (asserted directly -- endpointModeFor
+	// only has a case for the Responses/Messages flavors, so it would say nothing
+	// about a chat target), so upstreamPath keeps the OpenAI-compatible client's
 	// chat-completions endpoint.
-	chat := resolveAPIKeyOpenAITarget(t, newDispatchCipher(t), "openai_chat", "https://api.openai.com")
-	if _, mode := endpointModeFor(chat, "openai_chat_completions"); mode == routing.EndpointModePassthrough {
-		t.Fatalf("api-key openai vendor + chat: mode = %q, want translate (non-passthrough)", mode)
+	chat := resolveAPIKeyOpenAITarget(t, newDispatchCipher(t), "openai_chat_completions", "https://api.openai.com")
+	if chat.ResponsesMode != "" {
+		t.Fatalf("api-key openai vendor + chat: ResponsesMode = %q, want zero (translate)", chat.ResponsesMode)
 	}
 	if got := upstreamPath(chat, "openai_chat_completions"); got != "/v1/chat/completions" {
 		t.Fatalf("upstreamPath(api-key openai vendor, chat) = %q, want /v1/chat/completions (translate)", got)
