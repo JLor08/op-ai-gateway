@@ -6,10 +6,11 @@
 // It runs in the browser, so the file never leaves the page until the user
 // submits the extracted fields; it keeps ONLY the fields the token import needs.
 //
-// The result is UI-facing. Its error text is shown to the user, so it is built
-// from fixed strings only: never from the file's content and never from a
-// JSON.parse failure (V8's SyntaxError message quotes a fragment of the input,
-// which for a credential file is a token).
+// The result is UI-facing. A failure carries a stable `code` the renderer maps to
+// localised text, plus an English `error` for logs and tests. Both are built from
+// fixed strings only: never from the file's content and never from a JSON.parse
+// failure (V8's SyntaxError message quotes a fragment of the input, which for a
+// credential file is a token).
 
 export type CredentialVendor = 'openai' | 'anthropic';
 
@@ -21,11 +22,24 @@ export type ParsedCredential = {
   /** RFC 3339 UTC instant; absent when the file does not say and the token does not carry it. */
   expiresAt?: string;
   accountId?: string;
-  planType?: string;
 };
 
-/** A clear, token-free reason the file cannot be imported. */
-export type ParsedCredentialError = { error: string };
+/**
+ * Why a file cannot be imported. The UI maps each code to localised text (for
+ * example a Record<ParsedCredentialErrorCode, MessageKey>), so a new code is a
+ * compile error there until it is given a message.
+ */
+export type ParsedCredentialErrorCode =
+  | 'not_json'
+  | 'not_object'
+  | 'unrecognised'
+  | 'ambiguous'
+  | 'claude_no_access_token'
+  | 'codex_id_token_only'
+  | 'codex_no_access_token';
+
+/** A token-free reason the file cannot be imported: a stable `code`, and its English text. */
+export type ParsedCredentialError = { code: ParsedCredentialErrorCode; error: string };
 
 /** Narrows a parse result to its error arm; a credential never has an `error` key. */
 export function isParsedCredentialError(
@@ -34,20 +48,25 @@ export function isParsedCredentialError(
   return 'error' in result;
 }
 
-const SUPPORTED_FILES = 'Codex auth.json or Claude Code .credentials.json';
+const ERROR_MESSAGES: Record<ParsedCredentialErrorCode, string> = {
+  not_json: 'The file is not valid JSON. Upload the credential file unchanged.',
+  not_object:
+    'The file must contain a JSON object, as in Codex auth.json or Claude Code .credentials.json.',
+  unrecognised:
+    'The file is not a recognised credential file. Upload a Codex auth.json or Claude Code .credentials.json.',
+  ambiguous:
+    'The file looks like both a Codex auth.json and a Claude Code .credentials.json. Rename it to auth.json or .credentials.json, or upload only one of them.',
+  claude_no_access_token:
+    'The Claude Code file has no claudeAiOauth.accessToken. Upload a .credentials.json that holds an access token.',
+  codex_id_token_only:
+    'This Codex auth.json has an id_token but no tokens.access_token. The id_token is an identity token and cannot be imported; upload a file that holds the access_token (or paste the access_token itself).',
+  codex_no_access_token:
+    'This Codex auth.json has no tokens.access_token. Sign in to Codex with ChatGPT so that auth.json holds an access_token; an API key alone cannot be imported.',
+};
 
-const ERROR_NOT_JSON = 'The file is not valid JSON. Upload the credential file unchanged.';
-const ERROR_NOT_OBJECT =
-  'The file must contain a JSON object, as in Codex auth.json or Claude Code .credentials.json.';
-const ERROR_UNRECOGNISED = `The file is not a recognised credential file. Upload a ${SUPPORTED_FILES}.`;
-const ERROR_AMBIGUOUS =
-  'The file looks like both a Codex auth.json and a Claude Code .credentials.json. Rename it to auth.json or .credentials.json, or upload only one of them.';
-const ERROR_CLAUDE_NO_ACCESS_TOKEN =
-  'The Claude Code file has no claudeAiOauth.accessToken. Upload a .credentials.json that holds an access token.';
-const ERROR_CODEX_ID_TOKEN_ONLY =
-  'This Codex auth.json has an id_token but no tokens.access_token. The id_token is an identity token and cannot be imported; upload a file that holds the access_token (or paste the access_token itself).';
-const ERROR_CODEX_NO_ACCESS_TOKEN =
-  'This Codex auth.json has no tokens.access_token. Sign in to Codex with ChatGPT so that auth.json holds an access_token; an API key alone cannot be imported.';
+function fail(code: ParsedCredentialErrorCode): ParsedCredentialError {
+  return { code, error: ERROR_MESSAGES[code] };
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -62,12 +81,18 @@ function nonBlankString(value: unknown): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
-/** The instant as an RFC 3339 UTC string, or undefined when it is not a representable time. */
+/**
+ * The instant as an RFC 3339 UTC string, or undefined when it has none: not a
+ * valid Date, or a year outside 0000-9999. toISOString() prints such a year in an
+ * expanded form ("+010000-01-01..."), which RFC 3339 and the gateway's decoder
+ * reject, so the expiry is dropped rather than sent.
+ */
 function toRfc3339(epochMillis: number): string | undefined {
-  if (!Number.isFinite(epochMillis)) return undefined;
   const instant = new Date(epochMillis);
   // toISOString() throws a RangeError on an invalid Date, so test first.
-  return Number.isNaN(instant.getTime()) ? undefined : instant.toISOString();
+  if (Number.isNaN(instant.getTime())) return undefined;
+  const year = instant.getUTCFullYear();
+  return year >= 0 && year <= 9999 ? instant.toISOString() : undefined;
 }
 
 /**
@@ -91,14 +116,18 @@ function jwtExpiry(token: string): string | undefined {
   }
 }
 
-/** The last path segment, lower-cased: a user may upload from a path or a renamed copy. */
-function baseName(filename: string): string {
+/**
+ * The last path segment, lower-cased: a user may upload from a path or a renamed
+ * copy. A non-string name (it is only a hint) is the empty name.
+ */
+function baseName(filename: unknown): string {
+  if (typeof filename !== 'string') return '';
   return (filename.split(/[\\/]/).pop() ?? '').toLowerCase();
 }
 
 function parseClaudeCode(oauth: JsonObject): ParsedCredential | ParsedCredentialError {
   const accessToken = nonBlankString(oauth.accessToken);
-  if (accessToken === undefined) return { error: ERROR_CLAUDE_NO_ACCESS_TOKEN };
+  if (accessToken === undefined) return fail('claude_no_access_token');
 
   const credential: ParsedCredential = { vendor: 'anthropic', accessToken };
   const refreshToken = nonBlankString(oauth.refreshToken);
@@ -116,9 +145,11 @@ function parseCodex(tokens: JsonObject | undefined): ParsedCredential | ParsedCr
   if (tokens === undefined || accessToken === undefined) {
     // The live mistake this guards against: the id_token is the token that is
     // easy to copy out of auth.json, and it is not one the gateway can use.
-    return nonBlankString(tokens?.id_token) !== undefined
-      ? { error: ERROR_CODEX_ID_TOKEN_ONLY }
-      : { error: ERROR_CODEX_NO_ACCESS_TOKEN };
+    return fail(
+      nonBlankString(tokens?.id_token) !== undefined
+        ? 'codex_id_token_only'
+        : 'codex_no_access_token',
+    );
   }
 
   const credential: ParsedCredential = { vendor: 'openai', accessToken };
@@ -133,25 +164,28 @@ function parseCodex(tokens: JsonObject | undefined): ParsedCredential | ParsedCr
 
 /**
  * Reads a Codex `auth.json` or a Claude Code `.credentials.json` and returns the
- * fields a token import needs, or an `error` saying why it cannot be used. It
- * never throws.
+ * fields a token import needs, or an error (`code` + English `error`) saying why
+ * it cannot be used. It never throws, whatever it is given: the parameters are
+ * `unknown` so a caller may pass a FileReader result (string | ArrayBuffer | null)
+ * straight in, and anything but a string is not JSON text.
  *
  * The vendor is detected from the file's CONTENT, because a user may rename the
  * file; `filename` only breaks the tie in the unlikely case the content carries
  * both shapes.
  */
 export function parseCredentialFile(
-  filename: string,
-  text: string,
+  filename: unknown,
+  text: unknown,
 ): ParsedCredential | ParsedCredentialError {
+  if (typeof text !== 'string') return fail('not_json');
   let root: unknown;
   try {
     // A byte-order mark (some Windows editors add one) is not valid JSON.
     root = JSON.parse(text.replace(/^\uFEFF/, ''));
   } catch {
-    return { error: ERROR_NOT_JSON };
+    return fail('not_json');
   }
-  if (!isJsonObject(root)) return { error: ERROR_NOT_OBJECT };
+  if (!isJsonObject(root)) return fail('not_object');
 
   const claude = isJsonObject(root.claudeAiOauth) ? root.claudeAiOauth : undefined;
   // `tokens` is the ChatGPT sign-in; a sibling OPENAI_API_KEY marks the file as
@@ -164,9 +198,12 @@ export function parseCredentialFile(
     const name = baseName(filename);
     if (name === '.credentials.json') return parseClaudeCode(claude);
     if (name === 'auth.json') return parseCodex(codex);
-    return { error: ERROR_AMBIGUOUS };
+    return fail('ambiguous');
   }
   if (claude !== undefined) return parseClaudeCode(claude);
   if (isCodex) return parseCodex(codex);
-  return { error: ERROR_UNRECOGNISED };
+  // A flat id_token with no `tokens` object is the same mistake as an id_token-only
+  // auth.json, so it gets the same hint to use the access_token.
+  if (nonBlankString(root.id_token) !== undefined) return fail('codex_id_token_only');
+  return fail('unrecognised');
 }

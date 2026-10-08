@@ -3,7 +3,11 @@
 
 import { describe, expect, it } from 'vitest';
 import { isParsedCredentialError, parseCredentialFile } from './parseCredentialFile';
-import type { ParsedCredential, ParsedCredentialError } from './parseCredentialFile';
+import type {
+  ParsedCredential,
+  ParsedCredentialError,
+  ParsedCredentialErrorCode,
+} from './parseCredentialFile';
 
 // base64url (RFC 4648 section 5, unpadded) of a JSON object, the encoding of a JWT segment.
 function b64url(value: unknown): string {
@@ -32,11 +36,17 @@ function expectCredential(result: ParsedCredential | ParsedCredentialError): Par
   return result;
 }
 
-function expectError(result: ParsedCredential | ParsedCredentialError): string {
+function expectErrorResult(
+  result: ParsedCredential | ParsedCredentialError,
+): ParsedCredentialError {
   if (!isParsedCredentialError(result)) {
     throw new Error('expected an error, got a credential');
   }
-  return result.error;
+  return result;
+}
+
+function expectError(result: ParsedCredential | ParsedCredentialError): string {
+  return expectErrorResult(result).error;
 }
 
 describe('parseCredentialFile: Claude Code .credentials.json', () => {
@@ -299,5 +309,153 @@ describe('parseCredentialFile: a file carrying both shapes', () => {
     expect(error).toContain('.credentials.json');
     expect(error).not.toContain('claude-tok');
     expect(error).not.toContain('codex-tok');
+  });
+});
+
+describe('parseCredentialFile: an expiry outside the years RFC 3339 can write', () => {
+  // new Date(253402300800000).toISOString() is "+010000-01-01T00:00:00.000Z", which the
+  // gateway's RFC 3339 decoder rejects: the import would fail instead of just losing
+  // the expiry hint. The expiry must be dropped, not sent and not turned into an error.
+  const YEAR_10000_SECONDS = 253402300800;
+  const YEAR_10000_MILLIS = 253402300800000;
+
+  it('drops a Codex JWT exp in year 10000 and still succeeds', () => {
+    const accessToken = jwt({ exp: YEAR_10000_SECONDS });
+    const text = JSON.stringify({ tokens: { access_token: accessToken } });
+
+    const result = expectCredential(parseCredentialFile('auth.json', text));
+
+    expect(result).toStrictEqual({ vendor: 'openai', accessToken });
+  });
+
+  it('drops a Claude expiresAt far beyond year 9999 and still succeeds', () => {
+    for (const expiresAt of [1e15, YEAR_10000_MILLIS]) {
+      const text = JSON.stringify({ claudeAiOauth: { accessToken: 'tok', expiresAt } });
+
+      const result = expectCredential(parseCredentialFile('.credentials.json', text));
+
+      expect(result).toStrictEqual({ vendor: 'anthropic', accessToken: 'tok' });
+    }
+  });
+
+  it('drops an expiry before year 0000', () => {
+    const text = JSON.stringify({ claudeAiOauth: { accessToken: 'tok', expiresAt: -1e14 } });
+
+    expect(expectCredential(parseCredentialFile('.credentials.json', text)).expiresAt).toBe(
+      undefined,
+    );
+  });
+
+  it('keeps the last representable instants', () => {
+    const codex = JSON.stringify({
+      tokens: { access_token: jwt({ exp: YEAR_10000_SECONDS - 1 }) },
+    });
+    const claude = JSON.stringify({
+      claudeAiOauth: { accessToken: 'tok', expiresAt: YEAR_10000_MILLIS - 1 },
+    });
+
+    expect(expectCredential(parseCredentialFile('auth.json', codex)).expiresAt).toBe(
+      '9999-12-31T23:59:59.000Z',
+    );
+    expect(expectCredential(parseCredentialFile('.credentials.json', claude)).expiresAt).toBe(
+      '9999-12-31T23:59:59.999Z',
+    );
+  });
+});
+
+describe('parseCredentialFile: input that is not text', () => {
+  const claudeText = JSON.stringify({ claudeAiOauth: { accessToken: 'tok' } });
+
+  it('reports a non-string text as not JSON instead of throwing', () => {
+    // FileReader.result is string | ArrayBuffer | null; a caller that does not narrow it
+    // passes any of these straight through.
+    for (const text of [null, undefined, new ArrayBuffer(8), 42, {}, ['{}']]) {
+      expect(expectErrorResult(parseCredentialFile('auth.json', text)).code).toBe('not_json');
+    }
+  });
+
+  it('treats a non-string file name as no name', () => {
+    for (const filename of [null, undefined, 42, {}, ['auth.json']]) {
+      expect(expectCredential(parseCredentialFile(filename, claudeText)).vendor).toBe('anthropic');
+    }
+    // With no name the tie-break cannot settle a file that carries both shapes.
+    const both = JSON.stringify({
+      claudeAiOauth: { accessToken: 'claude-tok' },
+      tokens: { access_token: 'codex-tok' },
+    });
+    expect(expectErrorResult(parseCredentialFile(null, both)).code).toBe('ambiguous');
+  });
+});
+
+describe('parseCredentialFile: error codes', () => {
+  // The UI maps each code to localised text, so every failure path must report its own.
+  const bothShapes = JSON.stringify({
+    claudeAiOauth: { accessToken: 'claude-tok' },
+    tokens: { access_token: 'codex-tok' },
+  });
+  const cases: [string, string, string, ParsedCredentialErrorCode][] = [
+    ['malformed JSON', 'auth.json', '{"tokens": ', 'not_json'],
+    ['an empty file', 'auth.json', '', 'not_json'],
+    ['an array root', 'auth.json', '[]', 'not_object'],
+    ['a scalar root', 'auth.json', '42', 'not_object'],
+    ['an unrecognised shape', 'auth.json', '{"foo": 1}', 'unrecognised'],
+    ['a non-object tokens value', 'auth.json', '{"tokens": "tok"}', 'unrecognised'],
+    ['both shapes and an unhelpful name', 'renamed.json', bothShapes, 'ambiguous'],
+    [
+      'a Claude file without an access token',
+      '.credentials.json',
+      '{"claudeAiOauth": {"refreshToken": "r"}}',
+      'claude_no_access_token',
+    ],
+    [
+      'a Codex file with only an id_token',
+      'auth.json',
+      '{"tokens": {"id_token": "a.b.c"}}',
+      'codex_id_token_only',
+    ],
+    [
+      'a flat id_token with no tokens object',
+      'auth.json',
+      '{"id_token": "a.b.c"}',
+      'codex_id_token_only',
+    ],
+    ['a Codex file with empty tokens', 'auth.json', '{"tokens": {}}', 'codex_no_access_token'],
+    [
+      'a Codex API-key-only file',
+      'auth.json',
+      '{"OPENAI_API_KEY": "sk-key", "tokens": null}',
+      'codex_no_access_token',
+    ],
+  ];
+
+  it.each(cases)('%s -> the matching code, with English text', (_name, filename, text, code) => {
+    const result = expectErrorResult(parseCredentialFile(filename, text));
+
+    expect(result.code).toBe(code);
+    expect(result.error).not.toBe('');
+  });
+
+  it('exercises every code at least once', () => {
+    const all: ParsedCredentialErrorCode[] = [
+      'not_json',
+      'not_object',
+      'unrecognised',
+      'ambiguous',
+      'claude_no_access_token',
+      'codex_id_token_only',
+      'codex_no_access_token',
+    ];
+    expect(new Set(cases.map((c) => c[3]))).toStrictEqual(new Set(all));
+  });
+
+  it('names access_token for a flat id_token without echoing it', () => {
+    const idToken = jwt({ email: 'someone@example.test' });
+
+    const error = expectError(
+      parseCredentialFile('auth.json', JSON.stringify({ id_token: idToken })),
+    );
+
+    expect(error).toContain('access_token');
+    expect(error).not.toContain(idToken);
   });
 });
