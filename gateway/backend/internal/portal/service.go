@@ -546,6 +546,17 @@ type ServiceDeps struct {
 	// vendorauth fetcher; tests inject fakes so nothing reaches a vendor over the
 	// network.
 	VendorDiscoverers VendorModelDiscoverers
+	// VendorTokenRefresher renews a subscription account's expired access token
+	// for the model discovery: it must refresh AND persist the account's token set
+	// (so a re-read sees the new token) under the same per-account lock the
+	// dispatch refreshes under, because a rotating refresh token is single-use and
+	// two parties refreshing at once would burn it. The portal never refreshes by
+	// itself. nil = no refresher: an expired token is then reported unverifiable
+	// (fail-soft) instead of refreshed. The gateway's refresher belongs to the
+	// gateway Server, which cmd/gateway builds AFTER this Service, so production
+	// wires it through SetVendorTokenRefresher (see its doc); the dep is for a
+	// caller that has one at construction (tests).
+	VendorTokenRefresher VendorTokenRefresher
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -747,6 +758,10 @@ type Service struct {
 	// vendorDiscovery holds the model-discovery fetchers and their bounded http
 	// client (see vendorDiscoveryState).
 	vendorDiscovery vendorDiscoveryState
+	// vendorModelWrites serializes the two writers of an account's model rows (a
+	// discovery's replace and a prefix re-label) per account, so they cannot undo
+	// each other (see accountLocks).
+	vendorModelWrites accountLocks
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -858,7 +873,7 @@ func NewService(deps ServiceDeps) *Service {
 			client:    vendorClient,
 		},
 		vendorValidation:            newVendorValidationState(deps.VendorValidators),
-		vendorDiscovery:             newVendorDiscoveryState(deps.VendorDiscoverers),
+		vendorDiscovery:             newVendorDiscoveryState(deps.VendorDiscoverers, deps.VendorTokenRefresher),
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
 		agentTLSPort:                deps.AgentTLSPort,
@@ -899,6 +914,18 @@ func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string)) {
 // direction that leaves existing behaviour untouched.
 func (s *Service) SetBenchmarkReservationHook(fn func(serverID string) bool) {
 	s.benchmarkReserved = fn
+}
+
+// SetVendorTokenRefresher sets (or replaces) the function the model discovery
+// calls to renew an expired subscription token (see ServiceDeps.VendorTokenRefresher
+// for its contract). nil clears it.
+//
+// A setter for the same reason as SetRuntimeConfigChangedHook: the real refresher
+// is the gateway Server's locked token refresh, and cmd/gateway builds that Server
+// AFTER the portal Service, so the Service cannot take it at construction. Call it
+// once at startup, before the Service serves requests; it is not synchronised.
+func (s *Service) SetVendorTokenRefresher(fn VendorTokenRefresher) {
+	s.vendorDiscovery.tokenRefresher = fn
 }
 
 type CurrentUser struct {

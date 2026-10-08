@@ -500,7 +500,7 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	// re-label left behind; relabelVendorAccountModels writes only when a row
 	// actually differs.
 	if req.ModelPrefix != nil {
-		if err := s.relabelVendorAccountModels(ctx, acc); err != nil {
+		if err := s.relabelVendorAccountModels(ctx, acc.ID); err != nil {
 			return VendorAccountDTO{}, err
 		}
 	}

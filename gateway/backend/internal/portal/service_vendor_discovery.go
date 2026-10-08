@@ -39,6 +39,13 @@ import (
 //     the connect.
 //   - A prefix change re-labels the existing rows (relabelVendorAccountModels)
 //     without asking the vendor again.
+//   - An access token already past its expiry is renewed through the injected
+//     VendorTokenRefresher (the gateway's locked refresh, never the portal's own)
+//     before the vendor is asked; with no refresher, or a failing one, the
+//     discovery is simply unverifiable.
+//   - The two writers of an account's model rows (the discovery's replace and the
+//     prefix re-label) run under a per-account lock (accountLocks), so neither
+//     undoes the other.
 //
 // No credential ever reaches a RefreshResult, an error or a log line from here.
 
@@ -46,6 +53,14 @@ const (
 	// vendorDiscoveryHTTPTimeout bounds one discovery fetch. Discovery runs only
 	// at connect time and on the explicit refresh action, never on a request path.
 	vendorDiscoveryHTTPTimeout = 10 * time.Second
+
+	// vendorConnectDiscoveryTimeout bounds the WHOLE best-effort discovery a
+	// connect runs after the tokens are stored (token refresh, fetch and write): a
+	// vendor that hangs then adds at most this to the connect, and the discovery
+	// degrades to its fail-soft outcome (the account keeps its seeded models).
+	// Shorter than vendorDiscoveryHTTPTimeout on purpose: the explicit refresh
+	// action may wait the full client timeout, a connect response should not.
+	vendorConnectDiscoveryTimeout = 5 * time.Second
 
 	// maxDiscoveredModelIDLen and maxDiscoveredDisplayNameLen cap the two strings
 	// the vendor supplies for each model. Real ids are a few dozen characters.
@@ -116,18 +131,37 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	return d
 }
 
+// VendorTokenRefresher renews the expired OAuth access token of the subscription
+// account accountID and PERSISTS the renewed token set, so that re-reading the
+// account yields it. It is the gateway's own locked refresh (the one the dispatch
+// uses): the portal must not refresh by itself, because a rotating refresh token
+// is single-use and two parties refreshing at once would burn it. A nil error says
+// the refresh ran, not that the token is now fresh: the caller re-reads the
+// account and checks. The error must carry no credential.
+type VendorTokenRefresher func(ctx context.Context, accountID string) error
+
 // vendorDiscoveryState is the model discovery's configuration: the fetchers and
-// the bounded http client they share. Held as a single field on Service
+// the bounded http client they share, the optional token refresher and the bound
+// on connect-time discovery. Held as a single field on Service
 // (Service.vendorDiscovery).
 type vendorDiscoveryState struct {
 	discoverers VendorModelDiscoverers
 	client      *http.Client
+	// tokenRefresher is nil when none is wired (fail-soft: an expired token is
+	// reported unverifiable). Set through ServiceDeps.VendorTokenRefresher or
+	// Service.SetVendorTokenRefresher.
+	tokenRefresher VendorTokenRefresher
+	// connectTimeout bounds discoverAfterConnect (vendorConnectDiscoveryTimeout);
+	// a zero value means that default.
+	connectTimeout time.Duration
 }
 
-func newVendorDiscoveryState(discoverers VendorModelDiscoverers) vendorDiscoveryState {
+func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher VendorTokenRefresher) vendorDiscoveryState {
 	return vendorDiscoveryState{
-		discoverers: discoverers.withDefaults(),
-		client:      &http.Client{Timeout: vendorDiscoveryHTTPTimeout},
+		discoverers:    discoverers.withDefaults(),
+		client:         &http.Client{Timeout: vendorDiscoveryHTTPTimeout},
+		tokenRefresher: refresher,
+		connectTimeout: vendorConnectDiscoveryTimeout,
 	}
 }
 
@@ -137,12 +171,17 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers) vendorDiscovery
 // the vendor's slug, the slug stays the id sent upstream and the vendor's display
 // name is kept. It returns the credential-free account view and the outcome.
 //
-// FAIL-SOFT: when nothing usable can be had (the credential is missing or an
-// expired token cannot be refreshed here, the vendor is unreachable, it answers
-// with an error, a body that is not a catalog, or a list with no usable model) the
-// rows are left exactly as they were, the result is VendorRefreshUnverifiable and
-// the error is nil. Only a stored credential that cannot be opened
-// (ErrVendorAccountCredentialUnreadable) or a store failure is an error.
+// A subscription token that is already past its expiry is renewed first, through
+// the VendorTokenRefresher (the gateway's locked refresh), and the account is
+// re-read so the fresh token is the one sent; the portal never refreshes by itself.
+//
+// FAIL-SOFT: when nothing usable can be had (the credential is missing, an expired
+// token cannot be renewed (no refresher wired, or it failed), the vendor is
+// unreachable, it answers with an error, a body that is not a catalog, or a list
+// with no usable model) the rows are left exactly as they were, the result is
+// VendorRefreshUnverifiable and the error is nil. Only a stored credential that
+// cannot be opened (ErrVendorAccountCredentialUnreadable) or a store failure is an
+// error.
 //
 // What the vendor sent is untrusted: a slug that is not a plain model id (empty,
 // over maxDiscoveredModelIDLen, outside [A-Za-z0-9._~:/@+-], not starting with a
@@ -174,21 +213,8 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 	if len(rows) == 0 {
 		return s.keptVendorModels(ctx, acc, "the vendor listed no usable model")
 	}
-	// The vendor call is a network round trip; re-load the account so a prefix
-	// change (or a rename) made meanwhile is not overwritten, and so an account
-	// deleted meanwhile is reported rather than silently written to.
-	acc, err = s.routes.VendorAccountByID(ctx, acc.ID)
+	acc, rows, err = s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return VendorAccountDTO{}, RefreshResult{}, ErrVendorAccountNotFound
-		}
-		return VendorAccountDTO{}, RefreshResult{}, err
-	}
-	rows, _ = relabelVendorModels(rows, acc.ModelPrefix)
-	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, rows); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return VendorAccountDTO{}, RefreshResult{}, ErrVendorAccountNotFound
-		}
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
 	dto, err := s.vendorAccountDTO(ctx, acc)
@@ -200,6 +226,39 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 		detail += fmt.Sprintf("; %d unusable entries were dropped", dropped)
 	}
 	return dto, RefreshResult{Status: VendorRefreshOK, Discovered: len(rows), Detail: detail}, nil
+}
+
+// storeDiscoveredVendorModels replaces the account's model rows with rows (the
+// prefix not yet applied), under the account's model-write lock. The vendor call
+// that produced rows was a network round trip, so the account is re-loaded INSIDE
+// the lock: a prefix change made meanwhile is not overwritten (the rows are written
+// under the prefix current now, and a re-label that arrives later re-labels these
+// rows), and an account deleted meanwhile is reported rather than written to. It
+// returns the re-loaded account and the rows as stored.
+func (s *Service) storeDiscoveredVendorModels(ctx context.Context, id string, rows []routing.VendorAccountModel) (routing.VendorAccount, []routing.VendorAccountModel, error) {
+	unlock, err := s.vendorModelWrites.lock(ctx, id)
+	if err != nil {
+		return routing.VendorAccount{}, nil, err
+	}
+	defer unlock()
+	acc, err := s.routes.VendorAccountByID(ctx, id)
+	if err != nil {
+		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
+	}
+	rows, _ = relabelVendorModels(rows, acc.ModelPrefix)
+	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, rows); err != nil {
+		return routing.VendorAccount{}, nil, notFoundAsVendorAccountNotFound(err)
+	}
+	return acc, rows, nil
+}
+
+// notFoundAsVendorAccountNotFound maps the store's not-found to
+// ErrVendorAccountNotFound and returns every other error as it is.
+func notFoundAsVendorAccountNotFound(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrVendorAccountNotFound
+	}
+	return err
 }
 
 // keptVendorModels is the fail-soft answer: acc's current models, untouched, with
@@ -240,11 +299,15 @@ func (s *Service) discoverVendorModels(ctx context.Context, acc routing.VendorAc
 		if ts.AccessToken == "" {
 			return nil, "the subscription is not connected", nil
 		}
-		// The dispatch refreshes an expired token lazily and persists the result;
-		// the portal must not race it for the single-use refresh token. Asking the
-		// vendor with a token known to be expired only earns a 401, so say so.
+		// Asking the vendor with a token known to be expired only earns a 401. A
+		// token with a refresh token to renew it is renewed first, by the gateway's
+		// locked refresher (see refreshedVendorTokenSet); one without can never
+		// heal, so it is simply tried.
 		if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
-			return nil, "the access token has expired; it is refreshed automatically on the next request, then refresh the models again", nil
+			var refreshNote string
+			if ts, refreshNote, err = s.refreshedVendorTokenSet(ctx, acc); err != nil || refreshNote != "" {
+				return nil, refreshNote, err
+			}
 		}
 		switch acc.Vendor {
 		case routing.VendorOpenAI:
@@ -266,6 +329,46 @@ func (s *Service) discoverVendorModels(ctx context.Context, acc routing.VendorAc
 // noVendorDiscoveryNote is the note for an account whose vendor or auth type has
 // no discovery.
 const noVendorDiscoveryNote = "model discovery is not available for this account type"
+
+// expiredVendorTokenNote is the note when an expired access token could not be
+// renewed (the refresher failed, or left the stored token expired).
+const expiredVendorTokenNote = "the access token has expired and could not be refreshed; try again, or reconnect the account if this persists"
+
+// noVendorTokenRefresherNote is the note when an expired access token cannot be
+// renewed here because no refresher is wired.
+const noVendorTokenRefresherNote = "the access token has expired; it is refreshed automatically on the next request, then refresh the models again"
+
+// refreshedVendorTokenSet renews acc's expired access token through the
+// VendorTokenRefresher and returns the token set after the refresh. The refresher
+// persists the renewed set, so the account is RE-LOADED and its tokens RE-OPENED:
+// the fresh token is what the vendor is then asked with, never the copy read before.
+// A non-empty note means no fresh token could be had (and why, with no credential
+// in it): there is no refresher, it failed, or the stored token is still expired
+// afterwards. The refresher's own error is not surfaced or logged here (it is the
+// gateway's to log; this path only needs to know it failed). The error is a
+// deleted account (ErrVendorAccountNotFound) or an unreadable renewed credential
+// (ErrVendorAccountCredentialUnreadable).
+func (s *Service) refreshedVendorTokenSet(ctx context.Context, acc routing.VendorAccount) (ts vendorauth.TokenSet, note string, err error) {
+	refresh := s.vendorDiscovery.tokenRefresher
+	if refresh == nil {
+		return vendorauth.TokenSet{}, noVendorTokenRefresherNote, nil
+	}
+	if refresh(ctx, acc.ID) != nil {
+		return vendorauth.TokenSet{}, expiredVendorTokenNote, nil
+	}
+	reloaded, err := s.routes.VendorAccountByID(ctx, acc.ID)
+	if err != nil {
+		return vendorauth.TokenSet{}, "", notFoundAsVendorAccountNotFound(err)
+	}
+	ts, err = s.openVendorTokenSet(reloaded)
+	if err != nil {
+		return vendorauth.TokenSet{}, "", err
+	}
+	if ts.AccessToken == "" || (ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0)) {
+		return vendorauth.TokenSet{}, expiredVendorTokenNote, nil
+	}
+	return ts, "", nil
+}
 
 // apiKeyDiscoverer returns the api-key fetcher for vendor, or nil for a vendor
 // with none.
@@ -430,10 +533,22 @@ func relabelVendorModels(rows []routing.VendorAccountModel, prefix string) (rela
 	return relabeled, changed
 }
 
-// relabelVendorAccountModels re-labels acc's stored model rows to acc's current
-// model prefix, without asking the vendor. It writes only when some row would
-// change, so re-sending the prefix an account already has costs a read.
-func (s *Service) relabelVendorAccountModels(ctx context.Context, acc routing.VendorAccount) error {
+// relabelVendorAccountModels re-labels the stored model rows of the account id to
+// the account's CURRENT model prefix, without asking the vendor. It writes only
+// when some row would change, so re-sending the prefix an account already has costs
+// a read. It runs under the account's model-write lock and reads the account and
+// its rows inside it, so it re-labels whatever a concurrent discovery wrote, and a
+// discovery that follows writes under the prefix this one used.
+func (s *Service) relabelVendorAccountModels(ctx context.Context, id string) error {
+	unlock, err := s.vendorModelWrites.lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	acc, err := s.routes.VendorAccountByID(ctx, id)
+	if err != nil {
+		return notFoundAsVendorAccountNotFound(err)
+	}
 	rows, err := s.routes.VendorAccountModels(ctx, acc.ID)
 	if err != nil {
 		return err
@@ -451,9 +566,26 @@ func (s *Service) relabelVendorAccountModels(ctx context.Context, acc routing.Ve
 // and dto is returned as it was, because the connect itself has succeeded and
 // must be reported as such. On success the refreshed view (the discovered models)
 // is returned in its place.
+//
+// The whole discovery runs under its own short bound (vendorConnectDiscoveryTimeout,
+// shared by the token refresh, the fetch and the write), so a vendor that hangs
+// adds at most that to the connect and the discovery degrades to its fail-soft
+// outcome (the seeded models are kept).
 func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token, dto VendorAccountDTO) VendorAccountDTO {
+	timeout := s.vendorDiscovery.connectTimeout
+	if timeout <= 0 {
+		timeout = vendorConnectDiscoveryTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	refreshed, result, err := s.RefreshVendorAccountModels(ctx, principal, dto.ID)
 	if err != nil {
+		if errors.Is(err, ErrVendorAccountCredentialUnreadable) {
+			// A FIXED line, never the cause chain: the chain of a stored blob that
+			// cannot be decoded can quote part of what it could not decode.
+			slog.Warn("vendor model discovery after connect skipped: the stored credential could not be read; the account keeps its current models", "account", dto.ID)
+			return dto
+		}
 		slog.Warn("vendor model discovery after connect failed; the account keeps its current models", "account", dto.ID, "err", err)
 		return dto
 	}
