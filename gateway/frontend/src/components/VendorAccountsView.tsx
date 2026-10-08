@@ -20,6 +20,7 @@ import { ConfirmDialog } from './shared/ConfirmDialog';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { vendorLabel } from './shared/vendorLabel';
 import { VendorAccountUsage } from './VendorAccountUsagePanel';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
@@ -30,17 +31,6 @@ type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 // disconnected and connected from its detail view (VendorSubscriptionConnect).
 const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic'];
 const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
-
-function vendorLabel(t: Translation, vendor: string): string {
-  switch (vendor) {
-    case 'openai':
-      return t.vendorOpenAI;
-    case 'anthropic':
-      return t.vendorAnthropic;
-    default:
-      return vendor;
-  }
-}
 
 function authTypeLabel(t: Translation, authType: string): string {
   switch (authType) {

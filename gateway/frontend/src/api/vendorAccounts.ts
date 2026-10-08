@@ -153,7 +153,10 @@ export function vendorAccountsApi(fetcher: Fetcher) {
         method: 'DELETE',
       }),
     // Subscription connect, path 1: attach tokens the user already holds. The
-    // backend does not probe them (the first real request validates them).
+    // backend probes the access token once before it stores anything: a token the
+    // vendor definitively rejects is a 400 vendor_account.connect_invalid_credentials
+    // (nothing stored). The portal's file picker fills this same request from a
+    // credential file it parsed in the browser.
     connectVendorAccountImport: (id: string, body: ConnectVendorAccountImportRequest) =>
       request<VendorAccount>(
         fetcher,

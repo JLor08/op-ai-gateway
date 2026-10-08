@@ -14,7 +14,7 @@ import type {
   VendorAccount,
   VendorAccountUsage,
 } from '../api';
-import type { PortalApi } from './shared/types';
+import type { MessageKey, PortalApi } from './shared/types';
 
 function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
   return {
@@ -800,6 +800,360 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
         expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(ACCESS);
         expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+      });
+    });
+
+    // The file picker beside the manual paste: the credential file is read and
+    // parsed IN THE BROWSER (parseCredentialFile), the right fields are filled in
+    // and the same import is submitted. The raw file never reaches the API.
+    describe('file import', () => {
+      // base64url of a JSON object: one segment of a JWT.
+      const b64url = (value: unknown) =>
+        btoa(JSON.stringify(value)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const EXP_SECONDS = 1790000000;
+      const EXP_RFC3339 = '2026-09-21T14:13:20.000Z';
+      const CODEX_ACCESS = `${b64url({ alg: 'none' })}.${b64url({ exp: EXP_SECONDS })}.sig`;
+      const CODEX_REFRESH = 'rt-codex-refresh';
+      // Fields of the raw file that must never reach the API.
+      const ID_TOKEN = 'idtoken-never-sent';
+      const ACCOUNT_ID = 'acct-never-sent';
+
+      const codexFile = (overrides: Record<string, unknown> = {}) => ({
+        OPENAI_API_KEY: null,
+        tokens: {
+          id_token: ID_TOKEN,
+          access_token: CODEX_ACCESS,
+          refresh_token: CODEX_REFRESH,
+          account_id: ACCOUNT_ID,
+          ...overrides,
+        },
+        last_refresh: '2026-09-11T10:00:00Z',
+      });
+
+      const CLAUDE_ACCESS = 'sk-ant-oat01-claude-access';
+      const CLAUDE_REFRESH = 'sk-ant-ort01-claude-refresh';
+      const claudeFile = (overrides: Record<string, unknown> = {}) => ({
+        claudeAiOauth: {
+          accessToken: CLAUDE_ACCESS,
+          refreshToken: CLAUDE_REFRESH,
+          expiresAt: EXP_SECONDS * 1000,
+          scopes: ['user:inference'],
+          subscriptionType: 'max',
+          ...overrides,
+        },
+      });
+
+      const fileOf = (name: string, content: unknown) =>
+        new File([typeof content === 'string' ? content : JSON.stringify(content)], name, {
+          type: 'application/json',
+        });
+
+      const picker = () => screen.getByLabelText(t.vendorConnectFileAction);
+      function upload(file: File) {
+        fireEvent.change(picker(), { target: { files: [file] } });
+      }
+      it('offers the picker beside the manual paste, with a note that nothing is uploaded', async () => {
+        renderSubscription();
+        await openDetail();
+
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+        expect(picker()).toHaveAttribute('type', 'file');
+        expect(screen.getByText(t.vendorConnectFileNote)).toBeInTheDocument();
+        // The manual fields stay as the fallback.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+      });
+
+      it('imports a Codex auth.json with the access token, never the id_token or the raw file', async () => {
+        const { fakeApi, container } = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+
+        upload(fileOf('auth.json', codexFile()));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledWith('va_sub', {
+          access_token: CODEX_ACCESS,
+          refresh_token: CODEX_REFRESH,
+          // The access token's own exp claim, as an RFC 3339 instant.
+          expires_at: EXP_RFC3339,
+        });
+        // Only those three fields: nothing else of the raw file is submitted.
+        const sent = JSON.stringify(fakeApi.connectVendorAccountImport.mock.calls);
+        for (const secret of [ID_TOKEN, ACCOUNT_ID, 'OPENAI_API_KEY', 'last_refresh', 'tokens']) {
+          expect(sent).not.toContain(secret);
+        }
+
+        // Connected, success toast, and the write-only fields emptied again.
+        expect(await screen.findByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectExpiresAtLabel)).toHaveValue('');
+        expect(container.innerHTML).not.toContain(CODEX_ACCESS);
+        expect(container.innerHTML).not.toContain(CODEX_REFRESH);
+      });
+
+      it('imports a Claude Code .credentials.json with its millisecond expiry', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledWith('va_sub', {
+          access_token: CLAUDE_ACCESS,
+          refresh_token: CLAUDE_REFRESH,
+          expires_at: EXP_RFC3339,
+        });
+        const sent = JSON.stringify(fakeApi.connectVendorAccountImport.mock.calls);
+        for (const raw of ['claudeAiOauth', 'subscriptionType', 'scopes', 'user:inference']) {
+          expect(sent).not.toContain(raw);
+        }
+        expect(await screen.findByText(t.vendorConnectSuccess)).toBeInTheDocument();
+      });
+
+      it('sends only the access token when the file holds nothing else', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', { claudeAiOauth: { accessToken: CLAUDE_ACCESS } }));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport.mock.calls[0][1]).toEqual({
+          access_token: CLAUDE_ACCESS,
+        });
+      });
+
+      it('fills the visible fields with what was extracted while the import is in flight', async () => {
+        let resolveImport!: (account: VendorAccount) => void;
+        const pending = new Promise<VendorAccount>((resolve) => {
+          resolveImport = resolve;
+        });
+        const { fakeApi } = renderSubscription({}, { connectVendorAccountImport: () => pending });
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        // The extracted tokens and expiry are shown (masked / as a local time) ...
+        await waitFor(() =>
+          expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(CLAUDE_ACCESS),
+        );
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue(CLAUDE_REFRESH);
+        const expiry = new Date(EXP_RFC3339);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        expect(screen.getByLabelText(t.vendorConnectExpiresAtLabel)).toHaveValue(
+          `${expiry.getFullYear()}-${pad(expiry.getMonth() + 1)}-${pad(expiry.getDate())}` +
+            `T${pad(expiry.getHours())}:${pad(expiry.getMinutes())}`,
+        );
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveAttribute(
+          'type',
+          'password',
+        );
+        // ... the picker is busy-disabled meanwhile, and the SAME import was submitted.
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeDisabled();
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
+
+        await act(async () =>
+          resolveImport(
+            makeVendorAccount({ ...SUBSCRIPTION, status: 'active', subscription_connected: true }),
+          ),
+        );
+        await screen.findByText(t.vendorConnectSuccess);
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+      });
+
+      it('rejects a Codex file that has only an id_token, inline, without calling the API', async () => {
+        const { fakeApi } = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+
+        upload(
+          fileOf('auth.json', {
+            OPENAI_API_KEY: null,
+            tokens: { id_token: ID_TOKEN, refresh_token: CODEX_REFRESH },
+          }),
+        );
+
+        expect(
+          await screen.findByText(t.vendorConnectFileErrorCodexIdTokenOnly),
+        ).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        // The id_token is not dropped into the form either, and no token is rendered.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue('');
+        expect(document.body.innerHTML).not.toContain(ID_TOKEN);
+        expect(screen.getByRole('button', { name: t.vendorConnectImportAction })).toBeDisabled();
+      });
+
+      // Every parser error code has its own localized text. The ambiguous case needs
+      // a file name that does not say which of its two shapes to use.
+      const PARSE_ERRORS: (readonly [string, string, unknown, MessageKey])[] = [
+        ['not_json', 'credentials.json', '{ not json', 'vendorConnectFileErrorNotJson'],
+        ['not_object', 'credentials.json', '[1, 2]', 'vendorConnectFileErrorNotObject'],
+        [
+          'unrecognised',
+          'credentials.json',
+          { hello: 'world' },
+          'vendorConnectFileErrorUnrecognised',
+        ],
+        [
+          'ambiguous',
+          'credentials-copy.json',
+          { ...claudeFile(), ...codexFile() },
+          'vendorConnectFileErrorAmbiguous',
+        ],
+        [
+          'claude_no_access_token',
+          'credentials.json',
+          { claudeAiOauth: { refreshToken: CLAUDE_REFRESH } },
+          'vendorConnectFileErrorClaudeNoAccessToken',
+        ],
+        [
+          'codex_id_token_only',
+          'credentials.json',
+          { tokens: { id_token: ID_TOKEN } },
+          'vendorConnectFileErrorCodexIdTokenOnly',
+        ],
+        [
+          'codex_no_access_token',
+          'credentials.json',
+          { OPENAI_API_KEY: 'sk-never-sent', tokens: null },
+          'vendorConnectFileErrorCodexNoAccessToken',
+        ],
+      ];
+
+      it.each(PARSE_ERRORS)(
+        'shows the localized message for the %s parse error',
+        async (_code, name, content, key) => {
+          const { fakeApi } = renderSubscription();
+          await openDetail();
+
+          upload(fileOf(name, content));
+
+          expect(await screen.findByText(t[key])).toBeInTheDocument();
+          expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+          expect(document.body.innerHTML).not.toContain('sk-never-sent');
+        },
+      );
+
+      it('rejects a file for the other vendor, naming both, without calling the API', async () => {
+        // A Codex file on an Anthropic account ...
+        const first = renderSubscription();
+        await openDetail();
+        upload(fileOf('auth.json', codexFile()));
+        expect(
+          await screen.findByText(
+            t.vendorConnectFileVendorMismatch(t.vendorOpenAI, t.vendorAnthropic),
+          ),
+        ).toBeInTheDocument();
+        expect(first.fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        cleanup();
+
+        // ... and a Claude Code file on an OpenAI account.
+        const second = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+        upload(fileOf('.credentials.json', claudeFile()));
+        expect(
+          await screen.findByText(
+            t.vendorConnectFileVendorMismatch(t.vendorAnthropic, t.vendorOpenAI),
+          ),
+        ).toBeInTheDocument();
+        expect(second.fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+      });
+
+      it('rejects an oversized file before reading it', async () => {
+        const read = vi.spyOn(FileReader.prototype, 'readAsText');
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(new File([new Uint8Array(1024 * 1024 + 1)], 'auth.json'));
+
+        expect(await screen.findByText(t.vendorConnectFileTooLarge)).toBeInTheDocument();
+        expect(read).not.toHaveBeenCalled();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+      });
+
+      it('accepts a file at the size cap', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+        // Valid JSON padded to exactly 1 MiB: the cap is inclusive.
+        const json = JSON.stringify(claudeFile({ padding: '' }));
+        const padded = json.slice(0, -1) + ' '.repeat(1024 * 1024 - json.length) + '}';
+        expect(padded.length).toBe(1024 * 1024);
+
+        upload(fileOf('.credentials.json', padded));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+      });
+
+      it('says so when the browser cannot read the file', async () => {
+        vi.spyOn(FileReader.prototype, 'readAsText').mockImplementation(function (
+          this: FileReader,
+        ) {
+          queueMicrotask(() => this.dispatchEvent(new ProgressEvent('error')));
+        });
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        expect(await screen.findByText(t.vendorConnectFileReadFailed)).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+      });
+
+      it('clears an earlier file error when the next file is chosen', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('credentials.json', '{ not json'));
+        await screen.findByText(t.vendorConnectFileErrorNotJson);
+
+        upload(fileOf('.credentials.json', claudeFile()));
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.vendorConnectFileErrorNotJson)).not.toBeInTheDocument();
+      });
+
+      it('shows the vendor rejecting the credentials as a localized toast and keeps the fields', async () => {
+        const { fakeApi } = renderSubscription(
+          {},
+          { connectVendorAccountImport: refusal('vendor_account.connect_invalid_credentials') },
+        );
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_invalid_credentials: ${t.errorVendorAccountConnectInvalidCredentials}`,
+          ),
+        ).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
+        // What was extracted stays visible, and the account stays not connected.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(CLAUDE_ACCESS);
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+      });
+
+      it('shows the same localized message when a pasted token is rejected', async () => {
+        renderSubscription(
+          {},
+          { connectVendorAccountImport: refusal('vendor_account.connect_invalid_credentials') },
+        );
+        await openDetail();
+
+        fireEvent.change(screen.getByLabelText(t.vendorConnectAccessTokenLabel), {
+          target: { value: 'dead-token' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_invalid_credentials: ${t.errorVendorAccountConnectInvalidCredentials}`,
+          ),
+        ).toBeInTheDocument();
       });
     });
 

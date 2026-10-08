@@ -135,9 +135,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // from the Go sentinels in portal/service.go. The 500 *_failed fallbacks of
   // the CRUD handlers (vendor_account.list_failed, ...) are left unmapped on
   // purpose: they carry the server's own message, like every other *_failed
-  // fallback. vendor_account.connect_failed is the one exception: its server
-  // message is only a generic English "vendor account request failed", and the
-  // connect dialog is a step a user acts on, so it gets a localized label.
+  // fallback. vendor_account.connect_failed and vendor_account.check_failed
+  // (the connection test's fallback) are the exceptions: their server message is
+  // only a generic English "vendor account request failed", and both are steps a
+  // user acts on, so they get a localized label.
   'vendor_account.not_found': 'errorVendorAccountNotFound',
   'vendor_account.name_required': 'errorVendorAccountNameRequired',
   'vendor_account.vendor_invalid': 'errorVendorAccountVendorInvalid',
@@ -156,9 +157,13 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.connect_code_required': 'errorVendorAccountConnectCodeRequired',
   'vendor_account.connect_state': 'errorVendorAccountConnectState',
   'vendor_account.connect_rejected': 'errorVendorAccountConnectRejected',
+  // A token import the vendor definitively rejected (400; nothing was stored). The
+  // import probes the token once before it stores anything.
+  'vendor_account.connect_invalid_credentials': 'errorVendorAccountConnectInvalidCredentials',
   'vendor_account.connect_upstream_failed': 'errorVendorAccountConnectUpstream',
   'vendor_account.connect_key_required': 'errorVendorAccountConnectKeyRequired',
   'vendor_account.connect_failed': 'errorVendorAccountConnectFailed',
+  'vendor_account.check_failed': 'errorVendorAccountCheckFailed',
   // The OpenAI-only device-code connect's two own refusals (both 400s), wired in
   // the same errRow table. Its poll loop also meets connect_rejected and
   // connect_upstream_failed above: the latter is transient (keep polling).
