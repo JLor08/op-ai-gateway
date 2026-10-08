@@ -154,6 +154,41 @@ const (
 	AnthropicAPIVersion = "2023-06-01"
 )
 
+// Model discovery (see discover.go). The OpenAI api-key and Anthropic api-key
+// listings reuse OpenAIModelsURL / AnthropicModelsURL above; the Anthropic
+// SUBSCRIPTION listing reuses AnthropicModelsURL with the OAuth beta header
+// (AnthropicBeta) and is VERIFY LIVE: no consumer-bearer answer has been
+// confirmed, and discovery degrades to "unverifiable" when it does not serve one.
+const (
+	// CodexModelsURL is the ChatGPT backend's model catalog, the same endpoint the
+	// Codex CLI refreshes its model list from. The request carries
+	// ?client_version=<version> plus the account's bearer token,
+	// ChatGPT-Account-Id and originator headers. The answer is
+	// {"models":[{slug, display_name, visibility, supported_in_api,
+	// minimal_client_version, ...}]}; the usable chat models are the entries with
+	// visibility "list" AND supported_in_api true.
+	//
+	// The backend FILTERS OUT every model whose minimal_client_version exceeds the
+	// client_version sent, so a version that is too low hides new models; the
+	// caller passes the version in and CodexModelsClientVersionDefault is only the
+	// fallback.
+	//
+	// REVERSE-ENGINEERED / LIVE-CONFIRMED (operator curl returned the real catalog)
+	CodexModelsURL = "https://chatgpt.com/backend-api/codex/models"
+	// CodexModelsOriginator is the originator header the catalog request sends
+	// (same value the Codex CLI identifies itself with, OpenAIOriginator).
+	//
+	// REVERSE-ENGINEERED / LIVE-CONFIRMED (operator curl returned the real catalog)
+	CodexModelsOriginator = "codex_cli_rs"
+	// CodexModelsClientVersionDefault is the client_version used when the caller
+	// supplies none: the version the live catalog request was confirmed with. A
+	// version below a model's minimal_client_version hides that model, and this
+	// value will age, so prefer the caller's.
+	//
+	// REVERSE-ENGINEERED / LIVE-CONFIRMED (operator curl returned the real catalog)
+	CodexModelsClientVersionDefault = "26.930.61225"
+)
+
 // Endpoints carries every vendor-specific OAuth parameter the flow functions
 // read: the HTTP URLs plus the client id, redirect URI, scopes and extra
 // authorize parameters. It is named for its main purpose (pointing the flows at
