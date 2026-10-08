@@ -872,6 +872,57 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    describe('token import guide', () => {
+      it.each([
+        ['anthropic', 'Team Claude Max'],
+        ['openai', 'ChatGPT Plus'],
+      ] as const)(
+        'is collapsed by default and explains where to find the token for an %s account',
+        async (vendor, name) => {
+          renderSubscription({ vendor, name });
+          await openDetail();
+
+          const summary = screen.getByRole('button', { name: t.vendorConnectGuideTitle });
+          expect(summary).toHaveAttribute('aria-expanded', 'false');
+          expect(screen.queryByText(t.vendorConnectGuideClaudeBody)).not.toBeInTheDocument();
+
+          fireEvent.click(summary);
+
+          expect(summary).toHaveAttribute('aria-expanded', 'true');
+          expect(screen.getByText(t.vendorConnectGuideClaudeTitle)).toBeInTheDocument();
+          expect(screen.getByText(t.vendorConnectGuideClaudeBody)).toBeInTheDocument();
+          expect(screen.getByText(t.vendorConnectGuideCodexTitle)).toBeInTheDocument();
+          expect(screen.getByText(t.vendorConnectGuideCodexBody)).toBeInTheDocument();
+        },
+      );
+
+      it('sits in the token-import section, above the token fields', async () => {
+        renderSubscription();
+        await openDetail();
+
+        const importSection = screen
+          .getByRole('heading', { name: t.vendorConnectImportTitle })
+          .closest('section')!;
+        const summary = within(importSection).getByRole('button', {
+          name: t.vendorConnectGuideTitle,
+        });
+        const accessToken = within(importSection).getByLabelText(t.vendorConnectAccessTokenLabel);
+        expect(
+          summary.compareDocumentPosition(accessToken) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+      });
+
+      it('names the files, fields and command of both command-line clients', () => {
+        // The facts the guide exists for, pinned in both languages.
+        expect(t.vendorConnectGuideClaudeBody).toContain('~/.claude/.credentials.json');
+        expect(t.vendorConnectGuideClaudeBody).toContain('claudeAiOauth.accessToken');
+        expect(t.vendorConnectGuideClaudeBody).toContain('Claude Code-credentials');
+        expect(t.vendorConnectGuideClaudeBody).toContain('claude setup-token');
+        expect(t.vendorConnectGuideCodexBody).toContain('~/.codex/auth.json');
+        expect(t.vendorConnectGuideCodexBody).toContain('tokens.access_token');
+      });
+    });
+
     describe('device code', () => {
       const OPENAI: Partial<VendorAccount> = {
         vendor: 'openai',

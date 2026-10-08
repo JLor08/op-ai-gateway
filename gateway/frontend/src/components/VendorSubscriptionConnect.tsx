@@ -2,7 +2,17 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useState, type SubmitEvent } from 'react';
-import { Box, Button, Divider, TextField, Typography } from '@mui/material';
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Box,
+  Button,
+  Divider,
+  TextField,
+  Typography,
+} from '@mui/material';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import type { VendorAccount } from '../api';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
@@ -56,7 +66,8 @@ function expiryToRfc3339(local: string): string | undefined {
  *    backend keeps the pending connect: the user simply retries.
  *  - Device code (OpenAI accounts ONLY -- Anthropic has no device login): see
  *    VendorDeviceConnect. Works for a remote gateway, and polls until approved.
- *  - Token import: tokens the user already holds.
+ *  - Token import: tokens the user already holds, with a short guide to where
+ *    the Claude Code / Codex command-line clients keep them.
  *
  * Tokens are WRITE-ONLY secrets: the DTO only says `subscription_connected`,
  * the token inputs are masked, never pre-filled, and cleared on success. The
@@ -280,6 +291,34 @@ export function VendorSubscriptionConnect({
         <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
           {t.vendorConnectImportIntro}
         </Typography>
+        <Accordion
+          disableGutters
+          variant="outlined"
+          slotProps={{ transition: { unmountOnExit: true } }}
+          sx={{ mb: 2, '&::before': { display: 'none' } }}
+        >
+          <AccordionSummary
+            expandIcon={<ExpandMoreIcon />}
+            aria-controls="vendor-connect-guide-content"
+            id="vendor-connect-guide-header"
+          >
+            <Typography variant="subtitle2">{t.vendorConnectGuideTitle}</Typography>
+          </AccordionSummary>
+          <AccordionDetails id="vendor-connect-guide-content">
+            <Typography component="h4" variant="subtitle2">
+              {t.vendorConnectGuideClaudeTitle}
+            </Typography>
+            <Typography color="text.secondary" variant="body2" sx={{ mb: 1.5 }}>
+              {t.vendorConnectGuideClaudeBody}
+            </Typography>
+            <Typography component="h4" variant="subtitle2">
+              {t.vendorConnectGuideCodexTitle}
+            </Typography>
+            <Typography color="text.secondary" variant="body2">
+              {t.vendorConnectGuideCodexBody}
+            </Typography>
+          </AccordionDetails>
+        </Accordion>
         <Box component="form" onSubmit={submitImport} sx={FORM_GRID_SX}>
           <Field
             id="vendor-account-connect-access-token"
