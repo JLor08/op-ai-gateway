@@ -331,7 +331,7 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	// cancellation and bounded by vendorAccountCleanupTimeout. If it fails too,
 	// the account is left behind unseeded and BOTH faults are returned, so the
 	// double fault is visible rather than dropped.
-	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, VendorCatalog(vendor)); err != nil {
+	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, VendorCatalog(vendor, authType)); err != nil {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vendorAccountCleanupTimeout)
 		defer cancel()
 		if delErr := s.routes.DeleteVendorAccount(cctx, acc.ID); delErr != nil {
