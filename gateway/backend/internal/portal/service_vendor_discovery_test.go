@@ -666,7 +666,7 @@ func (f failSetModelsStore) SetVendorAccountModels(context.Context, string, []ro
 // overwritten by the older prefix: the rows are written under the prefix the
 // account has at write time.
 func TestRefreshVendorAccountModelsUsesThePrefixItHasWhenItWrites(t *testing.T) {
-	svc, routeStore, fake := newDiscoveryTestService(t)
+	svc, routeStore, _ := newDiscoveryTestService(t)
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "old/")
 	svc.vendorDiscovery.discoverers.OpenAISubscription = func(context.Context, *http.Client, string, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 		// The prefix changes while the vendor call is "in flight".
@@ -680,7 +680,6 @@ func TestRefreshVendorAccountModelsUsesThePrefixItHasWhenItWrites(t *testing.T) 
 		}
 		return []vendorauth.DiscoveredModel{discovered("gpt-6-luna", "GPT-6 Luna")}, vendorauth.DiscoveryOK
 	}
-	_ = fake
 
 	if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
 		t.Fatalf("RefreshVendorAccountModels: %v", err)
