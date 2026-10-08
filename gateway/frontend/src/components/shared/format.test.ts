@@ -122,6 +122,29 @@ describe('formatPortalError', () => {
     expect(formatPortalError(err, messages.de)).toBe(`${code}: ${messages.de[key]}`);
     expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
   });
+
+  // The refusals the vendor model discovery adds: a malformed model prefix, a
+  // stored credential the models refresh cannot open, the refresh's own 500 and a
+  // malformed Codex client_version. Each renders its localized label, never the
+  // server's English text, in both locales.
+  it.each([
+    [400, 'vendor_account.model_prefix_invalid', 'errorVendorAccountModelPrefixInvalid'],
+    [409, 'vendor_account.credential_unreadable', 'errorVendorAccountCredentialUnreadable'],
+    [500, 'vendor_account.refresh_failed', 'errorVendorAccountRefreshFailed'],
+    [
+      400,
+      'system.vendor_openai_codex_client_version_invalid',
+      'errorSystemVendorOpenAICodexClientVersionInvalid',
+    ],
+  ] as const)('labels %i %s with %s, in both locales', (status, code, key) => {
+    const err = new PortalApiError(status, code, 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale][key];
+      expect(label.length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
 });
 
 describe('errorLabelByCode (whole-map invariants)', () => {
@@ -447,7 +470,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   });
 
   /**
-   * The vendor-account ("Anbieter") page's twenty-two refusal codes, pinned as
+   * The vendor-account ("Anbieter") page's twenty-four refusal codes, pinned as
    * LITERALS for the same reason as the lists above: the whole-map invariants
    * cannot catch a code STRING drifting from the backend's, and an unmapped
    * code reaches the toast as the raw English the server sent.
@@ -464,10 +487,13 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * the two the OpenAI-only device-code flow adds. `connect_invalid_credentials` is the
    * import's 400 for a token the vendor definitively rejected (nothing stored), and
    * `check_failed` the connection test's 500 fallback, mapped for the same reason as
-   * `connect_failed`. `credential_unreadable` is the connection test's 409 for a stored
-   * credential that cannot be opened (a lost key, a corrupt blob). The five CRUD 500 `vendor_account.*_failed`
-   * fallbacks (list/create/get/update/delete) are left unmapped on purpose:
-   * they carry the server's own message.
+   * `connect_failed`. `credential_unreadable` is the 409 of the connection test and of
+   * the models refresh for a stored credential that cannot be opened (a lost key, a
+   * corrupt blob). `model_prefix_invalid` is the 400 of create and update for a
+   * malformed model prefix, and `refresh_failed` the models refresh's 500 fallback,
+   * mapped for the same reason as `check_failed`. The five CRUD 500
+   * `vendor_account.*_failed` fallbacks (list/create/get/update/delete) are left
+   * unmapped on purpose: they carry the server's own message.
    */
   const vendorAccountWireCodes = [
     'vendor_account.not_found',
@@ -492,6 +518,8 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'vendor_account.device_connect_state',
     'vendor_account.check_failed',
     'vendor_account.credential_unreadable',
+    'vendor_account.model_prefix_invalid',
+    'vendor_account.refresh_failed',
   ] as const;
 
   it('carries every vendor-account refusal code, by its exact wire string', () => {
@@ -501,7 +529,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         `${code} is not mapped: the operator sees raw English`,
       ).toBeDefined();
     }
-    // Both directions: a twenty-third `vendor_account.*` code added to the map
+    // Both directions: a further `vendor_account.*` code added to the map
     // without being named here fails too.
     expect(
       entries
@@ -512,7 +540,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   });
 
   // The master-flag 409 (`portalVendorAccountErrRows`' first row). Its code is
-  // `vendor_accounts.` (plural) -- a different prefix from the twenty-two above -- so
+  // `vendor_accounts.` (plural) -- a different prefix from the codes above -- so
   // the both-directions check does not cover it: pin it on its own.
   it('maps the vendor-accounts module-disabled refusal by its exact wire string', () => {
     expect(errorLabelByCode['vendor_accounts.module_disabled']).toBe(

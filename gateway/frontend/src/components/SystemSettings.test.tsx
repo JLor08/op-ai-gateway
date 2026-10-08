@@ -7,7 +7,7 @@ import { SystemSettings } from './SystemSettings';
 import { ToastProvider } from './shared/ToastProvider';
 import { ThemeControlsContext, type ThemeControls } from '../theme/useThemeControls';
 import { messages, type Locale } from '../i18n';
-import type { SystemSettings as SystemSettingsDTO } from '../api';
+import { PortalApiError, type SystemSettings as SystemSettingsDTO } from '../api';
 import type { PortalApi } from './shared/types';
 
 // NOTE on i18n key reuse: SystemSettings' NetBird panel renders ONLY the enable
@@ -41,6 +41,7 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
+    vendor_openai_codex_client_version: '26.930.61225',
     energy_default_price_per_kwh: 0,
     energy_default_pue: 0,
     energy_default_wh_per_token: 0,
@@ -425,6 +426,122 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           (screen.getByLabelText(t.systemVendorAccountsEnabledLabel) as HTMLInputElement).checked,
         ).toBe(true),
       );
+    });
+  });
+
+  describe(`SystemSettings vendor Codex client version [${locale}]`, () => {
+    const versionField = () =>
+      screen.findByLabelText(
+        t.systemVendorOpenAICodexClientVersionLabel,
+      ) as Promise<HTMLInputElement>;
+    const saveButton = () => screen.getByRole('button', { name: t.save });
+
+    it('shows the effective version with a note on why to raise it', async () => {
+      renderSystemSettings(makeSettings({ vendor_openai_codex_client_version: '26.930.61225' }));
+
+      const field = await versionField();
+      expect(field.value).toBe('26.930.61225');
+      expect(field).toHaveAttribute('aria-invalid', 'false');
+      expect(screen.getByText(t.systemVendorOpenAICodexClientVersionNote)).toBeInTheDocument();
+      // The help says what happens when it is stale.
+      expect(t.systemVendorOpenAICodexClientVersionNote).toMatch(/OpenAI/);
+    });
+
+    it('does not re-send the loaded value on a save that does not touch it', async () => {
+      // The loaded value is the EFFECTIVE one (the built-in default when none is
+      // stored): sending it back would pin today's default.
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      await versionField();
+      await waitFor(() => expect(saveButton()).not.toBeDisabled());
+
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect('vendor_openai_codex_client_version' in updateSystemSettings.mock.calls[0][0]).toBe(
+        false,
+      );
+    });
+
+    it('round-trips an edited version, trimmed, and shows what was saved', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const field = await versionField();
+
+      fireEvent.change(field, { target: { value: ' 27.101.5 ' } });
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_openai_codex_client_version: '27.101.5',
+      });
+      await waitFor(() => expect(saveButton()).not.toBeDisabled());
+      expect((await versionField()).value).toBe('27.101.5');
+    });
+
+    it('sends a blank value as "" so the backend resets to its default', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const field = await versionField();
+
+      fireEvent.change(field, { target: { value: '' } });
+      expect(field).toHaveAttribute('aria-invalid', 'false');
+      fireEvent.click(saveButton());
+
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_openai_codex_client_version: '',
+      });
+    });
+
+    it.each([
+      ['a leading v', 'v26.1'],
+      ['a space inside', '26 1'],
+      ['a leading letter', 'abc'],
+      ['more than 64 characters', `1${'0'.repeat(64)}`],
+    ])('flags a version with %s inline and does not save it', async (_why, bad) => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const field = await versionField();
+
+      fireEvent.change(field, { target: { value: bad } });
+
+      expect(field).toHaveAttribute('aria-invalid', 'true');
+      expect(
+        screen.getByText(t.errorSystemVendorOpenAICodexClientVersionInvalid),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText(t.systemVendorOpenAICodexClientVersionNote),
+      ).not.toBeInTheDocument();
+      expect(saveButton()).toBeDisabled();
+      fireEvent.click(saveButton());
+      expect(updateSystemSettings).not.toHaveBeenCalled();
+
+      // Correcting it brings Save back.
+      fireEvent.change(field, { target: { value: '26.1' } });
+      expect(field).toHaveAttribute('aria-invalid', 'false');
+      expect(saveButton()).toBeEnabled();
+    });
+
+    it('shows a version the backend still refuses as the localized toast', async () => {
+      const updateSystemSettings = vi.fn(async () => {
+        throw new PortalApiError(
+          400,
+          'system.vendor_openai_codex_client_version_invalid',
+          'codex client version must be 1-64 characters',
+        );
+      });
+      renderSystemSettings(makeSettings(), {
+        updateSystemSettings: updateSystemSettings as unknown as PortalApi['updateSystemSettings'],
+      });
+      const field = await versionField();
+
+      fireEvent.change(field, { target: { value: '27.1' } });
+      fireEvent.click(saveButton());
+
+      expect(
+        await screen.findByText(
+          `system.vendor_openai_codex_client_version_invalid: ${t.errorSystemVendorOpenAICodexClientVersionInvalid}`,
+        ),
+      ).toBeInTheDocument();
+      // The edit is kept so it can be corrected.
+      expect(field.value).toBe('27.1');
     });
   });
 

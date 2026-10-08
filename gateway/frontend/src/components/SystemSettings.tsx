@@ -14,6 +14,7 @@ import { Field } from './shared/Field';
 import { useToast } from './shared/ToastProvider';
 import { availableUnits, fromEur, toEur, type CurrencyUnit } from '../currency';
 import type { VendorAccountRoutingMode } from '../api';
+import { isValidCodexClientVersion } from './shared/vendorInputs';
 
 const LANGUAGE_LABELS: Record<string, string> = { de: 'Deutsch', en: 'English' };
 
@@ -77,6 +78,8 @@ export function SystemSettings({
   );
   const [pendingVendorRoutingMode, setPendingVendorRoutingMode] =
     useState<VendorAccountRoutingMode | null>(null);
+  // The Codex client_version the OpenAI model discovery sends. Null = untouched.
+  const [pendingCodexClientVersion, setPendingCodexClientVersion] = useState<string | null>(null);
   // pendingEnergyPricePerKwh holds the price DISPLAY string in the currently
   // selected unit (pendingPriceUnit ?? the stored default), never raw EUR —
   // see the seed/convert/save derivation below.
@@ -152,6 +155,11 @@ export function SystemSettings({
     pendingVendorAccountsEnabled ?? settings?.vendor_accounts_enabled ?? false;
   const vendorRoutingMode: VendorAccountRoutingMode =
     pendingVendorRoutingMode ?? settings?.vendor_account_routing_mode ?? 'vendor_first';
+  // The settings carry the EFFECTIVE client version (the built-in default when
+  // none is stored). Blank is valid: it resets to that default on save.
+  const codexClientVersion =
+    pendingCodexClientVersion ?? settings?.vendor_openai_codex_client_version ?? '';
+  const codexClientVersionValid = isValidCodexClientVersion(codexClientVersion);
   // Currency conversion factor (USD per 1 EUR) driving USD-unit availability;
   // arrives on the SAME settings load as the price/unit fields, so (unlike
   // ServerList's separate api.getCurrency() fetch) there is no factor-arrives-
@@ -239,6 +247,12 @@ export function SystemSettings({
         vision_probe_mode: visionProbeMode,
         vendor_accounts_enabled: vendorAccountsEnabled,
         vendor_account_routing_mode: vendorRoutingMode,
+        // Only when edited: the loaded value is the EFFECTIVE one, so re-sending it
+        // on every unrelated save would pin today's built-in default and stop a
+        // later default bump from reaching this gateway.
+        ...(pendingCodexClientVersion !== null
+          ? { vendor_openai_codex_client_version: pendingCodexClientVersion.trim() }
+          : {}),
         energy_default_price_per_kwh: toEur(energyPricePerKwhNum, effectiveUnit, currencyFactorNum),
         energy_default_price_unit: effectiveUnit,
         currency_usd_per_eur: currencyFactorNum,
@@ -270,6 +284,7 @@ export function SystemSettings({
       setPendingVisionProbeMode(null);
       setPendingVendorAccountsEnabled(null);
       setPendingVendorRoutingMode(null);
+      setPendingCodexClientVersion(null);
       setPendingEnergyPricePerKwh(null);
       setPendingPriceUnit(null);
       setPendingCurrencyFactor(null);
@@ -529,6 +544,19 @@ export function SystemSettings({
               <option value="vendor_first">{t.vendorRoutingModeVendorFirst}</option>
               <option value="fallback_only">{t.vendorRoutingModeFallbackOnly}</option>
             </SelectField>
+            <Field
+              id="system-vendor-openai-codex-client-version"
+              label={t.systemVendorOpenAICodexClientVersionLabel}
+              value={codexClientVersion}
+              onChange={(event) => setPendingCodexClientVersion(event.target.value)}
+              autoComplete="off"
+              error={!codexClientVersionValid}
+              helperText={
+                codexClientVersionValid
+                  ? t.systemVendorOpenAICodexClientVersionNote
+                  : t.errorSystemVendorOpenAICodexClientVersionInvalid
+              }
+            />
           </Stack>
         </Panel>
 
@@ -757,6 +785,7 @@ export function SystemSettings({
               !energyPricePerKwhValid ||
               !energyPueValid ||
               !energyWhPerTokenValid ||
+              !codexClientVersionValid ||
               !smtpConfigOk
             }
             onClick={save}
