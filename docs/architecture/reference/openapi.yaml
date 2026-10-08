@@ -1154,11 +1154,48 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     post:
       tags: [portal]
-      summary: Connect a subscription account from imported OAuth tokens
+      summary: Connect a subscription account from imported OAuth tokens (validated fail-soft)
+      description: >
+        Body {access_token, refresh_token?, expires_at?}. The access token is
+        checked against the vendor before it is stored; a definitive rejection
+        is a 400 with vendor_account.connect_invalid_credentials and nothing is
+        stored, an unreachable or inconclusive vendor still stores.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/vendor-accounts/{id}/check:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Test the connection (model-independent credential check)
+      description: >
+        No request body. Asks the vendor whether the account's stored credential
+        is accepted and answers a VendorConnectionCheck. Strictly owner-only
+        (system scope included); a non-owner gets the same 404 as an unknown
+        id. Changes nothing and never returns a credential. A rejected
+        credential is a 200 with status invalid, not an error; a stored
+        credential that cannot be opened (lost encryption key, corrupt blob) is
+        a 409 vendor_account.credential_unreadable.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The verdict on the account's stored credential
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorConnectionCheck' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The account cannot be checked -- vendor_account.credential_unreadable
+            (the stored credential cannot be opened; reconnect the account) or
+            vendor_accounts.module_disabled while the master flag is off. The
+            Error envelope carries the stable code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/vendor-accounts/{id}/connect/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1878,3 +1915,27 @@ components:
                   exit_code: { type: integer }
                   failures: { type: integer }
                   stderr_tail: { type: string }
+    VendorConnectionCheck:
+      type: object
+      description: >
+        Verdict of POST /api/portal/vendor-accounts/{id}/check on an account's
+        stored credential (portal.VendorConnectionCheck). The check names no
+        model, so it speaks to authentication only, never to whether a model is
+        served. Never carries a credential.
+      required: [status, detail, checked_at]
+      properties:
+        status:
+          type: string
+          enum: [valid, invalid, unverifiable]
+          description: >
+            valid - the vendor accepted the credential. invalid - it was
+            definitively rejected (HTTP 401). unverifiable - no clean answer
+            (vendor unreachable, rate-limited or unexpected) or nothing to test
+            (no API key set, subscription not connected, access token expired but
+            refreshable); says nothing about the credential.
+        detail:
+          type: string
+          description: >
+            Short English status phrase (HTTP status and, when sent, the vendor's
+            short error code). Credential-free; may be empty.
+        checked_at: { type: string, format: date-time }

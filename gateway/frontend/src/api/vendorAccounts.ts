@@ -123,6 +123,23 @@ export type VendorAccountDeviceConnectBegin = { user_code: string; verification_
 // the code yet, true once the account is connected. Never carries a token.
 export type VendorAccountDeviceConnectPoll = { connected: boolean };
 
+// POST .../check response -- mirrors portal.VendorConnectionCheck: the verdict of
+// asking the vendor whether the account's stored credential is accepted. It is
+// about the CREDENTIAL only, never about whether a particular model is served,
+// so a refused chat with a `valid` verdict points at the model, not the login.
+// `unverifiable` is no statement about the credential: the vendor could not be
+// reached or gave no clear answer, or there was nothing to test (no credential
+// stored yet). `detail` is a short English status phrase (the vendor's HTTP
+// status and error code, or what was missing), token-free by construction: a
+// technical aid for the user, not a message to localize. checked_at is an
+// RFC 3339 instant.
+export type VendorConnectionStatus = 'valid' | 'invalid' | 'unverifiable';
+export type VendorConnectionCheck = {
+  status: VendorConnectionStatus;
+  detail: string;
+  checked_at: string;
+};
+
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
     // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
@@ -152,8 +169,23 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(fetcher, `/api/portal/vendor-accounts/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       }),
+    // The explicit "test connection": the backend opens the account's stored
+    // credential and asks the vendor whether it is accepted, answering 200 with
+    // the credential-free verdict whichever way it came out (a rejected credential
+    // is an `invalid` verdict, NOT an error). Owner-only (404 for anybody else's
+    // id); an unexpected failure is a 500 vendor_account.check_failed. No request
+    // body.
+    testConnection: (id: string) =>
+      request<VendorConnectionCheck>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/check`,
+        { method: 'POST' },
+      ),
     // Subscription connect, path 1: attach tokens the user already holds. The
-    // backend does not probe them (the first real request validates them).
+    // backend probes the access token once before it stores anything: a token the
+    // vendor definitively rejects is a 400 vendor_account.connect_invalid_credentials
+    // (nothing stored). The portal's file picker fills this same request from a
+    // credential file it parsed in the browser.
     connectVendorAccountImport: (id: string, body: ConnectVendorAccountImportRequest) =>
       request<VendorAccount>(
         fetcher,

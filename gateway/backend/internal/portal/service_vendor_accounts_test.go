@@ -12,6 +12,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,11 +33,15 @@ func newVendorAccountTestService(t *testing.T, now time.Time) (*Service, *routin
 // newVendorAccountTestServiceWithCipher is newServerTestServiceWithCipher with
 // the vendor_accounts_enabled master flag switched ON: every vendor-account
 // service method is refused while it is off (ErrVendorAccountsDisabled), so the
-// tests of the methods' own behaviour run with the area enabled.
+// tests of the methods' own behaviour run with the area enabled. The credential
+// validators are replaced by an all-Unverifiable fake, so no test of the area can
+// reach a vendor over the network; a test that cares about the verdicts installs
+// its own with installFakeVendorValidators.
 func newVendorAccountTestServiceWithCipher(t *testing.T, now time.Time, cipher *capture.Cipher, volatile bool) (*Service, *routing.MemoryStore) {
 	t.Helper()
 	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, volatile)
 	setVendorAccountsEnabled(t, svc, true)
+	installFakeVendorValidators(svc)
 	return svc, routeStore
 }
 
@@ -90,7 +95,7 @@ func TestCreateVendorAccountAPIKeyRoundTrip(t *testing.T) {
 	if !dto.APIKeySet || dto.SubscriptionConnected {
 		t.Fatalf("api_key_set/subscription_connected = %v/%v, want true/false", dto.APIKeySet, dto.SubscriptionConnected)
 	}
-	wantModels := vendorAccountModelDTOs(VendorCatalog(routing.VendorOpenAI))
+	wantModels := vendorAccountModelDTOs(VendorCatalog(routing.VendorOpenAI, routing.VendorAuthAPIKey))
 	if !reflect.DeepEqual(dto.Models, wantModels) {
 		t.Fatalf("models = %#v, want the OpenAI catalog %#v", dto.Models, wantModels)
 	}
@@ -778,7 +783,7 @@ func TestCreateVendorAccountSeedsTheVendorCatalog(t *testing.T) {
 				Vendor: tc.vendor, AuthType: routing.VendorAuthAPIKey, Name: "Seeded", APIKey: vendorAccountTestKey,
 			})
 
-			catalog := VendorCatalog(tc.vendor)
+			catalog := VendorCatalog(tc.vendor, routing.VendorAuthAPIKey)
 			if len(catalog) == 0 {
 				t.Fatalf("%s has an empty catalog", tc.vendor)
 			}
@@ -820,16 +825,72 @@ func TestCreateVendorAccountSeedsTheVendorCatalog(t *testing.T) {
 	}
 }
 
-// A subscription account is created unconnected but serves the same vendor
-// catalog, so it is routable the moment its OAuth connect completes.
+// A subscription account is created unconnected but is seeded with its vendor's
+// catalog, so it is routable the moment its OAuth connect completes. Anthropic's
+// OAuth path serves the same ids as its api key.
 func TestCreateVendorAccountSubscriptionAlsoSeedsTheCatalog(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)
 	dto := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
 		Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription, Name: "Claude Max",
 	})
-	if want := vendorAccountModelDTOs(VendorCatalog(routing.VendorAnthropic)); !reflect.DeepEqual(dto.Models, want) {
+	if want := vendorAccountModelDTOs(VendorCatalog(routing.VendorAnthropic, routing.VendorAuthSubscription)); !reflect.DeepEqual(dto.Models, want) {
 		t.Fatalf("models = %#v, want %#v", dto.Models, want)
+	}
+}
+
+// An OpenAI subscription account is served by the Codex ChatGPT backend, which
+// does not serve gpt-4.1 / o3: it is seeded with exactly gpt-5 and gpt-5-mini --
+// in the create DTO and in the stored rows -- while an OpenAI api-key account
+// (api.openai.com) is seeded with all four. Seeding a model the backend cannot
+// serve would guarantee a model error on a perfectly good credential.
+func TestCreateVendorAccountSeedsTheCatalogByAuthType(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		req  CreateVendorAccountRequest
+		want []string
+	}{
+		{
+			"subscription",
+			CreateVendorAccountRequest{Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthSubscription, Name: "ChatGPT Plus"},
+			[]string{"gpt-5", "gpt-5-mini"},
+		},
+		{
+			"api_key",
+			CreateVendorAccountRequest{Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey, Name: "Platform", APIKey: vendorAccountTestKey},
+			[]string{"gpt-4.1", "gpt-5", "gpt-5-mini", "o3"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore := newVendorAccountTestService(t, now)
+			dto := createTestVendorAccount(t, svc, ownerToken(), tc.req)
+
+			var dtoIDs []string
+			for _, m := range dto.Models {
+				dtoIDs = append(dtoIDs, m.GatewayModel)
+				if m.UpstreamModel != m.GatewayModel || m.APIFlavor != routing.APIFlavorOpenAI {
+					t.Errorf("model %+v, want a transparent openai-flavor pass-through", m)
+				}
+			}
+			slices.Sort(dtoIDs)
+			if !slices.Equal(dtoIDs, tc.want) {
+				t.Fatalf("create DTO models = %q, want exactly %q", dtoIDs, tc.want)
+			}
+
+			rows, err := routeStore.VendorAccountModels(context.Background(), dto.ID)
+			if err != nil {
+				t.Fatalf("VendorAccountModels: %v", err)
+			}
+			var rowIDs []string
+			for _, row := range rows {
+				rowIDs = append(rowIDs, row.GatewayModel)
+			}
+			slices.Sort(rowIDs)
+			if !slices.Equal(rowIDs, tc.want) {
+				t.Fatalf("stored models = %q, want exactly %q", rowIDs, tc.want)
+			}
+		})
 	}
 }
 

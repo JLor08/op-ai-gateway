@@ -53,7 +53,7 @@ func TestVendorModelsAppearInOwnerListings(t *testing.T) {
 	owner := ownerToken()
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
 
-	// A catalog model (openAIModels[0]) is listed in the picker under both flavors.
+	// A catalog model (the first OpenAI one, gpt-5) is listed in the picker under both flavors.
 	const vendorModel = "gpt-5"
 	row, ok := modelDTONamed(svc.Models(ctx, owner).Data, vendorModel)
 	if !ok {

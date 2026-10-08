@@ -5,8 +5,6 @@ package vendorauth
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -126,16 +124,8 @@ func OpenAIClaimsFromJWT(token string) (accountID, planType string) {
 // to authenticate anyone. Tolerant by design: a missing, malformed or
 // unexpectedly typed token yields empty strings and never panics.
 func parseOpenAIIDTokenClaims(idToken string) (accountID, planType string) {
-	parts := strings.Split(strings.TrimSpace(idToken), ".")
-	if len(parts) != 3 {
-		return "", ""
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
-	if err != nil {
-		return "", ""
-	}
-	var claims map[string]any
-	if json.Unmarshal(payload, &claims) != nil {
+	claims, ok := jwtClaims(idToken)
+	if !ok {
 		return "", ""
 	}
 	auth, _ := claims[OpenAIAuthClaimNamespace].(map[string]any)

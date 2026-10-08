@@ -198,12 +198,23 @@ type ConnectVendorAccountImportRequest struct {
 
 // ConnectVendorAccountImport connects a subscription account from tokens the
 // user already holds. Only the access token is required; the refresh token and
-// the expiry (the zero time = unknown) are optional. There is deliberately no
-// live probe: the first real request validates the tokens. For an OpenAI account
-// the ChatGPT account id and plan are read, best-effort, from the access token's
-// JWT claims (the dispatch needs the account id for the chatgpt-account-id
-// header), so an import yields the same token set the code-paste flow does. The
-// write is OWNER-ONLY and the response is the credential-free DTO
+// the expiry (the zero time = unknown) are optional.
+//
+// Before anything is stored the access token is checked once against the vendor
+// (the matching SUBSCRIPTION probe, see service_vendor_validation.go), fail-soft:
+// only a definitive rejection blocks the import (ErrVendorAccountConnectInvalidCredentials,
+// nothing persisted); an unreachable vendor or an unexpected answer proceeds, so
+// the first real request remains the final judge. An access token that is already
+// expired while a refresh token came with it is not probed at all (the vendor
+// would reject it, yet the account heals on its first request by refreshing). A pasted token carries no
+// expires_in, so a missing expiry is read from the access token's JWT exp claim
+// when it has one (an OpenAI token does, an Anthropic one is opaque), which lets a
+// stale token refresh instead of failing forever on its stored refresh token. For
+// an OpenAI account the ChatGPT account id and plan are read from the access
+// token's JWT claims and, when the token carries none, backfilled from the probe's
+// Valid answer (after a printable-ASCII, length-capped check), because the
+// dispatch needs the account id for the chatgpt-account-id header. The write is
+// OWNER-ONLY and the response is the credential-free DTO
 // (SubscriptionConnected=true, never a token). ErrVendorAccountsDisabled while
 // the master flag is off.
 func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID string, req ConnectVendorAccountImportRequest) (VendorAccountDTO, error) {
@@ -215,14 +226,44 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 	if access == "" {
 		return VendorAccountDTO{}, ErrVendorAccountConnectTokenRequired
 	}
+	ts := importedTokenSet(acc.Vendor, access, req)
+	check := s.checkSubscriptionTokenSet(ctx, acc.Vendor, ts)
+	if check.Status == vendorauth.StatusInvalid {
+		return VendorAccountDTO{}, fmt.Errorf("%w: %s", ErrVendorAccountConnectInvalidCredentials, scrubCredential(scrubCredential(check.Detail, access), ts.RefreshToken))
+	}
+	if acc.Vendor == routing.VendorOpenAI {
+		backfillOpenAIIdentity(&ts, check)
+	}
+	// The probe is a network round trip; re-load the account so a rename or a
+	// status change made meanwhile is not overwritten by the copy loaded above.
+	acc, err = s.connectableVendorAccount(ctx, principal, accountID)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return s.persistVendorTokens(ctx, acc, ts)
+}
+
+// importedTokenSet builds the token set of a token import from the trimmed access
+// token and the request: the refresh token as pasted, the expiry as given or, when
+// none was given, derived from the access token's JWT exp claim (left unknown
+// when it has none), and, for an OpenAI account, the account id and plan read from
+// the access token's claims (each kept only if it passes vendorIdentityValue).
+func importedTokenSet(vendor, access string, req ConnectVendorAccountImportRequest) vendorauth.TokenSet {
 	ts := vendorauth.TokenSet{AccessToken: access, RefreshToken: strings.TrimSpace(req.RefreshToken)}
 	if !req.ExpiresAt.IsZero() {
 		ts.ExpiresAt = req.ExpiresAt.UTC()
+	} else if exp, ok := vendorauth.AccessTokenExpiry(access); ok {
+		ts.ExpiresAt = exp
 	}
-	if acc.Vendor == routing.VendorOpenAI {
-		ts.AccountID, ts.PlanType = vendorauth.OpenAIClaimsFromJWT(access)
+	if vendor == routing.VendorOpenAI {
+		// The claims are as unvalidated as a probe's answer (the token is pasted),
+		// and the account id is sent back as a header: apply the same cap, dropping
+		// a value that fails it.
+		accountID, planType := vendorauth.OpenAIClaimsFromJWT(access)
+		ts.AccountID, _ = vendorIdentityValue(accountID)
+		ts.PlanType, _ = vendorIdentityValue(planType)
 	}
-	return s.persistVendorTokens(ctx, acc, ts)
+	return ts
 }
 
 // BeginVendorAccountConnect starts the OAuth code-paste flow for a subscription

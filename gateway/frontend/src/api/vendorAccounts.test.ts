@@ -215,4 +215,41 @@ describe('vendorAccountsApi', () => {
       code: 'vendor_account.connect_upstream_failed',
     });
   });
+
+  it('POSTs .../check with no body, the id URL-encoded, and returns the verdict as served', async () => {
+    const verdict = {
+      status: 'invalid',
+      detail: 'the vendor rejected the credential (401)',
+      checked_at: '2026-10-08T10:00:00Z',
+    };
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(verdict));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.testConnection('va/1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/check');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp).toEqual(verdict);
+  });
+
+  it('surfaces a failed check as a PortalApiError carrying vendor_account.check_failed', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { code: 'vendor_account.check_failed', message: 'check failed' } },
+          500,
+        ),
+      );
+    const api = createPortalApi(fetcher);
+
+    await expect(api.testConnection('va_1')).rejects.toMatchObject({
+      name: 'PortalApiError',
+      status: 500,
+      code: 'vendor_account.check_failed',
+    });
+  });
 });

@@ -2422,6 +2422,29 @@ const de = {
     'Datei ~/.claude/.credentials.json, Feld claudeAiOauth.accessToken. Unter macOS alternativ der Schlüsselbund-Eintrag „Claude Code-credentials“. Ein langlebiges Token erzeugt der Befehl claude setup-token.',
   vendorConnectGuideCodexTitle: 'Codex',
   vendorConnectGuideCodexBody: 'Datei ~/.codex/auth.json, Feld tokens.access_token.',
+  vendorConnectFileAction: 'auth.json / .credentials.json hochladen',
+  vendorConnectFileNote:
+    'Die Datei wird nur in diesem Browser gelesen und nie hochgeladen. Übertragen werden nur Access-Token, Refresh-Token und Ablaufdatum, und der Import startet sofort.',
+  vendorConnectManualHint: 'Oder die Tokens von Hand einfügen:',
+  vendorConnectFileTooLarge:
+    'Die Datei ist zu groß (höchstens 1 MiB). Eine Zugangsdaten-Datei hat nur wenige KiB; wurde die richtige Datei gewählt?',
+  vendorConnectFileReadFailed: 'Die Datei konnte nicht gelesen werden.',
+  vendorConnectFileVendorMismatch: (fileVendor: string, accountVendor: string) =>
+    `Diese Datei gehört zu ${fileVendor}, dieses Konto ist aber ein ${accountVendor}-Konto. Eine passende Datei wählen.`,
+  vendorConnectFileErrorNotJson:
+    'Die Datei ist kein gültiges JSON. Die Zugangsdaten-Datei unverändert hochladen.',
+  vendorConnectFileErrorNotObject:
+    'Die Datei muss ein JSON-Objekt enthalten, wie die auth.json von Codex oder die .credentials.json von Claude Code.',
+  vendorConnectFileErrorUnrecognised:
+    'Die Datei ist keine bekannte Zugangsdaten-Datei. Eine auth.json von Codex oder eine .credentials.json von Claude Code hochladen.',
+  vendorConnectFileErrorAmbiguous:
+    'Die Datei sieht sowohl wie eine auth.json von Codex als auch wie eine .credentials.json von Claude Code aus. Sie in auth.json oder .credentials.json umbenennen oder nur eine der beiden hochladen.',
+  vendorConnectFileErrorClaudeNoAccessToken:
+    'In der Claude-Code-Datei fehlt claudeAiOauth.accessToken. Eine .credentials.json hochladen, die ein Access-Token enthält.',
+  vendorConnectFileErrorCodexIdTokenOnly:
+    'Diese auth.json enthält ein id_token, aber kein tokens.access_token. Das id_token ist ein Identitäts-Token und kann nicht importiert werden. Eine Datei mit access_token hochladen oder das access_token selbst einfügen.',
+  vendorConnectFileErrorCodexNoAccessToken:
+    'Diese auth.json enthält kein tokens.access_token. In Codex mit ChatGPT anmelden, damit die auth.json ein access_token enthält; ein reiner API-Schlüssel lässt sich nicht importieren.',
   vendorConnectDeviceTitle: 'Device-Code',
   vendorConnectDeviceIntro:
     'Nur für OpenAI. Einen kurzen Code auf der Seite des Anbieters eingeben; die Verbindung schließt sich danach hier automatisch ab. Funktioniert auch bei einem entfernten Gateway.',
@@ -2447,6 +2470,14 @@ const de = {
   vendorUsageNoData: 'Noch keine Daten',
   vendorUsageCreditBalance: 'Guthaben',
   vendorUsageUpdatedAt: (ago: string) => `Zuletzt aktualisiert: ${ago}`,
+  vendorCheckTitle: 'Zugangsdaten prüfen',
+  vendorCheckIntro:
+    'Der Test fragt nur beim Anbieter nach, ob die gespeicherten Zugangsdaten akzeptiert werden. Er prüft nicht, ob ein bestimmtes Modell verfügbar ist: Schlägt ein Chat trotz gültiger Zugangsdaten fehl, liegt es am Modell und nicht an der Anmeldung.',
+  vendorCheckAction: 'Verbindung testen',
+  vendorCheckValid: 'Zugangsdaten gültig',
+  vendorCheckInvalid: 'Zugangsdaten abgelehnt',
+  vendorCheckUnverifiable: 'Zugangsdaten konnten nicht geprüft werden',
+  vendorCheckDetail: (detail: string) => `Technische Angabe: ${detail}`,
   errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
   errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
@@ -2475,6 +2506,11 @@ const de = {
   errorVendorAccountConnectKeyRequired:
     'Zum Speichern eines Abonnements ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
   errorVendorAccountConnectFailed: 'Das Konto konnte nicht verbunden werden',
+  errorVendorAccountConnectInvalidCredentials:
+    'Der Anbieter hat das Token abgelehnt. Prüfen, ob es aktuell, vollständig kopiert und ein Access-Token (kein id_token) ist. Es wurde nichts gespeichert.',
+  errorVendorAccountCheckFailed: 'Die Verbindung konnte nicht geprüft werden',
+  errorVendorAccountCredentialUnreadable:
+    'Die gespeicherten Zugangsdaten konnten nicht gelesen werden. Das Konto neu verbinden (bei einem API-Schlüssel: den Schlüssel neu setzen).',
   errorVendorAccountDeviceNotSupported: 'Der Device-Code-Login ist nur für OpenAI-Konten verfügbar',
   errorVendorAccountDeviceConnectState:
     'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
@@ -4966,6 +5002,29 @@ const en: PortalMessages = {
     'File ~/.claude/.credentials.json, field claudeAiOauth.accessToken. On macOS, alternatively the Keychain entry "Claude Code-credentials". The command claude setup-token creates a long-lived token.',
   vendorConnectGuideCodexTitle: 'Codex',
   vendorConnectGuideCodexBody: 'File ~/.codex/auth.json, field tokens.access_token.',
+  vendorConnectFileAction: 'Upload auth.json / .credentials.json',
+  vendorConnectFileNote:
+    'The file is read in this browser only and never uploaded. Only the access token, refresh token and expiry are sent, and the import starts right away.',
+  vendorConnectManualHint: 'Or paste the tokens by hand:',
+  vendorConnectFileTooLarge:
+    'The file is too large (1 MiB at most). A credential file is only a few KiB; was the right file chosen?',
+  vendorConnectFileReadFailed: 'The file could not be read.',
+  vendorConnectFileVendorMismatch: (fileVendor: string, accountVendor: string) =>
+    `This file is for ${fileVendor}, but this account is an ${accountVendor} account. Choose a matching file.`,
+  vendorConnectFileErrorNotJson:
+    'The file is not valid JSON. Upload the credential file unchanged.',
+  vendorConnectFileErrorNotObject:
+    'The file must contain a JSON object, like the auth.json of Codex or the .credentials.json of Claude Code.',
+  vendorConnectFileErrorUnrecognised:
+    'The file is not a recognised credential file. Upload an auth.json from Codex or a .credentials.json from Claude Code.',
+  vendorConnectFileErrorAmbiguous:
+    'The file looks like both a Codex auth.json and a Claude Code .credentials.json. Rename it to auth.json or .credentials.json, or upload only one of them.',
+  vendorConnectFileErrorClaudeNoAccessToken:
+    'The Claude Code file has no claudeAiOauth.accessToken. Upload a .credentials.json that holds an access token.',
+  vendorConnectFileErrorCodexIdTokenOnly:
+    'This auth.json has an id_token but no tokens.access_token. The id_token is an identity token and cannot be imported. Upload a file that holds the access_token, or paste the access_token itself.',
+  vendorConnectFileErrorCodexNoAccessToken:
+    'This auth.json has no tokens.access_token. Sign in to Codex with ChatGPT so that auth.json holds an access_token; an API key alone cannot be imported.',
   vendorConnectDeviceTitle: 'Device code',
   vendorConnectDeviceIntro:
     'OpenAI only. Enter a short code on the provider page; the connection then completes here automatically. Works for a remote gateway too.',
@@ -4989,6 +5048,14 @@ const en: PortalMessages = {
   vendorUsageNoData: 'No data yet',
   vendorUsageCreditBalance: 'Credit balance',
   vendorUsageUpdatedAt: (ago: string) => `Last updated: ${ago}`,
+  vendorCheckTitle: 'Check credentials',
+  vendorCheckIntro:
+    'The test only asks the provider whether the stored credentials are accepted. It does not check whether a specific model is available: if a chat fails although the credentials are valid, the cause is the model, not the login.',
+  vendorCheckAction: 'Test connection',
+  vendorCheckValid: 'Credentials valid',
+  vendorCheckInvalid: 'Credentials rejected',
+  vendorCheckUnverifiable: 'Could not verify credentials',
+  vendorCheckDetail: (detail: string) => `Technical detail: ${detail}`,
   errorVendorAccountNotFound: 'Provider account not found',
   errorVendorAccountNameRequired: 'Provider account name is required',
   errorVendorAccountVendorInvalid: 'Invalid provider',
@@ -5016,6 +5083,11 @@ const en: PortalMessages = {
   errorVendorAccountConnectKeyRequired:
     'An encryption key on the gateway is required to store a subscription',
   errorVendorAccountConnectFailed: 'The account could not be connected',
+  errorVendorAccountConnectInvalidCredentials:
+    'The provider rejected the token. Check that it is current, copied completely, and an access token (not an id_token). Nothing was stored.',
+  errorVendorAccountCheckFailed: 'The connection could not be tested',
+  errorVendorAccountCredentialUnreadable:
+    'The stored credentials could not be read. Reconnect the account (for an API key, set the key again).',
   errorVendorAccountDeviceNotSupported:
     'The device-code login is available for OpenAI accounts only',
   errorVendorAccountDeviceConnectState:

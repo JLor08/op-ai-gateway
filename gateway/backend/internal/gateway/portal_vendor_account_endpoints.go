@@ -23,6 +23,7 @@ const (
 	codeVendorAccountUpdateFailed  = "vendor_account.update_failed"
 	codeVendorAccountDeleteFailed  = "vendor_account.delete_failed"
 	codeVendorAccountConnectFailed = "vendor_account.connect_failed"
+	codeVendorAccountCheckFailed   = "vendor_account.check_failed"
 )
 
 // handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
@@ -87,7 +88,8 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // (GET / PATCH / DELETE), the subscription-connect sub-resources
 // "/api/portal/vendor-accounts/{id}/connect/{import|begin|complete}" (POST), and
 // the OPTIONAL device-code connect sub-resources
-// "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST). Any
+// "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST), and the
+// test-connection action "/api/portal/vendor-accounts/{id}/check" (POST). Any
 // other deeper path is answered with the same 404 as an unknown id.
 func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
@@ -96,7 +98,7 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/portal/vendor-accounts/"), "/")
 	parts := strings.Split(rest, "/")
-	if s.routeVendorAccountConnectSubpath(w, r, token, parts) {
+	if s.routeVendorAccountSubpath(w, r, token, parts) {
 		return
 	}
 	id := pathID(r.URL.Path, "/api/portal/vendor-accounts/")
@@ -126,10 +128,20 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// routeVendorAccountSubpath dispatches the sub-routes of
+// /api/portal/vendor-accounts/{id}/... (the /check action and the /connect/...
+// family) and reports whether it handled the request. The item handler falls
+// through to the {id} GET/PATCH/DELETE surface when this returns false.
+func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "check" {
+		s.handlePortalVendorAccountCheck(w, r, token, parts[0])
+		return true
+	}
+	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
+}
+
 // routeVendorAccountConnectSubpath dispatches the /connect/... sub-routes of
 // /api/portal/vendor-accounts/{id}/... and reports whether it handled the request.
-// The item handler falls through to the {id} GET/PATCH/DELETE surface when this
-// returns false.
 func (s *Server) routeVendorAccountConnectSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
 	if len(parts) == 4 && parts[0] != "" && parts[1] == "connect" && parts[2] == "device" {
 		switch parts[3] {
@@ -175,6 +187,25 @@ func (s *Server) handlePortalVendorAccountPatch(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalVendorAccountCheck (POST .../check) is the explicit "test
+// connection" action: the gateway asks the vendor whether the account's stored
+// credential is accepted and returns the verdict {status, detail, checked_at}
+// (status is valid, invalid or unverifiable). The request has no body, the call
+// changes nothing, and no credential is ever returned. Owner-only and gated by
+// the vendor_accounts_enabled master flag (both in portal.Service): any other
+// principal gets the same 404 as an unknown id.
+func (s *Server) handlePortalVendorAccountCheck(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	check, err := s.Portal.TestVendorAccountConnection(r.Context(), token, id)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountCheckFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, check)
 }
 
 // vendorAccountConnectCompleteRequest is the body of POST
@@ -306,12 +337,24 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountConnectCodeRequired, status: http.StatusBadRequest, code: "vendor_account.connect_code_required", msg: "paste the code the vendor showed after the sign-in"},
 	{err: portal.ErrVendorAccountConnectState, status: http.StatusBadRequest, code: "vendor_account.connect_state", msg: "no connect is in progress for this account, it has expired, or the pasted state does not match; start the connect again"},
 	{err: portal.ErrVendorAccountConnectRejected, status: http.StatusBadRequest, code: "vendor_account.connect_rejected", msg: "the vendor rejected the code; check it or start the connect again"},
+	// A token import the vendor definitively rejected (nothing was stored): a 400,
+	// never a 401, because the portal treats a 401 from this API as an expired
+	// session and would log the user out instead of showing the message.
+	{err: portal.ErrVendorAccountConnectInvalidCredentials, status: http.StatusBadRequest, code: "vendor_account.connect_invalid_credentials", msg: "the vendor rejected the access token; check that it is current and was copied completely"},
 	{err: portal.ErrVendorAccountConnectUpstream, status: http.StatusBadGateway, code: "vendor_account.connect_upstream_failed", msg: "the vendor could not be reached or answered unexpectedly; try again later"},
 	{err: portal.ErrVendorAccountConnectKeyRequired, status: http.StatusBadRequest, code: "vendor_account.connect_key_required", msg: "an encryption key is required to store a vendor subscription on a disk-backed store"},
 	// Device-code connect (OpenAI only). Both are 400s, never a 401 (the portal
 	// treats a 401 from this API as an expired session).
 	{err: portal.ErrVendorAccountDeviceUnsupported, status: http.StatusBadRequest, code: "vendor_account.device_not_supported", msg: "the device connect flow is available for OpenAI accounts only"},
 	{err: portal.ErrVendorAccountDeviceConnectState, status: http.StatusBadRequest, code: "vendor_account.device_connect_state", msg: "no device connect is in progress for this account or it has expired; start the device connect again"},
+	// The connection test (POST .../check) could not OPEN the stored credential: the
+	// encryption key is lost, or the sealed blob no longer decrypts. A 409 -- the
+	// account is in a state that cannot be checked -- never a 400 (nothing in the
+	// request is wrong), a 401 (the portal reads that as an expired session) or a
+	// 500 (this is a known, deterministic state). The row precedes the
+	// capture.ErrKeyRequired one because the error wraps it for a lost key, and that
+	// row's message talks about STORING an api key.
+	{err: portal.ErrVendorAccountCredentialUnreadable, status: http.StatusConflict, code: "vendor_account.credential_unreadable", msg: "the stored credential could not be read; reconnect the account"},
 	// capture.SealSecret returns capture.ErrKeyRequired when a non-empty api key
 	// is sealed on a disk-backed store with no encryption key: the operator's
 	// own keyless misconfiguration, a 400 rather than a 500 (the same class the

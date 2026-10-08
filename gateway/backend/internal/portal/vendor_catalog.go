@@ -16,14 +16,28 @@ import "op-ai-gateway/internal/routing"
 // contract. An account keeps the rows it was seeded with: a change here only
 // affects accounts created afterwards. Existing accounts' rows can be rewritten
 // with SetVendorAccountModels, but no backfill exists yet.
+//
+// The OpenAI set depends on the account's auth type, because the two auth types
+// reach different backends: a subscription account is served by the Codex
+// ChatGPT backend, which (as far as is known) does NOT serve gpt-4.1 or o3,
+// while an api_key account talks to api.openai.com, which serves all four. Only
+// the shared gpt-5 / gpt-5-mini are seeded on a subscription account, so that a
+// working credential is never paired with a model its backend rejects. The
+// subscription set is the less certain of the two (VERIFY-LIVE: a plan may serve
+// further codex-* ids that are not seeded until confirmed). Anthropic's OAuth
+// Messages path and its api key serve the same ids, so its set does not vary.
 var (
-	openAIModels    = []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3"}
-	anthropicModels = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"}
+	openAISubscriptionModels = []string{"gpt-5", "gpt-5-mini"}
+	openAIAPIKeyModels       = []string{"gpt-5", "gpt-5-mini", "gpt-4.1", "o3"}
+	anthropicModels          = []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"}
 )
 
 // VendorCatalog returns the curated model set a new account of the given vendor
-// is seeded with: OpenAI models are served over the OpenAI wire flavor,
-// Anthropic models over the Anthropic one.
+// and auth type (routing.VendorAuthSubscription or routing.VendorAuthAPIKey) is
+// seeded with: OpenAI models are served over the OpenAI wire flavor, Anthropic
+// models over the Anthropic one. The OpenAI set is narrower for a subscription
+// account than for an api_key one (see the catalog comment above); the Anthropic
+// set is the same for both.
 //
 // GatewayModel (what a caller asks the gateway for) is the vendor's own public
 // model id and so is UpstreamModel: for these vendors the two coincide, which
@@ -32,16 +46,22 @@ var (
 // in vendor_account_models so an account can diverge later.
 //
 // AccountID is left empty (the store stamps it with the account being seeded).
-// The result is a fresh slice the caller may modify; an unknown vendor yields an
-// empty one.
-func VendorCatalog(vendor string) []routing.VendorAccountModel {
+// The result is a fresh slice the caller may modify; an unknown vendor or auth
+// type yields an empty one.
+func VendorCatalog(vendor, authType string) []routing.VendorAccountModel {
+	if authType != routing.VendorAuthSubscription && authType != routing.VendorAuthAPIKey {
+		return []routing.VendorAccountModel{}
+	}
 	var (
 		ids    []string
 		flavor string
 	)
 	switch vendor {
 	case routing.VendorOpenAI:
-		ids, flavor = openAIModels, routing.APIFlavorOpenAI
+		ids, flavor = openAIAPIKeyModels, routing.APIFlavorOpenAI
+		if authType == routing.VendorAuthSubscription {
+			ids = openAISubscriptionModels
+		}
 	case routing.VendorAnthropic:
 		ids, flavor = anthropicModels, routing.APIFlavorAnthropic
 	default:

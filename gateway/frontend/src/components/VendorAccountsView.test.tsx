@@ -13,8 +13,9 @@ import type {
   UpdateVendorAccountRequest,
   VendorAccount,
   VendorAccountUsage,
+  VendorConnectionCheck,
 } from '../api';
-import type { PortalApi } from './shared/types';
+import type { MessageKey, PortalApi } from './shared/types';
 
 function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
   return {
@@ -62,6 +63,17 @@ function makeUsage(overrides: Partial<VendorAccountUsage> = {}): VendorAccountUs
   };
 }
 
+// The credential-check verdict as POST .../check answers it. The detail is the
+// token-free ENGLISH status phrase the backend sends whatever the portal locale.
+function makeCheck(overrides: Partial<VendorConnectionCheck> = {}): VendorConnectionCheck {
+  return {
+    status: 'valid',
+    detail: 'the vendor accepted the credential',
+    checked_at: '2026-10-08T10:00:00Z',
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -83,6 +95,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       beginVendorAccountDeviceConnect?: PortalApi['beginVendorAccountDeviceConnect'];
       pollVendorAccountDeviceConnect?: PortalApi['pollVendorAccountDeviceConnect'];
       vendorAccount?: PortalApi['vendorAccount'];
+      testConnection?: PortalApi['testConnection'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -156,6 +169,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               subscription_connected: true,
               status: 'active',
             })),
+      ),
+      testConnection: vi.fn<PortalApi['testConnection']>(
+        opts.testConnection ?? (async () => makeCheck()),
       ),
     };
     const view = render(
@@ -800,6 +816,360 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
         expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(ACCESS);
         expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+      });
+    });
+
+    // The file picker beside the manual paste: the credential file is read and
+    // parsed IN THE BROWSER (parseCredentialFile), the right fields are filled in
+    // and the same import is submitted. The raw file never reaches the API.
+    describe('file import', () => {
+      // base64url of a JSON object: one segment of a JWT.
+      const b64url = (value: unknown) =>
+        btoa(JSON.stringify(value)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const EXP_SECONDS = 1790000000;
+      const EXP_RFC3339 = '2026-09-21T14:13:20.000Z';
+      const CODEX_ACCESS = `${b64url({ alg: 'none' })}.${b64url({ exp: EXP_SECONDS })}.sig`;
+      const CODEX_REFRESH = 'rt-codex-refresh';
+      // Fields of the raw file that must never reach the API.
+      const ID_TOKEN = 'idtoken-never-sent';
+      const ACCOUNT_ID = 'acct-never-sent';
+
+      const codexFile = (overrides: Record<string, unknown> = {}) => ({
+        OPENAI_API_KEY: null,
+        tokens: {
+          id_token: ID_TOKEN,
+          access_token: CODEX_ACCESS,
+          refresh_token: CODEX_REFRESH,
+          account_id: ACCOUNT_ID,
+          ...overrides,
+        },
+        last_refresh: '2026-09-11T10:00:00Z',
+      });
+
+      const CLAUDE_ACCESS = 'sk-ant-oat01-claude-access';
+      const CLAUDE_REFRESH = 'sk-ant-ort01-claude-refresh';
+      const claudeFile = (overrides: Record<string, unknown> = {}) => ({
+        claudeAiOauth: {
+          accessToken: CLAUDE_ACCESS,
+          refreshToken: CLAUDE_REFRESH,
+          expiresAt: EXP_SECONDS * 1000,
+          scopes: ['user:inference'],
+          subscriptionType: 'max',
+          ...overrides,
+        },
+      });
+
+      const fileOf = (name: string, content: unknown) =>
+        new File([typeof content === 'string' ? content : JSON.stringify(content)], name, {
+          type: 'application/json',
+        });
+
+      const picker = () => screen.getByLabelText(t.vendorConnectFileAction);
+      function upload(file: File) {
+        fireEvent.change(picker(), { target: { files: [file] } });
+      }
+      it('offers the picker beside the manual paste, with a note that nothing is uploaded', async () => {
+        renderSubscription();
+        await openDetail();
+
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+        expect(picker()).toHaveAttribute('type', 'file');
+        expect(screen.getByText(t.vendorConnectFileNote)).toBeInTheDocument();
+        // The manual fields stay as the fallback.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+      });
+
+      it('imports a Codex auth.json with the access token, never the id_token or the raw file', async () => {
+        const { fakeApi, container } = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+
+        upload(fileOf('auth.json', codexFile()));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledWith('va_sub', {
+          access_token: CODEX_ACCESS,
+          refresh_token: CODEX_REFRESH,
+          // The access token's own exp claim, as an RFC 3339 instant.
+          expires_at: EXP_RFC3339,
+        });
+        // Only those three fields: nothing else of the raw file is submitted.
+        const sent = JSON.stringify(fakeApi.connectVendorAccountImport.mock.calls);
+        for (const secret of [ID_TOKEN, ACCOUNT_ID, 'OPENAI_API_KEY', 'last_refresh', 'tokens']) {
+          expect(sent).not.toContain(secret);
+        }
+
+        // Connected, success toast, and the write-only fields emptied again.
+        expect(await screen.findByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectExpiresAtLabel)).toHaveValue('');
+        expect(container.innerHTML).not.toContain(CODEX_ACCESS);
+        expect(container.innerHTML).not.toContain(CODEX_REFRESH);
+      });
+
+      it('imports a Claude Code .credentials.json with its millisecond expiry', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledWith('va_sub', {
+          access_token: CLAUDE_ACCESS,
+          refresh_token: CLAUDE_REFRESH,
+          expires_at: EXP_RFC3339,
+        });
+        const sent = JSON.stringify(fakeApi.connectVendorAccountImport.mock.calls);
+        for (const raw of ['claudeAiOauth', 'subscriptionType', 'scopes', 'user:inference']) {
+          expect(sent).not.toContain(raw);
+        }
+        expect(await screen.findByText(t.vendorConnectSuccess)).toBeInTheDocument();
+      });
+
+      it('sends only the access token when the file holds nothing else', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', { claudeAiOauth: { accessToken: CLAUDE_ACCESS } }));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(fakeApi.connectVendorAccountImport.mock.calls[0][1]).toEqual({
+          access_token: CLAUDE_ACCESS,
+        });
+      });
+
+      it('fills the visible fields with what was extracted while the import is in flight', async () => {
+        let resolveImport!: (account: VendorAccount) => void;
+        const pending = new Promise<VendorAccount>((resolve) => {
+          resolveImport = resolve;
+        });
+        const { fakeApi } = renderSubscription({}, { connectVendorAccountImport: () => pending });
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        // The extracted tokens and expiry are shown (masked / as a local time) ...
+        await waitFor(() =>
+          expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(CLAUDE_ACCESS),
+        );
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue(CLAUDE_REFRESH);
+        const expiry = new Date(EXP_RFC3339);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        expect(screen.getByLabelText(t.vendorConnectExpiresAtLabel)).toHaveValue(
+          `${expiry.getFullYear()}-${pad(expiry.getMonth() + 1)}-${pad(expiry.getDate())}` +
+            `T${pad(expiry.getHours())}:${pad(expiry.getMinutes())}`,
+        );
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveAttribute(
+          'type',
+          'password',
+        );
+        // ... the picker is busy-disabled meanwhile, and the SAME import was submitted.
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeDisabled();
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
+
+        await act(async () =>
+          resolveImport(
+            makeVendorAccount({ ...SUBSCRIPTION, status: 'active', subscription_connected: true }),
+          ),
+        );
+        await screen.findByText(t.vendorConnectSuccess);
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+      });
+
+      it('rejects a Codex file that has only an id_token, inline, without calling the API', async () => {
+        const { fakeApi } = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+
+        upload(
+          fileOf('auth.json', {
+            OPENAI_API_KEY: null,
+            tokens: { id_token: ID_TOKEN, refresh_token: CODEX_REFRESH },
+          }),
+        );
+
+        expect(
+          await screen.findByText(t.vendorConnectFileErrorCodexIdTokenOnly),
+        ).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        // The id_token is not dropped into the form either, and no token is rendered.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        expect(screen.getByLabelText(t.vendorConnectRefreshTokenLabel)).toHaveValue('');
+        expect(document.body.innerHTML).not.toContain(ID_TOKEN);
+        expect(screen.getByRole('button', { name: t.vendorConnectImportAction })).toBeDisabled();
+      });
+
+      // Every parser error code has its own localized text. The ambiguous case needs
+      // a file name that does not say which of its two shapes to use.
+      const PARSE_ERRORS: (readonly [string, string, unknown, MessageKey])[] = [
+        ['not_json', 'credentials.json', '{ not json', 'vendorConnectFileErrorNotJson'],
+        ['not_object', 'credentials.json', '[1, 2]', 'vendorConnectFileErrorNotObject'],
+        [
+          'unrecognised',
+          'credentials.json',
+          { hello: 'world' },
+          'vendorConnectFileErrorUnrecognised',
+        ],
+        [
+          'ambiguous',
+          'credentials-copy.json',
+          { ...claudeFile(), ...codexFile() },
+          'vendorConnectFileErrorAmbiguous',
+        ],
+        [
+          'claude_no_access_token',
+          'credentials.json',
+          { claudeAiOauth: { refreshToken: CLAUDE_REFRESH } },
+          'vendorConnectFileErrorClaudeNoAccessToken',
+        ],
+        [
+          'codex_id_token_only',
+          'credentials.json',
+          { tokens: { id_token: ID_TOKEN } },
+          'vendorConnectFileErrorCodexIdTokenOnly',
+        ],
+        [
+          'codex_no_access_token',
+          'credentials.json',
+          { OPENAI_API_KEY: 'sk-never-sent', tokens: null },
+          'vendorConnectFileErrorCodexNoAccessToken',
+        ],
+      ];
+
+      it.each(PARSE_ERRORS)(
+        'shows the localized message for the %s parse error',
+        async (_code, name, content, key) => {
+          const { fakeApi } = renderSubscription();
+          await openDetail();
+
+          upload(fileOf(name, content));
+
+          expect(await screen.findByText(t[key])).toBeInTheDocument();
+          expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+          expect(document.body.innerHTML).not.toContain('sk-never-sent');
+        },
+      );
+
+      it('rejects a file for the other vendor, naming both, without calling the API', async () => {
+        // A Codex file on an Anthropic account ...
+        const first = renderSubscription();
+        await openDetail();
+        upload(fileOf('auth.json', codexFile()));
+        expect(
+          await screen.findByText(
+            t.vendorConnectFileVendorMismatch(t.vendorOpenAI, t.vendorAnthropic),
+          ),
+        ).toBeInTheDocument();
+        expect(first.fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue('');
+        cleanup();
+
+        // ... and a Claude Code file on an OpenAI account.
+        const second = renderSubscription({ vendor: 'openai' });
+        await openDetail();
+        upload(fileOf('.credentials.json', claudeFile()));
+        expect(
+          await screen.findByText(
+            t.vendorConnectFileVendorMismatch(t.vendorAnthropic, t.vendorOpenAI),
+          ),
+        ).toBeInTheDocument();
+        expect(second.fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+      });
+
+      it('rejects an oversized file before reading it', async () => {
+        const read = vi.spyOn(FileReader.prototype, 'readAsText');
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(new File([new Uint8Array(1024 * 1024 + 1)], 'auth.json'));
+
+        expect(await screen.findByText(t.vendorConnectFileTooLarge)).toBeInTheDocument();
+        expect(read).not.toHaveBeenCalled();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+      });
+
+      it('accepts a file at the size cap', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+        // Valid JSON padded to exactly 1 MiB: the cap is inclusive.
+        const json = JSON.stringify(claudeFile({ padding: '' }));
+        const padded = json.slice(0, -1) + ' '.repeat(1024 * 1024 - json.length) + '}';
+        expect(padded).toHaveLength(1024 * 1024);
+
+        upload(fileOf('.credentials.json', padded));
+
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+      });
+
+      it('says so when the browser cannot read the file', async () => {
+        vi.spyOn(FileReader.prototype, 'readAsText').mockImplementation(function (
+          this: FileReader,
+        ) {
+          queueMicrotask(() => this.dispatchEvent(new ProgressEvent('error')));
+        });
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        expect(await screen.findByText(t.vendorConnectFileReadFailed)).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).not.toHaveBeenCalled();
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+      });
+
+      it('clears an earlier file error when the next file is chosen', async () => {
+        const { fakeApi } = renderSubscription();
+        await openDetail();
+
+        upload(fileOf('credentials.json', '{ not json'));
+        await screen.findByText(t.vendorConnectFileErrorNotJson);
+
+        upload(fileOf('.credentials.json', claudeFile()));
+        await waitFor(() => expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.vendorConnectFileErrorNotJson)).not.toBeInTheDocument();
+      });
+
+      it('shows the vendor rejecting the credentials as a localized toast and keeps the fields', async () => {
+        const { fakeApi } = renderSubscription(
+          {},
+          { connectVendorAccountImport: refusal('vendor_account.connect_invalid_credentials') },
+        );
+        await openDetail();
+
+        upload(fileOf('.credentials.json', claudeFile()));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_invalid_credentials: ${t.errorVendorAccountConnectInvalidCredentials}`,
+          ),
+        ).toBeInTheDocument();
+        expect(fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1);
+        // What was extracted stays visible, and the account stays not connected.
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toHaveValue(CLAUDE_ACCESS);
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.vendorConnectFileAction })).toBeEnabled();
+      });
+
+      it('shows the same localized message when a pasted token is rejected', async () => {
+        renderSubscription(
+          {},
+          { connectVendorAccountImport: refusal('vendor_account.connect_invalid_credentials') },
+        );
+        await openDetail();
+
+        fireEvent.change(screen.getByLabelText(t.vendorConnectAccessTokenLabel), {
+          target: { value: 'dead-token' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.connect_invalid_credentials: ${t.errorVendorAccountConnectInvalidCredentials}`,
+          ),
+        ).toBeInTheDocument();
       });
     });
 
@@ -1516,6 +1886,285 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await advance(DEVICE_POLL_INTERVAL_MS * 5);
         expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe(`VendorAccountsView test connection [${locale}]`, () => {
+    async function openDetail(name = 'Work OpenAI') {
+      const row = (await screen.findByText(name)).closest('tr')!;
+      fireEvent.click(within(row).getByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    const testButton = () => screen.getByRole('button', { name: t.vendorCheckAction });
+    const verdict = () => screen.getByRole('status');
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    it('offers the test button with a note that only the credentials are checked, not a model', async () => {
+      const { fakeApi } = renderView();
+      await openDetail();
+
+      expect(testButton()).toBeEnabled();
+      expect(screen.getByText(t.vendorCheckIntro)).toBeInTheDocument();
+      // Nothing is sent, and no verdict is shown, until the user asks.
+      expect(fakeApi.testConnection).not.toHaveBeenCalled();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+
+    it('is offered on a subscription that is not connected too (the verdict then says why it cannot be checked)', async () => {
+      renderView({ accounts: [makeVendorAccount(SUBSCRIPTION)] });
+      await openDetail('Team Claude Max');
+
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('is not offered on the list or the create form', async () => {
+      renderView();
+      await screen.findByText('Work OpenAI');
+      expect(screen.queryByRole('button', { name: t.vendorCheckAction })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+      await screen.findByLabelText(t.vendorAccountNameLabel);
+      expect(screen.queryByRole('button', { name: t.vendorCheckAction })).not.toBeInTheDocument();
+    });
+
+    it('checks the open account by id and shows a valid verdict as success', async () => {
+      const { fakeApi } = renderView();
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckValid)).toBeInTheDocument();
+      expect(fakeApi.testConnection).toHaveBeenCalledTimes(1);
+      expect(fakeApi.testConnection).toHaveBeenCalledWith('va_1');
+      expect(verdict()).toHaveClass('MuiAlert-colorSuccess');
+      expect(within(verdict()).getByText(t.vendorCheckValid)).toBeInTheDocument();
+    });
+
+    it('shows an invalid verdict as an error', async () => {
+      renderView({
+        testConnection: async () =>
+          makeCheck({ status: 'invalid', detail: 'the vendor rejected the credential (401)' }),
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckInvalid)).toBeInTheDocument();
+      expect(verdict()).toHaveClass('MuiAlert-colorError');
+    });
+
+    it('shows an unverifiable verdict neutrally: neither success nor error', async () => {
+      renderView({
+        testConnection: async () =>
+          makeCheck({ status: 'unverifiable', detail: 'the vendor could not be reached' }),
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckUnverifiable)).toBeInTheDocument();
+      expect(verdict()).toHaveClass('MuiAlert-colorInfo');
+      expect(verdict()).not.toHaveClass('MuiAlert-colorSuccess');
+      expect(verdict()).not.toHaveClass('MuiAlert-colorError');
+    });
+
+    it('words the three verdicts differently, so none reads as another', () => {
+      const texts = [t.vendorCheckValid, t.vendorCheckInvalid, t.vendorCheckUnverifiable];
+      expect(new Set(texts).size).toBe(3);
+    });
+
+    it('leads with the localized verdict and keeps the English detail as secondary technical text', async () => {
+      const detail = 'the vendor rejected the credential (invalid_api_key)';
+      renderView({ testConnection: async () => makeCheck({ status: 'invalid', detail }) });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await screen.findByText(t.vendorCheckInvalid);
+      // The detail is labelled as technical, never the verdict's headline.
+      const secondary = within(verdict()).getByText(t.vendorCheckDetail(detail));
+      expect(secondary).toBeInTheDocument();
+      expect(screen.queryByText(detail, { exact: true })).not.toBeInTheDocument();
+      // The localized headline comes first in the verdict.
+      expect(verdict().textContent?.indexOf(t.vendorCheckInvalid)).toBeLessThan(
+        verdict().textContent?.indexOf(detail) ?? -1,
+      );
+    });
+
+    it('shows no technical line when the backend sent no detail', async () => {
+      renderView({ testConnection: async () => makeCheck({ detail: '' }) });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await screen.findByText(t.vendorCheckValid);
+      expect(verdict().textContent).toBe(t.vendorCheckValid);
+    });
+
+    it('disables the button while the check runs, sends it once, and re-enables it with the verdict', async () => {
+      const pending = deferred<VendorConnectionCheck>();
+      const { fakeApi } = renderView({ testConnection: () => pending.promise });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await waitFor(() => expect(testButton()).toBeDisabled());
+      fireEvent.click(testButton());
+      expect(fakeApi.testConnection).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+      await act(async () => pending.resolve(makeCheck()));
+
+      expect(await screen.findByText(t.vendorCheckValid)).toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('hides the previous verdict while it checks again, then shows the new one', async () => {
+      const second = deferred<VendorConnectionCheck>();
+      const testConnection = vi
+        .fn<PortalApi['testConnection']>()
+        .mockResolvedValueOnce(makeCheck({ status: 'valid' }))
+        .mockReturnValueOnce(second.promise);
+      renderView({ testConnection });
+      await openDetail();
+
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.click(testButton());
+      await waitFor(() => expect(testButton()).toBeDisabled());
+      // A stale "valid" must not stay on screen next to a check that is running.
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+
+      await act(async () => second.resolve(makeCheck({ status: 'invalid' })));
+      expect(await screen.findByText(t.vendorCheckInvalid)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it('shows a thrown error as the localized toast, not as a verdict, and re-enables the button', async () => {
+      renderView({
+        testConnection: async () => {
+          throw new PortalApiError(500, 'vendor_account.check_failed', 'raw server text');
+        },
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(
+        await screen.findByText(`vendor_account.check_failed: ${t.errorVendorAccountCheckFailed}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckInvalid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckUnverifiable)).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('shows an unreadable stored credential as a localized toast about reading, not storing', async () => {
+      renderView({
+        testConnection: async () => {
+          throw new PortalApiError(409, 'vendor_account.credential_unreadable', 'raw server text');
+        },
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(
+        await screen.findByText(
+          `vendor_account.credential_unreadable: ${t.errorVendorAccountCredentialUnreadable}`,
+        ),
+      ).toBeInTheDocument();
+      expect(t.errorVendorAccountCredentialUnreadable).not.toBe(
+        t.errorVendorAccountApiKeyKeyRequired,
+      );
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckInvalid)).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('clears an earlier verdict when the next check throws', async () => {
+      const testConnection = vi
+        .fn<PortalApi['testConnection']>()
+        .mockResolvedValueOnce(makeCheck())
+        .mockRejectedValueOnce(new PortalApiError(500, 'vendor_account.check_failed', 'raw'));
+      renderView({ testConnection });
+      await openDetail();
+
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+      fireEvent.click(testButton());
+
+      await screen.findByText(`vendor_account.check_failed: ${t.errorVendorAccountCheckFailed}`);
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it("does not show one account's verdict on another account", async () => {
+      renderView({
+        accounts: [
+          makeVendorAccount(),
+          makeVendorAccount({ id: 'va_other', name: 'Other OpenAI' }),
+        ],
+      });
+      await openDetail();
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.click(screen.getByRole('button', { name: t.providers }));
+      await openDetail('Other OpenAI');
+
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('drops a verdict once the account was saved, because the credential may have changed', async () => {
+      renderView({
+        updateVendorAccount: async (id) =>
+          makeVendorAccount({ id, updated_at: '2026-10-08T11:00:00Z' }),
+      });
+      await openDetail();
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+        target: { value: 'sk-rotated' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await screen.findByText(t.save, { selector: '[role="alert"] *' });
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it('ignores a result that arrives after the user left the account (no verdict, no toast)', async () => {
+      const pending = deferred<VendorConnectionCheck>();
+      const { fakeApi } = renderView({ testConnection: () => pending.promise });
+      await openDetail();
+      fireEvent.click(testButton());
+      await waitFor(() => expect(fakeApi.testConnection).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(screen.getByRole('button', { name: t.providers }));
+      await screen.findByRole('button', { name: t.vendorAccountCreate });
+      await act(async () =>
+        pending.reject(new PortalApiError(500, 'vendor_account.check_failed', 'raw')),
+      );
+
+      expect(screen.queryByText(/vendor_account\.check_failed/)).not.toBeInTheDocument();
+      // Back on the same account: it has no verdict from the abandoned check.
+      await openDetail();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
     });
   });
 

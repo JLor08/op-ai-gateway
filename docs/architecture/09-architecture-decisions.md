@@ -3011,7 +3011,7 @@ reverse-engineered.
   self-hosted/shared route exists. The resolver reads it through a cached accessor
   invalidated on a settings write.
 - **(e) A master feature flag, off by default.** `vendor_accounts_enabled` (bool,
-  default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect
+  default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect/check
   endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor
   branch and the model-listing overlay are no-ops — the same module-enable posture
   as the NetBird and certificate modules.
@@ -3041,6 +3041,24 @@ server-side-enforced behavior — it is honest only as flag-gated experiment);
 hardcoding the vendor constants inline across packages (they must be correctable in
 one place against a live vendor); and shipping the master flag **on** by default (a
 ToS-restricted, experimental path must be opt-in).
+
+**Follow-ups landed under the same flag (no new decision).** Three changes built on
+this entity without altering any of the five choices. *Credential validation:*
+four model-independent probes (an OpenAI and an Anthropic one for each of the two
+auth types) classify a credential as valid, invalid (HTTP 401 only) or
+unverifiable, fail-soft, so a token import refuses a definitively rejected token
+but is never blocked by an unreachable vendor, and an owner-only test-connection
+endpoint (`POST /api/portal/vendor-accounts/{id}/check`) reports the same verdict;
+the two subscription probe endpoints are reverse-engineered and join the
+VERIFY-LIVE constants of choice (c) (as plain constants, not part of the
+overridable `Endpoints`). *File-assisted import:* the portal parses a
+Codex `auth.json` or Claude Code `.credentials.json` in the browser and sends only
+the access token, refresh token and expiry to the existing import endpoint, so the
+raw file never leaves the browser. *Catalog by auth type:* an OpenAI subscription
+account is seeded with only the models the Codex backend serves, an `api_key`
+account with the full set (accounts seeded earlier keep their rows; there is no
+backfill). → [External Vendor Accounts §3.5](cross-cutting/external-vendor-accounts.md#35-credential-validation).
+
 → [External Vendor Accounts](cross-cutting/external-vendor-accounts.md),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [Data Model §1](reference/data-model.md#external-vendor-accounts-anbieter),

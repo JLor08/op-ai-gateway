@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useState, type SubmitEvent } from 'react';
+import { useRef, useState, type ChangeEvent, type SubmitEvent } from 'react';
 import {
   Accordion,
   AccordionDetails,
   AccordionSummary,
+  Alert,
   Box,
   Button,
   Divider,
@@ -13,14 +14,23 @@ import {
   Typography,
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
-import type { VendorAccount } from '../api';
-import type { BadgeStatus, PortalApi, Translation } from './shared/types';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
+import type { ConnectVendorAccountImportRequest, VendorAccount } from '../api';
+import type { BadgeStatus, MessageKey, PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { isWebUrl } from './shared/webUrl';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { StatusChip } from './shared/StatusChip';
 import { useToast } from './shared/ToastProvider';
+import { vendorLabel } from './shared/vendorLabel';
+import {
+  isParsedCredentialError,
+  parseCredentialFile,
+  type ParsedCredential,
+  type ParsedCredentialError,
+  type ParsedCredentialErrorCode,
+} from './parseCredentialFile';
 import { VendorDeviceConnect } from './VendorDeviceConnect';
 
 type ConnectBusy = '' | 'import' | 'begin' | 'complete';
@@ -53,6 +63,68 @@ function expiryToRfc3339(local: string): string | undefined {
   return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
 }
 
+// The inverse, to show an extracted RFC 3339 expiry in the datetime-local field:
+// the instant as a LOCAL wall-clock "YYYY-MM-DDTHH:mm". The field only displays it
+// (minutes are all it holds); a file import submits the exact instant, not this.
+function rfc3339ToLocalInput(instant: string): string {
+  const date = new Date(instant);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${String(date.getFullYear()).padStart(4, '0')}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  );
+}
+
+function importRequest(
+  accessToken: string,
+  refreshToken: string,
+  expiresAt: string | undefined,
+): ConnectVendorAccountImportRequest {
+  const refresh = refreshToken.trim();
+  return {
+    access_token: accessToken,
+    ...(refresh !== '' ? { refresh_token: refresh } : {}),
+    ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
+  };
+}
+
+/**
+ * The largest credential file the picker reads. A Codex auth.json or Claude Code
+ * .credentials.json is a few KiB; the cap keeps a wrong (huge) pick from being
+ * pulled into the page. The size is checked BEFORE the file is read.
+ */
+const MAX_CREDENTIAL_FILE_BYTES = 1024 * 1024;
+
+// Each parser error code's localized text. A Record, so a code the parser gains is
+// a compile error here until it has a message in both locales.
+const FILE_ERROR_MESSAGE: Record<ParsedCredentialErrorCode, MessageKey> = {
+  not_json: 'vendorConnectFileErrorNotJson',
+  not_object: 'vendorConnectFileErrorNotObject',
+  unrecognised: 'vendorConnectFileErrorUnrecognised',
+  ambiguous: 'vendorConnectFileErrorAmbiguous',
+  claude_no_access_token: 'vendorConnectFileErrorClaudeNoAccessToken',
+  codex_id_token_only: 'vendorConnectFileErrorCodexIdTokenOnly',
+  codex_no_access_token: 'vendorConnectFileErrorCodexNoAccessToken',
+};
+
+// The parser's English `error` is only the fallback for a code this table does not
+// know (a stale build); it is token-free by construction, so showing it leaks nothing.
+function fileErrorText(t: Translation, error: ParsedCredentialError): string {
+  const key: MessageKey | undefined = FILE_ERROR_MESSAGE[error.code];
+  return key === undefined ? error.error : t[key];
+}
+
+function readFileText(file: File): Promise<string | ArrayBuffer | null> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error ?? new Error('file read failed'));
+    reader.onabort = () => reject(new Error('file read aborted'));
+    reader.readAsText(file);
+  });
+}
+
 /**
  * The "connect a subscription" panel of a vendor account's detail view. Three
  * ways to attach the account to a consumer subscription (all owner-only POSTs,
@@ -67,7 +139,10 @@ function expiryToRfc3339(local: string): string | undefined {
  *  - Device code (OpenAI accounts ONLY -- Anthropic has no device login): see
  *    VendorDeviceConnect. Works for a remote gateway, and polls until approved.
  *  - Token import: tokens the user already holds, with a short guide to where
- *    the Claude Code / Codex command-line clients keep them.
+ *    the Claude Code / Codex command-line clients keep them. The user can paste
+ *    the fields, or pick the client's credential file: it is read and parsed in
+ *    the browser (parseCredentialFile), the right fields are extracted and the
+ *    SAME import is submitted. The raw file never leaves the page.
  *
  * Tokens are WRITE-ONLY secrets: the DTO only says `subscription_connected`,
  * the token inputs are masked, never pre-filled, and cleared on success. The
@@ -101,6 +176,10 @@ export function VendorSubscriptionConnect({
   const [accessToken, setAccessToken] = useState('');
   const [refreshToken, setRefreshToken] = useState('');
   const [expiresAt, setExpiresAt] = useState('');
+  // Why the chosen credential file could not be imported (localized; never carries
+  // any of the file's content), shown inline beside the picker.
+  const [fileError, setFileError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Browser sign-in: the URL the begin call returned (empty = not begun) and
   // the pasted code.
@@ -119,6 +198,7 @@ export function VendorSubscriptionConnect({
     setAccessToken('');
     setRefreshToken('');
     setExpiresAt('');
+    setFileError('');
     setAuthorizeUrl('');
     setCode('');
     setConnectEpoch((epoch) => epoch + 1);
@@ -126,24 +206,78 @@ export function VendorSubscriptionConnect({
     showSuccess(t.vendorConnectSuccess);
   }
 
-  async function submitImport(event: SubmitEvent<HTMLFormElement>) {
-    event.preventDefault();
+  // The one place the token import is sent, from the form and from a credential file.
+  async function runImport(body: ConnectVendorAccountImportRequest) {
     setBusy('import');
     try {
-      const refresh = refreshToken.trim();
-      const expiry = expiryToRfc3339(expiresAt);
-      const updated = await api.connectVendorAccountImport(account.id, {
-        access_token: accessToken,
-        ...(refresh !== '' ? { refresh_token: refresh } : {}),
-        ...(expiry !== undefined ? { expires_at: expiry } : {}),
-      });
+      const updated = await api.connectVendorAccountImport(account.id, body);
       finishConnected(updated);
     } catch (err) {
-      // The typed tokens stay so the user can correct and retry.
+      // The tokens stay in the form so the user can correct and retry.
       showError(formatPortalError(err, t));
     } finally {
       setBusy('');
     }
+  }
+
+  async function submitImport(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await runImport(importRequest(accessToken, refreshToken, expiryToRfc3339(expiresAt)));
+  }
+
+  // Reads and parses the chosen file in the browser. On a problem it sets the
+  // inline error and answers undefined; it never throws.
+  async function readCredential(file: File): Promise<ParsedCredential | undefined> {
+    let text: string | ArrayBuffer | null;
+    try {
+      text = await readFileText(file);
+    } catch {
+      setFileError(t.vendorConnectFileReadFailed);
+      return undefined;
+    }
+    const parsed = parseCredentialFile(file.name, text);
+    if (isParsedCredentialError(parsed)) {
+      setFileError(fileErrorText(t, parsed));
+      return undefined;
+    }
+    // The vendor comes from the file's CONTENT; importing it into the other
+    // vendor's account would only be refused (or, worse, accepted and broken).
+    if (parsed.vendor !== account.vendor) {
+      setFileError(
+        t.vendorConnectFileVendorMismatch(
+          vendorLabel(t, parsed.vendor),
+          vendorLabel(t, account.vendor),
+        ),
+      );
+      return undefined;
+    }
+    return parsed;
+  }
+
+  async function importFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    // Emptied so that choosing the same file again (after fixing it) still fires.
+    event.target.value = '';
+    if (file === undefined) return;
+    setFileError('');
+    if (file.size > MAX_CREDENTIAL_FILE_BYTES) {
+      setFileError(t.vendorConnectFileTooLarge);
+      return;
+    }
+    setBusy('import');
+    const credential = await readCredential(file);
+    if (credential === undefined) {
+      setBusy('');
+      return;
+    }
+    // Show what was extracted, then submit it through the same import as the form.
+    const refresh = credential.refreshToken ?? '';
+    setAccessToken(credential.accessToken);
+    setRefreshToken(refresh);
+    setExpiresAt(
+      credential.expiresAt === undefined ? '' : rfc3339ToLocalInput(credential.expiresAt),
+    );
+    await runImport(importRequest(credential.accessToken, refresh, credential.expiresAt));
   }
 
   async function beginConnect() {
@@ -319,6 +453,35 @@ export function VendorSubscriptionConnect({
             </Typography>
           </AccordionDetails>
         </Accordion>
+        <Box sx={{ ...FORM_GRID_SX, mb: 2 }}>
+          <Box>
+            <Button
+              type="button"
+              variant="outlined"
+              startIcon={<UploadFileIcon />}
+              disabled={busy !== ''}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {t.vendorConnectFileAction}
+            </Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              tabIndex={-1}
+              aria-label={t.vendorConnectFileAction}
+              onChange={(event) => void importFile(event)}
+            />
+            <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+              {t.vendorConnectFileNote}
+            </Typography>
+          </Box>
+          {fileError !== '' && <Alert severity="error">{fileError}</Alert>}
+          <Typography color="text.secondary" variant="body2">
+            {t.vendorConnectManualHint}
+          </Typography>
+        </Box>
         <Box component="form" onSubmit={submitImport} sx={FORM_GRID_SX}>
           <Field
             id="vendor-account-connect-access-token"

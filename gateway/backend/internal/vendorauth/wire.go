@@ -122,6 +122,12 @@ func post(ctx context.Context, c *http.Client, endpoint, contentType string, bod
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
+	return send(c, req)
+}
+
+// send performs req with c (a nil c falls back to defaultHTTPClient) and returns
+// the status and the body, capped at maxResponseBytes.
+func send(c *http.Client, req *http.Request) (int, []byte, error) {
 	if c == nil {
 		c = defaultHTTPClient
 	}
