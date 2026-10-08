@@ -150,7 +150,7 @@ settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for either
 
 | System setting | Values | Default | Effect |
 |---|---|---|---|
-| `vendor_accounts_enabled` | `bool` | **off** | The master module flag. When off the "Anbieter" nav item is hidden, the CRUD/connect endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch + model-listing overlay are no-ops. |
+| `vendor_accounts_enabled` | `bool` | **off** | The master module flag. When off the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch + model-listing overlay are no-ops. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor account and the self-hosted/shared routes (an invalid value is rejected with `system.vendor_account_routing_mode_invalid`). |
 
 See [External Vendor Accounts §6](../cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode).

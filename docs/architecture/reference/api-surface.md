@@ -798,7 +798,7 @@ carries the API key or an OAuth token. The whole surface is gated by the
 | Field | Meaning |
 |---|---|
 | `status` | `valid` (the vendor accepted the credential), `invalid` (the vendor definitively rejected it, HTTP 401), or `unverifiable` (no clean answer: vendor unreachable, rate-limited or unexpected, or nothing to test — an unset API key, an unconnected subscription, or an access token that is expired but refreshable). `unverifiable` says **nothing** about the credential. |
-| `detail` | A short English status phrase (HTTP status and, when the vendor sent one, its short error code). Never contains a credential; the portal shows it only as a secondary technical line, the headline being localized from `status`. |
+| `detail` | A short English status phrase (the HTTP status and, when the vendor sent one, its short error code; the "nothing to test" cases carry an explanatory phrase with no HTTP status, since no request was made). Never contains a credential; the portal shows it only as a secondary technical line, the headline being localized from `status`. |
 | `checked_at` | RFC 3339 UTC time the verdict was produced. |
 
 The verdict is about the **credential only**: no model is named, so a chat that

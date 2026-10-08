@@ -119,8 +119,9 @@ code-paste flow does:
   OpenAI token is a JWT; an Anthropic one is opaque and yields none, which is why
   the file-assisted import below sends the explicit `expiresAt` that a Claude Code
   credential file carries). Without a known expiry the lazy refresh (§3.4) never
-  fires for the token, so an access-only import would stop serving at its first
-  lapse and could never heal through its refresh token.
+  fires for the token, so an import with no known expiry would keep presenting a
+  lapsed access token for good, even when a refresh token was supplied that could
+  have renewed it.
 
 The portal ships a guide for finding the tokens: Claude Code's
 `~/.claude/.credentials.json` (or the macOS Keychain entry, or `claude setup-token`)
@@ -246,9 +247,10 @@ probed only by the explicit test, not when it is saved. At import:
   persist;
 - an access token that is **already expired while a refresh token came with it**
   is not probed at all and reads `unverifiable`: the vendor would answer 401 for
-  an account that heals on its first request through the lazy refresh (§3.4), so a
-  refreshable token is never blocked. Without a refresh token, an expired token
-  can never heal and is probed like any other;
+  an account that heals on its first request through the lazy refresh (§3.4), so an
+  expired-but-refreshable token is never blocked (a token that has not expired
+  and that the vendor answers with 401 is still refused). Without a refresh
+  token, an expired token can never heal and is probed like any other;
 - **account-id backfill (OpenAI).** If the token's claims carried no
   `chatgpt_account_id`, a `valid` answer from `accounts/check` supplies it
   (`default_account_id`, falling back to the first listed account) together with
@@ -281,11 +283,16 @@ check could not run) surfaces as a toast, never as a verdict.
 
 The two subscription endpoints are reverse-engineered and join the other
 VERIFY-LIVE constants (§9). A moved or removed endpoint typically answers 404, a
-redirect or a 5xx and so degrades to `unverifiable`. The residual risk is an
-endpoint that starts answering 401 for a good token: that would read as a false
-`invalid` and refuse an import. The probe URLs are plain constants, not part of
-the overridable OAuth `Endpoints`, so correcting one is a one-line change in
-`constants.go`.
+redirect or a 5xx and so degrades to `unverifiable`. Two residual exposures
+remain, in opposite directions. An endpoint that starts answering 401 for a good
+token would read as a false `invalid` and refuse an import. Conversely, the
+Anthropic subscription probe counts **any** 403 as `valid`, so a profile endpoint
+that is moved or blocked behind a 403 would pass a bad token; and the reason given
+for that exception (a `setup-token` token lacks `user:profile`) is itself inferred
+from the scope names, not confirmed against a live token. The 403 rule is
+therefore part of the VERIFY-LIVE assumption, like the URLs. The probe URLs are
+plain constants, not part of the overridable OAuth `Endpoints`, so correcting
+either is a one-line change in `constants.go`.
 
 ## 4. Serving
 
@@ -429,7 +436,7 @@ gate and the model-listing overlay) reads them uncached:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
-| `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
+| `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor accounts and the self-hosted/shared routes. `vendor_first`: an owned account wins when it serves the requested model. `fallback_only`: an owned account is used only when no self-hosted/shared route exists. |
 
 The frontend reads the master flag through a portal-scoped
@@ -453,7 +460,9 @@ A non-owner gets the **same `404 vendor_account.not_found`** as for a
 non-existent account (the no-existence-leak rule). The `system` scope may **read**
 any account (`GetVendorAccount`), but `ListVendorAccounts` and every **write**
 (create/update/delete/connect) are owner-only — a deliberate read/write
-asymmetry. Routing enforces the same owner scope by enumerating only the
+asymmetry. The **test-connection** action (§3.5) is not a write but is owner-only
+for the `system` scope too, because it uses the stored credential: it is
+authorized like a write, not like a metadata read. Routing enforces the same owner scope by enumerating only the
 principal's own accounts, so one user's account can never serve another's request.
 
 ## 8. Secrets at rest
@@ -463,8 +472,12 @@ mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-th
 
 - The `api_key` and `oauth_tokens` columns are **sealed** with
   `capture.SealSecret` **before** the store write, and opened with
-  `capture.OpenSecret` only at the cipher-holding dispatch edge. A refresh
-  re-seals in place.
+  `capture.OpenSecret` at the cipher-holding dispatch edge **and, for the owner's
+  explicit test-connection (§3.5), inside `portal.Service`** (`checkVendorAccount`).
+  On that second path the opened value goes only to the vendor's own validation
+  URL: it is never returned, logged or echoed in a verdict's `detail`. Likewise a
+  token import probes the plaintext access token the user just submitted, before
+  it is sealed. A refresh re-seals in place.
 - The read-back DTO exposes **presence only** (`api_key_set`,
   `subscription_connected`), never the value. PATCH uses the keep/clear/replace
   `*string` sentinel (nil = keep, `""` = clear, value = replace + reseal), exactly

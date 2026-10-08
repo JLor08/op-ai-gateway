@@ -3011,7 +3011,7 @@ reverse-engineered.
   self-hosted/shared route exists. The resolver reads it through a cached accessor
   invalidated on a settings write.
 - **(e) A master feature flag, off by default.** `vendor_accounts_enabled` (bool,
-  default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect
+  default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect/check
   endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor
   branch and the model-listing overlay are no-ops — the same module-enable posture
   as the NetBird and certificate modules.
@@ -3050,7 +3050,8 @@ unverifiable, fail-soft, so a token import refuses a definitively rejected token
 but is never blocked by an unreachable vendor, and an owner-only test-connection
 endpoint (`POST /api/portal/vendor-accounts/{id}/check`) reports the same verdict;
 the two subscription probe endpoints are reverse-engineered and join the
-VERIFY-LIVE constants of choice (c). *File-assisted import:* the portal parses a
+VERIFY-LIVE constants of choice (c) (as plain constants, not part of the
+overridable `Endpoints`). *File-assisted import:* the portal parses a
 Codex `auth.json` or Claude Code `.credentials.json` in the browser and sends only
 the access token, refresh token and expiry to the existing import endpoint, so the
 raw file never leaves the browser. *Catalog by auth type:* an OpenAI subscription
