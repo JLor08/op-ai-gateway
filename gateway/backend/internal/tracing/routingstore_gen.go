@@ -1708,6 +1708,18 @@ func (_d *RoutingStoreWithTracing) UpsertTelemetry(ctx context.Context, telemetr
 	return _d.Store.UpsertTelemetry(ctx, telemetry)
 }
 
+func (_d *RoutingStoreWithTracing) UpsertVendorAccountUsage(ctx context.Context, u _sourceRouting.VendorAccountUsage) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertVendorAccountUsage")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertVendorAccountUsage(ctx, u)
+}
+
 func (_d *RoutingStoreWithTracing) UsageAggregateSince(ctx context.Context, principalType string, principalID string, since time.Time) (requests int64, tokens int64, cost float64, err error) {
 	ctx, span := Start(ctx, "routing.Store.UsageAggregateSince")
 	defer span.End()
@@ -1742,6 +1754,18 @@ func (_d *RoutingStoreWithTracing) VendorAccountModels(ctx context.Context, acco
 		}
 	}()
 	return _d.Store.VendorAccountModels(ctx, accountID)
+}
+
+func (_d *RoutingStoreWithTracing) VendorAccountUsageByID(ctx context.Context, accountID string) (v1 _sourceRouting.VendorAccountUsage, b1 bool, err error) {
+	ctx, span := Start(ctx, "routing.Store.VendorAccountUsageByID")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.VendorAccountUsageByID(ctx, accountID)
 }
 
 func (_d *RoutingStoreWithTracing) VendorAccounts(ctx context.Context) (va1 []_sourceRouting.VendorAccount, err error) {

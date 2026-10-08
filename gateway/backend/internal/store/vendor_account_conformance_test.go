@@ -180,3 +180,107 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		}
 	})
 }
+
+// normalizeVendorAccountUsageForCompare makes two routing.VendorAccountUsage
+// values comparable across dialects: postgres returns timestamps in a different
+// *time.Location, so every time (the two optional resets and UpdatedAt) is
+// compared as a UTC wall-clock value. nil reset pointers are left nil.
+func normalizeVendorAccountUsageForCompare(in routing.VendorAccountUsage) routing.VendorAccountUsage {
+	out := in
+	out.UpdatedAt = in.UpdatedAt.UTC()
+	if in.FiveHourResetAt != nil {
+		t := in.FiveHourResetAt.UTC()
+		out.FiveHourResetAt = &t
+	}
+	if in.WeeklyResetAt != nil {
+		t := in.WeeklyResetAt.UTC()
+		out.WeeklyResetAt = &t
+	}
+	return out
+}
+
+func vendorAccountUsageEqual(a, b routing.VendorAccountUsage) bool {
+	na, nb := normalizeVendorAccountUsageForCompare(a), normalizeVendorAccountUsageForCompare(b)
+	timePtrEq := func(x, y *time.Time) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return x.Equal(*y)
+	}
+	return na.AccountID == nb.AccountID && na.FiveHourPct == nb.FiveHourPct && na.WeeklyPct == nb.WeeklyPct &&
+		na.CreditBalance == nb.CreditBalance && na.UpdatedAt.Equal(nb.UpdatedAt) &&
+		timePtrEq(na.FiveHourResetAt, nb.FiveHourResetAt) && timePtrEq(na.WeeklyResetAt, nb.WeeklyResetAt)
+}
+
+// TestRoutingStoreVendorAccountUsageUpsertRoundTrip pins the rate-limit
+// usage-snapshot store on every driver (memory + sqlite + postgres): upsert on an
+// unknown account is ErrNotFound; a read before any upsert is ok=false; a first
+// upsert round-trips every field (including a SET five-hour reset, a NIL weekly
+// reset, an UNKNOWN -1 weekly percent, and a credit string); a second upsert
+// OVERWRITES the whole row (the previously-set reset can be cleared back to nil,
+// the unknown filled in).
+func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	reset5h := now.Add(5 * time.Hour)
+	resetWk := now.Add(7 * 24 * time.Hour)
+	seedSQL := func(t *testing.T, s *SQLStore) {
+		if err := s.CreateUser(context.Background(), newTestUser("u_vu", "vu@example.test", now)); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	forEachRoutingStoreSeeded(t, seedSQL, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+
+		// Upsert against a non-existent account is ErrNotFound (the FK on the SQL
+		// drivers; the explicit existence check in memory).
+		if err := s.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{AccountID: "nope", UpdatedAt: now}); !errors.Is(err, storeerr.ErrNotFound) {
+			t.Fatalf("upsert unknown account err = %v, want ErrNotFound", err)
+		}
+
+		if err := s.CreateVendorAccount(ctx, routing.VendorAccount{
+			ID: "va_u", OwnerUserID: "u_vu", Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription,
+			Name: "sub", Status: routing.VendorAccountStatusActive, OAuthTokens: "enc:t", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+
+		// No snapshot yet.
+		if _, ok, err := s.VendorAccountUsageByID(ctx, "va_u"); err != nil || ok {
+			t.Fatalf("usage before any upsert: ok = %v, err = %v, want ok=false", ok, err)
+		}
+
+		first := routing.VendorAccountUsage{
+			AccountID: "va_u", FiveHourPct: 42.5, FiveHourResetAt: &reset5h,
+			WeeklyPct: -1, WeeklyResetAt: nil, CreditBalance: "12.34", UpdatedAt: now,
+		}
+		if err := s.UpsertVendorAccountUsage(ctx, first); err != nil {
+			t.Fatalf("first upsert: %v", err)
+		}
+		got, ok, err := s.VendorAccountUsageByID(ctx, "va_u")
+		if err != nil || !ok {
+			t.Fatalf("read after first upsert: ok = %v, err = %v", ok, err)
+		}
+		if !vendorAccountUsageEqual(got, first) {
+			t.Fatalf("first round-trip mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",
+				got, got.FiveHourResetAt, got.WeeklyResetAt, first, first.FiveHourResetAt, first.WeeklyResetAt)
+		}
+
+		// A second upsert OVERWRITES the whole row: the previously-set five-hour
+		// reset is cleared to nil, the weekly fields are filled in, the credit changes.
+		second := routing.VendorAccountUsage{
+			AccountID: "va_u", FiveHourPct: 0, FiveHourResetAt: nil,
+			WeeklyPct: 88.75, WeeklyResetAt: &resetWk, CreditBalance: "", UpdatedAt: now.Add(time.Minute),
+		}
+		if err := s.UpsertVendorAccountUsage(ctx, second); err != nil {
+			t.Fatalf("second upsert: %v", err)
+		}
+		got2, ok, err := s.VendorAccountUsageByID(ctx, "va_u")
+		if err != nil || !ok {
+			t.Fatalf("read after second upsert: ok = %v, err = %v", ok, err)
+		}
+		if !vendorAccountUsageEqual(got2, second) {
+			t.Fatalf("second round-trip mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",
+				got2, got2.FiveHourResetAt, got2.WeeklyResetAt, second, second.FiveHourResetAt, second.WeeklyResetAt)
+		}
+	})
+}

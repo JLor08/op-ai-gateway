@@ -145,6 +145,12 @@ type MemoryStore struct {
 	// VendorAccountModel holds no pointers, so a copy is a plain slice copy.
 	// Deleting the account drops its whole entry (see DeleteVendorAccount).
 	vendorAccountModels map[string][]VendorAccountModel
+	// vendorAccountUsage mirrors vendor_account_usage: account id -> the latest
+	// rate-limit snapshot scraped from that account's upstream responses (one row
+	// per account). VendorAccountUsage holds *time.Time pointers, so a copy must
+	// deep-copy them (see copyVendorAccountUsage). Deleting the account drops its
+	// entry (see DeleteVendorAccount), mirroring the SQL ON DELETE CASCADE FK.
+	vendorAccountUsage map[string]VendorAccountUsage
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -182,6 +188,7 @@ func NewMemoryStore() *MemoryStore {
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
 		vendorAccounts:           map[string]VendorAccount{},
 		vendorAccountModels:      map[string][]VendorAccountModel{},
+		vendorAccountUsage:       map[string]VendorAccountUsage{},
 	}
 }
 
@@ -2318,6 +2325,14 @@ func sortedByFirstSeen(byID map[string]time.Time) []string {
 // slices or maps, so a stored/returned account never aliases the caller's.
 func copyVendorAccount(a VendorAccount) VendorAccount { return a }
 
+// copyVendorAccountUsage deep-copies the snapshot's two *time.Time fields so a
+// stored/returned value never aliases the caller's reset pointers.
+func copyVendorAccountUsage(u VendorAccountUsage) VendorAccountUsage {
+	u.FiveHourResetAt = copyTimePtr(u.FiveHourResetAt)
+	u.WeeklyResetAt = copyTimePtr(u.WeeklyResetAt)
+	return u
+}
+
 func copyAIServer(host AIServer) AIServer {
 	host.LastSeenAt = copyTimePtr(host.LastSeenAt)
 	return host
@@ -2856,10 +2871,9 @@ func (m *MemoryStore) vendorAccountsLocked(keep func(VendorAccount) bool) []Vend
 	return out
 }
 
-// DeleteVendorAccount removes the account and its model rows (the SQL drivers
-// cascade them through the ON DELETE CASCADE FK). An unknown id is ErrNotFound.
-// The usage-snapshot child table still has no memory counterpart, so there is
-// nothing further to drop; the milestone that adds its map must delete it here.
+// DeleteVendorAccount removes the account and its child rows -- the model catalog
+// and the usage snapshot -- mirroring the SQL drivers' two ON DELETE CASCADE FKs.
+// An unknown id is ErrNotFound.
 func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2868,6 +2882,7 @@ func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	}
 	delete(m.vendorAccounts, id)
 	delete(m.vendorAccountModels, id)
+	delete(m.vendorAccountUsage, id)
 	return nil
 }
 
@@ -2908,4 +2923,31 @@ func (m *MemoryStore) SetVendorAccountModels(_ context.Context, accountID string
 	}
 	m.vendorAccountModels[accountID] = stored
 	return nil
+}
+
+// UpsertVendorAccountUsage inserts or replaces accountID's single usage-snapshot
+// row. The account must exist (an unknown id is ErrNotFound, mirroring the SQL
+// FK). The stored value is deep-copied so it never aliases the caller's reset
+// pointers.
+func (m *MemoryStore) UpsertVendorAccountUsage(_ context.Context, u VendorAccountUsage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vendorAccounts[u.AccountID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	m.vendorAccountUsage[u.AccountID] = copyVendorAccountUsage(u)
+	return nil
+}
+
+// VendorAccountUsageByID returns accountID's usage snapshot; ok is false when no
+// snapshot has been upserted for it yet (not an error). The returned value never
+// aliases stored state.
+func (m *MemoryStore) VendorAccountUsageByID(_ context.Context, accountID string) (VendorAccountUsage, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.vendorAccountUsage[accountID]
+	if !ok {
+		return VendorAccountUsage{}, false, nil
+	}
+	return copyVendorAccountUsage(u), true, nil
 }

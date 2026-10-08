@@ -230,6 +230,26 @@ type VendorAccountModel struct {
 	APIFlavor     string
 }
 
+// VendorAccountUsage is the latest rate-limit usage snapshot scraped from a
+// vendor account's upstream responses (vendor_account_usage, one row per account,
+// migration 82). The two percentages are NORMALIZED to a percent scale (0..100)
+// across vendors (Anthropic reports a 0..1 utilization fraction, OpenAI/Codex a
+// 0..100 used-percent); a value of -1 means UNKNOWN -- the header was absent or
+// unparseable, deliberately distinct from a real 0% so the panel can show "n/a"
+// rather than a false "0% used". The reset times are nil when the vendor sent no
+// reset; CreditBalance is the vendor's raw credit string ("" when none). The
+// scraper upserts this best-effort after a served request; a parse/store failure
+// never faults the inference request.
+type VendorAccountUsage struct {
+	AccountID       string
+	FiveHourPct     float64    // 0..100, or -1 = unknown (the five-hour / "primary" window)
+	FiveHourResetAt *time.Time // when the five-hour window resets; nil = unknown
+	WeeklyPct       float64    // 0..100, or -1 = unknown (the weekly / "secondary" window)
+	WeeklyResetAt   *time.Time // when the weekly window resets; nil = unknown
+	CreditBalance   string     // the vendor's raw credit-balance string; "" = unknown/none
+	UpdatedAt       time.Time
+}
+
 // Service is a Service Account (Phase 1 service accounts): an autonomous
 // principal that owns 0..N service tokens (api_tokens with kind="service"),
 // managed like an AI-Server — created by an admin, then administered by its
@@ -2198,6 +2218,19 @@ type VendorAccountStore interface {
 	// unknown account is ErrNotFound (even for an empty set); a duplicate
 	// GatewayModel within the set is ErrConflict.
 	SetVendorAccountModels(ctx context.Context, accountID string, models []VendorAccountModel) error
+
+	// UpsertVendorAccountUsage inserts or replaces the single rate-limit usage
+	// snapshot row for u.AccountID (one row per account). The account must exist --
+	// an unknown id is ErrNotFound (the FK). The whole row is overwritten on
+	// conflict, so an UNKNOWN field must be passed as -1 / nil / "" (never a
+	// fabricated 0), matching the snapshot's own unknown convention. Called
+	// best-effort by the usage scraper; a failure is logged, never propagated into
+	// the inference request.
+	UpsertVendorAccountUsage(ctx context.Context, u VendorAccountUsage) error
+	// VendorAccountUsageByID returns accountID's usage snapshot. ok is false when
+	// no snapshot has been scraped for that account yet (not an error), mirroring
+	// RuntimeSpecByMapping's absent-read contract.
+	VendorAccountUsageByID(ctx context.Context, accountID string) (VendorAccountUsage, bool, error)
 }
 
 // Store is the full routing persistence surface: the composition of every
