@@ -540,6 +540,11 @@ type ServiceDeps struct {
 	// TestVendorAccountConnection run. A nil field means the real vendorauth
 	// probe; tests inject fakes so nothing reaches a vendor over the network.
 	VendorValidators VendorCredentialValidators
+	// VendorDiscoverers are the model-list fetchers RefreshVendorAccountModels (and
+	// the connect flows' best-effort discovery) run. A nil field means the real
+	// vendorauth fetcher; tests inject fakes so nothing reaches a vendor over the
+	// network.
+	VendorDiscoverers VendorModelDiscoverers
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -738,6 +743,9 @@ type Service struct {
 	// vendorValidation holds the credential-validation probes and their bounded
 	// http client (see vendorValidationState).
 	vendorValidation vendorValidationState
+	// vendorDiscovery holds the model-discovery fetchers and their bounded http
+	// client (see vendorDiscoveryState).
+	vendorDiscovery vendorDiscoveryState
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -849,6 +857,7 @@ func NewService(deps ServiceDeps) *Service {
 			client:    vendorClient,
 		},
 		vendorValidation:            newVendorValidationState(deps.VendorValidators),
+		vendorDiscovery:             newVendorDiscoveryState(deps.VendorDiscoverers),
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
 		agentTLSPort:                deps.AgentTLSPort,

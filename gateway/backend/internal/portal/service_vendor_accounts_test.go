@@ -34,14 +34,16 @@ func newVendorAccountTestService(t *testing.T, now time.Time) (*Service, *routin
 // the vendor_accounts_enabled master flag switched ON: every vendor-account
 // service method is refused while it is off (ErrVendorAccountsDisabled), so the
 // tests of the methods' own behaviour run with the area enabled. The credential
-// validators are replaced by an all-Unverifiable fake, so no test of the area can
-// reach a vendor over the network; a test that cares about the verdicts installs
-// its own with installFakeVendorValidators.
+// validators and the model-discovery fetchers are replaced by all-Unverifiable
+// fakes, so no test of the area can reach a vendor over the network; a test that
+// cares about the verdicts or the discovered models installs its own with
+// installFakeVendorValidators / installFakeVendorDiscoverers.
 func newVendorAccountTestServiceWithCipher(t *testing.T, now time.Time, cipher *capture.Cipher, volatile bool) (*Service, *routing.MemoryStore) {
 	t.Helper()
 	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, volatile)
 	setVendorAccountsEnabled(t, svc, true)
 	installFakeVendorValidators(svc)
+	installFakeVendorDiscoverers(svc)
 	return svc, routeStore
 }
 

@@ -13,9 +13,11 @@ import "op-ai-gateway/internal/routing"
 // rename, retire and add models without notice, and the subscription path in
 // particular serves whatever the consumer plan currently exposes, so treat every
 // id here as a best-effort snapshot to be re-verified (Milestone 5 spike), not a
-// contract. An account keeps the rows it was seeded with: a change here only
-// affects accounts created afterwards. Existing accounts' rows can be rewritten
-// with SetVendorAccountModels, but no backfill exists yet.
+// contract. This catalog is ONLY the create-time seed and the fallback: the
+// vendor's real model list is discovered from the vendor itself when an account
+// connects and on the explicit refresh (RefreshVendorAccountModels), and replaces
+// these rows; a discovery that cannot be had leaves them in place. A change here
+// only affects accounts created afterwards.
 //
 // The OpenAI set depends on the account's auth type, because the two auth types
 // reach different backends: a subscription account is served by the Codex
@@ -52,24 +54,37 @@ func VendorCatalog(vendor, authType string) []routing.VendorAccountModel {
 	if authType != routing.VendorAuthSubscription && authType != routing.VendorAuthAPIKey {
 		return []routing.VendorAccountModel{}
 	}
-	var (
-		ids    []string
-		flavor string
-	)
+	var ids []string
 	switch vendor {
 	case routing.VendorOpenAI:
-		ids, flavor = openAIAPIKeyModels, routing.APIFlavorOpenAI
+		ids = openAIAPIKeyModels
 		if authType == routing.VendorAuthSubscription {
 			ids = openAISubscriptionModels
 		}
 	case routing.VendorAnthropic:
-		ids, flavor = anthropicModels, routing.APIFlavorAnthropic
+		ids = anthropicModels
 	default:
 		return []routing.VendorAccountModel{}
 	}
+	flavor, _ := vendorAPIFlavor(vendor)
 	out := make([]routing.VendorAccountModel, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, routing.VendorAccountModel{GatewayModel: id, UpstreamModel: id, APIFlavor: flavor})
 	}
 	return out
+}
+
+// vendorAPIFlavor is the wire flavor a vendor's models are served over: OpenAI
+// models over the OpenAI dialect, Anthropic ones over the Anthropic dialect. It is
+// shared by the static seed (VendorCatalog) and the discovered rows
+// (RefreshVendorAccountModels), so the two cannot disagree. ok is false for a
+// vendor with no flavor.
+func vendorAPIFlavor(vendor string) (flavor string, ok bool) {
+	switch vendor {
+	case routing.VendorOpenAI:
+		return routing.APIFlavorOpenAI, true
+	case routing.VendorAnthropic:
+		return routing.APIFlavorAnthropic, true
+	}
+	return "", false
 }

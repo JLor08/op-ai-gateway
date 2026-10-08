@@ -213,10 +213,13 @@ type ConnectVendorAccountImportRequest struct {
 // an OpenAI account the ChatGPT account id and plan are read from the access
 // token's JWT claims and, when the token carries none, backfilled from the probe's
 // Valid answer (after a printable-ASCII, length-capped check), because the
-// dispatch needs the account id for the chatgpt-account-id header. The write is
-// OWNER-ONLY and the response is the credential-free DTO
-// (SubscriptionConnected=true, never a token). ErrVendorAccountsDisabled while
-// the master flag is off.
+// dispatch needs the account id for the chatgpt-account-id header. Once the tokens
+// are stored a best-effort model discovery runs (discoverAfterConnect), so the
+// account serves the models the vendor reports instead of the static seed; it can
+// never fail the import. The write is OWNER-ONLY and the response is the
+// credential-free DTO (SubscriptionConnected=true, never a token, with the
+// discovered models when the discovery produced any). ErrVendorAccountsDisabled
+// while the master flag is off.
 func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID string, req ConnectVendorAccountImportRequest) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -240,7 +243,11 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return s.discoverAfterConnect(ctx, principal, dto), nil
 }
 
 // importedTokenSet builds the token set of a token import from the trimmed access
@@ -325,6 +332,8 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 // A missing or expired entry, or a state mismatch, is ErrVendorAccountConnectState.
 // The seal probe runs before the exchange, so an unstorable result
 // (ErrVendorAccountConnectKeyRequired) never costs the user their one-time code.
+// Once the tokens are stored a best-effort model discovery runs (see
+// ConnectVendorAccountImport); it never fails the connect.
 // OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal auth.Token, accountID, codeAndState string) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
@@ -363,7 +372,7 @@ func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal au
 		return VendorAccountDTO{}, err
 	}
 	s.vendorConnect.clear(acc.ID, pending.state)
-	return dto, nil
+	return s.discoverAfterConnect(ctx, principal, dto), nil
 }
 
 // exchangeVendorCode trades the authorization code for a token set at the

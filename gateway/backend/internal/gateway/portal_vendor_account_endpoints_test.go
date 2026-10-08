@@ -67,10 +67,29 @@ func vaNoNetworkValidators() portal.VendorCredentialValidators {
 	return portal.VendorCredentialValidators{OpenAISubscription: probe, AnthropicSubscription: probe, OpenAIAPIKey: probe, AnthropicAPIKey: probe}
 }
 
+// vaNoNetworkDiscoverers answers Unverifiable for every model-discovery fetch, so
+// a vendor-account test (a connect runs a best-effort discovery) can never reach a
+// vendor over the network. A test that needs discovered models overrides the
+// fetchers it cares about through the adjust hook below.
+func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
+	fetch := func(context.Context, *http.Client, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		return nil, vendorauth.DiscoveryUnverifiable
+	}
+	return portal.VendorModelDiscoverers{
+		OpenAISubscription: func(context.Context, *http.Client, string, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+			return nil, vendorauth.DiscoveryUnverifiable
+		},
+		AnthropicSubscription: fetch,
+		OpenAIAPIKey:          fetch,
+		AnthropicAPIKey:       fetch,
+	}
+}
+
 // newVendorAccountSettingsTestServerWithDeps is newVendorAccountSettingsTestServer
 // with a hook to adjust the portal.ServiceDeps before the Service is built (the
 // connect tests inject httptest vendor OAuth endpoints this way). The credential
-// probes default to vaNoNetworkValidators before the hook runs.
+// probes and the model-discovery fetchers default to vaNoNetworkValidators /
+// vaNoNetworkDiscoverers before the hook runs.
 func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adjust func(*portal.ServiceDeps)) (*Server, *routing.MemoryStore, *portal.MemorySystemSettings) {
 	t.Helper()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
@@ -91,7 +110,7 @@ func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adj
 	routeStore := routing.NewMemoryStore()
 	recorder := usage.NewRecorder()
 	settings := portal.NewMemorySystemSettings()
-	deps := portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile, VendorValidators: vaNoNetworkValidators()}
+	deps := portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile, VendorValidators: vaNoNetworkValidators(), VendorDiscoverers: vaNoNetworkDiscoverers()}
 	if adjust != nil {
 		adjust(&deps)
 	}

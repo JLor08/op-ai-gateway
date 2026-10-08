@@ -59,9 +59,10 @@ type VendorAccountUsageDTO struct {
 // the APIKeySet / SubscriptionConnected booleans (write-only secrets), and the
 // owner is implicit (every caller sees only their own accounts).
 //
-// ModelPrefix is the account's optional model-id namespace ("" = none). It is
-// stored and reported here; applying it to the gateway model ids is the model
-// listing's concern, not this DTO's.
+// ModelPrefix is the account's optional model-id namespace ("" = none): every
+// model the account serves is listed and requested as ModelPrefix + the vendor's
+// model id (a model's GatewayModel), while the vendor is still asked for its own
+// id (UpstreamModel).
 //
 // Usage is the rate-limit snapshot and is filled by GetVendorAccount ONLY (the
 // detail view's Usage & Limits panel): the list and the write endpoints leave it
@@ -364,9 +365,11 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err := s.routes.CreateVendorAccount(ctx, acc); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	// Seed the vendor's curated model catalog so the account is routable from
-	// the start. An account without its rows would silently serve nothing, so a
-	// seeding failure fails the create and removes the half-made account.
+	// Seed the vendor's curated model catalog (under the account's prefix) so the
+	// account is routable from the start. It is only a fallback: a connected
+	// account replaces it with what the vendor reports (RefreshVendorAccountModels).
+	// An account without its rows would silently serve nothing, so a seeding
+	// failure fails the create and removes the half-made account.
 	//
 	// The most plausible reason a seed fails on a SQL driver is that ctx died
 	// (the client went away, the request timed out); a cleanup on that same ctx
@@ -375,7 +378,8 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	// cancellation and bounded by vendorAccountCleanupTimeout. If it fails too,
 	// the account is left behind unseeded and BOTH faults are returned, so the
 	// double fault is visible rather than dropped.
-	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, VendorCatalog(vendor, authType)); err != nil {
+	seed, _ := relabelVendorModels(VendorCatalog(vendor, authType), modelPrefix)
+	if err := s.routes.SetVendorAccountModels(ctx, acc.ID, seed); err != nil {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vendorAccountCleanupTimeout)
 		defer cancel()
 		if delErr := s.routes.DeleteVendorAccount(cctx, acc.ID); delErr != nil {
@@ -486,6 +490,16 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 			return VendorAccountDTO{}, ErrVendorAccountNotFound
 		}
 		return VendorAccountDTO{}, err
+	}
+	// A request that carries a prefix re-labels the account's model rows to it
+	// (prefix + upstream id, no re-discovery). It is keyed on the request, not on
+	// a changed value, so re-sending the stored prefix heals rows a failed
+	// re-label left behind; relabelVendorAccountModels writes only when a row
+	// actually differs.
+	if req.ModelPrefix != nil {
+		if err := s.relabelVendorAccountModels(ctx, acc); err != nil {
+			return VendorAccountDTO{}, err
+		}
 	}
 	return s.vendorAccountDTO(ctx, acc)
 }
