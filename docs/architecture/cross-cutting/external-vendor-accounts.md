@@ -27,8 +27,8 @@ first-class account entity (§1), an OAuth subsystem — connect + token refresh
 tells a rejected login from a wrong model (§3.5), a small native Anthropic
 Messages client and an OpenAI Responses translate client (`internal/provider`,
 §4), two static dispatch extensions (extra headers + a system-prompt masquerade,
-§4), a usage/limits snapshot scraped from vendor rate-limit response headers
-(§5), and a discovery of each account's real model catalog from the vendor,
+§4), a usage/limits snapshot fed by the vendor's rate-limit response headers and,
+for an OpenAI subscription, an active usage pull (§5), and a discovery of each account's real model catalog from the vendor,
 served under an optional per-account prefix (§6).
 
 ## 1. The entity and its ownership
@@ -441,16 +441,26 @@ upstream rather than a missing API version. The api-key path is unchanged: its
 sealed `APIToken` rides the vendor's own API-key header. The custom `x-api-key`
 header is redacted in payload capture (a latent leak the feature closed).
 
-## 5. Usage & limits (header scraping)
+## 5. Usage & limits
 
 Neither vendor exposes an absolute subscription cap, so the panel shows
-**percentages and reset times only**. At the single `recordUsage` choke point
-(`internal/gateway/inference_complete.go`), when the served target is a vendor
-account, the gateway scrapes the vendor's **rate-limit response headers** — which
-it already has in hand, so no extra request is made — and upserts a per-account
-snapshot (`vendor_account_usage`). The scrape is **entirely best-effort**: it
-never faults the inference request, logs only the account id (never a header value
-or a token), and never overwrites a good snapshot with an all-unknown one.
+**percentages and reset times only**. They live in one per-account snapshot
+(`vendor_account_usage`) that two independent, best-effort writers fill: a
+**passive header scrape** on every served request (§5.1) and, for an OpenAI
+subscription only, an **active pull** from the vendor's usage endpoint whenever
+the account's models are refreshed (§5.2). Both write through the same **merge
+rule** (§5.3), so neither can blank what the other learned.
+
+### 5.1 Passive header scraping
+
+At the single `recordUsage` choke point (`internal/gateway/inference_complete.go`),
+when the served target is a vendor account, the gateway scrapes the vendor's
+**rate-limit response headers** — which it already has in hand, so no extra
+request is made — and writes the per-account snapshot. The scrape is **entirely
+best-effort**: it never faults the inference request, logs only the account id
+(never a header value or a token), and never writes an all-unknown snapshot (a
+response that carries none of the recognized headers leaves the stored snapshot
+alone). What it does parse is merged over the stored row (§5.3).
 
 | Vendor | Headers (lowercased; VERIFY-LIVE) | Normalization |
 |---|---|---|
@@ -459,11 +469,119 @@ or a token), and never overwrites a good snapshot with an all-unknown one.
 
 Parsing is **tolerant**: a missing/non-numeric value leaves the window at its
 unknown sentinel (`-1` percent, nil reset), never a fabricated `0`; a scaled
-percent is clamped to `≤ 100`. The snapshot is exposed only on the **detail**
-read (`GET /api/portal/vendor-accounts/{id}` → `VendorAccountDTO.Usage`,
-`omitempty`), never on the list (one snapshot read per row would be an N+1), and a
-`-1` window is hidden in the UI rather than shown as a real 0 %. API-key accounts
-carry no subscription window; absolute €/$ spend accounting is deferred.
+percent is clamped to `≤ 100`.
+
+### 5.2 Active pull (OpenAI subscription only)
+
+The headers arrive only with a served request, so a ChatGPT subscription that has
+not been used lately shows no windows, or old ones. For that one account kind the
+gateway can also **ask** the vendor. An OpenAI `api_key` account (a platform
+account has no subscription window to report) and every Anthropic account have no
+such endpoint; for Anthropic the header scrape stays the only source.
+
+| Credential | Request | Provenance |
+|---|---|---|
+| OpenAI **subscription** | `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `User-Agent: codex-cli`; no query, no body | reverse-engineered from the open-source Codex client, **VERIFY-LIVE** — not yet confirmed against a live account |
+
+The fetcher is `vendorauth.FetchOpenAISubscriptionUsage` (`internal/vendorauth/usage.go`),
+built like the discovery fetchers (§6): one GET, **no error return**, only a
+snapshot and a status, `ok` or `unverifiable`. The URL and the `User-Agent` live in
+`constants.go` beside the other VERIFY-LIVE constants. The body is mapped as
+`rate_limit.primary_window` → the five-hour window and `rate_limit.secondary_window`
+→ the weekly one (each `used_percent` and `reset_at`, an absolute unix time in
+seconds), and `credits.balance` → the credit balance. The other fields of the
+`credits` object, `has_credits` and `unlimited`, are **not read** (follow-up, below).
+
+Parsing is as tolerant as the scrape's, and for the same reason: a percent is
+clamped to `≤ 100` and a negative one is unknown; an absent, null or `0` reset is
+unknown; a balance is kept as the string the vendor wrote (a JSON number is
+coerced to its literal, one longer than 64 bytes is unknown); a field of the wrong
+type is skipped without sinking its siblings. The verdict is `ok` only when **at
+least one** field could be read. Every other answer — any non-2xx (a 401 included:
+it is no verdict on the credential, and only the dispatch moves an account to
+`needs_reconnect`), a redirect (never followed), a timeout, a transport failure, a
+body that is not JSON, or JSON that carries none of the fields — is `unverifiable`,
+and an empty answer is deliberately not "OK, nothing known", for the reason given
+for discovery (§6.3): it must not be able to wipe a stored snapshot. The response
+is capped at the same 8 MiB as a discovery fetch (§6.4).
+
+**When it runs.** The pull is the **last, best-effort step of
+`RefreshVendorAccountModels`** (§6), so it runs wherever that does: on the explicit
+`POST .../models/refresh` ("Modelle aktualisieren") and, because the connect flows
+call the same function, at the end of every subscription connect (§6.2). There is
+no separate usage endpoint, trigger, background job or startup step. Specifically:
+
+- It reuses the **token set the model discovery already opened** and, if it had
+  expired, renewed through the gateway's locked refresher (§6.3). The usage code
+  never opens, renews or refreshes a token itself, and a token that could not be
+  renewed means no pull.
+- It runs only when the refresh itself did not fail with an error, and **also when
+  the model list was unusable** (the refresh then reads `unverifiable` and keeps
+  the models): the usage endpoint is a separate request that may well succeed.
+- It runs **after** the model rows are written, so a slow usage endpoint can never
+  starve the model write of the connect-time bound.
+- It is purely additive: it cannot change the refresh's result, its account view or
+  its error, the pull itself never changes the account's status, and it logs only
+  the account id at Debug — never the token, the ChatGPT account id or any vendor
+  text.
+
+**Time budget.** The explicit refresh now makes up to **two** vendor requests, each
+bounded by the discovery client's 10 seconds (the model list, then usage), so it can
+take about 20 seconds against the server's 30 second write timeout. The connect
+flows stay inside their single 5 second budget (§6.2), which the usage pull
+**shares** with the token renewal, the model list and the model write: behind a
+slow model list the budget is spent and the pull degrades to `unverifiable`,
+leaving the snapshot as it was. That is acceptable for an advisory number, and the
+next refresh or served request fills it in.
+
+### 5.3 The merge rule
+
+`UpsertVendorAccountUsage` replaces the whole row, and each writer sees only part of
+the picture: the OpenAI scrape carries the credit balance only when the response
+does, and a pull may know the windows but not the balance. If a write simply
+replaced the row, a partial reading would blank known values. So **every usage
+write keeps each known field and never blanks a stored one**, not merely "never
+replaces a good snapshot with an all-unknown one".
+Both writers read the stored row and combine it with their reading through
+`routing.MergeVendorAccountUsage(existing, incoming)`, a pure function. Per field the
+result takes `incoming` when it **knows** the field and keeps `existing` otherwise:
+a percent is known when it is `≥ 0` (a real `0` is known, `-1` is not), a reset time
+when non-nil, the credit balance when non-empty. A field no writer has ever seen
+stays unknown (`-1` / nil / `""`) and is never turned into a fabricated `0`: with no
+stored row, the reading is written as it is. A stored row that cannot be read is
+handled per writer, both best-effort: the scrape writes its own reading as it is,
+the pull writes nothing.
+
+Two consequences to know:
+
+- `UpdatedAt` is the time of the **last write**, not a per-field freshness. A credit
+  balance carried over a scrape that only reported the windows still shows the
+  fresh `UpdatedAt`, so the panel's "updated" time says when the snapshot was last
+  touched, not how old each number is.
+- The read-merge-write takes **no per-account lock**, in either writer. Two that
+  overlap (a scrape during a refresh) can each merge against a read that misses the
+  other's newer write, and the later write wins. The worst case is one writer's
+  fresh reading being lost to the other's slightly older one, which the next write
+  repairs; a field that was already stored when both read is never blanked. This is
+  accepted for a best-effort snapshot; closing it would need a store-level merge
+  upsert.
+
+### 5.4 Reading it, and what is deferred
+
+The snapshot is exposed only on the **detail** read (`GET /api/portal/vendor-accounts/{id}`
+→ `VendorAccountDTO.Usage`, `omitempty`), never on the list (one snapshot read per
+row would be an N+1), and a `-1` window is hidden in the UI rather than shown as a
+real 0 %. The detail view's usage panel **re-reads** the account after a successful
+models refresh — whatever its `ok` / `unverifiable` answer, since the pull may have
+changed the snapshot either way — so a fresh pull shows without reloading the page;
+a refresh that failed with an error does not trigger it. API-key accounts carry no
+subscription window; absolute €/$ spend accounting is deferred.
+
+Deliberately **not** in this change, and listed as follow-ups: the credit object's
+`has_credits` and `unlimited` flags (so a plan with no credit balance cannot yet be
+told apart from a balance the vendor did not send), and a **dedicated
+`POST .../usage/refresh` endpoint**, so the usage can be refreshed without also
+re-listing the models.
 
 ## 6. Dynamic model discovery and the model prefix
 
@@ -515,7 +633,8 @@ account keeps its static seed.
 
 - **At connect.** After a subscription's tokens are stored — by token import,
   code paste or device code alike — a discovery runs best-effort under a bound
-  of 5 seconds for the whole of it (token refresh, fetch and write). A vendor
+  of 5 seconds for the whole of it (token refresh, fetch and write, and for an
+  OpenAI subscription the usage pull that follows, §5.2). A vendor
   that hangs adds at most that to the connect; whatever goes wrong is logged
   without a credential and the connect still succeeds with the models it had.
   The import and complete responses carry the account as it then serves; the
@@ -523,7 +642,8 @@ account keeps its static seed.
 - **On demand.** `POST /api/portal/vendor-accounts/{id}/models/refresh` — the
   "Modelle aktualisieren" button of the account's Models panel in the detail view
   — runs the same discovery and may wait for the vendor client's own 10 second
-  timeout ([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
+  timeout, twice for an OpenAI subscription (the model list, then the usage pull
+  of §5.2; [API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
   An `api_key` account has no connect step, so this is how it leaves the static
   seed.
 - **Never otherwise.** No request path, background job or startup step runs a
@@ -709,8 +829,8 @@ mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-th
   `capture.OpenSecret` at the cipher-holding dispatch edge **and, for the owner's
   explicit test-connection (§3.5) and model refresh (§6.3), inside
   `portal.Service`** (`checkVendorAccount`, `RefreshVendorAccountModels`).
-  On those paths the opened value goes only to the vendor's own validation or
-  model-listing URL: it is never returned, logged or echoed in a verdict's or a
+  On those paths the opened value goes only to the vendor's own validation,
+  model-listing or (OpenAI subscription) usage URL: it is never returned, logged or echoed in a verdict's or a
   refresh's `detail`. Likewise a token import probes the plaintext access token
   the user just submitted, before it is sealed. A refresh re-seals in place.
 - The read-back DTO exposes **presence only** (`api_key_set`,
@@ -739,8 +859,9 @@ reasons are recorded deliberately, not in denial of them
   only for use with Claude Code; the forced `You are Claude Code` system block).
   The feature must degrade gracefully when a vendor blocks or changes behavior.
 - **Every subscription constant is reverse-engineered and VERIFY-LIVE.** Each
-  endpoint (including the two subscription credential-validation probes, §3.5, and
-  the two subscription model-list endpoints, §6.1),
+  endpoint (including the two subscription credential-validation probes, §3.5, the
+  two subscription model-list endpoints, §6.1, and the ChatGPT usage endpoint,
+  §5.2),
   client id, redirect URI, scope, beta header, device-code path, token-claim name,
   masquerade requirement, serving host, request/refresh body encoding, and the
   rate-limit response-header names can change without notice.
