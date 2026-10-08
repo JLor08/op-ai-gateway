@@ -341,9 +341,9 @@ describe('parseCredentialFile: an expiry outside the years RFC 3339 can write', 
   it('drops an expiry before year 0000', () => {
     const text = JSON.stringify({ claudeAiOauth: { accessToken: 'tok', expiresAt: -1e14 } });
 
-    expect(expectCredential(parseCredentialFile('.credentials.json', text)).expiresAt).toBe(
-      undefined,
-    );
+    expect(
+      expectCredential(parseCredentialFile('.credentials.json', text)).expiresAt,
+    ).toBeUndefined();
   });
 
   it('keeps the last representable instants', () => {

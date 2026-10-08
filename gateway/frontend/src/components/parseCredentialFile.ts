@@ -108,7 +108,7 @@ function jwtExpiry(token: string): string | undefined {
     // base64url -> base64. atob() accepts the missing '=' padding (forgiving-base64)
     // and yields one char per byte; only `exp` is read and any multi-byte text sits
     // inside JSON strings, so there is no need to decode the bytes as UTF-8.
-    const claims: unknown = JSON.parse(atob(segments[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const claims: unknown = JSON.parse(atob(segments[1].replaceAll('-', '+').replaceAll('_', '/')));
     if (!isJsonObject(claims) || typeof claims.exp !== 'number') return undefined;
     return toRfc3339(claims.exp * 1000);
   } catch {

@@ -1097,7 +1097,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         // Valid JSON padded to exactly 1 MiB: the cap is inclusive.
         const json = JSON.stringify(claudeFile({ padding: '' }));
         const padded = json.slice(0, -1) + ' '.repeat(1024 * 1024 - json.length) + '}';
-        expect(padded.length).toBe(1024 * 1024);
+        expect(padded).toHaveLength(1024 * 1024);
 
         upload(fileOf('.credentials.json', padded));
 

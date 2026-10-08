@@ -48,6 +48,10 @@ const (
 	StatusUnverifiable
 )
 
+// authBearerPrefix is the Authorization-header scheme every bearer probe uses
+// ("Bearer " + the access token or api key).
+const authBearerPrefix = "Bearer "
+
 // String returns "valid", "invalid" or "unverifiable" ("unknown" for a value that
 // is none of them).
 func (s CredentialStatus) String() string {
@@ -99,7 +103,7 @@ const (
 func ValidateOpenAISubscription(ctx context.Context, httpClient *http.Client, accessToken string) CredentialCheck {
 	check, body := runProbe(ctx, httpClient, probeSpec{
 		url:     OpenAIAccountsCheckURL,
-		headers: map[string]string{"Authorization": "Bearer " + accessToken},
+		headers: map[string]string{"Authorization": authBearerPrefix + accessToken},
 		secret:  accessToken,
 	})
 	if check.Status == StatusValid {
@@ -118,7 +122,7 @@ func ValidateAnthropicSubscription(ctx context.Context, httpClient *http.Client,
 	check, _ := runProbe(ctx, httpClient, probeSpec{
 		url: AnthropicOAuthProfileURL,
 		headers: map[string]string{
-			"Authorization":     "Bearer " + accessToken,
+			"Authorization":     authBearerPrefix + accessToken,
 			"anthropic-beta":    AnthropicBeta,
 			"anthropic-version": AnthropicAPIVersion,
 		},
@@ -132,7 +136,7 @@ func ValidateAnthropicSubscription(ctx context.Context, httpClient *http.Client,
 func ValidateOpenAIAPIKey(ctx context.Context, httpClient *http.Client, apiKey string) CredentialCheck {
 	check, _ := runProbe(ctx, httpClient, probeSpec{
 		url:     OpenAIModelsURL,
-		headers: map[string]string{"Authorization": "Bearer " + apiKey},
+		headers: map[string]string{"Authorization": authBearerPrefix + apiKey},
 		secret:  apiKey,
 	})
 	return check
