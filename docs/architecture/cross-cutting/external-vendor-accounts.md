@@ -446,18 +446,20 @@ carry no subscription window; absolute €/$ spend accounting is deferred.
 
 ## 6. Feature flag and routing mode
 
-Two system settings govern the feature (both read from the `system_settings`
-store). The **resolver** reads them through a cached accessor that is
+Three system settings govern the feature (all read from the `system_settings`
+store). The **resolver** reads the first two through a cached accessor that is
 **invalidated on the settings PUT** whenever it carries either key
 (`invalidateVendorSettingsCache`), so a portal toggle takes effect on the next
 resolve; the accessor's short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
 **out-of-band** change, such as a direct database edit. `portal.Service` (the CRUD
-gate and the model-listing overlay) reads them uncached:
+gate, the model-listing overlay and the discovery client version) reads them
+uncached, so a PUT is visible on its very next call:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor accounts and the self-hosted/shared routes. `vendor_first`: an owned account wins when it serves the requested model. `fallback_only`: an owned account is used only when no self-hosted/shared route exists. |
+| `vendor_openai_codex_client_version` | version string | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends. The ChatGPT backend **hides every model whose `minimal_client_version` exceeds it**, so a stale value silently hides new models: **raise it when OpenAI ships a newer Codex app** (System settings, no redeploy). Blank resets to the built-in default (`vendorauth.CodexModelsClientVersionDefault`); a malformed value is a `400 system.vendor_openai_codex_client_version_invalid`. Read only by `portal.Service` (never the resolver), so it has no cache. VERIFY-LIVE. |
 
 The frontend reads the master flag through a portal-scoped
 `GET /api/portal/vendor-accounts/enabled` (`{module_enabled}`, readable by any

@@ -906,6 +906,12 @@ type SystemSettingsDTO struct {
 	// vendor accounts and the self-hosted/shared routes: "vendor_first"
 	// (default) or "fallback_only".
 	VendorAccountRoutingMode string `json:"vendor_account_routing_mode"`
+	// VendorOpenAICodexClientVersion is the Codex client_version the OpenAI
+	// subscription model discovery sends (default "26.930.61225", the effective
+	// value, never blank). VERIFY-LIVE: the ChatGPT backend hides every model whose
+	// minimal_client_version exceeds it, so raise it when OpenAI releases a newer
+	// Codex app and a new model is missing from discovery.
+	VendorOpenAICodexClientVersion string `json:"vendor_openai_codex_client_version"`
 
 	// Energy-attribution defaults (purely additive — no engine consumes these
 	// yet; a later phase falls back to them when a per-mapping/per-server
@@ -1071,6 +1077,11 @@ type UpdateSystemSettingsRequest struct {
 	// ErrVendorAccountRoutingModeInvalid.
 	VendorAccountsEnabled    *bool   `json:"vendor_accounts_enabled"`
 	VendorAccountRoutingMode *string `json:"vendor_account_routing_mode"`
+	// VendorOpenAICodexClientVersion: nil = keep the stored value. Trimmed; blank
+	// resets to the built-in default; otherwise it must be a version-shaped token
+	// (digit first, [0-9A-Za-z._+-], at most 64 characters) or the write is rejected
+	// with ErrVendorOpenAICodexClientVersionInvalid.
+	VendorOpenAICodexClientVersion *string `json:"vendor_openai_codex_client_version"`
 
 	// Energy-attribution defaults; nil = keep the stored value. Must be >= 0
 	// when set (0 resets to "unset / no default").
@@ -1592,7 +1603,8 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 
 		// The vendor-accounts flag is off (zero value) and the routing mode is the
 		// default when the store is absent/unreadable.
-		VendorAccountRoutingMode: DefaultVendorAccountRoutingMode,
+		VendorAccountRoutingMode:       DefaultVendorAccountRoutingMode,
+		VendorOpenAICodexClientVersion: DefaultVendorOpenAICodexClientVersion,
 
 		// SMTP defaults hold when the store is absent/unreadable.
 		SMTPPort:    DefaultSMTPPort,
@@ -1602,6 +1614,7 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 		if values, err := s.settings.SystemSettings(ctx); err == nil {
 			dto.VendorAccountsEnabled = VendorAccountsEnabled(values)
 			dto.VendorAccountRoutingMode = VendorAccountRoutingMode(values)
+			dto.VendorOpenAICodexClientVersion = VendorOpenAICodexClientVersion(values)
 
 			dto.EnergyDefaultPricePerKwh = EnergyDefaultPricePerKwh(values)
 			dto.EnergyDefaultPue = EnergyDefaultPue(values)
@@ -1794,6 +1807,15 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 			return SystemSettingsDTO{}, ErrVendorAccountRoutingModeInvalid
 		}
 		writes = append(writes, settingWrite{vendorAccountRoutingModeKey, mode})
+	}
+	if req.VendorOpenAICodexClientVersion != nil {
+		// Blank is stored as "" (= follow the built-in default, which the lenient read
+		// resolves); anything else must be version-shaped.
+		version := strings.TrimSpace(*req.VendorOpenAICodexClientVersion)
+		if version != "" && !isValidVendorOpenAICodexClientVersion(version) {
+			return SystemSettingsDTO{}, ErrVendorOpenAICodexClientVersionInvalid
+		}
+		writes = append(writes, settingWrite{vendorOpenAICodexClientVersionKey, version})
 	}
 	if req.EnergyDefaultPricePerKwh != nil {
 		if err := validateEnergyDefault(*req.EnergyDefaultPricePerKwh); err != nil {

@@ -892,7 +892,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 |---|---|---|---|
 | `/api/system/theme` | GET | **Public** | Active theme descriptor for the pre-login UI |
 | `/api/system/themes/{id}/favicon\|logo` | GET | **Public** | External theme asset (favicon/logo); `{id}` resolved only against the loaded theme registry, never joined onto a filesystem path — no traversal surface |
-| `/api/system/settings` | GET/PUT | `system` | System-wide settings (SMTP, NetBird, certificate gates, currency, the vendor-accounts master flag `vendor_accounts_enabled` and precedence `vendor_account_routing_mode`, etc.) |
+| `/api/system/settings` | GET/PUT | `system` | System-wide settings (SMTP, NetBird, certificate gates, currency, the vendor-accounts master flag `vendor_accounts_enabled`, precedence `vendor_account_routing_mode` and the Codex discovery `vendor_openai_codex_client_version`, etc.) |
 | `/api/system/smtp/test` | POST | `system` | Send a test email with the currently configured/pending SMTP settings |
 | `/api/system/tracing` | GET/PUT | `system` | OpenTelemetry tracing status/config |
 | `/api/system/logs`, `/logs/events`, `/logs/level` | GET, GET (SSE), GET/PUT | `system` | Log buffer snapshot, live tail, runtime log-level control |

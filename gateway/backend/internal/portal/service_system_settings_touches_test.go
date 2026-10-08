@@ -39,6 +39,7 @@ var nonReconcileFields = []string{
 	"RouteAffinitySessionMode",
 	"VendorAccountsEnabled",
 	"VendorAccountRoutingMode",
+	"VendorOpenAICodexClientVersion",
 	"EnergyDefaultPricePerKwh",
 	"EnergyDefaultPue",
 	"EnergyDefaultWhPerToken",

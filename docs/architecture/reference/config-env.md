@@ -144,14 +144,15 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 
 ### Vendor accounts (system settings, no env-var form)
 
-The external-vendor-accounts ("Anbieter") feature is governed by **two system
+The external-vendor-accounts ("Anbieter") feature is governed by **three system
 settings** held in the `system_settings` store and edited in the portal's System
-settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for either:
+settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for any of them:
 
 | System setting | Values | Default | Effect |
 |---|---|---|---|
 | `vendor_accounts_enabled` | `bool` | **off** | The master module flag. When off the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch + model-listing overlay are no-ops. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor account and the self-hosted/shared routes (an invalid value is rejected with `system.vendor_account_routing_mode_invalid`). |
+| `vendor_openai_codex_client_version` | version string (digit first, `[0-9A-Za-z._+-]`, ≤ 64 chars) | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (`/backend-api/codex/models?client_version=<V>`). The backend **hides every model whose `minimal_client_version` exceeds it**, so **raise it when OpenAI ships a newer Codex app** (no redeploy). Blank resets to the default; a malformed value is rejected with `system.vendor_openai_codex_client_version_invalid`. VERIFY-LIVE. |
 
 See [External Vendor Accounts §6](../cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode).
 The subscription path additionally requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY`
