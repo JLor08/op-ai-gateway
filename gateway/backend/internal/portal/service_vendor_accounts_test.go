@@ -270,6 +270,157 @@ func TestVendorAccountAuthorizationIsOwnerOnly(t *testing.T) {
 	}
 }
 
+// A detail read carries the scraped rate-limit snapshot when the gateway has
+// seen one, and nothing (a nil Usage, no "usage" key) while it has not -- the
+// portal then simply hides the Usage & Limits panel.
+func TestGetVendorAccountIncludesTheUsageSnapshotWhenOneExists(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	acc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Work"))
+
+	// No snapshot yet: Usage is nil and is left out of the JSON entirely.
+	before, err := svc.GetVendorAccount(ctx, ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("GetVendorAccount: %v", err)
+	}
+	if before.Usage != nil {
+		t.Fatalf("Usage before any snapshot = %#v, want nil", before.Usage)
+	}
+	rawBefore, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var beforeKeys map[string]json.RawMessage
+	if err := json.Unmarshal(rawBefore, &beforeKeys); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := beforeKeys["usage"]; present {
+		t.Fatalf("a snapshot-less account serialized a usage key: %s", rawBefore)
+	}
+
+	fiveHourReset := now.Add(2*time.Hour + 14*time.Minute)
+	weeklyReset := now.Add(3 * 24 * time.Hour)
+	snapshotAt := now.Add(-time.Minute)
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID:       acc.ID,
+		FiveHourPct:     42.5,
+		FiveHourResetAt: &fiveHourReset,
+		WeeklyPct:       7,
+		WeeklyResetAt:   &weeklyReset,
+		CreditBalance:   "12.34",
+		UpdatedAt:       snapshotAt,
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+
+	got, err := svc.GetVendorAccount(ctx, ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("GetVendorAccount: %v", err)
+	}
+	if got.Usage == nil {
+		t.Fatal("Usage = nil, want the stored snapshot")
+	}
+	if got.Usage.FiveHourPct != 42.5 || got.Usage.WeeklyPct != 7 || got.Usage.CreditBalance != "12.34" {
+		t.Fatalf("Usage = %#v, want 42.5 / 7 / 12.34", got.Usage)
+	}
+	if got.Usage.FiveHourResetAt == nil || !got.Usage.FiveHourResetAt.Equal(fiveHourReset) ||
+		got.Usage.WeeklyResetAt == nil || !got.Usage.WeeklyResetAt.Equal(weeklyReset) {
+		t.Fatalf("reset times = %v / %v, want %v / %v", got.Usage.FiveHourResetAt, got.Usage.WeeklyResetAt, fiveHourReset, weeklyReset)
+	}
+	if !got.Usage.UpdatedAt.Equal(snapshotAt) {
+		t.Fatalf("Usage.UpdatedAt = %v, want %v", got.Usage.UpdatedAt, snapshotAt)
+	}
+
+	// The wire shape the portal reads (snake_case, nested under "usage").
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"five_hour_pct", "five_hour_reset_at", "weekly_pct", "weekly_reset_at", "credit_balance", "updated_at"} {
+		if _, ok := wire.Usage[key]; !ok {
+			t.Fatalf("usage JSON lacks %q: %s", key, raw)
+		}
+	}
+	if wire.Usage["five_hour_pct"] != 42.5 || wire.Usage["credit_balance"] != "12.34" {
+		t.Fatalf("usage JSON = %v", wire.Usage)
+	}
+
+	// The list endpoint stays snapshot-free: reading one row per account would
+	// be an N+1 on the list, and the panel lives on the detail view only.
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil || len(list.Data) != 1 {
+		t.Fatalf("ListVendorAccounts = %#v, %v", list, err)
+	}
+	if list.Data[0].Usage != nil {
+		t.Fatalf("list Usage = %#v, want nil (detail-only)", list.Data[0].Usage)
+	}
+
+	// A system-scope operator reads the same snapshot with the account.
+	sys, err := svc.GetVendorAccount(ctx, systemToken(), acc.ID)
+	if err != nil || sys.Usage == nil || sys.Usage.FiveHourPct != 42.5 {
+		t.Fatalf("system Get = %#v, %v, want the snapshot", sys, err)
+	}
+}
+
+// -1 (unknown) and a nil reset are passed through as-is: the DTO never turns an
+// unknown window into a real 0 %, so the portal can tell "no data yet" from "0 % used".
+func TestGetVendorAccountUsagePassesUnknownWindowsThrough(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	acc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Work"))
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID:   acc.ID,
+		FiveHourPct: 0,
+		WeeklyPct:   -1,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+
+	got, err := svc.GetVendorAccount(ctx, ownerToken(), acc.ID)
+	if err != nil || got.Usage == nil {
+		t.Fatalf("GetVendorAccount = %#v, %v, want a usage snapshot", got, err)
+	}
+	if got.Usage.FiveHourPct != 0 || got.Usage.WeeklyPct != -1 {
+		t.Fatalf("pcts = %v / %v, want 0 / -1", got.Usage.FiveHourPct, got.Usage.WeeklyPct)
+	}
+	if got.Usage.FiveHourResetAt != nil || got.Usage.WeeklyResetAt != nil || got.Usage.CreditBalance != "" {
+		t.Fatalf("Usage = %#v, want nil resets and no credit balance", got.Usage)
+	}
+	raw, _ := json.Marshal(got)
+	var wire struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := wire.Usage["five_hour_reset_at"]; !ok || v != nil {
+		t.Fatalf("five_hour_reset_at = %v (present %v), want an explicit null", v, ok)
+	}
+}
+
+// Another user's account stays a 404-no-leak, snapshot or not.
+func TestGetVendorAccountUsageStaysBehindTheOwnerCheck(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	acc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Work"))
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 10, WeeklyPct: 20, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+	if _, err := svc.GetVendorAccount(ctx, otherToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotFound) {
+		t.Fatalf("stranger Get err = %v, want ErrVendorAccountNotFound", err)
+	}
+}
+
 func TestListVendorAccountsReturnsOnlyThePrincipalsOwn(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)

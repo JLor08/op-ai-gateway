@@ -187,6 +187,59 @@ func TestVendorAccountEndpointsCreateListGet(t *testing.T) {
 	}
 }
 
+// The detail GET -- and only it -- carries the scraped rate-limit snapshot under
+// "usage"; the list and a snapshot-less detail read leave the key out.
+func TestVendorAccountEndpointsGetCarriesTheUsageSnapshot(t *testing.T) {
+	srv, routeStore := newVendorAccountTestServer(t, true)
+	created := vaCreate(t, srv, vaOwnerSecret, "Owner's")
+	path := "/api/portal/vendor-accounts/" + created.ID
+
+	usageOf := func(rec *httptest.ResponseRecorder) (map[string]any, bool) {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var raw struct {
+			Usage map[string]any `json:"usage"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return raw.Usage, raw.Usage != nil
+	}
+
+	if _, has := usageOf(vaDo(t, srv, http.MethodGet, path, vaOwnerSecret, "")); has {
+		t.Fatal("detail GET carried usage before any snapshot exists")
+	}
+
+	resetAt := time.Date(2026, 10, 7, 17, 0, 0, 0, time.UTC)
+	if err := routeStore.UpsertVendorAccountUsage(context.Background(), routing.VendorAccountUsage{
+		AccountID:       created.ID,
+		FiveHourPct:     64,
+		FiveHourResetAt: &resetAt,
+		WeeklyPct:       -1,
+		UpdatedAt:       resetAt.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+
+	usage, has := usageOf(vaDo(t, srv, http.MethodGet, path, vaOwnerSecret, ""))
+	if !has {
+		t.Fatal("detail GET lacks usage although a snapshot exists")
+	}
+	if usage["five_hour_pct"] != float64(64) || usage["weekly_pct"] != float64(-1) || usage["five_hour_reset_at"] != "2026-10-07T17:00:00Z" {
+		t.Fatalf("usage = %v", usage)
+	}
+
+	rec := vaDo(t, srv, http.MethodGet, "/api/portal/vendor-accounts", vaOwnerSecret, "")
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), `"usage"`) {
+		t.Fatalf("list = %d %s, want no usage on the list", rec.Code, rec.Body.String())
+	}
+	if rec := vaDo(t, srv, http.MethodGet, path, vaOtherSecret, ""); rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), `"usage"`) {
+		t.Fatalf("non-owner detail = %d %s, want the plain 404", rec.Code, rec.Body.String())
+	}
+}
+
 // A non-owner gets the SAME 404 as for an unknown id on every item verb, so an
 // account's existence never leaks across users -- and nothing is changed.
 func TestVendorAccountEndpointsCrossUserIs404(t *testing.T) {

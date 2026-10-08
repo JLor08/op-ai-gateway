@@ -30,10 +30,32 @@ type VendorAccountModelDTO struct {
 	APIFlavor     string `json:"api_flavor"`
 }
 
+// VendorAccountUsageDTO is the portal view of a routing.VendorAccountUsage: the
+// latest rate-limit snapshot the gateway scraped off the account's upstream
+// responses. It carries percentages and reset times only -- neither vendor
+// exposes an absolute cap, so there is deliberately no "N of M". A percentage is
+// 0..100, or -1 when that window is UNKNOWN (never observed): the portal must
+// not read -1 as a real 0 % used. A reset time is nil when the vendor sent none;
+// CreditBalance is the vendor's raw credit string ("" = none).
+type VendorAccountUsageDTO struct {
+	FiveHourPct     float64    `json:"five_hour_pct"`
+	FiveHourResetAt *time.Time `json:"five_hour_reset_at"`
+	WeeklyPct       float64    `json:"weekly_pct"`
+	WeeklyResetAt   *time.Time `json:"weekly_reset_at"`
+	CreditBalance   string     `json:"credit_balance"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
 // VendorAccountDTO is the portal view of a routing.VendorAccount. It carries NO
 // credential material: the sealed api key and OAuth token set are reduced to
 // the APIKeySet / SubscriptionConnected booleans (write-only secrets), and the
 // owner is implicit (every caller sees only their own accounts).
+//
+// Usage is the rate-limit snapshot and is filled by GetVendorAccount ONLY (the
+// detail view's Usage & Limits panel): the list and the write endpoints leave it
+// nil -- one snapshot read per row would be an N+1 on the list -- and so does a
+// detail read of an account the gateway has not yet seen a rate-limit header
+// for. A nil Usage is omitted from the JSON.
 type VendorAccountDTO struct {
 	ID                    string                  `json:"id"`
 	Vendor                string                  `json:"vendor"`
@@ -43,6 +65,7 @@ type VendorAccountDTO struct {
 	APIKeySet             bool                    `json:"api_key_set"`
 	SubscriptionConnected bool                    `json:"subscription_connected"`
 	Models                []VendorAccountModelDTO `json:"models"`
+	Usage                 *VendorAccountUsageDTO  `json:"usage,omitempty"`
 	CreatedAt             time.Time               `json:"created_at"`
 	UpdatedAt             time.Time               `json:"updated_at"`
 }
@@ -100,6 +123,25 @@ func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccoun
 		Models:                models,
 		CreatedAt:             acc.CreatedAt,
 		UpdatedAt:             acc.UpdatedAt,
+	}, nil
+}
+
+// vendorAccountUsageDTO reads accountID's rate-limit snapshot and maps it to its
+// portal view. A nil result (and a nil error) means no snapshot has been scraped
+// for the account yet. The store hands out its own copy of the snapshot, so the
+// reset pointers are not shared with stored state.
+func (s *Service) vendorAccountUsageDTO(ctx context.Context, accountID string) (*VendorAccountUsageDTO, error) {
+	usage, ok, err := s.routes.VendorAccountUsageByID(ctx, accountID)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &VendorAccountUsageDTO{
+		FiveHourPct:     usage.FiveHourPct,
+		FiveHourResetAt: usage.FiveHourResetAt,
+		WeeklyPct:       usage.WeeklyPct,
+		WeeklyResetAt:   usage.WeeklyResetAt,
+		CreditBalance:   usage.CreditBalance,
+		UpdatedAt:       usage.UpdatedAt,
 	}, nil
 }
 
@@ -203,8 +245,9 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 }
 
 // GetVendorAccount returns one account the principal owns (404-no-leak
-// otherwise); system scope may read any account. ErrVendorAccountsDisabled while
-// the master flag is off.
+// otherwise); system scope may read any account. It is the only read that also
+// carries the account's rate-limit usage snapshot (Usage; nil until one has been
+// scraped). ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
@@ -213,7 +256,14 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, acc)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if dto.Usage, err = s.vendorAccountUsageDTO(ctx, acc.ID); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return dto, nil
 }
 
 // CreateVendorAccount creates an account owned by the calling principal
