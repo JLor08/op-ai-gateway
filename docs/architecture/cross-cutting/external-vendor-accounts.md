@@ -339,7 +339,7 @@ matrix:
 
 | Account | Serves | How |
 |---|---|---|
-| **api-key** (OpenAI or Anthropic) | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to the vendor's native wire (OpenAI → `/v1/chat/completions`; Anthropic → `/v1/messages`). |
+| **api-key** (OpenAI or Anthropic) | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to the vendor's native wire (OpenAI → `/v1/chat/completions`; Anthropic → `/v1/messages`). **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) to an **OpenAI** api-key account has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor, the `anthropic` dialect and the **Anthropic** api-key account stay translate. |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | same `[openai, anthropic]` translate, into `/v1/messages` with the masquerade + beta headers. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
 
@@ -385,15 +385,16 @@ by a **native Anthropic Messages client** (`internal/provider/anthropic_messages
 which renders the neutral `inference` request to a `/v1/messages` body and parses
 the response/SSE back. It renders and parses itself rather than importing
 `internal/compat` (an architecture-test boundary), and it has **no** native
-passthrough path — the only passthrough on any vendor path is the OpenAI-subscription
-Responses path (§4.2).
+passthrough path — the only passthroughs on any vendor path are the two OpenAI
+Responses ones, the subscription's and the api-key account's (§4.2).
 
 ### 4.2 OpenAI
 
-- **api_key**: `https://api.openai.com` via the existing OpenAI-compatible client.
-  The target's endpoint modes are zero, so every inbound dialect is **translated to
-  `/v1/chat/completions`** (there is no api-key `/responses` passthrough);
-  `Authorization: Bearer`.
+- **api_key**: `https://api.openai.com` via the existing OpenAI-compatible client,
+  `Authorization: Bearer`. The target's endpoint modes are zero (translate), so
+  chat completions, every other `openai` flavor and the `anthropic` dialect are
+  **translated to `/v1/chat/completions`** — with one exception, the lossless
+  Responses passthrough described below.
 - **subscription**: the ChatGPT backend,
   `https://chatgpt.com/backend-api/codex`, which speaks the **Responses protocol
   only**. Static headers `OpenAI-Beta: responses=experimental` and
@@ -410,7 +411,8 @@ The subscription path splits by the inbound request shape:
   has a prefix, and the response is not rewritten back, §6.5). It is
   `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
   path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
-  false, is unaffected.
+  false, is unaffected and keeps the platform `/v1/responses` (*Api-key Responses
+  passthrough*, below).
 - Any other OpenAI flavor (chat completions, **portal chat**) is **translated** by
   a new outbound **OpenAI Responses translate client**
   (`internal/provider/openai_responses.go`): it renders the neutral request to a
@@ -418,8 +420,8 @@ The subscription path splits by the inbound request shape:
   SSE back to the neutral model.
 
 The ChatGPT backend is far stricter than the public Responses API, so the
-translate client always sends what the Codex CLI always sends, whatever the
-inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE): `store: false` (a
+subscription translate client always sends what the Codex CLI always sends,
+whatever the inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE): `store: false` (a
 body without `store` defaults to `true`, which the subscription backend rejects
 with a 400), `include: ["reasoning.encrypted_content"]` (so reasoning round-trips
 while nothing is stored), and a `reasoning` object — the request's effort, else
@@ -430,6 +432,52 @@ when empty. A non-2xx answer keeps the usual status → sentinel mapping
 and now also carries a bounded (4 KiB), single-line snippet of the vendor's error
 body in the returned error and in the payload capture, because the backend states
 why it refused a request only there.
+
+#### Api-key Responses passthrough
+
+An inbound **OpenAI Responses** request (`POST /v1/responses`, the **fine**
+`openai_responses` flavor) to an OpenAI **api-key** account is relayed
+**verbatim** to the platform's `https://api.openai.com/v1/responses` rather than
+translated to `/v1/chat/completions`, which cannot carry what a Responses client
+sends (tools, reasoning, `previous_response_id`, `store`, `include`, ...). The
+resolver sets `ResponsesMode = passthrough` for exactly this one case
+(`vendorAccountTarget`, keyed on the fine flavor exactly as the subscription
+target is), and everything downstream is the existing native-passthrough layer:
+the OpenAI-compatible client's native relay, `endpointModeFor` choosing the
+standard `/v1/responses` (a non-subscription OpenAI vendor target), the account's
+opened sealed key as the `Authorization: Bearer`, and the usual usage attribution
+to the serving account (§5).
+
+- **Only `model` is rewritten.** It is set to the account's bare upstream id,
+  which equals the requested name when the account has no prefix. The rest of the
+  body reaches OpenAI as the client wrote it, **including `store`, `include` and
+  `previous_response_id`**: `store: false` is **not** forced here, because that
+  is a requirement of the subscription backend, imposed by the subscription
+  *translate* client only (above). The relay is value-lossless rather than
+  byte-identical when a rewrite happens (key order may change). The response and
+  its SSE are relayed unchanged and are not rewritten back (§6.5).
+- **Unchanged:** chat completions and every other `openai` flavor to an api-key
+  account, the `anthropic` dialect to any account, the **Anthropic** api-key
+  account (an inbound Responses request there still translates to `/v1/messages`;
+  there is no Responses surface to pass through to) and the whole subscription
+  path.
+- **Behaviour change (VERIFY-LIVE).** A model that the platform serves only over
+  Chat Completions — for example `gpt-4o-search-preview` or
+  `gpt-4o-audio-preview` — worked for a Responses client through the old translate path and
+  would now **fail** on `/v1/responses`, where OpenAI answers for it. This is the
+  expected cost of forwarding to the real Responses endpoint, not a regression to
+  chase in the relay. Such ids are not excluded by the discovery heuristic (§6.1),
+  so they can appear in an account's catalog. Which models the platform's
+  `/v1/responses` accepts is OpenAI's to change and has not been checked against
+  a live key; chat completions to the same model are unaffected.
+- **Create-only.** Only `POST /v1/responses` is registered. The follow-up routes
+  `GET`/`DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel` and
+  `GET /v1/responses/{id}/input_items` are not registered on the gateway and
+  answer 404, so a client that stores a response and later fetches, cancels or
+  lists its input items through the gateway cannot. The translate path never
+  supported them either; proxying them is a documented follow-up, not part of
+  this passthrough. `previous_response_id` itself rides the create body and so
+  reaches OpenAI intact.
 
 ### 4.3 Credential resolution at the edge
 
@@ -730,10 +778,10 @@ Two behaviours to know:
 - With a prefix set, the bare vendor id is **not** served by that account.
   Different prefixes are also how a user keeps two accounts that offer the same
   model both reachable.
-- On the native-passthrough path (an OpenAI subscription's `/v1/responses`, §4.2)
-  the gateway rewrites only the request's `model` field to the bare slug. The
-  vendor's response is relayed verbatim and there is no response-side rewrite, so
-  its `model` field echoes the **bare** slug, not the prefixed name the client
+- On the native-passthrough path (an OpenAI subscription's or an OpenAI api-key
+  account's `/v1/responses`, §4.2) the gateway rewrites only the request's `model`
+  field to the bare slug. The vendor's response is relayed verbatim and there is
+  no response-side rewrite, so its `model` field echoes the **bare** slug, not the prefixed name the client
   asked for. A recorded usage event keeps the requested (prefixed) name as its
   model and the bare slug as the provider model.
 
