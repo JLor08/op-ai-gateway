@@ -825,7 +825,8 @@ flag), with their HTTP status:
 | `vendor_account.connect_upstream_failed` | 502 | The vendor was unreachable or answered unusably. |
 | `vendor_account.connect_key_required` | 400 | No encryption key to seal the OAuth token set on a disk-backed store. |
 | `vendor_account.device_not_supported` | 400 | The device-code flow was attempted for a non-OpenAI account. |
-| `vendor_account.check_failed` | 500 | The connection test could not run — the stored credential could not be read (a lost cipher key, a corrupt blob). It is **not** a verdict: a rejected credential is a normal `200` with `status: invalid`. |
+| `vendor_account.credential_unreadable` | 409 | The connection test (`/check`) could not open the stored credential — the encryption key is lost or was never configured, or the sealed value no longer decrypts (corrupt, or sealed under another key). A state of the account, deterministic and fixed by reconnecting it: never a `400` (nothing in the request is wrong), never a `401` (the portal reads that as an expired session) and not a `500`. Read-path only; sealing on a keyless disk store stays `.api_key_key_required` / `.connect_key_required`. It is **not** a verdict: a rejected credential is a normal `200` with `status: invalid`. |
+| `vendor_account.check_failed` | 500 | The connection test failed for a reason outside the known states above (the uncategorized fallback of `/check`). Not a verdict either. |
 | `vendor_account.{list,create,get,update,delete,connect}_failed` | 500 | The uncategorized fallback for each operation. |
 
 ### Groups, projects, services, resource-groups (governance model)

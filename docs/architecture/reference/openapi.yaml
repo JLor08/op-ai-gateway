@@ -1176,7 +1176,9 @@ paths:
         is accepted and answers a VendorConnectionCheck. Strictly owner-only
         (system scope included); a non-owner gets the same 404 as an unknown
         id. Changes nothing and never returns a credential. A rejected
-        credential is a 200 with status invalid, not an error.
+        credential is a 200 with status invalid, not an error; a stored
+        credential that cannot be opened (lost encryption key, corrupt blob) is
+        a 409 vendor_account.credential_unreadable.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200':
@@ -1185,6 +1187,15 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorConnectionCheck' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The account cannot be checked -- vendor_account.credential_unreadable
+            (the stored credential cannot be opened; reconnect the account) or
+            vendor_accounts.module_disabled while the master flag is off. The
+            Error envelope carries the stable code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/vendor-accounts/{id}/connect/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }

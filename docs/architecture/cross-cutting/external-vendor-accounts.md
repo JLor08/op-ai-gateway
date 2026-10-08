@@ -273,9 +273,13 @@ would turn that credential into a live-or-dead oracle. A non-owner gets the same
 `404 vendor_account.not_found` as for an unknown id; a disabled module answers
 `409`. A missing credential (no API key set, subscription not connected) and an
 expired-but-refreshable token report `unverifiable` with an explanatory `detail`;
-an unreadable stored credential (a lost cipher key, a corrupt blob) is an error,
-`vendor_account.check_failed`, not a verdict. The portal's detail view has a
-"Test connection" button that renders the verdict inline — success, error, or a
+a stored credential that cannot be opened (a lost or never-configured cipher key,
+a corrupt blob, a blob sealed under another key) is an error,
+`409 vendor_account.credential_unreadable`, not a verdict — a state of the
+account that reconnecting fixes, worded about *reading* the credential rather
+than the write path's "an encryption key is required to store ...", which would
+be wrong for a read-only check and nonsensical on a subscription. The portal's
+detail view has a "Test connection" button that renders the verdict inline — success, error, or a
 neutral notice for `unverifiable` — and says in so many words that it checks the
 credential only, never a particular model, so a chat that fails while the test
 reads `valid` points at the model rather than the login. A thrown error (the

@@ -2509,6 +2509,8 @@ const de = {
   errorVendorAccountConnectInvalidCredentials:
     'Der Anbieter hat das Token abgelehnt. Prüfen, ob es aktuell, vollständig kopiert und ein Access-Token (kein id_token) ist. Es wurde nichts gespeichert.',
   errorVendorAccountCheckFailed: 'Die Verbindung konnte nicht geprüft werden',
+  errorVendorAccountCredentialUnreadable:
+    'Die gespeicherten Zugangsdaten konnten nicht gelesen werden. Das Konto neu verbinden (bei einem API-Schlüssel: den Schlüssel neu setzen).',
   errorVendorAccountDeviceNotSupported: 'Der Device-Code-Login ist nur für OpenAI-Konten verfügbar',
   errorVendorAccountDeviceConnectState:
     'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
@@ -5084,6 +5086,8 @@ const en: PortalMessages = {
   errorVendorAccountConnectInvalidCredentials:
     'The provider rejected the token. Check that it is current, copied completely, and an access token (not an id_token). Nothing was stored.',
   errorVendorAccountCheckFailed: 'The connection could not be tested',
+  errorVendorAccountCredentialUnreadable:
+    'The stored credentials could not be read. Reconnect the account (for an API key, set the key again).',
   errorVendorAccountDeviceNotSupported:
     'The device-code login is available for OpenAI accounts only',
   errorVendorAccountDeviceConnectState:

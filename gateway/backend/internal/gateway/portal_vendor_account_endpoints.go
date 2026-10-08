@@ -347,6 +347,14 @@ var portalVendorAccountErrRows = []errRow{
 	// treats a 401 from this API as an expired session).
 	{err: portal.ErrVendorAccountDeviceUnsupported, status: http.StatusBadRequest, code: "vendor_account.device_not_supported", msg: "the device connect flow is available for OpenAI accounts only"},
 	{err: portal.ErrVendorAccountDeviceConnectState, status: http.StatusBadRequest, code: "vendor_account.device_connect_state", msg: "no device connect is in progress for this account or it has expired; start the device connect again"},
+	// The connection test (POST .../check) could not OPEN the stored credential: the
+	// encryption key is lost, or the sealed blob no longer decrypts. A 409 -- the
+	// account is in a state that cannot be checked -- never a 400 (nothing in the
+	// request is wrong), a 401 (the portal reads that as an expired session) or a
+	// 500 (this is a known, deterministic state). The row precedes the
+	// capture.ErrKeyRequired one because the error wraps it for a lost key, and that
+	// row's message talks about STORING an api key.
+	{err: portal.ErrVendorAccountCredentialUnreadable, status: http.StatusConflict, code: "vendor_account.credential_unreadable", msg: "the stored credential could not be read; reconnect the account"},
 	// capture.SealSecret returns capture.ErrKeyRequired when a non-empty api key
 	// is sealed on a disk-backed store with no encryption key: the operator's
 	// own keyless misconfiguration, a 400 rather than a 500 (the same class the

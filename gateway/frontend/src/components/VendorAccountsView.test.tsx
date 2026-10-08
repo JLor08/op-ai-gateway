@@ -2071,6 +2071,29 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(testButton()).toBeEnabled();
     });
 
+    it('shows an unreadable stored credential as a localized toast about reading, not storing', async () => {
+      renderView({
+        testConnection: async () => {
+          throw new PortalApiError(409, 'vendor_account.credential_unreadable', 'raw server text');
+        },
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(
+        await screen.findByText(
+          `vendor_account.credential_unreadable: ${t.errorVendorAccountCredentialUnreadable}`,
+        ),
+      ).toBeInTheDocument();
+      expect(t.errorVendorAccountCredentialUnreadable).not.toBe(
+        t.errorVendorAccountApiKeyKeyRequired,
+      );
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckInvalid)).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
     it('clears an earlier verdict when the next check throws', async () => {
       const testConnection = vi
         .fn<PortalApi['testConnection']>()

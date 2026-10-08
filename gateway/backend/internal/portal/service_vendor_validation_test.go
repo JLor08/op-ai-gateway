@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/vendorauth"
 	"strings"
@@ -768,6 +769,75 @@ func TestTestVendorAccountConnectionDoesNotProbeAnExpiredButRefreshableToken(t *
 	}
 	if got.Status != "invalid" || len(fake.recorded()) != 1 {
 		t.Fatalf("no refresh token: check = %+v, calls = %+v, want one probe answering invalid", got, fake.recorded())
+	}
+}
+
+// A stored credential that cannot be OPENED -- a lost encryption key, or a blob
+// that no longer decrypts -- is ErrVendorAccountCredentialUnreadable, for both auth
+// types, and the vendor is never called. The cause stays in the chain (for logs)
+// but neither it nor the message carries the credential.
+func TestTestVendorAccountConnectionUnreadableCredential(t *testing.T) {
+	otherCipher, err := capture.New(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatalf("capture.New: %v", err)
+	}
+	sealedUnderOtherKey, err := capture.SealSecret(otherCipher, false, vendorAccountTestKey)
+	if err != nil {
+		t.Fatalf("SealSecret: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		cipher  *capture.Cipher
+		stored  string
+		keyLost bool // the cause is capture.ErrKeyRequired (otherwise a decrypt/decode failure)
+	}{
+		{"enc blob but no key", nil, sealedUnderOtherKey, true},
+		{"enc blob sealed under another key", otherCipher, "enc:AAAA", false},
+		{"enc blob that is not base64", otherCipher, "enc:!!!", false},
+		{"value of no known shape", otherCipher, "garbage", true},
+	} {
+		for _, authType := range []string{routing.VendorAuthAPIKey, routing.VendorAuthSubscription} {
+			t.Run(tc.name+"/"+authType, func(t *testing.T) {
+				svc, routeStore, _ := newVendorConnectTestService(t)
+				fake := installFakeVendorValidators(svc)
+				fake.setAll(validCheck("", ""))
+				req := CreateVendorAccountRequest{Vendor: routing.VendorAnthropic, AuthType: authType, Name: "Broken"}
+				if authType == routing.VendorAuthAPIKey {
+					req.APIKey = vendorAccountTestKey
+				}
+				acc := createTestVendorAccount(t, svc, ownerToken(), req)
+				row, err := routeStore.VendorAccountByID(context.Background(), acc.ID)
+				if err != nil {
+					t.Fatalf("VendorAccountByID: %v", err)
+				}
+				if authType == routing.VendorAuthAPIKey {
+					row.APIKey = tc.stored
+				} else {
+					row.OAuthTokens = tc.stored
+				}
+				if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
+					t.Fatalf("UpdateVendorAccount: %v", err)
+				}
+				svc.cipher = tc.cipher
+
+				got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+				if !errors.Is(err, ErrVendorAccountCredentialUnreadable) {
+					t.Fatalf("err = %v, want ErrVendorAccountCredentialUnreadable", err)
+				}
+				if got != (VendorConnectionCheck{}) {
+					t.Fatalf("check = %+v, want the zero verdict with an error", got)
+				}
+				if errors.Is(err, capture.ErrKeyRequired) != tc.keyLost {
+					t.Fatalf("errors.Is(err, capture.ErrKeyRequired) = %v, want %v (the cause stays in the chain)", !tc.keyLost, tc.keyLost)
+				}
+				if strings.Contains(err.Error(), vendorAccountTestKey) || strings.Contains(strings.ToLower(err.Error()), "storing") {
+					t.Fatalf("err = %q, want a token-free read-path message", err)
+				}
+				if calls := fake.recorded(); len(calls) != 0 {
+					t.Fatalf("validator calls = %+v, want none for an unreadable credential", calls)
+				}
+			})
+		}
 	}
 }
 

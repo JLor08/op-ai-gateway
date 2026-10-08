@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/vendorauth"
 	"strings"
 	"testing"
+	"time"
 )
 
 // vaProbe is a controllable credential probe: it answers the verdict set on it
@@ -202,5 +204,105 @@ func TestVendorAccountConnectImportEndpointInvalidCredentialsIs400(t *testing.T)
 	}
 	if row, err := routeStore.VendorAccountByID(context.Background(), acc.ID); err != nil || row.OAuthTokens != "" {
 		t.Fatalf("account after the refused import = %+v, %v, want no stored tokens", row, err)
+	}
+}
+
+// A stored credential that cannot be OPENED is a state of the account, not a
+// server fault and not a bad request: the check answers 409
+// vendor_account.credential_unreadable for every way the open fails -- no
+// encryption key configured, a blob sealed under another key, a blob that is not
+// even base64, a value of no known shape, and (subscription) a token set that
+// decrypts to something other than JSON. It must NOT be the write path's 400
+// vendor_account.api_key_key_required (that message talks about STORING an api
+// key, which is wrong for a read-only check and nonsensical on a subscription),
+// nor a 500 check_failed, nor a 401 (the portal reads a 401 as an expired
+// session). The body carries no credential, and no vendor is ever called.
+func TestVendorAccountCheckEndpointUnreadableCredentialIs409(t *testing.T) {
+	const (
+		otherKeyHex = "ab"
+		wantMessage = "the stored credential could not be read; reconnect the account"
+	)
+	cipher := newDispatchCipher(t)
+	otherCipher, err := capture.New(strings.Repeat(otherKeyHex, 32))
+	if err != nil {
+		t.Fatalf("capture.New: %v", err)
+	}
+	seal := func(c *capture.Cipher, plain string) string {
+		t.Helper()
+		sealed, err := capture.SealSecret(c, false, plain)
+		if err != nil {
+			t.Fatalf("SealSecret: %v", err)
+		}
+		return sealed
+	}
+	sealTokens := func(c *capture.Cipher) string {
+		t.Helper()
+		sealed, err := vendorauth.SealTokenSet(c, false, vendorauth.TokenSet{AccessToken: vaConnectAccess, RefreshToken: vaConnectRefresh})
+		if err != nil {
+			t.Fatalf("SealTokenSet: %v", err)
+		}
+		return sealed
+	}
+
+	for _, tc := range []struct {
+		name       string
+		authType   string
+		serverKey  *capture.Cipher // the gateway's cipher; nil = the key is lost / never configured
+		stored     string
+		credential string // plaintext that must never reach the response
+	}{
+		{"api key, no encryption key configured", routing.VendorAuthAPIKey, nil, seal(cipher, vaTestAPIKey), vaTestAPIKey},
+		{"api key, sealed under another key", routing.VendorAuthAPIKey, cipher, seal(otherCipher, vaTestAPIKey), vaTestAPIKey},
+		{"api key, corrupt enc blob", routing.VendorAuthAPIKey, cipher, "enc:!!!not-base64!!!", vaTestAPIKey},
+		{"api key, truncated enc blob", routing.VendorAuthAPIKey, cipher, seal(cipher, vaTestAPIKey)[:12], vaTestAPIKey},
+		{"api key, value of no known shape", routing.VendorAuthAPIKey, cipher, "garbage-without-a-prefix", vaTestAPIKey},
+		{"subscription, no encryption key configured", routing.VendorAuthSubscription, nil, sealTokens(cipher), vaConnectAccess},
+		{"subscription, sealed under another key", routing.VendorAuthSubscription, cipher, sealTokens(otherCipher), vaConnectAccess},
+		{"subscription, corrupt enc blob", routing.VendorAuthSubscription, cipher, "enc:%%%", vaConnectAccess},
+		{"subscription, token set that is not JSON", routing.VendorAuthSubscription, cipher, seal(cipher, "this is not json"), vaConnectAccess},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &vaProbe{check: vendorauth.CredentialCheck{Status: vendorauth.StatusValid}}
+			srv, routeStore, _ := newVendorAccountSettingsTestServerWithDeps(t, false, func(deps *portal.ServiceDeps) {
+				deps.VendorValidators = probe.validators()
+				deps.Cipher = tc.serverKey
+			})
+			enableVendorAccountsFlag(t, srv)
+			now := time.Now().UTC()
+			acc := routing.VendorAccount{
+				ID: "va_unreadable", OwnerUserID: "usr_va_a", Vendor: routing.VendorAnthropic, AuthType: tc.authType,
+				Name: "Unreadable", Status: routing.VendorAccountStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+			if tc.authType == routing.VendorAuthAPIKey {
+				acc.APIKey = tc.stored
+			} else {
+				acc.OAuthTokens = tc.stored
+			}
+			if err := routeStore.CreateVendorAccount(context.Background(), acc); err != nil {
+				t.Fatalf("CreateVendorAccount: %v", err)
+			}
+
+			rec := vaDo(t, srv, http.MethodPost, vaCheckPath(acc.ID), vaOwnerSecret, "")
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("check status = %d, want 409, body = %s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Error struct{ Code, Message string } `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("unmarshal error body: %v (%s)", err, rec.Body.String())
+			}
+			if body.Error.Code != "vendor_account.credential_unreadable" || body.Error.Message != wantMessage {
+				t.Fatalf("error = %+v, want vendor_account.credential_unreadable / %q", body.Error, wantMessage)
+			}
+			for _, leak := range []string{tc.credential, tc.stored, vaConnectRefresh} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("error body leaks %q: %s", leak, rec.Body.String())
+				}
+			}
+			if len(probe.seen) != 0 {
+				t.Fatalf("probe saw %v, want no vendor call for an unreadable credential", probe.seen)
+			}
+		})
 	}
 }

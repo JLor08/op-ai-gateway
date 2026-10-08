@@ -164,6 +164,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.connect_key_required': 'errorVendorAccountConnectKeyRequired',
   'vendor_account.connect_failed': 'errorVendorAccountConnectFailed',
   'vendor_account.check_failed': 'errorVendorAccountCheckFailed',
+  // The connection test could not open the stored credential (a lost encryption
+  // key, a corrupt blob): a 409, never a 401 (the portal reads a 401 as an expired
+  // session). The label is about READING it -- the write path's api_key_key_required
+  // talks about storing a key, which is wrong for a check and for a subscription.
+  'vendor_account.credential_unreadable': 'errorVendorAccountCredentialUnreadable',
   // The OpenAI-only device-code connect's two own refusals (both 400s), wired in
   // the same errRow table. Its poll loop also meets connect_rejected and
   // connect_upstream_failed above: the latter is transient (keep polling).

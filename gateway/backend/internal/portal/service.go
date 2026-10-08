@@ -182,6 +182,17 @@ var (
 	// -- none was begun, or it outlived its TTL.
 	ErrVendorAccountDeviceUnsupported  = errors.New("vendor_account.device_not_supported")
 	ErrVendorAccountDeviceConnectState = errors.New("vendor_account.device_connect_state")
+
+	// ErrVendorAccountCredentialUnreadable: the account's stored credential cannot
+	// be OPENED, so the connection test has nothing to send -- the encryption key
+	// is lost or was never configured, or the sealed blob no longer decrypts
+	// (corrupt, or sealed under another key). A state of the account, not a bad
+	// request and not a server fault; the fix is to reconnect the account. It is
+	// raised on the read/check path only: sealing a credential on a keyless disk
+	// store stays capture.ErrKeyRequired (api_key_key_required / connect_key_required).
+	// The underlying open error stays in the chain for logs; the API response
+	// carries only the fixed, token-free message of its error row.
+	ErrVendorAccountCredentialUnreadable = errors.New("vendor_account.credential_unreadable")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable

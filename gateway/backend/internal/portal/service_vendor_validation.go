@@ -246,7 +246,8 @@ func vendorConnectionStatus(status vendorauth.CredentialStatus) string {
 // "unverifiable" with a detail saying so, and so is an access token that is
 // already past its expiry while a refresh token can renew it: the vendor would
 // answer 401 for an account the next request heals, and "invalid" would be a false
-// alarm. An unreadable stored credential (a lost key, a corrupt blob) is an error.
+// alarm. A stored credential that cannot be opened (a lost key, a corrupt blob) is
+// ErrVendorAccountCredentialUnreadable, not a verdict.
 func (s *Service) TestVendorAccountConnection(ctx context.Context, principal auth.Token, id string) (VendorConnectionCheck, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorConnectionCheck{}, err
@@ -270,14 +271,26 @@ func (s *Service) TestVendorAccountConnection(ctx context.Context, principal aut
 	}, nil
 }
 
+// unreadableVendorCredential marks err, the failure to OPEN an account's stored
+// credential (what says which one: "api key" or "token set"), as
+// ErrVendorAccountCredentialUnreadable. This is the READ path: it must not read as
+// the write path's "an encryption key is required to store ..." refusal, so the
+// capture.ErrKeyRequired of a lost key and the decrypt/decode error of a corrupt
+// blob alike become the one sentinel. The cause stays in the chain for tests and
+// logs; the API response carries only the sentinel's fixed, token-free message.
+func unreadableVendorCredential(what string, err error) error {
+	return fmt.Errorf("%w: open vendor account %s: %w", ErrVendorAccountCredentialUnreadable, what, err)
+}
+
 // checkVendorAccount opens acc's stored credential and probes it. It returns the
-// verdict and the credential it used (so the caller can scrub the detail).
+// verdict and the credential it used (so the caller can scrub the detail). A
+// credential that cannot be opened is ErrVendorAccountCredentialUnreadable.
 func (s *Service) checkVendorAccount(ctx context.Context, acc routing.VendorAccount) (vendorauth.CredentialCheck, string, error) {
 	switch acc.AuthType {
 	case routing.VendorAuthAPIKey:
 		apiKey, err := capture.OpenSecret(s.cipher, acc.APIKey)
 		if err != nil {
-			return vendorauth.CredentialCheck{}, "", fmt.Errorf("open vendor account api key: %w", err)
+			return vendorauth.CredentialCheck{}, "", unreadableVendorCredential("api key", err)
 		}
 		if apiKey == "" {
 			return unverifiableVendorCheck("no API key is set"), "", nil
@@ -286,7 +299,7 @@ func (s *Service) checkVendorAccount(ctx context.Context, acc routing.VendorAcco
 	case routing.VendorAuthSubscription:
 		ts, err := vendorauth.OpenTokenSet(s.cipher, acc.OAuthTokens)
 		if err != nil {
-			return vendorauth.CredentialCheck{}, "", fmt.Errorf("open vendor account token set: %w", err)
+			return vendorauth.CredentialCheck{}, "", unreadableVendorCredential("token set", err)
 		}
 		if ts.AccessToken == "" {
 			return unverifiableVendorCheck("the subscription is not connected"), "", nil
