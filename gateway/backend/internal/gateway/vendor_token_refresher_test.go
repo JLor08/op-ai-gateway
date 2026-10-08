@@ -321,3 +321,58 @@ func TestModelsRefreshEndpointRefreshesAnExpiredSubscriptionTokenThroughTheGatew
 		t.Fatal("the refreshed token set was not persisted")
 	}
 }
+
+// The vendor rejecting the refresh token flips the account to needs_reconnect (in
+// the gateway's refresher); the 200 answer of "refresh models" reports that status
+// and says to reconnect, instead of the stale "active" the account had when the
+// request loaded it. Nothing is fetched and the seeded models are kept.
+func TestModelsRefreshEndpointReportsNeedsReconnectAfterARejectedRefreshToken(t *testing.T) {
+	cipher := newDispatchCipher(t)
+	oauth := newOpenAITokenEndpoint(t, http.StatusUnauthorized, `{"error":"invalid_grant"}`)
+	disc := &vaDiscovery{status: vendorauth.DiscoveryOK, models: []vendorauth.DiscoveredModel{{Slug: "gpt-6-luna", DisplayName: "x"}}}
+	srv, store, _ := newVendorAccountSettingsTestServerWithDeps(t, false, func(deps *portal.ServiceDeps) {
+		deps.VendorDiscoverers = disc.discoverers()
+		deps.Cipher = cipher
+	})
+	enableVendorAccountsFlag(t, srv)
+	srv.Cipher = cipher
+	srv.vendorOpenAIEndpoints = oauth.endpoints()
+	srv.Portal.(*portal.Service).SetVendorTokenRefresher(srv.RefreshVendorSubscriptionTokens)
+
+	acc := vaCreateSubscription(t, srv, vaOwnerSecret, "openai", "ChatGPT Plus")
+	sealed, err := vendorauth.SealTokenSet(cipher, false, expiredOpenAITokens())
+	if err != nil {
+		t.Fatalf("SealTokenSet: %v", err)
+	}
+	row, err := store.VendorAccountByID(context.Background(), acc.ID)
+	if err != nil {
+		t.Fatalf("VendorAccountByID: %v", err)
+	}
+	row.OAuthTokens = sealed
+	if err := store.UpdateVendorAccount(context.Background(), row); err != nil {
+		t.Fatalf("UpdateVendorAccount: %v", err)
+	}
+
+	rec := vaDo(t, srv, http.MethodPost, vaRefreshPath(acc.ID), vaOwnerSecret, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	body := vaDecodeRefresh(t, rec.Body.Bytes())
+	if body.Account.Status != routing.VendorAccountStatusNeedsReconnect {
+		t.Fatalf("account status = %q, want needs_reconnect (the refresh token was rejected)", body.Account.Status)
+	}
+	if body.Refresh.Status != portal.VendorRefreshUnverifiable || !strings.Contains(body.Refresh.Detail, "reconnect") {
+		t.Fatalf("refresh = %+v, want unverifiable telling the user to reconnect", body.Refresh)
+	}
+	if got := vaDecode(t, vaDo(t, srv, http.MethodGet, "/api/portal/vendor-accounts/"+acc.ID, vaOwnerSecret, "")); got.Status != routing.VendorAccountStatusNeedsReconnect {
+		t.Fatalf("stored status = %q, want needs_reconnect", got.Status)
+	}
+	if len(disc.credentials()) != 0 {
+		t.Fatalf("discovery saw %v, want no fetch with a token that could not be refreshed", disc.credentials())
+	}
+	for _, secret := range []string{refresherStaleAccess, refresherStaleRefresh} {
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Fatalf("refresh response leaks a token: %s", rec.Body.String())
+		}
+	}
+}

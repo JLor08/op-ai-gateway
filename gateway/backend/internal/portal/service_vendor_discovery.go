@@ -62,6 +62,12 @@ const (
 	// action may wait the full client timeout, a connect response should not.
 	vendorConnectDiscoveryTimeout = 5 * time.Second
 
+	// vendorTokenRefreshTimeout bounds a token refresh the discovery asks for. The
+	// refresh runs on a context that its caller's cancellation cannot reach (see
+	// runVendorTokenRefresh), so it needs a bound of its own: a little over the
+	// 30s the vendor token calls themselves may take (vendorauth's default client).
+	vendorTokenRefreshTimeout = 45 * time.Second
+
 	// maxDiscoveredModelIDLen and maxDiscoveredDisplayNameLen cap the two strings
 	// the vendor supplies for each model. Real ids are a few dozen characters.
 	maxDiscoveredModelIDLen     = 128
@@ -207,11 +213,11 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
 	if note != "" {
-		return s.keptVendorModels(ctx, acc, note)
+		return s.keptVendorModels(ctx, acc.ID, note)
 	}
 	rows, dropped := vendorModelRows(acc, found)
 	if len(rows) == 0 {
-		return s.keptVendorModels(ctx, acc, "the vendor listed no usable model")
+		return s.keptVendorModels(ctx, acc.ID, "the vendor listed no usable model")
 	}
 	acc, rows, err = s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
@@ -261,9 +267,17 @@ func notFoundAsVendorAccountNotFound(err error) error {
 	return err
 }
 
-// keptVendorModels is the fail-soft answer: acc's current models, untouched, with
-// the unverifiable result and why.
-func (s *Service) keptVendorModels(ctx context.Context, acc routing.VendorAccount, why string) (VendorAccountDTO, RefreshResult, error) {
+// keptVendorModels is the fail-soft answer: the account's current models,
+// untouched, with the unverifiable result and why. The account is RE-LOADED, not
+// taken from the caller: the discovery may have changed it since it was loaded (a
+// refresh token the vendor rejected flips the account to needs_reconnect), and the
+// answer must report the status it has now. An account deleted meanwhile is
+// ErrVendorAccountNotFound.
+func (s *Service) keptVendorModels(ctx context.Context, id, why string) (VendorAccountDTO, RefreshResult, error) {
+	acc, err := s.routes.VendorAccountByID(ctx, id)
+	if err != nil {
+		return VendorAccountDTO{}, RefreshResult{}, notFoundAsVendorAccountNotFound(err)
+	}
 	dto, err := s.vendorAccountDTO(ctx, acc)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
@@ -334,6 +348,14 @@ const noVendorDiscoveryNote = "model discovery is not available for this account
 // renewed (the refresher failed, or left the stored token expired).
 const expiredVendorTokenNote = "the access token has expired and could not be refreshed; try again, or reconnect the account if this persists"
 
+// reconnectVendorTokenNote is the note when the vendor rejected the refresh token
+// (the refresher marked the account needs_reconnect): retrying cannot help.
+const reconnectVendorTokenNote = "the access token has expired and the vendor rejected the refresh token; reconnect the account"
+
+// vendorTokenRefreshPendingNote is the note when the discovery stopped waiting for a
+// token refresh that is still running (its own context ended first).
+const vendorTokenRefreshPendingNote = "the access token has expired and its refresh is still in progress; refresh the models again in a moment"
+
 // noVendorTokenRefresherNote is the note when an expired access token cannot be
 // renewed here because no refresher is wired.
 const noVendorTokenRefresherNote = "the access token has expired; it is refreshed automatically on the next request, then refresh the models again"
@@ -344,8 +366,11 @@ const noVendorTokenRefresherNote = "the access token has expired; it is refreshe
 // the fresh token is what the vendor is then asked with, never the copy read before.
 // A non-empty note means no fresh token could be had (and why, with no credential
 // in it): there is no refresher, it failed, or the stored token is still expired
-// afterwards. The refresher's own error is not surfaced or logged here (it is the
-// gateway's to log; this path only needs to know it failed). The error is a
+// afterwards, or the discovery's own context ended while it was still running
+// (runVendorTokenRefresh: the refresh is never cancelled mid-flight). When the
+// vendor rejected the refresh token the note says to reconnect. The refresher's own
+// error is not surfaced or logged here (it is the gateway's to log; this path only
+// needs to know it failed). The error is a
 // deleted account (ErrVendorAccountNotFound) or an unreadable renewed credential
 // (ErrVendorAccountCredentialUnreadable).
 func (s *Service) refreshedVendorTokenSet(ctx context.Context, acc routing.VendorAccount) (ts vendorauth.TokenSet, note string, err error) {
@@ -353,7 +378,13 @@ func (s *Service) refreshedVendorTokenSet(ctx context.Context, acc routing.Vendo
 	if refresh == nil {
 		return vendorauth.TokenSet{}, noVendorTokenRefresherNote, nil
 	}
-	if refresh(ctx, acc.ID) != nil {
+	switch outcome := runVendorTokenRefresh(ctx, refresh, acc.ID); outcome {
+	case vendorTokenRefreshAbandoned:
+		return vendorauth.TokenSet{}, vendorTokenRefreshPendingNote, nil
+	case vendorTokenRefreshFailed:
+		if s.vendorAccountNeedsReconnect(ctx, acc.ID) {
+			return vendorauth.TokenSet{}, reconnectVendorTokenNote, nil
+		}
 		return vendorauth.TokenSet{}, expiredVendorTokenNote, nil
 	}
 	reloaded, err := s.routes.VendorAccountByID(ctx, acc.ID)
@@ -368,6 +399,64 @@ func (s *Service) refreshedVendorTokenSet(ctx context.Context, acc routing.Vendo
 		return vendorauth.TokenSet{}, expiredVendorTokenNote, nil
 	}
 	return ts, "", nil
+}
+
+// vendorTokenRefreshOutcome is how runVendorTokenRefresh ended.
+type vendorTokenRefreshOutcome int
+
+const (
+	// vendorTokenRefreshDone: the refresher returned nil.
+	vendorTokenRefreshDone vendorTokenRefreshOutcome = iota
+	// vendorTokenRefreshFailed: the refresher returned an error (or panicked).
+	vendorTokenRefreshFailed
+	// vendorTokenRefreshAbandoned: the caller's context ended while the refresher
+	// was still running; it keeps running to its own end.
+	vendorTokenRefreshAbandoned
+)
+
+// runVendorTokenRefresh runs refresh for accountID and waits for it, but never lets
+// the CALLER's context cancel it. A refresh token is single-use: if the vendor has
+// rotated it and the exchange or the persist is then cut off, only the dead old
+// token is left and the account breaks on its next use (invalid_grant, then
+// needs_reconnect). So the refresher runs on a context detached from ctx's
+// cancellation (a client disconnect, the connect-time bound) under a bound of its
+// own (vendorTokenRefreshTimeout), on its own goroutine; when ctx ends first the
+// caller stops WAITING (vendorTokenRefreshAbandoned, so the discovery degrades to
+// its fail-soft outcome on time) while the refresh runs on and persists. A panic in
+// the refresher counts as a failed refresh instead of crashing the process.
+func runVendorTokenRefresh(ctx context.Context, refresh VendorTokenRefresher, accountID string) vendorTokenRefreshOutcome {
+	done := make(chan error, 1)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), vendorTokenRefreshTimeout)
+	go func() {
+		defer cancel()
+		defer func() {
+			if recover() != nil {
+				done <- errVendorTokenRefresherPanicked
+			}
+		}()
+		done <- refresh(rctx, accountID)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return vendorTokenRefreshFailed
+		}
+		return vendorTokenRefreshDone
+	case <-ctx.Done():
+		return vendorTokenRefreshAbandoned
+	}
+}
+
+// errVendorTokenRefresherPanicked stands for a refresher that panicked; it carries
+// no panic value, which could hold anything.
+var errVendorTokenRefresherPanicked = errors.New("the vendor token refresher panicked")
+
+// vendorAccountNeedsReconnect reports whether the account is now marked
+// needs_reconnect (the gateway's refresher does that when the vendor rejects the
+// refresh token). A failed read is "no": the generic note then applies.
+func (s *Service) vendorAccountNeedsReconnect(ctx context.Context, id string) bool {
+	acc, err := s.routes.VendorAccountByID(ctx, id)
+	return err == nil && acc.Status == routing.VendorAccountStatusNeedsReconnect
 }
 
 // apiKeyDiscoverer returns the api-key fetcher for vendor, or nil for a vendor
@@ -576,6 +665,7 @@ func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token
 	if timeout <= 0 {
 		timeout = vendorConnectDiscoveryTimeout
 	}
+	requestCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	refreshed, result, err := s.RefreshVendorAccountModels(ctx, principal, dto.ID)
@@ -584,11 +674,28 @@ func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token
 			// A FIXED line, never the cause chain: the chain of a stored blob that
 			// cannot be decoded can quote part of what it could not decode.
 			slog.Warn("vendor model discovery after connect skipped: the stored credential could not be read; the account keeps its current models", "account", dto.ID)
-			return dto
+		} else {
+			slog.Warn("vendor model discovery after connect failed; the account keeps its current models", "account", dto.ID, "err", err)
 		}
-		slog.Warn("vendor model discovery after connect failed; the account keeps its current models", "account", dto.ID, "err", err)
-		return dto
+		return s.currentConnectedVendorAccount(requestCtx, dto)
 	}
 	slog.Info("vendor model discovery after connect", "account", dto.ID, "status", result.Status, "discovered", result.Discovered)
 	return refreshed
+}
+
+// currentConnectedVendorAccount re-reads the account for the connect response after
+// a discovery that failed: it may have changed since dto was built (a status the
+// discovery's token refresh set). Best effort on the REQUEST's context, not the
+// discovery's (which may be the very thing that ended): any failure returns dto as
+// it was, the connect itself having succeeded.
+func (s *Service) currentConnectedVendorAccount(ctx context.Context, dto VendorAccountDTO) VendorAccountDTO {
+	acc, err := s.routes.VendorAccountByID(ctx, dto.ID)
+	if err != nil {
+		return dto
+	}
+	current, err := s.vendorAccountDTO(ctx, acc)
+	if err != nil {
+		return dto
+	}
+	return current
 }

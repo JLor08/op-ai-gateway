@@ -321,6 +321,70 @@ func TestRefreshVendorAccountModelsWhenTheAccountVanishesDuringTheRefresh(t *tes
 	fake.requireNoCalls(t, "for a deleted account")
 }
 
+// The gateway's refresher flips the account to needs_reconnect when the vendor
+// rejects the refresh token. The 200 the portal answers must report THAT status
+// (not the "active" the account had when the request loaded it), and say to
+// reconnect instead of suggesting a retry that can only fail again.
+func TestRefreshVendorAccountModelsReportsTheStatusARejectedRefreshSet(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	before := storedModels(t, routeStore, acc.ID)
+	if acc.Status != routing.VendorAccountStatusActive {
+		t.Fatalf("precondition: status = %q, want active", acc.Status)
+	}
+	svc.vendorDiscovery.tokenRefresher = func(ctx context.Context, id string) error {
+		// What resolveSubscriptionBearer does on a rejected refresh token.
+		if err := routeStore.SetVendorAccountStatus(ctx, id, routing.VendorAccountStatusNeedsReconnect); err != nil {
+			t.Errorf("SetVendorAccountStatus: %v", err)
+		}
+		return errors.New("refresh rejected")
+	}
+
+	dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v (fail-soft must not be an error)", err)
+	}
+	if dto.Status != routing.VendorAccountStatusNeedsReconnect {
+		t.Fatalf("dto status = %q, want needs_reconnect (the status the refresher just set, not the stale active)", dto.Status)
+	}
+	if res.Status != VendorRefreshUnverifiable || res.Discovered != 0 || !strings.Contains(res.Detail, "reconnect") || strings.Contains(res.Detail, "try again") {
+		t.Fatalf("result = %+v, want unverifiable telling the user to reconnect, not to try again", res)
+	}
+	fake.requireNoCalls(t, "after a rejected refresh")
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+		t.Fatalf("rows changed to %+v", got)
+	}
+	if len(dto.Models) != len(before) {
+		t.Fatalf("dto models = %+v, want the kept rows", dto.Models)
+	}
+}
+
+// Every fail-soft answer is built from the account as it is NOW: a refresher that
+// fails without touching the status leaves it active (and suggests a retry), and an
+// account deleted during the refresh is reported as not found rather than rendered
+// from the stale copy.
+func TestRefreshVendorAccountModelsFailSoftAnswerIsBuiltFromTheCurrentAccount(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	refresher := installTokenRefresher(t, svc, routeStore)
+	refresher.err = errors.New("vendor unreachable")
+	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+	dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || dto.Status != routing.VendorAccountStatusActive || !strings.Contains(res.Detail, "try again") {
+		t.Fatalf("dto = %+v, result = %+v, err = %v, want active with a retry hint", dto, res, err)
+	}
+
+	svc.vendorDiscovery.tokenRefresher = func(ctx context.Context, id string) error {
+		_ = routeStore.DeleteVendorAccount(ctx, id)
+		return errors.New("vendor unreachable")
+	}
+	if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotFound) {
+		t.Fatalf("deleted during the refresh: err = %v, want ErrVendorAccountNotFound", err)
+	}
+}
+
 // A refused principal never reaches the refresher either (it would otherwise let a
 // stranger spend the owner's refresh token).
 func TestRefreshVendorAccountModelsRefusedPrincipalNeverRefreshesTheToken(t *testing.T) {
@@ -400,6 +464,145 @@ func TestNewServiceInjectsAndReplacesTheVendorTokenRefresher(t *testing.T) {
 	}
 }
 
+// --- the refresh is never cancelled mid-flight -----------------------------------------
+
+// A refresh token is single-use: if the vendor rotated it and the call or the
+// persist is then cut off, only the dead old token is left and the account breaks
+// on its next use. So the refresher runs on a context that neither a client
+// disconnect nor the connect-time bound can cancel, under a bound of its own, and
+// the discovery stops WAITING for it when its own context ends instead.
+func TestRefreshVendorAccountModelsNeverCancelsATokenRefreshInFlight(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	fresh := vendorauth.TokenSet{AccessToken: refreshTestFreshAccess, RefreshToken: refreshTestRefresh, ExpiresAt: discoveryTestNow.Add(time.Hour), AccountID: discoveryTestAccount}
+
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var ctxErrAtPersist error
+	var hasOwnBound bool
+	svc.vendorDiscovery.tokenRefresher = func(ctx context.Context, id string) error {
+		defer close(finished)
+		_, hasOwnBound = ctx.Deadline()
+		close(entered)
+		<-release
+		// The vendor has rotated the token and the persist is about to run.
+		ctxErrAtPersist = ctx.Err()
+		setDiscoveryTokens(t, svc, routeStore, id, fresh)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		res RefreshResult
+		err error
+	}
+	got := make(chan outcome, 1)
+	go func() {
+		_, res, err := svc.RefreshVendorAccountModels(ctx, ownerToken(), acc.ID)
+		got <- outcome{res, err}
+	}()
+	waitClosed(t, entered, "the refresher to start")
+	cancel() // the client goes away mid-refresh
+
+	// The discovery gives up waiting (fail-soft, nothing fetched) ...
+	select {
+	case o := <-got:
+		if o.err != nil && !errors.Is(o.err, context.Canceled) {
+			t.Fatalf("err = %v, want fail-soft or the context's own error", o.err)
+		}
+		if o.err == nil && o.res.Status != VendorRefreshUnverifiable {
+			t.Fatalf("result = %+v, want unverifiable", o.res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the discovery kept waiting on a refresh after its own context ended")
+	}
+	fake.requireNoCalls(t, "after the discovery stopped waiting")
+
+	// ... but the refresh itself was NOT cancelled and still persists the rotation.
+	close(release)
+	waitClosed(t, finished, "the refresher to finish")
+	if ctxErrAtPersist != nil {
+		t.Fatalf("the refresher's context was cancelled mid-flight: %v (a rotated single-use token would be lost)", ctxErrAtPersist)
+	}
+	if !hasOwnBound {
+		t.Fatal("the refresher ran without a bound of its own")
+	}
+	if _, ts := storedTokenSet(t, routeStore, svc, acc.ID); ts.AccessToken != refreshTestFreshAccess {
+		t.Fatalf("stored access token = %q, want the rotated one persisted", ts.AccessToken)
+	}
+}
+
+// Same at connect time: the connect-time bound ends the discovery's wait, never the
+// refresh, and the connect still succeeds with the seeded models.
+func TestConnectVendorAccountImportBoundDoesNotCancelATokenRefresh(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+	fake := installFakeVendorDiscoverers(svc)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	svc.vendorDiscovery.connectTimeout = 100 * time.Millisecond
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
+	seed := storedModels(t, routeStore, acc.ID)
+	fresh := vendorauth.TokenSet{AccessToken: refreshTestFreshAccess, RefreshToken: refreshTestRefresh, ExpiresAt: svc.clock().Add(time.Hour)}
+
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var ctxErrAtPersist error
+	svc.vendorDiscovery.tokenRefresher = func(ctx context.Context, id string) error {
+		defer close(finished)
+		close(entered)
+		<-release
+		ctxErrAtPersist = ctx.Err()
+		setDiscoveryTokens(t, svc, routeStore, id, fresh)
+		return nil
+	}
+
+	type outcome struct {
+		dto VendorAccountDTO
+		err error
+	}
+	got := make(chan outcome, 1)
+	go func() {
+		dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{
+			AccessToken: refreshTestOldAccess, RefreshToken: refreshTestRefresh, ExpiresAt: svc.clock().Add(-time.Hour),
+		})
+		got <- outcome{dto, err}
+	}()
+	waitClosed(t, entered, "the refresher to start")
+	select {
+	case o := <-got:
+		if o.err != nil || !o.dto.SubscriptionConnected || len(o.dto.Models) != len(seed) {
+			t.Fatalf("connect = %+v, %v, want a connected account with the seeded models", o.dto, o.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connect waited on a slow refresh past its discovery bound")
+	}
+
+	close(release)
+	waitClosed(t, finished, "the refresher to finish")
+	if ctxErrAtPersist != nil {
+		t.Fatalf("the connect-time bound cancelled the refresh in flight: %v", ctxErrAtPersist)
+	}
+	if _, ts := storedTokenSet(t, routeStore, svc, acc.ID); ts.AccessToken != refreshTestFreshAccess {
+		t.Fatalf("stored access token = %q, want the rotated one persisted", ts.AccessToken)
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, seed) {
+		t.Fatalf("stored rows = %+v, want the seed kept", got)
+	}
+}
+
+// A refresher that panics must not take the process down (it runs off the request
+// goroutine); the discovery treats it as a failed refresh.
+func TestRefreshVendorAccountModelsSurvivesAPanickingRefresher(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	svc.vendorDiscovery.tokenRefresher = func(context.Context, string) error { panic("boom") }
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want a fail-soft unverifiable", res, err)
+	}
+	fake.requireNoCalls(t, "after a failed refresh")
+}
+
 // --- connect-time discovery bound ------------------------------------------------------
 
 func TestNewServiceBoundsConnectTimeDiscoveryToFiveSeconds(t *testing.T) {
@@ -463,6 +666,30 @@ func TestRefreshVendorAccountModelsHasNoConnectTimeBound(t *testing.T) {
 	}
 	if hasDeadline {
 		t.Fatal("the explicit refresh was given a deadline; only connect-time discovery is bounded")
+	}
+}
+
+// When the connect-time discovery ends in an error the connect still answers with
+// the account, and it is the account as it is NOW (here: a status flipped meanwhile),
+// not the copy taken before the discovery ran.
+func TestConnectDiscoveryFailureAnswersWithTheCurrentAccount(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
+	svc.vendorDiscovery.discoverers.OpenAISubscription = func(context.Context, *http.Client, string, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		// The status changes while the vendor call is in flight, then the write fails.
+		if err := routeStore.SetVendorAccountStatus(context.Background(), acc.ID, routing.VendorAccountStatusNeedsReconnect); err != nil {
+			t.Errorf("SetVendorAccountStatus: %v", err)
+		}
+		svc.routes = failSetModelsStore{Store: routeStore, err: errors.New("db down")}
+		return []vendorauth.DiscoveredModel{discovered("gpt-6-luna", "x")}, vendorauth.DiscoveryOK
+	}
+
+	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess, RefreshToken: connectTestRefresh})
+	if err != nil {
+		t.Fatalf("ConnectVendorAccountImport: %v (a failing discovery must not fail the connect)", err)
+	}
+	if !dto.SubscriptionConnected || dto.Status != routing.VendorAccountStatusNeedsReconnect {
+		t.Fatalf("dto = %+v, want the connected account with its CURRENT status needs_reconnect", dto)
 	}
 }
 
