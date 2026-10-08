@@ -236,20 +236,27 @@ type VendorAccount struct {
 	// else "". Shape (plaintext, before sealing): {access, refresh, expires_at,
 	// account_id, plan_type, scope}. See internal/vendorauth.TokenSet.
 	OAuthTokens string
+	// ModelPrefix is the optional per-account namespace for the account's gateway
+	// model ids (migration 83): "" = none. The service validates it (printable
+	// ASCII, no spaces, bounded length); the store keeps it verbatim.
+	ModelPrefix string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
 
 // VendorAccountModel is one model a vendor account serves: the public id a
 // caller asks the gateway for (GatewayModel), the id sent to the vendor
-// (UpstreamModel) and the wire dialect used to reach it (APIFlavor, one of
-// APIFlavorOpenAI / APIFlavorAnthropic). For the vendors served today the two
-// ids coincide. (AccountID, GatewayModel) is the primary key.
+// (UpstreamModel), the wire dialect used to reach it (APIFlavor, one of
+// APIFlavorOpenAI / APIFlavorAnthropic) and the vendor's human-readable name for
+// it (DisplayName, migration 83; "" when the vendor supplied none). For the
+// vendors served today the two ids coincide. (AccountID, GatewayModel) is the
+// primary key.
 type VendorAccountModel struct {
 	AccountID     string
 	GatewayModel  string
 	UpstreamModel string
 	APIFlavor     string
+	DisplayName   string
 }
 
 // VendorAccountUsage is the latest rate-limit usage snapshot scraped from a
@@ -2204,12 +2211,12 @@ type RuntimeStore interface {
 // VendorAccountStore is per-user external-vendor-account CRUD. Credentials ride
 // sealed; the cipher-holding layers open them at dispatch.
 //
-// UpdateVendorAccount rewrites auth_type, name, status, api_key, oauth_tokens
-// and updated_at; the account's identity — id, owner_user_id, vendor and
-// created_at — is immutable, so every driver ignores a changed value there. An
-// unknown id is ErrNotFound on Update and Delete, a duplicate id is ErrConflict
-// on Create. Deleting an account (or its owning user) cascades its dependent
-// rows.
+// UpdateVendorAccount rewrites auth_type, name, status, api_key, oauth_tokens,
+// model_prefix and updated_at; the account's identity — id, owner_user_id,
+// vendor and created_at — is immutable, so every driver ignores a changed value
+// there. An unknown id is ErrNotFound on Update and Delete, a duplicate id is
+// ErrConflict on Create. Deleting an account (or its owning user) cascades its
+// dependent rows.
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error

@@ -21,13 +21,21 @@ import (
 // context detached from the request, so this is its only deadline.
 const vendorAccountCleanupTimeout = 5 * time.Second
 
+// vendorAccountModelPrefixMaxLen bounds an account's model prefix. The prefix is
+// glued onto every gateway model id the account serves, so a generous but finite
+// cap keeps ids (and the URLs and logs they appear in) reasonable.
+const vendorAccountModelPrefixMaxLen = 64
+
 // VendorAccountModelDTO is one gateway-model entry a vendor account serves: a
 // row of vendor_account_models, seeded from the curated per-vendor catalog
-// (VendorCatalog) when the account is created.
+// (VendorCatalog) when the account is created. DisplayName is the vendor's
+// human-readable name for the model ("" when it supplied none); it is always
+// present on the wire.
 type VendorAccountModelDTO struct {
 	GatewayModel  string `json:"gateway_model"`
 	UpstreamModel string `json:"upstream_model"`
 	APIFlavor     string `json:"api_flavor"`
+	DisplayName   string `json:"display_name"`
 }
 
 // VendorAccountUsageDTO is the portal view of a routing.VendorAccountUsage: the
@@ -51,6 +59,10 @@ type VendorAccountUsageDTO struct {
 // the APIKeySet / SubscriptionConnected booleans (write-only secrets), and the
 // owner is implicit (every caller sees only their own accounts).
 //
+// ModelPrefix is the account's optional model-id namespace ("" = none). It is
+// stored and reported here; applying it to the gateway model ids is the model
+// listing's concern, not this DTO's.
+//
 // Usage is the rate-limit snapshot and is filled by GetVendorAccount ONLY (the
 // detail view's Usage & Limits panel): the list and the write endpoints leave it
 // nil -- one snapshot read per row would be an N+1 on the list -- and so does a
@@ -62,6 +74,7 @@ type VendorAccountDTO struct {
 	AuthType              string                  `json:"auth_type"`
 	Name                  string                  `json:"name"`
 	Status                string                  `json:"status"`
+	ModelPrefix           string                  `json:"model_prefix"`
 	APIKeySet             bool                    `json:"api_key_set"`
 	SubscriptionConnected bool                    `json:"subscription_connected"`
 	Models                []VendorAccountModelDTO `json:"models"`
@@ -78,22 +91,27 @@ type VendorAccountListResponse struct {
 // CreateVendorAccountRequest creates an account owned by the calling principal.
 // APIKey is write-only and only meaningful for AuthType == api_key; a
 // subscription account is created unconnected (the OAuth connect flow fills its
-// token set later). An empty Status defaults to active.
+// token set later). An empty Status defaults to active. ModelPrefix is optional
+// ("" = none); see normalizeVendorAccountModelPrefix for the accepted shape.
 type CreateVendorAccountRequest struct {
-	Vendor   string `json:"vendor"`
-	AuthType string `json:"auth_type"`
-	Name     string `json:"name"`
-	Status   string `json:"status"`
-	APIKey   string `json:"api_key"`
+	Vendor      string `json:"vendor"`
+	AuthType    string `json:"auth_type"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	APIKey      string `json:"api_key"`
+	ModelPrefix string `json:"model_prefix"`
 }
 
 // UpdateVendorAccountRequest is a partial update: a nil field keeps the stored
 // value. APIKey is the write-only secret sentinel: nil keeps the sealed key,
-// "" clears it, any other value replaces it. Vendor and auth type are immutable.
+// "" clears it, any other value replaces it. ModelPrefix follows the same
+// pointer convention: nil keeps the stored prefix, "" clears it, any other value
+// replaces it. Vendor and auth type are immutable.
 type UpdateVendorAccountRequest struct {
-	Name   *string `json:"name"`
-	Status *string `json:"status"`
-	APIKey *string `json:"api_key"`
+	Name        *string `json:"name"`
+	Status      *string `json:"status"`
+	APIKey      *string `json:"api_key"`
+	ModelPrefix *string `json:"model_prefix"`
 }
 
 // vendorAccountDTO maps a stored account to its credential-free view, reading
@@ -110,6 +128,7 @@ func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccoun
 			GatewayModel:  row.GatewayModel,
 			UpstreamModel: row.UpstreamModel,
 			APIFlavor:     row.APIFlavor,
+			DisplayName:   row.DisplayName,
 		})
 	}
 	return VendorAccountDTO{
@@ -118,6 +137,7 @@ func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccoun
 		AuthType:              acc.AuthType,
 		Name:                  acc.Name,
 		Status:                acc.Status,
+		ModelPrefix:           acc.ModelPrefix,
 		APIKeySet:             acc.APIKey != "",
 		SubscriptionConnected: acc.OAuthTokens != "",
 		Models:                models,
@@ -174,6 +194,25 @@ func normalizeVendorAccountStatus(raw string) (string, error) {
 	default:
 		return "", ErrVendorAccountStatusInvalid
 	}
+}
+
+// normalizeVendorAccountModelPrefix trims a requested model prefix and checks it.
+// "" (after trimming) means no prefix and is always valid. Otherwise the prefix
+// must be at most vendorAccountModelPrefixMaxLen bytes of printable ASCII with no
+// whitespace (0x21-0x7e): it is concatenated into model ids that travel in JSON
+// bodies, URLs and logs, so spaces, control characters and non-ASCII text are
+// refused rather than escaped.
+func normalizeVendorAccountModelPrefix(raw string) (string, error) {
+	prefix := strings.TrimSpace(raw)
+	if len(prefix) > vendorAccountModelPrefixMaxLen {
+		return "", ErrVendorAccountModelPrefixInvalid
+	}
+	for i := 0; i < len(prefix); i++ {
+		if c := prefix[i]; c < 0x21 || c > 0x7e {
+			return "", ErrVendorAccountModelPrefixInvalid
+		}
+	}
+	return prefix, nil
 }
 
 // sealVendorAPIKey trims surrounding whitespace (a pasted key often carries a
@@ -297,6 +336,10 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if status, err = normalizeVendorAccountStatus(status); err != nil {
 		return VendorAccountDTO{}, err
 	}
+	modelPrefix, err := normalizeVendorAccountModelPrefix(req.ModelPrefix)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey != "" && authType != routing.VendorAuthAPIKey {
 		return VendorAccountDTO{}, ErrVendorAccountAPIKeyNotAllowed
@@ -314,6 +357,7 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		Name:        name,
 		Status:      status,
 		APIKey:      sealedKey,
+		ModelPrefix: modelPrefix,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -372,6 +416,21 @@ func applyVendorAccountStatus(acc *routing.VendorAccount, status *string) error 
 	return nil
 }
 
+// applyVendorAccountModelPrefix applies a model-prefix change when the request
+// carries one: nil keeps the stored prefix, "" clears it, any other value is
+// validated (normalizeVendorAccountModelPrefix) and replaces it.
+func applyVendorAccountModelPrefix(acc *routing.VendorAccount, raw *string) error {
+	if raw == nil {
+		return nil
+	}
+	prefix, err := normalizeVendorAccountModelPrefix(*raw)
+	if err != nil {
+		return err
+	}
+	acc.ModelPrefix = prefix
+	return nil
+}
+
 // applyVendorAccountAPIKey seals and applies an api-key change when the request
 // carries one. Only the exact empty string clears the key; a value that is blank
 // after trimming is a paste slip and must not silently wipe it. A key may be set
@@ -395,11 +454,11 @@ func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *stri
 	return nil
 }
 
-// UpdateVendorAccount renames an account, changes its status, and/or replaces
-// or clears its api key. The store keeps id, owner, vendor and created_at
-// immutable, so this loads the row, mutates only the requested fields and writes
-// it back. The write is OWNER-ONLY (system scope included), and authorization
-// runs first, so a stranger gets 404 even for an invalid body.
+// UpdateVendorAccount renames an account, changes its status or model prefix,
+// and/or replaces or clears its api key. The store keeps id, owner, vendor and
+// created_at immutable, so this loads the row, mutates only the requested fields
+// and writes it back. The write is OWNER-ONLY (system scope included), and
+// authorization runs first, so a stranger gets 404 even for an invalid body.
 // ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
@@ -413,6 +472,9 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 		return VendorAccountDTO{}, err
 	}
 	if err := applyVendorAccountStatus(&acc, req.Status); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if err := applyVendorAccountModelPrefix(&acc, req.ModelPrefix); err != nil {
 		return VendorAccountDTO{}, err
 	}
 	if err := s.applyVendorAccountAPIKey(&acc, req.APIKey); err != nil {

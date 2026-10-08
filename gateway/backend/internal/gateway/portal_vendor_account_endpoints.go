@@ -326,6 +326,7 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountStatusInvalid, status: http.StatusBadRequest, code: "vendor_account.status_invalid", msg: "vendor account status is invalid"},
 	{err: portal.ErrVendorAccountAPIKeyNotAllowed, status: http.StatusBadRequest, code: "vendor_account.api_key_not_allowed", msg: "an api key can only be set on an api_key account"},
 	{err: portal.ErrVendorAccountAPIKeyInvalid, status: http.StatusBadRequest, code: "vendor_account.api_key_invalid", msg: "api key must not be blank; send an empty string to clear it"},
+	{err: portal.ErrVendorAccountModelPrefixInvalid, status: http.StatusBadRequest, code: "vendor_account.model_prefix_invalid", msg: "model prefix must be at most 64 printable ASCII characters without spaces"},
 	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: "vendor_account.forbidden", msg: notAllowedMsg},
 	// Subscription connect. A vendor refusal of the pasted code is a 400, never a
 	// 401: the portal treats a 401 from this API as an expired session. The vendor

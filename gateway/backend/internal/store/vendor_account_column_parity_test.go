@@ -30,8 +30,8 @@ const vendorAccountParityRows = 3
 // So every reader must return the EXACT same routing.VendorAccount value for the
 // same row, and the ByID baseline must carry the value seeded into each field.
 // vendor_accounts has no integer-boolean column, so no bit-pattern table is
-// needed: every one of the ten fields holds a distinct non-zero value per row
-// (the six text credential/identity columns are each different from every
+// needed: every one of the eleven fields holds a distinct non-zero value per row
+// (the seven text credential/identity columns are each different from every
 // other, so a swapped pair is observable), and the two owners make
 // VendorAccountsByOwner's filter observable too.
 func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
@@ -61,8 +61,9 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 				ID: "va_cols_" + idx, OwnerUserID: rowOwner[i], Vendor: vendors[i], AuthType: authTypes[i],
 				Name: "Column Parity " + idx, Status: statuses[i],
 				APIKey: "enc:api-key-" + idx, OAuthTokens: "enc:oauth-tokens-" + idx,
-				CreatedAt: now.Add(time.Duration(-10-i) * time.Minute),
-				UpdatedAt: now.Add(time.Duration(-3-i) * time.Minute),
+				ModelPrefix: "prefix-" + idx + "/",
+				CreatedAt:   now.Add(time.Duration(-10-i) * time.Minute),
+				UpdatedAt:   now.Add(time.Duration(-3-i) * time.Minute),
 			})
 		}
 		for _, acc := range want {
@@ -145,7 +146,7 @@ func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 		assertColumnCoverage(context.Background(), t, s, "vendor_accounts", columnCoverage{
 			bools: nil,
 			seeded: []string{
-				"api_key", "auth_type", "created_at", "id", "name", "oauth_tokens",
+				"api_key", "auth_type", "created_at", "id", "model_prefix", "name", "oauth_tokens",
 				"owner_user_id", "status", "updated_at", "vendor",
 			},
 			ignored: map[string]string{},

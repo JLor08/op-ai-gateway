@@ -115,6 +115,7 @@ var migrations = []migration{
 	{version: 80, name: "application_responses_live_timings", up: migration80Up},
 	{version: 81, name: "usage_events_billing_unit", up: migration81Up},
 	{version: 82, name: "vendor_accounts", up: migration82Up},
+	{version: 83, name: "vendor_account_model_discovery", up: migration83Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3907,4 +3908,23 @@ func migration82Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return addColumnIfMissing(ctx, tx, dl, "usage_events", "account_id text not null default ''")
+}
+
+// migration83Up prepares the vendor accounts for dynamic model discovery: a
+// per-account model prefix (vendor_accounts.model_prefix, the optional namespace
+// a later change applies to the account's gateway model ids; empty = none) and
+// the vendor's human-readable model name (vendor_account_models.display_name;
+// empty when the vendor supplied none).
+//
+// Both are plain text columns with an empty-string default, so every row written
+// before the upgrade reads back "no prefix" / "no display name" and the two
+// existing writers keep working unchanged. addColumnIfMissing makes the step
+// replayable on both dialects. baselineCreateStatements is NOT touched (frozen
+// as of v60), so the columns live only here -- the same discipline migration61Up,
+// migration81Up and migration82Up follow.
+func migration83Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	if err := addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "model_prefix text not null default ''"); err != nil {
+		return err
+	}
+	return addColumnIfMissing(ctx, tx, dl, "vendor_account_models", "display_name text not null default ''")
 }

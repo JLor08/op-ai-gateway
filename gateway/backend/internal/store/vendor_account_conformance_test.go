@@ -39,7 +39,7 @@ func TestRoutingStoreVendorAccountCRUD(t *testing.T) {
 		acc := routing.VendorAccount{
 			ID: "va_one", OwnerUserID: "u_va", Vendor: routing.VendorOpenAI,
 			AuthType: routing.VendorAuthAPIKey, Name: "My OpenAI", Status: routing.VendorAccountStatusActive,
-			APIKey: "enc:seeded", OAuthTokens: "", CreatedAt: now, UpdatedAt: now,
+			APIKey: "enc:seeded", OAuthTokens: "", ModelPrefix: "work/", CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.CreateVendorAccount(ctx, acc); err != nil {
 			t.Fatalf("create: %v", err)
@@ -63,11 +63,12 @@ func TestRoutingStoreVendorAccountCRUD(t *testing.T) {
 			t.Fatalf("by owner = %v, %v", byOwner, err)
 		}
 		acc.Name = "Renamed"
+		acc.ModelPrefix = "home-"
 		acc.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateVendorAccount(ctx, acc); err != nil {
 			t.Fatalf("update: %v", err)
 		}
-		if got, _ := s.VendorAccountByID(ctx, "va_one"); got.Name != "Renamed" {
+		if got, _ := s.VendorAccountByID(ctx, "va_one"); got.Name != "Renamed" || got.ModelPrefix != "home-" {
 			t.Fatalf("update not applied: %+v", got)
 		}
 		if err := s.DeleteVendorAccount(ctx, "va_one"); err != nil {
@@ -111,12 +112,12 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		mine := routing.VendorAccount{
 			ID: "va_mine", OwnerUserID: "u_va_a", Vendor: routing.VendorAnthropic,
 			AuthType: routing.VendorAuthAPIKey, Name: "Mine", Status: routing.VendorAccountStatusActive,
-			APIKey: "enc:key", CreatedAt: now, UpdatedAt: now,
+			APIKey: "enc:key", ModelPrefix: "mine/", CreatedAt: now, UpdatedAt: now,
 		}
 		theirs := routing.VendorAccount{
 			ID: "va_theirs", OwnerUserID: "u_va_b", Vendor: routing.VendorOpenAI,
 			AuthType: routing.VendorAuthSubscription, Name: "Theirs", Status: routing.VendorAccountStatusNeedsReconnect,
-			OAuthTokens: "enc:tokens", CreatedAt: now, UpdatedAt: now,
+			OAuthTokens: "enc:tokens", ModelPrefix: "theirs/", CreatedAt: now, UpdatedAt: now,
 		}
 		for _, acc := range []routing.VendorAccount{theirs, mine} {
 			if err := s.CreateVendorAccount(ctx, acc); err != nil {
@@ -147,6 +148,7 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		upd.Status = routing.VendorAccountStatusDisabled
 		upd.APIKey = ""
 		upd.OAuthTokens = "enc:new-tokens"
+		upd.ModelPrefix = "edited-"
 		upd.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateVendorAccount(ctx, upd); err != nil {
 			t.Fatalf("update: %v", err)
@@ -161,6 +163,7 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		want.Status = upd.Status
 		want.APIKey = upd.APIKey
 		want.OAuthTokens = upd.OAuthTokens
+		want.ModelPrefix = upd.ModelPrefix
 		want.UpdatedAt = upd.UpdatedAt
 		if normalizeVendorAccountForCompare(got) != normalizeVendorAccountForCompare(want) {
 			t.Fatalf("update touched identity or missed a column:\n got  %+v\n want %+v", got, want)

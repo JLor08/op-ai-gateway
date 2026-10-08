@@ -48,13 +48,15 @@ sharing link table plus a resolver filter extension), not a rewrite.
 | `status` | `active` \| `disabled` \| `needs_reconnect`. The last is system-managed (§3.4): a refresh rejection flips an account to it; the operator cannot set it directly. |
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
+| `model_prefix` | Optional per-account namespace for the account's gateway model ids (migration 83; `''` = none). Validated by the service — trimmed, printable ASCII without spaces, at most 64 bytes — and stored verbatim; the DTO reports it (`model_prefix`) and the create/update requests accept it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
 account created but not yet connected, and an api-key account with no key set, have
 neither (the exclusivity is enforced in the
 service, not the schema). A per-account curated model catalog
 (`vendor_account_models`, seeded at creation from a static set keyed by vendor
-**and** auth type, §9) and a rate-limit usage snapshot
+**and** auth type, §9; each row also carries the vendor's human-readable
+`display_name`, `''` when none, since migration 83) and a rate-limit usage snapshot
 (`vendor_account_usage`) hang off the account, both `on delete cascade`. The three
 tables and the `usage_events.account_id` attribution column are migration 82; see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).

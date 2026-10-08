@@ -48,8 +48,8 @@ func TestRoutingStoreVendorAccountModels(t *testing.T) {
 
 		// Written out of order; read back sorted by gateway_model.
 		first := []routing.VendorAccountModel{
-			{AccountID: "va_models", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024-08-06", APIFlavor: routing.APIFlavorOpenAI},
-			{AccountID: "va_models", GatewayModel: "gpt-4.1", UpstreamModel: "gpt-4.1", APIFlavor: routing.APIFlavorOpenAI},
+			{AccountID: "va_models", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024-08-06", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT-4o"},
+			{AccountID: "va_models", GatewayModel: "gpt-4.1", UpstreamModel: "gpt-4.1", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT-4.1"},
 			{AccountID: "va_models", GatewayModel: "o3", UpstreamModel: "o3", APIFlavor: routing.APIFlavorOpenAI},
 		}
 		if err := s.SetVendorAccountModels(ctx, "va_models", first); err != nil {
@@ -72,14 +72,14 @@ func TestRoutingStoreVendorAccountModels(t *testing.T) {
 
 		// The caller's AccountID is authoritative-by-argument: a row carrying a
 		// stale or empty AccountID is stored under the account it was set for.
-		other := []routing.VendorAccountModel{{GatewayModel: "claude-opus-4", UpstreamModel: "claude-opus-4", APIFlavor: routing.APIFlavorAnthropic}}
+		other := []routing.VendorAccountModel{{GatewayModel: "claude-opus-4", UpstreamModel: "claude-opus-4", APIFlavor: routing.APIFlavorAnthropic, DisplayName: "Claude Opus 4"}}
 		if err := s.SetVendorAccountModels(ctx, "va_models_other", other); err != nil {
 			t.Fatalf("set other: %v", err)
 		}
 
 		// Replace-all: the second set overwrites the first entirely.
 		second := []routing.VendorAccountModel{
-			{AccountID: "va_models", GatewayModel: "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI},
+			{AccountID: "va_models", GatewayModel: "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT-5"},
 		}
 		if err := s.SetVendorAccountModels(ctx, "va_models", second); err != nil {
 			t.Fatalf("set second: %v", err)
@@ -91,7 +91,7 @@ func TestRoutingStoreVendorAccountModels(t *testing.T) {
 
 		// ...and did not touch the other account's rows.
 		gotOther, _ := s.VendorAccountModels(ctx, "va_models_other")
-		wantOther := []routing.VendorAccountModel{{AccountID: "va_models_other", GatewayModel: "claude-opus-4", UpstreamModel: "claude-opus-4", APIFlavor: routing.APIFlavorAnthropic}}
+		wantOther := []routing.VendorAccountModel{{AccountID: "va_models_other", GatewayModel: "claude-opus-4", UpstreamModel: "claude-opus-4", APIFlavor: routing.APIFlavorAnthropic, DisplayName: "Claude Opus 4"}}
 		if !reflect.DeepEqual(gotOther, wantOther) {
 			t.Fatalf("other account's models changed:\n got  %+v\n want %+v", gotOther, wantOther)
 		}
@@ -123,5 +123,23 @@ func TestRoutingStoreVendorAccountModels(t *testing.T) {
 				t.Fatalf("unknown account (%d rows) err = %v, want ErrNotFound", len(models), err)
 			}
 		}
+	})
+}
+
+// TestVendorAccountModelsSchemaColumnsAllCovered ties the vendor_account_models
+// round-trip fixture above to the LIVE migrated schema (the #84 guard): a column
+// added to the table but not seeded with a distinct value in
+// TestRoutingStoreVendorAccountModels would read back its zero from every reader
+// and stay green. The table has no integer-boolean column, so every column is
+// seeded.
+func TestVendorAccountModelsSchemaColumnsAllCovered(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		assertColumnCoverage(context.Background(), t, s, "vendor_account_models", columnCoverage{
+			bools: nil,
+			seeded: []string{
+				"account_id", "api_flavor", "display_name", "gateway_model", "upstream_model",
+			},
+			ignored: map[string]string{},
+		})
 	})
 }
