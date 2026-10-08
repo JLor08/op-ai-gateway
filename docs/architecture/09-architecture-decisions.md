@@ -3057,10 +3057,40 @@ the access token, refresh token and expiry to the existing import endpoint, so t
 raw file never leaves the browser. *Catalog by auth type:* an OpenAI subscription
 account is seeded with only the models the Codex backend serves, an `api_key`
 account with the full set (accounts seeded earlier keep their rows; there is no
-backfill). → [External Vendor Accounts §3.5](cross-cutting/external-vendor-accounts.md#35-credential-validation).
+backfill; the seed is now only the create-time fallback, see below).
+→ [External Vendor Accounts §3.5](cross-cutting/external-vendor-accounts.md#35-credential-validation).
+
+**Follow-up: dynamic model discovery, a model prefix and dashboard visibility
+(also no new decision).** A static model list is a guess that the vendors outrun,
+and for a ChatGPT subscription it was a visibly wrong one: the Codex backend
+serves newer model generations than any list kept in this repository. The gateway
+now asks the vendor which models the account's own credential can use and
+replaces the seed with the answer — at a subscription connect (best-effort, short
+bound, never failing the connect) and on an explicit, owner-only
+`POST /api/portal/vendor-accounts/{id}/models/refresh`. It is fail-soft in the
+way the credential validation is: an unreachable, rejecting, empty or
+unrecognizable answer leaves the existing models untouched, so a changed vendor
+schema can never wipe a working catalog. An expired subscription token is renewed
+first through the gateway's own locked refresher rather than by the portal,
+because a refresh token is single-use and a second refresher would race the
+dispatch for it. Choice (c) extends rather than changes: the Codex catalog request
+is the one subscription endpoint an operator has confirmed live, the Anthropic
+consumer-bearer listing is not, and the Codex `client_version` the request carries
+is a system setting (`vendor_openai_codex_client_version`) that an operator has to
+raise by hand when OpenAI ships a newer Codex app, or new models stay hidden — a
+maintenance burden accepted with the reverse-engineered backend
+([§11.1](11-risks-and-technical-debt.md#111-operational-risks)). Two smaller
+pieces ride along. An optional per-account `model_prefix` is now **applied**: a
+model is listed and requested as the prefix plus the vendor's id, and the vendor
+is still sent the bare id. And the principal's own vendor models appear in the
+portal dashboard's live-routes table, while the admin Models management page
+(`ManageModels`) deliberately stays the system's real models, so the two admin
+views differ on purpose.
+→ [External Vendor Accounts §6](cross-cutting/external-vendor-accounts.md#6-dynamic-model-discovery-and-the-model-prefix).
 
 → [External Vendor Accounts](cross-cutting/external-vendor-accounts.md),
-[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [Data Model §1](reference/data-model.md#external-vendor-accounts-anbieter),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Configuration & Environment Variables](reference/config-env.md).

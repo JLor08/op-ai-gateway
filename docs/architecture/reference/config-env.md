@@ -121,7 +121,7 @@ All backend variables are read through `internal/config/config.go`'s `Load()` (e
 
 | Variable | Type | Purpose | Default |
 |---|---|---|---|
-| `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` | string | Key sealing captured request/response payloads (and the SMTP password, the NetBird admin token, and a **vendor account**'s API key + OAuth token set) at rest on a disk-backed store. **Required for the vendor-account subscription path**: an OAuth token set is a decryptable secret, so on a disk-backed store with no key a connect/import rejects the write (`capture.ErrKeyRequired` → `vendor_account.connect_key_required`); a memory/volatile store needs no key. See [External Vendor Accounts §8](../cross-cutting/external-vendor-accounts.md#8-secrets-at-rest) | `` |
+| `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` | string | Key sealing captured request/response payloads (and the SMTP password, the NetBird admin token, and a **vendor account**'s API key + OAuth token set) at rest on a disk-backed store. **Required for the vendor-account subscription path**: an OAuth token set is a decryptable secret, so on a disk-backed store with no key a connect/import rejects the write (`capture.ErrKeyRequired` → `vendor_account.connect_key_required`); a memory/volatile store needs no key. See [External Vendor Accounts §9](../cross-cutting/external-vendor-accounts.md#9-secrets-at-rest) | `` |
 | `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` | int | Max captured payload size on a disk-backed store | `1048576` (1 MiB) |
 | `OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES` | int | Max total bytes held by the in-memory capture/chat store (memory driver) | `67108864` (64 MiB) |
 
@@ -154,7 +154,19 @@ settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for any of
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor account and the self-hosted/shared routes (an invalid value is rejected with `system.vendor_account_routing_mode_invalid`). |
 | `vendor_openai_codex_client_version` | version string (digit first, `[0-9A-Za-z._+-]`, ≤ 64 chars) | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (`/backend-api/codex/models?client_version=<V>`). The backend **hides every model whose `minimal_client_version` exceeds it**, so **raise it when OpenAI ships a newer Codex app** (no redeploy). Blank resets to the default; a malformed value is rejected with `system.vendor_openai_codex_client_version_invalid`. VERIFY-LIVE. |
 
-See [External Vendor Accounts §6](../cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode).
+**Maintenance: raise `vendor_openai_codex_client_version` when OpenAI ships a
+newer Codex app.** The default is the version the live-confirmed catalog request
+used and it ages with every Codex release. A value that is too low does not
+fail: the backend simply leaves newer models out of the answer, so the gateway
+cannot tell they are missing — they just never appear in the portal. When a model
+OpenAI has announced is absent after "Modelle aktualisieren", set the setting to
+the current Codex app version (System settings, no redeploy; the next refresh
+uses it) and refresh again. The setting is read at discovery time only, so it
+changes nothing for models an account already serves.
+
+See [External Vendor Accounts §7](../cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)
+and, for what discovery does with the version,
+[§6.6](../cross-cutting/external-vendor-accounts.md#66-the-client_version-knob).
 The subscription path additionally requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY`
 (above) on a disk-backed store.
 
