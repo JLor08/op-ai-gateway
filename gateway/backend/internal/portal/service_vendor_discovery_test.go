@@ -46,17 +46,44 @@ type fakeDiscoveryResult struct {
 	status vendorauth.DiscoveryStatus
 }
 
-// fakeVendorDiscoverers replaces the four vendorauth discovery fetchers so no
-// service test reaches a vendor over the network. Each kind answers its
-// configured result (Unverifiable until set) and every call is recorded.
+// fakeUsageCall is one recorded usage-fetcher invocation.
+type fakeUsageCall struct {
+	accessToken string
+	accountID   string
+	// timeout is the Timeout of the *http.Client the service handed over;
+	// hasClient is false when it handed over nil.
+	timeout   time.Duration
+	hasClient bool
+}
+
+// fakeUsageResult is what the fake usage fetcher answers.
+type fakeUsageResult struct {
+	usage  vendorauth.OpenAISubscriptionUsage
+	status vendorauth.DiscoveryStatus
+}
+
+// unknownUsage is the all-unknown usage snapshot (-1 / nil / "").
+func unknownUsage() vendorauth.OpenAISubscriptionUsage {
+	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1}
+}
+
+// fakeVendorDiscoverers replaces the vendorauth fetchers a models refresh runs (the
+// four discovery fetchers and the OpenAI subscription usage fetch) so no service
+// test reaches a vendor over the network. Each kind answers its configured result
+// (Unverifiable until set) and every call is recorded.
 type fakeVendorDiscoverers struct {
-	mu      sync.Mutex
-	results map[string]fakeDiscoveryResult
-	calls   []fakeDiscoveryCall
+	mu         sync.Mutex
+	results    map[string]fakeDiscoveryResult
+	calls      []fakeDiscoveryCall
+	usage      fakeUsageResult
+	usageCalls []fakeUsageCall
 }
 
 func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
-	f := &fakeVendorDiscoverers{results: map[string]fakeDiscoveryResult{}}
+	f := &fakeVendorDiscoverers{
+		results: map[string]fakeDiscoveryResult{},
+		usage:   fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
+	}
 	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey} {
 		f.results[kind] = fakeDiscoveryResult{status: vendorauth.DiscoveryUnverifiable}
 	}
@@ -98,6 +125,55 @@ func (f *fakeVendorDiscoverers) record(kind, credential, accountID, clientVersio
 	return append([]vendorauth.DiscoveredModel(nil), r.models...), r.status
 }
 
+// okUsage makes the usage fetch answer usage as a verified read.
+func (f *fakeVendorDiscoverers) okUsage(usage vendorauth.OpenAISubscriptionUsage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.usage = fakeUsageResult{usage: usage, status: vendorauth.DiscoveryOK}
+}
+
+// failUsage makes the usage fetch answer Unverifiable together with usage, a
+// payload a correct caller ignores (the real fetcher answers all-unknown then).
+func (f *fakeVendorDiscoverers) failUsage(usage vendorauth.OpenAISubscriptionUsage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.usage = fakeUsageResult{usage: usage, status: vendorauth.DiscoveryUnverifiable}
+}
+
+func (f *fakeVendorDiscoverers) recordUsage(accessToken, accountID string, client *http.Client) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := fakeUsageCall{accessToken: accessToken, accountID: accountID, hasClient: client != nil}
+	if client != nil {
+		call.timeout = client.Timeout
+	}
+	f.usageCalls = append(f.usageCalls, call)
+	return f.usage.usage, f.usage.status
+}
+
+func (f *fakeVendorDiscoverers) usageRecorded() []fakeUsageCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeUsageCall(nil), f.usageCalls...)
+}
+
+// onlyUsageCall fails the test unless exactly one usage fetch was made, and returns it.
+func (f *fakeVendorDiscoverers) onlyUsageCall(t *testing.T) fakeUsageCall {
+	t.Helper()
+	calls := f.usageRecorded()
+	if len(calls) != 1 {
+		t.Fatalf("usage fetcher calls = %+v, want exactly one", calls)
+	}
+	return calls[0]
+}
+
+func (f *fakeVendorDiscoverers) requireNoUsageCalls(t *testing.T, why string) {
+	t.Helper()
+	if calls := f.usageRecorded(); len(calls) != 0 {
+		t.Fatalf("usage fetcher calls = %+v, want none %s", calls, why)
+	}
+}
+
 func (f *fakeVendorDiscoverers) keyed(kind string) VendorCredentialDiscoverer {
 	return func(_ context.Context, client *http.Client, credential string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 		return f.record(kind, credential, "", "", client)
@@ -112,6 +188,9 @@ func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 		AnthropicSubscription: f.keyed(kindAnthropicSubscription),
 		OpenAIAPIKey:          f.keyed(kindOpenAIAPIKey),
 		AnthropicAPIKey:       f.keyed(kindAnthropicAPIKey),
+		OpenAIUsage: func(_ context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+			return f.recordUsage(accessToken, accountID, client)
+		},
 	}
 }
 
@@ -1154,8 +1233,8 @@ func TestUpdateVendorAccountModelPrefixAuthorizationAndValidationRunBeforeRelabe
 func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	d := defaults.vendorDiscovery.discoverers
-	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil {
-		t.Fatalf("defaults = %+v, want every discoverer filled with the vendorauth function", d)
+	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAIUsage == nil {
+		t.Fatalf("defaults = %+v, want every discoverer and the usage fetcher filled with the vendorauth function", d)
 	}
 	if c := defaults.vendorDiscovery.client; c == nil || c.Timeout != 10*time.Second {
 		t.Fatalf("default discovery client = %+v, want a 10s timeout", c)
@@ -1169,12 +1248,28 @@ func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 		},
 	}})
 	id := injected.vendorDiscovery.discoverers
-	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil {
-		t.Fatalf("injected = %+v, want the un-injected discoverers defaulted", id)
+	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAIUsage == nil {
+		t.Fatalf("injected = %+v, want the un-injected discoverers and usage fetcher defaulted", id)
 	}
 	id.OpenAIAPIKey(context.Background(), nil, "k")
 	if !openAIKeyCalled {
 		t.Fatal("the injected OpenAI api-key discoverer was replaced by the default")
+	}
+
+	var usageCalled bool
+	usageInjected := NewService(ServiceDeps{VendorDiscoverers: VendorModelDiscoverers{
+		OpenAIUsage: func(context.Context, *http.Client, string, string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+			usageCalled = true
+			return unknownUsage(), vendorauth.DiscoveryUnverifiable
+		},
+	}})
+	ud := usageInjected.vendorDiscovery.discoverers
+	if ud.OpenAISubscription == nil || ud.OpenAIAPIKey == nil {
+		t.Fatalf("injected usage = %+v, want the model discoverers defaulted", ud)
+	}
+	ud.OpenAIUsage(context.Background(), nil, "t", "a")
+	if !usageCalled {
+		t.Fatal("the injected usage fetcher was replaced by the default")
 	}
 }
 

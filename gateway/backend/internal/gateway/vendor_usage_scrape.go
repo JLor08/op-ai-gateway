@@ -39,13 +39,15 @@ const (
 )
 
 // scrapeVendorAccountUsage parses the vendor rate-limit headers off a served
-// vendor-account response and upserts the per-account usage snapshot. Entirely
-// BEST-EFFORT: it runs only for a vendor target (VendorAccountID != ""), never
-// upserts an all-unknown snapshot (so a response that carries NONE of the
-// recognized headers leaves the previous snapshot intact), and swallows every
-// parse/store failure with a Debug log -- it must NEVER fault the inference
-// request (the client already has its answer by the time recordUsage runs). It
-// logs only the account id, never a header value or a token.
+// vendor-account response and upserts the per-account usage snapshot, MERGED over
+// the stored one so a field the response does not carry (e.g. the credit balance)
+// keeps its stored value instead of being blanked. Entirely BEST-EFFORT: it runs
+// only for a vendor target (VendorAccountID != ""), never upserts an all-unknown
+// snapshot (so a response that carries NONE of the recognized headers leaves the
+// previous snapshot intact), and swallows every parse/store failure with a Debug
+// log -- it must NEVER fault the inference request (the client already has its
+// answer by the time recordUsage runs). It logs only the account id, never a
+// header value or a token.
 func (s *Server) scrapeVendorAccountUsage(target routing.Target, h http.Header) {
 	if s.Routes == nil || target.VendorAccountID == "" || len(h) == 0 {
 		return
@@ -57,7 +59,19 @@ func (s *Server) scrapeVendorAccountUsage(target routing.Target, h http.Header) 
 		// snapshot with all-unknowns.
 		return
 	}
-	if err := s.Routes.UpsertVendorAccountUsage(context.Background(), snapshot); err != nil {
+	ctx := context.Background()
+	// MERGE over the stored snapshot rather than overwrite it: UpsertVendorAccountUsage
+	// replaces the whole row, so a response that omits a field (typically the
+	// credit-balance header, or one window) would otherwise blank what an earlier
+	// scrape or the active usage fetch already stored. A read error is as
+	// best-effort as the rest: fall back to upserting the parsed snapshot as-is.
+	switch existing, found, err := s.Routes.VendorAccountUsageByID(ctx, target.VendorAccountID); {
+	case err != nil:
+		slog.Debug("vendor account usage read for merge failed", "account", target.VendorAccountID, "err", err)
+	case found:
+		snapshot = routing.MergeVendorAccountUsage(existing, snapshot)
+	}
+	if err := s.Routes.UpsertVendorAccountUsage(ctx, snapshot); err != nil {
 		slog.Debug("vendor account usage upsert failed", "account", target.VendorAccountID, "err", err)
 	}
 }

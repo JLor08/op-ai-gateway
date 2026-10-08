@@ -265,3 +265,137 @@ func TestTelemetrySampleStoreInterface(t *testing.T) {
 		_ = s.PruneTelemetrySamples
 	}
 }
+
+// TestMergeVendorAccountUsage pins the "merge, never blank" rule every usage
+// writer (the passive scrape and the active fetch) relies on: the incoming
+// snapshot wins for each field it KNOWS (percent >= 0, non-nil reset, non-empty
+// credit string) and the stored value survives for each field it does not
+// (-1 / nil / ""), so a partial reading can never wipe a good one. AccountID and
+// UpdatedAt always come from the incoming snapshot.
+func TestMergeVendorAccountUsage(t *testing.T) {
+	t0 := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	t1 := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	fiveOld := time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC)
+	fiveNew := time.Date(2026, 10, 8, 15, 0, 0, 0, time.UTC)
+	weekOld := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
+	weekNew := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+
+	// existing is a fully known stored snapshot; unknown is a snapshot that
+	// knows nothing (every field at its unknown sentinel) apart from the
+	// identity and timestamp every snapshot carries.
+	existing := VendorAccountUsage{
+		AccountID: "old", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
+		WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t0,
+	}
+	unknown := VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, UpdatedAt: t1}
+
+	cases := []struct {
+		name     string
+		incoming VendorAccountUsage
+		want     VendorAccountUsage
+	}{
+		{
+			name:     "nothing known keeps every stored field",
+			incoming: unknown,
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "five-hour percent known overrides, the rest is kept",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: 55, WeeklyPct: -1, UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 55, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "a real 0 percent is known and overrides (not mistaken for unknown)",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: 0, WeeklyPct: 0, UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 0, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 0, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "five-hour reset known overrides, the rest is kept",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, FiveHourResetAt: &fiveNew, WeeklyPct: -1, UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 40, FiveHourResetAt: &fiveNew,
+				WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "weekly percent known overrides, the rest is kept",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: 60, UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 60, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "weekly reset known overrides, the rest is kept",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, WeeklyResetAt: &weekNew, UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 25, WeeklyResetAt: &weekNew, CreditBalance: "10.00", UpdatedAt: t1,
+			},
+		},
+		{
+			name:     "credit balance known overrides, the rest is kept",
+			incoming: VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "3.25", UpdatedAt: t1},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
+				WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "3.25", UpdatedAt: t1,
+			},
+		},
+		{
+			name: "everything known overrides every stored field",
+			incoming: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 5, FiveHourResetAt: &fiveNew,
+				WeeklyPct: 6, WeeklyResetAt: &weekNew, CreditBalance: "99", UpdatedAt: t1,
+			},
+			want: VendorAccountUsage{
+				AccountID: "acc", FiveHourPct: 5, FiveHourResetAt: &fiveNew,
+				WeeklyPct: 6, WeeklyResetAt: &weekNew, CreditBalance: "99", UpdatedAt: t1,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MergeVendorAccountUsage(existing, tc.incoming)
+			if got.AccountID != tc.want.AccountID || got.FiveHourPct != tc.want.FiveHourPct ||
+				got.WeeklyPct != tc.want.WeeklyPct || got.CreditBalance != tc.want.CreditBalance ||
+				!got.UpdatedAt.Equal(tc.want.UpdatedAt) {
+				t.Fatalf("scalar mismatch:\n got  %+v\n want %+v", got, tc.want)
+			}
+			if !mergeTimePtrEqual(got.FiveHourResetAt, tc.want.FiveHourResetAt) {
+				t.Fatalf("FiveHourResetAt = %v, want %v", got.FiveHourResetAt, tc.want.FiveHourResetAt)
+			}
+			if !mergeTimePtrEqual(got.WeeklyResetAt, tc.want.WeeklyResetAt) {
+				t.Fatalf("WeeklyResetAt = %v, want %v", got.WeeklyResetAt, tc.want.WeeklyResetAt)
+			}
+		})
+	}
+
+	t.Run("an all-unknown existing stays unknown under an all-unknown incoming", func(t *testing.T) {
+		// No stored reading and no new one: the result must be the unknown
+		// sentinels, never a fabricated 0 / zero time / credit.
+		got := MergeVendorAccountUsage(
+			VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1},
+			unknown,
+		)
+		if got.FiveHourPct != -1 || got.WeeklyPct != -1 || got.FiveHourResetAt != nil ||
+			got.WeeklyResetAt != nil || got.CreditBalance != "" {
+			t.Fatalf("merged = %+v, want every field still unknown", got)
+		}
+	})
+}
+
+func mergeTimePtrEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
+}

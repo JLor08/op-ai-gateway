@@ -148,19 +148,27 @@ export function VendorAccountUsagePanel({
  * no snapshot (one read per row would be an N+1), so the detail view reads it
  * from the single-account GET. The panel is auxiliary: a failed read simply
  * leaves it out rather than raising a toast on every detail open.
+ *
+ * `refreshKey` is a counter the parent bumps when something happened that can
+ * have changed the snapshot behind this panel's back -- the models refresh pulls
+ * the vendor's usage, and neither `account.id` nor `account.updated_at` change
+ * with it. A new value re-reads the snapshot; the panel keeps showing the
+ * previous one meanwhile instead of blinking out.
  */
 export function VendorAccountUsage({
   t,
   api,
   accountId,
+  refreshKey = 0,
 }: Readonly<{
   t: Translation;
   api: Pick<PortalApi, 'vendorAccount'>;
   accountId: VendorAccount['id'];
+  refreshKey?: number;
 }>) {
   const { data } = useLatestFetch(
     () => api.vendorAccount(accountId).then((account) => account.usage ?? null),
-    [api, accountId],
+    [api, accountId, refreshKey],
   );
   return <VendorAccountUsagePanel t={t} usage={data} />;
 }

@@ -67,8 +67,9 @@ func vaNoNetworkValidators() portal.VendorCredentialValidators {
 	return portal.VendorCredentialValidators{OpenAISubscription: probe, AnthropicSubscription: probe, OpenAIAPIKey: probe, AnthropicAPIKey: probe}
 }
 
-// vaNoNetworkDiscoverers answers Unverifiable for every model-discovery fetch, so
-// a vendor-account test (a connect runs a best-effort discovery) can never reach a
+// vaNoNetworkDiscoverers answers Unverifiable for every model-discovery fetch and
+// for the OpenAI subscription usage fetch a refresh runs after it, so a
+// vendor-account test (a connect runs a best-effort discovery) can never reach a
 // vendor over the network. A test that needs discovered models overrides the
 // fetchers it cares about through the adjust hook below.
 func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
@@ -82,7 +83,14 @@ func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
 		AnthropicSubscription: fetch,
 		OpenAIAPIKey:          fetch,
 		AnthropicAPIKey:       fetch,
+		OpenAIUsage:           vaNoNetworkUsage,
 	}
+}
+
+// vaNoNetworkUsage is the usage fetch of an OpenAI subscription that cannot be
+// asked: Unverifiable and all-unknown, like the real fetcher's failure answer.
+func vaNoNetworkUsage(context.Context, *http.Client, string, string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1}, vendorauth.DiscoveryUnverifiable
 }
 
 // newVendorAccountSettingsTestServerWithDeps is newVendorAccountSettingsTestServer

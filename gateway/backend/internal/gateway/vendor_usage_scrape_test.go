@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -237,6 +238,91 @@ func TestScrapeVendorAccountUsageUpsertsForVendorTarget(t *testing.T) {
 			t.Fatal("a failed upsert must leave no snapshot")
 		}
 	})
+}
+
+// TestScrapeVendorAccountUsageMergesOverStoredSnapshot proves the passive scrape
+// MERGES over the stored per-account snapshot instead of overwriting the whole
+// row: a response carrying only the primary/secondary window headers (no
+// x-codex-credits-balance, which is the common case) must leave a previously
+// stored CreditBalance -- e.g. one the active fetch wrote -- and any window the
+// response did not mention intact, while the windows it does report are updated.
+func TestScrapeVendorAccountUsageMergesOverStoredSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := routing.NewMemoryStore()
+	seedVendorAPIKeyAccount(t, store, "acc_merge", routing.VendorOpenAI)
+	s := &Server{Routes: store}
+	target := routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_merge"}
+
+	// Seeded in the past relative to the real clock: the scrape stamps UpdatedAt from
+	// time.Now(), so a fixed calendar instant would make the .After check below
+	// depend on the runner's date.
+	storedAt := time.Now().Add(-time.Hour).UTC()
+	storedFiveReset := time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC)
+	storedWeekReset := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
+	if err := store.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID: "acc_merge", FiveHourPct: 10, FiveHourResetAt: &storedFiveReset,
+		WeeklyPct: 20, WeeklyResetAt: &storedWeekReset, CreditBalance: "42.50", UpdatedAt: storedAt,
+	}); err != nil {
+		t.Fatalf("seed usage snapshot: %v", err)
+	}
+
+	// Primary window only: no secondary window, no credit balance.
+	headers := http.Header{}
+	headers.Set("x-codex-primary-used-percent", "55")
+	headers.Set("x-codex-primary-reset-at", "1760000000")
+	s.scrapeVendorAccountUsage(target, headers)
+
+	got, ok, err := store.VendorAccountUsageByID(ctx, "acc_merge")
+	if err != nil || !ok {
+		t.Fatalf("snapshot after scrape: ok = %v, err = %v", ok, err)
+	}
+	if got.CreditBalance != "42.50" {
+		t.Fatalf("CreditBalance = %q, want the stored %q kept (the scrape had no credits header)", got.CreditBalance, "42.50")
+	}
+	if got.FiveHourPct != 55 {
+		t.Fatalf("FiveHourPct = %v, want 55 from the scrape", got.FiveHourPct)
+	}
+	if want := time.Unix(1760000000, 0).UTC(); got.FiveHourResetAt == nil || !got.FiveHourResetAt.Equal(want) {
+		t.Fatalf("FiveHourResetAt = %v, want %v from the scrape", got.FiveHourResetAt, want)
+	}
+	if got.WeeklyPct != 20 || got.WeeklyResetAt == nil || !got.WeeklyResetAt.Equal(storedWeekReset) {
+		t.Fatalf("weekly = %v reset %v, want the stored 20 / %v kept (the scrape had no secondary headers)", got.WeeklyPct, got.WeeklyResetAt, storedWeekReset)
+	}
+	if !got.UpdatedAt.After(storedAt) {
+		t.Fatalf("UpdatedAt = %v, want it advanced past the stored %v (it comes from the scrape)", got.UpdatedAt, storedAt)
+	}
+}
+
+// failingUsageReadStore is a routing.Store whose usage-snapshot READ always fails,
+// to prove the scrape's merge step is as best-effort as the rest of the scrape.
+type failingUsageReadStore struct {
+	*routing.MemoryStore
+}
+
+func (failingUsageReadStore) VendorAccountUsageByID(context.Context, string) (routing.VendorAccountUsage, bool, error) {
+	return routing.VendorAccountUsage{}, false, errors.New("usage read unavailable")
+}
+
+// TestScrapeVendorAccountUsageReadErrorFallsBackToParsedSnapshot proves that a
+// failure to read the stored snapshot (the merge's only new I/O) never faults the
+// scrape: it is swallowed and the parsed snapshot is upserted exactly as before.
+func TestScrapeVendorAccountUsageReadErrorFallsBackToParsedSnapshot(t *testing.T) {
+	mem := routing.NewMemoryStore()
+	seedVendorAPIKeyAccount(t, mem, "acc_rd", routing.VendorOpenAI)
+	s := &Server{Routes: failingUsageReadStore{MemoryStore: mem}}
+
+	headers := http.Header{}
+	headers.Set("x-codex-primary-used-percent", "55")
+	s.scrapeVendorAccountUsage(routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_rd"}, headers) // must not panic
+
+	// Read it back through the underlying store (the wrapper's read always fails).
+	got, ok, err := mem.VendorAccountUsageByID(context.Background(), "acc_rd")
+	if err != nil || !ok {
+		t.Fatalf("snapshot after a failed merge read: ok = %v, err = %v; want the parsed snapshot upserted", ok, err)
+	}
+	if got.FiveHourPct != 55 || got.WeeklyPct != -1 || got.CreditBalance != "" {
+		t.Fatalf("snapshot = %+v, want exactly the parsed one (5h 55, weekly unknown, no credit)", got)
+	}
 }
 
 // TestRecordUsageScrapesVendorUsage ties recordUsage to the scrape: recording a

@@ -281,6 +281,35 @@ type VendorAccountUsage struct {
 	UpdatedAt       time.Time
 }
 
+// MergeVendorAccountUsage combines the stored usage snapshot (existing) with a
+// freshly obtained one (incoming) so a partial reading never blanks a field the
+// stored row already knows -- the rule every usage writer follows, so the passive
+// header scrape and the active fetch cannot clobber each other. For each field the
+// result takes incoming when incoming KNOWS it and keeps existing otherwise:
+// FiveHourPct/WeeklyPct are known when >= 0 (-1 = unknown; a real 0 is known),
+// FiveHourResetAt/WeeklyResetAt when non-nil, CreditBalance when non-empty. AccountID
+// and UpdatedAt always come from incoming (it is the newer observation of the same
+// account). Pure: no I/O, and no unknown field is ever turned into a fabricated 0.
+func MergeVendorAccountUsage(existing, incoming VendorAccountUsage) VendorAccountUsage {
+	merged := incoming
+	if incoming.FiveHourPct < 0 {
+		merged.FiveHourPct = existing.FiveHourPct
+	}
+	if incoming.FiveHourResetAt == nil {
+		merged.FiveHourResetAt = existing.FiveHourResetAt
+	}
+	if incoming.WeeklyPct < 0 {
+		merged.WeeklyPct = existing.WeeklyPct
+	}
+	if incoming.WeeklyResetAt == nil {
+		merged.WeeklyResetAt = existing.WeeklyResetAt
+	}
+	if incoming.CreditBalance == "" {
+		merged.CreditBalance = existing.CreditBalance
+	}
+	return merged
+}
+
 // Service is a Service Account (Phase 1 service accounts): an autonomous
 // principal that owns 0..N service tokens (api_tokens with kind="service"),
 // managed like an AI-Server — created by an admin, then administered by its

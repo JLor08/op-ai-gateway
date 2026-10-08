@@ -136,6 +136,22 @@ const (
 	//
 	// REVERSE-ENGINEERED / VERIFY LIVE.
 	OpenAIAccountsCheckURL = "https://chatgpt.com/backend-api/wham/accounts/check"
+	// OpenAIUsageURL is the ChatGPT backend's subscription usage endpoint the Codex
+	// CLI calls (codex-rs backend-client get_usage): a bare GET (no query, no
+	// originator, no version header) with the bearer token and ChatGPT-Account-Id.
+	// It answers the account's rate-limit windows and credit balance: the top-level
+	// rate_limit carries primary_window (five-hour) and secondary_window (weekly),
+	// each {used_percent, reset_at (absolute unix seconds)}, and credits carries
+	// {balance (a string), has_credits, unlimited}. See usage.go for the parser.
+	// It lives under /backend-api/wham/, NOT under /codex/.
+	//
+	// REVERSE-ENGINEERED / VERIFY LIVE.
+	OpenAIUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+	// OpenAIUsageUserAgent is the User-Agent the Codex CLI sends on the usage
+	// request.
+	//
+	// REVERSE-ENGINEERED / VERIFY LIVE.
+	OpenAIUsageUserAgent = "codex-cli"
 	// AnthropicOAuthProfileURL is the Claude OAuth profile endpoint. It needs the
 	// anthropic-beta OAuth opt-in (AnthropicBeta) and anthropic-version
 	// (AnthropicAPIVersion) headers. A token minted by `claude setup-token` has
