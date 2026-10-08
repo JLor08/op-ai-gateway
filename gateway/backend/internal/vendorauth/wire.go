@@ -128,6 +128,14 @@ func post(ctx context.Context, c *http.Client, endpoint, contentType string, bod
 // send performs req with c (a nil c falls back to defaultHTTPClient) and returns
 // the status and the body, capped at maxResponseBytes.
 func send(c *http.Client, req *http.Request) (int, []byte, error) {
+	return sendCapped(c, req, maxResponseBytes)
+}
+
+// sendCapped is send with an explicit body limit: at most limit bytes of the body
+// are read, and a longer body is cut off there (so a caller that parses it sees a
+// truncated document). send's limit is maxResponseBytes; a response that
+// legitimately outgrows it, such as a model catalog, asks for its own.
+func sendCapped(c *http.Client, req *http.Request, limit int64) (int, []byte, error) {
 	if c == nil {
 		c = defaultHTTPClient
 	}
@@ -137,7 +145,7 @@ func send(c *http.Client, req *http.Request) (int, []byte, error) {
 		return 0, nil, fmt.Errorf("vendorauth: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		return 0, nil, fmt.Errorf("vendorauth: read response: %w", err)
 	}

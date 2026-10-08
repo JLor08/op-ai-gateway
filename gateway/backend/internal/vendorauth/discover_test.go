@@ -618,3 +618,85 @@ func TestCodexModelsConstants(t *testing.T) {
 		t.Errorf("CodexModelsClientVersionDefault = %q", CodexModelsClientVersionDefault)
 	}
 }
+
+// padCatalog returns body (a JSON object) with a junk field appended so the whole
+// answer is at least size bytes: the catalog entries stay where they were and the
+// weight sits after them, like the many fields of a real Codex catalog entry.
+func padCatalog(body string, size int) string {
+	const open, closing = `,"padding":"`, `"}`
+	head := strings.TrimSuffix(strings.TrimSpace(body), "}")
+	pad := size - len(head) - len(open) - len(closing)
+	if pad < 0 {
+		pad = 0
+	}
+	return head + open + strings.Repeat("x", pad) + closing
+}
+
+func TestDiscoverParsesACatalogBeyondTheValidatorBodyCap(t *testing.T) {
+	// The live codex/models body is ~0.6 MiB (613191 bytes) and grows with every
+	// model; the 1 MiB cap the credential validators share would soon truncate it
+	// into an unparseable body, i.e. a silent "unverifiable" for a working
+	// credential. Discovery has its own, larger limit, so a catalog between the two
+	// caps still parses.
+	if maxDiscoveryResponseBytes <= maxResponseBytes {
+		t.Errorf("maxDiscoveryResponseBytes = %d, want it larger than the validator cap %d", maxDiscoveryResponseBytes, maxResponseBytes)
+	}
+	for _, tc := range discoverCases() {
+		for _, size := range []int{maxResponseBytes + 1, 2 << 20, 6 << 20} {
+			t.Run(tc.name+"/"+sizeLabel(size), func(t *testing.T) {
+				body := padCatalog(tc.okBody, size)
+				if len(body) < size {
+					t.Fatalf("test body is %d bytes, want at least %d", len(body), size)
+				}
+				client, _ := newProbeClient(t, respondWith(http.StatusOK, body))
+				got, status := tc.call(context.Background(), client, probeSecret)
+				if status != DiscoveryOK {
+					t.Fatalf("status = %v, want ok for a %d byte catalog", status, len(body))
+				}
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Errorf("models = %+v, want %+v", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestDiscoverBodyBeyondItsOwnCapIsUnverifiable(t *testing.T) {
+	// The discovery limit is larger, not absent: a body past it is cut off,
+	// no longer parses, and is Unverifiable (the caller keeps its models).
+	for _, tc := range discoverCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newProbeClient(t, respondWith(http.StatusOK, padCatalog(tc.okBody, maxDiscoveryResponseBytes+4096)))
+			got, status := tc.call(context.Background(), client, probeSecret)
+			assertUnverifiable(t, tc.name, got, status)
+		})
+	}
+}
+
+func TestSendKeepsTheValidatorBodyCap(t *testing.T) {
+	// The discovery limit must not leak into the shared send() the credential
+	// validators and the token endpoints use: that one stays at maxResponseBytes.
+	client, _ := newProbeClient(t, respondWith(http.StatusOK, strings.Repeat("x", maxResponseBytes+4096)))
+	req, err := http.NewRequest(http.MethodGet, "https://probe.test/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body, err := send(client, req)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("send = %d, %v", status, err)
+	}
+	if len(body) != maxResponseBytes {
+		t.Fatalf("send read %d bytes, want the %d byte validator cap", len(body), maxResponseBytes)
+	}
+}
+
+func sizeLabel(size int) string {
+	switch {
+	case size <= maxResponseBytes+1:
+		return "just over 1MiB"
+	case size <= 2<<20:
+		return "2MiB"
+	default:
+		return "6MiB"
+	}
+}

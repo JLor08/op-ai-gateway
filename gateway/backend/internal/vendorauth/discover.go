@@ -80,6 +80,16 @@ const (
 	// anthropicModelsPageLimit is the largest page /v1/models serves (the default
 	// is 20), so the whole catalog arrives in one answer without pagination.
 	anthropicModelsPageLimit = "1000"
+
+	// maxDiscoveryResponseBytes caps the body of a model-list answer. It is its
+	// own limit, deliberately larger than the maxResponseBytes the credential
+	// validators and token endpoints share: the live Codex catalog already weighs
+	// ~0.6 MiB (613191 bytes measured) because every entry carries its full base
+	// instructions, and it grows with each model, so the shared 1 MiB cap would
+	// soon cut it into an unparseable body (a silent Unverifiable for a working
+	// credential). 8 MiB leaves an order of magnitude of headroom and is still a
+	// hard bound against a hostile or runaway answer.
+	maxDiscoveryResponseBytes = 8 << 20
 )
 
 // DiscoverOpenAISubscriptionModels lists the models a ChatGPT (Codex)
@@ -200,7 +210,7 @@ func fetchModelList(ctx context.Context, httpClient *http.Client, s modelListSpe
 	for name, value := range s.headers {
 		req.Header.Set(name, value)
 	}
-	status, body, err := send(withoutRedirects(httpClient), req)
+	status, body, err := sendCapped(withoutRedirects(httpClient), req, maxDiscoveryResponseBytes)
 	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
 		return nil, false
 	}
