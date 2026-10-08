@@ -48,7 +48,8 @@ var benchmarkOmits = map[string]bool{
 	// leaves all three zero.
 	"ExtraHeaders":    true, // static upstream headers only a vendor subscription target carries
 	"Masquerade":      true, // no client-side disguise on a benchmark stream
-	"VendorAccountID": true, // a benchmark never dispatches a vendor subscription bearer
+	"VendorAccountID": true, // a benchmark measures on-prem server throughput, never a vendor account
+	"Subscription":    true, // a benchmark never dispatches a vendor subscription bearer
 }
 
 // TestBenchmarkTargetReqSetsEveryFieldOrDocumentsOmission guards the SECOND real

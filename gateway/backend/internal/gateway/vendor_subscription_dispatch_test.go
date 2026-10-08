@@ -54,6 +54,7 @@ func subscriptionTarget(accountID, endpoint string) routing.Target {
 		Timeout:         30 * time.Second,
 		APIFlavor:       routing.APIFlavorAnthropic,
 		VendorAccountID: accountID,
+		Subscription:    true,
 		Masquerade:      routing.MasqueradeClaudeCode,
 		ExtraHeaders: map[string]string{
 			"anthropic-version": "2023-06-01",
@@ -376,6 +377,7 @@ func openAISubscriptionTarget(accountID, endpoint string) routing.Target {
 		Timeout:         30 * time.Second,
 		APIFlavor:       routing.APIFlavorOpenAI,
 		VendorAccountID: accountID,
+		Subscription:    true,
 		ExtraHeaders: map[string]string{
 			"OpenAI-Beta": "responses=experimental",
 			"originator":  "codex_cli_rs",
@@ -628,4 +630,94 @@ func TestOpenAISubscriptionDispatchRejectionMarksNeedsReconnect(t *testing.T) {
 	if acc.OAuthTokens != originalSealed {
 		t.Fatal("status flip must not rewrite the OAuth tokens column")
 	}
+}
+
+// TestUpstreamAuthCtxKeysOnSubscriptionFlagNotAccountID is the M6a decoupling
+// regression guard. The subscription-bearer trigger moved off target.VendorAccountID
+// (now carried by EVERY vendor target for usage attribution) onto the explicit
+// target.Subscription flag. This pins both halves so the move cannot silently
+// regress M5a/M5b:
+//
+//   - An API-KEY vendor target (VendorAccountID set, Subscription=false) uses its
+//     sealed APIToken and attempts NO subscription-bearer resolution -- proven by a
+//     decoy subscription account sharing the same id with a dead refresh token:
+//     were resolution attempted, it would flip that account to needs_reconnect; it
+//     stays active, and the upstream credential is the decrypted api key.
+//   - A SUBSCRIPTION target (Subscription=true) still resolves the OAuth bearer
+//     from the account's sealed tokens, carrying no api key.
+func TestUpstreamAuthCtxKeysOnSubscriptionFlagNotAccountID(t *testing.T) {
+	t.Run("api_key_target_uses_sealed_token_and_skips_subscription_resolution", func(t *testing.T) {
+		cipher := newDispatchCipher(t)
+		store := routing.NewMemoryStore()
+		// A decoy SUBSCRIPTION account with the SAME id as the api-key target's
+		// VendorAccountID, carrying a dead refresh token and an expired access token.
+		// If upstreamAuthCtx wrongly routed on VendorAccountID it would try to refresh
+		// this and flip it to needs_reconnect; it must not.
+		seedSubscriptionAccount(t, store, cipher, "acc_vendor", routing.VendorAnthropic, vendorauth.TokenSet{
+			AccessToken: "stale-access", RefreshToken: "dead-refresh", ExpiresAt: time.Now().Add(-time.Hour),
+		})
+		oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+		}))
+		defer oauth.Close()
+		ep := vendorauth.DefaultAnthropicEndpoints()
+		ep.TokenURL = oauth.URL
+		s := &Server{Cipher: cipher, Routes: store, vendorAnthropicEndpoints: ep}
+
+		sealedKey, err := capture.SealSecret(cipher, false, "sk-vendor-key")
+		if err != nil {
+			t.Fatalf("SealSecret: %v", err)
+		}
+		// The hand-built api-key vendor target: an account id (usage attribution) AND
+		// a sealed APIToken, Subscription deliberately false.
+		target := routing.Target{
+			RouteID:         "vendor:acc_vendor:gpt-4o",
+			Provider:        routing.ProviderVendorOpenAI,
+			Endpoint:        "https://api.openai.com",
+			Model:           "gpt-4o",
+			ProviderModel:   "gpt-4o",
+			Timeout:         30 * time.Second,
+			APIFlavor:       routing.APIFlavorOpenAI,
+			APIToken:        sealedKey,
+			VendorAccountID: "acc_vendor",
+			Subscription:    false,
+		}
+
+		ctx := s.upstreamAuthCtx(context.Background(), target)
+		auth, ok := provider.UpstreamAuthFrom(ctx)
+		if !ok {
+			t.Fatal("expected the sealed api-key credential to be carried")
+		}
+		if auth.Token != "sk-vendor-key" {
+			t.Fatalf("Token = %q, want the decrypted api key (the APIToken path)", auth.Token)
+		}
+		// No subscription resolution ran: the decoy account stays active.
+		acc, err := store.VendorAccountByID(context.Background(), "acc_vendor")
+		if err != nil {
+			t.Fatalf("VendorAccountByID: %v", err)
+		}
+		if acc.Status != routing.VendorAccountStatusActive {
+			t.Fatalf("status = %q, want active -- an api-key target must not trigger subscription-bearer resolution", acc.Status)
+		}
+	})
+
+	t.Run("subscription_target_resolves_oauth_bearer", func(t *testing.T) {
+		cipher := newDispatchCipher(t)
+		store := routing.NewMemoryStore()
+		seedSubscriptionAccount(t, store, cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
+			AccessToken: "live-access", RefreshToken: "live-refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "acct-1",
+		})
+		s := &Server{Cipher: cipher, Routes: store}
+		target := subscriptionTarget("acc_sub", "https://api.anthropic.com")
+
+		ctx := s.upstreamAuthCtx(context.Background(), target)
+		auth, ok := provider.UpstreamAuthFrom(ctx)
+		if !ok {
+			t.Fatal("expected an upstream credential for a subscription target")
+		}
+		if auth.Token != "live-access" {
+			t.Fatalf("Token = %q, want the resolved OAuth bearer live-access", auth.Token)
+		}
+	})
 }

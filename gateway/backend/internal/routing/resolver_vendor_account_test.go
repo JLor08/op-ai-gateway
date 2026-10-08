@@ -273,6 +273,7 @@ var vendorTargetMayBeZero = map[string]bool{
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
 	"VendorAccountID":             true, // the API-KEY bearer rides in APIToken, not resolved from an account at dispatch
+	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 }
 
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of

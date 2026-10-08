@@ -1783,9 +1783,14 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 // static extra headers so the provider layer attaches them to the upstream call.
 // Two shapes:
 //
-//   - A SUBSCRIPTION target (target.VendorAccountID != "") carries no APIToken;
-//     its OAuth bearer is resolved — and refreshed when stale — at dispatch from
-//     the named account's sealed tokens (subscriptionAuthCtx).
+//   - A SUBSCRIPTION target (target.Subscription) carries no APIToken; its OAuth
+//     bearer is resolved — and refreshed when stale — at dispatch from the named
+//     account's sealed tokens (subscriptionAuthCtx). The trigger is the explicit
+//     Subscription flag, NOT target.VendorAccountID: every vendor target now
+//     carries an account id (for usage attribution), but only a subscription
+//     target resolves an OAuth bearer. An API-KEY vendor target carries both a
+//     VendorAccountID and a sealed APIToken and takes the credential path below,
+//     exactly as it did before the id was added.
 //   - Every other target carries its credential sealed in target.APIToken
 //     (enc:/plain:), decrypted here, plus any target.ExtraHeaders.
 //
@@ -1794,7 +1799,7 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 // crash or refuse the request over it). The CLIENT bearer token is never
 // involved — this is a separate gateway-held credential.
 func (s *Server) upstreamAuthCtx(ctx context.Context, target routing.Target) context.Context {
-	if target.VendorAccountID != "" {
+	if target.Subscription {
 		return s.subscriptionAuthCtx(ctx, target)
 	}
 	token := ""

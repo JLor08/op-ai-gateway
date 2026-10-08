@@ -133,12 +133,22 @@ type Target struct {
 	// prepend the Claude-Code system block required on the subscription/OAuth
 	// Messages path. Only subscription targets set it.
 	Masquerade string
-	// VendorAccountID, when non-empty, marks a SUBSCRIPTION vendor target whose
-	// upstream bearer is NOT carried in APIToken but resolved -- and refreshed if
-	// stale -- at dispatch time from the named account's sealed OAuth tokens
-	// (upstreamAuthCtx). APIToken/APITokenHeader are empty for such a target. An
-	// API-KEY vendor target and every self-hosted target leave this "".
+	// VendorAccountID, when non-empty, names the vendor account that serves this
+	// target, for per-account USAGE ATTRIBUTION (the recorded usage_events.account_id
+	// and the scraped rate-limit snapshot). EVERY vendor target carries it now --
+	// api-key and subscription alike -- so it is no longer the subscription-bearer
+	// trigger it once was: that trigger moved to the explicit Subscription flag
+	// below. A self-hosted target leaves this "".
 	VendorAccountID string
+	// Subscription marks a SUBSCRIPTION (OAuth) vendor target whose upstream bearer
+	// is NOT carried in APIToken but resolved -- and refreshed if stale -- at
+	// dispatch time from the account's sealed OAuth tokens (upstreamAuthCtx keys the
+	// subscription-bearer path on THIS flag, not on VendorAccountID, so an API-KEY
+	// vendor target that now also carries a VendorAccountID keeps using its sealed
+	// APIToken). True only on the two subscription targets
+	// (vendorSubscription{Anthropic,OpenAI}Target); false on the api-key
+	// vendorAccountTarget and every self-hosted target.
+	Subscription bool
 }
 
 // MasqueradeClaudeCode is the Target.Masquerade value that makes the Anthropic
@@ -935,6 +945,7 @@ func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, 
 		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
 		APITokenHeader:  "",
 		VendorAccountID: acc.ID,
+		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
 		Masquerade:      MasqueradeClaudeCode,
 		ExtraHeaders: map[string]string{
 			"anthropic-version": "2023-06-01",
@@ -984,6 +995,7 @@ func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, mod
 		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
 		APITokenHeader:  "",
 		VendorAccountID: acc.ID,
+		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
 		ExtraHeaders: map[string]string{
 			"OpenAI-Beta": "responses=experimental",
 			"originator":  "codex_cli_rs",

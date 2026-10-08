@@ -27,7 +27,8 @@ var targetFromMayLeaveZero = map[string]bool{
 	// vendor account. Each is legitimately zero here.
 	"ExtraHeaders":    true, // static upstream headers only a vendor subscription target carries
 	"Masquerade":      true, // "" (no disguise) for every self-hosted target
-	"VendorAccountID": true, // non-empty only for a dispatch-resolved subscription bearer
+	"VendorAccountID": true, // non-empty only for a vendor target (usage attribution); a self-hosted target carries none
+	"Subscription":    true, // false for every self-hosted target (OAuth-bearer trigger, subscription-only)
 }
 
 // TestTargetFromPopulatesEveryField is the routing.Target analogue of
