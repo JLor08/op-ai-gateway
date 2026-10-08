@@ -76,56 +76,71 @@ func parseVendorAccountUsage(provider, accountID string, h http.Header, now time
 		WeeklyPct:   -1,
 		UpdatedAt:   now,
 	}
-	found := false
-
 	// Normalize the OpenAI subscription provider to the OpenAI vendor case: both
 	// scrape the same Codex rate-limit headers off the ChatGPT backend's response.
 	if routing.IsOpenAIVendorProvider(provider) {
 		provider = routing.ProviderVendorOpenAI
 	}
+	var found bool
 	switch provider {
 	case routing.ProviderVendorAnthropic:
-		// Anthropic utilization is a 0..1 fraction; scale to percent.
-		if pct, ok := parseScaledPercent(hdr[hdrAnthropicFiveHourUtil], 100); ok {
-			snapshot.FiveHourPct = pct
-			found = true
-		}
-		if pct, ok := parseScaledPercent(hdr[hdrAnthropicWeeklyUtil], 100); ok {
-			snapshot.WeeklyPct = pct
-			found = true
-		}
-		// A single unified reset; attribute it to the five-hour window (the weekly
-		// reset is not advertised as its own header -- VERIFY-LIVE).
-		if ts, ok := parseEpochSeconds(hdr[hdrAnthropicReset]); ok {
-			snapshot.FiveHourResetAt = &ts
-			found = true
-		}
+		found = scrapeAnthropicUsage(hdr, &snapshot)
 	case routing.ProviderVendorOpenAI:
-		// Codex used-percent is already a 0..100 value.
-		if pct, ok := parseScaledPercent(hdr[hdrCodexPrimaryPct], 1); ok {
-			snapshot.FiveHourPct = pct
-			found = true
-		}
-		if ts, ok := parseEpochSeconds(hdr[hdrCodexPrimaryReset]); ok {
-			snapshot.FiveHourResetAt = &ts
-			found = true
-		}
-		if pct, ok := parseScaledPercent(hdr[hdrCodexSecondaryPct], 1); ok {
-			snapshot.WeeklyPct = pct
-			found = true
-		}
-		if ts, ok := parseEpochSeconds(hdr[hdrCodexSecondaryReset]); ok {
-			snapshot.WeeklyResetAt = &ts
-			found = true
-		}
-		if cb := strings.TrimSpace(hdr[hdrCodexCredits]); cb != "" {
-			snapshot.CreditBalance = cb
-			found = true
-		}
+		found = scrapeCodexUsage(hdr, &snapshot)
 	default:
 		return routing.VendorAccountUsage{}, false
 	}
 	return snapshot, found
+}
+
+// scrapeAnthropicUsage fills the Anthropic rate-limit fields from the (lower-cased)
+// response headers and reports whether any were present. Anthropic utilization is a
+// 0..1 fraction, scaled to percent here.
+func scrapeAnthropicUsage(hdr map[string]string, snapshot *routing.VendorAccountUsage) bool {
+	found := false
+	if pct, ok := parseScaledPercent(hdr[hdrAnthropicFiveHourUtil], 100); ok {
+		snapshot.FiveHourPct = pct
+		found = true
+	}
+	if pct, ok := parseScaledPercent(hdr[hdrAnthropicWeeklyUtil], 100); ok {
+		snapshot.WeeklyPct = pct
+		found = true
+	}
+	// A single unified reset; attribute it to the five-hour window (the weekly
+	// reset is not advertised as its own header -- VERIFY-LIVE).
+	if ts, ok := parseEpochSeconds(hdr[hdrAnthropicReset]); ok {
+		snapshot.FiveHourResetAt = &ts
+		found = true
+	}
+	return found
+}
+
+// scrapeCodexUsage fills the Codex rate-limit fields from the (lower-cased) response
+// headers and reports whether any were present. Codex used-percent is already a
+// 0..100 value.
+func scrapeCodexUsage(hdr map[string]string, snapshot *routing.VendorAccountUsage) bool {
+	found := false
+	if pct, ok := parseScaledPercent(hdr[hdrCodexPrimaryPct], 1); ok {
+		snapshot.FiveHourPct = pct
+		found = true
+	}
+	if ts, ok := parseEpochSeconds(hdr[hdrCodexPrimaryReset]); ok {
+		snapshot.FiveHourResetAt = &ts
+		found = true
+	}
+	if pct, ok := parseScaledPercent(hdr[hdrCodexSecondaryPct], 1); ok {
+		snapshot.WeeklyPct = pct
+		found = true
+	}
+	if ts, ok := parseEpochSeconds(hdr[hdrCodexSecondaryReset]); ok {
+		snapshot.WeeklyResetAt = &ts
+		found = true
+	}
+	if cb := strings.TrimSpace(hdr[hdrCodexCredits]); cb != "" {
+		snapshot.CreditBalance = cb
+		found = true
+	}
+	return found
 }
 
 // lowerHeaderValues flattens h into a lowercased-key -> first-value map, so the

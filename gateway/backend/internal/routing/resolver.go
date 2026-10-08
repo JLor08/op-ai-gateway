@@ -429,6 +429,11 @@ const (
 // TimeoutMS column of its own.
 const vendorAccountDefaultTimeout = 120 * time.Second
 
+// vendorRoutePrefix is the RouteID namespace every vendor-account target shares
+// ("vendor:<accountID>:<model>"), so the format lives in one place across the
+// api_key and the two subscription target builders.
+const vendorRoutePrefix = "vendor:"
+
 func NewResolver(store resolverStore, clock func() time.Time, checker ReachabilityChecker) *Resolver {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
@@ -814,18 +819,13 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
 // account with a model row whose GatewayModel equals the request model wins.
 func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
-	if !r.vendorOn() ||
-		token.UserID == "" ||
-		req.ServerOverrideID != "" ||
-		len(req.RequiredCapabilities) > 0 ||
-		apiFlavor == APIFlavorOpenAIImages {
+	if !r.vendorAccountRoutingEligible(token, req, apiFlavor) {
 		return Target{}, false, nil
 	}
 	accounts, err := r.store.VendorAccountsByOwner(ctx, token.UserID)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
-nextAccount:
 	for _, acc := range accounts {
 		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 		// disabled accounts are skipped and fall through to the standard path.
@@ -852,35 +852,65 @@ nextAccount:
 		if err != nil {
 			return Target{}, false, fmt.Errorf("resolve vendor account models: %w", err)
 		}
-		for _, m := range models {
-			if m.GatewayModel != req.Model {
-				continue
-			}
-			if acc.AuthType == VendorAuthSubscription {
-				// Subscription (OAuth): the bearer is resolved + refreshed at dispatch
-				// from the account's sealed OAuth tokens, so the target carries
-				// VendorAccountID and the vendor's required headers, and NO APIToken.
-				// FAIL-CLOSED: only a KNOWN subscription vendor builds a target; an
-				// unknown one matches no account (continue) rather than defaulting to
-				// either vendor's target, which would misroute its sealed token.
-				switch acc.Vendor {
-				case VendorAnthropic:
-					// Anthropic: translate either inbound dialect to Messages; carries
-					// the Claude-Code masquerade + the OAuth version/beta headers.
-					return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true, nil
-				case VendorOpenAI:
-					// OpenAI: native passthrough of an inbound Responses request, or
-					// translate of a chat request, both to the ChatGPT backend. The FINE
-					// req.APIFlavor picks which (see vendorSubscriptionOpenAITarget).
-					return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true, nil
-				default:
-					continue nextAccount
-				}
-			}
-			return vendorAccountTarget(acc, m, req.Model, apiFlavor), true, nil
+		if t, ok := vendorAccountModelMatch(acc, models, req, apiFlavor); ok {
+			return t, true, nil
 		}
 	}
 	return Target{}, false, nil
+}
+
+// vendorAccountModelMatch returns the dispatch target for the FIRST model row whose
+// GatewayModel equals the request model. ok is false when no row matches, and also
+// when the one match is a subscription account with an unknown vendor
+// (vendorAccountModelTarget fails closed) — in both cases the caller falls through
+// to the next account.
+func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+	for _, m := range models {
+		if m.GatewayModel != req.Model {
+			continue
+		}
+		return vendorAccountModelTarget(acc, m, req, apiFlavor)
+	}
+	return Target{}, false
+}
+
+// vendorAccountRoutingEligible reports whether the request is one the vendor-account
+// path may serve at all, before any store lookup. A request that overrides the
+// server, demands capabilities, or is the images flavor (none of which a vendor
+// account models) is left to the standard path.
+func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.Request, apiFlavor string) bool {
+	return r.vendorOn() &&
+		token.UserID != "" &&
+		req.ServerOverrideID == "" &&
+		len(req.RequiredCapabilities) == 0 &&
+		apiFlavor != APIFlavorOpenAIImages
+}
+
+// vendorAccountModelTarget builds the dispatch target for a matched account+model
+// row. The bool reports whether a target was built: it is false only for a
+// subscription account whose vendor is unknown, which FAILS CLOSED (no target)
+// rather than defaulting to either vendor's endpoint, which would misroute its
+// sealed OAuth token. An api_key account always builds a target.
+func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+	if acc.AuthType != VendorAuthSubscription {
+		return vendorAccountTarget(acc, m, req.Model, apiFlavor), true
+	}
+	// Subscription (OAuth): the bearer is resolved + refreshed at dispatch from the
+	// account's sealed OAuth tokens, so the target carries VendorAccountID and the
+	// vendor's required headers, and NO APIToken.
+	switch acc.Vendor {
+	case VendorAnthropic:
+		// Anthropic: translate either inbound dialect to Messages; carries the
+		// Claude-Code masquerade + the OAuth version/beta headers.
+		return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true
+	case VendorOpenAI:
+		// OpenAI: native passthrough of an inbound Responses request, or translate of
+		// a chat request, both to the ChatGPT backend. The FINE req.APIFlavor picks
+		// which (see vendorSubscriptionOpenAITarget).
+		return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true
+	default:
+		return Target{}, false
+	}
 }
 
 // vendorAccountTarget assembles the Target for a matched vendor account + model
@@ -900,7 +930,7 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		tokenHeader = "x-api-key"
 	}
 	return Target{
-		RouteID:        "vendor:" + acc.ID + ":" + model,
+		RouteID:        vendorRoutePrefix + acc.ID + ":" + model,
 		ServerID:       "",
 		Provider:       provider,
 		Endpoint:       endpoint,
@@ -944,7 +974,7 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 // canonical home and the ToS caveat.
 func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
 	return Target{
-		RouteID:         "vendor:" + acc.ID + ":" + model,
+		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
 		ServerID:        "",
 		Provider:        ProviderVendorAnthropic,
 		Endpoint:        "https://api.anthropic.com",
@@ -1003,7 +1033,7 @@ func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, 
 // the Anthropic target's approach).
 func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
 	t := Target{
-		RouteID:         "vendor:" + acc.ID + ":" + model,
+		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
 		ServerID:        "",
 		Provider:        ProviderVendorOpenAISubscription,
 		Endpoint:        "https://chatgpt.com/backend-api/codex",

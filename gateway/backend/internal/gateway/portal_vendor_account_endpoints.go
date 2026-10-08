@@ -96,28 +96,8 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/portal/vendor-accounts/"), "/")
 	parts := strings.Split(rest, "/")
-	if len(parts) == 4 && parts[0] != "" && parts[1] == "connect" && parts[2] == "device" {
-		switch parts[3] {
-		case "begin":
-			s.handlePortalVendorAccountConnectDeviceBegin(w, r, token, parts[0])
-			return
-		case "poll":
-			s.handlePortalVendorAccountConnectDevicePoll(w, r, token, parts[0])
-			return
-		}
-	}
-	if len(parts) == 3 && parts[0] != "" && parts[1] == "connect" {
-		switch parts[2] {
-		case "import":
-			s.handlePortalVendorAccountConnectImport(w, r, token, parts[0])
-			return
-		case "begin":
-			s.handlePortalVendorAccountConnectBegin(w, r, token, parts[0])
-			return
-		case "complete":
-			s.handlePortalVendorAccountConnectComplete(w, r, token, parts[0])
-			return
-		}
+	if s.routeVendorAccountConnectSubpath(w, r, token, parts) {
+		return
 	}
 	id := pathID(r.URL.Path, "/api/portal/vendor-accounts/")
 	if id == "" {
@@ -133,21 +113,7 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 		}
 		writeJSON(w, http.StatusOK, dto)
 	case http.MethodPatch:
-		raw, ok := readRawJSON(w, r)
-		if !ok {
-			return
-		}
-		var req portal.UpdateVendorAccountRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
-			return
-		}
-		dto, err := s.Portal.UpdateVendorAccount(r.Context(), token, id, req)
-		if err != nil {
-			writePortalVendorAccountError(w, err, codeVendorAccountUpdateFailed)
-			return
-		}
-		writeJSON(w, http.StatusOK, dto)
+		s.handlePortalVendorAccountPatch(w, r, token, id)
 	case http.MethodDelete:
 		if _, err := s.Portal.DeleteVendorAccount(r.Context(), token, id); err != nil {
 			writePortalVendorAccountError(w, err, codeVendorAccountDeleteFailed)
@@ -158,6 +124,57 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPatch+", "+http.MethodDelete)
 		writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
 	}
+}
+
+// routeVendorAccountConnectSubpath dispatches the /connect/... sub-routes of
+// /api/portal/vendor-accounts/{id}/... and reports whether it handled the request.
+// The item handler falls through to the {id} GET/PATCH/DELETE surface when this
+// returns false.
+func (s *Server) routeVendorAccountConnectSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
+	if len(parts) == 4 && parts[0] != "" && parts[1] == "connect" && parts[2] == "device" {
+		switch parts[3] {
+		case "begin":
+			s.handlePortalVendorAccountConnectDeviceBegin(w, r, token, parts[0])
+			return true
+		case "poll":
+			s.handlePortalVendorAccountConnectDevicePoll(w, r, token, parts[0])
+			return true
+		}
+	}
+	if len(parts) == 3 && parts[0] != "" && parts[1] == "connect" {
+		switch parts[2] {
+		case "import":
+			s.handlePortalVendorAccountConnectImport(w, r, token, parts[0])
+			return true
+		case "begin":
+			s.handlePortalVendorAccountConnectBegin(w, r, token, parts[0])
+			return true
+		case "complete":
+			s.handlePortalVendorAccountConnectComplete(w, r, token, parts[0])
+			return true
+		}
+	}
+	return false
+}
+
+// handlePortalVendorAccountPatch applies a PATCH to the {id} vendor account: it
+// decodes the update body and writes the result (or the mapped error).
+func (s *Server) handlePortalVendorAccountPatch(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var req portal.UpdateVendorAccountRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.UpdateVendorAccount(r.Context(), token, id, req)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountUpdateFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // vendorAccountConnectCompleteRequest is the body of POST

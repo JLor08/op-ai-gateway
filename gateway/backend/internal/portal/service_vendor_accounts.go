@@ -342,6 +342,59 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	return s.vendorAccountDTO(ctx, acc)
 }
 
+// applyVendorAccountName applies a name change when the request carries one; an
+// all-whitespace name is rejected.
+func applyVendorAccountName(acc *routing.VendorAccount, name *string) error {
+	if name == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*name)
+	if trimmed == "" {
+		return ErrVendorAccountNameRequired
+	}
+	acc.Name = trimmed
+	return nil
+}
+
+// applyVendorAccountStatus applies a status change when the request carries one
+// that differs from the stored value. A status equal to the stored one is a no-op,
+// which lets a form echo back a system-managed needs_reconnect without tripping the
+// user-settable check.
+func applyVendorAccountStatus(acc *routing.VendorAccount, status *string) error {
+	if status == nil || strings.TrimSpace(*status) == acc.Status {
+		return nil
+	}
+	normalized, err := normalizeVendorAccountStatus(*status)
+	if err != nil {
+		return err
+	}
+	acc.Status = normalized
+	return nil
+}
+
+// applyVendorAccountAPIKey seals and applies an api-key change when the request
+// carries one. Only the exact empty string clears the key; a value that is blank
+// after trimming is a paste slip and must not silently wipe it. A key may be set
+// only on an api_key account.
+func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *string) error {
+	if raw == nil {
+		return nil
+	}
+	apiKey := strings.TrimSpace(*raw)
+	if *raw != "" && apiKey == "" {
+		return ErrVendorAccountAPIKeyInvalid
+	}
+	if apiKey != "" && acc.AuthType != routing.VendorAuthAPIKey {
+		return ErrVendorAccountAPIKeyNotAllowed
+	}
+	sealedKey, err := s.sealVendorAPIKey(apiKey)
+	if err != nil {
+		return err
+	}
+	acc.APIKey = sealedKey
+	return nil
+}
+
 // UpdateVendorAccount renames an account, changes its status, and/or replaces
 // or clears its api key. The store keeps id, owner, vendor and created_at
 // immutable, so this loads the row, mutates only the requested fields and writes
@@ -356,37 +409,14 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	if req.Name != nil {
-		name := strings.TrimSpace(*req.Name)
-		if name == "" {
-			return VendorAccountDTO{}, ErrVendorAccountNameRequired
-		}
-		acc.Name = name
+	if err := applyVendorAccountName(&acc, req.Name); err != nil {
+		return VendorAccountDTO{}, err
 	}
-	// A status equal to the stored one is a no-op, which lets a form echo back a
-	// system-managed needs_reconnect without tripping the user-settable check.
-	if req.Status != nil && strings.TrimSpace(*req.Status) != acc.Status {
-		status, err := normalizeVendorAccountStatus(*req.Status)
-		if err != nil {
-			return VendorAccountDTO{}, err
-		}
-		acc.Status = status
+	if err := applyVendorAccountStatus(&acc, req.Status); err != nil {
+		return VendorAccountDTO{}, err
 	}
-	if req.APIKey != nil {
-		apiKey := strings.TrimSpace(*req.APIKey)
-		// Only the exact empty string clears the key; a value that is blank
-		// after trimming is a paste slip and must not silently wipe the key.
-		if *req.APIKey != "" && apiKey == "" {
-			return VendorAccountDTO{}, ErrVendorAccountAPIKeyInvalid
-		}
-		if apiKey != "" && acc.AuthType != routing.VendorAuthAPIKey {
-			return VendorAccountDTO{}, ErrVendorAccountAPIKeyNotAllowed
-		}
-		sealedKey, err := s.sealVendorAPIKey(apiKey)
-		if err != nil {
-			return VendorAccountDTO{}, err
-		}
-		acc.APIKey = sealedKey
+	if err := s.applyVendorAccountAPIKey(&acc, req.APIKey); err != nil {
+		return VendorAccountDTO{}, err
 	}
 	acc.UpdatedAt = s.clock().UTC()
 	if err := s.routes.UpdateVendorAccount(ctx, acc); err != nil {

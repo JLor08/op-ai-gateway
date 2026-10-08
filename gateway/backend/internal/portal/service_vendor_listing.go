@@ -43,29 +43,40 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 		if acc.Status != routing.VendorAccountStatusActive {
 			continue
 		}
-		// The dialects this account's models are dispatched under. An OpenAI
-		// subscription account serves the openai dialect only (see the doc comment);
-		// every other account serves both via translate.
-		flavors := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
-		if acc.AuthType == routing.VendorAuthSubscription && acc.Vendor == routing.VendorOpenAI {
-			flavors = []string{routing.APIFlavorOpenAI}
-		}
-		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
-		if err != nil {
-			continue
-		}
-		for _, m := range models {
-			set := out[m.GatewayModel]
-			if set == nil {
-				set = make(map[string]struct{})
-				out[m.GatewayModel] = set
-			}
-			for _, f := range flavors {
-				set[f] = struct{}{}
-			}
-		}
+		s.addVendorAccountModelFlavors(ctx, acc, out)
 	}
 	return out
+}
+
+// addVendorAccountModelFlavors unions one active account's models and their served
+// dialects into the per-name flavor set map, in place. A model-row read error skips
+// the account (best effort) rather than failing the whole overlay.
+func (s *Service) addVendorAccountModelFlavors(ctx context.Context, acc routing.VendorAccount, out map[string]map[string]struct{}) {
+	flavors := vendorAccountServedFlavors(acc)
+	models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+	if err != nil {
+		return
+	}
+	for _, m := range models {
+		set := out[m.GatewayModel]
+		if set == nil {
+			set = make(map[string]struct{})
+			out[m.GatewayModel] = set
+		}
+		for _, f := range flavors {
+			set[f] = struct{}{}
+		}
+	}
+}
+
+// vendorAccountServedFlavors is the dialects an account's models are dispatched
+// under. An OpenAI subscription account serves the openai dialect only (the ChatGPT
+// backend speaks Responses only); every other account serves both via translate.
+func vendorAccountServedFlavors(acc routing.VendorAccount) []string {
+	if acc.AuthType == routing.VendorAuthSubscription && acc.Vendor == routing.VendorOpenAI {
+		return []string{routing.APIFlavorOpenAI}
+	}
+	return []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
 }
 
 // overlayVendorModels unions the principal's vendor-model flavor overlay into an

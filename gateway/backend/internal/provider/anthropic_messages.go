@@ -114,14 +114,38 @@ func (c *AnthropicClient) CompleteStream(ctx context.Context, target routing.Tar
 	if rw := CaptureSinkFrom(ctx).ResponseWriter(); rw != nil {
 		streamReader = io.TeeReader(httpResp.Body, rw)
 	}
-	activity := StreamActivityFrom(ctx)
 	st := &anthropicStreamState{tools: map[int]*anthropicStreamTool{}}
-	scanner := bufio.NewScanner(streamReader)
+	if err := c.scanStream(ctx, streamReader, st, emit); err != nil {
+		return err
+	}
+	// A stream that ends without its terminal event was cut off (a dropped
+	// connection, a proxy closing early). Reporting it as Completed would hand the
+	// client a partial answer with partial usage as if it were whole.
+	if !st.stopped && st.stopReason == "" {
+		return fmt.Errorf("%w: stream ended before message_stop", ErrUnavailable)
+	}
+	if err := st.emitToolCalls(emit); err != nil {
+		return err
+	}
+	var usage *inference.Usage
+	if st.sawUsage {
+		u := st.usage.canonical()
+		usage = &u
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: anthropicFinishReason(st.stopReason)})
+}
+
+// scanStream reads the upstream SSE line by line, applying each event to st until
+// the stream stops or ends. Only `data:` lines matter: every Anthropic event's
+// JSON carries its own `type`, so the preceding `event:` line is redundant.
+// Comment lines (keepalives) are reported to the activity hook by streamLineData.
+// A scanner error is mapped to the canonical provider error (ErrTimeout when ctx's
+// deadline elapsed, ErrUnavailable otherwise).
+func (c *AnthropicClient) scanStream(ctx context.Context, r io.Reader, st *anthropicStreamState, emit StreamEmit) error {
+	activity := StreamActivityFrom(ctx)
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		// Only `data:` lines matter: every Anthropic event's JSON carries its own
-		// `type`, so the preceding `event:` line is redundant. Comment lines
-		// (keepalives) are reported to the activity hook by streamLineData.
 		data, ok := streamLineData(strings.TrimSpace(scanner.Text()), activity)
 		if !ok {
 			continue
@@ -139,21 +163,7 @@ func (c *AnthropicClient) CompleteStream(ctx context.Context, target routing.Tar
 		}
 		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
 	}
-	// A stream that ends without its terminal event was cut off (a dropped
-	// connection, a proxy closing early). Reporting it as Completed would hand the
-	// client a partial answer with partial usage as if it were whole.
-	if !st.stopped && st.stopReason == "" {
-		return fmt.Errorf("%w: stream ended before message_stop", ErrUnavailable)
-	}
-	if err := st.emitToolCalls(emit); err != nil {
-		return err
-	}
-	var usage *inference.Usage
-	if st.sawUsage {
-		u := st.usage.canonical()
-		usage = &u
-	}
-	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: anthropicFinishReason(st.stopReason)})
+	return nil
 }
 
 // post sends the rendered body to the Messages endpoint and returns the 2xx

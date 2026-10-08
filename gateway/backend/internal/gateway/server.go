@@ -1896,22 +1896,8 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 		slog.Debug("subscription token open failed; proceeding without bearer", "account", accountID)
 		return "", "", false
 	}
-	// Branch on the account's vendor so the refresh token is only ever exchanged
-	// against its OWN token endpoint (a cross-vendor refresh would leak the token to
-	// the wrong host and always fail). FAIL-CLOSED: an unknown vendor serves no
-	// bearer rather than defaulting to one vendor's endpoint — a default-based
-	// branch here would, on a future third vendor, send its sealed token to the
-	// wrong host.
-	var (
-		fresh   vendorauth.TokenSet
-		changed bool
-	)
-	switch acc.Vendor {
-	case routing.VendorOpenAI:
-		fresh, changed, err = vendorauth.EnsureFreshOpenAI(ctx, nil, s.openAIRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
-	case routing.VendorAnthropic:
-		fresh, changed, err = vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
-	default:
+	fresh, changed, err := s.refreshSubscriptionTokenSet(ctx, acc, ts)
+	if errors.Is(err, errUnknownSubscriptionVendor) {
 		slog.Debug("subscription account has an unknown vendor; proceeding without bearer", "account", accountID, "vendor", acc.Vendor)
 		return "", "", false
 	}
@@ -1929,11 +1915,7 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 		return "", "", false
 	}
 	if changed {
-		if sealed, serr := vendorauth.SealTokenSet(s.Cipher, s.settingsVolatile, fresh); serr != nil {
-			slog.Warn("subscription token reseal failed; serving refreshed token without persisting", "account", accountID)
-		} else if perr := s.Routes.SetVendorAccountOAuthTokens(ctx, accountID, sealed); perr != nil {
-			slog.Warn("subscription token persist failed; serving refreshed token without persisting", "account", accountID, "err", perr)
-		}
+		s.persistRefreshedSubscriptionTokens(ctx, accountID, fresh)
 	}
 	if fresh.AccessToken == "" {
 		return "", "", false
@@ -1948,6 +1930,42 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 		accID, _ = vendorauth.OpenAIClaimsFromJWT(fresh.AccessToken)
 	}
 	return fresh.AccessToken, accID, true
+}
+
+// errUnknownSubscriptionVendor marks a subscription account whose vendor is neither
+// OpenAI nor Anthropic. refreshSubscriptionTokenSet fails closed with it so the
+// caller logs the unknown vendor at Debug and serves no bearer, rather than the
+// generic refresh-failure Warn.
+var errUnknownSubscriptionVendor = errors.New("subscription account has an unknown vendor")
+
+// refreshSubscriptionTokenSet refreshes ts against the account's OWN token endpoint,
+// chosen by its vendor. Branching on the vendor keeps a refresh token from ever
+// being exchanged against the wrong host (which would leak it and always fail).
+// FAIL-CLOSED: an unknown vendor returns errUnknownSubscriptionVendor rather than
+// defaulting to one vendor's endpoint.
+func (s *Server) refreshSubscriptionTokenSet(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) (vendorauth.TokenSet, bool, error) {
+	switch acc.Vendor {
+	case routing.VendorOpenAI:
+		return vendorauth.EnsureFreshOpenAI(ctx, nil, s.openAIRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	case routing.VendorAnthropic:
+		return vendorauth.EnsureFresh(ctx, nil, s.anthropicRefreshEndpoints(), ts, vendorTokenRefreshBuffer)
+	default:
+		return vendorauth.TokenSet{}, false, errUnknownSubscriptionVendor
+	}
+}
+
+// persistRefreshedSubscriptionTokens reseals the refreshed token set and writes it
+// back. Best effort: a reseal or persist failure is logged and the refreshed token
+// is still served for this request (it is simply not persisted).
+func (s *Server) persistRefreshedSubscriptionTokens(ctx context.Context, accountID string, fresh vendorauth.TokenSet) {
+	sealed, serr := vendorauth.SealTokenSet(s.Cipher, s.settingsVolatile, fresh)
+	if serr != nil {
+		slog.Warn("subscription token reseal failed; serving refreshed token without persisting", "account", accountID)
+		return
+	}
+	if perr := s.Routes.SetVendorAccountOAuthTokens(ctx, accountID, sealed); perr != nil {
+		slog.Warn("subscription token persist failed; serving refreshed token without persisting", "account", accountID, "err", perr)
+	}
 }
 
 // lockVendorAccount acquires the per-account refresh mutex and returns its

@@ -123,30 +123,9 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, target routing.Targe
 	if rw := CaptureSinkFrom(ctx).ResponseWriter(); rw != nil {
 		streamReader = io.TeeReader(httpResp.Body, rw)
 	}
-	activity := StreamActivityFrom(ctx)
 	st := &openaiResponsesStreamState{tools: map[int]*openaiResponsesStreamTool{}}
-	scanner := bufio.NewScanner(streamReader)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		// Only `data:` lines carry an event; each payload's own `type` discriminates
-		// it, so the preceding `event:` line is redundant. Comment lines (keepalives)
-		// are reported to the activity hook by streamLineData.
-		data, ok := streamLineData(strings.TrimSpace(scanner.Text()), activity)
-		if !ok {
-			continue
-		}
-		if err := st.apply(data, emit); err != nil {
-			return err
-		}
-		if st.stopped {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTimeout
-		}
-		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
+	if err := c.scanStream(ctx, streamReader, st, emit); err != nil {
+		return err
 	}
 	// A stream that ends without a terminal event was cut off (a dropped
 	// connection, a proxy closing early). Reporting it as Completed would hand the
@@ -166,6 +145,37 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, target routing.Targe
 		usage = &u
 	}
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usage, FinishReason: st.finishReason()})
+}
+
+// scanStream reads the upstream SSE line by line, applying each event to st until
+// the stream stops or ends. Only `data:` lines carry an event; each payload's own
+// `type` discriminates it, so the preceding `event:` line is redundant. Comment
+// lines (keepalives) are reported to the activity hook by streamLineData. A scanner
+// error is mapped to the canonical provider error (ErrTimeout when ctx's deadline
+// elapsed, ErrUnavailable otherwise).
+func (c *OpenAIResponsesClient) scanStream(ctx context.Context, r io.Reader, st *openaiResponsesStreamState, emit StreamEmit) error {
+	activity := StreamActivityFrom(ctx)
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		data, ok := streamLineData(strings.TrimSpace(scanner.Text()), activity)
+		if !ok {
+			continue
+		}
+		if err := st.apply(data, emit); err != nil {
+			return err
+		}
+		if st.stopped {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ErrTimeout
+		}
+		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
+	}
+	return nil
 }
 
 // post sends the rendered body to {endpoint}/responses and returns the 2xx
