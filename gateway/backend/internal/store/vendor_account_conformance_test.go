@@ -287,3 +287,68 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// TestRoutingStoreVendorAccountUsageMergeKeepsStoredFields pins, on every driver
+// (memory + sqlite + postgres), the read -> routing.MergeVendorAccountUsage ->
+// upsert sequence the usage writers run: the unknown sentinels (-1 / nil / "")
+// must survive the persisted representation, so a partial snapshot merged over a
+// stored one keeps the stored credit balance, reset and other window rather than
+// blanking them, while the fields it does know are replaced.
+func TestRoutingStoreVendorAccountUsageMergeKeepsStoredFields(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	resetWk := now.Add(7 * 24 * time.Hour)
+	seedSQL := func(t *testing.T, s *SQLStore) {
+		if err := s.CreateUser(context.Background(), newTestUser("u_vm", "vm@example.test", now)); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	forEachRoutingStoreSeeded(t, seedSQL, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		if err := s.CreateVendorAccount(ctx, routing.VendorAccount{
+			ID: "va_m", OwnerUserID: "u_vm", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthSubscription,
+			Name: "sub", Status: routing.VendorAccountStatusActive, OAuthTokens: "enc:t", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create account: %v", err)
+		}
+
+		// merge is the writers' sequence: read the stored snapshot, merge the
+		// incoming one over it, upsert the result, read it back.
+		merge := func(t *testing.T, incoming routing.VendorAccountUsage) routing.VendorAccountUsage {
+			t.Helper()
+			existing, found, err := s.VendorAccountUsageByID(ctx, "va_m")
+			if err != nil {
+				t.Fatalf("read existing: %v", err)
+			}
+			if found {
+				incoming = routing.MergeVendorAccountUsage(existing, incoming)
+			}
+			if err := s.UpsertVendorAccountUsage(ctx, incoming); err != nil {
+				t.Fatalf("upsert merged: %v", err)
+			}
+			got, ok, err := s.VendorAccountUsageByID(ctx, "va_m")
+			if err != nil || !ok {
+				t.Fatalf("read merged: ok = %v, err = %v", ok, err)
+			}
+			return got
+		}
+
+		// First write: only a weekly window and a credit balance are known.
+		first := routing.VendorAccountUsage{
+			AccountID: "va_m", FiveHourPct: -1, WeeklyPct: 30, WeeklyResetAt: &resetWk, CreditBalance: "12.34", UpdatedAt: now,
+		}
+		if got := merge(t, first); !vendorAccountUsageEqual(got, first) {
+			t.Fatalf("first write (no stored row) mismatch:\n got  %+v\n want %+v", got, first)
+		}
+
+		// A partial snapshot (five-hour percent only) merged over it keeps the
+		// stored weekly window, its reset and the credit balance.
+		partial := routing.VendorAccountUsage{AccountID: "va_m", FiveHourPct: 55, WeeklyPct: -1, UpdatedAt: now.Add(time.Minute)}
+		want := routing.VendorAccountUsage{
+			AccountID: "va_m", FiveHourPct: 55, WeeklyPct: 30, WeeklyResetAt: &resetWk, CreditBalance: "12.34", UpdatedAt: now.Add(time.Minute),
+		}
+		if got := merge(t, partial); !vendorAccountUsageEqual(got, want) {
+			t.Fatalf("partial merge mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",
+				got, got.FiveHourResetAt, got.WeeklyResetAt, want, want.FiveHourResetAt, want.WeeklyResetAt)
+		}
+	})
+}
