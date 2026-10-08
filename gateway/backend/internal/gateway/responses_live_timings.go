@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 )
@@ -96,9 +97,9 @@ func wantsResponsesLiveTimings(target routing.Target, apiFlavor string, stream b
 	if !target.ResponsesLiveTimingsEnabled {
 		return false
 	}
-	// The same literal endpointModeFor switches on for this endpoint. A rename
-	// there fails this shut rather than open, which is the safe direction.
-	if apiFlavor != "openai_responses" {
+	// The same constant endpointModeFor switches on for this endpoint, so the two
+	// cannot drift apart.
+	if apiFlavor != inference.APIFlavorOpenAIResponses {
 		return false
 	}
 	if !stream {

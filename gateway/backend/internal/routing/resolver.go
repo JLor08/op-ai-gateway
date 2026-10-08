@@ -965,7 +965,7 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 	// response, ...). Chat and every other openai flavor stay translated, and so
 	// does the Anthropic api-key branch (its upstream is /v1/messages; there is no
 	// Responses surface to pass through to). Mirrors vendorSubscriptionOpenAITarget.
-	if acc.Vendor == VendorOpenAI && fineFlavor == "openai_responses" {
+	if acc.Vendor == VendorOpenAI && fineFlavor == inference.APIFlavorOpenAIResponses {
 		t.ResponsesMode = EndpointModePassthrough
 	}
 	return t
@@ -1073,7 +1073,7 @@ func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, mod
 	}
 	// openai_responses is served LOSSLESSLY via native passthrough; every other
 	// openai flavor is translated (ResponsesMode left zero == translate).
-	if fineFlavor == "openai_responses" {
+	if fineFlavor == inference.APIFlavorOpenAIResponses {
 		t.ResponsesMode = EndpointModePassthrough
 	}
 	return t
@@ -1216,7 +1216,7 @@ func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 // openai_chat_completions and any coarse flavor it is a no-op, so the coarse
 // openai/anthropic gate the store already applied stands unchanged.
 func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []MappingCandidate {
-	if fineFlavor != "openai_responses" && fineFlavor != "anthropic_messages" {
+	if fineFlavor != inference.APIFlavorOpenAIResponses && fineFlavor != "anthropic_messages" {
 		return cands
 	}
 	out := cands[:0:0]

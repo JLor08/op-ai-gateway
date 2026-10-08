@@ -170,6 +170,15 @@ func (e *Error) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+// APIFlavorOpenAIResponses is the FINE api-flavor of an inbound OpenAI Responses
+// request (/v1/responses): the value stamped onto Request.APIFlavor by
+// compat.ParseOpenAIResponses, and the one routing, the native-passthrough
+// dispatch and the usage scan switch on. It lives here, next to Request, because
+// every one of those packages already depends on this one; one definition keeps
+// a rename from silently desyncing a comparison from the value it is compared
+// against.
+const APIFlavorOpenAIResponses = "openai_responses"
+
 type Request struct {
 	ID        string `json:"id,omitempty"`
 	APIFlavor string `json:"api_flavor"`
