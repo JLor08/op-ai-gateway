@@ -2336,6 +2336,128 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeInTheDocument();
     });
 
+    describe('after a models refresh', () => {
+      // The refresh also pulls the vendor's usage on the gateway, so the snapshot
+      // behind the panel changes while the account (id, updated_at) does not.
+      const refreshButton = () => screen.getByRole('button', { name: t.vendorModelsRefreshAction });
+      const refreshAnswer =
+        (refresh: Partial<VendorModelsRefresh> = {}) =>
+        async (id: string) => ({
+          account: makeVendorAccount({ ...SUBSCRIPTION, id, subscription_connected: true }),
+          refresh: makeRefresh(refresh),
+        });
+      // A GET whose credit balance moves on with every read: 12.34, then 56.78.
+      const balances = ['12.34', '56.78'];
+      const readsWithMovingBalance = () => {
+        let reads = 0;
+        return async (id: string) =>
+          makeVendorAccount({
+            ...SUBSCRIPTION,
+            id,
+            subscription_connected: true,
+            usage: makeUsage({ credit_balance: balances[Math.min(reads++, balances.length - 1)] }),
+          });
+      };
+
+      it('reads the snapshot again and shows the freshly pulled credit balance', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          vendorAccount: readsWithMovingBalance(),
+          refreshModels: refreshAnswer(),
+        });
+        await openDetail();
+        expect(await screen.findByText('12.34')).toBeInTheDocument();
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+
+        fireEvent.click(refreshButton());
+
+        expect(await screen.findByText('56.78')).toBeInTheDocument();
+        expect(screen.queryByText('12.34')).not.toBeInTheDocument();
+        expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1);
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+        expect(fakeApi.vendorAccount).toHaveBeenLastCalledWith('va_sub');
+      });
+
+      it('keeps showing the previous snapshot while the new one is read', async () => {
+        const second = deferred<VendorAccount>();
+        const first = makeVendorAccount({
+          ...SUBSCRIPTION,
+          subscription_connected: true,
+          usage: makeUsage({ credit_balance: '12.34' }),
+        });
+        const vendorAccount = vi
+          .fn<PortalApi['vendorAccount']>()
+          .mockResolvedValueOnce(first)
+          .mockReturnValueOnce(second.promise);
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          vendorAccount,
+          refreshModels: refreshAnswer(),
+        });
+        await openDetail();
+        await screen.findByText('12.34');
+
+        fireEvent.click(refreshButton());
+        await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2));
+
+        // The re-read is in flight: the panel has not blinked out.
+        expect(screen.getByText(t.vendorUsageTitle)).toBeInTheDocument();
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+
+        await act(async () =>
+          second.resolve({
+            ...first,
+            usage: makeUsage({ credit_balance: '56.78' }),
+          }),
+        );
+        expect(await screen.findByText('56.78')).toBeInTheDocument();
+      });
+
+      it('also reads again when the vendor could not list models, since the usage pull is independent', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          vendorAccount: readsWithMovingBalance(),
+          refreshModels: refreshAnswer({
+            status: 'unverifiable',
+            discovered: 0,
+            detail: 'the vendor could not be reached',
+          }),
+        });
+        await openDetail();
+        await screen.findByText('12.34');
+
+        fireEvent.click(refreshButton());
+
+        expect(await screen.findByText('56.78')).toBeInTheDocument();
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+      });
+
+      it('does not read again when the refresh fails', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          vendorAccount: readsWithMovingBalance(),
+          refreshModels: async () => {
+            throw new PortalApiError(
+              500,
+              'vendor_account.refresh_failed',
+              'vendor account request failed',
+            );
+          },
+        });
+        await openDetail();
+        await screen.findByText('12.34');
+
+        fireEvent.click(refreshButton());
+        await screen.findByText(
+          `vendor_account.refresh_failed: ${t.errorVendorAccountRefreshFailed}`,
+        );
+
+        expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1);
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+      });
+    });
+
     it('never asks for a snapshot on the list (it would be one read per row)', async () => {
       const { fakeApi } = renderView({
         accounts: [

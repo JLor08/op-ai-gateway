@@ -154,6 +154,10 @@ export function VendorAccountsView({
     modeRef.current = mode;
   }, [mode]);
   const [busy, setBusy] = useState(false);
+  // Bumped after every models refresh that the gateway answered: that call also
+  // pulls the vendor's usage, which changes neither the account's id nor its
+  // updated_at, so the usage panel needs this to know it should read again.
+  const [usageRefreshes, setUsageRefreshes] = useState(0);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
 
   // Form state, shared by the create form and the detail view's settings panel.
@@ -323,12 +327,15 @@ export function VendorAccountsView({
   // The explicit "refresh models": ask the gateway to re-discover the models from
   // the vendor, adopt the account it answers with, and hand the outcome to the
   // panel. `busy` keeps it and a settings save from overlapping. A thrown error
-  // is the panel's to show.
+  // is the panel's to show. An answered refresh -- whatever its outcome, since the
+  // usage pull runs even when the model list was unusable -- also makes the usage
+  // panel read its snapshot again; a thrown one does not.
   async function refreshAccountModels(id: string): Promise<VendorModelsRefresh> {
     setBusy(true);
     try {
       const { account, refresh } = await api.refreshModels(id);
       accountRefreshed(account);
+      setUsageRefreshes((n) => n + 1);
       return refresh;
     } finally {
       setBusy(false);
@@ -653,7 +660,13 @@ export function VendorAccountsView({
         {/* A subscription that was never connected has served nothing, so it
             has no usage snapshot to read; everything else may. */}
         {(account.auth_type === 'api_key' || account.subscription_connected) && (
-          <VendorAccountUsage key={account.id} t={t} api={api} accountId={account.id} />
+          <VendorAccountUsage
+            key={account.id}
+            t={t}
+            api={api}
+            accountId={account.id}
+            refreshKey={usageRefreshes}
+          />
         )}
 
         {account.auth_type === 'subscription' && (
