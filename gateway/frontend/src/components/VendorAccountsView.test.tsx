@@ -13,6 +13,7 @@ import type {
   UpdateVendorAccountRequest,
   VendorAccount,
   VendorAccountUsage,
+  VendorConnectionCheck,
 } from '../api';
 import type { MessageKey, PortalApi } from './shared/types';
 
@@ -62,6 +63,17 @@ function makeUsage(overrides: Partial<VendorAccountUsage> = {}): VendorAccountUs
   };
 }
 
+// The credential-check verdict as POST .../check answers it. The detail is the
+// token-free ENGLISH status phrase the backend sends whatever the portal locale.
+function makeCheck(overrides: Partial<VendorConnectionCheck> = {}): VendorConnectionCheck {
+  return {
+    status: 'valid',
+    detail: 'the vendor accepted the credential',
+    checked_at: '2026-10-08T10:00:00Z',
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -83,6 +95,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       beginVendorAccountDeviceConnect?: PortalApi['beginVendorAccountDeviceConnect'];
       pollVendorAccountDeviceConnect?: PortalApi['pollVendorAccountDeviceConnect'];
       vendorAccount?: PortalApi['vendorAccount'];
+      testConnection?: PortalApi['testConnection'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -156,6 +169,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               subscription_connected: true,
               status: 'active',
             })),
+      ),
+      testConnection: vi.fn<PortalApi['testConnection']>(
+        opts.testConnection ?? (async () => makeCheck()),
       ),
     };
     const view = render(
@@ -1870,6 +1886,262 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await advance(DEVICE_POLL_INTERVAL_MS * 5);
         expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe(`VendorAccountsView test connection [${locale}]`, () => {
+    async function openDetail(name = 'Work OpenAI') {
+      const row = (await screen.findByText(name)).closest('tr')!;
+      fireEvent.click(within(row).getByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    const testButton = () => screen.getByRole('button', { name: t.vendorCheckAction });
+    const verdict = () => screen.getByRole('status');
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    it('offers the test button with a note that only the credentials are checked, not a model', async () => {
+      const { fakeApi } = renderView();
+      await openDetail();
+
+      expect(testButton()).toBeEnabled();
+      expect(screen.getByText(t.vendorCheckIntro)).toBeInTheDocument();
+      // Nothing is sent, and no verdict is shown, until the user asks.
+      expect(fakeApi.testConnection).not.toHaveBeenCalled();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+
+    it('is offered on a subscription that is not connected too (the verdict then says why it cannot be checked)', async () => {
+      renderView({ accounts: [makeVendorAccount(SUBSCRIPTION)] });
+      await openDetail('Team Claude Max');
+
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('is not offered on the list or the create form', async () => {
+      renderView();
+      await screen.findByText('Work OpenAI');
+      expect(screen.queryByRole('button', { name: t.vendorCheckAction })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+      await screen.findByLabelText(t.vendorAccountNameLabel);
+      expect(screen.queryByRole('button', { name: t.vendorCheckAction })).not.toBeInTheDocument();
+    });
+
+    it('checks the open account by id and shows a valid verdict as success', async () => {
+      const { fakeApi } = renderView();
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckValid)).toBeInTheDocument();
+      expect(fakeApi.testConnection).toHaveBeenCalledTimes(1);
+      expect(fakeApi.testConnection).toHaveBeenCalledWith('va_1');
+      expect(verdict()).toHaveClass('MuiAlert-colorSuccess');
+      expect(within(verdict()).getByText(t.vendorCheckValid)).toBeInTheDocument();
+    });
+
+    it('shows an invalid verdict as an error', async () => {
+      renderView({
+        testConnection: async () =>
+          makeCheck({ status: 'invalid', detail: 'the vendor rejected the credential (401)' }),
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckInvalid)).toBeInTheDocument();
+      expect(verdict()).toHaveClass('MuiAlert-colorError');
+    });
+
+    it('shows an unverifiable verdict neutrally: neither success nor error', async () => {
+      renderView({
+        testConnection: async () =>
+          makeCheck({ status: 'unverifiable', detail: 'the vendor could not be reached' }),
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(await screen.findByText(t.vendorCheckUnverifiable)).toBeInTheDocument();
+      expect(verdict()).toHaveClass('MuiAlert-colorInfo');
+      expect(verdict()).not.toHaveClass('MuiAlert-colorSuccess');
+      expect(verdict()).not.toHaveClass('MuiAlert-colorError');
+    });
+
+    it('words the three verdicts differently, so none reads as another', () => {
+      const texts = [t.vendorCheckValid, t.vendorCheckInvalid, t.vendorCheckUnverifiable];
+      expect(new Set(texts).size).toBe(3);
+    });
+
+    it('leads with the localized verdict and keeps the English detail as secondary technical text', async () => {
+      const detail = 'the vendor rejected the credential (invalid_api_key)';
+      renderView({ testConnection: async () => makeCheck({ status: 'invalid', detail }) });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await screen.findByText(t.vendorCheckInvalid);
+      // The detail is labelled as technical, never the verdict's headline.
+      const secondary = within(verdict()).getByText(t.vendorCheckDetail(detail));
+      expect(secondary).toBeInTheDocument();
+      expect(screen.queryByText(detail, { exact: true })).not.toBeInTheDocument();
+      // The localized headline comes first in the verdict.
+      expect(verdict().textContent?.indexOf(t.vendorCheckInvalid)).toBeLessThan(
+        verdict().textContent?.indexOf(detail) ?? -1,
+      );
+    });
+
+    it('shows no technical line when the backend sent no detail', async () => {
+      renderView({ testConnection: async () => makeCheck({ detail: '' }) });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await screen.findByText(t.vendorCheckValid);
+      expect(verdict().textContent).toBe(t.vendorCheckValid);
+    });
+
+    it('disables the button while the check runs, sends it once, and re-enables it with the verdict', async () => {
+      const pending = deferred<VendorConnectionCheck>();
+      const { fakeApi } = renderView({ testConnection: () => pending.promise });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      await waitFor(() => expect(testButton()).toBeDisabled());
+      fireEvent.click(testButton());
+      expect(fakeApi.testConnection).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+      await act(async () => pending.resolve(makeCheck()));
+
+      expect(await screen.findByText(t.vendorCheckValid)).toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('hides the previous verdict while it checks again, then shows the new one', async () => {
+      const second = deferred<VendorConnectionCheck>();
+      const testConnection = vi
+        .fn<PortalApi['testConnection']>()
+        .mockResolvedValueOnce(makeCheck({ status: 'valid' }))
+        .mockReturnValueOnce(second.promise);
+      renderView({ testConnection });
+      await openDetail();
+
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.click(testButton());
+      await waitFor(() => expect(testButton()).toBeDisabled());
+      // A stale "valid" must not stay on screen next to a check that is running.
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+
+      await act(async () => second.resolve(makeCheck({ status: 'invalid' })));
+      expect(await screen.findByText(t.vendorCheckInvalid)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it('shows a thrown error as the localized toast, not as a verdict, and re-enables the button', async () => {
+      renderView({
+        testConnection: async () => {
+          throw new PortalApiError(500, 'vendor_account.check_failed', 'raw server text');
+        },
+      });
+      await openDetail();
+
+      fireEvent.click(testButton());
+
+      expect(
+        await screen.findByText(`vendor_account.check_failed: ${t.errorVendorAccountCheckFailed}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckInvalid)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckUnverifiable)).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('clears an earlier verdict when the next check throws', async () => {
+      const testConnection = vi
+        .fn<PortalApi['testConnection']>()
+        .mockResolvedValueOnce(makeCheck())
+        .mockRejectedValueOnce(new PortalApiError(500, 'vendor_account.check_failed', 'raw'));
+      renderView({ testConnection });
+      await openDetail();
+
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+      fireEvent.click(testButton());
+
+      await screen.findByText(`vendor_account.check_failed: ${t.errorVendorAccountCheckFailed}`);
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it("does not show one account's verdict on another account", async () => {
+      renderView({
+        accounts: [
+          makeVendorAccount(),
+          makeVendorAccount({ id: 'va_other', name: 'Other OpenAI' }),
+        ],
+      });
+      await openDetail();
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.click(screen.getByRole('button', { name: t.providers }));
+      await openDetail('Other OpenAI');
+
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
+    });
+
+    it('drops a verdict once the account was saved, because the credential may have changed', async () => {
+      renderView({
+        updateVendorAccount: async (id) =>
+          makeVendorAccount({ id, updated_at: '2026-10-08T11:00:00Z' }),
+      });
+      await openDetail();
+      fireEvent.click(testButton());
+      await screen.findByText(t.vendorCheckValid);
+
+      fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+        target: { value: 'sk-rotated' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await screen.findByText(t.save, { selector: '[role="alert"] *' });
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorCheckValid)).not.toBeInTheDocument();
+    });
+
+    it('ignores a result that arrives after the user left the account (no verdict, no toast)', async () => {
+      const pending = deferred<VendorConnectionCheck>();
+      const { fakeApi } = renderView({ testConnection: () => pending.promise });
+      await openDetail();
+      fireEvent.click(testButton());
+      await waitFor(() => expect(fakeApi.testConnection).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(screen.getByRole('button', { name: t.providers }));
+      await screen.findByRole('button', { name: t.vendorAccountCreate });
+      await act(async () =>
+        pending.reject(new PortalApiError(500, 'vendor_account.check_failed', 'raw')),
+      );
+
+      expect(screen.queryByText(/vendor_account\.check_failed/)).not.toBeInTheDocument();
+      // Back on the same account: it has no verdict from the abandoned check.
+      await openDetail();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(testButton()).toBeEnabled();
     });
   });
 

@@ -22,6 +22,7 @@ import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { vendorLabel } from './shared/vendorLabel';
 import { VendorAccountUsage } from './VendorAccountUsagePanel';
+import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
 type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
@@ -91,10 +92,12 @@ function hasCredential(account: VendorAccount): boolean {
  * form then opens its detail view) and connected from the detail view's
  * "connect subscription" panel, which only ever sees `subscription_connected`.
  *
- * The detail view also shows a "Usage & limits" panel (VendorAccountUsage)
- * for any account that can have a rate-limit snapshot -- in practice a
- * connected subscription. The list carries no snapshot, so the panel reads it
- * from the single-account GET.
+ * The detail view also shows a "Check credentials" panel
+ * (VendorConnectionTest): a "Test connection" button whose verdict is about the
+ * stored credential only, not about any model -- and a "Usage & limits" panel
+ * (VendorAccountUsage) for any account that can have a rate-limit snapshot -- in
+ * practice a connected subscription. The list carries no snapshot, so the panel
+ * reads it from the single-account GET.
  */
 export function VendorAccountsView({
   t,
@@ -113,6 +116,7 @@ export function VendorAccountsView({
     | 'beginVendorAccountDeviceConnect'
     | 'pollVendorAccountDeviceConnect'
     | 'vendorAccount'
+    | 'testConnection'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -395,9 +399,10 @@ export function VendorAccountsView({
     );
   }
 
-  // Detail sub-view: rename / status / key rotation + delete, plus the usage
-  // panel and the connect panel of a subscription account. Vendor and auth
-  // type are immutable server-side, so they are shown read-only.
+  // Detail sub-view: rename / status / key rotation + delete, plus the
+  // credential-check and usage panels and the connect panel of a subscription
+  // account. Vendor and auth type are immutable server-side, so they are shown
+  // read-only.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
     const keyStored = account.api_key_set && !keyCleared;
@@ -507,6 +512,19 @@ export function VendorAccountsView({
             </Box>
           </Box>
         </Panel>
+
+        {/* The credential check works for every account: one without a stored
+            credential simply answers "unverifiable". Keyed by id and updated_at,
+            so saving or reconnecting the account drops a verdict that described
+            the previous credential. */}
+        <Box sx={{ mt: 3 }}>
+          <VendorConnectionTest
+            key={`${account.id}:${account.updated_at}`}
+            t={t}
+            api={api}
+            accountId={account.id}
+          />
+        </Box>
 
         {/* A subscription that was never connected has served nothing, so it
             has no usage snapshot to read; everything else may. */}
