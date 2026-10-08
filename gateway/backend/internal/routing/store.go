@@ -248,9 +248,11 @@ type VendorAccount struct {
 // caller asks the gateway for (GatewayModel), the id sent to the vendor
 // (UpstreamModel), the wire dialect used to reach it (APIFlavor, one of
 // APIFlavorOpenAI / APIFlavorAnthropic) and the vendor's human-readable name for
-// it (DisplayName, migration 83; "" when the vendor supplied none). For the
-// vendors served today the two ids coincide. (AccountID, GatewayModel) is the
-// primary key.
+// it (DisplayName, migration 83; "" when the vendor supplied none). The two ids
+// coincide only for an account with no ModelPrefix: with a prefix GatewayModel is
+// ModelPrefix + UpstreamModel, the resolver matches the request model against
+// GatewayModel and always dispatches UpstreamModel upstream, so nothing may treat
+// the two as interchangeable. (AccountID, GatewayModel) is the primary key.
 type VendorAccountModel struct {
 	AccountID     string
 	GatewayModel  string
