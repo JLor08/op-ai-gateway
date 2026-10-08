@@ -73,8 +73,13 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 		// Codex CLI's own path, NOT the OpenAI-platform /v1/responses. The Endpoint
 		// already carries the .../codex prefix, so the path is the bare /responses.
 		// Every other Responses upstream (self-hosted llama.cpp/vLLM, an api_key
-		// OpenAI app) keeps the standard /v1/responses.
-		if target.Provider == routing.ProviderVendorOpenAI && target.VendorAccountID != "" {
+		// OpenAI vendor account or app) keeps the standard /v1/responses.
+		//
+		// The trigger is the explicit Subscription flag, NOT VendorAccountID: M6a now
+		// sets VendorAccountID on api-key OpenAI vendor targets too (for usage
+		// attribution), so keying on it here would also route an api-key OpenAI target
+		// to the Codex backend -- the exact conflation Target.Subscription removed.
+		if target.Provider == routing.ProviderVendorOpenAI && target.Subscription {
 			return "/responses", target.ResponsesMode
 		}
 		return "/v1/responses", target.ResponsesMode

@@ -66,6 +66,14 @@ func TestParseVendorAccountUsage(t *testing.T) {
 			want: routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: 0, WeeklyPct: -1, UpdatedAt: now},
 		},
 		{
+			name:     "anthropic over-range fraction clamps to 100",
+			provider: routing.ProviderVendorAnthropic,
+			headers:  hdr(map[string]string{"anthropic-ratelimit-unified-5h-utilization": "1.5"}),
+			wantOK:   true,
+			// 1.5 * 100 = 150 -> clamped to 100 (a real reading can never exceed 100).
+			want: routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: 100, WeeklyPct: -1, UpdatedAt: now},
+		},
+		{
 			name:     "openai full",
 			provider: routing.ProviderVendorOpenAI,
 			headers: hdr(map[string]string{

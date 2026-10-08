@@ -138,7 +138,9 @@ func lowerHeaderValues(h http.Header) map[string]string {
 // parseScaledPercent parses a numeric header value and multiplies it by scale
 // (100 for an Anthropic 0..1 fraction, 1 for a Codex 0..100 percent). ok is false
 // for a missing or non-numeric value. A negative result is rejected (-1 is the
-// reserved unknown sentinel, so a real reading must never be negative).
+// reserved unknown sentinel, so a real reading must never be negative), and the
+// scaled result is clamped to <=100 so a malformed over-range value (e.g. an
+// Anthropic fraction >1 scaling past 100) cannot report an impossible percent.
 func parseScaledPercent(s string, scale float64) (float64, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -148,7 +150,11 @@ func parseScaledPercent(s string, scale float64) (float64, bool) {
 	if err != nil || f < 0 {
 		return 0, false
 	}
-	return f * scale, true
+	pct := f * scale
+	if pct > 100 {
+		pct = 100
+	}
+	return pct, true
 }
 
 // parseEpochSeconds parses a unix-epoch-seconds header value (integer or
