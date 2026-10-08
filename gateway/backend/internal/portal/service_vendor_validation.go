@@ -139,6 +139,21 @@ func (s *Service) validateSubscriptionToken(ctx context.Context, vendor, accessT
 	return probe(ctx, s.vendorValidation.client, accessToken)
 }
 
+// checkSubscriptionTokenSet probes ts's access token (validateSubscriptionToken),
+// EXCEPT when that token is already past its expiry while a refresh token can
+// renew it: the vendor would answer 401 for an account the next request heals (the
+// dispatch refreshes lazily), and a verdict of "invalid" would be a false alarm
+// that blocks a working import or reads as a dead credential. Such a token set is
+// Unverifiable without a probe. Without a refresh token an expired token can never
+// heal, so it is probed like any other. The one place this rule lives, shared by
+// the token import and TestVendorAccountConnection.
+func (s *Service) checkSubscriptionTokenSet(ctx context.Context, vendor string, ts vendorauth.TokenSet) vendorauth.CredentialCheck {
+	if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
+		return unverifiableVendorCheck("the access token has expired; it is refreshed automatically on the next request")
+	}
+	return s.validateSubscriptionToken(ctx, vendor, ts.AccessToken)
+}
+
 // validateAPIKey runs vendor's API-KEY probe.
 func (s *Service) validateAPIKey(ctx context.Context, vendor, apiKey string) vendorauth.CredentialCheck {
 	var probe VendorCredentialValidator
@@ -222,9 +237,10 @@ func vendorConnectionStatus(status vendorauth.CredentialStatus) string {
 // TestVendorAccountConnection is the explicit "test connection" action: it opens
 // the account's stored credential (an api key, or the access token of the sealed
 // token set), asks the vendor whether it is accepted and returns the verdict. It
-// changes nothing and refreshes nothing. OWNER-ONLY, like every vendor-account
-// call; an unknown id and a stranger's account are both ErrVendorAccountNotFound.
-// ErrVendorAccountsDisabled while the master flag is off.
+// changes nothing and refreshes nothing. STRICTLY OWNER-ONLY, system scope
+// included (it USES the stored credential, so it is authorized like a write, not
+// like a metadata read); an unknown id and a stranger's account are both
+// ErrVendorAccountNotFound. ErrVendorAccountsDisabled while the master flag is off.
 //
 // A missing credential (no api key set, subscription not connected) is
 // "unverifiable" with a detail saying so, and so is an access token that is
@@ -235,7 +251,11 @@ func (s *Service) TestVendorAccountConnection(ctx context.Context, principal aut
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorConnectionCheck{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
+	// write=true: strictly owner-only, system scope included. The test opens the
+	// sealed credential and sends it to the vendor from the gateway, so letting a
+	// non-owner trigger it would make the owner's personal credential a live/dead
+	// oracle for someone else (and a vendor-side call the owner never made).
+	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
 	if err != nil {
 		return VendorConnectionCheck{}, err
 	}
@@ -271,10 +291,7 @@ func (s *Service) checkVendorAccount(ctx context.Context, acc routing.VendorAcco
 		if ts.AccessToken == "" {
 			return unverifiableVendorCheck("the subscription is not connected"), "", nil
 		}
-		if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
-			return unverifiableVendorCheck("the access token has expired; it is refreshed automatically on the next request"), "", nil
-		}
-		return s.validateSubscriptionToken(ctx, acc.Vendor, ts.AccessToken), ts.AccessToken, nil
+		return s.checkSubscriptionTokenSet(ctx, acc.Vendor, ts), ts.AccessToken, nil
 	default:
 		return unverifiableVendorCheck("no credential check exists for this account type"), "", nil
 	}

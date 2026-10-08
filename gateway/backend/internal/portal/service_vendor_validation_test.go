@@ -485,6 +485,99 @@ func TestConnectVendorAccountImportLeavesAnUnderivableExpiryUnknown(t *testing.T
 	}
 }
 
+// An EXPIRED access token that came with a refresh token is not probed: the real
+// vendor answers 401 for it, yet the account heals on its first request by
+// refreshing, so blocking the import would reject a working auth.json. Without a
+// refresh token the expired token can never heal and an Invalid verdict still
+// blocks.
+func TestConnectVendorAccountImportDoesNotProbeAnExpiredButRefreshableToken(t *testing.T) {
+	svc0, _, _ := newVendorConnectTestService(t)
+	past := svc0.clock().Add(-2 * time.Hour)
+	expiredJWT := jwtWithClaims(t, map[string]any{"exp": past.Unix()})
+
+	cases := []struct {
+		name string
+		req  ConnectVendorAccountImportRequest
+	}{
+		{"expired jwt exp + refresh token", ConnectVendorAccountImportRequest{AccessToken: expiredJWT, RefreshToken: connectTestRefresh}},
+		{"explicit past expiry + refresh token", ConnectVendorAccountImportRequest{AccessToken: connectTestAccess, RefreshToken: connectTestRefresh, ExpiresAt: past}},
+	}
+	for _, vendor := range []string{routing.VendorOpenAI, routing.VendorAnthropic} {
+		for _, tc := range cases {
+			t.Run(vendor+"/"+tc.name, func(t *testing.T) {
+				svc, routeStore, _ := newVendorConnectTestService(t)
+				fake := installFakeVendorValidators(svc)
+				fake.setAll(invalidCheck())
+				acc := createSubscriptionAccount(t, svc, ownerToken(), vendor, "Stale paste")
+
+				dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, tc.req)
+				if err != nil {
+					t.Fatalf("ConnectVendorAccountImport: %v, want the stale-but-refreshable token imported", err)
+				}
+				if !dto.SubscriptionConnected {
+					t.Fatalf("dto = %+v, want a connected account", dto)
+				}
+				_, ts := storedTokenSet(t, routeStore, svc, acc.ID)
+				if ts.AccessToken != tc.req.AccessToken || ts.RefreshToken != connectTestRefresh || !ts.NeedsRefresh(svc.clock(), 0) {
+					t.Fatalf("stored token set = %v, want the pasted tokens, flagged for refresh", ts)
+				}
+				if calls := fake.recorded(); len(calls) != 0 {
+					t.Fatalf("validator calls = %+v, want none for an expired but refreshable token", calls)
+				}
+			})
+		}
+	}
+
+	t.Run("expired without a refresh token is still probed and blocked", func(t *testing.T) {
+		svc, routeStore, _ := newVendorConnectTestService(t)
+		fake := installFakeVendorValidators(svc)
+		fake.setAll(invalidCheck())
+		acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Dead paste")
+
+		_, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: expiredJWT})
+		if !errors.Is(err, ErrVendorAccountConnectInvalidCredentials) {
+			t.Fatalf("err = %v, want ErrVendorAccountConnectInvalidCredentials", err)
+		}
+		if len(fake.recorded()) != 1 {
+			t.Fatalf("validator calls = %+v, want exactly one", fake.recorded())
+		}
+		if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
+			t.Fatalf("OAuthTokens = %q, want nothing persisted", row.OAuthTokens)
+		}
+	})
+}
+
+// The account facts read from the pasted JWT are as unvalidated as a probe's
+// answer and the account id is sent back as a header, so they pass the same
+// printable-ASCII / length cap; a value that fails it is dropped on its own.
+func TestConnectVendorAccountImportCapsTheJWTDerivedIdentity(t *testing.T) {
+	cases := []struct {
+		name             string
+		accountID, plan  string
+		wantID, wantPlan string
+	}{
+		{"both fine", "acct-123", "plus", "acct-123", "plus"},
+		{"over-long id dropped", strings.Repeat("a", 129), "plus", "", "plus"},
+		{"non-ascii plan dropped, id kept", "acct-123", "pl\u00fcs", "acct-123", ""},
+		{"control character in id dropped", "acct-\x01", "pro", "", "pro"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, _ := newVendorConnectTestService(t)
+			installFakeVendorValidators(svc) // Unverifiable: nothing backfills over the drop
+			acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Imported")
+
+			if _, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestJWT(t, tc.accountID, tc.plan)}); err != nil {
+				t.Fatalf("ConnectVendorAccountImport: %v", err)
+			}
+			_, ts := storedTokenSet(t, routeStore, svc, acc.ID)
+			if ts.AccountID != tc.wantID || ts.PlanType != tc.wantPlan {
+				t.Fatalf("stored account id %d bytes / plan %q, want id %d bytes / plan %q", len(ts.AccountID), ts.PlanType, len(tc.wantID), tc.wantPlan)
+			}
+		})
+	}
+}
+
 // --- test connection --------------------------------------------------------
 
 func TestTestVendorAccountConnectionAPIKey(t *testing.T) {
@@ -688,6 +781,9 @@ func TestTestVendorAccountConnectionIsOwnerOnly(t *testing.T) {
 		"another user":       otherToken(),
 		"no user identity":   {},
 		"another user (adm)": {UserID: "usr_admin", Scopes: []string{"gateway:use", "admin"}},
+		// System scope widens METADATA reads, but the test sends the owner's sealed
+		// credential to the vendor: a non-owner must not be able to trigger that.
+		"system scope non-owner": systemToken(),
 	} {
 		if _, err := svc.TestVendorAccountConnection(context.Background(), principal, acc.ID); !errors.Is(err, ErrVendorAccountNotFound) {
 			t.Fatalf("%s: err = %v, want ErrVendorAccountNotFound", label, err)

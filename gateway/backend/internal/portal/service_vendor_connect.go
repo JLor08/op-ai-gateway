@@ -204,7 +204,9 @@ type ConnectVendorAccountImportRequest struct {
 // (the matching SUBSCRIPTION probe, see service_vendor_validation.go), fail-soft:
 // only a definitive rejection blocks the import (ErrVendorAccountConnectInvalidCredentials,
 // nothing persisted); an unreachable vendor or an unexpected answer proceeds, so
-// the first real request remains the final judge. A pasted token carries no
+// the first real request remains the final judge. An access token that is already
+// expired while a refresh token came with it is not probed at all (the vendor
+// would reject it, yet the account heals on its first request by refreshing). A pasted token carries no
 // expires_in, so a missing expiry is read from the access token's JWT exp claim
 // when it has one (an OpenAI token does, an Anthropic one is opaque), which lets a
 // stale token refresh instead of failing forever on its stored refresh token. For
@@ -225,7 +227,7 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 		return VendorAccountDTO{}, ErrVendorAccountConnectTokenRequired
 	}
 	ts := importedTokenSet(acc.Vendor, access, req)
-	check := s.validateSubscriptionToken(ctx, acc.Vendor, access)
+	check := s.checkSubscriptionTokenSet(ctx, acc.Vendor, ts)
 	if check.Status == vendorauth.StatusInvalid {
 		return VendorAccountDTO{}, fmt.Errorf("%w: %s", ErrVendorAccountConnectInvalidCredentials, scrubCredential(scrubCredential(check.Detail, access), ts.RefreshToken))
 	}
@@ -245,7 +247,7 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 // token and the request: the refresh token as pasted, the expiry as given or, when
 // none was given, derived from the access token's JWT exp claim (left unknown
 // when it has none), and, for an OpenAI account, the account id and plan read from
-// the access token's claims.
+// the access token's claims (each kept only if it passes vendorIdentityValue).
 func importedTokenSet(vendor, access string, req ConnectVendorAccountImportRequest) vendorauth.TokenSet {
 	ts := vendorauth.TokenSet{AccessToken: access, RefreshToken: strings.TrimSpace(req.RefreshToken)}
 	if !req.ExpiresAt.IsZero() {
@@ -254,7 +256,12 @@ func importedTokenSet(vendor, access string, req ConnectVendorAccountImportReque
 		ts.ExpiresAt = exp
 	}
 	if vendor == routing.VendorOpenAI {
-		ts.AccountID, ts.PlanType = vendorauth.OpenAIClaimsFromJWT(access)
+		// The claims are as unvalidated as a probe's answer (the token is pasted),
+		// and the account id is sent back as a header: apply the same cap, dropping
+		// a value that fails it.
+		accountID, planType := vendorauth.OpenAIClaimsFromJWT(access)
+		ts.AccountID, _ = vendorIdentityValue(accountID)
+		ts.PlanType, _ = vendorIdentityValue(planType)
 	}
 	return ts
 }
