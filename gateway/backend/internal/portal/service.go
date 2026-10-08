@@ -165,6 +165,12 @@ var (
 	ErrVendorAccountConnectUpstream      = errors.New("vendor_account.connect_upstream_failed")
 	ErrVendorAccountConnectKeyRequired   = errors.New("vendor_account.connect_key_required")
 
+	// ErrVendorAccountConnectInvalidCredentials: a token import whose access token
+	// the vendor DEFINITIVELY rejected (the validation probe answered HTTP 401), so
+	// nothing was stored. An unreachable vendor or an unexpected answer never
+	// raises it: validation is fail-soft and only a clear rejection blocks.
+	ErrVendorAccountConnectInvalidCredentials = errors.New("vendor_account.connect_invalid_credentials")
+
 	// Device-code connect (the OPTIONAL Codex deviceauth flow; see
 	// service_vendor_device_connect.go). It reuses the connect sentinels above for
 	// a vendor refusal / upstream failure / unsealable store, and adds two of its
@@ -515,6 +521,10 @@ type ServiceDeps struct {
 	// VendorHTTPClient performs the connect flow's token exchange. nil means a
 	// client with a 30s timeout.
 	VendorHTTPClient *http.Client
+	// VendorValidators are the credential-validation probes the token import and
+	// TestVendorAccountConnection run. A nil field means the real vendorauth
+	// probe; tests inject fakes so nothing reaches a vendor over the network.
+	VendorValidators VendorCredentialValidators
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -710,6 +720,9 @@ type Service struct {
 	// vendorConnect holds the subscription connect flow's endpoints, http client
 	// and in-memory pending state (see vendorConnectState).
 	vendorConnect vendorConnectState
+	// vendorValidation holds the credential-validation probes and their bounded
+	// http client (see vendorValidationState).
+	vendorValidation vendorValidationState
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -820,6 +833,7 @@ func NewService(deps ServiceDeps) *Service {
 			openai:    vendorOpenAI,
 			client:    vendorClient,
 		},
+		vendorValidation:            newVendorValidationState(deps.VendorValidators),
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
 		agentTLSPort:                deps.AgentTLSPort,
