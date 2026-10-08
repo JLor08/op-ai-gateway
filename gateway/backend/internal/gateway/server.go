@@ -239,6 +239,16 @@ type ServerDeps struct {
 	// construction. Server never stores or reads this field. nil is correct
 	// for any Server built without cmd/gateway.
 	SetBenchmarkReservationHook func(func(serverID string) bool)
+	// SetVendorTokenRefresher is the same wiring conduit for the model discovery's
+	// token refresh: it is portal.Service.SetVendorTokenRefresher itself, called
+	// ONCE by cmd/gateway's buildGatewayServer with the just-built Server's
+	// RefreshVendorSubscriptionTokens bound as the argument, so "refresh models" on
+	// an expired subscription refreshes the token under the dispatch's own
+	// per-account lock instead of racing it (see that method's doc). The Server
+	// does not exist until gateway.New returns, so the portal Service cannot take
+	// it at its own construction. Server never stores or reads this field. nil is
+	// correct for any Server built without cmd/gateway.
+	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.

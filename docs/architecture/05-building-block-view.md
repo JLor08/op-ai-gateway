@@ -127,7 +127,13 @@ recover the concrete service from `srv.Portal`. It defeats the exact
 `api_tracing_gen.go` is generated, a template change or a second wrapping layer
 would break the type assertion with **no compile error, only a nil at runtime**;
 and it added permanent public API surface a later reader would treat as a
-sanctioned escape hatch. It has been deleted.
+sanctioned escape hatch. It has been deleted. The same conduit carries
+`SetBenchmarkReservationHook` and `SetVendorTokenRefresher`: the latter hands the
+vendor model discovery the `Server`'s locked subscription-token refresh
+(`srv.RefreshVendorSubscriptionTokens`, the refresh the dispatch itself runs under
+its per-account lock), so "refresh models" can renew an expired subscription token
+without the portal ever refreshing by itself and racing the dispatch for the
+single-use refresh token.
 
 **A per-server registry that `cmd/gateway` must prune needs an exported
 constructor.** Without one, `gateway.New`'s internal nil-default fallback builds

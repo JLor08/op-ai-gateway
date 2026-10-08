@@ -34,6 +34,7 @@ func TestVendorAccountEndpointsAre409WhileTheMasterFlagIsOff(t *testing.T) {
 		{"connect begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOwnerSecret, ""},
 		{"connect complete", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/complete", vaOwnerSecret, `{"code":"c"}`},
 		{"check", http.MethodPost, "/api/portal/vendor-accounts/va_anything/check", vaOwnerSecret, ""},
+		{"models refresh", http.MethodPost, "/api/portal/vendor-accounts/va_anything/models/refresh", vaOwnerSecret, ""},
 		{"connect device begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/begin", vaOwnerSecret, ""},
 		{"connect device poll", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/poll", vaOwnerSecret, ""},
 		{"connect begin as another user", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOtherSecret, ""},

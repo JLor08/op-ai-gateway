@@ -1196,6 +1196,46 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/vendor-accounts/{id}/models/refresh:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Refresh the account's models from the vendor
+      description: >
+        No request body. Asks the vendor which models the account's stored
+        credential can use and, when it answers with a usable list, replaces the
+        account's models with it (each served as the account's model_prefix plus
+        the vendor's id). A subscription access token already past its expiry is
+        renewed first through the gateway's own locked token refresh. Answers the
+        credential-free account and a VendorModelsRefreshResult. Fail-soft: when
+        nothing usable can be had the models are kept and the answer is still a
+        200 with refresh.status unverifiable. Strictly owner-only (system scope
+        included); a non-owner gets the same 404 as an unknown id. A stored
+        credential that cannot be opened is a 409
+        vendor_account.credential_unreadable.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The account as it now serves its models, and what the refresh did
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account, refresh]
+                properties:
+                  account: { type: object, description: The credential-free vendor account DTO (portal.VendorAccountDTO), with its models as now served }
+                  refresh: { $ref: '#/components/schemas/VendorModelsRefreshResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The account cannot be refreshed -- vendor_account.credential_unreadable
+            (the stored credential cannot be opened; reconnect the account) or
+            vendor_accounts.module_disabled while the master flag is off. The
+            Error envelope carries the stable code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/vendor-accounts/{id}/connect/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1915,6 +1955,27 @@ components:
                   exit_code: { type: integer }
                   failures: { type: integer }
                   stderr_tail: { type: string }
+    VendorModelsRefreshResult:
+      type: object
+      description: >
+        What POST /api/portal/vendor-accounts/{id}/models/refresh did
+        (portal.RefreshResult). Credential-free.
+      required: [status, discovered, detail]
+      properties:
+        status:
+          type: string
+          enum: [ok, unverifiable]
+          description: >
+            ok - the vendor served a usable list and it replaced the account's
+            models. unverifiable - nothing usable could be had (no credential,
+            expired token that could not be renewed, vendor unreachable or
+            unexpected answer, no usable model); the models were kept.
+        discovered:
+          type: integer
+          description: Number of models now served from the discovery (0 when unverifiable).
+        detail:
+          type: string
+          description: Short English phrase (what was stored, or why nothing was). Never a credential.
     VendorConnectionCheck:
       type: object
       description: >

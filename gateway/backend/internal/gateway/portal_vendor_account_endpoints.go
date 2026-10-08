@@ -24,6 +24,7 @@ const (
 	codeVendorAccountDeleteFailed  = "vendor_account.delete_failed"
 	codeVendorAccountConnectFailed = "vendor_account.connect_failed"
 	codeVendorAccountCheckFailed   = "vendor_account.check_failed"
+	codeVendorAccountRefreshFailed = "vendor_account.refresh_failed"
 )
 
 // handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
@@ -88,9 +89,10 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // (GET / PATCH / DELETE), the subscription-connect sub-resources
 // "/api/portal/vendor-accounts/{id}/connect/{import|begin|complete}" (POST), and
 // the OPTIONAL device-code connect sub-resources
-// "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST), and the
-// test-connection action "/api/portal/vendor-accounts/{id}/check" (POST). Any
-// other deeper path is answered with the same 404 as an unknown id.
+// "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST), the
+// test-connection action "/api/portal/vendor-accounts/{id}/check" (POST) and the
+// model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST).
+// Any other deeper path is answered with the same 404 as an unknown id.
 func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
@@ -129,12 +131,16 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 }
 
 // routeVendorAccountSubpath dispatches the sub-routes of
-// /api/portal/vendor-accounts/{id}/... (the /check action and the /connect/...
-// family) and reports whether it handled the request. The item handler falls
+// /api/portal/vendor-accounts/{id}/... (the /check and /models/refresh actions and
+// the /connect/... family) and reports whether it handled the request. The item handler falls
 // through to the {id} GET/PATCH/DELETE surface when this returns false.
 func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "check" {
 		s.handlePortalVendorAccountCheck(w, r, token, parts[0])
+		return true
+	}
+	if len(parts) == 3 && parts[0] != "" && parts[1] == "models" && parts[2] == "refresh" {
+		s.handlePortalVendorAccountModelsRefresh(w, r, token, parts[0])
 		return true
 	}
 	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
@@ -206,6 +212,37 @@ func (s *Server) handlePortalVendorAccountCheck(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, check)
+}
+
+// vendorAccountModelsRefreshResponse is the response of POST
+// /api/portal/vendor-accounts/{id}/models/refresh: the credential-free account as
+// it now serves its models, and what the refresh did (status ok or unverifiable,
+// how many models were stored, and a short phrase for the portal to show).
+type vendorAccountModelsRefreshResponse struct {
+	Account portal.VendorAccountDTO `json:"account"`
+	Refresh portal.RefreshResult    `json:"refresh"`
+}
+
+// handlePortalVendorAccountModelsRefresh (POST .../models/refresh) is the explicit
+// "refresh models" action: the gateway asks the vendor which models the account's
+// stored credential can use and, when it answers with a usable list, replaces the
+// account's models with it (under the account's prefix). It is fail-soft: a vendor
+// that cannot be asked leaves the models as they were and is still a 200, with
+// refresh.status "unverifiable" and the reason in refresh.detail. The request has no
+// body and no credential is ever returned. Owner-only and gated by the
+// vendor_accounts_enabled master flag (both in portal.Service): any other principal
+// gets the same 404 as an unknown id; a stored credential that cannot be opened is a
+// 409 vendor_account.credential_unreadable.
+func (s *Server) handlePortalVendorAccountModelsRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	dto, result, err := s.Portal.RefreshVendorAccountModels(r.Context(), token, id)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountRefreshFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, vendorAccountModelsRefreshResponse{Account: dto, Refresh: result})
 }
 
 // vendorAccountConnectCompleteRequest is the body of POST

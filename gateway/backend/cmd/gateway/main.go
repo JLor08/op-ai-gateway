@@ -423,6 +423,16 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetBenchmarkReservationHook != nil {
 		deps.SetBenchmarkReservationHook(srv.Benchmarks.ServerBusy)
 	}
+	// And once more for the vendor model discovery: refreshing the models of a
+	// subscription whose access token has expired needs a fresh token, and the
+	// only party allowed to refresh it is the gateway Server (under its
+	// per-account lock, the one the dispatch refreshes under: a rotating refresh
+	// token is single-use). The Server exists only now, so the portal Service
+	// takes the refresher through its setter. Without this a "refresh models"
+	// on an expired-but-refreshable subscription can only report unverifiable.
+	if deps.SetVendorTokenRefresher != nil {
+		deps.SetVendorTokenRefresher(srv.RefreshVendorSubscriptionTokens)
+	}
 	// Settle what a benchmark run left behind when the process died: the
 	// force_stopped overrides and lifted pins it recorded in the override
 	// lease. Synchronous, and before the scheduler and the listeners start, so
@@ -1065,6 +1075,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		// why this indirection exists instead of a direct field value.
 		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
+		SetVendorTokenRefresher:         portalService.SetVendorTokenRefresher,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,
