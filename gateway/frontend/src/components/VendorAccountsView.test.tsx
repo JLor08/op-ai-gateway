@@ -8,7 +8,12 @@ import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import { PortalApiError } from '../api';
 import { DEVICE_POLL_INTERVAL_MS, DEVICE_POLL_TIMEOUT_MS } from './VendorDeviceConnect';
-import type { CreateVendorAccountRequest, UpdateVendorAccountRequest, VendorAccount } from '../api';
+import type {
+  CreateVendorAccountRequest,
+  UpdateVendorAccountRequest,
+  VendorAccount,
+  VendorAccountUsage,
+} from '../api';
 import type { PortalApi } from './shared/types';
 
 function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
@@ -40,6 +45,22 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
   api_key_set: false,
   subscription_connected: false,
 };
+
+// A rate-limit snapshot as the single-account GET returns it. The 5-hour window
+// resets in 2 h 14 min (plus 30 s of slack, so the countdown still reads 14 min
+// after the test's own latency); the weekly one in 3 d 4 h.
+function makeUsage(overrides: Partial<VendorAccountUsage> = {}): VendorAccountUsage {
+  const now = Date.now();
+  return {
+    five_hour_pct: 42,
+    five_hour_reset_at: new Date(now + (2 * 60 + 14) * 60_000 + 30_000).toISOString(),
+    weekly_pct: 7,
+    weekly_reset_at: new Date(now + (3 * 24 + 4) * 3_600_000 + 30_000).toISOString(),
+    credit_balance: '',
+    updated_at: new Date(now - 5 * 60_000).toISOString(),
+    ...overrides,
+  };
+}
 
 afterEach(() => {
   cleanup();
@@ -1091,7 +1112,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await startDevice();
         await advance(DEVICE_POLL_INTERVAL_MS);
 
-        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+        // Two reads, both failing: the connect's own re-read, then the usage
+        // panel's read once the account reads as connected (a failed usage read
+        // stays silent, see the usage & limits tests).
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+        expect(fakeApi.vendorAccount).toHaveBeenNthCalledWith(1, 'va_sub');
+        expect(fakeApi.vendorAccount).toHaveBeenNthCalledWith(2, 'va_sub');
         expect(screen.getByText(t.vendorConnectStatusConnected)).toHaveAttribute(
           'data-status',
           'active',
@@ -1412,6 +1438,149 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await advance(DEVICE_POLL_INTERVAL_MS * 5);
         expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe(`VendorAccountsView usage & limits [${locale}]`, () => {
+    // The usage snapshot rides on the single-account GET only: the list rows
+    // carry none, so the detail view reads it when it opens.
+    const withUsage = (usage?: VendorAccountUsage) => async (id: string) =>
+      makeVendorAccount({ ...SUBSCRIPTION, id, subscription_connected: true, usage });
+
+    async function openDetail() {
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    it('shows both windows with their reset countdown and the credit balance for a connected subscription', async () => {
+      const { fakeApi } = renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(makeUsage({ credit_balance: '12.34' })),
+      });
+      await openDetail();
+
+      expect(await screen.findByText(t.vendorUsageTitle)).toBeInTheDocument();
+      expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub');
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toHaveAttribute(
+        'aria-valuenow',
+        '42',
+      );
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageWeekly })).toHaveAttribute(
+        'aria-valuenow',
+        '7',
+      );
+      expect(screen.getByText(t.vendorUsageResetsIn('2 h 14 min'))).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageResetsIn('3 d 4 h'))).toBeInTheDocument();
+      expect(screen.getByText('12.34')).toBeInTheDocument();
+    });
+
+    it('shows "no data yet" for a window the gateway has not observed, with no bar for it', async () => {
+      renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(makeUsage({ weekly_pct: -1, weekly_reset_at: null })),
+      });
+      await openDetail();
+
+      await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+      expect(screen.getByText(t.vendorUsageNoData)).toBeInTheDocument();
+      expect(
+        screen.queryByRole('progressbar', { name: t.vendorUsageWeekly }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('hides the panel for an account the gateway has no snapshot for', async () => {
+      const { fakeApi } = renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(undefined),
+      });
+      await openDetail();
+
+      await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub'));
+      expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+    });
+
+    it('hides the panel for a snapshot that knows no window and no balance yet', async () => {
+      const { fakeApi } = renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(
+          makeUsage({
+            five_hour_pct: -1,
+            five_hour_reset_at: null,
+            weekly_pct: -1,
+            weekly_reset_at: null,
+          }),
+        ),
+      });
+      await openDetail();
+
+      await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub'));
+      expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+    });
+
+    it('is also available for an api-key account that has a snapshot', async () => {
+      renderView({
+        vendorAccount: async (id: string) => makeVendorAccount({ id, usage: makeUsage() }),
+      });
+      await openDetail();
+
+      expect(await screen.findByText(t.vendorUsageTitle)).toBeInTheDocument();
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeInTheDocument();
+    });
+
+    it('does not read a snapshot for a subscription that was never connected', async () => {
+      const { fakeApi } = renderView({
+        accounts: [makeVendorAccount(SUBSCRIPTION)],
+        vendorAccount: withUsage(makeUsage()),
+      });
+      await openDetail();
+
+      expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+      expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+    });
+
+    it('leaves the panel out, without an error toast, when the snapshot cannot be read', async () => {
+      renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: async () => {
+          throw new PortalApiError(500, 'vendor_account.get_failed', 'raw server text');
+        },
+      });
+      await openDetail();
+
+      // The settings panel is fully usable; only the optional usage panel is absent.
+      await waitFor(() => expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument());
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByLabelText(t.vendorAccountNameLabel)).toBeInTheDocument();
+    });
+
+    it('keeps the panel after the settings are saved (the PATCH answer carries no snapshot)', async () => {
+      const { fakeApi } = renderView({
+        vendorAccount: async (id: string) => makeVendorAccount({ id, usage: makeUsage() }),
+      });
+      await openDetail();
+      await screen.findByText(t.vendorUsageTitle);
+
+      fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+        target: { value: 'Renamed' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalled());
+
+      expect(await screen.findByText(t.save, { selector: '[role="alert"] *' })).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageTitle)).toBeInTheDocument();
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeInTheDocument();
+    });
+
+    it('never asks for a snapshot on the list (it would be one read per row)', async () => {
+      const { fakeApi } = renderView({
+        accounts: [
+          makeVendorAccount({ id: 'va_a' }),
+          makeVendorAccount({ id: 'va_b', name: 'Second' }),
+        ],
+      });
+      await screen.findByText('Second');
+
+      expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
     });
   });
 }

@@ -20,6 +20,7 @@ import { ConfirmDialog } from './shared/ConfirmDialog';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
+import { VendorAccountUsage } from './VendorAccountUsagePanel';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
 type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
@@ -99,6 +100,11 @@ function hasCredential(account: VendorAccount): boolean {
  * A subscription account has no key: it is created disconnected (the create
  * form then opens its detail view) and connected from the detail view's
  * "connect subscription" panel, which only ever sees `subscription_connected`.
+ *
+ * The detail view also shows a "Usage & limits" panel (VendorAccountUsage)
+ * for any account that can have a rate-limit snapshot -- in practice a
+ * connected subscription. The list carries no snapshot, so the panel reads it
+ * from the single-account GET.
  */
 export function VendorAccountsView({
   t,
@@ -386,9 +392,9 @@ export function VendorAccountsView({
     );
   }
 
-  // Detail sub-view: rename / status / key rotation + delete, plus the connect
-  // panel of a subscription account. Vendor and auth type are immutable
-  // server-side, so they are shown read-only.
+  // Detail sub-view: rename / status / key rotation + delete, plus the usage
+  // panel and the connect panel of a subscription account. Vendor and auth
+  // type are immutable server-side, so they are shown read-only.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
     const keyStored = account.api_key_set && !keyCleared;
@@ -498,6 +504,12 @@ export function VendorAccountsView({
             </Box>
           </Box>
         </Panel>
+
+        {/* A subscription that was never connected has served nothing, so it
+            has no usage snapshot to read; everything else may. */}
+        {(account.auth_type === 'api_key' || account.subscription_connected) && (
+          <VendorAccountUsage key={account.id} t={t} api={api} accountId={account.id} />
+        )}
 
         {account.auth_type === 'subscription' && (
           <Box sx={{ mt: 3 }}>

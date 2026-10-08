@@ -2435,6 +2435,18 @@ const de = {
     'Der Anbieter ist gerade nicht erreichbar. Es wird weiter versucht …',
   vendorConnectDeviceTimedOut:
     'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
+  vendorUsageTitle: 'Nutzung & Limits',
+  vendorUsageIntro:
+    'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
+  vendorUsageFiveHour: '5-Stunden-Limit',
+  vendorUsageWeekly: 'Wochen-Limit',
+  vendorUsagePercentUsed: (pct: number) => `${pct} % genutzt`,
+  vendorUsageResetsIn: (time: string) => `Zurückgesetzt in ${time}`,
+  vendorUsageResetPassed:
+    'Das Zeitfenster wurde inzwischen zurückgesetzt; der Wert wird mit der nächsten Anfrage aktualisiert.',
+  vendorUsageNoData: 'Noch keine Daten',
+  vendorUsageCreditBalance: 'Guthaben',
+  vendorUsageUpdatedAt: (ago: string) => `Zuletzt aktualisiert: ${ago}`,
   errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
   errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
@@ -4966,6 +4978,17 @@ const en: PortalMessages = {
   vendorConnectDeviceRetrying: 'The provider cannot be reached right now. Still trying …',
   vendorConnectDeviceTimedOut:
     'Timed out: the code was not confirmed in time. Start the device code again.',
+  vendorUsageTitle: 'Usage & limits',
+  vendorUsageIntro:
+    'Usage as a percentage of the provider limit; the provider does not publish absolute values. The figures are refreshed with every request the gateway serves.',
+  vendorUsageFiveHour: '5-hour limit',
+  vendorUsageWeekly: 'Weekly limit',
+  vendorUsagePercentUsed: (pct: number) => `${pct}% used`,
+  vendorUsageResetsIn: (time: string) => `Resets in ${time}`,
+  vendorUsageResetPassed: 'The window has since reset; the value updates with the next request.',
+  vendorUsageNoData: 'No data yet',
+  vendorUsageCreditBalance: 'Credit balance',
+  vendorUsageUpdatedAt: (ago: string) => `Last updated: ${ago}`,
   errorVendorAccountNotFound: 'Provider account not found',
   errorVendorAccountNameRequired: 'Provider account name is required',
   errorVendorAccountVendorInvalid: 'Invalid provider',

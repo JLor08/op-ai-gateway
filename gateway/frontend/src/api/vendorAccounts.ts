@@ -42,6 +42,21 @@ export type VendorAccountModel = {
   api_flavor: string;
 };
 
+// The latest rate-limit snapshot the gateway scraped off an account's upstream
+// responses -- mirrors portal.VendorAccountUsageDTO. PERCENTAGES ONLY: neither
+// vendor exposes an absolute cap, so there is no "N of M". A percentage is
+// 0..100, or -1 when that window has never been observed (unknown, NOT 0 % used);
+// a reset time is null when the vendor sent none; credit_balance is the vendor's
+// raw credit string ("" = none).
+export type VendorAccountUsage = {
+  five_hour_pct: number;
+  five_hour_reset_at: string | null;
+  weekly_pct: number;
+  weekly_reset_at: string | null;
+  credit_balance: string;
+  updated_at: string;
+};
+
 export type VendorAccount = {
   id: string;
   vendor: VendorAccountVendor;
@@ -53,6 +68,10 @@ export type VendorAccount = {
   api_key_set: boolean;
   subscription_connected: boolean;
   models: VendorAccountModel[];
+  // The rate-limit snapshot. ONLY the single-account read (GET .../{id}, i.e.
+  // vendorAccount(id)) carries it, and only once the gateway has scraped one;
+  // the list and the create/update/connect responses omit it.
+  usage?: VendorAccountUsage;
   created_at: string;
   updated_at: string;
 };
