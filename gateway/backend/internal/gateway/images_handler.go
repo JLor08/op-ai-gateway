@@ -488,7 +488,7 @@ func (s *Server) recordImagesRoutingFailure(w http.ResponseWriter, r *http.Reque
 	// usageMeta's own doc comment). BillingQuantity is left at its zero
 	// value: nothing was produced by a routing failure. Target is always
 	// routing.Target{} -- see the doc comment above for why.
-	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor))
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
 }
 
 // relayImages resolves the routing target for an already-gated images request
@@ -598,7 +598,7 @@ func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request
 	// relayImagesUpstreamError is images-only, so ex.req.APIFlavor is always
 	// apiFlavorImages. A non-2xx upstream response is still a non-token
 	// request -- BillingQuantity stays 0, nothing was produced.
-	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor))
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
 }
 
 // needsImagesErrorRelay reports whether a native-passthrough response must go

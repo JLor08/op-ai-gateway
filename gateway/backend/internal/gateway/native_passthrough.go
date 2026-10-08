@@ -262,7 +262,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			ireq := req
 			slog.Warn("native passthrough admission rejected", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "code", completionErrorCode(err), "status", completionHTTPStatus(err))
 			body := writeCompletionErrorCaptured(w, err)
-			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor))
+			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor), nil)
 			return true
 		}
 		// Routing failed (no route for the model, or the application is currently
@@ -319,7 +319,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
 			"server", s.serverName(target.ServerID), "code", code, "status", status)
 		body := writeJSONCaptured(w, status, apierror.Response(code, msgEndpointDisabled, ""))
-		s.recordUsage(start, *token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor))
+		s.recordUsage(start, *token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor), nil)
 		return true
 	default:
 		// translate (or an unpopulated "" mode — treated as translate, the safe
@@ -386,7 +386,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// passthrough flavor, so the images unit must come from the CALLER's
 		// own endpoint identity here too, not only in images_handler.go's own
 		// two call sites.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor), nil)
 		return
 	}
 
@@ -518,7 +518,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// Same reasoning as the provider.unavailable branch above: this is a
 		// pre-response failure (nothing came back from sd-server at all), and
 		// it is still a non-token images request when pfReq.APIFlavor says so.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor), nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -645,7 +645,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the count comes off the RESPONSE and why a counted zero is logged rather
 	// than quietly recorded.
 	setImagesBillingQuantity(&meta, ex, imgCounter, status)
-	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor))
+	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
+	// path holds them directly), threaded in for the best-effort vendor rate-limit
+	// scrape -- a no-op for a non-vendor target.
+	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor), resp.Header)
 }
 
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native

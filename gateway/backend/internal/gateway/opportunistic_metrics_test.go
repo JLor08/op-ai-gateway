@@ -33,7 +33,7 @@ func TestRecordUsageOpportunisticUpdatesOnSuccess(t *testing.T) {
 	target := routing.Target{RouteID: seedMappingID, ServerID: "mock-host-comp", OpportunisticMetrics: true}
 	resp := provider.Response{Usage: inference.Usage{TokensPerSecond: 42, PromptPerSecond: 500}}
 
-	srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "qwen-coder"}, target, resp, "", "success", usageMeta{}, "req_1", nil)
+	srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "qwen-coder"}, target, resp, "", "success", usageMeta{}, "req_1", nil, nil)
 
 	if got := mappingGenTPS(t, srv); got != 42 {
 		t.Fatalf("GenTokensPerSecond = %v, want 42 (seeded on first positive success sample)", got)
@@ -61,7 +61,7 @@ func TestRecordUsageOpportunisticGate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewTestServer()
 			target := routing.Target{RouteID: seedMappingID, ServerID: "mock-host-comp", OpportunisticMetrics: tc.flag}
-			srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "qwen-coder"}, target, tc.resp, "", tc.status, usageMeta{}, "req_g", nil)
+			srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "qwen-coder"}, target, tc.resp, "", tc.status, usageMeta{}, "req_g", nil, nil)
 			if got := mappingGenTPS(t, srv); got != 0 {
 				t.Fatalf("GenTokensPerSecond = %v, want 0 (no opportunistic update)", got)
 			}

@@ -19,7 +19,7 @@ import (
 func TestRecordUsageAttributesVendorAccountID(t *testing.T) {
 	srv := NewTestServer()
 	target := routing.Target{RouteID: "vendor:acc_x:gpt-4o", Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_x"}
-	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_v"}, inference.Request{Model: "gpt-4o"}, target, provider.Response{}, "", "success", usageMeta{}, "req_vendor_attr", nil)
+	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_v"}, inference.Request{Model: "gpt-4o"}, target, provider.Response{}, "", "success", usageMeta{}, "req_vendor_attr", nil, nil)
 
 	events := srv.Usage.ByUser("usr_v")
 	if len(events) != 1 {
@@ -37,7 +37,7 @@ func TestRecordUsageAttributesVendorAccountID(t *testing.T) {
 func TestRecordUsageVendorAccountIDEmptyForNonVendor(t *testing.T) {
 	srv := NewTestServer()
 	target := routing.Target{RouteID: "map_1", Provider: routing.ProviderOllama, ServerID: "srv1"}
-	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_s"}, inference.Request{Model: "m"}, target, provider.Response{}, "", "success", usageMeta{}, "req_selfhosted_attr", nil)
+	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_s"}, inference.Request{Model: "m"}, target, provider.Response{}, "", "success", usageMeta{}, "req_selfhosted_attr", nil, nil)
 
 	events := srv.Usage.ByUser("usr_s")
 	if len(events) != 1 {

@@ -93,13 +93,13 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 		// pre-stream failure: the client has no stream yet, so return a normal JSON error
 		slog.Warn("inference stream resolve failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", completionErrorCode(err), "status", completionHTTPStatus(err), "err", err)
 		body := writeCompletionErrorCaptured(w, err)
-		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor))
+		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor), nil)
 		return nil, false
 	}
 	streamer, ok := s.Provider.(provider.StreamingClient)
 	if !ok {
 		body := writeJSONCaptured(w, http.StatusBadGateway, apierror.Response("provider.unavailable", "streaming not supported", ""))
-		s.recordUsage(start, token, req, target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadGateway, req.APIFlavor))
+		s.recordUsage(start, token, req, target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadGateway, req.APIFlavor), nil)
 		return nil, false
 	}
 	flusher, ok := w.(http.Flusher)
@@ -144,10 +144,18 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	if idle > 0 {
 		ss.watchdog = time.AfterFunc(idle, func() { ss.idledOut.Store(true); cancel() })
 	}
-	// When capturing on the translate path, thread a capture sink so the provider
-	// records the translated upstream request + raw upstream response.
-	if capturing {
+	// Thread a capture sink so the provider records the upstream response headers.
+	// When capturing, it keeps the full translated request + raw upstream response.
+	// For a vendor-account target that is NOT capturing, a header-only sink (respCap
+	// 0, no body buffered) is still attached so the best-effort vendor rate-limit
+	// scrape can read the upstream headers off a normal (uncaptured) stream.
+	switch {
+	case capturing:
 		ss.captureSink = provider.NewCaptureSink(s.captureMaxBytes)
+	case target.VendorAccountID != "":
+		ss.captureSink = provider.NewCaptureSink(0)
+	}
+	if ss.captureSink != nil {
 		ss.ctx = provider.WithCaptureSink(ss.ctx, ss.captureSink)
 	}
 	// Attach the resolved application's per-app upstream credential (fail-open).
@@ -251,5 +259,5 @@ func (ss *streamSession) terminalStatus(streamErr error) (status, errorCode stri
 func (ss *streamSession) finish(usage inference.Usage, status, errorCode string) {
 	streamCI := buildCaptureInput(ss.capturing, ss.token.UserID, ss.token.Secret, ss.r, ss.raw, ss.w.Header(), ss.respBuf.Bytes(), http.StatusOK, ss.req.APIFlavor)
 	attachTranslatedCapture(streamCI, ss.captureSink)
-	ss.s.recordUsage(ss.start, ss.token, ss.req, ss.target, provider.Response{Usage: usage}, errorCode, status, usageMeta{ReqPath: ss.r.URL.Path, HTTPStatus: http.StatusOK, ContentType: "text/event-stream"}, ss.id, streamCI)
+	ss.s.recordUsage(ss.start, ss.token, ss.req, ss.target, provider.Response{Usage: usage}, errorCode, status, usageMeta{ReqPath: ss.r.URL.Path, HTTPStatus: http.StatusOK, ContentType: "text/event-stream"}, ss.id, streamCI, ss.captureSink.ResponseHeaders())
 }
