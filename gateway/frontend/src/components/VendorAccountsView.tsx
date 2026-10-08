@@ -114,6 +114,9 @@ export function VendorAccountsView({
     | 'connectVendorAccountImport'
     | 'beginVendorAccountConnect'
     | 'completeVendorAccountConnect'
+    | 'beginVendorAccountDeviceConnect'
+    | 'pollVendorAccountDeviceConnect'
+    | 'vendorAccount'
   >;
 }>) {
   const { showError, showSuccess } = useToast();

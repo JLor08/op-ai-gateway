@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { VendorAccountsView } from './VendorAccountsView';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import { PortalApiError } from '../api';
+import { DEVICE_POLL_INTERVAL_MS, DEVICE_POLL_TIMEOUT_MS } from './VendorDeviceConnect';
 import type { CreateVendorAccountRequest, UpdateVendorAccountRequest, VendorAccount } from '../api';
 import type { PortalApi } from './shared/types';
 
@@ -27,6 +28,8 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
 }
 
 const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize?client_id=x&state=s1';
+const DEVICE_URL = 'https://auth.example/codex/device';
+const DEVICE_CODE = 'ABCD-EFGH';
 
 // A subscription account that has not been connected yet.
 const SUBSCRIPTION: Partial<VendorAccount> = {
@@ -40,6 +43,7 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -55,6 +59,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       connectVendorAccountImport?: PortalApi['connectVendorAccountImport'];
       beginVendorAccountConnect?: PortalApi['beginVendorAccountConnect'];
       completeVendorAccountConnect?: PortalApi['completeVendorAccountConnect'];
+      beginVendorAccountDeviceConnect?: PortalApi['beginVendorAccountDeviceConnect'];
+      pollVendorAccountDeviceConnect?: PortalApi['pollVendorAccountDeviceConnect'];
+      vendorAccount?: PortalApi['vendorAccount'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -107,6 +114,26 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               id,
               api_key_set: false,
               subscription_connected: true,
+            })),
+      ),
+      // Device code: begin shows a pairing code, the poll is pending until a test
+      // says otherwise, and the post-connect re-read answers the account as the
+      // backend stores it after a connect (connected + active).
+      beginVendorAccountDeviceConnect: vi.fn<PortalApi['beginVendorAccountDeviceConnect']>(
+        opts.beginVendorAccountDeviceConnect ??
+          (async () => ({ user_code: DEVICE_CODE, verification_url: DEVICE_URL })),
+      ),
+      pollVendorAccountDeviceConnect: vi.fn<PortalApi['pollVendorAccountDeviceConnect']>(
+        opts.pollVendorAccountDeviceConnect ?? (async () => ({ connected: false })),
+      ),
+      vendorAccount: vi.fn<PortalApi['vendorAccount']>(
+        opts.vendorAccount ??
+          (async (id: string) =>
+            makeVendorAccount({
+              ...(accounts.find((a) => a.id === id) ?? accounts[0]),
+              api_key_set: false,
+              subscription_connected: true,
+              status: 'active',
             })),
       ),
     };
@@ -842,6 +869,497 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(await screen.findByText(t.errorRequestFailed)).toBeInTheDocument();
         expect(screen.queryByRole('button', { name: t.vendorConnectOpenLogin })).toBeNull();
         expect(open).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('device code', () => {
+      const OPENAI: Partial<VendorAccount> = {
+        vendor: 'openai',
+        name: 'ChatGPT Plus',
+      };
+      const upstreamFailure = () =>
+        new PortalApiError(502, 'vendor_account.connect_upstream_failed', 'raw upstream text');
+      const rejection = () =>
+        new PortalApiError(400, 'vendor_account.connect_rejected', 'raw server text');
+
+      /** A poll mock answering `steps` in order; the last step repeats. A step is
+       * a {connected} answer or an error to throw. */
+      function pollSteps(...steps: ({ connected: boolean } | Error)[]) {
+        let i = 0;
+        return async () => {
+          const step = steps[Math.min(i, steps.length - 1)];
+          i += 1;
+          if (step instanceof Error) throw step;
+          return step;
+        };
+      }
+
+      /** Open the detail view with real timers, THEN fake them: the poll's
+       * setTimeout is then the faked one, and the list/detail loading is not. */
+      async function openOpenAIDetail(opts: Parameters<typeof renderView>[0] = {}) {
+        const view = renderSubscription(OPENAI, opts);
+        await openDetail();
+        vi.useFakeTimers();
+        return view;
+      }
+
+      async function advance(ms: number) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(ms);
+        });
+      }
+
+      async function startDevice() {
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }));
+        await advance(0);
+      }
+
+      it('is offered for an OpenAI subscription, as a third method', async () => {
+        renderSubscription(OPENAI);
+        await openDetail();
+
+        expect(screen.getByRole('heading', { name: t.vendorConnectDeviceTitle })).toBeVisible();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+        // The other two methods are still there.
+        expect(screen.getByRole('button', { name: t.vendorConnectBeginAction })).toBeEnabled();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+      });
+
+      it('is hidden for an Anthropic subscription (Anthropic has no device login)', async () => {
+        renderSubscription({ vendor: 'anthropic' });
+        await openDetail();
+
+        expect(screen.queryByText(t.vendorConnectDeviceTitle)).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).not.toBeInTheDocument();
+        // Still offered: the other two methods.
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectBeginAction }),
+        ).toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+      });
+
+      it('is absent on an api_key account, which has no connect panel at all', async () => {
+        renderView({ accounts: [makeVendorAccount({ vendor: 'openai', auth_type: 'api_key' })] });
+        fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+        await screen.findByText(t.vendorAccountSettingsTitle);
+
+        expect(screen.queryByText(t.vendorConnectDeviceTitle)).not.toBeInTheDocument();
+      });
+
+      it('begins without a body, shows the user code and the page, and opens it in a new tab only on its own click', async () => {
+        const open = vi.spyOn(window, 'open').mockReturnValue(null);
+        const { fakeApi } = await openOpenAIDetail();
+
+        await startDevice();
+
+        expect(fakeApi.beginVendorAccountDeviceConnect).toHaveBeenCalledWith('va_sub');
+        // The pairing code is shown prominently, with its label and the steps.
+        expect(screen.getByText(DEVICE_CODE)).toBeVisible();
+        expect(screen.getByText(t.vendorConnectDeviceCodeLabel)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectDeviceInstructions)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectDeviceWaiting)).toBeInTheDocument();
+        // The page is also written out, so it can be opened on another device.
+        expect(screen.getByText(DEVICE_URL)).toBeInTheDocument();
+        // Begin itself opens nothing (a popup after an async call would be blocked).
+        expect(open).not.toHaveBeenCalled();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectDeviceOpenAction }));
+        expect(open).toHaveBeenCalledTimes(1);
+        expect(open).toHaveBeenCalledWith(DEVICE_URL, '_blank', 'noopener');
+        // Not polled yet: the first poll comes one interval after begin.
+        expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
+      });
+
+      it('polls on the interval while the approval is pending, then stops on connected and refreshes the account', async () => {
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: pollSteps(
+            { connected: false },
+            { connected: false },
+            { connected: true },
+          ),
+        });
+        await startDevice();
+        const polls = () => fakeApi.pollVendorAccountDeviceConnect.mock.calls.length;
+
+        await advance(DEVICE_POLL_INTERVAL_MS - 1);
+        expect(polls()).toBe(0);
+        await advance(1);
+        expect(polls()).toBe(1);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenLastCalledWith('va_sub');
+        // Still pending: the code stays on screen, nothing connected yet.
+        expect(screen.getByText(DEVICE_CODE)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(2);
+        expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(3);
+
+        // Connected: the account was re-read, the status flipped, the code is gone.
+        expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub');
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+
+        // ... and the loop is over for good.
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(polls()).toBe(3);
+      });
+
+      it('lists the account as stored after the device connect', async () => {
+        await openOpenAIDetail({ pollVendorAccountDeviceConnect: pollSteps({ connected: true }) });
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+
+        vi.useRealTimers();
+        fireEvent.click(screen.getByRole('button', { name: t.providers }));
+        const row = (await screen.findByText('ChatGPT Plus')).closest('tr')!;
+        expect(within(row).getByText(t.vendorAccountCredentialSet)).toBeInTheDocument();
+      });
+
+      it('still shows the account as connected when re-reading it fails', async () => {
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: pollSteps({ connected: true }),
+          vendorAccount: async () => {
+            throw new PortalApiError(500, 'vendor_account.get_failed', 'raw server text');
+          },
+        });
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toHaveAttribute(
+          'data-status',
+          'active',
+        );
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+      });
+
+      it.each([
+        ['a 502 vendor_account.connect_upstream_failed', upstreamFailure],
+        [
+          'a proxy-level 502 without an error body',
+          () => new PortalApiError(502, 'request.failed', 'Bad Gateway'),
+        ],
+        ['a 503 from the proxy', () => new PortalApiError(503, 'request.failed', 'Unavailable')],
+        ['a network failure of the browser itself', () => new TypeError('Failed to fetch')],
+      ])('keeps polling through %s and connects once the vendor answers again', async (_, blip) => {
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: pollSteps(
+            blip(),
+            blip(),
+            { connected: false },
+            { connected: true },
+          ),
+        });
+        await startDevice();
+        const polls = () => fakeApi.pollVendorAccountDeviceConnect.mock.calls.length;
+
+        // First blip: no error toast, no stop; the panel says it is still trying.
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(1);
+        expect(screen.getByText(t.vendorConnectDeviceRetrying)).toBeInTheDocument();
+        expect(screen.getByText(DEVICE_CODE)).toBeInTheDocument();
+        expect(screen.queryByText(/vendor_account\./)).not.toBeInTheDocument();
+
+        // Second blip: still polling.
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(2);
+        expect(screen.getByText(t.vendorConnectDeviceRetrying)).toBeInTheDocument();
+
+        // A good poll clears the retry hint; the loop carries on.
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(3);
+        expect(screen.queryByText(t.vendorConnectDeviceRetrying)).not.toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectDeviceWaiting)).toBeInTheDocument();
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(4);
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectSuccess)).toBeInTheDocument();
+      });
+
+      it.each([
+        [
+          'a vendor refusal (400 connect_rejected)',
+          rejection,
+          `vendor_account.connect_rejected: ${t.errorVendorAccountConnectRejected}`,
+        ],
+        [
+          'an expired login (400 device_connect_state)',
+          () => new PortalApiError(400, 'vendor_account.device_connect_state', 'raw server text'),
+          `vendor_account.device_connect_state: ${t.errorVendorAccountDeviceConnectState}`,
+        ],
+        [
+          'a disabled module (409)',
+          () => new PortalApiError(409, 'vendor_accounts.module_disabled', 'raw server text'),
+          `vendor_accounts.module_disabled: ${t.errorVendorAccountsModuleDisabled}`,
+        ],
+      ])('stops on %s, says why, and offers a clean restart', async (_, failure, message) => {
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: pollSteps({ connected: false }, failure()),
+        });
+        await startDevice();
+        const polls = () => fakeApi.pollVendorAccountDeviceConnect.mock.calls.length;
+
+        await advance(DEVICE_POLL_INTERVAL_MS * 2);
+        expect(polls()).toBe(2);
+
+        expect(screen.getByText(message)).toBeInTheDocument();
+        // The dead login's code is gone and the start button is back.
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+        expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+
+        // No further polls, however long we wait.
+        await advance(DEVICE_POLL_INTERVAL_MS * 20);
+        expect(polls()).toBe(2);
+      });
+
+      it('restarts after a rejection with a fresh begin, a new code and a new poll loop', async () => {
+        let begins = 0;
+        const { fakeApi } = await openOpenAIDetail({
+          beginVendorAccountDeviceConnect: async () => {
+            begins += 1;
+            return {
+              user_code: begins === 1 ? 'FIRST-1111' : 'SECOND-2222',
+              verification_url: DEVICE_URL,
+            };
+          },
+          pollVendorAccountDeviceConnect: pollSteps(rejection(), { connected: true }),
+        });
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(screen.queryByText('FIRST-1111')).not.toBeInTheDocument();
+
+        await startDevice();
+        expect(screen.getByText('SECOND-2222')).toBeInTheDocument();
+        expect(fakeApi.beginVendorAccountDeviceConnect).toHaveBeenCalledTimes(2);
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+      });
+
+      it('gives up after the timeout, says so, and lets the user start again', async () => {
+        const { fakeApi } = await openOpenAIDetail();
+        await startDevice();
+        const polls = () => fakeApi.pollVendorAccountDeviceConnect.mock.calls.length;
+
+        await advance(DEVICE_POLL_TIMEOUT_MS - DEVICE_POLL_INTERVAL_MS);
+        expect(screen.getByText(DEVICE_CODE)).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorConnectDeviceTimedOut)).not.toBeInTheDocument();
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(DEVICE_POLL_TIMEOUT_MS / DEVICE_POLL_INTERVAL_MS);
+        expect(screen.getByText(t.vendorConnectDeviceTimedOut)).toBeInTheDocument();
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+
+        // The loop is over.
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(polls()).toBe(DEVICE_POLL_TIMEOUT_MS / DEVICE_POLL_INTERVAL_MS);
+
+        // Starting again clears the notice and polls anew.
+        await startDevice();
+        expect(screen.queryByText(t.vendorConnectDeviceTimedOut)).not.toBeInTheDocument();
+        expect(screen.getByText(DEVICE_CODE)).toBeInTheDocument();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(DEVICE_POLL_TIMEOUT_MS / DEVICE_POLL_INTERVAL_MS + 1);
+      });
+
+      it('honours an approval that lands on the very last poll before the timeout', async () => {
+        const last = DEVICE_POLL_TIMEOUT_MS / DEVICE_POLL_INTERVAL_MS;
+        let calls = 0;
+        await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: async () => {
+            calls += 1;
+            return { connected: calls === last };
+          },
+        });
+        await startDevice();
+
+        await advance(DEVICE_POLL_TIMEOUT_MS);
+
+        expect(calls).toBe(last);
+        expect(screen.queryByText(t.vendorConnectDeviceTimedOut)).not.toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+      });
+
+      it('never overlaps polls: the next one is scheduled only after the previous answered', async () => {
+        let resolvePoll: (value: { connected: boolean }) => void = () => undefined;
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: () =>
+            new Promise((resolve) => {
+              resolvePoll = resolve;
+            }),
+        });
+        await startDevice();
+        const polls = () => fakeApi.pollVendorAccountDeviceConnect.mock.calls.length;
+
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(1);
+        // The poll is slow: several intervals pass without a second call.
+        await advance(DEVICE_POLL_INTERVAL_MS * 4);
+        expect(polls()).toBe(1);
+
+        await act(async () => {
+          resolvePoll({ connected: false });
+        });
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(polls()).toBe(2);
+      });
+
+      it('stops polling when the user cancels, and a late answer changes nothing', async () => {
+        let resolvePoll: (value: { connected: boolean }) => void = () => undefined;
+        const { fakeApi } = await openOpenAIDetail({
+          pollVendorAccountDeviceConnect: () =>
+            new Promise((resolve) => {
+              resolvePoll = resolve;
+            }),
+        });
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+
+        fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+
+        // The in-flight poll answers "connected" after the cancel: it is dropped.
+        await act(async () => {
+          resolvePoll({ connected: true });
+        });
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+        expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+        expect(screen.getByText(t.vendorConnectStatusNotConnected)).toBeInTheDocument();
+      });
+
+      it('starts over while waiting: a new begin replaces the code and the old loop is dropped', async () => {
+        let begins = 0;
+        const { fakeApi } = await openOpenAIDetail({
+          beginVendorAccountDeviceConnect: async () => {
+            begins += 1;
+            return { user_code: `CODE-${begins}`, verification_url: DEVICE_URL };
+          },
+        });
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS * 2);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(2);
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectBeginAgainAction }));
+        await advance(0);
+        expect(screen.getByText('CODE-2')).toBeInTheDocument();
+        expect(screen.queryByText('CODE-1')).not.toBeInTheDocument();
+
+        // One loop only: exactly one poll per interval after the restart.
+        await advance(DEVICE_POLL_INTERVAL_MS * 3);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(5);
+      });
+
+      it('leaves no timer behind when the user leaves the detail view', async () => {
+        const { fakeApi } = await openOpenAIDetail();
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+
+        fireEvent.click(screen.getByRole('button', { name: t.providers }));
+        await advance(0);
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(vi.getTimerCount()).toBe(0);
+
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+      });
+
+      it('leaves no timer behind when the whole view unmounts', async () => {
+        const { fakeApi, unmount } = await openOpenAIDetail();
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+
+        unmount();
+        expect(vi.getTimerCount()).toBe(0);
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+      });
+
+      it('stops waiting when another method connects the account in the meantime', async () => {
+        const { fakeApi } = await openOpenAIDetail();
+        await startDevice();
+        await advance(DEVICE_POLL_INTERVAL_MS);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+
+        fireEvent.change(screen.getByLabelText(t.vendorConnectAccessTokenLabel), {
+          target: { value: 'at-secret-access' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+        await advance(0);
+
+        expect(screen.getByText(t.vendorConnectStatusConnected)).toBeInTheDocument();
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        await advance(DEVICE_POLL_INTERVAL_MS * 10);
+        expect(fakeApi.pollVendorAccountDeviceConnect).toHaveBeenCalledTimes(1);
+      });
+
+      it('shows a refused begin as a localized toast and starts no poll', async () => {
+        const { fakeApi } = await openOpenAIDetail({
+          beginVendorAccountDeviceConnect: async () => {
+            throw new PortalApiError(400, 'vendor_account.device_not_supported', 'raw server text');
+          },
+        });
+        await startDevice();
+
+        expect(
+          screen.getByText(
+            `vendor_account.device_not_supported: ${t.errorVendorAccountDeviceNotSupported}`,
+          ),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorConnectDeviceWaiting)).not.toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+        await advance(DEVICE_POLL_INTERVAL_MS * 5);
+        expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
+      });
+
+      it('never offers to open a verification URL that is not a web address', async () => {
+        const open = vi.spyOn(window, 'open').mockReturnValue(null);
+        const { fakeApi } = await openOpenAIDetail({
+          beginVendorAccountDeviceConnect: async () => ({
+            user_code: DEVICE_CODE,
+            verification_url: 'javascript:alert(1)',
+          }),
+        });
+        await startDevice();
+
+        expect(screen.getByText(t.errorRequestFailed)).toBeInTheDocument();
+        expect(screen.queryByText(DEVICE_CODE)).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole('button', { name: t.vendorConnectDeviceOpenAction }),
+        ).not.toBeInTheDocument();
+        expect(open).not.toHaveBeenCalled();
+        await advance(DEVICE_POLL_INTERVAL_MS * 5);
+        expect(fakeApi.pollVendorAccountDeviceConnect).not.toHaveBeenCalled();
       });
     });
   });

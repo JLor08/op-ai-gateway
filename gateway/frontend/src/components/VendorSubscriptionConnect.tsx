@@ -6,10 +6,12 @@ import { Box, Button, Divider, TextField, Typography } from '@mui/material';
 import type { VendorAccount } from '../api';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
+import { isWebUrl } from './shared/webUrl';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
 import { StatusChip } from './shared/StatusChip';
 import { useToast } from './shared/ToastProvider';
+import { VendorDeviceConnect } from './VendorDeviceConnect';
 
 type ConnectBusy = '' | 'import' | 'begin' | 'complete';
 
@@ -32,17 +34,6 @@ function connectionBadge(
   return { status: 'active', label: t.vendorConnectStatusConnected };
 }
 
-// The authorize URL comes from our own backend, but it is still handed to
-// window.open: only ever open a real web address (never a javascript: URL).
-function isWebUrl(value: string): boolean {
-  try {
-    const { protocol } = new URL(value);
-    return protocol === 'https:' || protocol === 'http:';
-  } catch {
-    return false;
-  }
-}
-
 // The <input type="datetime-local"> value is a LOCAL wall-clock time without an
 // offset; the backend wants an RFC 3339 instant. Empty or unparseable -> omit
 // the field (the backend then treats the expiry as unknown).
@@ -53,9 +44,9 @@ function expiryToRfc3339(local: string): string | undefined {
 }
 
 /**
- * The "connect a subscription" panel of a vendor account's detail view. Two ways
- * to attach the account to a consumer subscription (both owner-only POSTs, see
- * api/vendorAccounts.ts):
+ * The "connect a subscription" panel of a vendor account's detail view. Three
+ * ways to attach the account to a consumer subscription (all owner-only POSTs,
+ * see api/vendorAccounts.ts):
  *
  *  - Browser sign-in (OAuth code-paste): "Connect" begins the flow and returns
  *    the vendor sign-in URL; the user opens it in a NEW tab (a separate click,
@@ -63,6 +54,8 @@ function expiryToRfc3339(local: string): string | undefined {
  *    code the vendor shows (a bare code, "code#state" or a whole callback URL --
  *    the backend parses all three). A refused paste keeps the form, because the
  *    backend keeps the pending connect: the user simply retries.
+ *  - Device code (OpenAI accounts ONLY -- Anthropic has no device login): see
+ *    VendorDeviceConnect. Works for a remote gateway, and polls until approved.
  *  - Token import: tokens the user already holds.
  *
  * Tokens are WRITE-ONLY secrets: the DTO only says `subscription_connected`,
@@ -80,7 +73,12 @@ export function VendorSubscriptionConnect({
   account: VendorAccount;
   api: Pick<
     PortalApi,
-    'connectVendorAccountImport' | 'beginVendorAccountConnect' | 'completeVendorAccountConnect'
+    | 'connectVendorAccountImport'
+    | 'beginVendorAccountConnect'
+    | 'completeVendorAccountConnect'
+    | 'beginVendorAccountDeviceConnect'
+    | 'pollVendorAccountDeviceConnect'
+    | 'vendorAccount'
   >;
   /** The credential-free account a successful connect answered with. */
   onConnected: (updated: VendorAccount) => void;
@@ -98,6 +96,11 @@ export function VendorSubscriptionConnect({
   const [authorizeUrl, setAuthorizeUrl] = useState('');
   const [code, setCode] = useState('');
 
+  // Bumped by every successful connect: the device-code section is keyed by it,
+  // so a login another method just completed also stops a device poll that is
+  // still waiting (remounting runs its cleanup) instead of racing it.
+  const [connectEpoch, setConnectEpoch] = useState(0);
+
   const connection = connectionBadge(t, account);
   const connected = account.subscription_connected;
 
@@ -107,6 +110,7 @@ export function VendorSubscriptionConnect({
     setExpiresAt('');
     setAuthorizeUrl('');
     setCode('');
+    setConnectEpoch((epoch) => epoch + 1);
     onConnected(updated);
     showSuccess(t.vendorConnectSuccess);
   }
@@ -252,6 +256,20 @@ export function VendorSubscriptionConnect({
           )}
         </Box>
       </Box>
+
+      {/* The device-code flow is OpenAI-only: Anthropic offers no device login. */}
+      {account.vendor === 'openai' && (
+        <>
+          <Divider sx={{ my: 2.5 }} />
+          <VendorDeviceConnect
+            key={connectEpoch}
+            t={t}
+            account={account}
+            api={api}
+            onConnected={finishConnected}
+          />
+        </>
+      )}
 
       <Divider sx={{ my: 2.5 }} />
 
