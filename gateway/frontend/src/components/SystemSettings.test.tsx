@@ -430,10 +430,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   });
 
   describe(`SystemSettings vendor Codex client version [${locale}]`, () => {
-    const versionField = () =>
-      screen.findByLabelText(
+    const versionField = async () =>
+      (await screen.findByLabelText(
         t.systemVendorOpenAICodexClientVersionLabel,
-      ) as Promise<HTMLInputElement>;
+      )) as HTMLInputElement;
     const saveButton = () => screen.getByRole('button', { name: t.save });
 
     it('shows the effective version with a note on why to raise it', async () => {

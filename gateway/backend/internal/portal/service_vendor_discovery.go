@@ -293,51 +293,71 @@ func (s *Service) discoverVendorModels(ctx context.Context, acc routing.VendorAc
 	var status vendorauth.DiscoveryStatus
 	switch acc.AuthType {
 	case routing.VendorAuthAPIKey:
-		apiKey, err := s.openVendorAPIKey(acc)
-		if err != nil {
-			return nil, "", err
-		}
-		if apiKey == "" {
-			return nil, "no API key is set", nil
-		}
-		fetch := s.apiKeyDiscoverer(acc.Vendor)
-		if fetch == nil {
-			return nil, noVendorDiscoveryNote, nil
-		}
-		models, status = fetch(ctx, s.vendorDiscovery.client, apiKey)
+		models, status, note, err = s.discoverAPIKeyModels(ctx, acc)
 	case routing.VendorAuthSubscription:
-		ts, err := s.openVendorTokenSet(acc)
-		if err != nil {
-			return nil, "", err
-		}
-		if ts.AccessToken == "" {
-			return nil, "the subscription is not connected", nil
-		}
-		// Asking the vendor with a token known to be expired only earns a 401. A
-		// token with a refresh token to renew it is renewed first, by the gateway's
-		// locked refresher (see refreshedVendorTokenSet); one without can never
-		// heal, so it is simply tried.
-		if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
-			var refreshNote string
-			if ts, refreshNote, err = s.refreshedVendorTokenSet(ctx, acc); err != nil || refreshNote != "" {
-				return nil, refreshNote, err
-			}
-		}
-		switch acc.Vendor {
-		case routing.VendorOpenAI:
-			models, status = s.vendorDiscovery.discoverers.OpenAISubscription(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts), s.VendorOpenAICodexClientVersion(ctx))
-		case routing.VendorAnthropic:
-			models, status = s.vendorDiscovery.discoverers.AnthropicSubscription(ctx, s.vendorDiscovery.client, ts.AccessToken)
-		default:
-			return nil, noVendorDiscoveryNote, nil
-		}
+		models, status, note, err = s.discoverSubscriptionModels(ctx, acc)
 	default:
 		return nil, noVendorDiscoveryNote, nil
+	}
+	if err != nil || note != "" {
+		return nil, note, err
 	}
 	if status != vendorauth.DiscoveryOK {
 		return nil, "the vendor did not return a usable model list", nil
 	}
 	return models, "", nil
+}
+
+// discoverAPIKeyModels runs the model-list fetcher for an api_key account. A
+// non-empty note (credential-free) or an error short-circuits; otherwise status
+// is the fetcher's verdict.
+func (s *Service) discoverAPIKeyModels(ctx context.Context, acc routing.VendorAccount) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus, string, error) {
+	apiKey, err := s.openVendorAPIKey(acc)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if apiKey == "" {
+		return nil, 0, "no API key is set", nil
+	}
+	fetch := s.apiKeyDiscoverer(acc.Vendor)
+	if fetch == nil {
+		return nil, 0, noVendorDiscoveryNote, nil
+	}
+	models, status := fetch(ctx, s.vendorDiscovery.client, apiKey)
+	return models, status, "", nil
+}
+
+// discoverSubscriptionModels runs the model-list fetcher for a subscription
+// account, renewing an expired-but-refreshable token first through the gateway's
+// locked refresher. Same note/status contract as discoverAPIKeyModels.
+func (s *Service) discoverSubscriptionModels(ctx context.Context, acc routing.VendorAccount) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus, string, error) {
+	ts, err := s.openVendorTokenSet(acc)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if ts.AccessToken == "" {
+		return nil, 0, "the subscription is not connected", nil
+	}
+	// Asking the vendor with a token known to be expired only earns a 401. A token
+	// with a refresh token to renew it is renewed first, by the gateway's locked
+	// refresher (see refreshedVendorTokenSet); one without can never heal, so it is
+	// simply tried.
+	if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
+		var refreshNote string
+		if ts, refreshNote, err = s.refreshedVendorTokenSet(ctx, acc); err != nil || refreshNote != "" {
+			return nil, 0, refreshNote, err
+		}
+	}
+	switch acc.Vendor {
+	case routing.VendorOpenAI:
+		models, status := s.vendorDiscovery.discoverers.OpenAISubscription(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts), s.VendorOpenAICodexClientVersion(ctx))
+		return models, status, "", nil
+	case routing.VendorAnthropic:
+		models, status := s.vendorDiscovery.discoverers.AnthropicSubscription(ctx, s.vendorDiscovery.client, ts.AccessToken)
+		return models, status, "", nil
+	default:
+		return nil, 0, noVendorDiscoveryNote, nil
+	}
 }
 
 // noVendorDiscoveryNote is the note for an account whose vendor or auth type has

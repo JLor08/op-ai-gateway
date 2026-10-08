@@ -48,7 +48,7 @@ export const CODEX_CLIENT_VERSION_MAX_LENGTH = 64;
 // A version-shaped token: a digit first, then letters, digits and . _ + -
 // ("26.930.61225", "0.46.0-alpha.1"). A leading "v", spaces and separators are
 // refused (portal.isValidVendorOpenAICodexClientVersion).
-const CODEX_CLIENT_VERSION = /^[0-9][A-Za-z0-9._+-]*$/;
+const CODEX_CLIENT_VERSION = /^\d[A-Za-z\d._+-]*$/;
 
 /**
  * Whether `raw` is an acceptable Codex client_version: blank (reset to the
