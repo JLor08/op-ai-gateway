@@ -292,10 +292,12 @@ carry no subscription window; absolute €/$ spend accounting is deferred.
 ## 6. Feature flag and routing mode
 
 Two system settings govern the feature (both read from the `system_settings`
-store). The **resolver** reads them through a short-TTL (~5 s) cached accessor
-invalidated on a settings write, while `portal.Service` (the CRUD gate and the
-model-listing overlay) reads them uncached — so a flag change can take up to the
-cache TTL to affect in-flight routing, a bounded, deliberate skew:
+store). The **resolver** reads them through a cached accessor that is
+**invalidated on the settings PUT** whenever it carries either key
+(`invalidateVendorSettingsCache`), so a portal toggle takes effect on the next
+resolve; the accessor's short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
+**out-of-band** change, such as a direct database edit. `portal.Service` (the CRUD
+gate and the model-listing overlay) reads them uncached:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
