@@ -199,17 +199,20 @@ func normalizeVendorAccountStatus(raw string) (string, error) {
 
 // normalizeVendorAccountModelPrefix trims a requested model prefix and checks it.
 // "" (after trimming) means no prefix and is always valid. Otherwise the prefix
-// must be at most vendorAccountModelPrefixMaxLen bytes of printable ASCII with no
-// whitespace (0x21-0x7e): it is concatenated into model ids that travel in JSON
-// bodies, URLs and logs, so spaces, control characters and non-ASCII text are
-// refused rather than escaped.
+// must be at most vendorAccountModelPrefixMaxLen bytes drawn from isModelIDByte
+// (ASCII letters and digits plus "-", "_", ".", "~", ":", "/", "@", "+") and hold
+// no "..": it is concatenated into the model ids the account serves, which travel
+// in URL paths (/v1/models/{id}), JSON bodies and logs, so spaces, control
+// characters, non-ASCII text and the characters that start a query, fragment or
+// escape ("?", "#", "%") or break out of a string or markup are refused rather
+// than escaped.
 func normalizeVendorAccountModelPrefix(raw string) (string, error) {
 	prefix := strings.TrimSpace(raw)
-	if len(prefix) > vendorAccountModelPrefixMaxLen {
+	if len(prefix) > vendorAccountModelPrefixMaxLen || strings.Contains(prefix, "..") {
 		return "", ErrVendorAccountModelPrefixInvalid
 	}
 	for i := 0; i < len(prefix); i++ {
-		if c := prefix[i]; c < 0x21 || c > 0x7e {
+		if !isModelIDByte(prefix[i]) {
 			return "", ErrVendorAccountModelPrefixInvalid
 		}
 	}

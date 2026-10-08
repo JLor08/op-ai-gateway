@@ -1080,10 +1080,10 @@ func TestVendorAccountMethodsRefuseByDefault(t *testing.T) {
 }
 
 // The model prefix is an optional per-account namespace for the account's
-// gateway-model ids. This task only stores and exposes it (the dispatch path
-// applies it later), so the contract pinned here is: trimmed, "" = none, and a
-// printable-ASCII, space-free value of at most vendorAccountModelPrefixMaxLen
-// characters, on Create and on Update alike.
+// gateway-model ids. The contract pinned here is: trimmed, "" = none, and a
+// value of at most vendorAccountModelPrefixMaxLen characters from the URL-path-safe
+// set of isModelIDByte (it is glued onto ids that appear in URLs), with no "..",
+// on Create and on Update alike.
 func TestCreateVendorAccountStoresAndExposesTheModelPrefix(t *testing.T) {
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorAccountTestService(t, now)
@@ -1148,6 +1148,18 @@ func TestCreateVendorAccountRejectsAnInvalidModelPrefix(t *testing.T) {
 		{"embedded newline", "work\n/"},
 		{"control character", "work\x01/"},
 		{"DEL", "work\x7f/"},
+		// The prefix is glued onto model ids that appear in URL paths, so the
+		// characters that start a query, a fragment or an escape, and the ones that
+		// break out of a JSON string or markup, are refused.
+		{"query mark", "work?/"},
+		{"fragment mark", "work#/"},
+		{"percent escape", "work%2f"},
+		{"double quote", "work\"/"},
+		{"backslash", "work\\"},
+		{"angle bracket", "<work>/"},
+		{"other printable punctuation", "work!"},
+		{"parent-directory segment", "../work/"},
+		{"embedded parent-directory segment", "a/../b/"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := apiKeyAccountRequest("Acct")
@@ -1161,10 +1173,13 @@ func TestCreateVendorAccountRejectsAnInvalidModelPrefix(t *testing.T) {
 		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
 	}
 
-	// The limit is inclusive, and every printable ASCII symbol is allowed.
+	// The limit is inclusive, and the URL-path-safe symbols are allowed.
 	for _, prefix := range []string{
 		strings.Repeat("a", vendorAccountModelPrefixMaxLen),
-		"a-b_c.d:e/f+g@h~!",
+		"a-b_c.d:e/f+g@h~",
+		"chatgpt/",
+		"work-",
+		"my.team:",
 	} {
 		req := apiKeyAccountRequest("Edge")
 		req.ModelPrefix = prefix

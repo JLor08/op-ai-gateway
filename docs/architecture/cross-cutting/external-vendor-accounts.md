@@ -48,7 +48,7 @@ sharing link table plus a resolver filter extension), not a rewrite.
 | `status` | `active` \| `disabled` \| `needs_reconnect`. The last is system-managed (§3.4): a refresh rejection flips an account to it; the operator cannot set it directly. |
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
-| `model_prefix` | Optional per-account namespace for the account's gateway model ids (migration 83; `''` = none). Validated by the service — trimmed, printable ASCII without spaces, at most 64 bytes — and stored verbatim; the DTO reports it (`model_prefix`) and the create/update requests accept it. |
+| `model_prefix` | Optional per-account namespace for the account's gateway model ids (migration 83; `''` = none). Validated by the service — trimmed, at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +` (the URL-path-safe characters of a model id), no `..` — and stored verbatim; the DTO reports it (`model_prefix`) and the create/update requests accept it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
 account created but not yet connected, and an api-key account with no key set, have

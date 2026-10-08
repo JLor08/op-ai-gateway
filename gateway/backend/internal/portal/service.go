@@ -135,8 +135,9 @@ var (
 	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
 	ErrVendorAccountAPIKeyInvalid    = errors.New("vendor_account.api_key_invalid")
 
-	// ErrVendorAccountModelPrefixInvalid rejects a model prefix that is too long
-	// or holds anything but printable, non-space ASCII.
+	// ErrVendorAccountModelPrefixInvalid rejects a model prefix that is too long,
+	// holds "..", or holds anything but ASCII letters, digits and - _ . ~ : / @ +
+	// (the URL-path-safe characters of a model id).
 	ErrVendorAccountModelPrefixInvalid = errors.New("vendor_account.model_prefix_invalid")
 
 	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
