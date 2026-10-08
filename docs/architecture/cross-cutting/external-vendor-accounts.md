@@ -457,8 +457,9 @@ At the single `recordUsage` choke point (`internal/gateway/inference_complete.go
 when the served target is a vendor account, the gateway scrapes the vendor's
 **rate-limit response headers** — which it already has in hand, so no extra
 request is made — and writes the per-account snapshot. The scrape is **entirely
-best-effort**: it never faults the inference request, logs only the account id
-(never a header value or a token), and never writes an all-unknown snapshot (a
+best-effort**: it never faults the inference request, logs the account id (and,
+on a store read or write failure, that store error) at Debug — never a header
+value or a token — and never writes an all-unknown snapshot (a
 response that carries none of the recognized headers leaves the stored snapshot
 alone). What it does parse is merged over the stored row (§5.3).
 
@@ -508,7 +509,7 @@ is capped at the same 8 MiB as a discovery fetch (§6.4).
 **When it runs.** The pull is the **last, best-effort step of
 `RefreshVendorAccountModels`** (§6), so it runs wherever that does: on the explicit
 `POST .../models/refresh` ("Modelle aktualisieren") and, because the connect flows
-call the same function, at the end of every subscription connect (§6.2). There is
+call the same function, at the end of every OpenAI-subscription connect (§6.2). There is
 no separate usage endpoint, trigger, background job or startup step. Specifically:
 
 - It reuses the **token set the model discovery already opened** and, if it had
@@ -522,8 +523,8 @@ no separate usage endpoint, trigger, background job or startup step. Specificall
   starve the model write of the connect-time bound.
 - It is purely additive: it cannot change the refresh's result, its account view or
   its error, the pull itself never changes the account's status, and it logs only
-  the account id at Debug — never the token, the ChatGPT account id or any vendor
-  text.
+  the account id (and, on a store read or write failure, that store error) at
+  Debug — never the token, the ChatGPT account id or any vendor text.
 
 **Time budget.** The explicit refresh now makes up to **two** vendor requests, each
 bounded by the discovery client's 10 seconds (the model list, then usage), so it can

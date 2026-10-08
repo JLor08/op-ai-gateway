@@ -253,7 +253,10 @@ func TestScrapeVendorAccountUsageMergesOverStoredSnapshot(t *testing.T) {
 	s := &Server{Routes: store}
 	target := routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_merge"}
 
-	storedAt := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	// Seeded in the past relative to the real clock: the scrape stamps UpdatedAt from
+	// time.Now(), so a fixed calendar instant would make the .After check below
+	// depend on the runner's date.
+	storedAt := time.Now().Add(-time.Hour).UTC()
 	storedFiveReset := time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC)
 	storedWeekReset := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
 	if err := store.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
