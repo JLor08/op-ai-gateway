@@ -542,7 +542,8 @@ type ServiceDeps struct {
 	// probe; tests inject fakes so nothing reaches a vendor over the network.
 	VendorValidators VendorCredentialValidators
 	// VendorDiscoverers are the model-list fetchers RefreshVendorAccountModels (and
-	// the connect flows' best-effort discovery) run. A nil field means the real
+	// the connect flows' best-effort discovery) run, plus the OpenAI subscription's
+	// usage fetch that refresh runs after the models. A nil field means the real
 	// vendorauth fetcher; tests inject fakes so nothing reaches a vendor over the
 	// network.
 	VendorDiscoverers VendorModelDiscoverers

@@ -53,6 +53,7 @@ func (d *vaDiscovery) discoverers() portal.VendorModelDiscoverers {
 		AnthropicSubscription: keyed,
 		OpenAIAPIKey:          keyed,
 		AnthropicAPIKey:       keyed,
+		OpenAIUsage:           vaNoNetworkUsage,
 	}
 }
 

@@ -1065,3 +1065,513 @@ func TestAccountLocksSerializeOneKeyAndForgetIdleKeys(t *testing.T) {
 		t.Fatalf("lock entries = %d after a cancelled waiter and the release, want 0", n)
 	}
 }
+
+// --- the active usage refresh ------------------------------------------------------------
+//
+// An OpenAI subscription's models refresh also pulls the account's usage snapshot
+// (refreshVendorUsage) through the injected VendorOpenAIUsageFetcher. It is purely
+// additive and best effort: the refresh's result and error never depend on it.
+
+// usageAt is discoveryTestNow plus hours, as the *time.Time a usage window carries.
+func usageAt(hours int) *time.Time {
+	at := discoveryTestNow.Add(time.Duration(hours) * time.Hour)
+	return &at
+}
+
+// seedUsage stores u as the account's current usage snapshot, as a passive header
+// scrape would have.
+func seedUsage(t *testing.T, routeStore *routing.MemoryStore, u routing.VendorAccountUsage) {
+	t.Helper()
+	if err := routeStore.UpsertVendorAccountUsage(context.Background(), u); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+}
+
+func storedUsage(t *testing.T, routeStore *routing.MemoryStore, id string) (routing.VendorAccountUsage, bool) {
+	t.Helper()
+	u, found, err := routeStore.VendorAccountUsageByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("VendorAccountUsageByID: %v", err)
+	}
+	return u, found
+}
+
+// passiveUsage is a snapshot the passive header scrape could have stored earlier:
+// both windows, their resets and a credit balance, written well before now.
+func passiveUsage(id string) routing.VendorAccountUsage {
+	return routing.VendorAccountUsage{
+		AccountID: id, FiveHourPct: 40, FiveHourResetAt: usageAt(1),
+		WeeklyPct: 70, WeeklyResetAt: usageAt(90), CreditBalance: "99.00",
+		UpdatedAt: discoveryTestNow.Add(-6 * time.Hour),
+	}
+}
+
+// failUsageStore makes the usage snapshot's read and/or write fail.
+type failUsageStore struct {
+	routing.Store
+	readErr, writeErr error
+}
+
+func (f failUsageStore) VendorAccountUsageByID(ctx context.Context, id string) (routing.VendorAccountUsage, bool, error) {
+	if f.readErr != nil {
+		return routing.VendorAccountUsage{}, false, f.readErr
+	}
+	return f.Store.VendorAccountUsageByID(ctx, id)
+}
+
+func (f failUsageStore) UpsertVendorAccountUsage(ctx context.Context, u routing.VendorAccountUsage) error {
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	return f.Store.UpsertVendorAccountUsage(ctx, u)
+}
+
+// The happy path: the vendor's usage is stored as the account's snapshot, fetched
+// with the opened access token, the ChatGPT account id and the bounded client, and
+// stamped with the service clock. The refresh's own answer is the usual one.
+func TestRefreshVendorAccountModelsStoresTheUsageSnapshot(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34"})
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "chatgpt/")
+
+	dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshOK || res.Discovered != 1 {
+		t.Fatalf("result = %+v, err = %v, want ok / 1 / nil", res, err)
+	}
+	call := fake.onlyUsageCall(t)
+	if call.accessToken != discoveryTestAccess || call.accountID != discoveryTestAccount {
+		t.Fatalf("usage call = %+v, want the opened access token and the ChatGPT account id", call)
+	}
+	if !call.hasClient || call.timeout != 10*time.Second {
+		t.Fatalf("usage call = %+v, want the bounded 10s discovery client", call)
+	}
+	want := routing.VendorAccountUsage{
+		AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2),
+		WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34", UpdatedAt: discoveryTestNow,
+	}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+	}
+	requireNoToken(t, "result", res)
+	requireNoToken(t, "dto", dto)
+}
+
+// THE merge: a field the pull does not know keeps the value the passive scrape
+// stored, a field it knows replaces it, and the row is stamped with this write.
+func TestRefreshVendorAccountModelsMergesTheUsageOverThePassiveSnapshot(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	// Five-hour percent and the credit balance are known; the five-hour reset and
+	// the whole weekly window are not.
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: -1, CreditBalance: "12.34"})
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	seedUsage(t, routeStore, passiveUsage(acc.ID))
+
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("result = %+v, err = %v, want ok", res, err)
+	}
+	want := routing.VendorAccountUsage{
+		AccountID:       acc.ID,
+		FiveHourPct:     23,         // the pull knows it: replaced
+		FiveHourResetAt: usageAt(1), // unknown to the pull: the stored one survives
+		WeeklyPct:       70,         // unknown to the pull: the stored one survives
+		WeeklyResetAt:   usageAt(90),
+		CreditBalance:   "12.34", // the pull knows it: replaced
+		UpdatedAt:       discoveryTestNow,
+	}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+	}
+}
+
+// A real 0% is a known value and replaces a stored 40%; only -1 means unknown.
+func TestRefreshVendorAccountModelsTreatsARealZeroPercentAsKnown(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 0, WeeklyPct: -1})
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	seedUsage(t, routeStore, passiveUsage(acc.ID))
+
+	if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v", err)
+	}
+	got, _ := storedUsage(t, routeStore, acc.ID)
+	if got.FiveHourPct != 0 || got.WeeklyPct != 70 {
+		t.Fatalf("stored usage = %+v, want the real 0%% five-hour kept and the weekly 70 from the scrape", got)
+	}
+}
+
+// With no stored snapshot to merge into, a partial answer is written as it is: its
+// unknown fields stay unknown (-1 / nil / ""), never a fabricated 0%.
+func TestRefreshVendorAccountModelsWritesAPartialUsageWithoutFabricatingZeros(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1})
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+	if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v", err)
+	}
+	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1, UpdatedAt: discoveryTestNow}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+	}
+}
+
+// An Unverifiable usage fetch (a 401, a timeout, a body with nothing in it) leaves
+// the stored snapshot untouched, whatever payload came with it, and creates none
+// when there was none.
+func TestRefreshVendorAccountModelsKeepsTheStoredUsageWhenTheFetchIsUnverifiable(t *testing.T) {
+	junk := vendorauth.OpenAISubscriptionUsage{FiveHourPct: 99, FiveHourResetAt: usageAt(5), WeeklyPct: 99, WeeklyResetAt: usageAt(5), CreditBalance: "junk"}
+
+	t.Run("a stored snapshot is untouched", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+		fake.failUsage(junk)
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+		before := passiveUsage(acc.ID)
+		seedUsage(t, routeStore, before)
+
+		if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+			t.Fatalf("result = %+v, err = %v, want the models refresh to succeed regardless", res, err)
+		}
+		fake.onlyUsageCall(t)
+		if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, before) {
+			t.Fatalf("stored usage = %+v (found %v), want it untouched %+v", got, found, before)
+		}
+	})
+	t.Run("no snapshot is created", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.failUsage(junk)
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+		if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+			t.Fatalf("RefreshVendorAccountModels: %v", err)
+		}
+		fake.onlyUsageCall(t)
+		if got, found := storedUsage(t, routeStore, acc.ID); found {
+			t.Fatalf("stored usage = %+v, want none after an unverifiable fetch", got)
+		}
+	})
+}
+
+// Only an OpenAI SUBSCRIPTION is asked for usage: an api-key account (of either
+// vendor) and an Anthropic subscription never reach the fetcher, and the models
+// refresh answers exactly as it did before the usage fetch existed.
+func TestRefreshVendorAccountModelsSkipsTheUsageFetchForEveryOtherAccountKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO
+		kind string
+	}{
+		{"openai api key", func(t *testing.T, svc *Service, _ *routing.MemoryStore) VendorAccountDTO {
+			return apiKeyAccount(t, svc, routing.VendorOpenAI, "")
+		}, kindOpenAIAPIKey},
+		{"anthropic api key", func(t *testing.T, svc *Service, _ *routing.MemoryStore) VendorAccountDTO {
+			return apiKeyAccount(t, svc, routing.VendorAnthropic, "")
+		}, kindAnthropicAPIKey},
+		{"anthropic subscription", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO {
+			return connectedSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+		}, kindAnthropicSubscription},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.okSlugs(tc.kind, "gpt-6-luna")
+			// An answer that WOULD be stored if the fetcher were consulted.
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, CreditBalance: "12.34"})
+			acc := tc.make(t, svc, routeStore)
+
+			_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+			if err != nil || res.Status != VendorRefreshOK || res.Discovered != 1 {
+				t.Fatalf("result = %+v, err = %v, want the unchanged ok / 1 / nil", res, err)
+			}
+			fake.requireNoUsageCalls(t, "for an account that is not an OpenAI subscription")
+			if got, found := storedUsage(t, routeStore, acc.ID); found {
+				t.Fatalf("stored usage = %+v, want none", got)
+			}
+		})
+	}
+}
+
+// A subscription with nothing to ask with (never connected) is not asked either.
+func TestRefreshVendorAccountModelsSkipsTheUsageFetchWithoutAnAccessToken(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Not connected")
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want the unchanged unverifiable / nil", res, err)
+	}
+	fake.requireNoUsageCalls(t, "without an access token")
+	if _, found := storedUsage(t, routeStore, acc.ID); found {
+		t.Fatal("a usage snapshot was stored without an access token")
+	}
+}
+
+// The usage pull rides on the token set the model discovery opened and renewed: an
+// expired token is renewed ONCE, by the gateway's locked refresher, and the usage
+// fetch is made with the FRESH token. The portal never refreshes by itself.
+func TestRefreshVendorAccountModelsFetchesUsageWithTheRenewedTokenWithoutRenewingTwice(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	refresher := installTokenRefresher(t, svc, routeStore)
+	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("result = %+v, err = %v, want ok", res, err)
+	}
+	if got := refresher.recorded(); !reflect.DeepEqual(got, []string{acc.ID}) {
+		t.Fatalf("refresher calls = %v, want exactly one (the usage pull must reuse the renewed token set)", got)
+	}
+	if call := fake.onlyUsageCall(t); call.accessToken != refreshTestFreshAccess || call.accountID != discoveryTestAccount {
+		t.Fatalf("usage call = %+v, want the refreshed access token and the account id", call)
+	}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || got.FiveHourPct != 23 || got.WeeklyPct != 61 {
+		t.Fatalf("stored usage = %+v (found %v), want the pulled snapshot", got, found)
+	}
+}
+
+// An expired token that cannot be renewed (no refresher, or a failing one) means
+// there is no token to ask with: the usage fetch is skipped, the refresh answers
+// with the unchanged fail-soft result and the stored snapshot is kept.
+func TestRefreshVendorAccountModelsSkipsTheUsageFetchWhenTheTokenCannotBeRenewed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		wire  func(t *testing.T, svc *Service, routeStore *routing.MemoryStore)
+		wants string
+	}{
+		{"no refresher", func(*testing.T, *Service, *routing.MemoryStore) {}, noVendorTokenRefresherNote},
+		{"failing refresher", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) {
+			installTokenRefresher(t, svc, routeStore).err = errors.New("vendor said no")
+		}, expiredVendorTokenNote},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+			tc.wire(t, svc, routeStore)
+			acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+			before := passiveUsage(acc.ID)
+			seedUsage(t, routeStore, before)
+
+			_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+			if err != nil || res.Status != VendorRefreshUnverifiable || !strings.Contains(res.Detail, tc.wants) {
+				t.Fatalf("result = %+v, err = %v, want the unchanged unverifiable answer carrying %q", res, err, tc.wants)
+			}
+			fake.requireNoUsageCalls(t, "without a usable access token")
+			if got, _ := storedUsage(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+				t.Fatalf("stored usage = %+v, want it untouched %+v", got, before)
+			}
+		})
+	}
+}
+
+// The usage pull is independent of the model list: a vendor that lists no usable
+// model (the refresh stays fail-soft and keeps the rows) can still answer usage.
+func TestRefreshVendorAccountModelsPullsUsageEvenWhenTheModelListIsUnusable(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	// The model fetcher stays Unverifiable (its default).
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "chatgpt/")
+	seed := storedModels(t, routeStore, acc.ID)
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want the unchanged unverifiable / nil", res, err)
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, seed) {
+		t.Fatalf("stored rows = %+v, want the seed kept", got)
+	}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || got.FiveHourPct != 23 || got.WeeklyPct != 61 {
+		t.Fatalf("stored usage = %+v (found %v), want the pulled snapshot", got, found)
+	}
+}
+
+// The refresh's answer (account view, result, error) is the same whatever the usage
+// pull does: it succeeds, it is unverifiable, or the store fails on its read or its
+// write. A pull that cannot be stored leaves the snapshot as it was, never
+// flips the account's status (only the dispatch marks needs_reconnect) and never
+// turns the models refresh into an error.
+func TestRefreshVendorAccountModelsAnswerIsIndependentOfTheUsagePull(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna", "gpt-6.1-sol")
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "chatgpt/")
+	ctx := context.Background()
+
+	// Baseline: the usage fetch is Unverifiable (the fake's default).
+	wantDTO, wantRes, err := svc.RefreshVendorAccountModels(ctx, ownerToken(), acc.ID)
+	if err != nil || wantRes.Status != VendorRefreshOK || wantRes.Discovered != 2 {
+		t.Fatalf("baseline = %+v, err = %v, want ok / 2", wantRes, err)
+	}
+	if wantDTO.Status != routing.VendorAccountStatusActive {
+		t.Fatalf("baseline status = %q, want active", wantDTO.Status)
+	}
+	seedUsage(t, routeStore, passiveUsage(acc.ID))
+	before, _ := storedUsage(t, routeStore, acc.ID)
+
+	for _, tc := range []struct {
+		name string
+		prep func()
+		// snapshotKept is whether the stored snapshot must be unchanged afterwards.
+		snapshotKept bool
+	}{
+		{"usage ok", func() {
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6, CreditBalance: "1.00"})
+		}, false},
+		{"usage unverifiable", func() { fake.failUsage(unknownUsage()) }, true},
+		{"usage ok, snapshot read fails", func() {
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6})
+			svc.routes = failUsageStore{Store: routeStore, readErr: errors.New("usage table unavailable")}
+		}, true},
+		{"usage ok, snapshot write fails", func() {
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6})
+			svc.routes = failUsageStore{Store: routeStore, writeErr: errors.New("usage table unavailable")}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc.routes = routeStore
+			seedUsage(t, routeStore, before)
+			tc.prep()
+			t.Cleanup(func() { svc.routes = routeStore })
+
+			dto, res, err := svc.RefreshVendorAccountModels(ctx, ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("RefreshVendorAccountModels: %v (the usage pull must never fail the refresh)", err)
+			}
+			if !reflect.DeepEqual(res, wantRes) {
+				t.Fatalf("result = %+v, want the unchanged %+v", res, wantRes)
+			}
+			if !reflect.DeepEqual(dto, wantDTO) {
+				t.Fatalf("dto = %+v, want the unchanged %+v", dto, wantDTO)
+			}
+			got, _ := storedUsage(t, routeStore, acc.ID)
+			if tc.snapshotKept && !reflect.DeepEqual(got, before) {
+				t.Fatalf("stored usage = %+v, want it untouched %+v", got, before)
+			}
+			if !tc.snapshotKept && got.FiveHourPct != 5 {
+				t.Fatalf("stored usage = %+v, want the pulled five-hour 5", got)
+			}
+		})
+	}
+}
+
+// What the usage pull logs names the account and carries no credential, no ChatGPT
+// account id and no vendor payload, for an unverifiable fetch and for a store failure.
+func TestRefreshVendorAccountModelsUsageLogsCarryNoCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		prep func(svc *Service, routeStore *routing.MemoryStore, fake *fakeVendorDiscoverers)
+		want string
+	}{
+		{"unverifiable", func(_ *Service, _ *routing.MemoryStore, fake *fakeVendorDiscoverers) {
+			fake.failUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, CreditBalance: "payload-do-not-echo"})
+		}, "usage fetch was unverifiable"},
+		{"read fails", func(svc *Service, routeStore *routing.MemoryStore, fake *fakeVendorDiscoverers) {
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2})
+			svc.routes = failUsageStore{Store: routeStore, readErr: errors.New("usage read down")}
+		}, "usage read down"},
+		{"write fails", func(svc *Service, routeStore *routing.MemoryStore, fake *fakeVendorDiscoverers) {
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2})
+			svc.routes = failUsageStore{Store: routeStore, writeErr: errors.New("usage write down")}
+		}, "usage write down"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+			tc.prep(svc, routeStore, fake)
+
+			logs := captureSlog(t, func() {
+				if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+					t.Fatalf("RefreshVendorAccountModels: %v", err)
+				}
+			})
+			if !strings.Contains(logs, tc.want) || !strings.Contains(logs, acc.ID) {
+				t.Fatalf("logs = %s, want a line naming the account and %q", logs, tc.want)
+			}
+			for _, leak := range []string{discoveryTestAccess, discoveryTestAccount, "payload-do-not-echo"} {
+				if strings.Contains(logs, leak) {
+					t.Fatalf("logs contain %q: %s", leak, logs)
+				}
+			}
+		})
+	}
+}
+
+// The connect flows run the same refresh, so a freshly connected ChatGPT
+// subscription gets its usage at once; and the connect succeeds whatever the pull
+// does.
+func TestConnectVendorAccountImportPullsTheUsageSnapshot(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+	fake := installFakeVendorDiscoverers(svc)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, CreditBalance: "12.34"})
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
+
+	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess, RefreshToken: connectTestRefresh})
+	if err != nil || !dto.SubscriptionConnected || len(dto.Models) != 1 {
+		t.Fatalf("dto = %+v, err = %v, want a connected account serving the discovered model", dto, err)
+	}
+	if call := fake.onlyUsageCall(t); call.accessToken != connectTestAccess {
+		t.Fatalf("usage call = %+v, want the freshly connected access token", call)
+	}
+	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: nil, CreditBalance: "12.34", UpdatedAt: svc.clock().UTC()}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+	}
+}
+
+// liveContextModelsStore refuses the model-row write once its context has ended, as
+// a database driver does (the memory store ignores contexts).
+type liveContextModelsStore struct{ routing.Store }
+
+func (l liveContextModelsStore) SetVendorAccountModels(ctx context.Context, id string, rows []routing.VendorAccountModel) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return l.Store.SetVendorAccountModels(ctx, id, rows)
+}
+
+// A usage fetch that hangs cannot hold the connect past its discovery bound, and it
+// cannot starve the model write either: the usage pull runs AFTER the models were
+// stored, so the connect still answers with the discovered models.
+func TestConnectVendorAccountImportHangingUsageFetchKeepsTheDiscoveredModels(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+	svc.routes = liveContextModelsStore{Store: routeStore}
+	fake := installFakeVendorDiscoverers(svc)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	svc.vendorDiscovery.connectTimeout = 100 * time.Millisecond
+	var sawDeadline bool
+	svc.vendorDiscovery.discoverers.OpenAIUsage = func(ctx context.Context, _ *http.Client, _, _ string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+		_, sawDeadline = ctx.Deadline()
+		select {
+		case <-ctx.Done():
+		case <-time.After(30 * time.Second):
+			t.Error("the hanging usage fetch was never cancelled")
+		}
+		return unknownUsage(), vendorauth.DiscoveryUnverifiable
+	}
+	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
+
+	start := time.Now()
+	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ConnectVendorAccountImport: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("connect took %v, want it bounded by the connect-time discovery timeout", elapsed)
+	}
+	if !sawDeadline {
+		t.Fatal("the usage fetch ran without the connect-time deadline")
+	}
+	want := []routing.VendorAccountModel{modelRow(acc.ID, "gpt-6-luna", "gpt-6-luna", routing.APIFlavorOpenAI, "gpt-6-luna")}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want the discovered model written before the usage pull", got)
+	}
+	if !dto.SubscriptionConnected || len(dto.Models) != 1 {
+		t.Fatalf("dto = %+v, want a connected account serving the discovered model", dto)
+	}
+	if _, found := storedUsage(t, routeStore, acc.ID); found {
+		t.Fatal("a usage snapshot was stored although the fetch never answered")
+	}
+}

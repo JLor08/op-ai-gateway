@@ -37,6 +37,9 @@ import (
 //     effort once the tokens are stored, so a freshly connected subscription
 //     account serves its real models at once; a failing discovery never fails
 //     the connect.
+//   - An OpenAI subscription's refresh also pulls the account's usage snapshot
+//     (refreshVendorUsage), best effort and after the models, with the same opened
+//     and renewed token set; it never changes the refresh's outcome.
 //   - A prefix change re-labels the existing rows (relabelVendorAccountModels)
 //     without asking the vendor again.
 //   - An access token already past its expiry is renewed through the injected
@@ -110,14 +113,25 @@ type VendorCredentialDiscoverer func(ctx context.Context, httpClient *http.Clien
 // (vendorauth.DiscoverOpenAISubscriptionModels has exactly this shape).
 type VendorOpenAISubscriptionDiscoverer func(ctx context.Context, httpClient *http.Client, accessToken, accountID, clientVersion string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)
 
-// VendorModelDiscoverers is the seam over the four vendorauth discovery fetchers:
-// tests inject fakes so no service test reaches a vendor over the network. A nil
-// field means the real fetcher (see ServiceDeps.VendorDiscoverers).
+// VendorOpenAIUsageFetcher is the ChatGPT-subscription usage fetch the refresh runs
+// alongside the model discovery: it needs the ChatGPT account id as well as the
+// access token, and answers the five-hour / weekly windows and the credit balance
+// (vendorauth.FetchOpenAISubscriptionUsage has exactly this shape).
+type VendorOpenAIUsageFetcher func(ctx context.Context, httpClient *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus)
+
+// VendorModelDiscoverers is the seam over the vendorauth fetchers a models refresh
+// runs: the four model-list fetchers and, riding along with the OpenAI
+// subscription's refresh, its usage fetch. Tests inject fakes so no service test
+// reaches a vendor over the network. A nil field means the real fetcher (see
+// ServiceDeps.VendorDiscoverers).
 type VendorModelDiscoverers struct {
 	OpenAISubscription    VendorOpenAISubscriptionDiscoverer
 	AnthropicSubscription VendorCredentialDiscoverer
 	OpenAIAPIKey          VendorCredentialDiscoverer
 	AnthropicAPIKey       VendorCredentialDiscoverer
+	// OpenAIUsage is the usage fetch refreshVendorUsage runs for an OpenAI
+	// subscription account after its models were refreshed.
+	OpenAIUsage VendorOpenAIUsageFetcher
 }
 
 // withDefaults returns d with every nil fetcher replaced by its vendorauth function.
@@ -133,6 +147,9 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	}
 	if d.AnthropicAPIKey == nil {
 		d.AnthropicAPIKey = vendorauth.DiscoverAnthropicAPIKeyModels
+	}
+	if d.OpenAIUsage == nil {
+		d.OpenAIUsage = vendorauth.FetchOpenAISubscriptionUsage
 	}
 	return d
 }
@@ -196,6 +213,12 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher Vendo
 // over-long one is cut, and at most maxDiscoveredModels rows are stored. An OpenAI
 // api-key listing is narrowed to chat-capable models first (isChatCapableOpenAIModel).
 //
+// An OpenAI subscription account also gets its usage snapshot refreshed on the way
+// (refreshVendorUsage), with the very token set the model discovery opened and
+// renewed. That is purely additive and best effort: it never changes the result or
+// the error, never marks the account needs_reconnect, and any failure leaves the
+// stored snapshot as it was.
+//
 // STRICTLY OWNER-ONLY, system scope included: it opens the owner's sealed
 // credential and sends it to the vendor from the gateway, so it is authorized like
 // a write (an unknown id and a stranger's account are both
@@ -208,10 +231,25 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
-	found, note, err := s.discoverVendorModels(ctx, acc)
+	found, tokens, note, err := s.discoverVendorModels(ctx, acc)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
+	dto, result, err := s.applyVendorModelDiscovery(ctx, acc, found, note)
+	if err != nil {
+		return VendorAccountDTO{}, RefreshResult{}, err
+	}
+	// Last, and only for a refresh that succeeded (kept or replaced): a slow usage
+	// fetch can then never starve the model write of the connect-time bound, and a
+	// vendor that fails it changes nothing above.
+	s.refreshVendorUsage(ctx, acc, tokens)
+	return dto, result, nil
+}
+
+// applyVendorModelDiscovery turns discoverVendorModels' answer (found models, or a
+// note saying why none) into the refresh's outcome: the fail-soft kept-models answer,
+// or the rows replaced by what the vendor listed.
+func (s *Service) applyVendorModelDiscovery(ctx context.Context, acc routing.VendorAccount, found []vendorauth.DiscoveredModel, note string) (VendorAccountDTO, RefreshResult, error) {
 	if note != "" {
 		return s.keptVendorModels(ctx, acc.ID, note)
 	}
@@ -219,7 +257,7 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 	if len(rows) == 0 {
 		return s.keptVendorModels(ctx, acc.ID, "the vendor listed no usable model")
 	}
-	acc, rows, err = s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
+	acc, rows, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -289,23 +327,31 @@ func (s *Service) keptVendorModels(ctx context.Context, id, why string) (VendorA
 // and auth type. A non-empty note means no usable list was had (why, in words that
 // carry no credential) and the models are nil; an error is only a credential that
 // cannot be opened.
-func (s *Service) discoverVendorModels(ctx context.Context, acc routing.VendorAccount) (models []vendorauth.DiscoveredModel, note string, err error) {
+//
+// tokens is the subscription account's opened, current (renewed when it was
+// expired) token set, handed on so the usage refresh does not open or renew it a
+// second time. It is the zero value for an api_key account and whenever no usable
+// token set could be had, and it stays set when the vendor merely failed to list
+// models. It lives only in memory: it never reaches a DTO, an error or a log.
+func (s *Service) discoverVendorModels(ctx context.Context, acc routing.VendorAccount) (models []vendorauth.DiscoveredModel, tokens vendorauth.TokenSet, note string, err error) {
 	var status vendorauth.DiscoveryStatus
 	switch acc.AuthType {
 	case routing.VendorAuthAPIKey:
 		models, status, note, err = s.discoverAPIKeyModels(ctx, acc)
 	case routing.VendorAuthSubscription:
-		models, status, note, err = s.discoverSubscriptionModels(ctx, acc)
+		if tokens, note, err = s.currentSubscriptionTokens(ctx, acc); err == nil && note == "" {
+			models, status, note = s.discoverSubscriptionModels(ctx, acc.Vendor, tokens)
+		}
 	default:
-		return nil, noVendorDiscoveryNote, nil
+		return nil, vendorauth.TokenSet{}, noVendorDiscoveryNote, nil
 	}
 	if err != nil || note != "" {
-		return nil, note, err
+		return nil, tokens, note, err
 	}
 	if status != vendorauth.DiscoveryOK {
-		return nil, "the vendor did not return a usable model list", nil
+		return nil, tokens, "the vendor did not return a usable model list", nil
 	}
-	return models, "", nil
+	return models, tokens, "", nil
 }
 
 // discoverAPIKeyModels runs the model-list fetcher for an api_key account. A
@@ -327,16 +373,18 @@ func (s *Service) discoverAPIKeyModels(ctx context.Context, acc routing.VendorAc
 	return models, status, "", nil
 }
 
-// discoverSubscriptionModels runs the model-list fetcher for a subscription
-// account, renewing an expired-but-refreshable token first through the gateway's
-// locked refresher. Same note/status contract as discoverAPIKeyModels.
-func (s *Service) discoverSubscriptionModels(ctx context.Context, acc routing.VendorAccount) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus, string, error) {
+// currentSubscriptionTokens opens a subscription account's sealed token set and
+// returns it CURRENT: an expired-but-refreshable token is renewed first through the
+// gateway's locked refresher (see refreshedVendorTokenSet). A non-empty note
+// (credential-free) means no usable token set could be had and tokens is then the
+// zero value, as it is on an error.
+func (s *Service) currentSubscriptionTokens(ctx context.Context, acc routing.VendorAccount) (tokens vendorauth.TokenSet, note string, err error) {
 	ts, err := s.openVendorTokenSet(acc)
 	if err != nil {
-		return nil, 0, "", err
+		return vendorauth.TokenSet{}, "", err
 	}
 	if ts.AccessToken == "" {
-		return nil, 0, "the subscription is not connected", nil
+		return vendorauth.TokenSet{}, "the subscription is not connected", nil
 	}
 	// Asking the vendor with a token known to be expired only earns a 401. A token
 	// with a refresh token to renew it is renewed first, by the gateway's locked
@@ -345,18 +393,74 @@ func (s *Service) discoverSubscriptionModels(ctx context.Context, acc routing.Ve
 	if ts.RefreshToken != "" && ts.NeedsRefresh(s.clock(), 0) {
 		var refreshNote string
 		if ts, refreshNote, err = s.refreshedVendorTokenSet(ctx, acc); err != nil || refreshNote != "" {
-			return nil, 0, refreshNote, err
+			return vendorauth.TokenSet{}, refreshNote, err
 		}
 	}
-	switch acc.Vendor {
+	return ts, "", nil
+}
+
+// discoverSubscriptionModels runs the model-list fetcher of vendor for a
+// subscription account with its current token set ts. Same note/status contract as
+// discoverAPIKeyModels (the note is only the no-discovery one here: the credential
+// questions were settled by currentSubscriptionTokens).
+func (s *Service) discoverSubscriptionModels(ctx context.Context, vendor string, ts vendorauth.TokenSet) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus, string) {
+	switch vendor {
 	case routing.VendorOpenAI:
 		models, status := s.vendorDiscovery.discoverers.OpenAISubscription(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts), s.VendorOpenAICodexClientVersion(ctx))
-		return models, status, "", nil
+		return models, status, ""
 	case routing.VendorAnthropic:
 		models, status := s.vendorDiscovery.discoverers.AnthropicSubscription(ctx, s.vendorDiscovery.client, ts.AccessToken)
-		return models, status, "", nil
+		return models, status, ""
 	default:
-		return nil, 0, noVendorDiscoveryNote, nil
+		return nil, 0, noVendorDiscoveryNote
+	}
+}
+
+// refreshVendorUsage pulls an OpenAI subscription account's usage snapshot (the
+// five-hour and weekly windows and the credit balance) and stores it MERGED over
+// the stored one (routing.MergeVendorAccountUsage: a field the pull does not know
+// never blanks one the passive header scrape already stored). ts is the account's
+// current token set, the one the model discovery opened and, if it was expired,
+// renewed through the gateway's locked refresher: this path never opens or renews
+// a token itself.
+//
+// It runs ONLY for an OpenAI subscription account that has an access token (an
+// api_key account and every Anthropic account are skipped, the fetcher is never
+// called) and is purely ADDITIVE and BEST EFFORT: it returns nothing, so it cannot
+// change a refresh's outcome. An unverifiable fetch (a 401 included: only the
+// dispatch flips an account to needs_reconnect), a failed read of the stored
+// snapshot or a failed write is logged at Debug with the account id (never a token)
+// and leaves the stored snapshot exactly as it was.
+func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) {
+	if acc.AuthType != routing.VendorAuthSubscription || acc.Vendor != routing.VendorOpenAI || ts.AccessToken == "" {
+		return
+	}
+	usage, status := s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
+	if status != vendorauth.DiscoveryOK {
+		slog.Debug("vendor account usage fetch was unverifiable; the stored usage is kept", "account", acc.ID)
+		return
+	}
+	snapshot := routing.VendorAccountUsage{
+		AccountID:       acc.ID,
+		FiveHourPct:     usage.FiveHourPct,
+		FiveHourResetAt: usage.FiveHourResetAt,
+		WeeklyPct:       usage.WeeklyPct,
+		WeeklyResetAt:   usage.WeeklyResetAt,
+		CreditBalance:   usage.CreditBalance,
+		UpdatedAt:       s.clock().UTC(),
+	}
+	// An account with no stored snapshot is written as fetched: merging with the
+	// zero value would turn every unknown percent (-1) into a fabricated 0.
+	existing, found, err := s.routes.VendorAccountUsageByID(ctx, acc.ID)
+	if err != nil {
+		slog.Debug("vendor account usage read for merge failed; the stored usage is kept", "account", acc.ID, "err", err)
+		return
+	}
+	if found {
+		snapshot = routing.MergeVendorAccountUsage(existing, snapshot)
+	}
+	if err := s.routes.UpsertVendorAccountUsage(ctx, snapshot); err != nil {
+		slog.Debug("vendor account usage write failed; the stored usage is kept", "account", acc.ID, "err", err)
 	}
 }
 
