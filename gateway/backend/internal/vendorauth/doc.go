@@ -10,7 +10,11 @@
 // ValidateAnthropicSubscription, ValidateOpenAIAPIKey, ValidateAnthropicAPIKey):
 // one cheap GET per credential kind that classifies the answer as valid, invalid
 // (only a definitive HTTP 401) or unverifiable, and never carries the credential
-// into its result.
+// into its result. The model-discovery fetchers (DiscoverOpenAISubscriptionModels,
+// DiscoverOpenAIAPIKeyModels, DiscoverAnthropicAPIKeyModels,
+// DiscoverAnthropicSubscriptionModels) follow the same rules with one more GET per
+// credential kind: they return the vendor's model list with an ok or unverifiable
+// status and no error, so a caller that cannot get a list simply keeps what it has.
 //
 // WARNING: this whole path is REVERSE-ENGINEERED from the official vendor CLIs
 // (Claude Code, Codex CLI). It is UNDOCUMENTED, ToS-sensitive and

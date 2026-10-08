@@ -2384,6 +2384,25 @@ const de = {
   vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
   vendorAccountSubscriptionCreateNote:
     'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
+  // The optional model-id prefix of an account, plus the Models panel (the
+  // account's current models and the "refresh models" action).
+  vendorAccountModelPrefixLabel: 'Modell-Präfix (optional)',
+  vendorAccountModelPrefixNote:
+    'Wird jeder Modell-ID vorangestellt, z. B. „chatgpt/“ → Modelle erscheinen als „chatgpt/gpt-6-luna“. Erlaubt: Buchstaben, Ziffern und . _ ~ : / @ + - (höchstens 64 Zeichen, kein „..“).',
+  vendorModelsTitle: 'Modelle',
+  vendorModelsIntro:
+    'Die Modelle, die dieses Konto bereitstellt. Die Modell-ID ist die ID, unter der Clients das Modell am Gateway anfragen (mit Präfix).',
+  vendorModelsRefreshAction: 'Modelle aktualisieren',
+  vendorModelsListLabel: 'Modelle des Kontos',
+  vendorModelsColName: 'Name',
+  vendorModelsColId: 'Modell-ID',
+  vendorModelsEmpty: 'Für dieses Konto sind noch keine Modelle hinterlegt.',
+  vendorModelsRefreshed: (n: number) =>
+    n === 1 ? '1 Modell aktualisiert' : `${n} Modelle aktualisiert`,
+  vendorModelsRefreshUnverifiable: 'Modelle konnten nicht aktualisiert werden',
+  vendorModelsRefreshUnchanged: 'Die bisherigen Modelle bleiben unverändert.',
+  vendorModelsRefreshReconnect: (connectTitle: string) =>
+    `Das Konto muss neu verbunden werden, bevor sich die Modelle aktualisieren lassen: im Bereich „${connectTitle}“ erneut anmelden.`,
   vendorConnectTitle: 'Abonnement verbinden',
   vendorConnectIntro:
     'Dieses Konto mit einem Abonnement verbinden (z. B. Claude Pro/Max oder ChatGPT). Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
@@ -2514,6 +2533,11 @@ const de = {
   errorVendorAccountDeviceNotSupported: 'Der Device-Code-Login ist nur für OpenAI-Konten verfügbar',
   errorVendorAccountDeviceConnectState:
     'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
+  errorVendorAccountModelPrefixInvalid:
+    'Ungültiges Modell-Präfix: erlaubt sind höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ ~ : / @ + -, ohne „..“',
+  errorVendorAccountRefreshFailed: 'Die Modelle konnten nicht aktualisiert werden',
+  errorSystemVendorOpenAICodexClientVersionInvalid:
+    'Ungültige Codex-Client-Version: mit einer Ziffer beginnen, höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optionales Anbieter-Modul: Benutzer können eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) hinterlegen.',
@@ -2525,6 +2549,9 @@ const de = {
     'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
   vendorRoutingModeVendorFirst: 'Eigenes Anbieter-Konto zuerst',
   vendorRoutingModeFallbackOnly: 'Anbieter-Konto nur als Ausweichlösung',
+  systemVendorOpenAICodexClientVersionLabel: 'Codex-Client-Version (OpenAI)',
+  systemVendorOpenAICodexClientVersionNote:
+    'Version der Codex-App, mit der die Modellerkennung für OpenAI-Abonnements anfragt. Bei neuen OpenAI-Releases hochziehen, sonst fehlen neue Modelle. Leer lassen für den Standardwert.',
   settingsResourceProvisioningEnforceLabel: 'Ressourcengruppen-Bereitstellung erzwingen',
   settingsResourceProvisioningEnforceHelp:
     'Aus: bereitgestellte Ziele sind eine zusätzliche Freigabe (Opt-in). An: nur bereitgestellte Benutzer/Gruppen/Dienste dürfen die Server der Ressourcengruppe nutzen (Deny-by-default).',
@@ -4966,6 +4993,24 @@ const en: PortalMessages = {
   vendorAccountDeleteConfirm: 'Delete this provider account?',
   vendorAccountSubscriptionCreateNote:
     'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
+  // The optional model-id prefix of an account, plus the Models panel (the
+  // account's current models and the "refresh models" action).
+  vendorAccountModelPrefixLabel: 'Model prefix (optional)',
+  vendorAccountModelPrefixNote:
+    'Put in front of every model ID, e.g. "chatgpt/" → models appear as "chatgpt/gpt-6-luna". Allowed: letters, digits and . _ ~ : / @ + - (at most 64 characters, no "..").',
+  vendorModelsTitle: 'Models',
+  vendorModelsIntro:
+    'The models this account provides. The model ID is the ID clients request the model by at the gateway (including the prefix).',
+  vendorModelsRefreshAction: 'Refresh models',
+  vendorModelsListLabel: 'Account models',
+  vendorModelsColName: 'Name',
+  vendorModelsColId: 'Model ID',
+  vendorModelsEmpty: 'No models are stored for this account yet.',
+  vendorModelsRefreshed: (n: number) => (n === 1 ? '1 model refreshed' : `${n} models refreshed`),
+  vendorModelsRefreshUnverifiable: 'Models could not be refreshed',
+  vendorModelsRefreshUnchanged: 'The existing models are unchanged.',
+  vendorModelsRefreshReconnect: (connectTitle: string) =>
+    `The account has to be reconnected before its models can be refreshed: sign in again in the "${connectTitle}" section.`,
   vendorConnectTitle: 'Connect subscription',
   vendorConnectIntro:
     'Connect this account to a subscription (for example Claude Pro/Max or ChatGPT). Credentials are only stored and never shown again.',
@@ -5092,6 +5137,11 @@ const en: PortalMessages = {
     'The device-code login is available for OpenAI accounts only',
   errorVendorAccountDeviceConnectState:
     'No device-code login is in progress for this account, or it has expired. Start the device code again.',
+  errorVendorAccountModelPrefixInvalid:
+    'Invalid model prefix: at most 64 characters of letters, digits and . _ ~ : / @ + -, without ".."',
+  errorVendorAccountRefreshFailed: 'The models could not be refreshed',
+  errorSystemVendorOpenAICodexClientVersionInvalid:
+    'Invalid Codex client version: start with a digit, at most 64 characters of letters, digits and . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optional provider module: users can store their own accounts with external AI providers (e.g. OpenAI, Anthropic).',
@@ -5103,6 +5153,9 @@ const en: PortalMessages = {
     "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",
   vendorRoutingModeVendorFirst: 'Own provider account first',
   vendorRoutingModeFallbackOnly: 'Provider account as fallback only',
+  systemVendorOpenAICodexClientVersionLabel: 'Codex client version (OpenAI)',
+  systemVendorOpenAICodexClientVersionNote:
+    'Version of the Codex app the model discovery for OpenAI subscriptions identifies as. Raise it when OpenAI ships a new release, otherwise new models are missing. Leave empty for the default.',
   settingsResourceProvisioningEnforceLabel: 'Enforce resource-group provisioning',
   settingsResourceProvisioningEnforceHelp:
     "Off: provisioned targets are an additional grant (opt-in). On: only provisioned users/groups/services may use the resource group's servers (deny-by-default).",

@@ -2792,6 +2792,7 @@ func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) er
 	cur.Status = a.Status
 	cur.APIKey = a.APIKey
 	cur.OAuthTokens = a.OAuthTokens
+	cur.ModelPrefix = a.ModelPrefix
 	cur.UpdatedAt = a.UpdatedAt
 	m.vendorAccounts[a.ID] = copyVendorAccount(cur)
 	return nil

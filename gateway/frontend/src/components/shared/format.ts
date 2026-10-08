@@ -148,6 +148,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.api_key_not_allowed': 'errorVendorAccountApiKeyNotAllowed',
   'vendor_account.api_key_invalid': 'errorVendorAccountApiKeyInvalid',
   'vendor_account.api_key_key_required': 'errorVendorAccountApiKeyKeyRequired',
+  // A model prefix outside [A-Za-z0-9._~:/@+-], over 64 characters or holding
+  // ".." (400, on create and update; the portal validates the same shape before
+  // it sends, so this is the backstop for a stale build).
+  'vendor_account.model_prefix_invalid': 'errorVendorAccountModelPrefixInvalid',
   // Subscription connect (token import, code-paste and device code): the sentinels of
   // portal/service_vendor_connect.go, wired in the same errRow table. A vendor
   // refusal of the code is a 400 (connect_rejected), never a 401 -- the portal
@@ -164,10 +168,14 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.connect_key_required': 'errorVendorAccountConnectKeyRequired',
   'vendor_account.connect_failed': 'errorVendorAccountConnectFailed',
   'vendor_account.check_failed': 'errorVendorAccountCheckFailed',
-  // The connection test could not open the stored credential (a lost encryption
-  // key, a corrupt blob): a 409, never a 401 (the portal reads a 401 as an expired
-  // session). The label is about READING it -- the write path's api_key_key_required
-  // talks about storing a key, which is wrong for a check and for a subscription.
+  // The "refresh models" action's 500 fallback: like check_failed, its server
+  // message is only the generic English "vendor account request failed".
+  'vendor_account.refresh_failed': 'errorVendorAccountRefreshFailed',
+  // The connection test and the models refresh could not open the stored
+  // credential (a lost encryption key, a corrupt blob): a 409, never a 401 (the
+  // portal reads a 401 as an expired session). The label is about READING it --
+  // the write path's api_key_key_required talks about storing a key, which is
+  // wrong for a check, a refresh and for a subscription.
   'vendor_account.credential_unreadable': 'errorVendorAccountCredentialUnreadable',
   // The OpenAI-only device-code connect's two own refusals (both 400s), wired in
   // the same errRow table. Its poll loop also meets connect_rejected and
@@ -178,6 +186,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // although the portal hides the area in that state: a stale tab or a flag
   // flipped mid-session still reaches it.
   'vendor_accounts.module_disabled': 'errorVendorAccountsModuleDisabled',
+  // System settings: a Codex client_version the OpenAI model discovery would
+  // send that is not version-shaped (400). The portal checks the same shape
+  // inline, so this is the backstop.
+  'system.vendor_openai_codex_client_version_invalid':
+    'errorSystemVendorOpenAICodexClientVersionInvalid',
   // The plaintext gate's two arming-precondition refusals. Both are mapped, not
   // just the newer one: an operator seeing one translated and its sibling in raw
   // English would read the pair as inconsistent.

@@ -1112,14 +1112,33 @@ paths:
       summary: List the caller's own vendor accounts
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The caller's own accounts, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VendorAccount' }
     post:
       tags: [portal]
-      summary: Create a vendor account
+      summary: Create a vendor account (seeded with a static model set under its prefix)
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountCreateRequest' }
       responses:
-        '201': { $ref: '#/components/responses/OpaqueJSON' }
+        '201':
+          description: The credential-free account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/vendor-accounts/enabled:
     get:
       tags: [portal]
@@ -1135,14 +1154,35 @@ paths:
       summary: Vendor-account detail (includes the usage snapshot)
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
     patch:
       tags: [portal]
-      summary: Update a vendor account (write-only api_key sentinel)
+      summary: Update a vendor account (write-only api_key sentinel; a model_prefix re-labels the stored models)
+      description: >
+        Partial update; an absent field keeps its stored value. api_key and
+        model_prefix take the keep (absent or null) / clear ("") / replace
+        (value) sentinel. A request that carries model_prefix re-labels the
+        account's stored model rows to the prefix plus each vendor id without
+        asking the vendor again. A prefix longer than 64 characters, containing
+        "..", or containing anything but A-Z a-z 0-9 - _ . ~ : / @ + is a 400
+        vendor_account.model_prefix_invalid.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountUpdateRequest' }
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The credential-free account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
     delete:
       tags: [portal]
       summary: Delete a vendor account
@@ -1159,11 +1199,18 @@ paths:
         Body {access_token, refresh_token?, expires_at?}. The access token is
         checked against the vendor before it is stored; a definitive rejection
         is a 400 with vendor_account.connect_invalid_credentials and nothing is
-        stored, an unreachable or inconclusive vendor still stores.
+        stored, an unreachable or inconclusive vendor still stores. Once the
+        tokens are stored a best-effort model discovery (bounded to 5 seconds,
+        never failing the connect) replaces the seeded models with the vendor's
+        real list; the answer carries them when it succeeded.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The credential-free account, with the discovered models when the discovery succeeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/vendor-accounts/{id}/check:
     parameters:
@@ -1196,6 +1243,57 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/vendor-accounts/{id}/models/refresh:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Refresh the account's models from the vendor
+      description: >
+        No request body. Asks the vendor which models the account's stored
+        credential can use and, when it answers with a usable list, replaces the
+        account's models with it (each served as the account's model_prefix plus
+        the vendor's id; at most 500 models, each slug and display name validated
+        and capped). A subscription access token already past its expiry is
+        renewed first through the gateway's own locked token refresh. Answers the
+        credential-free account and a VendorModelsRefreshResult. Fail-soft: when
+        nothing usable can be had the models are kept and the answer is still a
+        200 with refresh.status unverifiable (the account then already reads
+        needs_reconnect when the vendor rejected the refresh token). Strictly
+        owner-only (system scope included); a non-owner gets the same 404 as an
+        unknown id. A stored credential that cannot be opened is a 409
+        vendor_account.credential_unreadable; an uncategorized failure (a store
+        error) is a 500 vendor_account.refresh_failed.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The account as it now serves its models, and what the refresh did
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account, refresh]
+                properties:
+                  account: { $ref: '#/components/schemas/VendorAccount' }
+                  refresh: { $ref: '#/components/schemas/VendorModelsRefreshResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The account cannot be refreshed -- vendor_account.credential_unreadable
+            (the stored credential cannot be opened; reconnect the account) or
+            vendor_accounts.module_disabled while the master flag is off. The
+            Error envelope carries the stable code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: >
+            vendor_account.refresh_failed -- the refresh failed for a reason
+            outside the known states (a store failure). A vendor that cannot be
+            asked is not this: it is a 200 with refresh.status unverifiable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/vendor-accounts/{id}/connect/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1211,10 +1309,18 @@ paths:
     post:
       tags: [portal]
       summary: Finish the OAuth code-paste connect (exchange the pasted code)
+      description: >
+        Body {code}. Like the token import, a successful connect runs a
+        best-effort model discovery and the answer carries the discovered models
+        when it succeeded.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The credential-free account, with the discovered models when the discovery succeeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
   /api/portal/vendor-accounts/{id}/connect/device/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1915,6 +2021,124 @@ components:
                   exit_code: { type: integer }
                   failures: { type: integer }
                   stderr_tail: { type: string }
+    VendorAccountModel:
+      type: object
+      description: >
+        One model a vendor account serves (portal.VendorAccountModelDTO, a row
+        of vendor_account_models): the id a client requests, the id the vendor
+        is sent, the wire flavor and the vendor's display name.
+      required: [gateway_model, upstream_model, api_flavor, display_name]
+      properties:
+        gateway_model:
+          type: string
+          description: The id a client lists and requests -- the account's model_prefix plus upstream_model.
+        upstream_model:
+          type: string
+          description: The vendor's own model id (slug), the one the vendor is sent.
+        api_flavor:
+          type: string
+          enum: [openai, anthropic]
+        display_name:
+          type: string
+          description: >
+            The vendor's human-readable model name; empty when it supplied none
+            or one that is not printable ASCII. At most 128 characters.
+    VendorAccount:
+      type: object
+      description: >
+        The credential-free view of a vendor account (portal.VendorAccountDTO).
+        The sealed api key and OAuth token set are reduced to the api_key_set /
+        subscription_connected booleans; no response carries a secret.
+      required: [id, vendor, auth_type, name, status, model_prefix, api_key_set, subscription_connected, models, created_at, updated_at]
+      properties:
+        id: { type: string, description: 'va_-prefixed, random hex.' }
+        vendor: { type: string, enum: [openai, anthropic] }
+        auth_type: { type: string, enum: [api_key, subscription] }
+        name: { type: string }
+        status:
+          type: string
+          enum: [active, disabled, needs_reconnect]
+          description: needs_reconnect is system-managed (a rejected token refresh sets it); a client cannot set it.
+        model_prefix:
+          type: string
+          description: >
+            The account's model-id namespace, empty for none. Every model the
+            account serves is requested as model_prefix + upstream_model.
+        api_key_set: { type: boolean }
+        subscription_connected: { type: boolean }
+        models:
+          type: array
+          description: The models the account serves; always an array, never null.
+          items: { $ref: '#/components/schemas/VendorAccountModel' }
+        usage:
+          type: object
+          description: >
+            The rate-limit snapshot (percentages and reset times only); present
+            on the detail read only, and only once one has been scraped.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    VendorAccountCreateRequest:
+      type: object
+      description: portal.CreateVendorAccountRequest.
+      required: [vendor, auth_type, name]
+      properties:
+        vendor: { type: string, enum: [openai, anthropic] }
+        auth_type: { type: string, enum: [api_key, subscription] }
+        name: { type: string }
+        status:
+          type: string
+          enum: [active, disabled]
+          description: Defaults to active.
+        api_key:
+          type: string
+          description: Write-only; meaningful for an api_key account only (a subscription account is created unconnected).
+        model_prefix:
+          type: string
+          maxLength: 64
+          pattern: '^[A-Za-z0-9._~:/@+-]*$'
+          description: >
+            Optional namespace for the account's model ids (trimmed; no "..").
+            An invalid value is a 400 vendor_account.model_prefix_invalid.
+    VendorAccountUpdateRequest:
+      type: object
+      description: portal.UpdateVendorAccountRequest; an absent field keeps the stored value.
+      properties:
+        name: { type: string }
+        status:
+          type: string
+          enum: [active, disabled]
+          description: needs_reconnect cannot be set; a status equal to the stored one is a no-op.
+        api_key:
+          type: [string, 'null']
+          description: Write-only keep (absent or null) / clear ("") / replace (a value) sentinel.
+        model_prefix:
+          type: [string, 'null']
+          maxLength: 64
+          pattern: '^[A-Za-z0-9._~:/@+-]*$'
+          description: >
+            Keep (absent or null) / clear ("") / replace (a value). A request
+            that carries it re-labels the stored model rows.
+    VendorModelsRefreshResult:
+      type: object
+      description: >
+        What POST /api/portal/vendor-accounts/{id}/models/refresh did
+        (portal.RefreshResult). Credential-free.
+      required: [status, discovered, detail]
+      properties:
+        status:
+          type: string
+          enum: [ok, unverifiable]
+          description: >
+            ok - the vendor served a usable list and it replaced the account's
+            models. unverifiable - nothing usable could be had (no credential,
+            expired token that could not be renewed, vendor unreachable or
+            unexpected answer, no usable model); the models were kept.
+        discovered:
+          type: integer
+          description: Number of models now served from the discovery (0 when unverifiable).
+        detail:
+          type: string
+          description: Short English phrase (what was stored, or why nothing was). Never a credential.
     VendorConnectionCheck:
       type: object
       description: >

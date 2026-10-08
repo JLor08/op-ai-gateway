@@ -94,11 +94,11 @@ flowchart TB
 | `account` | Auth + session + user management: login, session resolution, logout, set/change password, invite/list/update users, last-admin guard. |
 | `auth` | Token authentication primitives; bcrypt password hashing/policy. |
 | `totp` | TOTP 2FA enrollment and verification. |
-| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings, and the per-user external **vendor accounts** ("Anbieter") CRUD + subscription connect + credential validation and the test-connection action ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)). |
+| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings, and the per-user external **vendor accounts** ("Anbieter") CRUD + subscription connect + credential validation and the test-connection action, plus the dynamic model discovery (`RefreshVendorAccountModels`, `service_vendor_discovery.go`) with the account's model prefix and its owner-overlay listings ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)). |
 | `routing` | Candidate scoring, the mapping-based resolver, AI-server/routing repository interfaces, domain types (`AiServer`, `Application`, `ModelMapping`, `VendorAccount`), affinity, capacity/admission. The resolver's vendor-account candidate source turns a caller's own account into an owner-scoped `Target`. |
 | `inference` | The internal provider-neutral inference model. |
 | `provider` | Provider client interface (incl. `ModelLister`), Ollama adapter, OpenAI-compatible adapter (vLLM/llama.cpp + the OpenAI api-key vendor path), the native **Anthropic Messages** client and the **OpenAI Responses** translate client (the two vendor-subscription serving clients), mock provider. |
-| `vendorauth` | The vendor OAuth subsystem for the subscription path: PKCE, authorize-URL build, code/device-code exchange, token-set sealing and refresh, plus the four model-independent credential-validation probes (valid / invalid / unverifiable). All reverse-engineered vendor constants live here (VERIFY-LIVE); imports `capture` only ([External Vendor Accounts §3](cross-cutting/external-vendor-accounts.md#3-connect-flows-internalvendorauth)). |
+| `vendorauth` | The vendor OAuth subsystem for the subscription path: PKCE, authorize-URL build, code/device-code exchange, token-set sealing and refresh, plus the four model-independent credential-validation probes (valid / invalid / unverifiable) and the four model-discovery fetchers (one list GET per credential kind, `ok` / `unverifiable`). All reverse-engineered vendor constants live here (VERIFY-LIVE); imports `capture` only ([External Vendor Accounts §3](cross-cutting/external-vendor-accounts.md#3-connect-flows-internalvendorauth)). |
 | `usage` | Usage-event recording and aggregation inputs. |
 | `capture` | Opt-in payload capture (encrypted-at-rest or volatile-RAM), header redaction. |
 | `netbird` | NetBird integration: peers, groups, policies, the gateway-managed PAT and its rotation. |
@@ -127,7 +127,13 @@ recover the concrete service from `srv.Portal`. It defeats the exact
 `api_tracing_gen.go` is generated, a template change or a second wrapping layer
 would break the type assertion with **no compile error, only a nil at runtime**;
 and it added permanent public API surface a later reader would treat as a
-sanctioned escape hatch. It has been deleted.
+sanctioned escape hatch. It has been deleted. The same conduit carries
+`SetBenchmarkReservationHook` and `SetVendorTokenRefresher`: the latter hands the
+vendor model discovery the `Server`'s locked subscription-token refresh
+(`srv.RefreshVendorSubscriptionTokens`, the refresh the dispatch itself runs under
+its per-account lock), so "refresh models" can renew an expired subscription token
+without the portal ever refreshing by itself and racing the dispatch for the
+single-use refresh token.
 
 **A per-server registry that `cmd/gateway` must prune needs an exported
 constructor.** Without one, `gateway.New`'s internal nil-default fallback builds
@@ -164,7 +170,7 @@ servers, services, models, usage, system, netbird, chat, vendorAccounts), a
 the `vendorAccountsEnabled` flag — threaded through `App.tsx` and `NavSidebar`
 from `GET /api/portal/vendor-accounts/enabled` — so the nav item and the routed
 content are both hidden while the vendor-accounts module is off
-([External Vendor Accounts §6](cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode)).
+([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)).
 
 Two additions worth knowing when looking for code on this side:
 

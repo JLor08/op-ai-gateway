@@ -282,24 +282,47 @@ func unreadableVendorCredential(what string, err error) error {
 	return fmt.Errorf("%w: open vendor account %s: %w", ErrVendorAccountCredentialUnreadable, what, err)
 }
 
+// openVendorAPIKey opens acc's sealed api key ("" when none is set). A key that
+// cannot be opened is ErrVendorAccountCredentialUnreadable. Shared by the
+// connection test and the model discovery, the two places that send the stored
+// credential to a vendor.
+func (s *Service) openVendorAPIKey(acc routing.VendorAccount) (string, error) {
+	apiKey, err := capture.OpenSecret(s.cipher, acc.APIKey)
+	if err != nil {
+		return "", unreadableVendorCredential("api key", err)
+	}
+	return apiKey, nil
+}
+
+// openVendorTokenSet opens acc's sealed OAuth token set (the zero set when the
+// subscription is not connected). A blob that cannot be opened is
+// ErrVendorAccountCredentialUnreadable. Shared like openVendorAPIKey.
+func (s *Service) openVendorTokenSet(acc routing.VendorAccount) (vendorauth.TokenSet, error) {
+	ts, err := vendorauth.OpenTokenSet(s.cipher, acc.OAuthTokens)
+	if err != nil {
+		return vendorauth.TokenSet{}, unreadableVendorCredential("token set", err)
+	}
+	return ts, nil
+}
+
 // checkVendorAccount opens acc's stored credential and probes it. It returns the
 // verdict and the credential it used (so the caller can scrub the detail). A
 // credential that cannot be opened is ErrVendorAccountCredentialUnreadable.
 func (s *Service) checkVendorAccount(ctx context.Context, acc routing.VendorAccount) (vendorauth.CredentialCheck, string, error) {
 	switch acc.AuthType {
 	case routing.VendorAuthAPIKey:
-		apiKey, err := capture.OpenSecret(s.cipher, acc.APIKey)
+		apiKey, err := s.openVendorAPIKey(acc)
 		if err != nil {
-			return vendorauth.CredentialCheck{}, "", unreadableVendorCredential("api key", err)
+			return vendorauth.CredentialCheck{}, "", err
 		}
 		if apiKey == "" {
 			return unverifiableVendorCheck("no API key is set"), "", nil
 		}
 		return s.validateAPIKey(ctx, acc.Vendor, apiKey), apiKey, nil
 	case routing.VendorAuthSubscription:
-		ts, err := vendorauth.OpenTokenSet(s.cipher, acc.OAuthTokens)
+		ts, err := s.openVendorTokenSet(acc)
 		if err != nil {
-			return vendorauth.CredentialCheck{}, "", unreadableVendorCredential("token set", err)
+			return vendorauth.CredentialCheck{}, "", err
 		}
 		if ts.AccessToken == "" {
 			return unverifiableVendorCheck("the subscription is not connected"), "", nil

@@ -162,6 +162,80 @@ describe('vendorAccountsApi', () => {
     expect(resp.subscription_connected).toBe(true);
   });
 
+  it('POSTs the optional model_prefix of a create and a PATCH, and omits it when not sent', async () => {
+    // A fresh Response per call: a body can be read once.
+    const fetcher = vi.fn().mockImplementation(async () => jsonResponse({ id: 'va_1' }));
+    const api = createPortalApi(fetcher);
+
+    await api.createVendorAccount({
+      vendor: 'openai',
+      auth_type: 'subscription',
+      name: 'Work',
+      model_prefix: 'chatgpt/',
+    });
+    await api.updateVendorAccount('va_1', { model_prefix: '' });
+    await api.updateVendorAccount('va_1', { name: 'Renamed' });
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({
+      vendor: 'openai',
+      auth_type: 'subscription',
+      name: 'Work',
+      model_prefix: 'chatgpt/',
+    });
+    // "" is the explicit clear and must survive serialization.
+    expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({ model_prefix: '' });
+    expect(JSON.parse(fetcher.mock.calls[2][1].body)).toEqual({ name: 'Renamed' });
+  });
+
+  it('POSTs .../models/refresh with the id URL-encoded and no body, and returns the account and outcome', async () => {
+    const answer = {
+      account: {
+        id: 'va/1',
+        model_prefix: 'chatgpt/',
+        models: [
+          {
+            gateway_model: 'chatgpt/gpt-6-luna',
+            upstream_model: 'gpt-6-luna',
+            api_flavor: 'openai_responses',
+            display_name: 'GPT-6 Luna',
+          },
+        ],
+      },
+      refresh: { status: 'ok', discovered: 1, detail: 'discovered 1 models' },
+    };
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(answer));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.refreshModels('va/1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/models/refresh');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp).toEqual(answer);
+  });
+
+  it('surfaces a refused models refresh as a PortalApiError with the backend code', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: 'vendor_account.credential_unreadable',
+            message: 'the stored credential could not be read; reconnect the account',
+          },
+        },
+        409,
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    await expect(api.refreshModels('va_1')).rejects.toMatchObject({
+      status: 409,
+      code: 'vendor_account.credential_unreadable',
+    });
+  });
+
   it('POSTs .../connect/device/begin with no body and returns the user code and verification URL', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       jsonResponse({

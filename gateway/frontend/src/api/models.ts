@@ -412,6 +412,12 @@ export type UpdateModelGroupRequest = {
   min_speed_fallback?: ModelGroupMinSpeedFallback;
 };
 
+// One row of the dashboard's "Live Model Routes" table: a self-hosted route
+// (id = the mapping id, provider = the application type, host = the server) or one
+// of the principal's own vendor-account models (id = account id + ':' + model,
+// provider = the vendor, host = the account name, model = the PREFIXED gateway
+// name). Vendor rows are owner-scoped and arrive only while the vendor-accounts
+// module is enabled.
 export type PortalRoute = {
   id?: string;
   model: string;

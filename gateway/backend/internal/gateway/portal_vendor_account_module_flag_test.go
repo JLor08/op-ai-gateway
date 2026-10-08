@@ -34,6 +34,7 @@ func TestVendorAccountEndpointsAre409WhileTheMasterFlagIsOff(t *testing.T) {
 		{"connect begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOwnerSecret, ""},
 		{"connect complete", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/complete", vaOwnerSecret, `{"code":"c"}`},
 		{"check", http.MethodPost, "/api/portal/vendor-accounts/va_anything/check", vaOwnerSecret, ""},
+		{"models refresh", http.MethodPost, "/api/portal/vendor-accounts/va_anything/models/refresh", vaOwnerSecret, ""},
 		{"connect device begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/begin", vaOwnerSecret, ""},
 		{"connect device poll", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/poll", vaOwnerSecret, ""},
 		{"connect begin as another user", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOtherSecret, ""},
@@ -186,6 +187,84 @@ func TestSystemSettingsVendorAccountSettings(t *testing.T) {
 
 	// A non-system principal cannot read or write them.
 	if rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaOwnerSecret, `{"vendor_accounts_enabled":true}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("PUT as a plain user = %d, want 403", rec.Code)
+	}
+}
+
+// vendor_openai_codex_client_version round-trips through the system settings
+// endpoint: the default is the built-in Codex app version, a PUT takes effect on
+// the very next GET, blank resets to the default, a malformed value is a 400 that
+// stores nothing (not even the valid field beside it), and only a system
+// principal can write it.
+func TestSystemSettingsVendorOpenAICodexClientVersion(t *testing.T) {
+	srv, _, settings := newVendorAccountSettingsTestServer(t, true)
+	const key = "vendor_openai_codex_client_version"
+
+	get := func() map[string]any {
+		t.Helper()
+		rec := vaDo(t, srv, http.MethodGet, "/api/system/settings", vaSystemSecret, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET settings = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return body
+	}
+	if got := get()[key]; got != "26.930.61225" {
+		t.Fatalf("default %s = %v, want 26.930.61225", key, got)
+	}
+
+	rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"`+key+`":" 27.101.40000 "}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var putBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &putBody); err != nil {
+		t.Fatalf("unmarshal PUT: %v", err)
+	}
+	if putBody[key] != "27.101.40000" {
+		t.Fatalf("PUT response %s = %v, want the trimmed 27.101.40000", key, putBody[key])
+	}
+	if got := get()[key]; got != "27.101.40000" {
+		t.Fatalf("GET after PUT %s = %v, want 27.101.40000", key, got)
+	}
+
+	// A PUT that omits the field leaves it alone.
+	if rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"vendor_accounts_enabled":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT other field = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := get()[key]; got != "27.101.40000" {
+		t.Fatalf("GET after an unrelated PUT %s = %v, want the kept 27.101.40000", key, got)
+	}
+
+	// A malformed value is a 400 with its stable code; nothing in the request is applied.
+	rec = vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"vendor_accounts_enabled":false,"`+key+`":"v1 2"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PUT malformed = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := perfErrorCode(t, rec.Body.Bytes()); code != "system.vendor_openai_codex_client_version_invalid" {
+		t.Fatalf("code = %q, want system.vendor_openai_codex_client_version_invalid", code)
+	}
+	body := get()
+	if body[key] != "27.101.40000" || body["vendor_accounts_enabled"] != true {
+		t.Fatalf("after rejected PUT = %v/%v, want the earlier 27.101.40000/true kept", body[key], body["vendor_accounts_enabled"])
+	}
+	if values, err := settings.SystemSettings(context.Background()); err != nil || values[key] != "27.101.40000" {
+		t.Fatalf("stored = %v, %v, want 27.101.40000 kept", values, err)
+	}
+
+	// Blank resets to the built-in default.
+	if rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"`+key+`":"  "}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT blank = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := get()[key]; got != "26.930.61225" {
+		t.Fatalf("GET after blank PUT %s = %v, want the default 26.930.61225", key, got)
+	}
+
+	// A non-system principal cannot write it.
+	if rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaOwnerSecret, `{"`+key+`":"27.101.40000"}`); rec.Code != http.StatusForbidden {
 		t.Fatalf("PUT as a plain user = %d, want 403", rec.Code)
 	}
 }

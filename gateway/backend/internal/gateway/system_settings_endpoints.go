@@ -142,6 +142,10 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.vendor_account_routing_mode_invalid", "vendor account routing mode must be vendor_first or fallback_only", ""))
 				return
 			}
+			if errors.Is(err, portal.ErrVendorOpenAICodexClientVersionInvalid) {
+				writeJSON(w, http.StatusBadRequest, apierror.Response("system.vendor_openai_codex_client_version_invalid", "codex client version must be 1-64 characters of letters, digits, '.', '_', '+' or '-', starting with a digit", ""))
+				return
+			}
 			if errors.Is(err, portal.ErrEnergyDefaultInvalid) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.energy_default_invalid", "energy defaults must be non-negative", ""))
 				return

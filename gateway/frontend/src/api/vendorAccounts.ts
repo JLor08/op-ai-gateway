@@ -35,11 +35,16 @@ export type VendorAccountAuthType = 'api_key' | 'subscription';
 export type VendorAccountStatus = 'active' | 'disabled' | 'needs_reconnect';
 
 // One gateway model an account serves -- mirrors portal.VendorAccountModelDTO.
-// Always [] until the routing milestone seeds the per-vendor catalog.
+// gateway_model is the id a client requests at the gateway: the account's
+// model_prefix glued onto the vendor's own id (upstream_model), which is what
+// the vendor is still asked for. display_name is the vendor's human-readable
+// name for the model, "" when it supplied none. It is TEXT FROM THE VENDOR (it
+// may hold < > " &), so it is only ever rendered as text, never as markup.
 export type VendorAccountModel = {
   gateway_model: string;
   upstream_model: string;
   api_flavor: string;
+  display_name: string;
 };
 
 // The latest rate-limit snapshot the gateway scraped off an account's upstream
@@ -63,6 +68,10 @@ export type VendorAccount = {
   auth_type: VendorAccountAuthType;
   name: string;
   status: VendorAccountStatus;
+  // The account's optional model-id namespace ("" = none): every model it
+  // serves is listed and requested as model_prefix + the vendor's model id.
+  // Valid shape: at most 64 characters of [A-Za-z0-9._~:/@+-], no "..".
+  model_prefix: string;
   // The write-only secret sentinels: true once an api key (resp. a subscription
   // token set) is stored. The value itself is never returned.
   api_key_set: boolean;
@@ -79,13 +88,15 @@ export type VendorAccount = {
 // POST /api/portal/vendor-accounts body. status defaults to active when
 // omitted/empty; api_key is only meaningful (and only accepted) for an api_key
 // account -- the backend rejects one on a subscription account with
-// vendor_account.api_key_not_allowed.
+// vendor_account.api_key_not_allowed. model_prefix is optional (omitted = none);
+// a malformed one is a 400 vendor_account.model_prefix_invalid.
 export type CreateVendorAccountRequest = {
   vendor: string;
   auth_type: string;
   name: string;
   status?: string;
   api_key?: string;
+  model_prefix?: string;
 };
 
 // PATCH /api/portal/vendor-accounts/{id} body -- pointer-semantics on the
@@ -93,10 +104,16 @@ export type CreateVendorAccountRequest = {
 // immutable. api_key is the write-only secret sentinel: omitted keeps the
 // stored key, the exact empty string "" clears it, any other value replaces it
 // (a whitespace-only value is rejected with vendor_account.api_key_invalid).
+// model_prefix follows the same pointer semantics: omitted keeps the stored
+// prefix, "" clears it, any other value replaces it (a malformed one is a 400
+// vendor_account.model_prefix_invalid). Sending it -- even unchanged -- also
+// re-labels the account's model rows to the stored prefix, which heals rows a
+// failed earlier re-label left behind.
 export type UpdateVendorAccountRequest = {
   name?: string;
   status?: string;
   api_key?: string;
+  model_prefix?: string;
 };
 
 // POST .../connect/import body -- mirrors portal.ConnectVendorAccountImportRequest.
@@ -140,6 +157,26 @@ export type VendorConnectionCheck = {
   checked_at: string;
 };
 
+// POST .../models/refresh response -- mirrors vendorAccountModelsRefreshResponse:
+// the credential-free account as it now serves its models, and what the refresh
+// did. `ok`: the vendor served a usable list and it replaced the account's models
+// (`discovered` of them). `unverifiable`: no usable list could be had (the vendor
+// could not be reached, refused, or listed nothing usable), so the models are
+// UNCHANGED and `discovered` is 0; it is no statement about the credential, and
+// `account.status` reads needs_reconnect when a rejected refresh token is why.
+// `detail` is a short English phrase, token-free by construction: a technical
+// aid for the user, not a message to localize.
+export type VendorModelsRefreshStatus = 'ok' | 'unverifiable';
+export type VendorModelsRefresh = {
+  status: VendorModelsRefreshStatus;
+  discovered: number;
+  detail: string;
+};
+export type VendorAccountModelsRefresh = {
+  account: VendorAccount;
+  refresh: VendorModelsRefresh;
+};
+
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
     // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
@@ -179,6 +216,20 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<VendorConnectionCheck>(
         fetcher,
         `/api/portal/vendor-accounts/${encodeURIComponent(id)}/check`,
+        { method: 'POST' },
+      ),
+    // The explicit "refresh models": the gateway asks the vendor which models
+    // the account's stored credential can use and, on a usable answer, replaces
+    // the account's models with it (under the account's prefix). Fail-soft: a
+    // vendor that cannot be asked is still a 200 with refresh.status
+    // "unverifiable" and the models untouched. Owner-only (404 for anybody
+    // else's id); a stored credential that cannot be opened is a 409
+    // vendor_account.credential_unreadable, an unexpected failure a 500
+    // vendor_account.refresh_failed. No request body.
+    refreshModels: (id: string) =>
+      request<VendorAccountModelsRefresh>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/models/refresh`,
         { method: 'POST' },
       ),
     // Subscription connect, path 1: attach tokens the user already holds. The

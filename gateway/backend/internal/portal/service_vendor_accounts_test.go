@@ -34,14 +34,16 @@ func newVendorAccountTestService(t *testing.T, now time.Time) (*Service, *routin
 // the vendor_accounts_enabled master flag switched ON: every vendor-account
 // service method is refused while it is off (ErrVendorAccountsDisabled), so the
 // tests of the methods' own behaviour run with the area enabled. The credential
-// validators are replaced by an all-Unverifiable fake, so no test of the area can
-// reach a vendor over the network; a test that cares about the verdicts installs
-// its own with installFakeVendorValidators.
+// validators and the model-discovery fetchers are replaced by all-Unverifiable
+// fakes, so no test of the area can reach a vendor over the network; a test that
+// cares about the verdicts or the discovered models installs its own with
+// installFakeVendorValidators / installFakeVendorDiscoverers.
 func newVendorAccountTestServiceWithCipher(t *testing.T, now time.Time, cipher *capture.Cipher, volatile bool) (*Service, *routing.MemoryStore) {
 	t.Helper()
 	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, volatile)
 	setVendorAccountsEnabled(t, svc, true)
 	installFakeVendorValidators(svc)
+	installFakeVendorDiscoverers(svc)
 	return svc, routeStore
 }
 
@@ -759,7 +761,7 @@ func TestUpdateVendorAccountKeylessDiskStoreRefusesReplacementKey(t *testing.T) 
 func vendorAccountModelDTOs(models []routing.VendorAccountModel) []VendorAccountModelDTO {
 	out := make([]VendorAccountModelDTO, 0, len(models))
 	for _, m := range models {
-		out = append(out, VendorAccountModelDTO{GatewayModel: m.GatewayModel, UpstreamModel: m.UpstreamModel, APIFlavor: m.APIFlavor})
+		out = append(out, VendorAccountModelDTO{GatewayModel: m.GatewayModel, UpstreamModel: m.UpstreamModel, APIFlavor: m.APIFlavor, DisplayName: m.DisplayName})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].GatewayModel < out[j].GatewayModel })
 	return out
@@ -1074,5 +1076,215 @@ func TestVendorAccountMethodsRefuseByDefault(t *testing.T) {
 	svc.settings = NewMemorySystemSettings()
 	if _, err := svc.ListVendorAccounts(context.Background(), ownerToken()); !errors.Is(err, ErrVendorAccountsDisabled) {
 		t.Fatalf("list with the flag unset: err = %v, want ErrVendorAccountsDisabled", err)
+	}
+}
+
+// The model prefix is an optional per-account namespace for the account's
+// gateway-model ids. The contract pinned here is: trimmed, "" = none, and a
+// value of at most vendorAccountModelPrefixMaxLen characters from the URL-path-safe
+// set of isModelIDByte (it is glued onto ids that appear in URLs), with no "..",
+// on Create and on Update alike.
+func TestCreateVendorAccountStoresAndExposesTheModelPrefix(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+
+	plain := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("No prefix"))
+	if plain.ModelPrefix != "" {
+		t.Fatalf("default model_prefix = %q, want empty", plain.ModelPrefix)
+	}
+
+	req := apiKeyAccountRequest("Work")
+	req.ModelPrefix = "  work/  "
+	dto := createTestVendorAccount(t, svc, ownerToken(), req)
+	if dto.ModelPrefix != "work/" {
+		t.Fatalf("model_prefix = %q, want the trimmed value", dto.ModelPrefix)
+	}
+	row, err := routeStore.VendorAccountByID(ctx, dto.ID)
+	if err != nil || row.ModelPrefix != "work/" {
+		t.Fatalf("stored account = %#v, %v, want ModelPrefix work/", row, err)
+	}
+
+	// Every read of the account reports it: Get and List.
+	got, err := svc.GetVendorAccount(ctx, ownerToken(), dto.ID)
+	if err != nil || got.ModelPrefix != "work/" {
+		t.Fatalf("Get = %#v, %v, want model_prefix work/", got, err)
+	}
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	prefixes := map[string]string{}
+	for _, acc := range list.Data {
+		prefixes[acc.ID] = acc.ModelPrefix
+	}
+	if prefixes[dto.ID] != "work/" || prefixes[plain.ID] != "" {
+		t.Fatalf("list prefixes = %v, want work/ for the prefixed account and empty for the other", prefixes)
+	}
+
+	raw, _ := json.Marshal(dto)
+	if !strings.Contains(string(raw), `"model_prefix":"work/"`) {
+		t.Fatalf("dto JSON %s missing model_prefix", raw)
+	}
+	rawPlain, _ := json.Marshal(plain)
+	if !strings.Contains(string(rawPlain), `"model_prefix":""`) {
+		t.Fatalf("dto JSON %s must carry an empty model_prefix, not omit it", rawPlain)
+	}
+}
+
+func TestCreateVendorAccountRejectsAnInvalidModelPrefix(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"too long", strings.Repeat("a", vendorAccountModelPrefixMaxLen+1)},
+		{"non-ASCII letter", "w\u00f6rk/"},
+		{"non-ASCII symbol", "work\u2192"},
+		{"embedded space", "my work/"},
+		{"embedded tab", "my\twork/"},
+		{"embedded newline", "work\n/"},
+		{"control character", "work\x01/"},
+		{"DEL", "work\x7f/"},
+		// The prefix is glued onto model ids that appear in URL paths, so the
+		// characters that start a query, a fragment or an escape, and the ones that
+		// break out of a JSON string or markup, are refused.
+		{"query mark", "work?/"},
+		{"fragment mark", "work#/"},
+		{"percent escape", "work%2f"},
+		{"double quote", "work\"/"},
+		{"backslash", "work\\"},
+		{"angle bracket", "<work>/"},
+		{"other printable punctuation", "work!"},
+		{"parent-directory segment", "../work/"},
+		{"embedded parent-directory segment", "a/../b/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := apiKeyAccountRequest("Acct")
+			req.ModelPrefix = tc.prefix
+			if _, err := svc.CreateVendorAccount(context.Background(), ownerToken(), req); !errors.Is(err, ErrVendorAccountModelPrefixInvalid) {
+				t.Fatalf("err = %v, want ErrVendorAccountModelPrefixInvalid", err)
+			}
+		})
+	}
+	if rows, _ := routeStore.VendorAccounts(context.Background()); len(rows) != 0 {
+		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
+	}
+
+	// The limit is inclusive, and the URL-path-safe symbols are allowed.
+	for _, prefix := range []string{
+		strings.Repeat("a", vendorAccountModelPrefixMaxLen),
+		"a-b_c.d:e/f+g@h~",
+		"chatgpt/",
+		"work-",
+		"my.team:",
+	} {
+		req := apiKeyAccountRequest("Edge")
+		req.ModelPrefix = prefix
+		if dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), req); err != nil || dto.ModelPrefix != prefix {
+			t.Fatalf("prefix %q = %#v, %v, want it accepted verbatim", prefix, dto, err)
+		}
+	}
+
+	// All-whitespace trims to empty, which means "no prefix", not an error.
+	req := apiKeyAccountRequest("Blank")
+	req.ModelPrefix = "   "
+	if dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), req); err != nil || dto.ModelPrefix != "" {
+		t.Fatalf("blank prefix = %#v, %v, want accepted as no prefix", dto, err)
+	}
+}
+
+func TestUpdateVendorAccountModelPrefixSemantics(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	req := apiKeyAccountRequest("Prefixed")
+	req.ModelPrefix = "work/"
+	created := createTestVendorAccount(t, svc, ownerToken(), req)
+	ctx := context.Background()
+	str := func(s string) *string { return &s }
+	stored := func() routing.VendorAccount {
+		t.Helper()
+		row, err := routeStore.VendorAccountByID(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("VendorAccountByID: %v", err)
+		}
+		return row
+	}
+
+	// nil keeps the stored prefix (a rename must not wipe it).
+	dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{Name: str("Renamed")})
+	if err != nil || dto.ModelPrefix != "work/" || stored().ModelPrefix != "work/" {
+		t.Fatalf("rename = %#v, %v, stored prefix %q, want the prefix kept", dto, err, stored().ModelPrefix)
+	}
+
+	// A value replaces it, trimmed.
+	dto, err = svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{ModelPrefix: str("  home-  ")})
+	if err != nil || dto.ModelPrefix != "home-" || stored().ModelPrefix != "home-" {
+		t.Fatalf("set = %#v, %v, stored prefix %q, want home-", dto, err, stored().ModelPrefix)
+	}
+	if dto.Name != "Renamed" || !dto.APIKeySet {
+		t.Fatalf("setting the prefix touched other fields: %#v", dto)
+	}
+
+	// An invalid value is rejected and leaves the row untouched.
+	for _, bad := range []string{strings.Repeat("a", vendorAccountModelPrefixMaxLen+1), "w\u00f6rk", "has space"} {
+		if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{ModelPrefix: str(bad)}); !errors.Is(err, ErrVendorAccountModelPrefixInvalid) {
+			t.Fatalf("prefix %q err = %v, want ErrVendorAccountModelPrefixInvalid", bad, err)
+		}
+	}
+	if got := stored().ModelPrefix; got != "home-" {
+		t.Fatalf("stored prefix after rejected updates = %q, want home- untouched", got)
+	}
+
+	// The empty string clears it.
+	dto, err = svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{ModelPrefix: str("")})
+	if err != nil || dto.ModelPrefix != "" || stored().ModelPrefix != "" {
+		t.Fatalf("clear = %#v, %v, stored prefix %q, want empty", dto, err, stored().ModelPrefix)
+	}
+}
+
+// Each model row's display name rides on the model DTO under display_name, on
+// every read; a row without one reports "" (the field is always present).
+func TestVendorAccountModelDTOExposesTheDisplayName(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	created := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Named models"))
+	ctx := context.Background()
+
+	if err := routeStore.SetVendorAccountModels(ctx, created.ID, []routing.VendorAccountModel{
+		{GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT-4o"},
+		{GatewayModel: "o3", UpstreamModel: "o3", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+	want := []VendorAccountModelDTO{
+		{GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT-4o"},
+		{GatewayModel: "o3", UpstreamModel: "o3", APIFlavor: routing.APIFlavorOpenAI},
+	}
+
+	got, err := svc.GetVendorAccount(ctx, ownerToken(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !reflect.DeepEqual(got.Models, want) {
+		t.Fatalf("Get models = %#v, want %#v", got.Models, want)
+	}
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil || len(list.Data) != 1 || !reflect.DeepEqual(list.Data[0].Models, want) {
+		t.Fatalf("List = %#v, %v, want the same models", list, err)
+	}
+	str := "Renamed"
+	updated, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, UpdateVendorAccountRequest{Name: &str})
+	if err != nil || !reflect.DeepEqual(updated.Models, want) {
+		t.Fatalf("Update = %#v, %v, want the same models", updated, err)
+	}
+
+	raw, _ := json.Marshal(got.Models)
+	for _, field := range []string{`"display_name":"GPT-4o"`, `"display_name":""`} {
+		if !strings.Contains(string(raw), field) {
+			t.Fatalf("models JSON %s missing %s", raw, field)
+		}
 	}
 }

@@ -135,6 +135,11 @@ var (
 	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
 	ErrVendorAccountAPIKeyInvalid    = errors.New("vendor_account.api_key_invalid")
 
+	// ErrVendorAccountModelPrefixInvalid rejects a model prefix that is too long,
+	// holds "..", or holds anything but ASCII letters, digits and - _ . ~ : / @ +
+	// (the URL-path-safe characters of a model id).
+	ErrVendorAccountModelPrefixInvalid = errors.New("vendor_account.model_prefix_invalid")
+
 	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
 	// (system setting vendor_accounts_enabled, off by default): every
 	// vendor-account service method returns it, before doing anything, while
@@ -536,6 +541,22 @@ type ServiceDeps struct {
 	// TestVendorAccountConnection run. A nil field means the real vendorauth
 	// probe; tests inject fakes so nothing reaches a vendor over the network.
 	VendorValidators VendorCredentialValidators
+	// VendorDiscoverers are the model-list fetchers RefreshVendorAccountModels (and
+	// the connect flows' best-effort discovery) run. A nil field means the real
+	// vendorauth fetcher; tests inject fakes so nothing reaches a vendor over the
+	// network.
+	VendorDiscoverers VendorModelDiscoverers
+	// VendorTokenRefresher renews a subscription account's expired access token
+	// for the model discovery: it must refresh AND persist the account's token set
+	// (so a re-read sees the new token) under the same per-account lock the
+	// dispatch refreshes under, because a rotating refresh token is single-use and
+	// two parties refreshing at once would burn it. The portal never refreshes by
+	// itself. nil = no refresher: an expired token is then reported unverifiable
+	// (fail-soft) instead of refreshed. The gateway's refresher belongs to the
+	// gateway Server, which cmd/gateway builds AFTER this Service, so production
+	// wires it through SetVendorTokenRefresher (see its doc); the dep is for a
+	// caller that has one at construction (tests).
+	VendorTokenRefresher VendorTokenRefresher
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -734,6 +755,13 @@ type Service struct {
 	// vendorValidation holds the credential-validation probes and their bounded
 	// http client (see vendorValidationState).
 	vendorValidation vendorValidationState
+	// vendorDiscovery holds the model-discovery fetchers and their bounded http
+	// client (see vendorDiscoveryState).
+	vendorDiscovery vendorDiscoveryState
+	// vendorModelWrites serializes the two writers of an account's model rows (a
+	// discovery's replace and a prefix re-label) per account, so they cannot undo
+	// each other (see accountLocks).
+	vendorModelWrites accountLocks
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -845,6 +873,7 @@ func NewService(deps ServiceDeps) *Service {
 			client:    vendorClient,
 		},
 		vendorValidation:            newVendorValidationState(deps.VendorValidators),
+		vendorDiscovery:             newVendorDiscoveryState(deps.VendorDiscoverers, deps.VendorTokenRefresher),
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
 		agentTLSPort:                deps.AgentTLSPort,
@@ -885,6 +914,18 @@ func (s *Service) SetRuntimeConfigChangedHook(fn func(serverID string)) {
 // direction that leaves existing behaviour untouched.
 func (s *Service) SetBenchmarkReservationHook(fn func(serverID string) bool) {
 	s.benchmarkReserved = fn
+}
+
+// SetVendorTokenRefresher sets (or replaces) the function the model discovery
+// calls to renew an expired subscription token (see ServiceDeps.VendorTokenRefresher
+// for its contract). nil clears it.
+//
+// A setter for the same reason as SetRuntimeConfigChangedHook: the real refresher
+// is the gateway Server's locked token refresh, and cmd/gateway builds that Server
+// AFTER the portal Service, so the Service cannot take it at construction. Call it
+// once at startup, before the Service serves requests; it is not synchronised.
+func (s *Service) SetVendorTokenRefresher(fn VendorTokenRefresher) {
+	s.vendorDiscovery.tokenRefresher = fn
 }
 
 type CurrentUser struct {
@@ -2685,6 +2726,11 @@ func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (str
 			Status:   routing.ServerStatusActive,
 		})
 	}
+	// The principal's own vendor-account models (ChatGPT/OpenAI/Anthropic accounts)
+	// are part of what they can route to, so the table lists them next to the
+	// self-hosted routes -- the dashboard half of the owner overlay the model
+	// listings already carry (vendorDashboardRoutes).
+	out = append(out, s.vendorDashboardRoutes(ctx, token)...)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Model == out[j].Model {
 			return out[i].ID < out[j].ID
@@ -3881,6 +3927,12 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // with no reader. The listing surfaces in this table ARE the listing; the
 // offering answers only "can this token route to this name" (Callable) and
 // "does this name exist at all" (Existing), which no row above answers.)
+//
+// (Models(), ModelsForFlavor() and dashboardRouteData() additionally carry the
+// principal's OWN vendor-account models, the owner overlay of external vendor
+// accounts: ownVendorAccountModels is the one source they all read, and a
+// vendor model is never subject to column (b), which is a gateway-wide setting
+// on self-hosted models.)
 //
 // (ManageModels(), the admin-only management surface, applies NONE of the
 // three by design: an admin managing visibility/groups must see every active

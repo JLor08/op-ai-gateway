@@ -153,6 +153,7 @@ type API interface {
 	ReassignGroupsOwnedBy(context.Context, auth.Token, string) error
 	ReconcileCertificates(context.Context)
 	ReconcileGatewayPeer(context.Context) (string, bool, error)
+	RefreshVendorAccountModels(context.Context, auth.Token, string) (VendorAccountDTO, RefreshResult, error)
 	RegenerateNetbirdKey(context.Context, auth.Token, string) (string, string, error)
 	ReissueAllCertificates(context.Context, auth.Token) error
 	ReissueEdgeCertificate(context.Context, auth.Token) error

@@ -557,7 +557,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-83-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -613,7 +613,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-83-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -782,7 +782,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-83-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -967,7 +967,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-83-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1182,7 +1182,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-82-migrations),
+[§4](reference/data-model.md#4-migration-history-83-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1408,7 +1408,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-82-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-83-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1533,7 +1533,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-82-migrations),
+[§4](reference/data-model.md#4-migration-history-83-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3057,10 +3057,40 @@ the access token, refresh token and expiry to the existing import endpoint, so t
 raw file never leaves the browser. *Catalog by auth type:* an OpenAI subscription
 account is seeded with only the models the Codex backend serves, an `api_key`
 account with the full set (accounts seeded earlier keep their rows; there is no
-backfill). → [External Vendor Accounts §3.5](cross-cutting/external-vendor-accounts.md#35-credential-validation).
+backfill; the seed is now only the create-time fallback, see below).
+→ [External Vendor Accounts §3.5](cross-cutting/external-vendor-accounts.md#35-credential-validation).
+
+**Follow-up: dynamic model discovery, a model prefix and dashboard visibility
+(also no new decision).** A static model list is a guess that the vendors outrun,
+and for a ChatGPT subscription it was a visibly wrong one: the Codex backend
+serves newer model generations than any list kept in this repository. The gateway
+now asks the vendor which models the account's own credential can use and
+replaces the seed with the answer — at a subscription connect (best-effort, short
+bound, never failing the connect) and on an explicit, owner-only
+`POST /api/portal/vendor-accounts/{id}/models/refresh`. It is fail-soft in the
+way the credential validation is: an unreachable, rejecting, empty or
+unrecognizable answer leaves the existing models untouched, so a changed vendor
+schema can never wipe a working catalog. An expired subscription token is renewed
+first through the gateway's own locked refresher rather than by the portal,
+because a refresh token is single-use and a second refresher would race the
+dispatch for it. Choice (c) extends rather than changes: the Codex catalog request
+is the one subscription endpoint an operator has confirmed live, the Anthropic
+consumer-bearer listing is not, and the Codex `client_version` the request carries
+is a system setting (`vendor_openai_codex_client_version`) that an operator has to
+raise by hand when OpenAI ships a newer Codex app, or new models stay hidden — a
+maintenance burden accepted with the reverse-engineered backend
+([§11.1](11-risks-and-technical-debt.md#111-operational-risks)). Two smaller
+pieces ride along. An optional per-account `model_prefix` is now **applied**: a
+model is listed and requested as the prefix plus the vendor's id, and the vendor
+is still sent the bare id. And the principal's own vendor models appear in the
+portal dashboard's live-routes table, while the admin Models management page
+(`ManageModels`) deliberately stays the system's real models, so the two admin
+views differ on purpose.
+→ [External Vendor Accounts §6](cross-cutting/external-vendor-accounts.md#6-dynamic-model-discovery-and-the-model-prefix).
 
 → [External Vendor Accounts](cross-cutting/external-vendor-accounts.md),
-[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
 [Data Model §1](reference/data-model.md#external-vendor-accounts-anbieter),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Configuration & Environment Variables](reference/config-env.md).

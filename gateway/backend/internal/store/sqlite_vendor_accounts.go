@@ -14,15 +14,15 @@ import (
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them.
-const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, created_at, updated_at`
+const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, created_at, updated_at`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. A duplicate id is
 // ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
 	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountColumns+`)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.CreatedAt, a.UpdatedAt)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.CreatedAt, a.UpdatedAt)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict
@@ -32,15 +32,16 @@ func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorA
 	return nil
 }
 
-// UpdateVendorAccount rewrites the mutable columns of an existing account.
+// UpdateVendorAccount rewrites the mutable columns of an existing account
+// (auth_type, name, status, api_key, oauth_tokens, model_prefix, updated_at).
 // id, owner_user_id, vendor and created_at are the account's identity and are
 // never written, matching the memory driver. An unknown id is ErrNotFound.
 func (s *SQLiteStore) UpdateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
 	result, err := s.exec(ctx, `
 		update vendor_accounts
-		set auth_type = ?, name = ?, status = ?, api_key = ?, oauth_tokens = ?, updated_at = ?
+		set auth_type = ?, name = ?, status = ?, api_key = ?, oauth_tokens = ?, model_prefix = ?, updated_at = ?
 		where id = ?`,
-		a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.UpdatedAt, a.ID)
+		a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.UpdatedAt, a.ID)
 	if err != nil {
 		return fmt.Errorf("update vendor account: %w", err)
 	}
@@ -121,7 +122,7 @@ func (s *SQLiteStore) DeleteVendorAccount(ctx context.Context, id string) error 
 // gateway_model. The slice is always non-nil.
 func (s *SQLiteStore) VendorAccountModels(ctx context.Context, accountID string) ([]routing.VendorAccountModel, error) {
 	rows, err := s.query(ctx, `
-		select account_id, gateway_model, upstream_model, api_flavor
+		select account_id, gateway_model, upstream_model, api_flavor, display_name
 		from vendor_account_models where account_id = ? order by gateway_model`, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("list vendor account models: %w", err)
@@ -130,7 +131,7 @@ func (s *SQLiteStore) VendorAccountModels(ctx context.Context, accountID string)
 	out := make([]routing.VendorAccountModel, 0)
 	for rows.Next() {
 		var m routing.VendorAccountModel
-		if err := rows.Scan(&m.AccountID, &m.GatewayModel, &m.UpstreamModel, &m.APIFlavor); err != nil {
+		if err := rows.Scan(&m.AccountID, &m.GatewayModel, &m.UpstreamModel, &m.APIFlavor, &m.DisplayName); err != nil {
 			return nil, fmt.Errorf("scan vendor account model: %w", err)
 		}
 		out = append(out, m)
@@ -167,9 +168,9 @@ func (s *SQLiteStore) SetVendorAccountModels(ctx context.Context, accountID stri
 	}
 	for _, m := range models {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into vendor_account_models (account_id, gateway_model, upstream_model, api_flavor)
-			values (?, ?, ?, ?)`),
-			accountID, m.GatewayModel, m.UpstreamModel, m.APIFlavor); err != nil {
+			insert into vendor_account_models (account_id, gateway_model, upstream_model, api_flavor, display_name)
+			values (?, ?, ?, ?, ?)`),
+			accountID, m.GatewayModel, m.UpstreamModel, m.APIFlavor, m.DisplayName); err != nil {
 			// accountID was existence-checked above and no other column is an
 			// FK, so a failed insert is a duplicate (account_id, gateway_model).
 			if s.dl.isUniqueViolation(err) {
@@ -251,7 +252,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

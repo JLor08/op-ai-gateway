@@ -24,6 +24,7 @@ type recordedRequest struct {
 	Method string
 	Host   string
 	Path   string
+	Query  url.Values
 	Body   string
 	Header http.Header
 }
@@ -39,7 +40,7 @@ func (p *probeRecorder) add(r *http.Request) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.reqs = append(p.reqs, recordedRequest{
-		Method: r.Method, Host: r.Host, Path: r.URL.Path, Body: string(body), Header: r.Header.Clone(),
+		Method: r.Method, Host: r.Host, Path: r.URL.Path, Query: r.URL.Query(), Body: string(body), Header: r.Header.Clone(),
 	})
 }
 

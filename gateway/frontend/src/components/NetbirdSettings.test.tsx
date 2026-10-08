@@ -57,6 +57,7 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
+    vendor_openai_codex_client_version: '26.930.61225',
     energy_default_price_per_kwh: 0,
     energy_default_pue: 0,
     energy_default_wh_per_token: 0,

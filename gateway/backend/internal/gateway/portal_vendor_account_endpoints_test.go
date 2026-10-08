@@ -67,10 +67,29 @@ func vaNoNetworkValidators() portal.VendorCredentialValidators {
 	return portal.VendorCredentialValidators{OpenAISubscription: probe, AnthropicSubscription: probe, OpenAIAPIKey: probe, AnthropicAPIKey: probe}
 }
 
+// vaNoNetworkDiscoverers answers Unverifiable for every model-discovery fetch, so
+// a vendor-account test (a connect runs a best-effort discovery) can never reach a
+// vendor over the network. A test that needs discovered models overrides the
+// fetchers it cares about through the adjust hook below.
+func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
+	fetch := func(context.Context, *http.Client, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		return nil, vendorauth.DiscoveryUnverifiable
+	}
+	return portal.VendorModelDiscoverers{
+		OpenAISubscription: func(context.Context, *http.Client, string, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+			return nil, vendorauth.DiscoveryUnverifiable
+		},
+		AnthropicSubscription: fetch,
+		OpenAIAPIKey:          fetch,
+		AnthropicAPIKey:       fetch,
+	}
+}
+
 // newVendorAccountSettingsTestServerWithDeps is newVendorAccountSettingsTestServer
 // with a hook to adjust the portal.ServiceDeps before the Service is built (the
 // connect tests inject httptest vendor OAuth endpoints this way). The credential
-// probes default to vaNoNetworkValidators before the hook runs.
+// probes and the model-discovery fetchers default to vaNoNetworkValidators /
+// vaNoNetworkDiscoverers before the hook runs.
 func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adjust func(*portal.ServiceDeps)) (*Server, *routing.MemoryStore, *portal.MemorySystemSettings) {
 	t.Helper()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
@@ -91,7 +110,7 @@ func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adj
 	routeStore := routing.NewMemoryStore()
 	recorder := usage.NewRecorder()
 	settings := portal.NewMemorySystemSettings()
-	deps := portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile, VendorValidators: vaNoNetworkValidators()}
+	deps := portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, SystemSettings: settings, SettingsVolatile: volatile, VendorValidators: vaNoNetworkValidators(), VendorDiscoverers: vaNoNetworkDiscoverers()}
 	if adjust != nil {
 		adjust(&deps)
 	}
@@ -319,6 +338,51 @@ func TestVendorAccountEndpointsPatchAndDelete(t *testing.T) {
 	}
 }
 
+// model_prefix is accepted on create and patch, returned on every read, and a
+// model's display_name is always present on the wire (the dashboard keys off it).
+func TestVendorAccountEndpointsModelPrefixAndDisplayName(t *testing.T) {
+	srv, routeStore := newVendorAccountTestServer(t, true)
+
+	rec := vaDo(t, srv, http.MethodPost, "/api/portal/vendor-accounts", vaOwnerSecret,
+		`{"vendor":"openai","auth_type":"api_key","name":"Prefixed","model_prefix":" work/ "}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	created := vaDecode(t, rec)
+	if created.ModelPrefix != "work/" {
+		t.Fatalf("created model_prefix = %q, want the trimmed work/", created.ModelPrefix)
+	}
+	var raw struct {
+		ModelPrefix *string          `json:"model_prefix"`
+		Models      []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw.ModelPrefix == nil || len(raw.Models) == 0 {
+		t.Fatalf("response %s must carry model_prefix and the seeded models", rec.Body.String())
+	}
+	for _, m := range raw.Models {
+		if _, ok := m["display_name"]; !ok {
+			t.Fatalf("model %#v lacks display_name", m)
+		}
+	}
+
+	path := "/api/portal/vendor-accounts/" + created.ID
+	rec = vaDo(t, srv, http.MethodPatch, path, vaOwnerSecret, `{"model_prefix":"home-"}`)
+	if rec.Code != http.StatusOK || vaDecode(t, rec).ModelPrefix != "home-" {
+		t.Fatalf("patch = %d %s, want 200 with model_prefix home-", rec.Code, rec.Body.String())
+	}
+	if row, _ := routeStore.VendorAccountByID(context.Background(), created.ID); row.ModelPrefix != "home-" {
+		t.Fatalf("stored prefix = %q, want home-", row.ModelPrefix)
+	}
+	// An unrelated patch keeps it.
+	rec = vaDo(t, srv, http.MethodPatch, path, vaOwnerSecret, `{"name":"Renamed"}`)
+	if rec.Code != http.StatusOK || vaDecode(t, rec).ModelPrefix != "home-" {
+		t.Fatalf("rename = %d %s, want the prefix kept", rec.Code, rec.Body.String())
+	}
+}
+
 func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 	srv, _ := newVendorAccountTestServer(t, true)
 	created := vaCreate(t, srv, vaOwnerSecret, "Mapped")
@@ -336,10 +400,12 @@ func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 		{"bad auth type", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai","auth_type":"password","name":"x"}`, http.StatusBadRequest, "vendor_account.auth_type_invalid"},
 		{"bad status", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai","auth_type":"api_key","name":"x","status":"paused"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
 		{"api key on subscription", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"anthropic","auth_type":"subscription","name":"x","api_key":"sk-x"}`, http.StatusBadRequest, "vendor_account.api_key_not_allowed"},
+		{"bad model prefix", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai","auth_type":"api_key","name":"x","model_prefix":"has space"}`, http.StatusBadRequest, "vendor_account.model_prefix_invalid"},
 		{"malformed json", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":`, http.StatusBadRequest, codeRequestInvalidJSON},
 		{"patch blank name", http.MethodPatch, itemPath, `{"name":""}`, http.StatusBadRequest, "vendor_account.name_required"},
 		{"patch bad status", http.MethodPatch, itemPath, `{"status":"needs_reconnect"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
 		{"patch whitespace-only key", http.MethodPatch, itemPath, `{"api_key":"   "}`, http.StatusBadRequest, "vendor_account.api_key_invalid"},
+		{"patch bad model prefix", http.MethodPatch, itemPath, `{"model_prefix":"w\u00f6rk"}`, http.StatusBadRequest, "vendor_account.model_prefix_invalid"},
 		{"collection rejects PUT", http.MethodPut, "/api/portal/vendor-accounts", `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"item rejects POST", http.MethodPost, itemPath, `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"nested path is not an item", http.MethodGet, itemPath + "/connect", "", http.StatusNotFound, portal.CodeVendorAccountNotFound},

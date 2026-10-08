@@ -18,7 +18,7 @@ ToS-restricted subscription** path. The subscription path reuses consumer
 OAuth tokens through a third-party gateway, which is against both vendors' consumer
 Terms and is reverse-engineered throughout; it is **off by default**, behind a
 master feature flag, and every reverse-engineered constant is marked **VERIFY-LIVE**
-(§9).
+(§10).
 
 The feature reuses the gateway's existing credential sealing, routing `Target`,
 dispatch and usage machinery wherever possible. The genuinely new parts are a
@@ -27,8 +27,9 @@ first-class account entity (§1), an OAuth subsystem — connect + token refresh
 tells a rejected login from a wrong model (§3.5), a small native Anthropic
 Messages client and an OpenAI Responses translate client (`internal/provider`,
 §4), two static dispatch extensions (extra headers + a system-prompt masquerade,
-§4), and a usage/limits snapshot scraped from vendor rate-limit response headers
-(§5).
+§4), a usage/limits snapshot scraped from vendor rate-limit response headers
+(§5), and a discovery of each account's real model catalog from the vendor,
+served under an optional per-account prefix (§6).
 
 ## 1. The entity and its ownership
 
@@ -48,22 +49,28 @@ sharing link table plus a resolver filter extension), not a rewrite.
 | `status` | `active` \| `disabled` \| `needs_reconnect`. The last is system-managed (§3.4): a refresh rejection flips an account to it; the operator cannot set it directly. |
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
+| `model_prefix` | Optional per-account namespace for the account's model ids (migration 83; `''` = none). The service trims it and accepts at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +` (the URL-path-safe characters of a model id) with no `..`, anything else being `400 vendor_account.model_prefix_invalid`. It is **applied**, not merely stored: every model the account serves is advertised and requested as the prefix plus the vendor's own id, while the vendor is still sent the bare id (§6.5). The DTO reports it and the create/update requests accept it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
 account created but not yet connected, and an api-key account with no key set, have
 neither (the exclusivity is enforced in the
-service, not the schema). A per-account curated model catalog
-(`vendor_account_models`, seeded at creation from a static set keyed by vendor
-**and** auth type, §9) and a rate-limit usage snapshot
-(`vendor_account_usage`) hang off the account, both `on delete cascade`. The three
-tables and the `usage_events.account_id` attribution column are migration 82; see
+service, not the schema). A per-account model catalog
+(`vendor_account_models`) and a rate-limit usage snapshot (`vendor_account_usage`)
+hang off the account, both `on delete cascade`. Each catalog row pairs the id a
+client requests (`gateway_model`, the prefix plus the vendor's id) with the id
+the vendor is sent (`upstream_model`), the API flavor, and the vendor's
+human-readable `display_name` (`''` when it gave none; since migration 83). The
+catalog starts as a small **static guess** keyed by vendor **and** auth type
+(§10), written when the account is created, and is **replaced by the vendor's
+real list** once discovery has run (§6). The three tables and the
+`usage_events.account_id` attribution column are migration 82; see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
 
 The domain type is `routing.VendorAccount`, stored across all three drivers
 (memory / SQLite / PostgreSQL) through the usual `routing.Store` composition; the
 portal view is `portal.VendorAccountDTO`, which carries **no** credential material
 — the sealed key and token set are reduced to the `api_key_set` /
-`subscription_connected` booleans ([Secrets at rest](#8-secrets-at-rest)).
+`subscription_connected` booleans ([Secrets at rest](#9-secrets-at-rest)).
 
 ## 2. The two auth types
 
@@ -76,7 +83,7 @@ seals it at rest and sends it as the vendor's own API-key header at dispatch
 ChatGPT/Codex Plus/Pro/Team) through the vendor's OAuth login, and inference is
 served against the vendor's **subscription backend** rather than its metered API.
 Reverse-engineered, undocumented, and restricted by both vendors' consumer Terms
-(§9). A subscription account is created **unconnected**; a connect flow (§3) fills
+(§10). A subscription account is created **unconnected**; a connect flow (§3) fills
 its sealed OAuth token set afterwards.
 
 ## 3. Connect flows (`internal/vendorauth`)
@@ -93,7 +100,9 @@ flow code. `vendorauth` may import `capture` (for sealing) and nothing from
 Three connect methods exist. All are owner-only and gated by the
 `vendor_accounts_enabled` master flag in `portal.Service`, and a successful
 connect (by any method) sets the account's status to `active`, clearing a prior
-`needs_reconnect`. The HTTP endpoints are
+`needs_reconnect`, and then runs a best-effort **model discovery** (§6.2) so the
+account serves the models its vendor really offers rather than the static guess;
+that discovery can never fail a connect. The HTTP endpoints are
 under `POST /api/portal/vendor-accounts/{id}/connect/*`
 ([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
 
@@ -182,10 +191,17 @@ dispatch** (`subscriptionAuthCtx` / `resolveSubscriptionBearer`,
 `internal/gateway/server.go`). If the sealed access token is within a small buffer
 (`vendorTokenRefreshBuffer`, 2 minutes) of its expiry, the gateway refreshes with
 `grant_type=refresh_token`, re-seals the token set in place through a **narrow
-writer** (`SetVendorAccountOAuthTokens`, so a full-row rewrite cannot clobber a
-concurrently rotated token), and persists it. The whole sequence runs under a
+writer** (`SetVendorAccountOAuthTokens`, which writes only `oauth_tokens` and
+`updated_at`, so a refresh cannot clobber a concurrent rename or status change),
+and persists it. The whole sequence runs under a
 **per-account lock** (`lockVendorAccount`) so concurrent dispatches for one
 account single-flight the refresh instead of each burning the refresh token. The
+explicit model refresh (§6.3) asks for a refresh through this same path and lock
+rather than refreshing by itself. The protection runs in one direction only: the
+PATCH writer (`UpdateVendorAccount`) still rewrites the whole row, `oauth_tokens`
+included, from a copy it loaded earlier and outside both locks, so a PATCH that
+races a refresh can write the superseded single-use refresh token back — a known,
+tracked limitation (§10). The
 refresh is **vendor-aware**: an Anthropic token goes only to the Anthropic token
 endpoint and an OpenAI token only to the OpenAI one; the `resolveSubscriptionBearer`
 switch is fail-closed, serving no bearer for an unrecognized vendor.
@@ -195,13 +211,13 @@ a bearer (and the upstream answers 401/403) rather than faulting. A refresh
 **rejection** (a revoked/expired refresh token) additionally flips the account to
 `needs_reconnect`, which the portal surfaces. A 401 on an unexpired-but-revoked
 access token does **not** flip the status (it is bounded by the token TTL) — a
-known limitation recorded in §9.
+known limitation recorded in §10.
 
 ### 3.5 Credential validation
 
 A failed chat conflates two unrelated problems — a login the vendor rejects and a
 model the backend does not serve — and the seeded model ids are a best guess
-(§9). Validation separates them. Four probes in `internal/vendorauth/validate.go`
+(§10). Validation separates them. Four probes in `internal/vendorauth/validate.go`
 each make **one cheap GET that names no model**, so an authentication verdict can
 never be mistaken for a wrong-model error. The URLs live in `constants.go` beside
 the OAuth constants.
@@ -286,7 +302,7 @@ reads `valid` points at the model rather than the login. A thrown error (the
 check could not run) surfaces as a toast, never as a verdict.
 
 The two subscription endpoints are reverse-engineered and join the other
-VERIFY-LIVE constants (§9). A moved or removed endpoint typically answers 404, a
+VERIFY-LIVE constants (§10). A moved or removed endpoint typically answers 404, a
 redirect or a 5xx and so degrades to `unverifiable`. Two residual exposures
 remain, in opposite directions. An endpoint that starts answering 401 for a good
 token would read as a false `invalid` and refuse an import. Conversely, the
@@ -309,12 +325,17 @@ principal: it enumerates the principal's **own** active accounts and builds a
 `vendor_account_models` row whose `gateway_model` equals the requested model.
 Owner-scope is intrinsic — only the principal's accounts are enumerated — so one
 user's account can never serve another user's request. Precedence against
-self-hosted/shared routes is configurable (§6).
+self-hosted/shared routes is configurable (§7).
 
-The match is on the **model name only** (`gateway_model == req.Model`); the
-catalog row's `api_flavor` is stored metadata and is **not** read by the resolver
-or the listing overlay. What flavor each account serves is decided instead by the
-target the resolver builds, giving this served-flavor matrix:
+The match is on the **model name only** (`gateway_model == req.Model`). That name
+is the account's `model_prefix` plus the vendor's id (§6.5), so a prefixed account
+does not answer to the bare vendor id, and two accounts serving the same vendor
+model under different prefixes each route to their own account. The resolver
+sends the vendor the row's `upstream_model`, the bare id, as the target's
+`ProviderModel`. The catalog row's `api_flavor` is stored metadata and is **not**
+read by the resolver or the listing overlay. What flavor each account serves is
+decided instead by the target the resolver builds, giving this served-flavor
+matrix:
 
 | Account | Serves | How |
 |---|---|---|
@@ -327,8 +348,8 @@ self-hosted/shared path — when the module flag is off, the principal has no us
 id (a **service token**), a **server-override** is set, the request is
 **capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
 flavor is **images** (`openai_images`). That the resolver and the listing overlay
-agree on what each account serves is what makes §6's "served-flavors parity"
-between dispatch and the model listing meaningful.
+agree on what each account serves is what makes the "served-flavors parity"
+between dispatch and the model listing (§6.7) meaningful.
 
 `Target` carries four vendor fields, all empty/false for an ordinary AI-server
 target:
@@ -384,7 +405,9 @@ The subscription path splits by the inbound request shape:
 
 - An inbound **Codex `/v1/responses`** request has `ResponsesMode = passthrough`
   set by the resolver (from the **fine** `openai_responses` flavor), so it is
-  relayed **verbatim** to the ChatGPT backend's `/responses` (lossless). It is
+  relayed **verbatim** to the ChatGPT backend's `/responses` (lossless; the one
+  edit is the request's `model` field, set to the bare vendor id when the account
+  has a prefix, and the response is not rewritten back, §6.5). It is
   `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
   path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
   false, is unaffected.
@@ -393,6 +416,20 @@ The subscription path splits by the inbound request shape:
   (`internal/provider/openai_responses.go`): it renders the neutral request to a
   Responses body, POSTs the same bare `/responses` path, and parses the Responses
   SSE back to the neutral model.
+
+The ChatGPT backend is far stricter than the public Responses API, so the
+translate client always sends what the Codex CLI always sends, whatever the
+inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE): `store: false` (a
+body without `store` defaults to `true`, which the subscription backend rejects
+with a 400), `include: ["reasoning.encrypted_content"]` (so reasoning round-trips
+while nothing is stored), and a `reasoning` object — the request's effort, else
+`medium` (a portal chat carries none, and the subscription catalog is the
+reasoning-only gpt-5 family). `instructions` and `max_output_tokens` stay omitted
+when empty. A non-2xx answer keeps the usual status → sentinel mapping
+(401/403 → `ErrAuthRejected`, 503 → `ErrUpstreamStarting`, else `ErrUnavailable`)
+and now also carries a bounded (4 KiB), single-line snippet of the vendor's error
+body in the returned error and in the payload capture, because the backend states
+why it refused a request only there.
 
 ### 4.3 Credential resolution at the edge
 
@@ -428,20 +465,213 @@ read (`GET /api/portal/vendor-accounts/{id}` → `VendorAccountDTO.Usage`,
 `-1` window is hidden in the UI rather than shown as a real 0 %. API-key accounts
 carry no subscription window; absolute €/$ spend accounting is deferred.
 
-## 6. Feature flag and routing mode
+## 6. Dynamic model discovery and the model prefix
 
-Two system settings govern the feature (both read from the `system_settings`
-store). The **resolver** reads them through a cached accessor that is
+The catalog an account serves is seeded at creation from a small static set, and
+that set is only a guess (§10): a ChatGPT subscription's Codex backend serves
+newer model generations than any list kept in this repository, and a vendor
+renames or retires models without notice. So the gateway asks the vendor which
+models the account's **own credential** can really use and **replaces** the
+guess with the answer. The static set stays as the create-time fallback and as
+what an account keeps whenever discovery yields nothing.
+
+Discovery is split like the validation probes (§3.5). One fetcher per credential kind lives
+in `internal/vendorauth/discover.go` and never returns an error — only a list
+and a status, `ok` or `unverifiable`. The service around it
+(`portal.Service.RefreshVendorAccountModels`, `service_vendor_discovery.go`)
+opens the sealed credential, picks the fetcher, validates and caps what the
+vendor sent, applies the account's prefix and replaces the rows in one
+transaction.
+
+### 6.1 Where the list comes from
+
+| Credential | Request | Kept | Provenance |
+|---|---|---|---|
+| OpenAI **subscription** | `GET https://chatgpt.com/backend-api/codex/models?client_version=<V>` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `originator: codex_cli_rs` | entries whose `visibility` is `list` **and** whose `supported_in_api` is `true`; slug and display name | reverse-engineered, **live-confirmed** |
+| OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | ids that look chat-capable (below); the listing has no display name, so the id doubles as one | documented public API |
+| Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models?limit=1000` with `x-api-key`, `anthropic-version` | every `data[].id` with its `display_name` | documented public API |
+| Anthropic **subscription** | the same URL with `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | as above | reverse-engineered, **VERIFY-LIVE** |
+
+An OpenAI api-key listing names every model the key reaches, with no capability
+data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
+o-series families (and fine-tunes of them), minus ids that mark an embedding,
+speech, image, moderation, realtime or completion-only model. A model the rule
+does not recognize is left out — a missing model is added by a newer rule, while
+a non-chat model offered wrongly fails every request routed to it.
+
+**What "live-confirmed" covers, and what it does not.** The operator ran the
+Codex catalog request against a real subscription and got the real catalog: the
+endpoint, the three headers and the response shape are known to work, and the
+answer listed model ids no static list here held (for example `gpt-5.6-luna`,
+`gpt-6-luna`, `gpt-6.1-sol`). That settles the request, not the backend: it is
+still undocumented, reached under the subscription path's Terms caveats (§10),
+and free to change without notice. The two api-key rows are the vendors'
+documented public listings. Whether Anthropic serves a consumer OAuth bearer a
+model list at all is **unconfirmed** (VERIFY-LIVE): whenever that endpoint
+answers with anything but a usable list the result is `unverifiable` and the
+account keeps its static seed.
+
+### 6.2 When it runs
+
+- **At connect.** After a subscription's tokens are stored — by token import,
+  code paste or device code alike — a discovery runs best-effort under a bound
+  of 5 seconds for the whole of it (token refresh, fetch and write). A vendor
+  that hangs adds at most that to the connect; whatever goes wrong is logged
+  without a credential and the connect still succeeds with the models it had.
+  The import and complete responses carry the account as it then serves; the
+  device poll only reports `connected`, and the portal re-reads the account.
+- **On demand.** `POST /api/portal/vendor-accounts/{id}/models/refresh` — the
+  "Modelle aktualisieren" button of the account's Models panel in the detail view
+  — runs the same discovery and may wait for the vendor client's own 10 second
+  timeout ([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
+  An `api_key` account has no connect step, so this is how it leaves the static
+  seed.
+- **Never otherwise.** No request path, background job or startup step runs a
+  discovery, and migration 83 rewrites no catalog: an account that predates it
+  keeps its rows until its owner refreshes or reconnects.
+
+### 6.3 Fail-soft
+
+Discovery never reduces what an account already serves and never blocks a
+connect. When the vendor cannot be asked, answers with any non-2xx status (a 401
+included — that is not a verdict on the credential; the test-connection action
+is, §3.5), redirects, sends a body that is not a catalog, or lists nothing
+usable, the existing rows stay exactly as they were and the answer is
+`status: unverifiable` with a one-line `detail`. An **empty** list is
+deliberately `unverifiable` and not "OK, no models": a changed vendor schema or
+a filtered-out catalog is far likelier than a credential with no models, and an
+empty OK would let a schema change wipe a working set. A missing credential (no
+key set, subscription not connected) reads `unverifiable` too. Only a stored
+credential that cannot be opened (lost key, corrupt blob) is an error,
+`409 vendor_account.credential_unreadable`; after a connect it is logged and
+ignored.
+
+**An expired token is renewed first.** The vendor answers an expired access token
+with a 401, so a subscription access token that is past its expiry and has a
+refresh token is renewed through the gateway's own locked refresher before the
+vendor is asked: `Server.RefreshVendorSubscriptionTokens`, the refresh the
+dispatch itself runs under its per-account lock (§3.4), handed to the portal at
+start-up so the two cannot race for the single-use refresh token. The portal never refreshes by
+itself. The renewed set is read back from the store, so the fresh token is the
+one sent. If the refresh fails the result is `unverifiable` with a retry-or-
+reconnect note. If the vendor **rejected the refresh token**, the refresher has
+already moved the account to `needs_reconnect`; the response says to reconnect
+and its `account` reports the new status, not the one loaded before. A token with
+no refresh token can never heal and is simply tried. Because a rotated refresh
+token is single-use, the renewal is not cancelled when the request ends — a
+client that disconnects, or the 5 second connect bound, only stops the wait (the
+discovery reports `unverifiable` on time) while the refresh runs to completion
+under a bound of its own and persists its result.
+
+### 6.4 What is stored, and how it is bounded
+
+What the vendor sends becomes model ids, header values and rendered text, so it
+is untrusted and capped before it is stored:
+
+- **At most 500 models** per discovery.
+- **Slug:** 1 to 128 bytes, from `A-Z a-z 0-9 . _ ~ : / @ + -`, starting with a
+  letter or digit and containing no `..` — the URL-path-safe subset a model id
+  needs to travel in `/v1/models/{id}`, JSON and logs. It is used exactly as
+  sent (no trimming, no case change), since it is the id the vendor expects back.
+  An entry whose slug fails the rule is dropped, and a repeated slug is stored once.
+- **Display name:** trimmed, printable ASCII only (`0x20`–`0x7E`) and at most 128
+  bytes, cut if longer. A name with anything else is stored as `''` and the UI
+  falls back to the model id, because a hostile one would be rendered.
+- **Response body:** the discovery fetch has its own **8 MiB** limit, separate
+  from the 1 MiB the credential probes and token endpoints share, because the
+  live Codex catalog already weighs about 0.6 MiB (every entry carries its base
+  instructions) and grows with each model; the shared cap would soon cut it into
+  an unparseable body, a silent `unverifiable` for a working credential.
+
+`refresh.detail` says how many models were stored and, when entries were
+dropped, how many. It carries no credential and no vendor text. The write is a
+whole-set replace under a per-account lock (`accountLocks`), the same lock the
+prefix re-label (§6.5) takes, so a discovery and a prefix change that overlap
+cannot undo each other; the account is re-read inside the lock, so a prefix
+changed while the vendor was being asked is the one applied.
+
+### 6.5 The model prefix
+
+An account's optional `model_prefix` (§1) is the namespace its models are
+requested under. A row carries both names: `gateway_model` is `model_prefix` +
+the vendor's slug, what clients list and request, and `upstream_model` is the
+bare slug, what the vendor is sent. With the prefix `chatgpt/`, the vendor's
+`gpt-6-luna` is advertised and requested as `chatgpt/gpt-6-luna`, and the
+resolver (§4) matches on the first and sets the target's `ProviderModel` to the
+second. The prefix is applied wherever rows are written: to the creation seed, to
+every discovery, and on a PATCH that carries `model_prefix`, which **re-labels the
+existing rows** without asking the vendor again. Re-sending the stored prefix
+repairs rows a failed re-label left behind. Two rows whose labelled ids collide
+keep only the first.
+
+Two behaviours to know:
+
+- With a prefix set, the bare vendor id is **not** served by that account.
+  Different prefixes are also how a user keeps two accounts that offer the same
+  model both reachable.
+- On the native-passthrough path (an OpenAI subscription's `/v1/responses`, §4.2)
+  the gateway rewrites only the request's `model` field to the bare slug. The
+  vendor's response is relayed verbatim and there is no response-side rewrite, so
+  its `model` field echoes the **bare** slug, not the prefixed name the client
+  asked for. A recorded usage event keeps the requested (prefixed) name as its
+  model and the bare slug as the provider model.
+
+### 6.6 The `client_version` knob
+
+The Codex catalog request names a Codex app version, and the ChatGPT backend
+**hides every model whose `minimal_client_version` exceeds it**. The version
+sent is the system setting `vendor_openai_codex_client_version`, default
+`26.930.61225` (the version the confirmed request used). A stale value does not
+fail — it quietly leaves new models out of the catalog, so a model OpenAI has
+shipped never shows up in the portal. **The setting must be raised whenever
+OpenAI ships a newer Codex app** (System settings, no redeploy; blank resets to
+the default; the next refresh uses it). The default will age, and the gateway
+cannot tell that a model is missing, because the backend simply omits it from the
+answer; the remedy is to raise the setting to the current Codex app version and
+refresh again. Both the hiding rule and the default are VERIFY-LIVE, and the upkeep is
+tracked in [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks).
+The setting is read by `portal.Service` at discovery time, never by the
+resolver, so it needs no cache (§7).
+
+### 6.7 Where an account's models show up
+
+Every listing reads **one** source, `ownVendorAccountModels`: the principal's
+own **active** vendor accounts and their rows, behind the master flag, for a user
+principal only (a service token owns no account) and fail-open per account. What
+the listings advertise and what the dashboard shows therefore cannot drift, and a
+vendor model is never subject to the gateway-wide hidden/locked suppression,
+which applies to self-hosted models.
+
+| Surface | Vendor models of the caller's own accounts |
+|---|---|
+| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v0/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). |
+| Portal chat picker and a regular user's **Models** page | Listed. |
+| **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
+| **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
+| Another user's account, or a disabled / `needs_reconnect` account | Never. |
+
+The asymmetry is intended and worth stating, because it can read as a bug: an
+admin who connects an account sees its models on their own Dashboard, in the
+chat picker and in `/v1/models`, but not on the Models management page. The
+account's own detail view lists all its rows with the vendor's display name and
+the id clients request, and carries the refresh button.
+
+## 7. Feature flag and routing mode
+
+Three system settings govern the feature (all read from the `system_settings`
+store). The **resolver** reads the first two through a cached accessor that is
 **invalidated on the settings PUT** whenever it carries either key
 (`invalidateVendorSettingsCache`), so a portal toggle takes effect on the next
 resolve; the accessor's short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
 **out-of-band** change, such as a direct database edit. `portal.Service` (the CRUD
-gate and the model-listing overlay) reads them uncached:
+gate, the model-listing overlay and the discovery client version) reads them
+uncached, so a PUT is visible on its very next call:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor accounts and the self-hosted/shared routes. `vendor_first`: an owned account wins when it serves the requested model. `fallback_only`: an owned account is used only when no self-hosted/shared route exists. |
+| `vendor_openai_codex_client_version` | version string | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (§6.6). The ChatGPT backend **hides every model whose `minimal_client_version` exceeds it**, so a stale value silently hides new models: **raise it when OpenAI ships a newer Codex app** (System settings, no redeploy). Blank resets to the built-in default (`vendorauth.CodexModelsClientVersionDefault`); a malformed value is a `400 system.vendor_openai_codex_client_version_invalid`. Read only by `portal.Service` (never the resolver), so it has no cache. VERIFY-LIVE. |
 
 The frontend reads the master flag through a portal-scoped
 `GET /api/portal/vendor-accounts/enabled` (`{module_enabled}`, readable by any
@@ -450,12 +680,10 @@ nav item without granting the system-scoped settings read), mirroring the
 NetBird/certificates `/enabled` endpoints. The exact-path route wins over the
 `{id}` subtree because account ids are always `va_`-prefixed.
 
-A connected account also carries a **model-listing owner overlay**: the owner's
-vendor-account catalog models appear in their own `/v1/models` listing and the
-chat picker (served-flavors parity with dispatch holds). The overlay is gated on
-the same master flag.
+The same master flag gates the **model-listing owner overlay** and the dashboard
+rows that carry an account's models (§6.7).
 
-## 7. Owner-scope RBAC
+## 8. Owner-scope RBAC
 
 The HTTP handlers gate on the standard web scope (`gateway:use`), then per-object
 authorization happens **in `portal.Service`**: a user may read/manage only
@@ -464,12 +692,14 @@ A non-owner gets the **same `404 vendor_account.not_found`** as for a
 non-existent account (the no-existence-leak rule). The `system` scope may **read**
 any account (`GetVendorAccount`), but `ListVendorAccounts` and every **write**
 (create/update/delete/connect) are owner-only — a deliberate read/write
-asymmetry. The **test-connection** action (§3.5) is not a write but is owner-only
-for the `system` scope too, because it uses the stored credential: it is
-authorized like a write, not like a metadata read. Routing enforces the same owner scope by enumerating only the
-principal's own accounts, so one user's account can never serve another's request.
+asymmetry. The **test-connection** action (§3.5) and the **model refresh** (§6.3)
+are not writes of the account's credential but are owner-only for the `system`
+scope too, because each sends the stored credential to the vendor: they are
+authorized like a write, not like a metadata read. Routing and the model
+listings (§6.7) enforce the same owner scope by enumerating only the principal's
+own accounts, so one user's account can never serve, or be listed to, another.
 
-## 8. Secrets at rest
+## 9. Secrets at rest
 
 Credentials reuse the repo-wide secret envelope verbatim — no new key, no new
 mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-the-encplain-scheme)):
@@ -477,11 +707,12 @@ mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-th
 - The `api_key` and `oauth_tokens` columns are **sealed** with
   `capture.SealSecret` **before** the store write, and opened with
   `capture.OpenSecret` at the cipher-holding dispatch edge **and, for the owner's
-  explicit test-connection (§3.5), inside `portal.Service`** (`checkVendorAccount`).
-  On that second path the opened value goes only to the vendor's own validation
-  URL: it is never returned, logged or echoed in a verdict's `detail`. Likewise a
-  token import probes the plaintext access token the user just submitted, before
-  it is sealed. A refresh re-seals in place.
+  explicit test-connection (§3.5) and model refresh (§6.3), inside
+  `portal.Service`** (`checkVendorAccount`, `RefreshVendorAccountModels`).
+  On those paths the opened value goes only to the vendor's own validation or
+  model-listing URL: it is never returned, logged or echoed in a verdict's or a
+  refresh's `detail`. Likewise a token import probes the plaintext access token
+  the user just submitted, before it is sealed. A refresh re-seals in place.
 - The read-back DTO exposes **presence only** (`api_key_set`,
   `subscription_connected`), never the value. PATCH uses the keep/clear/replace
   `*string` sentinel (nil = keep, `""` = clear, value = replace + reseal), exactly
@@ -493,7 +724,7 @@ mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-th
   `vendor_account.api_key_key_required` on an API key), consistent with the
   secret-at-rest rule. A memory/volatile store needs no key.
 
-## 9. ToS, experimental status, and VERIFY-LIVE
+## 10. ToS, experimental status, and VERIFY-LIVE
 
 The subscription path is built **for internal testing with the operator's own
 account**, as an explicitly experimental, flag-gated, disable-able capability. It
@@ -508,39 +739,62 @@ reasons are recorded deliberately, not in denial of them
   only for use with Claude Code; the forced `You are Claude Code` system block).
   The feature must degrade gracefully when a vendor blocks or changes behavior.
 - **Every subscription constant is reverse-engineered and VERIFY-LIVE.** Each
-  endpoint (including the two subscription credential-validation probes, §3.5),
+  endpoint (including the two subscription credential-validation probes, §3.5, and
+  the two subscription model-list endpoints, §6.1),
   client id, redirect URI, scope, beta header, device-code path, token-claim name,
   masquerade requirement, serving host, request/refresh body encoding, and the
   rate-limit response-header names can change without notice.
   They are confined to `internal/vendorauth/constants.go` and the resolver's
   dispatch literals (routing cannot import `vendorauth`), all marked VERIFY-LIVE,
-  and all parsing is tolerant (prefix-matched, fail-open).
-- **The seeded model ids are a best guess, and the OpenAI set depends on the auth
-  type.** The curated catalog (`internal/portal/vendor_catalog.go`) seeds
-  vendor-native ids when an account is created, keyed by vendor **and** auth type.
-  An OpenAI **`api_key`** account talks to `api.openai.com` and gets the full set
-  (`gpt-5`, `gpt-5-mini`, `gpt-4.1`, `o3`). An OpenAI **subscription** account is
-  served by the Codex ChatGPT backend, which, as far as is known, does not serve
-  `gpt-4.1` or `o3`; it is therefore seeded with only `gpt-5` and `gpt-5-mini`, so
-  a working credential is never paired with a model its backend is known to
-  refuse — the auth-versus-model confusion that §3.5 exists to take apart.
-  Anthropic's OAuth Messages path and its API key serve the same ids, so its set
-  does not vary. Even the narrowed subscription set is unverified: a plan may
-  serve further ids (e.g. `gpt-5-codex`) that are not seeded until confirmed live,
-  and a subscription account serves nothing its rows do not name. **There is no
-  backfill:** an account keeps the rows it was seeded with, so a subscription
-  account created before the split keeps its `gpt-4.1` and `o3` rows (which that
-  backend rejects) until the account is recreated.
+  and all parsing is tolerant (prefix-matched, fail-open). One value is further
+  along than the rest: the Codex model-catalog request (URL, headers, response
+  shape) is **live-confirmed**, an operator having run it and received the real
+  catalog. That confirms the request as sent, not the backend's stability, and
+  the `client_version` hiding rule and its default, as well as whether Anthropic
+  serves a consumer bearer a model list, stay VERIFY-LIVE.
+- **The static model seed is a fallback guess, and the OpenAI set in it depends
+  on the auth type.** The curated set (`internal/portal/vendor_catalog.go`) is
+  written when an account is created, keyed by vendor **and** auth type, and is
+  what the account serves until discovery (§6) replaces it: an `api_key` account
+  until its first refresh, a subscription account when no discovery could be had
+  at connect, and an Anthropic subscription account for as long as that vendor's
+  consumer-bearer listing stays unconfirmed. An OpenAI **`api_key`** account talks
+  to `api.openai.com` and gets the full set (`gpt-5`, `gpt-5-mini`, `gpt-4.1`,
+  `o3`). An OpenAI **subscription** account is served by the Codex ChatGPT
+  backend, which, as far as is known, does not serve `gpt-4.1` or `o3`; it is
+  therefore seeded with only `gpt-5` and `gpt-5-mini`, so a working credential is
+  never paired with a model its backend is known to refuse — the auth-versus-model
+  confusion that §3.5 exists to take apart. Anthropic's OAuth Messages path and
+  its API key serve the same ids, so its set does not vary. Even the narrowed
+  subscription set is unverified, and an account serves nothing its rows do not
+  name — which is why the real catalog is discovered rather than kept here.
+  **There is no backfill:** nothing rewrites existing catalogs at upgrade or in
+  the background. An account created before discovery keeps its seeded rows until
+  its owner refreshes the models or reconnects, so a subscription account created
+  before the auth-type split still carries `gpt-4.1` and `o3` (which that backend
+  rejects) until a successful discovery replaces them.
+- **Discovery needs a live credential and a high enough `client_version`.** An
+  access token that is expired and cannot be renewed — no refresh token came with
+  it, the vendor rejects the refresh token (the account then reads
+  `needs_reconnect`), or the vendor is unreachable — cannot be asked, so the
+  account keeps its old rows until its owner retries or reconnects. Separately,
+  the Codex catalog silently omits models newer than the configured
+  `client_version` (§6.6). Both degrade to "fewer models than the vendor offers",
+  never to a wrong or emptied catalog.
 - **Known behavioral gaps.** A 401 on an unexpired-but-revoked access token does
   not flip the account to `needs_reconnect` (only a refresh rejection does); a
   persist-failure after a refresh may keep a single-use refresh token, forcing a
   reconnect on the next request. Both are bounded by the token TTL and accepted.
+  A third is **not** accepted but tracked: a PATCH that races a refresh can write
+  a stale `oauth_tokens` back, and its fix is a column-subset PATCH writer in
+  every store driver (§3.4; [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 - **Single-process assumptions.** The pending-connect state (PKCE verifier/state
-  and the device-code pending entry) and the per-account refresh lock are both
-  **in-process**: a gateway restart loses any connect in progress (the user starts
-  it again), and a multi-replica deployment (the PostgreSQL driver) would break the
-  refresh single-flight — two replicas could refresh one account concurrently and
-  burn its single-use refresh token. The feature is an operator-only experiment, so
+  and the device-code pending entry), the per-account refresh lock and the
+  per-account model-write lock (§6.4) are all **in-process**: a gateway restart
+  loses any connect in progress (the user starts it again), and a multi-replica
+  deployment (the PostgreSQL driver) would break the refresh single-flight — two
+  replicas could refresh one account concurrently and burn its single-use refresh
+  token — and let a discovery and a prefix re-label undo each other. The feature is an operator-only experiment, so
   one gateway process is assumed.
 
 ## Related chapters
@@ -552,10 +806,12 @@ reasons are recorded deliberately, not in denial of them
 - [Security, Authentication & Authorization](security-auth-rbac.md) — scopes and
   object-level authorization.
 - [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter) — the
-  three tables and the `usage_events.account_id` column (migration 82).
+  three tables and the `usage_events.account_id` column (migration 82), and the
+  prefix and display-name columns (migration 83).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
-  `/api/portal/vendor-accounts*` routes and their error codes.
+  `/api/portal/vendor-accounts*` routes (the model refresh included) and their
+  error codes.
 - [Configuration & Environment Variables](../reference/config-env.md) — the cipher
-  key and the two system settings.
+  key and the three system settings.
 - [ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)
   — the first-class-entity and experimental-subscription decisions.

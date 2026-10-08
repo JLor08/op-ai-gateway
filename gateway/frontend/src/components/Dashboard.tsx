@@ -113,7 +113,11 @@ export function Dashboard({
           emptyLabel={dashboard ? t.modelsEmpty : t.loading}
         >
           {routes.map((row) => (
-            <TableRow key={`${row.model}-${row.host}`}>
+            // A route's identity is its id (the mapping id of a self-hosted route, the
+            // account id plus model of a vendor-account model); model+host is only the
+            // fallback for a row without one, because two vendor accounts may share a
+            // name and a model.
+            <TableRow key={row.id ?? `${row.model}-${row.host}`}>
               <TableCell>{row.model}</TableCell>
               <TableCell>{row.provider}</TableCell>
               <TableCell>{row.host}</TableCell>

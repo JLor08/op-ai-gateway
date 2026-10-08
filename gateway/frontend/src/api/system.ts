@@ -86,6 +86,13 @@ export type SystemSettings = {
   // when it serves the requested model) or "fallback_only" (used only when no
   // self-hosted/shared route serves the model).
   vendor_account_routing_mode: VendorAccountRoutingMode;
+  // The Codex client_version the OpenAI subscription model discovery sends: the
+  // EFFECTIVE value, never blank (the built-in default when unset). OpenAI hides
+  // every model whose minimal client version exceeds it, so raise it when a new
+  // Codex app release leaves a new model missing from discovery. Valid: 1-64
+  // characters of letters, digits and "._+-", starting with a digit (anything
+  // else is a 400 system.vendor_openai_codex_client_version_invalid).
+  vendor_openai_codex_client_version: string;
   // Energy-attribution defaults (purely additive — no engine consumes these
   // yet; a later phase falls back to them when a per-mapping/per-server value
   // is unknown). All default 0 = "unset / no default".
@@ -491,6 +498,8 @@ export function systemApi(fetcher: Fetcher) {
       // is rejected with 400 system.vendor_account_routing_mode_invalid).
       vendor_accounts_enabled?: boolean;
       vendor_account_routing_mode?: VendorAccountRoutingMode;
+      // Omitted keeps the stored value, "" resets to the built-in default.
+      vendor_openai_codex_client_version?: string;
       // Energy-attribution defaults (0 resets to "unset / no default").
       energy_default_price_per_kwh?: number;
       energy_default_pue?: number;

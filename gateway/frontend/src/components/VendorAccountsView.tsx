@@ -6,7 +6,7 @@ import { Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
-import type { VendorAccount } from '../api';
+import type { VendorAccount, VendorModelsRefresh } from '../api';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
@@ -21,6 +21,8 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { vendorLabel } from './shared/vendorLabel';
+import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
+import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountUsage } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
@@ -92,6 +94,15 @@ function hasCredential(account: VendorAccount): boolean {
  * form then opens its detail view) and connected from the detail view's
  * "connect subscription" panel, which only ever sees `subscription_connected`.
  *
+ * An account may carry a model prefix (an optional input on the create form and
+ * the settings panel, validated inline against the shape the backend accepts):
+ * every model it serves is then listed and requested as prefix + the vendor's
+ * id. The detail view's "Models" panel (VendorAccountModels) lists the current
+ * models and refreshes them from the vendor. Saving the settings always sends the
+ * prefix -- the backend re-labels the account's models on any request that carries
+ * one, which also heals rows a failed earlier re-label left behind -- and a failed
+ * save re-reads the account, so the view shows what was truly persisted.
+ *
  * The detail view also shows a "Check credentials" panel
  * (VendorConnectionTest): a "Test connection" button whose verdict is about the
  * stored credential only, not about any model -- and a "Usage & limits" panel
@@ -117,6 +128,7 @@ export function VendorAccountsView({
     | 'pollVendorAccountDeviceConnect'
     | 'vendorAccount'
     | 'testConnection'
+    | 'refreshModels'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -154,6 +166,9 @@ export function VendorAccountsView({
   // (empty = keep the stored key) and the pending-clear flag.
   const [apiKey, setApiKey] = useState('');
   const [keyCleared, setKeyCleared] = useState(false);
+  // The optional model prefix, as typed (create and detail); trimmed on send.
+  const [modelPrefix, setModelPrefix] = useState('');
+  const modelPrefixValid = isValidModelPrefix(modelPrefix);
 
   function resetKeyInput() {
     setApiKey('');
@@ -164,6 +179,7 @@ export function VendorAccountsView({
     setName('');
     setVendor('openai');
     setAuthType('api_key');
+    setModelPrefix('');
     resetKeyInput();
     setMode('create');
   }
@@ -171,6 +187,7 @@ export function VendorAccountsView({
   function openDetail(account: VendorAccount) {
     setName(account.name);
     setStatus(account.status);
+    setModelPrefix(account.model_prefix);
     resetKeyInput();
     setMode({ kind: 'detail', account });
   }
@@ -183,13 +200,18 @@ export function VendorAccountsView({
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    // A malformed prefix is already flagged inline; never round-trip it for a 400.
+    if (!modelPrefixValid) return;
     setBusy(true);
     try {
+      // An empty prefix is simply omitted (= none).
+      const prefix = normalizeModelPrefix(modelPrefix);
+      const prefixField = prefix === '' ? {} : { model_prefix: prefix };
       // A subscription account carries no key: it is created disconnected.
       const created = await api.createVendorAccount(
         authType === 'subscription'
-          ? { vendor, auth_type: 'subscription', name }
-          : { vendor, auth_type: 'api_key', name, api_key: apiKey },
+          ? { vendor, auth_type: 'subscription', name, ...prefixField }
+          : { vendor, auth_type: 'api_key', name, api_key: apiKey, ...prefixField },
       );
       setAccountsData((current) => [...(current ?? []), created]);
       if (created.auth_type === 'subscription') {
@@ -207,6 +229,9 @@ export function VendorAccountsView({
 
   async function saveSettings() {
     if (typeof mode === 'string' || mode.kind !== 'detail') return;
+    // A malformed prefix is already flagged inline; never round-trip it for a 400.
+    if (!modelPrefixValid) return;
+    const before = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
     setBusy(true);
     try {
       // Key sentinel: a pending clear -> "" (clear); a typed value -> replace;
@@ -217,21 +242,49 @@ export function VendorAccountsView({
       } else if (apiKey !== '') {
         apiKeyPatch = { api_key: apiKey };
       }
-      const updated = await api.updateVendorAccount(mode.account.id, {
+      const updated = await api.updateVendorAccount(before.id, {
         name,
         status,
+        // Always sent, even unchanged: it makes the backend re-label the models.
+        model_prefix: normalizeModelPrefix(modelPrefix),
         ...apiKeyPatch,
       });
       setAccountsData((current) => (current ?? []).map((a) => (a.id === updated.id ? updated : a)));
       setMode({ kind: 'detail', account: updated });
       setStatus(updated.status);
+      setModelPrefix(updated.model_prefix);
       resetKeyInput();
       showSuccess(t.save);
     } catch (err) {
       showError(formatPortalError(err, t));
+      await reloadAfterFailedSave(before);
     } finally {
       setBusy(false);
     }
+  }
+
+  // A save that failed may still have written: the backend persists the account
+  // BEFORE it re-labels its models, so an error on that follow-on step leaves the
+  // new name, status and prefix stored. Re-read the account, so the list, the
+  // model list and (when the row was in fact written) the form show what is truly
+  // persisted rather than what was typed. A row that was not written (a refused
+  // value) keeps what the user typed, so it can be corrected. A re-read that fails
+  // too changes nothing: the error toast above already says what went wrong.
+  async function reloadAfterFailedSave(before: VendorAccount) {
+    let fresh: VendorAccount;
+    try {
+      fresh = await api.vendorAccount(before.id);
+    } catch {
+      return;
+    }
+    accountRefreshed(fresh);
+    const current = modeRef.current;
+    if (typeof current === 'string' || current.kind !== 'detail') return;
+    if (current.account.id !== fresh.id || fresh.updated_at === before.updated_at) return;
+    setName(fresh.name);
+    setStatus(fresh.status);
+    setModelPrefix(fresh.model_prefix);
+    resetKeyInput();
   }
 
   // A connect succeeded: the account now reads as connected (and active), so
@@ -248,6 +301,38 @@ export function VendorAccountsView({
     if (current.account.id !== updated.id) return;
     setMode({ kind: 'detail', account: updated });
     setStatus(updated.status);
+  }
+
+  // The models were refreshed (or the account was re-read after a failed save):
+  // the account in the list is replaced, and when the user is still on that
+  // account's detail view, so is the one it shows. The settings form is left
+  // alone -- an unsaved rename or prefix survives -- except for the status select,
+  // and only when the status itself changed: a refresh that finds the account's
+  // refresh token rejected flips it to needs_reconnect, and a Save with the stale
+  // select value would otherwise quietly re-activate it. Like accountConnected,
+  // it must not touch the view of an account the user has since left.
+  function accountRefreshed(updated: VendorAccount) {
+    setAccountsData((current) => (current ?? []).map((a) => (a.id === updated.id ? updated : a)));
+    const current = modeRef.current;
+    if (typeof current === 'string' || current.kind !== 'detail') return;
+    if (current.account.id !== updated.id) return;
+    if (current.account.status !== updated.status) setStatus(updated.status);
+    setMode({ kind: 'detail', account: updated });
+  }
+
+  // The explicit "refresh models": ask the gateway to re-discover the models from
+  // the vendor, adopt the account it answers with, and hand the outcome to the
+  // panel. `busy` keeps it and a settings save from overlapping. A thrown error
+  // is the panel's to show.
+  async function refreshAccountModels(id: string): Promise<VendorModelsRefresh> {
+    setBusy(true);
+    try {
+      const { account, refresh } = await api.refreshModels(id);
+      accountRefreshed(account);
+      return refresh;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function removeAccount(id: string) {
@@ -369,6 +454,19 @@ export function VendorAccountsView({
               onChange={(e) => setName(e.target.value)}
               required
             />
+            <Field
+              id="vendor-account-model-prefix"
+              label={t.vendorAccountModelPrefixLabel}
+              value={modelPrefix}
+              onChange={(e) => setModelPrefix(e.target.value)}
+              autoComplete="off"
+              error={!modelPrefixValid}
+              helperText={
+                modelPrefixValid
+                  ? t.vendorAccountModelPrefixNote
+                  : t.errorVendorAccountModelPrefixInvalid
+              }
+            />
             {authType === 'subscription' ? (
               <Typography color="text.secondary" variant="body2">
                 {t.vendorAccountSubscriptionCreateNote}
@@ -386,7 +484,7 @@ export function VendorAccountsView({
               />
             )}
             <Box sx={{ display: 'flex', gap: 1.5 }}>
-              <Button type="submit" variant="contained" disabled={busy}>
+              <Button type="submit" variant="contained" disabled={busy || !modelPrefixValid}>
                 {t.vendorAccountCreate}
               </Button>
               <Button type="button" variant="text" color="secondary" onClick={backToList}>
@@ -474,6 +572,19 @@ export function VendorAccountsView({
                 </option>
               )}
             </SelectField>
+            <Field
+              id="vendor-account-detail-model-prefix"
+              label={t.vendorAccountModelPrefixLabel}
+              value={modelPrefix}
+              onChange={(e) => setModelPrefix(e.target.value)}
+              autoComplete="off"
+              error={!modelPrefixValid}
+              helperText={
+                modelPrefixValid
+                  ? t.vendorAccountModelPrefixNote
+                  : t.errorVendorAccountModelPrefixInvalid
+              }
+            />
             {account.auth_type === 'api_key' && (
               <Box>
                 <Field
@@ -506,12 +617,25 @@ export function VendorAccountsView({
               </Box>
             )}
             <Box sx={{ display: 'flex', gap: 1.5 }}>
-              <Button type="submit" variant="contained" disabled={busy}>
+              <Button type="submit" variant="contained" disabled={busy || !modelPrefixValid}>
                 {t.save}
               </Button>
             </Box>
           </Box>
         </Panel>
+
+        {/* The account's current models, and the explicit refresh from the
+            vendor. Keyed by id only: a refresh answer must not drop its own
+            outcome, but another account never inherits one. */}
+        <Box sx={{ mt: 3 }}>
+          <VendorAccountModels
+            key={account.id}
+            t={t}
+            account={account}
+            busy={busy}
+            onRefresh={refreshAccountModels}
+          />
+        </Box>
 
         {/* The credential check works for every account: one without a stored
             credential simply answers "unverifiable". Keyed by id and updated_at,

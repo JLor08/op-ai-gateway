@@ -12,8 +12,10 @@ import type {
   CreateVendorAccountRequest,
   UpdateVendorAccountRequest,
   VendorAccount,
+  VendorAccountModel,
   VendorAccountUsage,
   VendorConnectionCheck,
+  VendorModelsRefresh,
 } from '../api';
 import type { MessageKey, PortalApi } from './shared/types';
 
@@ -24,6 +26,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     auth_type: 'api_key',
     name: 'Work OpenAI',
     status: 'active',
+    model_prefix: '',
     api_key_set: true,
     subscription_connected: false,
     models: [],
@@ -74,6 +77,40 @@ function makeCheck(overrides: Partial<VendorConnectionCheck> = {}): VendorConnec
   };
 }
 
+// A promise a test settles by hand, to hold a call in flight.
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// The models of an account with the prefix "chatgpt/": the second one carries no
+// display name (the vendor supplied none).
+const PREFIXED_MODELS: VendorAccountModel[] = [
+  {
+    gateway_model: 'chatgpt/gpt-6-luna',
+    upstream_model: 'gpt-6-luna',
+    api_flavor: 'openai_responses',
+    display_name: 'GPT-6 Luna',
+  },
+  {
+    gateway_model: 'chatgpt/gpt-6-sol',
+    upstream_model: 'gpt-6-sol',
+    api_flavor: 'openai_responses',
+    display_name: '',
+  },
+];
+
+// The models-refresh outcome as POST .../models/refresh answers it. The detail is
+// the token-free ENGLISH phrase the backend sends whatever the portal locale.
+function makeRefresh(overrides: Partial<VendorModelsRefresh> = {}): VendorModelsRefresh {
+  return { status: 'ok', discovered: 3, detail: 'discovered 3 models', ...overrides };
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -96,6 +133,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       pollVendorAccountDeviceConnect?: PortalApi['pollVendorAccountDeviceConnect'];
       vendorAccount?: PortalApi['vendorAccount'];
       testConnection?: PortalApi['testConnection'];
+      refreshModels?: PortalApi['refreshModels'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -172,6 +210,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ),
       testConnection: vi.fn<PortalApi['testConnection']>(
         opts.testConnection ?? (async () => makeCheck()),
+      ),
+      refreshModels: vi.fn<PortalApi['refreshModels']>(
+        opts.refreshModels ??
+          (async (id: string) => ({
+            account: makeVendorAccount({ id }),
+            refresh: makeRefresh(),
+          })),
       ),
     };
     const view = render(
@@ -435,7 +480,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
       const [id, body] = fakeApi.updateVendorAccount.mock.calls[0];
       expect(id).toBe('va_1');
-      expect(body).toEqual({ name: 'Renamed', status: 'active' });
+      // The prefix always rides along (the backend re-labels the models on any
+      // request that carries one); an account without one sends the empty string.
+      expect(body).toEqual({ name: 'Renamed', status: 'active', model_prefix: '' });
       expect('api_key' in body).toBe(false);
     });
 
@@ -451,6 +498,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(fakeApi.updateVendorAccount.mock.calls[0][1]).toEqual({
         name: 'Work OpenAI',
         status: 'disabled',
+        model_prefix: '',
       });
     });
 
@@ -1899,16 +1947,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     const testButton = () => screen.getByRole('button', { name: t.vendorCheckAction });
     const verdict = () => screen.getByRole('status');
 
-    function deferred<T>() {
-      let resolve!: (value: T) => void;
-      let reject!: (reason: unknown) => void;
-      const promise = new Promise<T>((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      return { promise, resolve, reject };
-    }
-
     it('offers the test button with a note that only the credentials are checked, not a model', async () => {
       const { fakeApi } = renderView();
       await openDetail();
@@ -2308,6 +2346,885 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await screen.findByText('Second');
 
       expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe(`VendorAccountsView model prefix [${locale}]`, () => {
+    async function openCreate() {
+      fireEvent.click(await screen.findByRole('button', { name: t.vendorAccountCreate }));
+      await screen.findByLabelText(t.vendorAccountApiKeyLabel);
+    }
+
+    async function openDetail() {
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    const prefixField = () => screen.getByLabelText(t.vendorAccountModelPrefixLabel);
+    const saveButton = () => screen.getByRole('button', { name: t.save });
+
+    // An update that answers like the backend: the account as stored, prefix included.
+    const storingUpdate: PortalApi['updateVendorAccount'] = async (id, body) =>
+      makeVendorAccount({
+        id,
+        name: body.name ?? 'Work OpenAI',
+        model_prefix: body.model_prefix ?? '',
+      });
+
+    describe('create form', () => {
+      it('offers an optional prefix field with a hint that shows the resulting model id', async () => {
+        renderView({ accounts: [] });
+        await openCreate();
+
+        const field = prefixField();
+        expect(field).toHaveValue('');
+        expect(field).not.toBeRequired();
+        expect(screen.getByText(t.vendorAccountModelPrefixNote)).toBeInTheDocument();
+        expect(t.vendorAccountModelPrefixNote).toContain('chatgpt/gpt-6-luna');
+      });
+
+      it('omits the prefix from the create body when none is typed', async () => {
+        const { fakeApi } = renderView({ accounts: [] });
+        await openCreate();
+
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+        expect('model_prefix' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
+      });
+
+      it('sends a typed prefix, trimmed, with an api_key account', async () => {
+        const { fakeApi } = renderView({ accounts: [] });
+        await openCreate();
+
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(prefixField(), { target: { value: '  chatgpt/ ' } });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+          vendor: 'openai',
+          auth_type: 'api_key',
+          name: 'Work',
+          api_key: 'sk-test-123',
+          model_prefix: 'chatgpt/',
+        });
+      });
+
+      it('sends the prefix with a subscription account too, and shows it on the detail it opens', async () => {
+        const { fakeApi } = renderView({
+          accounts: [],
+          createVendorAccount: async (body) =>
+            makeVendorAccount({
+              ...SUBSCRIPTION,
+              id: 'va_created',
+              name: body.name,
+              model_prefix: body.model_prefix ?? '',
+            }),
+        });
+        await openCreate();
+
+        fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+        fireEvent.click(await screen.findByRole('option', { name: t.vendorAuthSubscription }));
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Team' },
+        });
+        fireEvent.change(prefixField(), { target: { value: 'claude/' } });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+          vendor: 'openai',
+          auth_type: 'subscription',
+          name: 'Team',
+          model_prefix: 'claude/',
+        });
+        await screen.findByText(t.vendorAccountSettingsTitle);
+        expect(prefixField()).toHaveValue('claude/');
+      });
+
+      it('does not carry a typed prefix into the next create form', async () => {
+        renderView({ accounts: [] });
+        await openCreate();
+        fireEvent.change(prefixField(), { target: { value: 'chatgpt/' } });
+
+        fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+        await openCreate();
+
+        expect(prefixField()).toHaveValue('');
+      });
+
+      it.each([
+        ['a space', 'chat gpt/'],
+        ['a query character', 'chat?gpt'],
+        ['a non-ASCII letter', 'chätgpt/'],
+        ['a ".."', 'a..b'],
+        ['more than 64 characters', 'x'.repeat(65)],
+      ])('rejects a prefix with %s inline, without calling the API', async (_why, bad) => {
+        const { fakeApi, container } = renderView({ accounts: [] });
+        await openCreate();
+
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.change(prefixField(), { target: { value: bad } });
+
+        // The hint turns into the reason, the field is flagged and Create is off.
+        expect(screen.getByText(t.errorVendorAccountModelPrefixInvalid)).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorAccountModelPrefixNote)).not.toBeInTheDocument();
+        expect(prefixField()).toHaveAttribute('aria-invalid', 'true');
+        expect(screen.getByRole('button', { name: t.vendorAccountCreate })).toBeDisabled();
+
+        // Not even a submit that bypasses the disabled button (Enter in a field).
+        fireEvent.submit(container.querySelector('form')!);
+        expect(fakeApi.createVendorAccount).not.toHaveBeenCalled();
+
+        // Correcting it brings the form back.
+        fireEvent.change(prefixField(), { target: { value: 'ok/' } });
+        expect(screen.queryByText(t.errorVendorAccountModelPrefixInvalid)).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.vendorAccountCreate })).toBeEnabled();
+      });
+
+      it('accepts every character the backend allows', async () => {
+        renderView({ accounts: [] });
+        await openCreate();
+
+        fireEvent.change(prefixField(), { target: { value: 'aZ09._~:/@+-' } });
+
+        expect(screen.queryByText(t.errorVendorAccountModelPrefixInvalid)).not.toBeInTheDocument();
+        expect(prefixField()).toHaveAttribute('aria-invalid', 'false');
+      });
+
+      it('shows a prefix the backend still refuses as the localized toast and stays on the form', async () => {
+        renderView({
+          accounts: [],
+          createVendorAccount: async () => {
+            throw new PortalApiError(
+              400,
+              'vendor_account.model_prefix_invalid',
+              'model prefix must be at most 64 characters',
+            );
+          },
+        });
+        await openCreate();
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.change(prefixField(), { target: { value: 'chatgpt/' } });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        expect(
+          await screen.findByText(
+            `vendor_account.model_prefix_invalid: ${t.errorVendorAccountModelPrefixInvalid}`,
+          ),
+        ).toBeInTheDocument();
+        expect(prefixField()).toHaveValue('chatgpt/');
+      });
+    });
+
+    describe('detail view', () => {
+      it('shows the stored prefix, and an empty field for an account without one', async () => {
+        renderView({ accounts: [makeVendorAccount({ model_prefix: 'chatgpt/' })] });
+        await openDetail();
+        expect(prefixField()).toHaveValue('chatgpt/');
+        expect(screen.getByText(t.vendorAccountModelPrefixNote)).toBeInTheDocument();
+
+        cleanup();
+        renderView();
+        await openDetail();
+        expect(prefixField()).toHaveValue('');
+      });
+
+      it('round-trips: sends the edited prefix trimmed, then shows what the backend stored', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/' })],
+          updateVendorAccount: storingUpdate,
+        });
+        await openDetail();
+
+        fireEvent.change(prefixField(), { target: { value: '  claude/ ' } });
+        fireEvent.click(saveButton());
+
+        await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.updateVendorAccount).toHaveBeenCalledWith('va_1', {
+          name: 'Work OpenAI',
+          status: 'active',
+          model_prefix: 'claude/',
+        });
+        // The field now shows the stored value (trimmed), not the typed one.
+        await waitFor(() => expect(prefixField()).toHaveValue('claude/'));
+      });
+
+      it('clears the prefix with the exact empty string', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/' })],
+          updateVendorAccount: storingUpdate,
+        });
+        await openDetail();
+
+        fireEvent.change(prefixField(), { target: { value: '' } });
+        fireEvent.click(saveButton());
+
+        await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.updateVendorAccount.mock.calls[0][1]).toMatchObject({ model_prefix: '' });
+        await waitFor(() => expect(prefixField()).toHaveValue(''));
+      });
+
+      it('re-sends an unchanged prefix, so the backend can heal a failed earlier re-label', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/' })],
+          updateVendorAccount: storingUpdate,
+        });
+        await openDetail();
+
+        fireEvent.click(saveButton());
+
+        await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.updateVendorAccount.mock.calls[0][1]).toMatchObject({
+          model_prefix: 'chatgpt/',
+        });
+      });
+
+      it('updates the shown models to the ones the backend re-labelled on save', async () => {
+        renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/', models: PREFIXED_MODELS })],
+          updateVendorAccount: async (id) =>
+            makeVendorAccount({
+              id,
+              model_prefix: 'oai/',
+              models: PREFIXED_MODELS.map((m) => ({
+                ...m,
+                gateway_model: `oai/${m.upstream_model}`,
+              })),
+            }),
+        });
+        await openDetail();
+        const table = screen.getByRole('table', { name: t.vendorModelsListLabel });
+        expect(within(table).getByText('chatgpt/gpt-6-luna')).toBeInTheDocument();
+
+        fireEvent.change(prefixField(), { target: { value: 'oai/' } });
+        fireEvent.click(saveButton());
+
+        expect(await within(table).findByText('oai/gpt-6-luna')).toBeInTheDocument();
+        expect(within(table).queryByText('chatgpt/gpt-6-luna')).not.toBeInTheDocument();
+      });
+
+      it.each([
+        ['a space', 'chat gpt/'],
+        ['a fragment character', 'chat#gpt'],
+        ['a ".."', '../x'],
+        ['more than 64 characters', 'x'.repeat(65)],
+      ])('rejects a prefix with %s inline, without calling the API', async (_why, bad) => {
+        const { fakeApi, container } = renderView();
+        await openDetail();
+
+        fireEvent.change(prefixField(), { target: { value: bad } });
+
+        expect(screen.getByText(t.errorVendorAccountModelPrefixInvalid)).toBeInTheDocument();
+        expect(prefixField()).toHaveAttribute('aria-invalid', 'true');
+        expect(saveButton()).toBeDisabled();
+        fireEvent.submit(container.querySelector('form')!);
+        expect(fakeApi.updateVendorAccount).not.toHaveBeenCalled();
+
+        fireEvent.change(prefixField(), { target: { value: 'ok/' } });
+        expect(saveButton()).toBeEnabled();
+      });
+
+      describe('after a failed save', () => {
+        // The account as the backend persisted it although the save errored: the
+        // row is written BEFORE the models are re-labelled, so a failure in that
+        // follow-on step leaves the new name, status and prefix stored.
+        const persisted = makeVendorAccount({
+          name: 'Renamed',
+          model_prefix: 'new/',
+          updated_at: '2026-10-08T11:00:00Z',
+          models: [
+            {
+              gateway_model: 'new/gpt-6-luna',
+              upstream_model: 'gpt-6-luna',
+              api_flavor: 'openai_responses',
+              display_name: 'GPT-6 Luna',
+            },
+          ],
+        });
+
+        function renderFailingSave(
+          reread: (id: string) => Promise<VendorAccount>,
+          error: PortalApiError,
+        ) {
+          const rendered = renderView({
+            accounts: [makeVendorAccount({ models: PREFIXED_MODELS, model_prefix: 'chatgpt/' })],
+            updateVendorAccount: async () => {
+              throw error;
+            },
+            vendorAccount: reread,
+          });
+          return rendered;
+        }
+
+        async function typeAndSave(name: string, prefix: string) {
+          await openDetail();
+          // The usage panel reads the account once when the detail opens.
+          await waitFor(() => expect(screen.queryByText(t.vendorUsageTitle)).toBeNull());
+          fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+            target: { value: name },
+          });
+          fireEvent.change(prefixField(), { target: { value: prefix } });
+          fireEvent.click(saveButton());
+        }
+
+        it('re-reads the account and shows what was truly persisted', async () => {
+          let reads = 0;
+          const { fakeApi } = renderFailingSave(
+            async () => {
+              reads += 1;
+              // The first read is the usage panel's, on opening the detail.
+              return reads === 1 ? makeVendorAccount() : persisted;
+            },
+            new PortalApiError(500, 'vendor_account.update_failed', 'relabel failed'),
+          );
+
+          await typeAndSave('Renamed', 'new/');
+
+          // The failure itself is still told.
+          expect(
+            await screen.findByText('vendor_account.update_failed: relabel failed'),
+          ).toBeInTheDocument();
+          expect(fakeApi.vendorAccount).toHaveBeenLastCalledWith('va_1');
+          // The prefix and name fields and the model list read the persisted row.
+          const table = screen.getByRole('table', { name: t.vendorModelsListLabel });
+          expect(await within(table).findByText('new/gpt-6-luna')).toBeInTheDocument();
+          expect(prefixField()).toHaveValue('new/');
+          expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Renamed');
+          // And the list behind it.
+          fireEvent.click(screen.getByRole('button', { name: t.providers }));
+          expect(await screen.findByText('Renamed')).toBeInTheDocument();
+        });
+
+        it('keeps what was typed when the row was not written, so it can be corrected', async () => {
+          const { fakeApi } = renderFailingSave(
+            // Unchanged: the same updated_at the account was opened with.
+            async () => makeVendorAccount({ models: PREFIXED_MODELS, model_prefix: 'chatgpt/' }),
+            new PortalApiError(400, 'vendor_account.model_prefix_invalid', 'raw server text'),
+          );
+
+          await typeAndSave('Draft', 'bad/');
+
+          expect(
+            await screen.findByText(
+              `vendor_account.model_prefix_invalid: ${t.errorVendorAccountModelPrefixInvalid}`,
+            ),
+          ).toBeInTheDocument();
+          await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2));
+          expect(prefixField()).toHaveValue('bad/');
+          expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Draft');
+          // The stored models are still the ones listed.
+          expect(screen.getByText('chatgpt/gpt-6-luna')).toBeInTheDocument();
+          expect(saveButton()).toBeEnabled();
+        });
+
+        it('leaves the form alone, with only the original error, when the re-read fails too', async () => {
+          let reads = 0;
+          const { fakeApi } = renderFailingSave(
+            async () => {
+              reads += 1;
+              if (reads === 1) return makeVendorAccount();
+              throw new PortalApiError(404, 'vendor_account.not_found', 'gone');
+            },
+            new PortalApiError(500, 'vendor_account.update_failed', 'relabel failed'),
+          );
+
+          await typeAndSave('Draft', 'new/');
+
+          expect(
+            await screen.findByText('vendor_account.update_failed: relabel failed'),
+          ).toBeInTheDocument();
+          await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2));
+          await waitFor(() => expect(saveButton()).toBeEnabled());
+          expect(screen.queryByText(/vendor_account\.not_found/)).not.toBeInTheDocument();
+          expect(screen.getAllByRole('alert')).toHaveLength(1);
+          expect(prefixField()).toHaveValue('new/');
+          expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Draft');
+        });
+      });
+    });
+  });
+
+  describe(`VendorAccountsView models [${locale}]`, () => {
+    async function openDetail(name = 'Work OpenAI') {
+      const row = (await screen.findByText(name)).closest('tr')!;
+      fireEvent.click(within(row).getByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    const panel = () => screen.getByRole('region', { name: t.vendorModelsTitle });
+    const refreshButton = () => screen.getByRole('button', { name: t.vendorModelsRefreshAction });
+    const outcome = () => within(panel()).getByRole('status');
+
+    // What the backend answers after it stored `models` for an account.
+    const refreshed = (
+      models: VendorAccountModel[],
+      overrides: Partial<VendorAccount> = {},
+      refresh: Partial<VendorModelsRefresh> = {},
+    ) => ({
+      account: makeVendorAccount({ model_prefix: 'chatgpt/', models, ...overrides }),
+      refresh: makeRefresh({ discovered: models.length, ...refresh }),
+    });
+
+    describe('model list', () => {
+      it('shows each model by its display name and its gateway-facing (prefixed) id', async () => {
+        renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/', models: PREFIXED_MODELS })],
+        });
+        await openDetail();
+
+        const table = screen.getByRole('table', { name: t.vendorModelsListLabel });
+        const rows = within(table).getAllByRole('row');
+        // Header plus one row per model.
+        expect(rows).toHaveLength(3);
+        expect(within(table).getByText(t.vendorModelsColName)).toBeInTheDocument();
+        expect(within(table).getByText(t.vendorModelsColId)).toBeInTheDocument();
+        const luna = within(table).getByText('GPT-6 Luna').closest('tr')!;
+        expect(within(luna).getByText('chatgpt/gpt-6-luna')).toBeInTheDocument();
+        // The vendor's own (unprefixed) id is not what clients request.
+        expect(within(table).queryByText('gpt-6-luna')).not.toBeInTheDocument();
+        // A model without a display name shows a dash beside its id.
+        const sol = within(table).getByText('chatgpt/gpt-6-sol').closest('tr')!;
+        expect(within(sol).getByText('—')).toBeInTheDocument();
+      });
+
+      it('says so for an account without models, and shows no table', async () => {
+        renderView();
+        await openDetail();
+
+        expect(within(panel()).getByText(t.vendorModelsEmpty)).toBeInTheDocument();
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+      });
+
+      it('renders vendor-supplied names and ids as text, never as markup', async () => {
+        const hostile: VendorAccountModel[] = [
+          {
+            gateway_model: 'x/<b>bold</b>',
+            upstream_model: '<b>bold</b>',
+            api_flavor: 'openai_responses',
+            display_name: '<img src=x onerror="alert(1)"> & "quoted" <script>boom()</script>',
+          },
+        ];
+        renderView({ accounts: [makeVendorAccount({ model_prefix: 'x/', models: hostile })] });
+        await openDetail();
+
+        const table = screen.getByRole('table', { name: t.vendorModelsListLabel });
+        expect(
+          within(table).getByText(
+            '<img src=x onerror="alert(1)"> & "quoted" <script>boom()</script>',
+          ),
+        ).toBeInTheDocument();
+        expect(within(table).getByText('x/<b>bold</b>')).toBeInTheDocument();
+        expect(table.querySelector('img, b, script')).toBeNull();
+        expect(table.innerHTML).toContain('&lt;img');
+      });
+
+      it('is shown on the detail view only, not on the list or the create form', async () => {
+        renderView();
+        await screen.findByText('Work OpenAI');
+        expect(screen.queryByRole('button', { name: t.vendorModelsRefreshAction })).toBeNull();
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+        await screen.findByLabelText(t.vendorAccountNameLabel);
+        expect(screen.queryByRole('button', { name: t.vendorModelsRefreshAction })).toBeNull();
+        expect(screen.queryByText(t.vendorModelsTitle)).not.toBeInTheDocument();
+      });
+
+      it('is offered on an api_key account and a subscription alike', async () => {
+        renderView({ accounts: [makeVendorAccount(SUBSCRIPTION)] });
+        await openDetail('Team Claude Max');
+        expect(refreshButton()).toBeEnabled();
+      });
+    });
+
+    describe('refresh', () => {
+      it('asks for the open account by id and does nothing until the user clicks', async () => {
+        const { fakeApi } = renderView();
+        await openDetail();
+        expect(fakeApi.refreshModels).not.toHaveBeenCalled();
+        expect(within(panel()).queryByRole('status')).not.toBeInTheDocument();
+
+        fireEvent.click(refreshButton());
+
+        await waitFor(() => expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1));
+        expect(fakeApi.refreshModels).toHaveBeenCalledWith('va_1');
+      });
+
+      it('reads an ok outcome as "N models refreshed", in success style, and shows the new models', async () => {
+        renderView({ refreshModels: async () => refreshed(PREFIXED_MODELS) });
+        await openDetail();
+        expect(within(panel()).getByText(t.vendorModelsEmpty)).toBeInTheDocument();
+
+        fireEvent.click(refreshButton());
+
+        expect(await within(panel()).findByText(t.vendorModelsRefreshed(2))).toBeInTheDocument();
+        expect(outcome()).toHaveClass('MuiAlert-colorSuccess');
+        // The model list follows the account the refresh answered with.
+        const table = screen.getByRole('table', { name: t.vendorModelsListLabel });
+        expect(within(table).getByText('GPT-6 Luna')).toBeInTheDocument();
+        expect(within(table).getByText('chatgpt/gpt-6-sol')).toBeInTheDocument();
+        expect(within(panel()).queryByText(t.vendorModelsEmpty)).not.toBeInTheDocument();
+        // No technical line and no failure wording beside a success.
+        expect(within(outcome()).queryByText(t.vendorModelsRefreshUnverifiable)).toBeNull();
+      });
+
+      it('words one model and several differently, and each outcome apart', () => {
+        expect(t.vendorModelsRefreshed(1)).not.toBe(t.vendorModelsRefreshed(2));
+        expect(t.vendorModelsRefreshed(2)).toContain('2');
+        expect(t.vendorModelsRefreshed(1)).toContain('1');
+        expect(t.vendorModelsRefreshed(2)).not.toBe(t.vendorModelsRefreshUnverifiable);
+      });
+
+      it('reads a single refreshed model in the singular', async () => {
+        renderView({ refreshModels: async () => refreshed(PREFIXED_MODELS.slice(0, 1)) });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+
+        expect(await within(panel()).findByText(t.vendorModelsRefreshed(1))).toBeInTheDocument();
+      });
+
+      it('reads an unverifiable outcome neutrally, with the technical detail and the models unchanged', async () => {
+        const detail = 'the vendor could not be reached';
+        renderView({
+          accounts: [makeVendorAccount({ model_prefix: 'chatgpt/', models: PREFIXED_MODELS })],
+          refreshModels: async () =>
+            refreshed(PREFIXED_MODELS, {}, { status: 'unverifiable', discovered: 0, detail }),
+        });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+
+        expect(
+          await within(panel()).findByText(t.vendorModelsRefreshUnverifiable),
+        ).toBeInTheDocument();
+        expect(outcome()).toHaveClass('MuiAlert-colorInfo');
+        expect(outcome()).not.toHaveClass('MuiAlert-colorSuccess');
+        expect(outcome()).not.toHaveClass('MuiAlert-colorError');
+        // The English detail is secondary technical text, never the headline.
+        expect(within(outcome()).getByText(t.vendorCheckDetail(detail))).toBeInTheDocument();
+        expect(within(outcome()).getByText(t.vendorModelsRefreshUnchanged)).toBeInTheDocument();
+        // No reconnect hint for an account that is fine, and no count.
+        expect(
+          within(outcome()).queryByText(t.vendorModelsRefreshReconnect(t.vendorConnectTitle)),
+        ).toBeNull();
+        expect(within(panel()).queryByText(t.vendorModelsRefreshed(0))).toBeNull();
+        // The existing models stay listed.
+        expect(screen.getByText('chatgpt/gpt-6-luna')).toBeInTheDocument();
+        // It is no failure: no toast.
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('shows no technical line when an unverifiable outcome carries no detail', async () => {
+        renderView({
+          refreshModels: async () =>
+            refreshed([], {}, { status: 'unverifiable', discovered: 0, detail: '' }),
+        });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+
+        await within(panel()).findByText(t.vendorModelsRefreshUnverifiable);
+        // Only the headline and the "unchanged" note: no empty "technical detail:" line.
+        const technicalLabel = t.vendorCheckDetail('').trim();
+        expect(outcome().textContent).not.toContain(technicalLabel);
+        expect(within(outcome()).getByText(t.vendorModelsRefreshUnchanged)).toBeInTheDocument();
+      });
+
+      it('adds the reconnect hint and flips the status when a rejected refresh token is why', async () => {
+        const { fakeApi } = renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          refreshModels: async (id) => ({
+            account: makeVendorAccount({
+              ...SUBSCRIPTION,
+              id,
+              subscription_connected: true,
+              status: 'needs_reconnect',
+            }),
+            refresh: makeRefresh({
+              status: 'unverifiable',
+              discovered: 0,
+              detail: 'the refresh token was rejected',
+            }),
+          }),
+        });
+        await openDetail('Team Claude Max');
+        expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(t.statusActive);
+
+        fireEvent.click(refreshButton());
+
+        expect(
+          await within(panel()).findByText(t.vendorModelsRefreshReconnect(t.vendorConnectTitle)),
+        ).toBeInTheDocument();
+        expect(within(outcome()).getByText(t.vendorModelsRefreshUnverifiable)).toBeInTheDocument();
+        // The status select follows, so a Save cannot quietly re-activate the account.
+        expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(
+          t.vendorAccountStatusNeedsReconnect,
+        );
+        fireEvent.click(screen.getByRole('button', { name: t.save }));
+        await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.updateVendorAccount.mock.calls[0][1].status).toBe('needs_reconnect');
+      });
+
+      it('never renders a token, whatever the outcome says', async () => {
+        const { container } = renderView({
+          refreshModels: async () => refreshed(PREFIXED_MODELS),
+        });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+        await within(panel()).findByText(t.vendorModelsRefreshed(2));
+
+        expect(container.innerHTML).not.toMatch(/sk-|access_token|refresh_token|Bearer/);
+      });
+
+      it('shows a thrown error as the localized toast, not as an outcome, and re-enables the button', async () => {
+        renderView({
+          refreshModels: async () => {
+            throw new PortalApiError(
+              409,
+              'vendor_account.credential_unreadable',
+              'raw server text',
+            );
+          },
+        });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+
+        expect(
+          await screen.findByText(
+            `vendor_account.credential_unreadable: ${t.errorVendorAccountCredentialUnreadable}`,
+          ),
+        ).toBeInTheDocument();
+        expect(within(panel()).queryByRole('status')).not.toBeInTheDocument();
+        expect(refreshButton()).toBeEnabled();
+      });
+
+      it('labels the refresh 500 and a disabled module with their own localized text', async () => {
+        const refreshModels = vi
+          .fn<PortalApi['refreshModels']>()
+          .mockRejectedValueOnce(
+            new PortalApiError(
+              500,
+              'vendor_account.refresh_failed',
+              'vendor account request failed',
+            ),
+          )
+          .mockRejectedValueOnce(
+            new PortalApiError(409, 'vendor_accounts.module_disabled', 'module disabled'),
+          );
+        renderView({ refreshModels });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+        expect(
+          await screen.findByText(
+            `vendor_account.refresh_failed: ${t.errorVendorAccountRefreshFailed}`,
+          ),
+        ).toBeInTheDocument();
+
+        fireEvent.click(refreshButton());
+        expect(
+          await screen.findByText(
+            `vendor_accounts.module_disabled: ${t.errorVendorAccountsModuleDisabled}`,
+          ),
+        ).toBeInTheDocument();
+      });
+
+      it('disables the button while it runs, sends one request, and re-enables it with the outcome', async () => {
+        const pending = deferred<Awaited<ReturnType<PortalApi['refreshModels']>>>();
+        const { fakeApi } = renderView({ refreshModels: () => pending.promise });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+
+        await waitFor(() => expect(refreshButton()).toBeDisabled());
+        fireEvent.click(refreshButton());
+        expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1);
+        // A progress indicator, and no outcome yet.
+        expect(within(refreshButton()).getByRole('progressbar')).toBeInTheDocument();
+        expect(within(panel()).queryByRole('status')).not.toBeInTheDocument();
+        // A settings save would overwrite the answer, so it waits too.
+        expect(screen.getByRole('button', { name: t.save })).toBeDisabled();
+
+        await act(async () => pending.resolve(refreshed(PREFIXED_MODELS)));
+
+        expect(await within(panel()).findByText(t.vendorModelsRefreshed(2))).toBeInTheDocument();
+        expect(refreshButton()).toBeEnabled();
+        expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+        expect(within(refreshButton()).queryByRole('progressbar')).not.toBeInTheDocument();
+      });
+
+      it('disables the refresh while a settings save runs', async () => {
+        const pending = deferred<VendorAccount>();
+        const { fakeApi } = renderView({ updateVendorAccount: () => pending.promise });
+        await openDetail();
+
+        fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+        await waitFor(() => expect(refreshButton()).toBeDisabled());
+        fireEvent.click(refreshButton());
+        expect(fakeApi.refreshModels).not.toHaveBeenCalled();
+
+        await act(async () => pending.resolve(makeVendorAccount()));
+        await waitFor(() => expect(refreshButton()).toBeEnabled());
+      });
+
+      it('hides the previous outcome while it refreshes again, then shows the new one', async () => {
+        const second = deferred<Awaited<ReturnType<PortalApi['refreshModels']>>>();
+        const refreshModels = vi
+          .fn<PortalApi['refreshModels']>()
+          .mockResolvedValueOnce(refreshed(PREFIXED_MODELS))
+          .mockReturnValueOnce(second.promise);
+        renderView({ refreshModels });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+        await within(panel()).findByText(t.vendorModelsRefreshed(2));
+
+        fireEvent.click(refreshButton());
+        await waitFor(() => expect(refreshButton()).toBeDisabled());
+        expect(within(panel()).queryByText(t.vendorModelsRefreshed(2))).not.toBeInTheDocument();
+
+        await act(async () =>
+          second.resolve(
+            refreshed(
+              [],
+              {},
+              { status: 'unverifiable', discovered: 0, detail: 'the vendor refused' },
+            ),
+          ),
+        );
+        expect(
+          await within(panel()).findByText(t.vendorModelsRefreshUnverifiable),
+        ).toBeInTheDocument();
+        expect(within(panel()).queryByText(t.vendorModelsRefreshed(2))).not.toBeInTheDocument();
+      });
+
+      it('clears an earlier outcome when the next refresh throws', async () => {
+        const refreshModels = vi
+          .fn<PortalApi['refreshModels']>()
+          .mockResolvedValueOnce(refreshed(PREFIXED_MODELS))
+          .mockRejectedValueOnce(new PortalApiError(500, 'vendor_account.refresh_failed', 'raw'));
+        renderView({ refreshModels });
+        await openDetail();
+
+        fireEvent.click(refreshButton());
+        await within(panel()).findByText(t.vendorModelsRefreshed(2));
+        fireEvent.click(refreshButton());
+
+        await screen.findByText(
+          `vendor_account.refresh_failed: ${t.errorVendorAccountRefreshFailed}`,
+        );
+        expect(within(panel()).queryByText(t.vendorModelsRefreshed(2))).not.toBeInTheDocument();
+      });
+
+      it('keeps unsaved edits in the settings form across a refresh', async () => {
+        renderView({ refreshModels: async () => refreshed(PREFIXED_MODELS) });
+        await openDetail();
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Draft name' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountModelPrefixLabel), {
+          target: { value: 'draft/' },
+        });
+
+        fireEvent.click(refreshButton());
+        await within(panel()).findByText(t.vendorModelsRefreshed(2));
+
+        expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Draft name');
+        expect(screen.getByLabelText(t.vendorAccountModelPrefixLabel)).toHaveValue('draft/');
+      });
+
+      it("does not show one account's outcome on another account", async () => {
+        renderView({
+          accounts: [
+            makeVendorAccount(),
+            makeVendorAccount({ id: 'va_other', name: 'Other OpenAI' }),
+          ],
+        });
+        await openDetail();
+        fireEvent.click(refreshButton());
+        await within(panel()).findByText(t.vendorModelsRefreshed(3));
+
+        fireEvent.click(screen.getByRole('button', { name: t.providers }));
+        await openDetail('Other OpenAI');
+
+        expect(within(panel()).queryByRole('status')).not.toBeInTheDocument();
+        expect(refreshButton()).toBeEnabled();
+      });
+
+      describe('when the answer arrives after the user left the account', () => {
+        it('shows no outcome and no toast, but still updates the account in the list', async () => {
+          const pending = deferred<Awaited<ReturnType<PortalApi['refreshModels']>>>();
+          const { fakeApi } = renderView({ refreshModels: () => pending.promise });
+          await openDetail();
+          fireEvent.click(refreshButton());
+          await waitFor(() => expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1));
+
+          fireEvent.click(screen.getByRole('button', { name: t.providers }));
+          await screen.findByRole('button', { name: t.vendorAccountCreate });
+          await act(async () =>
+            pending.resolve({
+              account: makeVendorAccount({ status: 'needs_reconnect' }),
+              refresh: makeRefresh({ status: 'unverifiable', discovered: 0 }),
+            }),
+          );
+
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+          expect(screen.queryByRole('status')).not.toBeInTheDocument();
+          // The list row now reads what the refresh found.
+          const row = screen.getByText('Work OpenAI').closest('tr')!;
+          expect(within(row).getByText(t.vendorAccountStatusNeedsReconnect)).toBeInTheDocument();
+          // Back on the account: no outcome, and the status select follows the account.
+          await openDetail();
+          expect(within(panel()).queryByRole('status')).not.toBeInTheDocument();
+          expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(
+            t.vendorAccountStatusNeedsReconnect,
+          );
+        });
+
+        it('shows no toast for a refresh that failed', async () => {
+          const pending = deferred<Awaited<ReturnType<PortalApi['refreshModels']>>>();
+          const { fakeApi } = renderView({ refreshModels: () => pending.promise });
+          await openDetail();
+          fireEvent.click(refreshButton());
+          await waitFor(() => expect(fakeApi.refreshModels).toHaveBeenCalledTimes(1));
+
+          fireEvent.click(screen.getByRole('button', { name: t.providers }));
+          await screen.findByRole('button', { name: t.vendorAccountCreate });
+          await act(async () =>
+            pending.reject(new PortalApiError(500, 'vendor_account.refresh_failed', 'raw')),
+          );
+
+          expect(screen.queryByText(/vendor_account\.refresh_failed/)).not.toBeInTheDocument();
+          await openDetail();
+          expect(refreshButton()).toBeEnabled();
+        });
+      });
     });
   });
 }

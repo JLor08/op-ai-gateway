@@ -175,6 +175,63 @@ func TestVendorAccountConnectImportEndpointOptionalFields(t *testing.T) {
 	}
 }
 
+// A connect runs a best-effort model discovery: the import response already lists
+// the models the vendor reported (under the account's prefix), and a failing
+// discovery still answers the connect with 200 and the seeded catalog.
+func TestVendorAccountConnectImportEndpointDiscoversTheRealModels(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fetch    portal.VendorOpenAISubscriptionDiscoverer
+		wantRows []string
+	}{
+		{
+			name: "discovered",
+			fetch: func(_ context.Context, _ *http.Client, accessToken, _, _ string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+				if accessToken != vaConnectAccess {
+					return nil, vendorauth.DiscoveryUnverifiable
+				}
+				return []vendorauth.DiscoveredModel{{Slug: "gpt-6-luna", DisplayName: "GPT-6 Luna"}, {Slug: "gpt-6.1-sol", DisplayName: "GPT-6.1 Sol"}}, vendorauth.DiscoveryOK
+			},
+			wantRows: []string{"chatgpt/gpt-6-luna", "chatgpt/gpt-6.1-sol"},
+		},
+		{
+			name: "vendor cannot be asked",
+			fetch: func(context.Context, *http.Client, string, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+				return nil, vendorauth.DiscoveryUnverifiable
+			},
+			wantRows: []string{"chatgpt/gpt-5", "chatgpt/gpt-5-mini"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, _ := newVendorAccountSettingsTestServerWithDeps(t, true, func(deps *portal.ServiceDeps) {
+				deps.VendorDiscoverers.OpenAISubscription = tc.fetch
+			})
+			enableVendorAccountsFlag(t, srv)
+			created := vaDo(t, srv, http.MethodPost, "/api/portal/vendor-accounts", vaOwnerSecret,
+				`{"vendor":"openai","auth_type":"subscription","name":"ChatGPT","model_prefix":"chatgpt/"}`)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+			}
+			acc := vaDecode(t, created)
+
+			rec := vaDo(t, srv, http.MethodPost, vaConnectPath(acc.ID, "import"), vaOwnerSecret, `{"access_token":"`+vaConnectAccess+`"}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("import status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), vaConnectAccess) {
+				t.Fatalf("import response leaks a token: %s", rec.Body.String())
+			}
+			var got []string
+			for _, m := range vaDecode(t, rec).Models {
+				got = append(got, m.GatewayModel)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.wantRows, ",") {
+				t.Fatalf("models = %v, want %v", got, tc.wantRows)
+			}
+		})
+	}
+}
+
 func TestVendorAccountConnectImportEndpointValidation(t *testing.T) {
 	srv, routeStore, _ := newVendorConnectTestServer(t)
 	acc := vaCreateSubscription(t, srv, vaOwnerSecret, "anthropic", "Claude Max")

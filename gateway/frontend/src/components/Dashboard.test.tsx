@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, within } from '@testing-library/react';
 import { Dashboard } from './Dashboard';
 import { messages, type Locale } from '../i18n';
@@ -32,6 +32,73 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const routesTable = screen.getByRole('table');
       expect(within(routesTable).getByText(t.modelsEmpty)).toBeInTheDocument();
       expect(screen.queryByText(t.loading)).toBeNull();
+    });
+  });
+
+  describe(`Dashboard live routes: vendor-account models [${locale}]`, () => {
+    const metrics = { requests_24h: 0, tokens_24h: 0, healthy_hosts: '1/1', latency_p95_ms: 0 };
+    // The shapes the backend's dashboardRouteData sends: a self-hosted route
+    // (mapping id, application type, server name) next to the principal's own
+    // vendor-account model (vendor, account name, the PREFIXED gateway model).
+    const selfHosted = {
+      id: 'map_1',
+      model: 'qwen-coder',
+      provider: 'vllm',
+      host: 'Server One',
+      status: 'active',
+    } as const;
+    const vendorModel = {
+      id: 'va_1:chatgpt/gpt-6-luna',
+      model: 'chatgpt/gpt-6-luna',
+      provider: 'openai',
+      host: 'My ChatGPT',
+      status: 'active',
+    } as const;
+
+    it('lists a vendor-account model under its prefixed name, next to the self-hosted routes', () => {
+      const dashboard: DashboardResponse = { metrics, routes: [selfHosted, vendorModel] };
+      render(<Dashboard t={t} dashboard={dashboard} productName="X" />);
+      const routesTable = screen.getByRole('table');
+      // The vendor model is a row of its own: prefixed name, vendor, account.
+      const vendorRow = within(routesTable).getByText('chatgpt/gpt-6-luna').closest('tr');
+      expect(vendorRow).not.toBeNull();
+      expect(within(vendorRow as HTMLElement).getByText('openai')).toBeInTheDocument();
+      expect(within(vendorRow as HTMLElement).getByText('My ChatGPT')).toBeInTheDocument();
+      expect(
+        within(vendorRow as HTMLElement).getByText(messages[locale].statusActive),
+      ).toBeInTheDocument();
+      // ... and the self-hosted route is still there, the bare slug is not.
+      expect(within(routesTable).getByText('qwen-coder')).toBeInTheDocument();
+      expect(within(routesTable).queryByText('gpt-6-luna')).toBeNull();
+      // Neither the empty nor the loading label shows once there are rows.
+      expect(within(routesTable).queryByText(t.modelsEmpty)).toBeNull();
+    });
+
+    it('shows a vendor-account model even when no self-hosted route exists', () => {
+      const dashboard: DashboardResponse = { metrics, routes: [vendorModel] };
+      render(<Dashboard t={t} dashboard={dashboard} productName="X" />);
+      const routesTable = screen.getByRole('table');
+      expect(within(routesTable).getByText('chatgpt/gpt-6-luna')).toBeInTheDocument();
+      expect(within(routesTable).queryByText(t.modelsEmpty)).toBeNull();
+    });
+
+    it('renders two accounts that share a name and a model as two distinct rows', () => {
+      // Row identity is the route id, not model+host: two accounts both called
+      // "ChatGPT" serving the same model must not collide on a React key.
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const twin = (id: string) => ({ ...vendorModel, id, host: 'ChatGPT' });
+        const dashboard: DashboardResponse = {
+          metrics,
+          routes: [twin('va_1:chatgpt/gpt-6-luna'), twin('va_2:chatgpt/gpt-6-luna')],
+        };
+        render(<Dashboard t={t} dashboard={dashboard} productName="X" />);
+        const routesTable = screen.getByRole('table');
+        expect(within(routesTable).getAllByText('chatgpt/gpt-6-luna')).toHaveLength(2);
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
     });
   });
 

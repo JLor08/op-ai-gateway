@@ -197,7 +197,9 @@ func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal
 // (ErrVendorAccountConnectUpstream: network, 5xx, 429) KEEPS it, so the frontend's
 // next poll simply retries rather than aborting a ~15-minute authorization on one
 // blip. With no device connect in progress (never begun or past the TTL) it is
-// ErrVendorAccountDeviceConnectState. The response never carries a token.
+// ErrVendorAccountDeviceConnectState. The poll that connects the account also runs
+// a best-effort model discovery (see ConnectVendorAccountImport) before it
+// answers; it never fails the connect. The response never carries a token.
 // OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (connected bool, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
@@ -231,9 +233,13 @@ func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal 
 	if err != nil {
 		return false, err
 	}
-	if _, err := s.persistVendorTokens(ctx, acc, ts); err != nil {
+	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	if err != nil {
 		return false, err
 	}
 	s.vendorDeviceConnect.clear(acc.ID, pending.deviceAuthID)
+	// The poll only reports connected, so the refreshed view is not needed here;
+	// the frontend re-reads the account.
+	s.discoverAfterConnect(ctx, principal, dto)
 	return true, nil
 }
