@@ -120,6 +120,40 @@ const (
 	OpenAIDeviceCallbackRedirect = "https://auth.openai.com/deviceauth/callback"
 )
 
+// Credential validation probes. Each is a model-independent GET (no model id in
+// the request, so a wrong catalog entry can never masquerade as an auth failure)
+// that answers 2xx for a working credential and 401 for a dead one; see
+// validate.go for how the answers are classified.
+//
+// The two SUBSCRIPTION probes below are REVERSE-ENGINEERED from the official
+// CLIs and may be stale, moved or blocked: VERIFY LIVE. A probe that cannot
+// reach a clean verdict is reported as unverifiable, never as invalid, so a
+// wrong value here degrades to "could not verify" and never blocks a connect.
+const (
+	// OpenAIAccountsCheckURL is the ChatGPT backend's account-listing endpoint the
+	// Codex CLI calls (codex-rs backend-client get_accounts_check). A valid
+	// access token answers {accounts:[{id,plan_type,...}], default_account_id}.
+	//
+	// REVERSE-ENGINEERED / VERIFY LIVE.
+	OpenAIAccountsCheckURL = "https://chatgpt.com/backend-api/wham/accounts/check"
+	// AnthropicOAuthProfileURL is the Claude OAuth profile endpoint. It needs the
+	// anthropic-beta OAuth opt-in (AnthropicBeta) and anthropic-version
+	// (AnthropicAPIVersion) headers. A token minted by `claude setup-token` has
+	// scope user:inference but not user:profile, so this endpoint may answer 403
+	// for a perfectly good token.
+	//
+	// REVERSE-ENGINEERED / VERIFY LIVE.
+	AnthropicOAuthProfileURL = "https://api.anthropic.com/api/oauth/profile"
+
+	// OpenAIModelsURL and AnthropicModelsURL are the documented public model
+	// listings, used to probe an API key (not an OAuth token).
+	OpenAIModelsURL    = "https://api.openai.com/v1/models"
+	AnthropicModelsURL = "https://api.anthropic.com/v1/models"
+	// AnthropicAPIVersion is the anthropic-version header value the Anthropic API
+	// requires on every request.
+	AnthropicAPIVersion = "2023-06-01"
+)
+
 // Endpoints carries every vendor-specific OAuth parameter the flow functions
 // read: the HTTP URLs plus the client id, redirect URI, scopes and extra
 // authorize parameters. It is named for its main purpose (pointing the flows at

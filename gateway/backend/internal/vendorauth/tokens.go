@@ -4,10 +4,12 @@
 package vendorauth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"op-ai-gateway/internal/capture"
+	"strings"
 	"time"
 )
 
@@ -37,6 +39,54 @@ type TokenSet struct {
 // refresh token.
 func (ts TokenSet) NeedsRefresh(now time.Time, buffer time.Duration) bool {
 	return !ts.ExpiresAt.IsZero() && now.Add(buffer).After(ts.ExpiresAt)
+}
+
+const (
+	// jwtClaimExpiry is the registered "exp" claim (RFC 7519 section 4.1.4): the
+	// expiry as a NumericDate, seconds since the Unix epoch.
+	jwtClaimExpiry = "exp"
+	// maxJWTExpiry is 9999-12-31T23:59:59Z; a larger "exp" is not a date.
+	maxJWTExpiry = 253402300799
+)
+
+// AccessTokenExpiry reads the expiry of a JWT access token from its numeric
+// "exp" claim, without verifying the signature (like OpenAIClaimsFromJWT, it is
+// used to schedule a refresh, never to authenticate anyone). It returns the
+// expiry in UTC, or the zero time and false when the token is not a JWT or its
+// exp is missing, not a number, not positive or not a plausible date. A
+// pasted access token (an import) carries no expires_in, so this lets
+// TokenSet.NeedsRefresh fire for it. Anthropic access tokens are opaque, not
+// JWTs, and so always yield false.
+func AccessTokenExpiry(token string) (time.Time, bool) {
+	claims, ok := jwtClaims(token)
+	if !ok {
+		return time.Time{}, false
+	}
+	exp, _ := claims[jwtClaimExpiry].(float64)
+	if exp <= 0 || exp > maxJWTExpiry {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(exp), 0).UTC(), true
+}
+
+// jwtClaims decodes the payload (claims) segment of a JWT without verifying its
+// signature. Tolerant by design: anything that is not three dot-separated
+// segments around a base64url JSON object yields (nil, false), never an error or
+// a panic.
+func jwtClaims(token string) (map[string]any, bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return nil, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return nil, false
+	}
+	var claims map[string]any
+	if json.Unmarshal(payload, &claims) != nil || claims == nil {
+		return nil, false
+	}
+	return claims, true
 }
 
 // String redacts the secrets so a stray %v / %s of a TokenSet cannot spill a

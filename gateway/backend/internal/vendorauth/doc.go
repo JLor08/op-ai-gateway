@@ -5,7 +5,12 @@
 // SUBSCRIPTION account (Anthropic Claude Pro/Max, OpenAI ChatGPT/Codex) as an
 // external vendor account: PKCE and state generation, authorize-URL
 // construction, authorization-code (code-paste) token exchange, token
-// refresh, and the sealed TokenSet credential blob.
+// refresh, and the sealed TokenSet credential blob. It also holds the
+// model-independent credential validation probes (ValidateOpenAISubscription,
+// ValidateAnthropicSubscription, ValidateOpenAIAPIKey, ValidateAnthropicAPIKey):
+// one cheap GET per credential kind that classifies the answer as valid, invalid
+// (only a definitive HTTP 401) or unverifiable, and never carries the credential
+// into its result.
 //
 // WARNING: this whole path is REVERSE-ENGINEERED from the official vendor CLIs
 // (Claude Code, Codex CLI). It is UNDOCUMENTED, ToS-sensitive and
