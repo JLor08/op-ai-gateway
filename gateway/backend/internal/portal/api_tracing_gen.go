@@ -2186,6 +2186,18 @@ func (_d *APIWithTracing) TestNetbird(ctx context.Context, t1 auth.Token, np1 *N
 	return _d.API.TestNetbird(ctx, t1, np1)
 }
 
+func (_d *APIWithTracing) TestVendorAccountConnection(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorConnectionCheck, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.TestVendorAccountConnection")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.TestVendorAccountConnection(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) TransferOwnership(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.TransferOwnership")
 	defer span.End()

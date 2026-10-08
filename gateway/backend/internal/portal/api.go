@@ -213,6 +213,7 @@ type API interface {
 	SystemSettingsView(context.Context) SystemSettingsDTO
 	TOTPMode(context.Context) string
 	TestNetbird(context.Context, auth.Token, *NetbirdTestOverride) error
+	TestVendorAccountConnection(context.Context, auth.Token, string) (VendorConnectionCheck, error)
 	TransferOwnership(context.Context, auth.Token, string, string) error
 	TransferProject(context.Context, auth.Token, string, string) error
 	UpdateApplication(context.Context, auth.Token, string, UpdateApplicationRequest) (ApplicationDTO, error)
