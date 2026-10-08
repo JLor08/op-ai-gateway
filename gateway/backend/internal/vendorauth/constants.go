@@ -179,7 +179,7 @@ const (
 	// (same value the Codex CLI identifies itself with, OpenAIOriginator).
 	//
 	// REVERSE-ENGINEERED / LIVE-CONFIRMED (operator curl returned the real catalog)
-	CodexModelsOriginator = "codex_cli_rs"
+	CodexModelsOriginator = OpenAIOriginator
 	// CodexModelsClientVersionDefault is the client_version used when the caller
 	// supplies none: the version the live catalog request was confirmed with. A
 	// version below a model's minimal_client_version hides that model, and this
