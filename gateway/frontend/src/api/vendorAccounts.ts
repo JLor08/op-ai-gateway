@@ -16,14 +16,18 @@ import { type Fetcher, request } from './transport';
 // Credentials are WRITE-ONLY: the DTO carries only the api_key_set /
 // subscription_connected booleans, never the secret.
 //
-// A subscription account is attached to a consumer subscription in one of two
-// ways, both owner-only POSTs on the item path (handlePortalVendorAccountItem,
+// A subscription account is attached to a consumer subscription in one of
+// three ways, all owner-only POSTs on the item path (handlePortalVendorAccountItem,
 // internal/gateway/portal_vendor_account_endpoints.go; service side in
 // internal/portal/service_vendor_connect.go): connect/import takes tokens the
 // user already holds, connect/begin + connect/complete run the OAuth
 // code-paste flow (begin returns the vendor sign-in URL, the user pastes the
-// code the vendor shows back into complete). Every connect success answers the
-// credential-free VendorAccount with subscription_connected=true.
+// code the vendor shows back into complete), and -- OpenAI only --
+// connect/device/begin + connect/device/poll run the device-code flow
+// (internal/portal/service_vendor_device_connect.go). The import and
+// code-paste successes answer the credential-free VendorAccount with
+// subscription_connected=true; the device poll answers only {connected}, so the
+// caller re-reads the account (GET .../{id}).
 export type VendorAccountVendor = 'openai' | 'anthropic';
 export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
@@ -90,6 +94,16 @@ export type ConnectVendorAccountImportRequest = {
 // a new tab.
 export type VendorAccountConnectBegin = { authorize_url: string };
 
+// POST .../connect/device/begin response: the public pairing code the user
+// types in at the vendor's verification page, and that page's URL. The
+// user_code is NOT a secret (it only pairs a browser approval with this
+// pending login), so it is meant to be shown.
+export type VendorAccountDeviceConnectBegin = { user_code: string; verification_url: string };
+
+// POST .../connect/device/poll response: false while the user has not approved
+// the code yet, true once the account is connected. Never carries a token.
+export type VendorAccountDeviceConnectPoll = { connected: boolean };
+
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
     // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
@@ -105,6 +119,9 @@ export function vendorAccountsApi(fetcher: Fetcher) {
     // the list (the page is a personal one and the DTO carries no owner).
     vendorAccounts: () =>
       request<{ data: VendorAccount[] }>(fetcher, '/api/portal/vendor-accounts'),
+    // One account of the caller (404 for anybody else's id).
+    vendorAccount: (id: string) =>
+      request<VendorAccount>(fetcher, `/api/portal/vendor-accounts/${encodeURIComponent(id)}`),
     createVendorAccount: (body: CreateVendorAccountRequest) =>
       request<VendorAccount>(fetcher, '/api/portal/vendor-accounts', { method: 'POST', body }),
     updateVendorAccount: (id: string, body: UpdateVendorAccountRequest) =>
@@ -141,6 +158,28 @@ export function vendorAccountsApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/complete`,
         { method: 'POST', body: { code } },
+      ),
+    // Subscription connect, path 3 (OpenAI accounts only; any other vendor is
+    // vendor_account.device_not_supported): start the device-code login. No
+    // request body; a second begin for the same account replaces the first.
+    beginVendorAccountDeviceConnect: (id: string) =>
+      request<VendorAccountDeviceConnectBegin>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/device/begin`,
+        { method: 'POST' },
+      ),
+    // Path 3 / step 2: ONE backend poll of the begun login, called by the portal
+    // on an interval. {connected:false} (HTTP 200) while the user has not
+    // approved yet. A TRANSIENT vendor failure is a 502
+    // vendor_account.connect_upstream_failed that the backend answers WITHOUT
+    // dropping the pending login -- the caller keeps polling. A vendor refusal
+    // is a 400 vendor_account.connect_rejected (the pending login is gone: begin
+    // again). No request body.
+    pollVendorAccountDeviceConnect: (id: string) =>
+      request<VendorAccountDeviceConnectPoll>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/connect/device/poll`,
+        { method: 'POST' },
       ),
   };
 }

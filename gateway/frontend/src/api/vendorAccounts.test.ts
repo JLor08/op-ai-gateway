@@ -146,4 +146,73 @@ describe('vendorAccountsApi', () => {
     expect(JSON.parse(init.body)).toEqual({ code: 'abc#state' });
     expect(resp.subscription_connected).toBe(true);
   });
+
+  it('GETs one account by its URL-encoded id (the post-connect refresh)', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ id: 'va/1', subscription_connected: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.vendorAccount('va/1');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/vendor-accounts/va%2F1', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(resp.subscription_connected).toBe(true);
+  });
+
+  it('POSTs .../connect/device/begin with no body and returns the user code and verification URL', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      jsonResponse({
+        user_code: 'ABCD-EFGH',
+        verification_url: 'https://auth.example/codex/device',
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.beginVendorAccountDeviceConnect('va_1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va_1/connect/device/begin');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp).toEqual({
+      user_code: 'ABCD-EFGH',
+      verification_url: 'https://auth.example/codex/device',
+    });
+  });
+
+  it('POSTs .../connect/device/poll with no body and returns {connected}', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ connected: false }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.pollVendorAccountDeviceConnect('va/1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/connect/device/poll');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp).toEqual({ connected: false });
+  });
+
+  it('surfaces a transient poll failure as a PortalApiError carrying the upstream code', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { code: 'vendor_account.connect_upstream_failed', message: 'try again later' } },
+          502,
+        ),
+      );
+    const api = createPortalApi(fetcher);
+
+    await expect(api.pollVendorAccountDeviceConnect('va_1')).rejects.toMatchObject({
+      name: 'PortalApiError',
+      status: 502,
+      code: 'vendor_account.connect_upstream_failed',
+    });
+  });
 });
