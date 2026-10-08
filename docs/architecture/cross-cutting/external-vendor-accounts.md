@@ -23,10 +23,12 @@ master feature flag, and every reverse-engineered constant is marked **VERIFY-LI
 The feature reuses the gateway's existing credential sealing, routing `Target`,
 dispatch and usage machinery wherever possible. The genuinely new parts are a
 first-class account entity (§1), an OAuth subsystem — connect + token refresh —
-(`internal/vendorauth`, §3), a small native Anthropic Messages client and an
-OpenAI Responses translate client (`internal/provider`, §4), two static dispatch
-extensions (extra headers + a system-prompt masquerade, §4), and a usage/limits
-snapshot scraped from vendor rate-limit response headers (§5).
+(`internal/vendorauth`, §3), model-independent credential validation that
+tells a rejected login from a wrong model (§3.5), a small native Anthropic
+Messages client and an OpenAI Responses translate client (`internal/provider`,
+§4), two static dispatch extensions (extra headers + a system-prompt masquerade,
+§4), and a usage/limits snapshot scraped from vendor rate-limit response headers
+(§5).
 
 ## 1. The entity and its ownership
 
@@ -51,7 +53,8 @@ At most one of `api_key` / `oauth_tokens` is populated per row — a subscriptio
 account created but not yet connected, and an api-key account with no key set, have
 neither (the exclusivity is enforced in the
 service, not the schema). A per-account curated model catalog
-(`vendor_account_models`) and a rate-limit usage snapshot
+(`vendor_account_models`, seeded at creation from a static set keyed by vendor
+**and** auth type, §9) and a rate-limit usage snapshot
 (`vendor_account_usage`) hang off the account, both `on delete cascade`. The three
 tables and the `usage_events.account_id` attribution column are migration 82; see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
@@ -96,15 +99,49 @@ under `POST /api/portal/vendor-accounts/{id}/connect/*`
 
 ### 3.1 Token import (both vendors) — the quick start
 
-The user pastes OAuth tokens they already hold (`POST .../connect/import` with
-`{access_token, refresh_token?, expires_at?}`). The backend seals them into
-`oauth_tokens` and marks the account connected; there is deliberately **no live
-probe** — the first real request validates the tokens. For an OpenAI account the
-ChatGPT account id and plan type are read, best-effort, from the access token's
-JWT claims (the `https://api.openai.com/auth` namespace), so an import yields the
-same token set the code-paste flow does. The portal ships a guide for finding the
-tokens: Claude Code's `~/.claude/.credentials.json` (or the macOS Keychain entry,
-or `claude setup-token`) and Codex's `~/.codex/auth.json`.
+The user supplies OAuth tokens they already hold (`POST .../connect/import` with
+`{access_token, refresh_token?, expires_at?}`). Before anything is stored, the
+access token is checked once against the vendor (§3.5): a token the vendor
+definitively rejects is refused with `400 vendor_account.connect_invalid_credentials`
+and nothing is persisted, while an unreachable vendor or an inconclusive answer
+still lets the import through. The backend then seals the tokens into
+`oauth_tokens` and marks the account connected.
+
+Two details are filled in so that an import yields the same token set the
+code-paste flow does:
+
+- **Identity (OpenAI).** The ChatGPT account id and plan type are read,
+  best-effort, from the access token's JWT claims (the `https://api.openai.com/auth`
+  namespace); when the token carries no account id, it is backfilled from the
+  validation answer (§3.5).
+- **Expiry.** A pasted token has no `expires_in`. When the request carries no
+  `expires_at`, the expiry is read from the access token's JWT `exp` claim (an
+  OpenAI token is a JWT; an Anthropic one is opaque and yields none, which is why
+  the file-assisted import below sends the explicit `expiresAt` that a Claude Code
+  credential file carries). Without a known expiry the lazy refresh (§3.4) never
+  fires for the token, so an access-only import would stop serving at its first
+  lapse and could never heal through its refresh token.
+
+The portal ships a guide for finding the tokens: Claude Code's
+`~/.claude/.credentials.json` (or the macOS Keychain entry, or `claude setup-token`)
+and Codex's `~/.codex/auth.json`.
+
+**File-assisted import.** Picking the right field out of those files by hand is
+error-prone; the usual slip is pasting Codex's `id_token`, which is an identity
+token the gateway cannot use, where the `access_token` belongs. The import panel
+therefore also accepts the file itself. It is read and parsed **in the browser**
+(`parseCredentialFile`, a pure module with no network access): the size is capped
+at 1 MiB before the file is read, the vendor is recognized from the file's content
+(the file name only breaks a tie), and a file for the other vendor than the
+account is refused locally. Only `{access_token, refresh_token, expires_at}` are
+then submitted through the *same* import endpoint as a manual paste, so both
+ways get the same validation and no server code path accepts a credential file.
+This is data minimization: the raw file, its `id_token`, a sibling
+`OPENAI_API_KEY` and every other field **never leave the browser**. The parser's
+failures are fixed strings keyed by a code that the UI localizes; none quotes the
+file, because a JSON syntax-error message would echo a fragment of a credential.
+An `id_token`-only file is rejected with an explanation instead of being sent and
+left to surface later as a 401.
 
 ### 3.2 Authorization-code paste (both vendors)
 
@@ -158,6 +195,97 @@ a bearer (and the upstream answers 401/403) rather than faulting. A refresh
 `needs_reconnect`, which the portal surfaces. A 401 on an unexpired-but-revoked
 access token does **not** flip the status (it is bounded by the token TTL) — a
 known limitation recorded in §9.
+
+### 3.5 Credential validation
+
+A failed chat conflates two unrelated problems — a login the vendor rejects and a
+model the backend does not serve — and the seeded model ids are a best guess
+(§9). Validation separates them. Four probes in `internal/vendorauth/validate.go`
+each make **one cheap GET that names no model**, so an authentication verdict can
+never be mistaken for a wrong-model error. The URLs live in `constants.go` beside
+the OAuth constants.
+
+| Credential | Probe | Auth headers | Provenance |
+|---|---|---|---|
+| OpenAI **subscription** access token | `GET https://chatgpt.com/backend-api/wham/accounts/check` | `Authorization: Bearer` | reverse-engineered, **VERIFY-LIVE** |
+| Anthropic **subscription** access token | `GET https://api.anthropic.com/api/oauth/profile` | `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | reverse-engineered, **VERIFY-LIVE** |
+| OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | `Authorization: Bearer` | documented public API |
+| Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models` | `x-api-key`, `anthropic-version` | documented public API |
+
+**Classification** is one rule for all four:
+
+- HTTP **2xx** → `valid`.
+- HTTP **401** → `invalid`. This is the only answer that ever counts as a bad
+  credential.
+- **Everything else** — 403, 404, 429, 5xx, a redirect, a timeout, any transport
+  failure → `unverifiable`: the vendor gave no clean answer, which says nothing
+  about the credential. Redirects are not followed, so a credential header can
+  never be carried to another host.
+- **One exception:** for the Anthropic *subscription* probe, **403 is `valid`**. A
+  token minted by `claude setup-token` has the inference scope but not
+  `user:profile`, so the profile endpoint legitimately refuses it with a 403
+  although the token serves inference.
+
+**Fail-soft.** Validation never reduces availability: `unverifiable` neither
+blocks an import nor is ever reported as an invalid credential. A probe runs only
+at import and on the explicit test action — never on a request path — and is
+bounded to 10 seconds. The probes never log or return the credential; the
+`detail` is a fixed phrase plus the HTTP status and, only when the response body
+carries a short identifier-like error code, that code. The vendor's free-text
+message (which may quote the key) and transport error text are never echoed, and
+the service scrubs the credential from any detail once more before it leaves.
+
+**At import.** `ConnectVendorAccountImport` runs the matching *subscription* probe
+once before it persists (§3.1). The code-paste and device-code connects are not
+probed, since the vendor itself has just issued those tokens, and an API key is
+probed only by the explicit test, not when it is saved. At import:
+
+- a definitive `invalid` rejects the import with `400
+  vendor_account.connect_invalid_credentials` (a 400, never a 401: the portal
+  treats a 401 from this API as an expired session). `valid` and `unverifiable`
+  persist;
+- an access token that is **already expired while a refresh token came with it**
+  is not probed at all and reads `unverifiable`: the vendor would answer 401 for
+  an account that heals on its first request through the lazy refresh (§3.4), so a
+  refreshable token is never blocked. Without a refresh token, an expired token
+  can never heal and is probed like any other;
+- **account-id backfill (OpenAI).** If the token's claims carried no
+  `chatgpt_account_id`, a `valid` answer from `accounts/check` supplies it
+  (`default_account_id`, falling back to the first listed account) together with
+  the matching plan type. The probe body is untrusted vendor input and the id is
+  later sent back as the `chatgpt-account-id` request header, so it is stored only
+  if it is non-empty printable ASCII of at most 128 bytes; an id derived from the
+  token wins, and the plan is taken only with the id it belongs to;
+- **never-refresh fix.** The expiry derived from the JWT `exp` claim (§3.1) is
+  what lets a pasted access token be refreshed at all.
+
+**Test connection.** `POST /api/portal/vendor-accounts/{id}/check` opens the
+account's stored credential (an API key, or the access token of the sealed token
+set), runs the same probe and returns `VendorConnectionCheck`:
+`{status: "valid" | "invalid" | "unverifiable", detail, checked_at}`
+([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)). It has no
+request body and changes nothing — it does not even refresh a token. It is
+**strictly owner-only, system scope included**, because it sends the owner's
+sealed credential to the vendor from the gateway: letting anyone else trigger it
+would turn that credential into a live-or-dead oracle. A non-owner gets the same
+`404 vendor_account.not_found` as for an unknown id; a disabled module answers
+`409`. A missing credential (no API key set, subscription not connected) and an
+expired-but-refreshable token report `unverifiable` with an explanatory `detail`;
+an unreadable stored credential (a lost cipher key, a corrupt blob) is an error,
+`vendor_account.check_failed`, not a verdict. The portal's detail view has a
+"Test connection" button that renders the verdict inline — success, error, or a
+neutral notice for `unverifiable` — and says in so many words that it checks the
+credential only, never a particular model, so a chat that fails while the test
+reads `valid` points at the model rather than the login. A thrown error (the
+check could not run) surfaces as a toast, never as a verdict.
+
+The two subscription endpoints are reverse-engineered and join the other
+VERIFY-LIVE constants (§9). A moved or removed endpoint typically answers 404, a
+redirect or a 5xx and so degrades to `unverifiable`. The residual risk is an
+endpoint that starts answering 401 for a good token: that would read as a false
+`invalid` and refuse an import. The probe URLs are plain constants, not part of
+the overridable OAuth `Endpoints`, so correcting one is a one-line change in
+`constants.go`.
 
 ## 4. Serving
 
@@ -363,17 +491,29 @@ reasons are recorded deliberately, not in denial of them
   only for use with Claude Code; the forced `You are Claude Code` system block).
   The feature must degrade gracefully when a vendor blocks or changes behavior.
 - **Every subscription constant is reverse-engineered and VERIFY-LIVE.** Each
-  endpoint, client id, redirect URI, scope, beta header, device-code path,
-  token-claim name, masquerade requirement, serving host, request/refresh body
-  encoding, and the rate-limit response-header names can change without notice.
+  endpoint (including the two subscription credential-validation probes, §3.5),
+  client id, redirect URI, scope, beta header, device-code path, token-claim name,
+  masquerade requirement, serving host, request/refresh body encoding, and the
+  rate-limit response-header names can change without notice.
   They are confined to `internal/vendorauth/constants.go` and the resolver's
   dispatch literals (routing cannot import `vendorauth`), all marked VERIFY-LIVE,
   and all parsing is tolerant (prefix-matched, fail-open).
-- **The seeded OpenAI subscription model ids are a best guess.** The curated
-  catalog seeds vendor-native ids (e.g. `gpt-5`, `claude-sonnet-5-5`); the ids a
-  given ChatGPT plan actually serves (e.g. `gpt-5-codex`) must be verified live,
-  and a subscription account will not serve until its model rows match what the
-  plan offers.
+- **The seeded model ids are a best guess, and the OpenAI set depends on the auth
+  type.** The curated catalog (`internal/portal/vendor_catalog.go`) seeds
+  vendor-native ids when an account is created, keyed by vendor **and** auth type.
+  An OpenAI **`api_key`** account talks to `api.openai.com` and gets the full set
+  (`gpt-5`, `gpt-5-mini`, `gpt-4.1`, `o3`). An OpenAI **subscription** account is
+  served by the Codex ChatGPT backend, which, as far as is known, does not serve
+  `gpt-4.1` or `o3`; it is therefore seeded with only `gpt-5` and `gpt-5-mini`, so
+  a working credential is never paired with a model its backend is known to
+  refuse — the auth-versus-model confusion that §3.5 exists to take apart.
+  Anthropic's OAuth Messages path and its API key serve the same ids, so its set
+  does not vary. Even the narrowed subscription set is unverified: a plan may
+  serve further ids (e.g. `gpt-5-codex`) that are not seeded until confirmed live,
+  and a subscription account serves nothing its rows do not name. **There is no
+  backfill:** an account keeps the rows it was seeded with, so a subscription
+  account created before the split keeps its `gpt-4.1` and `o3` rows (which that
+  backend rejects) until the account is recreated.
 - **Known behavioral gaps.** A 401 on an unexpired-but-revoked access token does
   not flip the account to `needs_reconnect` (only a refresh rejection does); a
   persist-failure after a refresh may keep a single-use refresh token, forcing a

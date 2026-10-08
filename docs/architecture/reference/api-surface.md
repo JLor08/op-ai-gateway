@@ -775,22 +775,34 @@ experimental consumer-subscription OAuth connection
 All routes take scope `gateway:use`; **object-level authorization is owner-only
 inside `portal.Service`** — a non-owner gets `404 vendor_account.not_found`, the
 same no-existence-leak posture as servers. The `system` scope may **read** an
-account (GET), but listing and every **write** (create/update/delete/connect) are
-owner-only. Secrets are **write-only**: no response ever carries the API key or an
-OAuth token. The whole surface is gated by the `vendor_accounts_enabled` master
-flag — every CRUD/connect route answers `409 vendor_accounts.module_disabled`
-while it is off.
+account (GET), but listing, every **write** (create/update/delete/connect) and
+the connection test are owner-only. Secrets are **write-only**: no response ever
+carries the API key or an OAuth token. The whole surface is gated by the
+`vendor_accounts_enabled` master flag — every CRUD/connect/check route answers
+`409 vendor_accounts.module_disabled` while it is off.
 
 | Path | Methods | Purpose |
 |---|---|---|
 | `/api/portal/vendor-accounts` | GET/POST | List the caller's own accounts (`{data:[…]}`); create one (`{vendor, auth_type, name, status?, api_key?}` → `201` with the credential-free DTO). `api_key` is meaningful only for an `api_key` account; a `subscription` account is created unconnected. |
 | `/api/portal/vendor-accounts/{id}` | GET/PATCH/DELETE | Detail (GET also fills the `usage` rate-limit snapshot); partial update (`{name?, status?, api_key?}`, `api_key` the `null`=keep / `""`=clear / value=replace sentinel; vendor and auth type are immutable); delete (`{ok:true}`). |
 | `/api/portal/vendor-accounts/enabled` | GET | Whether the vendor-accounts master flag is on (`{module_enabled}`, boolean only). Readable by any user **even while the module is off** — it exists so the shell can show/hide the "Anbieter" nav item without the system-scoped settings read. The exact path wins over the `{id}` subtree because account ids are `va_`-prefixed. |
-| `/api/portal/vendor-accounts/{id}/connect/import` | POST | Token-import connect: `{access_token, refresh_token?, expires_at?}` (write-only). No live probe; the first request validates the tokens. |
+| `/api/portal/vendor-accounts/{id}/connect/import` | POST | Token-import connect: `{access_token, refresh_token?, expires_at?}` (write-only). The access token is validated **fail-soft** against the vendor before it is stored: a definitive rejection is `400 vendor_account.connect_invalid_credentials` (nothing stored), while an unreachable vendor or an inconclusive answer still stores. A missing `expires_at` is derived from the token's JWT `exp` claim, and an OpenAI account id the token lacks is backfilled from the vendor's answer ([Credential validation](../cross-cutting/external-vendor-accounts.md#35-credential-validation)). The portal's file-assisted import parses a Codex `auth.json` / Claude Code `.credentials.json` in the browser and sends only these three fields here; there is no endpoint that accepts a credential file. |
 | `/api/portal/vendor-accounts/{id}/connect/begin` | POST | Start the authorization-code-paste flow; no body, returns `{authorize_url}`. |
 | `/api/portal/vendor-accounts/{id}/connect/complete` | POST | Finish the code-paste flow: `{code}` (a bare code, `code#state`, or a whole callback URL). |
 | `/api/portal/vendor-accounts/{id}/connect/device/begin` | POST | Start the OpenAI-only Codex device-code login; no body, returns `{user_code, verification_url}`. |
 | `/api/portal/vendor-accounts/{id}/connect/device/poll` | POST | One poll of a begun device login; no body, returns `{connected}`; never returns a token. |
+| `/api/portal/vendor-accounts/{id}/check` | POST | **Test connection.** No body; asks the vendor, through a model-independent probe, whether the account's stored credential (API key or subscription access token) is accepted, and returns `VendorConnectionCheck` (below). Changes nothing, refreshes nothing, never returns a credential. **Strictly owner-only, system scope included** (it sends the owner's sealed credential to the vendor); a non-owner gets `404 vendor_account.not_found`. |
+
+`VendorConnectionCheck` (the `/check` response, always `200` when the check ran):
+
+| Field | Meaning |
+|---|---|
+| `status` | `valid` (the vendor accepted the credential), `invalid` (the vendor definitively rejected it, HTTP 401), or `unverifiable` (no clean answer: vendor unreachable, rate-limited or unexpected, or nothing to test — an unset API key, an unconnected subscription, or an access token that is expired but refreshable). `unverifiable` says **nothing** about the credential. |
+| `detail` | A short English status phrase (HTTP status and, when the vendor sent one, its short error code). Never contains a credential; the portal shows it only as a secondary technical line, the headline being localized from `status`. |
+| `checked_at` | RFC 3339 UTC time the verdict was produced. |
+
+The verdict is about the **credential only**: no model is named, so a chat that
+fails while the check says `valid` is a model problem, not an authentication one.
 
 Error codes specific to this surface (all `vendor_account.*` except the module
 flag), with their HTTP status:
@@ -809,9 +821,11 @@ flag), with their HTTP status:
 | `vendor_account.connect_token_required` / `.connect_code_required` | 400 | The import token / the pasted code is missing. |
 | `vendor_account.connect_state` / `.device_connect_state` | 400 | No connect (or device connect) is in progress, it expired, or the pasted state does not match. |
 | `vendor_account.connect_rejected` | 400 | The vendor rejected the code. **Never a 401** — the portal treats a 401 from this API as an expired session. |
+| `vendor_account.connect_invalid_credentials` | 400 | A token import whose access token the vendor definitively rejected (HTTP 401 from the validation probe); nothing was stored. Never raised for an unreachable or inconclusive vendor. Also a 400, never a 401, for the same reason. |
 | `vendor_account.connect_upstream_failed` | 502 | The vendor was unreachable or answered unusably. |
 | `vendor_account.connect_key_required` | 400 | No encryption key to seal the OAuth token set on a disk-backed store. |
 | `vendor_account.device_not_supported` | 400 | The device-code flow was attempted for a non-OpenAI account. |
+| `vendor_account.check_failed` | 500 | The connection test could not run — the stored credential could not be read (a lost cipher key, a corrupt blob). It is **not** a verdict: a rejected credential is a normal `200` with `status: invalid`. |
 | `vendor_account.{list,create,get,update,delete,connect}_failed` | 500 | The uncategorized fallback for each operation. |
 
 ### Groups, projects, services, resource-groups (governance model)
