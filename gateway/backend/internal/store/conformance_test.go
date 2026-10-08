@@ -3222,6 +3222,7 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 			ID: "evt1", UserID: "u1", TokenID: "tok1", SessionID: "sess_1",
 			SessionSource: "codex", AgentID: "agent_1",
 			APIFlavor: "openai", Model: "gpt-4o-mini", RequestedModel: "gpt-oss-20b", Provider: "ollama", Host: "srv1.local",
+			AccountID:   "acc_vendor_1",
 			InputTokens: 10, OutputTokens: 20, TotalTokens: 30, LatencyMS: 123,
 			HTTPStatus: 200, Status: "ok", CreatedAt: now,
 		}
@@ -3247,6 +3248,12 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		if got := page.Data[0].RequestedModel; got != "gpt-oss-20b" {
 			t.Fatalf("RequestedModel (query) = %q, want gpt-oss-20b", got)
 		}
+		// account_id (vendor-account attribution, M6a) must survive the round-trip on
+		// the Query (scanUsageRows) path -- written by Record, read back by the
+		// select list.
+		if got := page.Data[0].AccountID; got != "acc_vendor_1" {
+			t.Fatalf("AccountID (query) = %q, want acc_vendor_1", got)
+		}
 		// ... and on the All (scanUsageEvents) path.
 		all := s.All()
 		if len(all) != 1 {
@@ -3257,6 +3264,9 @@ func TestConformanceUsageRecordQueryStats(t *testing.T) {
 		}
 		if got := all[0].RequestedModel; got != "gpt-oss-20b" {
 			t.Fatalf("RequestedModel (all) = %q, want gpt-oss-20b", got)
+		}
+		if got := all[0].AccountID; got != "acc_vendor_1" {
+			t.Fatalf("AccountID (all) = %q, want acc_vendor_1", got)
 		}
 
 		// Substring filter on session_source: "codex" matches, "claude-code" does not.

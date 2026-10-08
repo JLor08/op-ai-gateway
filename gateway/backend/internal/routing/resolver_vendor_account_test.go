@@ -82,6 +82,14 @@ func TestVendorAccountOwnerResolvesToVendorTarget(t *testing.T) {
 	if target.RouteID != "vendor:acc_openai:gpt-4o" {
 		t.Errorf("RouteID = %q, want vendor:acc_openai:gpt-4o", target.RouteID)
 	}
+	// M6a: every vendor target carries its account id for usage attribution, but an
+	// api-key target is NOT a subscription target -- its bearer rides in APIToken.
+	if target.VendorAccountID != "acc_openai" {
+		t.Errorf("VendorAccountID = %q, want acc_openai (usage attribution on every vendor target)", target.VendorAccountID)
+	}
+	if target.Subscription {
+		t.Error("Subscription = true, want false for an api-key vendor target (no dispatch-time OAuth bearer)")
+	}
 }
 
 // TestVendorAccountAnthropicTargetShape proves the native-Anthropic vendor kind
@@ -272,7 +280,6 @@ var vendorTargetMayBeZero = map[string]bool{
 	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default); set for Anthropic
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
-	"VendorAccountID":             true, // the API-KEY bearer rides in APIToken, not resolved from an account at dispatch
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 }
 

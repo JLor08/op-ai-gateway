@@ -59,12 +59,12 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 	_, err := s.exec(context.Background(), `
 		insert into usage_events (
 			id, request_id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model,
-			route_id, provider, host, status, error_code, input_tokens, output_tokens,
+			route_id, provider, host, account_id, status, error_code, input_tokens, output_tokens,
 			total_tokens, latency_ms, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second,
 			http_status, content_type, req_path, provider_path, provider_model, stream, token_name,
 			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
 			billing_unit, billing_quantity
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
 		event.ID,
 		event.UserID,
@@ -78,6 +78,7 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 		event.RouteID,
 		event.Provider,
 		event.Host,
+		event.AccountID,
 		event.Status,
 		event.ErrorCode,
 		event.InputTokens,
@@ -205,7 +206,7 @@ func (s *SQLiteStore) UsageEventsForServerWindow(ctx context.Context, serverID s
 func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 	rows, err := s.query(context.Background(), `
 		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model, provider,
-			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
+			route_id, host, account_id, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
 			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
@@ -229,7 +230,7 @@ func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 func (s *SQLiteStore) All() []usage.Event {
 	rows, err := s.query(context.Background(), `
 		select id, user_id, token_id, session_id, session_source, agent_id, api_flavor, model, requested_model, provider,
-			route_id, host, input_tokens, output_tokens, total_tokens, latency_ms, status,
+			route_id, host, account_id, input_tokens, output_tokens, total_tokens, latency_ms, status,
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
 			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
@@ -374,6 +375,7 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 			&event.Provider,
 			&event.RouteID,
 			&event.Host,
+			&event.AccountID,
 			&event.InputTokens,
 			&event.OutputTokens,
 			&event.TotalTokens,
@@ -417,7 +419,7 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 // usageEventColumns is the e.-aliased select list matching scanUsageRows order,
 // identical to the ByUser/All column order.
 const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_source, e.agent_id, e.api_flavor, e.model, e.requested_model, e.provider,
-	e.route_id, e.host, e.input_tokens, e.output_tokens, e.total_tokens, e.latency_ms, e.status,
+	e.route_id, e.host, e.account_id, e.input_tokens, e.output_tokens, e.total_tokens, e.latency_ms, e.status,
 	e.error_code, e.cached_tokens, e.cache_write_tokens, e.prompt_per_second, e.tokens_per_second, e.http_status,
 	e.content_type, e.req_path, e.provider_path, e.provider_model, e.stream, e.token_name, e.server_name,
 	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at,
@@ -708,6 +710,7 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 			&row.Provider,
 			&row.RouteID,
 			&row.Host,
+			&row.AccountID,
 			&row.InputTokens,
 			&row.OutputTokens,
 			&row.TotalTokens,

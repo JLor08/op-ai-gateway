@@ -683,6 +683,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		RouteID:          target.RouteID,
 		Provider:         target.Provider,
 		Host:             target.ServerID,
+		AccountID:        target.VendorAccountID, // "" for the self-hosted path; the vendor account id otherwise
 		InputTokens:      freshInputTokens,
 		OutputTokens:     resp.Usage.OutputTokens,
 		TotalTokens:      resp.Usage.TotalTokens,

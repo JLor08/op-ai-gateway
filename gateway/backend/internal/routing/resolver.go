@@ -905,6 +905,11 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		APIFlavor:      apiFlavor,
 		APIToken:       acc.APIKey, // still sealed; upstreamAuthCtx opens it, as for an app credential
 		APITokenHeader: tokenHeader,
+		// VendorAccountID names the serving account for USAGE ATTRIBUTION (the
+		// recorded usage_events.account_id and the scraped rate-limit snapshot). It
+		// is NOT the subscription-bearer trigger -- Subscription stays false, so
+		// upstreamAuthCtx keeps using the sealed APIToken above, not an OAuth bearer.
+		VendorAccountID: acc.ID,
 		// Both inbound dialects are served; the zero endpoint modes mean translate,
 		// so native-passthrough converts whichever one the caller used to the
 		// vendor's native wire format.
