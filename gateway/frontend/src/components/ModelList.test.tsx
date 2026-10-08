@@ -597,4 +597,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(modelRow).queryByText(t.modelGroupChip)).toBeNull();
     });
   });
+
+  describe(`ModelList vendor-account model [${locale}]`, () => {
+    // The overlaid listing (/api/portal/models, api.models()) carries the
+    // principal's own vendor-account models like any other row: the PREFIXED
+    // gateway name as id, the dialects the account is served under, and zero
+    // listing data (no server offers or loads it, no context size).
+    const vendorModel: ModelOption = {
+      id: 'chatgpt/gpt-6-luna',
+      display_name: 'chatgpt/gpt-6-luna',
+      flavors: ['openai'],
+      loaded: false,
+      offered_on_count: 0,
+      loading_on_count: 0,
+      visibility: 'shown',
+    };
+
+    it('lists the model under its prefixed name with the dialects it is served under', () => {
+      renderList({ t, models: [models[1], vendorModel] });
+      const row = screen.getByText('chatgpt/gpt-6-luna').closest('tr')!;
+      expect(within(row).getByText('openai')).toBeInTheDocument();
+      expect(within(row).getByText(t.tableModel)).toBeInTheDocument();
+      expect(within(row).getByText(t.modelVisibilityShown)).toBeInTheDocument();
+      // Not the empty state, and the bare slug is nowhere in the list.
+      expect(screen.queryByText(t.modelsEmpty)).toBeNull();
+      expect(screen.queryByText('gpt-6-luna')).toBeNull();
+    });
+  });
 }

@@ -471,7 +471,15 @@ NetBird/certificates `/enabled` endpoints. The exact-path route wins over the
 A connected account also carries a **model-listing owner overlay**: the owner's
 vendor-account catalog models appear in their own `/v1/models` listing and the
 chat picker (served-flavors parity with dispatch holds). The overlay is gated on
-the same master flag.
+the same master flag. The same models also appear, under their prefixed gateway
+name, as rows of the dashboard's "Live Model Routes" table
+(`GET /api/portal/dashboard`): a vendor model has no server, so the row's
+provider is the vendor and its host is the account's name. Both read one source
+(`ownVendorAccountModels`: the principal's own *active* accounts), so what the
+dashboard shows and what the listings advertise cannot drift. The admin
+management listing (`ManageModels`, the admin view of the Models page) is
+deliberately left out: it shows the system's real models, and a vendor model is
+one principal's own.
 
 ## 7. Owner-scope RBAC
 

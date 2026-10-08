@@ -2726,6 +2726,11 @@ func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (str
 			Status:   routing.ServerStatusActive,
 		})
 	}
+	// The principal's own vendor-account models (ChatGPT/OpenAI/Anthropic accounts)
+	// are part of what they can route to, so the table lists them next to the
+	// self-hosted routes -- the dashboard half of the owner overlay the model
+	// listings already carry (vendorDashboardRoutes).
+	out = append(out, s.vendorDashboardRoutes(ctx, token)...)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Model == out[j].Model {
 			return out[i].ID < out[j].ID
@@ -3922,6 +3927,12 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // with no reader. The listing surfaces in this table ARE the listing; the
 // offering answers only "can this token route to this name" (Callable) and
 // "does this name exist at all" (Existing), which no row above answers.)
+//
+// (Models(), ModelsForFlavor() and dashboardRouteData() additionally carry the
+// principal's OWN vendor-account models, the owner overlay of external vendor
+// accounts: ownVendorAccountModels is the one source they all read, and a
+// vendor model is never subject to column (b), which is a gateway-wide setting
+// on self-hosted models.)
 //
 // (ManageModels(), the admin-only management surface, applies NONE of the
 // three by design: an admin managing visibility/groups must see every active

@@ -9,6 +9,47 @@ import (
 	"op-ai-gateway/internal/routing"
 )
 
+// ownVendorAccountModels is the single source every owner-facing listing reads
+// the principal's vendor-account models from: each of the PRINCIPAL's own ACTIVE
+// vendor accounts together with the models it serves. The listing overlay
+// (vendorModelFlavorSets: /v1/models, the Anthropic list, the chat picker,
+// /api/v0/models) and the dashboard's route table (vendorDashboardRoutes) both
+// go through it, so which accounts and models they surface cannot drift.
+//
+// Returns nil (nothing to overlay) unless the vendor_accounts_enabled master flag
+// is on, the principal is a USER (a service token has no UserID and owns no vendor
+// accounts), and a routing store is wired. Best-effort and FAIL-OPEN like the
+// group overlay: a store error yields what was read so far (nil on the first
+// read) rather than blanking the whole listing, and an account whose model rows
+// cannot be read is skipped.
+func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) []vendorAccountModels {
+	if s.routes == nil || token.UserID == "" || !s.VendorAccountsEnabled(ctx) {
+		return nil
+	}
+	accounts, err := s.routes.VendorAccountsByOwner(ctx, token.UserID)
+	if err != nil {
+		return nil
+	}
+	var out []vendorAccountModels
+	for _, acc := range accounts {
+		if acc.Status != routing.VendorAccountStatusActive {
+			continue
+		}
+		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+		if err != nil {
+			continue
+		}
+		out = append(out, vendorAccountModels{Account: acc, Models: models})
+	}
+	return out
+}
+
+// vendorAccountModels is one active vendor account with the models it serves.
+type vendorAccountModels struct {
+	Account routing.VendorAccount
+	Models  []routing.VendorAccountModel
+}
+
 // vendorModelFlavorSets returns, for the PRINCIPAL, each gateway model one of
 // their OWN active vendor accounts serves → the coarse inbound flavors dispatch
 // serves it under. It is the listing half of the resolver's resolveVendorAccount
@@ -25,48 +66,54 @@ import (
 //     {openai} here. Listing them under anthropic would put them in
 //     /anthropic/v1/models where an anthropic call then 404s, breaking parity.
 //
-// Returns nil (no overlay) unless the vendor_accounts_enabled master flag is on,
-// the principal is a USER (a service token has no UserID and owns no vendor
-// accounts), and a routing store is wired. Best-effort and FAIL-OPEN like the
-// group overlay: a store error yields the overlay built so far (nil on the first
-// read) rather than blanking the whole listing.
+// Gating, owner scope and the fail-open behaviour are ownVendorAccountModels's.
 func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) map[string]map[string]struct{} {
-	if s.routes == nil || token.UserID == "" || !s.VendorAccountsEnabled(ctx) {
-		return nil
-	}
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, token.UserID)
-	if err != nil {
+	owned := s.ownVendorAccountModels(ctx, token)
+	if owned == nil {
 		return nil
 	}
 	out := make(map[string]map[string]struct{})
-	for _, acc := range accounts {
-		if acc.Status != routing.VendorAccountStatusActive {
-			continue
+	for _, am := range owned {
+		flavors := vendorAccountServedFlavors(am.Account)
+		for _, m := range am.Models {
+			set := out[m.GatewayModel]
+			if set == nil {
+				set = make(map[string]struct{})
+				out[m.GatewayModel] = set
+			}
+			for _, f := range flavors {
+				set[f] = struct{}{}
+			}
 		}
-		s.addVendorAccountModelFlavors(ctx, acc, out)
 	}
 	return out
 }
 
-// addVendorAccountModelFlavors unions one active account's models and their served
-// dialects into the per-name flavor set map, in place. A model-row read error skips
-// the account (best effort) rather than failing the whole overlay.
-func (s *Service) addVendorAccountModelFlavors(ctx context.Context, acc routing.VendorAccount, out map[string]map[string]struct{}) {
-	flavors := vendorAccountServedFlavors(acc)
-	models, err := s.routes.VendorAccountModels(ctx, acc.ID)
-	if err != nil {
-		return
-	}
-	for _, m := range models {
-		set := out[m.GatewayModel]
-		if set == nil {
-			set = make(map[string]struct{})
-			out[m.GatewayModel] = set
+// vendorDashboardRoutes is the dashboard half of the owner overlay: one row per
+// model of the principal's own active vendor accounts, under the model's
+// PREFIXED gateway name (the id a caller requests). A vendor model has no
+// server and no mapping, so the row carries the vendor as its provider, the
+// account's name as its host and, as its id, the account id and the model (the
+// pair is the vendor_account_models key, so two accounts of the same name
+// serving the same model still get distinct, stably ordered rows); its status
+// is active, because only active accounts are read.
+// Like the model listings' overlay it is NOT subject to the hidden/locked
+// suppression (that is a gateway-wide setting on self-hosted models, and these
+// are the principal's own), and it never reaches the admin management surface.
+func (s *Service) vendorDashboardRoutes(ctx context.Context, token auth.Token) []RouteDTO {
+	var out []RouteDTO
+	for _, am := range s.ownVendorAccountModels(ctx, token) {
+		for _, m := range am.Models {
+			out = append(out, RouteDTO{
+				ID:       am.Account.ID + ":" + m.GatewayModel,
+				Model:    m.GatewayModel,
+				Provider: am.Account.Vendor,
+				Host:     am.Account.Name,
+				Status:   routing.ServerStatusActive,
+			})
 		}
-		for _, f := range flavors {
-			set[f] = struct{}{}
-		}
 	}
+	return out
 }
 
 // vendorAccountServedFlavors is the dialects an account's models are dispatched
