@@ -146,8 +146,7 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 
 The external-vendor-accounts ("Anbieter") feature is governed by **two system
 settings** held in the `system_settings` store and edited in the portal's System
-settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for either
-(unlike the module flags that carry an env fallback):
+settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for either:
 
 | System setting | Values | Default | Effect |
 |---|---|---|---|

@@ -804,7 +804,7 @@ flag), with their HTTP status:
 | `vendor_account.api_key_not_allowed` | 400 | An API key was sent to a non-`api_key` account. |
 | `vendor_account.api_key_invalid` | 400 | A blank (whitespace-only) API key; send `""` to clear instead. |
 | `vendor_account.api_key_key_required` | 400 | No encryption key to seal the API key on a disk-backed store. |
-| `vendor_account.forbidden` | 403 | A write the caller may not make on an account it can otherwise reach. |
+| `vendor_account.forbidden` | 403 | `CreateVendorAccount` attempted by a principal that is not a user (a service principal has no owner to assign). A non-owner reaching an existing account gets `404 .not_found`, not this. |
 | `vendor_account.not_subscription` | 400 | A connect was attempted on an `api_key` account. |
 | `vendor_account.connect_token_required` / `.connect_code_required` | 400 | The import token / the pasted code is missing. |
 | `vendor_account.connect_state` / `.device_connect_state` | 400 | No connect (or device connect) is in progress, it expired, or the pasted state does not match. |
@@ -876,7 +876,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 |---|---|---|---|
 | `/api/system/theme` | GET | **Public** | Active theme descriptor for the pre-login UI |
 | `/api/system/themes/{id}/favicon\|logo` | GET | **Public** | External theme asset (favicon/logo); `{id}` resolved only against the loaded theme registry, never joined onto a filesystem path — no traversal surface |
-| `/api/system/settings` | GET/PUT | `system` | System-wide settings (SMTP, NetBird, certificate gates, currency, etc.) |
+| `/api/system/settings` | GET/PUT | `system` | System-wide settings (SMTP, NetBird, certificate gates, currency, the vendor-accounts master flag `vendor_accounts_enabled` and precedence `vendor_account_routing_mode`, etc.) |
 | `/api/system/smtp/test` | POST | `system` | Send a test email with the currently configured/pending SMTP settings |
 | `/api/system/tracing` | GET/PUT | `system` | OpenTelemetry tracing status/config |
 | `/api/system/logs`, `/logs/events`, `/logs/level` | GET, GET (SSE), GET/PUT | `system` | Log buffer snapshot, live tail, runtime log-level control |

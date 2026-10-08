@@ -516,7 +516,8 @@ state forward.
 Every served request (success or failure) produces exactly one `usage.Event`
 (`gateway/backend/internal/usage/query.go`), recorded once at the single accounting
 choke point, `Server.recordUsage` (`inference_complete.go`). Its fields cover full attribution:
-user/token/service/project id+name, session id/source/agent id, API flavor, model
+user/token/service/project id+name, session id/source/agent id, the vendor
+account id that served it (`account_id`, `''` off the vendor path), API flavor, model
 (requested + effective provider model), route/provider/host, token counts, latency,
 HTTP status/error code, content type, and (additively) energy/cost.
 

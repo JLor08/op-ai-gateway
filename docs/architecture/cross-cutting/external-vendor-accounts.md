@@ -47,7 +47,9 @@ sharing link table plus a resolver filter extension), not a rewrite.
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
 
-Exactly one of `api_key` / `oauth_tokens` is populated per row (enforced in the
+At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
+account created but not yet connected, and an api-key account with no key set, have
+neither (the exclusivity is enforced in the
 service, not the schema). A per-account curated model catalog
 (`vendor_account_models`) and a rate-limit usage snapshot
 (`vendor_account_usage`) hang off the account, both `on delete cascade`. The three
@@ -86,7 +88,9 @@ flow code. `vendorauth` may import `capture` (for sealing) and nothing from
 `provider`, `portal` or `routing`.
 
 Three connect methods exist. All are owner-only and gated by the
-`vendor_accounts_enabled` master flag in `portal.Service`; the HTTP endpoints are
+`vendor_accounts_enabled` master flag in `portal.Service`, and a successful
+connect (by any method) sets the account's status to `active`, clearing a prior
+`needs_reconnect`. The HTTP endpoints are
 under `POST /api/portal/vendor-accounts/{id}/connect/*`
 ([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
 
@@ -119,7 +123,7 @@ Anthropic exchanges at its console token URL with a JSON body;
 OpenAI uses form-encoded bodies at its OAuth token URL. The `state` is verified
 when the pasted value carries it; PKCE binds the exchange either way.
 
-### 3.3 Device-code (OpenAI only) — optional
+### 3.3 Device-code (OpenAI only)
 
 OpenAI additionally offers the Codex CLI's **bespoke `deviceauth` protocol**
 (not RFC 8628), which works for both local and remote gateways because it is
@@ -130,8 +134,8 @@ code and returns `{user_code, verification_url}` for the UI to display;
 account is connected (no token is ever returned). A poll that meets a transient
 upstream error (5xx/429/network) keeps the pending entry alive and keeps polling;
 only a 4xx rejection or the pending-state expiry ends it. Anthropic has no device
-flow. Device-code is the primary OpenAI connect method, with code-paste and token
-import as the alternatives.
+flow. Device-code is one of OpenAI's three connect methods — the portal offers
+code-paste, device-code and token import — not a required or primary one.
 
 ### 3.4 Token refresh
 
@@ -160,13 +164,32 @@ known limitation recorded in §9.
 A connected account becomes a routable candidate **without touching the hot
 scoring path, the multiplexer, or the `Target` core** beyond a small, additive
 dispatch extension. The resolver (`internal/routing/resolver.go`) gains a
-vendor-account candidate source consulted for a resolve carrying a known
-principal: it enumerates the principal's **own** active accounts, matches the
-requested gateway model + API flavor against the account's `vendor_account_models`
-rows, and builds a `Target` directly. Owner-scope is intrinsic — only the
-principal's accounts are enumerated — so one user's account can never serve
-another user's request. Precedence against self-hosted/shared routes is
-configurable (§6).
+vendor-account candidate source consulted for a resolve carrying a known **user**
+principal: it enumerates the principal's **own** active accounts and builds a
+`Target` directly for the **first** active account that has a
+`vendor_account_models` row whose `gateway_model` equals the requested model.
+Owner-scope is intrinsic — only the principal's accounts are enumerated — so one
+user's account can never serve another user's request. Precedence against
+self-hosted/shared routes is configurable (§6).
+
+The match is on the **model name only** (`gateway_model == req.Model`); the
+catalog row's `api_flavor` is stored metadata and is **not** read by the resolver
+or the listing overlay. What flavor each account serves is decided instead by the
+target the resolver builds, giving this served-flavor matrix:
+
+| Account | Serves | How |
+|---|---|---|
+| **api-key** (OpenAI or Anthropic) | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to the vendor's native wire (OpenAI → `/v1/chat/completions`; Anthropic → `/v1/messages`). |
+| **Anthropic subscription** | the `openai` **and** `anthropic` dialects | same `[openai, anthropic]` translate, into `/v1/messages` with the masquerade + beta headers. |
+| **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
+
+The vendor branch is **skipped entirely** — the request falls through to the
+self-hosted/shared path — when the module flag is off, the principal has no user
+id (a **service token**), a **server-override** is set, the request is
+**capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
+flavor is **images** (`openai_images`). That the resolver and the listing overlay
+agree on what each account serves is what makes §6's "served-flavors parity"
+between dispatch and the model listing meaningful.
 
 `Target` carries four vendor fields, all empty/false for an ordinary AI-server
 target:
@@ -178,10 +201,11 @@ target:
 | `ExtraHeaders` | A small static header set attached to the upstream request (§4.1/§4.2). |
 | `Masquerade` | `""` (none) or `claude_code` (`routing.MasqueradeClaudeCode`), which makes the Anthropic client prepend the required Claude-Code system block (§4.1). |
 
-Four provider kinds select the client at dispatch: `vendor_openai`
+Three provider kinds select the client at dispatch: `vendor_openai`
 (`ProviderVendorOpenAI`, the api-key OpenAI path via the existing
 OpenAI-compatible client), `vendor_anthropic` (`ProviderVendorAnthropic`, the
-native Anthropic Messages client), and `vendor_openai_subscription`
+native Anthropic Messages client, used for an Anthropic account whether api-key or
+subscription), and `vendor_openai_subscription`
 (`ProviderVendorOpenAISubscription`, the ChatGPT backend).
 
 ### 4.1 Anthropic
@@ -194,18 +218,22 @@ native Anthropic Messages client), and `vendor_openai_subscription`
   `You are Claude Code, Anthropic's official CLI for Claude.`, which the OAuth
   Messages path requires. Endpoint `https://api.anthropic.com`.
 
-Portal chat builds requests itself and Anthropic serves only `/v1/messages`
-(not `/v1/chat/completions`), so a **native Anthropic Messages client**
-(`internal/provider/anthropic_messages.go`) renders the neutral `inference`
-request to a `/v1/messages` body and parses the response/SSE back. It renders and
-parses itself rather than importing `internal/compat` (an architecture-test
-boundary). Claude-Code-flavored inbound traffic continues to use native
-passthrough.
+Anthropic serves only `/v1/messages` (not `/v1/chat/completions`), and the vendor
+targets leave `MessagesMode` zero (**translate**), so **both** inbound dialects —
+OpenAI and Anthropic — are translated through the neutral model into `/v1/messages`
+by a **native Anthropic Messages client** (`internal/provider/anthropic_messages.go`),
+which renders the neutral `inference` request to a `/v1/messages` body and parses
+the response/SSE back. It renders and parses itself rather than importing
+`internal/compat` (an architecture-test boundary), and it has **no** native
+passthrough path — the only passthrough on any vendor path is the OpenAI-subscription
+Responses path (§4.2).
 
 ### 4.2 OpenAI
 
-- **api_key**: `https://api.openai.com` via the existing OpenAI-compatible client
-  (`/v1/responses` or `/v1/chat/completions`), `Authorization: Bearer`.
+- **api_key**: `https://api.openai.com` via the existing OpenAI-compatible client.
+  The target's endpoint modes are zero, so every inbound dialect is **translated to
+  `/v1/chat/completions`** (there is no api-key `/responses` passthrough);
+  `Authorization: Bearer`.
 - **subscription**: the ChatGPT backend,
   `https://chatgpt.com/backend-api/codex`, which speaks the **Responses protocol
   only**. Static headers `OpenAI-Beta: responses=experimental` and
@@ -215,10 +243,12 @@ passthrough.
 
 The subscription path splits by the inbound request shape:
 
-- An inbound **Codex `/v1/responses`** request is relayed **verbatim** to the
-  ChatGPT backend's `/responses` (native passthrough — lossless). The endpoint
-  mode keys on `Target.Subscription`, so an api-key OpenAI `/responses` target is
-  unaffected.
+- An inbound **Codex `/v1/responses`** request has `ResponsesMode = passthrough`
+  set by the resolver (from the **fine** `openai_responses` flavor), so it is
+  relayed **verbatim** to the ChatGPT backend's `/responses` (lossless). It is
+  `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
+  path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
+  false, is unaffected.
 - Any other OpenAI flavor (chat completions, **portal chat**) is **translated** by
   a new outbound **OpenAI Responses translate client**
   (`internal/provider/openai_responses.go`): it renders the neutral request to a
@@ -262,7 +292,10 @@ carry no subscription window; absolute €/$ spend accounting is deferred.
 ## 6. Feature flag and routing mode
 
 Two system settings govern the feature (both read from the `system_settings`
-store through a cached accessor invalidated on a settings write):
+store). The **resolver** reads them through a short-TTL (~5 s) cached accessor
+invalidated on a settings write, while `portal.Service` (the CRUD gate and the
+model-listing overlay) reads them uncached — so a flag change can take up to the
+cache TTL to affect in-flight routing, a bounded, deliberate skew:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
@@ -343,9 +376,13 @@ reasons are recorded deliberately, not in denial of them
   not flip the account to `needs_reconnect` (only a refresh rejection does); a
   persist-failure after a refresh may keep a single-use refresh token, forcing a
   reconnect on the next request. Both are bounded by the token TTL and accepted.
-
-Keep the operator's real gateway hostname out of all repo text; use
-`<gateway-host>` where a host is needed.
+- **Single-process assumptions.** The pending-connect state (PKCE verifier/state
+  and the device-code pending entry) and the per-account refresh lock are both
+  **in-process**: a gateway restart loses any connect in progress (the user starts
+  it again), and a multi-replica deployment (the PostgreSQL driver) would break the
+  refresh single-flight — two replicas could refresh one account concurrently and
+  burn its single-use refresh token. The feature is an operator-only experiment, so
+  one gateway process is assumed.
 
 ## Related chapters
 
