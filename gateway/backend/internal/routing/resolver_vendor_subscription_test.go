@@ -94,11 +94,12 @@ func TestVendorSubscriptionNeedsReconnectDoesNotMatch(t *testing.T) {
 	}
 }
 
-// TestVendorSubscriptionOpenAIResolvesToPassthroughTarget is the core M5b proof:
-// an ACTIVE OpenAI subscription account, reached over the FINE openai_responses
-// flavor, resolves to a NATIVE-PASSTHROUGH target pointed at the ChatGPT backend
-// (ResponsesMode passthrough, the account id for the dispatch bearer, the two
-// static Codex headers, [openai] flavors only, and NO APIToken/Masquerade).
+// TestVendorSubscriptionOpenAIResolvesToPassthroughTarget is the core passthrough
+// proof: an ACTIVE OpenAI subscription account, reached over the FINE
+// openai_responses flavor, resolves to a NATIVE-PASSTHROUGH target pointed at the
+// ChatGPT backend (ResponsesMode passthrough, the account id for the dispatch
+// bearer, the two static Codex headers, [openai] flavors only, and NO
+// APIToken/Masquerade).
 func TestVendorSubscriptionOpenAIResolvesToPassthroughTarget(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
@@ -110,8 +111,8 @@ func TestVendorSubscriptionOpenAIResolvesToPassthroughTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve(openai_responses) = %v, want a passthrough target", err)
 	}
-	if target.Provider != ProviderVendorOpenAI {
-		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorOpenAI)
+	if target.Provider != ProviderVendorOpenAISubscription {
+		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorOpenAISubscription)
 	}
 	if target.Endpoint != "https://chatgpt.com/backend-api/codex" {
 		t.Errorf("Endpoint = %q, want the ChatGPT backend", target.Endpoint)
@@ -141,23 +142,56 @@ func TestVendorSubscriptionOpenAIResolvesToPassthroughTarget(t *testing.T) {
 		t.Errorf("chatgpt-account-id must NOT be a static header; it is resolved per-account at dispatch, got %q", target.ExtraHeaders["chatgpt-account-id"])
 	}
 	if len(target.APIFlavors) != 1 || target.APIFlavors[0] != APIFlavorOpenAI {
-		t.Errorf("APIFlavors = %q, want [openai] only (chat/completions is M5c)", target.APIFlavors)
+		t.Errorf("APIFlavors = %q, want [openai] only (the anthropic dialect is never served)", target.APIFlavors)
 	}
 }
 
-// TestVendorSubscriptionOpenAIChatFlavorDoesNotMatch proves a chat-flavor request
-// to an ACTIVE OpenAI subscription account does NOT match (portal chat/completions
-// support is Milestone 5c): it falls through to ErrNoModelRoute rather than
-// producing a target that chat/completions would then 404 on.
-func TestVendorSubscriptionOpenAIChatFlavorDoesNotMatch(t *testing.T) {
+// TestVendorSubscriptionOpenAIChatFlavorResolvesToTranslateTarget is the M5c proof:
+// a chat-flavor request to an ACTIVE OpenAI subscription account now MATCHES and
+// resolves to a TRANSLATE target (ResponsesMode zero), so the OpenAIResponsesClient
+// renders chat as a Responses body. It is the same ChatGPT-backend target as the
+// passthrough case but without the passthrough mode and still [openai] only.
+func TestVendorSubscriptionOpenAIChatFlavorResolvesToTranslateTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex-upstream", APIFlavorOpenAI)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_chat"})
+	if err != nil {
+		t.Fatalf("Resolve(openai chat) = %v, want a translate target (chat/completions is Milestone 5c)", err)
+	}
+	if target.Provider != ProviderVendorOpenAISubscription {
+		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorOpenAISubscription)
+	}
+	if target.Endpoint != "https://chatgpt.com/backend-api/codex" {
+		t.Errorf("Endpoint = %q, want the ChatGPT backend", target.Endpoint)
+	}
+	if target.ResponsesMode != "" {
+		t.Errorf("ResponsesMode = %q, want zero (translate) for a chat-flavor request", target.ResponsesMode)
+	}
+	if !target.Subscription || target.VendorAccountID != "acc_sub_oai" {
+		t.Errorf("Subscription=%v VendorAccountID=%q, want true/acc_sub_oai (bearer resolved at dispatch)", target.Subscription, target.VendorAccountID)
+	}
+	if len(target.APIFlavors) != 1 || target.APIFlavors[0] != APIFlavorOpenAI {
+		t.Errorf("APIFlavors = %q, want [openai] only", target.APIFlavors)
+	}
+}
+
+// TestVendorSubscriptionOpenAIAnthropicFlavorDoesNotMatch proves an OpenAI
+// subscription account never serves the anthropic dialect (the ChatGPT backend
+// speaks Responses only): an anthropic_messages request falls through to
+// ErrNoModelRoute rather than producing an OpenAI target an anthropic call 404s on.
+func TestVendorSubscriptionOpenAIAnthropicFlavorDoesNotMatch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
 	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
-	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_chat"}); !errors.Is(err, ErrNoModelRoute) {
-		t.Fatalf("Resolve(openai chat) = %v, want ErrNoModelRoute (chat/completions is Milestone 5c)", err)
+	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "anthropic_messages"}); !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("Resolve(anthropic) = %v, want ErrNoModelRoute (an OpenAI account never serves the anthropic dialect)", err)
 	}
 }
 
@@ -244,7 +278,9 @@ func TestVendorSubscriptionTargetCompleteness(t *testing.T) {
 		mayBeZero map[string]bool
 	}{
 		{"anthropic", "vendorSubscriptionAnthropicTarget", vendorSubscriptionAnthropicTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic), vendorSubscriptionTargetMayBeZero},
-		{"openai", "vendorSubscriptionOpenAITarget", vendorSubscriptionOpenAITarget(openAIAcc, openAIModel, "gpt-5-codex", APIFlavorOpenAI), vendorSubscriptionOpenAITargetMayBeZero},
+		// The openai case uses the openai_responses (passthrough) shape, whose
+		// ResponsesMode is non-zero — the complete shape the may-be-zero set expects.
+		{"openai", "vendorSubscriptionOpenAITarget", vendorSubscriptionOpenAITarget(openAIAcc, openAIModel, "gpt-5-codex", APIFlavorOpenAI, "openai_responses"), vendorSubscriptionOpenAITargetMayBeZero},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

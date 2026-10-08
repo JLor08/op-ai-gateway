@@ -370,7 +370,7 @@ func newChatGPTBackendStub(t *testing.T) *chatGPTBackendStub {
 func openAISubscriptionTarget(accountID, endpoint string) routing.Target {
 	return routing.Target{
 		RouteID:         "vendor:" + accountID + ":gpt-5-codex",
-		Provider:        routing.ProviderVendorOpenAI,
+		Provider:        routing.ProviderVendorOpenAISubscription,
 		Endpoint:        endpoint,
 		Model:           "gpt-5-codex",
 		ProviderModel:   "gpt-5-codex-upstream",
@@ -452,7 +452,7 @@ func TestOpenAISubscriptionDispatchAttachesBearerAccountIDAndHeaders(t *testing.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
 	path := upstreamPath(target, "openai_responses")
 	upstreamBody := rewriteModelField([]byte(openAIResponsesBody), target.ProviderModel)
-	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody)
+	resp, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody)
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
@@ -534,7 +534,7 @@ func TestOpenAISubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
 	target := openAISubscriptionTarget("acc_sub_oai", stub.srv.URL)
 
 	ctx := s.upstreamAuthCtx(context.Background(), target)
-	if _, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody)); err != nil {
+	if _, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody)); err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
 

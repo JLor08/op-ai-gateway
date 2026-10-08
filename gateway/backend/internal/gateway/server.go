@@ -1838,7 +1838,7 @@ func (s *Server) subscriptionAuthCtx(ctx context.Context, target routing.Target)
 		return provider.WithUpstreamAuthHeaders(ctx, "", "", target.ExtraHeaders)
 	}
 	extra := target.ExtraHeaders
-	if target.Provider == routing.ProviderVendorOpenAI {
+	if routing.IsOpenAIVendorProvider(target.Provider) {
 		// COPY the shared target map before adding the per-account header — the
 		// resolved Target (and its ExtraHeaders) is shared across requests and must
 		// never be mutated. An empty account id is fail-open: the request goes

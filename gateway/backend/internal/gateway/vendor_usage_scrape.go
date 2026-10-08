@@ -77,6 +77,11 @@ func parseVendorAccountUsage(provider, accountID string, h http.Header, now time
 	}
 	found := false
 
+	// Normalize the OpenAI subscription provider to the OpenAI vendor case: both
+	// scrape the same Codex rate-limit headers off the ChatGPT backend's response.
+	if routing.IsOpenAIVendorProvider(provider) {
+		provider = routing.ProviderVendorOpenAI
+	}
 	switch provider {
 	case routing.ProviderVendorAnthropic:
 		// Anthropic utilization is a 0..1 fraction; scale to percent.

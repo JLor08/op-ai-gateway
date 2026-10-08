@@ -13,10 +13,17 @@ import (
 // their OWN active vendor accounts serves → the coarse inbound flavors dispatch
 // serves it under. It is the listing half of the resolver's resolveVendorAccount
 // branch, and the two are deliberately kept in lock-step (served_flavors parity):
-// dispatch serves a vendor model over BOTH the openai and anthropic inbound
-// dialects (the vendor Target carries APIFlavors [openai, anthropic] with
-// translate endpoint modes) and never over images, so every served model maps to
-// {openai, anthropic} here.
+//
+//   - Most accounts (api_key OpenAI/Anthropic, Anthropic subscription) serve a
+//     model over BOTH the openai and anthropic inbound dialects via translate (their
+//     Target carries APIFlavors [openai, anthropic]), so the model maps to
+//     {openai, anthropic} here.
+//   - An OpenAI SUBSCRIPTION account (the ChatGPT backend, Responses-only) serves a
+//     model over the OPENAI dialect only — openai_responses via native passthrough
+//     and chat/completions via translate, both coarse "openai" — and NOT the
+//     anthropic dialect (its Target carries [openai] only). So its models map to
+//     {openai} here. Listing them under anthropic would put them in
+//     /anthropic/v1/models where an anthropic call then 404s, breaking parity.
 //
 // Returns nil (no overlay) unless the vendor_accounts_enabled master flag is on,
 // the principal is a USER (a service token has no UserID and owns no vendor
@@ -36,16 +43,12 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 		if acc.Status != routing.VendorAccountStatusActive {
 			continue
 		}
-		// An OpenAI SUBSCRIPTION account serves ONLY /v1/responses via native
-		// passthrough (Milestone 5b); chat/completions support is Milestone 5c. The
-		// overlay advertises a model under the coarse {openai, anthropic} dialects,
-		// so listing an OpenAI subscription model here would put it in /v1/models and
-		// the chat picker, where a chat/completions call then 404s — breaking
-		// served_flavors parity. Skip it until M5c. (API-key OpenAI accounts and
-		// Anthropic subscription accounts still serve both dialects via translate and
-		// stay advertised.)
+		// The dialects this account's models are dispatched under. An OpenAI
+		// subscription account serves the openai dialect only (see the doc comment);
+		// every other account serves both via translate.
+		flavors := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
 		if acc.AuthType == routing.VendorAuthSubscription && acc.Vendor == routing.VendorOpenAI {
-			continue
+			flavors = []string{routing.APIFlavorOpenAI}
 		}
 		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
 		if err != nil {
@@ -57,8 +60,9 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 				set = make(map[string]struct{})
 				out[m.GatewayModel] = set
 			}
-			set[routing.APIFlavorOpenAI] = struct{}{}
-			set[routing.APIFlavorAnthropic] = struct{}{}
+			for _, f := range flavors {
+				set[f] = struct{}{}
+			}
 		}
 	}
 	return out

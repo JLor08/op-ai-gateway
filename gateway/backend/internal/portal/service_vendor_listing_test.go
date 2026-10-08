@@ -122,38 +122,45 @@ func TestVendorModelsHiddenWhenFlagOff(t *testing.T) {
 	}
 }
 
-// TestVendorModelsOpenAISubscriptionHiddenUntilM5c proves an ACTIVE OpenAI
-// SUBSCRIPTION account's models are NOT advertised in any owner listing (it serves
-// only /v1/responses via native passthrough in M5b; chat/completions is M5c, so
-// advertising would break served_flavors parity). An active OpenAI API-KEY account
-// in the same listing stays visible, proving the skip is specific to the
-// subscription auth type and not to the OpenAI vendor.
-func TestVendorModelsOpenAISubscriptionHiddenUntilM5c(t *testing.T) {
+// TestVendorModelsOpenAISubscriptionAdvertisedUnderOpenAIOnly proves an ACTIVE
+// OpenAI SUBSCRIPTION account's models ARE advertised to their owner as of M5c — in
+// the chat picker and /v1/models (openai) — but NOT in /anthropic/v1/models, because
+// the ChatGPT backend speaks Responses only and the account serves the openai
+// dialect only (openai_responses passthrough + chat translate). Listing it under
+// anthropic would break served_flavors parity (an anthropic call would 404).
+func TestVendorModelsOpenAISubscriptionAdvertisedUnderOpenAIOnly(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorAccountTestService(t, now)
 	ctx := context.Background()
 	owner := ownerToken()
 
-	// An api_key OpenAI account (its catalog models must stay visible).
+	// An api_key OpenAI account (its catalog models stay visible under both dialects).
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
-	// An ACTIVE OpenAI subscription account serving a distinct model (must be hidden).
+	// An ACTIVE OpenAI subscription account serving a distinct model.
 	const subModel = "gpt-5-codex"
 	seedActiveSubscriptionAccount(t, routeStore, now, owner, "acc_sub_oai", routing.VendorOpenAI, subModel, routing.APIFlavorOpenAI)
 
-	// The subscription model is absent from every owner listing.
-	if _, ok := modelDTONamed(svc.Models(ctx, owner).Data, subModel); ok {
-		t.Errorf("Models() lists the OpenAI subscription model %q; it must be hidden until M5c", subModel)
+	// The subscription model is advertised under the openai dialect.
+	row, ok := modelDTONamed(svc.Models(ctx, owner).Data, subModel)
+	if !ok {
+		t.Fatalf("Models() has no row for the OpenAI subscription model %q; it must be advertised in M5c", subModel)
 	}
-	if got := svc.ModelsForFlavor(ctx, owner, routing.APIFlavorOpenAI); slices.Contains(got, subModel) {
-		t.Errorf("/v1/models (openai) = %q, must not include the subscription model %q", got, subModel)
+	if !slices.Contains(row.Flavors, routing.APIFlavorOpenAI) {
+		t.Errorf("subscription model Flavors = %q, want it to include openai", row.Flavors)
+	}
+	if slices.Contains(row.Flavors, routing.APIFlavorAnthropic) {
+		t.Errorf("subscription model Flavors = %q, must NOT include anthropic (the backend speaks Responses only)", row.Flavors)
+	}
+	if got := svc.ModelsForFlavor(ctx, owner, routing.APIFlavorOpenAI); !slices.Contains(got, subModel) {
+		t.Errorf("/v1/models (openai) = %q, want it to include the subscription model %q", got, subModel)
 	}
 	if got := svc.ModelsForFlavor(ctx, owner, routing.APIFlavorAnthropic); slices.Contains(got, subModel) {
 		t.Errorf("/anthropic/v1/models = %q, must not include the subscription model %q", got, subModel)
 	}
 
-	// The api_key account's catalog model is still advertised (skip is specific).
+	// The api_key account's catalog model is still advertised under both dialects.
 	if _, ok := modelDTONamed(svc.Models(ctx, owner).Data, "gpt-5"); !ok {
-		t.Error("Models() dropped the api_key OpenAI model gpt-5; only subscription accounts must be skipped")
+		t.Error("Models() dropped the api_key OpenAI model gpt-5")
 	}
 }
 

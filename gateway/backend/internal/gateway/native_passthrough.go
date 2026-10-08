@@ -75,11 +75,13 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 		// Every other Responses upstream (self-hosted llama.cpp/vLLM, an api_key
 		// OpenAI vendor account or app) keeps the standard /v1/responses.
 		//
-		// The trigger is the explicit Subscription flag, NOT VendorAccountID: M6a now
-		// sets VendorAccountID on api-key OpenAI vendor targets too (for usage
-		// attribution), so keying on it here would also route an api-key OpenAI target
-		// to the Codex backend -- the exact conflation Target.Subscription removed.
-		if target.Provider == routing.ProviderVendorOpenAI && target.Subscription {
+		// The trigger is the explicit Subscription flag plus an OpenAI vendor provider
+		// (ProviderVendorOpenAI or the M5c ProviderVendorOpenAISubscription), NOT
+		// VendorAccountID: M6a now sets VendorAccountID on api-key OpenAI vendor
+		// targets too (for usage attribution), so keying on it here would also route an
+		// api-key OpenAI target to the Codex backend -- the exact conflation
+		// Target.Subscription removed.
+		if target.Subscription && routing.IsOpenAIVendorProvider(target.Provider) {
 			return "/responses", target.ResponsesMode
 		}
 		return "/v1/responses", target.ResponsesMode
@@ -178,6 +180,12 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 		return "/api/chat"
 	case routing.ProviderVendorAnthropic:
 		return "/v1/messages"
+	case routing.ProviderVendorOpenAISubscription:
+		// The OpenAI subscription translate path (chat -> Responses) POSTs to the
+		// ChatGPT backend's bare /responses, not /v1/chat/completions (the backend has
+		// no chat-completions surface) -- provider.OpenAIResponsesClient's path. This
+		// keeps the usage label consistent with endpointModeFor's passthrough answer.
+		return "/responses"
 	}
 	return "/v1/chat/completions"
 }
