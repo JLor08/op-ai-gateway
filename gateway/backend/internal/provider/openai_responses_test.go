@@ -513,3 +513,189 @@ func collectResponsesStream(t *testing.T, client *OpenAIResponsesClient, ctx con
 	})
 	return events, err
 }
+
+// ---- Codex-backend request requirements (store / include / reasoning) ----
+
+// decodeResponsesBody renders req for the subscription target and decodes the
+// body into a generic map, so a test can tell a MISSING key from a zero value.
+func decodeResponsesBody(t *testing.T, req inference.Request) (map[string]any, string) {
+	t.Helper()
+	raw, err := openaiResponsesRequestBody(openaiResponsesTarget("http://unused"), req)
+	if err != nil {
+		t.Fatalf("openaiResponsesRequestBody returned %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("body is not JSON: %v: %s", err, raw)
+	}
+	return body, string(raw)
+}
+
+// A plain portal-chat request carries no reasoning effort, no system prompt and no
+// output cap. The ChatGPT/Codex backend still needs store:false (it rejects the
+// default store:true with a 400), the encrypted-reasoning include, and a reasoning
+// object (the subscription catalog is reasoning-only gpt-5 models).
+func TestOpenAIResponsesRequestBodyAlwaysSendsCodexBackendRequirements(t *testing.T) {
+	body, raw := decodeResponsesBody(t, inference.Request{
+		Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")},
+	})
+
+	if !strings.Contains(raw, `"store":false`) {
+		t.Fatalf("body lacks an explicit \"store\":false (omitting it defaults to true, which the backend rejects): %s", raw)
+	}
+	if body["store"] != false {
+		t.Fatalf("store = %v, want false", body["store"])
+	}
+	assertJSON(t, "include", body["include"], `["reasoning.encrypted_content"]`)
+	assertJSON(t, "reasoning", body["reasoning"], `{"effort":"medium"}`)
+	if body["stream"] != true {
+		t.Fatalf("stream = %v, want true", body["stream"])
+	}
+	if input, ok := body["input"].([]any); !ok || len(input) != 1 {
+		t.Fatalf("input = %#v, want a non-null array of one item", body["input"])
+	}
+	for _, absent := range []string{"instructions", "max_output_tokens", "tools", "tool_choice"} {
+		if _, present := body[absent]; present {
+			t.Errorf("%s present in a plain request, want it omitted: %s", absent, raw)
+		}
+	}
+}
+
+func TestOpenAIResponsesRequestBodyHonorsExplicitReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name, effort, want string
+	}{
+		{"explicit effort wins over the default", "high", "high"},
+		{"effort is trimmed", "  low ", "low"},
+		{"blank effort falls back to the default", "   ", "medium"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := decodeResponsesBody(t, inference.Request{
+				ReasoningEffort: tc.effort,
+				Messages:        []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")},
+			})
+			assertJSON(t, "reasoning", body["reasoning"], `{"effort":"`+tc.want+`"}`)
+			if body["store"] != false {
+				t.Fatalf("store = %v, want false", body["store"])
+			}
+			assertJSON(t, "include", body["include"], `["reasoning.encrypted_content"]`)
+		})
+	}
+}
+
+// ---- non-2xx diagnosability ----
+
+func TestOpenAIResponsesClientErrorCarriesStatusAndBoundedUpstreamBody(t *testing.T) {
+	const reason = `{"detail":"Unsupported parameter: store"}`
+	tests := []struct {
+		status int
+		want   error
+	}{
+		{http.StatusBadRequest, ErrUnavailable},
+		{http.StatusUnauthorized, ErrAuthRejected},
+		{http.StatusForbidden, ErrAuthRejected},
+		{http.StatusServiceUnavailable, ErrUpstreamStarting},
+	}
+	for _, tc := range tests {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, reason)
+			}))
+			defer upstream.Close()
+			client := NewOpenAIResponsesClient(http.DefaultClient)
+			ctx := WithUpstreamAuthHeaders(context.Background(), "", "super-secret-oauth-token", map[string]string{"chatgpt-account-id": "acc-secret-123"})
+			req := inference.Request{Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")}}
+
+			_, completeErr := client.Complete(ctx, openaiResponsesTarget(upstream.URL), req)
+			streamErr := client.CompleteStream(ctx, openaiResponsesTarget(upstream.URL), req, func(inference.StreamEvent) error { return nil })
+
+			for name, err := range map[string]error{"Complete": completeErr, "CompleteStream": streamErr} {
+				if !errors.Is(err, tc.want) || !errors.Is(err, ErrUnavailable) {
+					t.Errorf("%s(%d) error = %v, want it to wrap %v", name, tc.status, err, tc.want)
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, strconv.Itoa(tc.status)) {
+					t.Errorf("%s(%d) error %q lacks the status", name, tc.status, msg)
+				}
+				if !strings.Contains(msg, reason) {
+					t.Errorf("%s(%d) error %q lacks the upstream reason", name, tc.status, msg)
+				}
+				if strings.Contains(msg, "super-secret-oauth-token") || strings.Contains(msg, "acc-secret-123") {
+					t.Errorf("%s(%d) error %q leaks a request credential", name, tc.status, msg)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAIResponsesClientErrorBodySnippetIsCappedAndSingleLine(t *testing.T) {
+	const tail = "TAIL-MARKER-BEYOND-THE-CAP"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "{\n  \"detail\": \"first\r\nsecond\"\n}\n"+strings.Repeat("x", 64<<10)+tail)
+	}))
+	defer upstream.Close()
+	client := NewOpenAIResponsesClient(http.DefaultClient)
+
+	_, err := client.Complete(context.Background(), openaiResponsesTarget(upstream.URL), inference.Request{Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")}})
+
+	if err == nil {
+		t.Fatal("Complete returned nil, want the upstream 400")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, tail) {
+		t.Fatalf("error carries the body past the cap")
+	}
+	if got, limit := len(msg), 4096+512; got > limit {
+		t.Fatalf("error is %d bytes, want it bounded to about 4 KiB (<= %d)", got, limit)
+	}
+	if strings.ContainsAny(msg, "\r\n") {
+		t.Fatalf("error spans several lines, which splits the log line: %q", msg)
+	}
+	if !strings.Contains(msg, `"detail"`) || !strings.Contains(msg, "first") || !strings.Contains(msg, "second") {
+		t.Fatalf("error lost the start of the upstream body: %q", msg)
+	}
+	if !strings.Contains(msg, "truncated") {
+		t.Fatalf("error does not say the snippet was truncated: %q", msg)
+	}
+}
+
+func TestOpenAIResponsesClientErrorWithEmptyBodyStillNamesTheStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	client := NewOpenAIResponsesClient(http.DefaultClient)
+
+	_, err := client.Complete(context.Background(), openaiResponsesTarget(upstream.URL), inference.Request{Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")}})
+
+	if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "upstream status 502") {
+		t.Fatalf("error = %v, want ErrUnavailable naming status 502", err)
+	}
+}
+
+func TestOpenAIResponsesClientRecordsTheErrorBodyInTheCaptureSink(t *testing.T) {
+	const reason = `{"detail":"Unsupported parameter: store"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-request-id", "req-1")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, reason)
+	}))
+	defer upstream.Close()
+	client := NewOpenAIResponsesClient(http.DefaultClient)
+	sink := NewCaptureSink(1 << 10)
+
+	_, err := client.Complete(WithCaptureSink(context.Background(), sink), openaiResponsesTarget(upstream.URL), inference.Request{Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")}})
+
+	if err == nil {
+		t.Fatal("Complete returned nil, want the upstream 400")
+	}
+	if got := string(sink.ResponseBody()); got != reason {
+		t.Fatalf("captured response body = %q, want the upstream error body %q", got, reason)
+	}
+	if got := sink.ResponseHeaders().Get("x-request-id"); got != "req-1" {
+		t.Fatalf("captured response header x-request-id = %q, want req-1", got)
+	}
+}

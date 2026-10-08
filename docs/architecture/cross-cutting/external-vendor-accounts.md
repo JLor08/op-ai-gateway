@@ -394,6 +394,20 @@ The subscription path splits by the inbound request shape:
   Responses body, POSTs the same bare `/responses` path, and parses the Responses
   SSE back to the neutral model.
 
+The ChatGPT backend is far stricter than the public Responses API, so the
+translate client always sends what the Codex CLI always sends, whatever the
+inbound request carried (REVERSE-ENGINEERED / VERIFY-LIVE): `store: false` (a
+body without `store` defaults to `true`, which the subscription backend rejects
+with a 400), `include: ["reasoning.encrypted_content"]` (so reasoning round-trips
+while nothing is stored), and a `reasoning` object — the request's effort, else
+`medium` (a portal chat carries none, and the subscription catalog is the
+reasoning-only gpt-5 family). `instructions` and `max_output_tokens` stay omitted
+when empty. A non-2xx answer keeps the usual status → sentinel mapping
+(401/403 → `ErrAuthRejected`, 503 → `ErrUpstreamStarting`, else `ErrUnavailable`)
+and now also carries a bounded (4 KiB), single-line snippet of the vendor's error
+body in the returned error and in the payload capture, because the backend states
+why it refused a request only there.
+
 ### 4.3 Credential resolution at the edge
 
 For a subscription target, `subscriptionAuthCtx` resolves (and refreshes, §3.4)

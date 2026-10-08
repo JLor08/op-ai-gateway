@@ -15,6 +15,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"unicode"
 )
 
 // openaiResponsesPath is the one endpoint this client POSTs to. The target's
@@ -25,6 +26,27 @@ import (
 // passthrough legs of the SAME target reach the identical upstream URL.
 // REVERSE-ENGINEERED / VERIFY-LIVE.
 const openaiResponsesPath = "/responses"
+
+const (
+	// openaiResponsesDefaultReasoningEffort is the reasoning effort sent when the
+	// inbound request carries none (a portal chat never does). The ChatGPT backend
+	// serves only the reasoning gpt-5 family to a subscription, and the Codex CLI
+	// always sends a `reasoning` object for such a model, so one is always present;
+	// "medium" is the Codex CLI's own default effort. REVERSE-ENGINEERED /
+	// VERIFY-LIVE.
+	openaiResponsesDefaultReasoningEffort = "medium"
+
+	// openaiResponsesIncludeEncryptedReasoning is the `include` entry that makes the
+	// backend return a reasoning item's encrypted_content, so reasoning can
+	// round-trip while `store` is false. The Codex CLI always sends it.
+	// REVERSE-ENGINEERED / VERIFY-LIVE.
+	openaiResponsesIncludeEncryptedReasoning = "reasoning.encrypted_content"
+
+	// openaiResponsesErrorBodyLimit bounds how much of a non-2xx upstream body is
+	// read into the returned error (and the capture sink): enough for the vendor's
+	// error JSON, small enough that a misbehaving upstream cannot flood a log line.
+	openaiResponsesErrorBodyLimit = 4 << 10
+)
 
 // OpenAIResponsesClient is the outbound client for an OpenAI SUBSCRIPTION target
 // (the reverse-engineered ChatGPT backend, Responses protocol only). It serves
@@ -182,10 +204,16 @@ func (c *OpenAIResponsesClient) scanStream(ctx context.Context, r io.Reader, st 
 // response (the caller owns closing its Body). Every failure is already mapped to
 // a provider error: ErrTimeout when ctx's deadline elapsed, ErrUnavailable for a
 // transport error, and unavailableStatus for a non-2xx status (401/403 ->
-// ErrAuthRejected, 503 -> ErrUpstreamStarting). It records the outbound request
-// and, on success, the response headers with the context's capture sink. The
-// credential + the static Codex headers ride on ctx (subscriptionAuthCtx) and are
-// set by applyUpstreamAuth; this client sets only Content-Type.
+// ErrAuthRejected, 503 -> ErrUpstreamStarting). A non-2xx status keeps that
+// sentinel and appends a bounded, single-line snippet of the vendor's error body to
+// the message: the ChatGPT backend states WHY it refused a request (an unsupported
+// or missing parameter) only there, and without it the log reads just "upstream
+// status 400". The snippet is the vendor's response, never the request, so it
+// carries no credential. It records the outbound request and the response headers
+// (and, for a non-2xx status, the same bounded body snippet) with the context's
+// capture sink. The credential + the static Codex headers ride on ctx
+// (subscriptionAuthCtx) and are set by applyUpstreamAuth; this client sets only
+// Content-Type.
 func (c *OpenAIResponsesClient) post(ctx context.Context, target routing.Target, body []byte) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, openaiResponsesPath), bytes.NewReader(body))
 	if err != nil {
@@ -202,30 +230,81 @@ func (c *OpenAIResponsesClient) post(ctx context.Context, target routing.Target,
 		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		httpResp.Body.Close()
-		return nil, unavailableStatus(httpResp.StatusCode)
-	}
 	sink.RecordResponseHeaders(httpResp.Header)
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		snippet := readUpstreamErrorSnippet(httpResp.Body, openaiResponsesErrorBodyLimit)
+		httpResp.Body.Close()
+		sink.WriteResponse([]byte(snippet))
+		return nil, upstreamStatusError(httpResp.StatusCode, snippet)
+	}
 	return httpResp, nil
+}
+
+// upstreamStatusError is unavailableStatus plus the upstream's own explanation: it
+// keeps the status -> sentinel mapping (errors.Is still matches ErrAuthRejected /
+// ErrUpstreamStarting / ErrUnavailable) and appends snippet when there is one.
+func upstreamStatusError(status int, snippet string) error {
+	base := unavailableStatus(status)
+	if snippet == "" {
+		return base
+	}
+	return fmt.Errorf("%w: %s", base, snippet)
+}
+
+// readUpstreamErrorSnippet reads at most limit bytes of a non-2xx response body and
+// returns them as ONE log-safe line: invalid UTF-8 is dropped, every control
+// character (newlines included, which would split a log line) becomes a space, runs
+// of whitespace collapse, and a body longer than limit ends in "...(truncated)".
+// A read error just ends the snippet early; the status already says what failed.
+func readUpstreamErrorSnippet(r io.Reader, limit int) string {
+	raw, _ := io.ReadAll(io.LimitReader(r, int64(limit)+1))
+	truncated := len(raw) > limit
+	if truncated {
+		raw = raw[:limit]
+	}
+	text := strings.ToValidUTF8(string(raw), "")
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }), " ")
+	if truncated {
+		text += "...(truncated)"
+	}
+	return text
 }
 
 // ---- request render (neutral -> Responses body) ----
 
+// openaiResponsesRequest is the body POSTed to the ChatGPT/Codex backend
+// (chatgpt.com/backend-api/codex/responses). That backend is far stricter than the
+// public Responses API: it rejects a body that omits the fields the Codex CLI
+// always sends, so Store, Include and Reasoning below are ALWAYS populated by
+// openaiResponsesRequestBody. REVERSE-ENGINEERED (from the openai/codex client) /
+// VERIFY-LIVE.
 type openaiResponsesRequest struct {
 	Model string `json:"model"`
 	// Stream is ALWAYS true: the ChatGPT backend is stream-only (VERIFY-LIVE), and
 	// Complete streams internally and aggregates. It is a literal, not read from
 	// req.Stream, so the body always matches the SSE parser that reads the reply.
 	Stream bool `json:"stream"`
+	// Store is ALWAYS false and, unlike the omitempty fields, is NEVER omitted: a
+	// body without `store` defaults to store:true, which the subscription backend
+	// rejects with a 400 (the Codex CLI always sends store:false). A bool without
+	// omitempty is what makes the literal false serialize. REVERSE-ENGINEERED /
+	// VERIFY-LIVE.
+	Store bool `json:"store"`
+	// Include is ALWAYS ["reasoning.encrypted_content"], as the Codex CLI sends it:
+	// with store:false the backend keeps no reasoning state, so the encrypted content
+	// is what lets reasoning round-trip. REVERSE-ENGINEERED / VERIFY-LIVE.
+	Include []string `json:"include,omitempty"`
 	// Instructions is the Responses system prompt: the joined system + developer
 	// text. Omitted when empty.
-	Instructions    string                     `json:"instructions,omitempty"`
-	Input           []openaiResponsesInputItem `json:"input"`
-	Tools           []openaiResponsesTool      `json:"tools,omitempty"`
-	ToolChoice      any                        `json:"tool_choice,omitempty"`
-	Reasoning       *openaiResponsesReasoning  `json:"reasoning,omitempty"`
-	MaxOutputTokens int                        `json:"max_output_tokens,omitempty"`
+	Instructions string                     `json:"instructions,omitempty"`
+	Input        []openaiResponsesInputItem `json:"input"`
+	Tools        []openaiResponsesTool      `json:"tools,omitempty"`
+	ToolChoice   any                        `json:"tool_choice,omitempty"`
+	// Reasoning is ALWAYS set by openaiResponsesRequestBody (the Codex CLI always
+	// sends it for a gpt-5 model); the pointer only keeps a hand-built zero value
+	// from serializing an empty effort.
+	Reasoning       *openaiResponsesReasoning `json:"reasoning,omitempty"`
+	MaxOutputTokens int                       `json:"max_output_tokens,omitempty"`
 }
 
 // openaiResponsesInputItem is one `input` array item, discriminated by Type:
@@ -264,15 +343,26 @@ type openaiResponsesReasoning struct {
 	Effort string `json:"effort"`
 }
 
-// openaiResponsesRequestBody renders the neutral request as a Responses body. The
-// stream flag is always true (see openaiResponsesRequest.Stream).
+// openaiResponsesRequestBody renders the neutral request as a Responses body for
+// the ChatGPT/Codex backend. The stream flag is always true (see
+// openaiResponsesRequest.Stream). It also ALWAYS sends the three things the Codex
+// CLI always sends and the backend insists on, whatever the inbound request
+// carried: store:false, include ["reasoning.encrypted_content"], and a reasoning
+// object (the request's effort, else openaiResponsesDefaultReasoningEffort). This
+// client serves only an OpenAI SUBSCRIPTION target, whose catalog is the
+// reasoning-only gpt-5 family, so unconditionally sending reasoning is correct
+// here; it must not be reused for a model that rejects `reasoning`.
+// REVERSE-ENGINEERED / VERIFY-LIVE.
 func openaiResponsesRequestBody(target routing.Target, req inference.Request) ([]byte, error) {
 	instructions, input := openaiResponsesInput(req.Messages)
 	body := openaiResponsesRequest{
 		Model:        providerModel(target, req),
 		Stream:       true,
+		Store:        false,
+		Include:      []string{openaiResponsesIncludeEncryptedReasoning},
 		Instructions: instructions,
 		Input:        input,
+		Reasoning:    &openaiResponsesReasoning{Effort: openaiResponsesDefaultReasoningEffort},
 	}
 	if body.Input == nil {
 		// The backend requires a non-null input array; an all-system conversation
@@ -286,7 +376,7 @@ func openaiResponsesRequestBody(target routing.Target, req inference.Request) ([
 		body.ToolChoice = openaiResponsesToolChoiceFor(req.ToolChoice)
 	}
 	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
-		body.Reasoning = &openaiResponsesReasoning{Effort: effort}
+		body.Reasoning.Effort = effort
 	}
 	if req.MaxTokens > 0 {
 		body.MaxOutputTokens = req.MaxTokens
