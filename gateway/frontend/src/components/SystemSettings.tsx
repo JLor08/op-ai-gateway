@@ -13,6 +13,7 @@ import { SelectField } from './shared/SelectField';
 import { Field } from './shared/Field';
 import { useToast } from './shared/ToastProvider';
 import { availableUnits, fromEur, toEur, type CurrencyUnit } from '../currency';
+import type { VendorAccountRoutingMode } from '../api';
 
 const LANGUAGE_LABELS: Record<string, string> = { de: 'Deutsch', en: 'English' };
 
@@ -70,6 +71,12 @@ export function SystemSettings({
   const [pendingTotpMode, setPendingTotpMode] = useState<string | null>(null);
   const [pendingAffinityMode, setPendingAffinityMode] = useState<string | null>(null);
   const [pendingVisionProbeMode, setPendingVisionProbeMode] = useState<string | null>(null);
+  // Vendor accounts ("Anbieter") master flag + routing precedence.
+  const [pendingVendorAccountsEnabled, setPendingVendorAccountsEnabled] = useState<boolean | null>(
+    null,
+  );
+  const [pendingVendorRoutingMode, setPendingVendorRoutingMode] =
+    useState<VendorAccountRoutingMode | null>(null);
   // pendingEnergyPricePerKwh holds the price DISPLAY string in the currently
   // selected unit (pendingPriceUnit ?? the stored default), never raw EUR —
   // see the seed/convert/save derivation below.
@@ -139,6 +146,12 @@ export function SystemSettings({
   const affinityMode =
     pendingAffinityMode ?? settings?.route_affinity_session_mode ?? 'client_session';
   const visionProbeMode = pendingVisionProbeMode ?? settings?.vision_probe_mode ?? 'accept';
+  // The vendor-accounts area is opt-in (off by default); the precedence defaults
+  // to the own account winning -- both mirror the backend defaults.
+  const vendorAccountsEnabled =
+    pendingVendorAccountsEnabled ?? settings?.vendor_accounts_enabled ?? false;
+  const vendorRoutingMode: VendorAccountRoutingMode =
+    pendingVendorRoutingMode ?? settings?.vendor_account_routing_mode ?? 'vendor_first';
   // Currency conversion factor (USD per 1 EUR) driving USD-unit availability;
   // arrives on the SAME settings load as the price/unit fields, so (unlike
   // ServerList's separate api.getCurrency() fetch) there is no factor-arrives-
@@ -224,6 +237,8 @@ export function SystemSettings({
         totp_mode: totpMode,
         route_affinity_session_mode: affinityMode,
         vision_probe_mode: visionProbeMode,
+        vendor_accounts_enabled: vendorAccountsEnabled,
+        vendor_account_routing_mode: vendorRoutingMode,
         energy_default_price_per_kwh: toEur(energyPricePerKwhNum, effectiveUnit, currencyFactorNum),
         energy_default_price_unit: effectiveUnit,
         currency_usd_per_eur: currencyFactorNum,
@@ -253,6 +268,8 @@ export function SystemSettings({
       setPendingTotpMode(null);
       setPendingAffinityMode(null);
       setPendingVisionProbeMode(null);
+      setPendingVendorAccountsEnabled(null);
+      setPendingVendorRoutingMode(null);
       setPendingEnergyPricePerKwh(null);
       setPendingPriceUnit(null);
       setPendingCurrencyFactor(null);
@@ -273,8 +290,9 @@ export function SystemSettings({
       setPendingCertEnabled(null);
       showSuccess(t.systemSaved);
       reloadTheme();
-      // The NetBird module toggle lives here; let the shell re-check it so the
-      // NetBird nav item appears/disappears live (no manual refresh needed).
+      // The NetBird, certificates and vendor-accounts module toggles live here;
+      // let the shell re-check them so their nav items appear/disappear live (no
+      // manual refresh needed).
       onSaved?.();
     } catch (err) {
       showError(formatPortalError(err, t));
@@ -473,6 +491,45 @@ export function SystemSettings({
             <option value="accept">{t.settingsVisionProbeModeAccept}</option>
             <option value="verify">{t.settingsVisionProbeModeVerify}</option>
           </SelectField>
+        </Panel>
+
+        {/* Vendor accounts ("Anbieter") MODULE: the master flag plus the routing
+            precedence. Off (the default) hides the "Anbieter" nav item for every
+            user and the backend refuses every vendor-account call (409
+            vendor_accounts.module_disabled). */}
+        <Panel
+          titleId="system-vendor-accounts-heading"
+          title={t.providers}
+          subtitle={t.systemVendorAccountsIntro}
+        >
+          <Stack spacing={3}>
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={vendorAccountsEnabled}
+                    onChange={(e) => setPendingVendorAccountsEnabled(e.target.checked)}
+                  />
+                }
+                label={t.systemVendorAccountsEnabledLabel}
+              />
+              <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
+                {t.systemVendorAccountsEnabledNote}
+              </FormHelperText>
+            </Box>
+            <SelectField
+              id="system-vendor-account-routing-mode"
+              label={t.systemVendorAccountRoutingModeLabel}
+              value={vendorRoutingMode}
+              onChange={(event) =>
+                setPendingVendorRoutingMode(event.target.value as VendorAccountRoutingMode)
+              }
+              helperText={t.systemVendorAccountRoutingModeNote}
+            >
+              <option value="vendor_first">{t.vendorRoutingModeVendorFirst}</option>
+              <option value="fallback_only">{t.vendorRoutingModeFallbackOnly}</option>
+            </SelectField>
+          </Stack>
         </Panel>
 
         <Panel titleId="system-energy-heading" title={t.settingsEnergyTitle}>

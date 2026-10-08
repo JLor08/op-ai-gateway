@@ -42,7 +42,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	if err != nil {
 		slog.Warn("inference resolve failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", completionErrorCode(err), "status", completionHTTPStatus(err), "err", err)
 		body := writeCompletionErrorCaptured(w, err)
-		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor))
+		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor), nil)
 		return
 	}
 	// Register the in-flight request now that routing has resolved the target
@@ -55,12 +55,22 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	if target.ProviderModel != "" {
 		providerReq.Model = target.ProviderModel
 	}
-	// When capturing on the translate path, thread a capture sink so the provider
-	// records the translated upstream request/response; nil (no sink) otherwise.
+	// Thread a capture sink so the provider records the upstream response headers.
+	// When capturing, it keeps the full translated request/response (bounded by
+	// captureMaxBytes). For a vendor-account target that is NOT capturing, a
+	// header-only sink (respCap 0, no body buffered) is still attached so the
+	// best-effort vendor rate-limit scrape can read the upstream headers off a
+	// normal (uncaptured) request. nil (no sink) for a non-vendor, non-capturing
+	// request, exactly as before.
 	provCtx := r.Context()
 	var sink *provider.CaptureSink
-	if capturing {
+	switch {
+	case capturing:
 		sink = provider.NewCaptureSink(s.captureMaxBytes)
+	case target.VendorAccountID != "":
+		sink = provider.NewCaptureSink(0)
+	}
+	if sink != nil {
 		provCtx = provider.WithCaptureSink(provCtx, sink)
 	}
 	// Attach the resolved application's per-app upstream credential (fail-open).
@@ -80,7 +90,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	}
 	ci := buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor)
 	attachTranslatedCapture(ci, sink)
-	s.recordUsage(start, token, req, target, resp, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, ci)
+	s.recordUsage(start, token, req, target, resp, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, ci, sink.ResponseHeaders())
 }
 
 func (s *Server) completeStream(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
@@ -647,7 +657,14 @@ type usageMeta struct {
 // mapping average when the application opts into opportunistic metric updates.
 const opportunisticEWMAAlpha = 0.2
 
-func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Request, target routing.Target, resp provider.Response, errorCode, status string, meta usageMeta, id string, capture *captureInput) {
+// recordUsage persists the usage_events row for a completed request and runs the
+// fire-and-forget epilogue (capture, opportunistic metrics, vendor usage scrape).
+// upstreamHeaders are the UPSTREAM provider response headers when available (the
+// native-passthrough path has resp.Header directly; the translate path reads them
+// off the request's capture sink), nil on an error path that never reached an
+// upstream. They are used ONLY for the best-effort vendor rate-limit scrape; a nil
+// value or a non-vendor target simply skips it.
+func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Request, target routing.Target, resp provider.Response, errorCode, status string, meta usageMeta, id string, capture *captureInput, upstreamHeaders http.Header) {
 	// Gateway-wide accounting convention: the stored usage event splits the prompt
 	// tokens into three DISJOINT buckets so they map cleanly onto Anthropic-style
 	// read/write pricing — input_tokens = only FRESH (base) tokens, cached_tokens =
@@ -683,6 +700,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		RouteID:          target.RouteID,
 		Provider:         target.Provider,
 		Host:             target.ServerID,
+		AccountID:        target.VendorAccountID, // "" for the self-hosted path; the vendor account id otherwise
 		InputTokens:      freshInputTokens,
 		OutputTokens:     resp.Usage.OutputTokens,
 		TotalTokens:      resp.Usage.TotalTokens,
@@ -723,6 +741,11 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// Fire-and-forget and unconditional: a spurious signal only triggers a refetch
 	// that finds nothing new, which is harmless.
 	s.UsageEvents.Publish()
+	// Best-effort vendor rate-limit scrape: for a vendor-account target, parse the
+	// upstream response's rate-limit headers into the per-account usage snapshot. A
+	// no-op for a non-vendor target, a nil header set, or a response carrying no
+	// recognized headers; any failure is swallowed (never faults this request).
+	s.scrapeVendorAccountUsage(target, upstreamHeaders)
 	// Opt-in payload capture: capture is already nil unless the caller decided to
 	// capture; capturingEnabled re-checks the FULL gate (global switch + opt-in +
 	// store/cipher wiring) defensively — capturingEnabled (capture.go) is the single

@@ -37,6 +37,8 @@ var nonReconcileFields = []string{
 	"TOTPMode",
 	"VisionProbeMode",
 	"RouteAffinitySessionMode",
+	"VendorAccountsEnabled",
+	"VendorAccountRoutingMode",
 	"EnergyDefaultPricePerKwh",
 	"EnergyDefaultPue",
 	"EnergyDefaultWhPerToken",

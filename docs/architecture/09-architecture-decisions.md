@@ -557,7 +557,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -613,7 +613,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -782,7 +782,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -967,7 +967,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-81-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-82-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1182,7 +1182,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-81-migrations),
+[§4](reference/data-model.md#4-migration-history-82-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1408,7 +1408,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-81-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-82-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1533,7 +1533,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-81-migrations),
+[§4](reference/data-model.md#4-migration-history-82-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -2963,3 +2963,86 @@ at the agent.
 [§9](cross-cutting/agent-runtime-manager.md#9-keeping-the-agent-current-the-notification-rule),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks).
+
+## ADR-049 — Vendor accounts are a first-class entity; the subscription-OAuth path is experimental and ToS-restricted
+**Context:** a portal user wanted to route their own requests through an external
+AI vendor account — a plain platform API key, or a consumer subscription (Claude
+Pro/Max, ChatGPT/Codex) reached through the vendor's own OAuth login — alongside
+the self-hosted AI servers. Two design questions were load-bearing. First,
+**naming**: "provider" is already the backend client-adapter layer
+(`internal/provider`), the `Application.Type` discriminator
+(`routing.ProviderOllama` …), `Target.Provider`, `usage.Event.Provider`, and the
+agent-reported `provider_health`. An external vendor *account/subscription* is a
+different concept and must not collide. Second, **legitimacy**: the subscription
+path reuses consumer-subscription OAuth tokens for inference through a third-party
+gateway, which is against both vendors' consumer Terms — Anthropic enforces it
+server-side (the credential is authorized only for use with Claude Code; the
+forced `You are Claude Code` system block) — and every endpoint, client id, scope,
+beta header, serving host, device-code path, token-claim name, request/refresh
+encoding and rate-limit response-header name is undocumented and
+reverse-engineered.
+
+**Decision — five choices, taken together.**
+- **(a) A first-class `vendor_account` entity, a sibling of `AIServer`, not folded
+  into "provider".** Code/wire/schema name `vendor_account` (type `VendorAccount`,
+  id prefix `va_`); enums `vendor ∈ {openai, anthropic}`, `auth_type ∈ {api_key,
+  subscription}`. It lives beside the untouched `internal/provider` package and
+  *reuses* its clients to reach the vendor clouds — renaming `provider` would be a
+  broad, unrelated refactor the repo rules forbid. The entity is stored across all
+  three drivers (migration 82) and owned by exactly one user; sharing via resource
+  groups is deferred and made additive, not pre-built.
+- **(b) The subscription-OAuth path is accepted as experimental and
+  ToS-restricted, on purpose.** It is built **for internal testing with the
+  operator's own account**, flag-gated, disable-able, and must degrade gracefully
+  when a vendor blocks or changes behavior; it must never be presented as a
+  supported, multi-tenant production capability. The acceptance is deliberate, not
+  an oversight ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **(c) Every reverse-engineered constant is confined and marked VERIFY-LIVE.**
+  All vendor OAuth constants live in one file
+  (`internal/vendorauth/constants.go`), read through an overridable `Endpoints`
+  struct so a live operator or an `httptest` test can correct a rotated value
+  without touching flow code; the dispatch literals the resolver needs
+  (`internal/routing` cannot import `vendorauth`) are mirrored there with the same
+  caveat. All parsing is tolerant — prefix-matched, fail-open, unknown → unknown
+  never a fabricated `0`.
+- **(d) A configurable routing precedence.** `vendor_account_routing_mode` ∈
+  `{vendor_first, fallback_only}` (default `vendor_first`) sets whether a caller's
+  own account wins when it serves the requested model, or is used only when no
+  self-hosted/shared route exists. The resolver reads it through a cached accessor
+  invalidated on a settings write.
+- **(e) A master feature flag, off by default.** `vendor_accounts_enabled` (bool,
+  default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect
+  endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor
+  branch and the model-listing overlay are no-ops — the same module-enable posture
+  as the NetBird and certificate modules.
+
+**Consequence:** the new serving path reuses the existing credential sealing
+([ADR-007](#adr-007--secrets-at-rest-the-encplain-scheme)), the routing `Target`
+and dispatch, and the `recordUsage` usage choke point, so the genuinely new code is
+small: the entity + store, an OAuth subsystem (`internal/vendorauth`), a native
+Anthropic Messages client and an OpenAI Responses translate client in
+`internal/provider`, two static `Target` extensions (`ExtraHeaders` + a
+`Masquerade` flag) plus an explicit `Subscription` trigger and a `VendorAccountID`
+attribution field, and a header-scraped usage snapshot. The subscription path
+requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` because the OAuth token set is a
+decryptable secret at rest (a keyless disk store rejects the write). Because the
+subscription constants are undocumented, a large part of the subscription code
+(endpoints, headers, model ids, refresh encoding, rate-limit header names) is
+VERIFY-LIVE and can break without notice; the flag-gated, fail-open design is what
+keeps that from affecting the self-hosted path or a deployment that leaves the
+flag off.
+
+**Rejected:** folding the account into the "provider" term (a four-way-overloaded
+name that would collide with the adapter layer, the application type, the target
+field and the usage field); renaming `internal/provider` to free the name (a broad
+refactor the repo forbids, unrelated to this feature); building the subscription
+path as a supported production capability (it rests on undocumented, ToS-violating,
+server-side-enforced behavior — it is honest only as flag-gated experiment);
+hardcoding the vendor constants inline across packages (they must be correctable in
+one place against a live vendor); and shipping the master flag **on** by default (a
+ToS-restricted, experimental path must be opt-in).
+→ [External Vendor Accounts](cross-cutting/external-vendor-accounts.md),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[Data Model §1](reference/data-model.md#external-vendor-accounts-anbieter),
+[API Surface](reference/api-surface.md#vendor-accounts-anbieter),
+[Configuration & Environment Variables](reference/config-env.md).

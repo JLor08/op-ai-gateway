@@ -121,7 +121,7 @@ All backend variables are read through `internal/config/config.go`'s `Load()` (e
 
 | Variable | Type | Purpose | Default |
 |---|---|---|---|
-| `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` | string | Key sealing captured request/response payloads (and the SMTP password + NetBird admin token) at rest on a disk-backed store | `` |
+| `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` | string | Key sealing captured request/response payloads (and the SMTP password, the NetBird admin token, and a **vendor account**'s API key + OAuth token set) at rest on a disk-backed store. **Required for the vendor-account subscription path**: an OAuth token set is a decryptable secret, so on a disk-backed store with no key a connect/import rejects the write (`capture.ErrKeyRequired` → `vendor_account.connect_key_required`); a memory/volatile store needs no key. See [External Vendor Accounts §8](../cross-cutting/external-vendor-accounts.md#8-secrets-at-rest) | `` |
 | `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` | int | Max captured payload size on a disk-backed store | `1048576` (1 MiB) |
 | `OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES` | int | Max total bytes held by the in-memory capture/chat store (memory driver) | `67108864` (64 MiB) |
 
@@ -141,6 +141,21 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 | `OP_AI_GATEWAY_DEV_TOKEN` | Bearer secret for the seeded dev API token (`tok_dev`, scopes `gateway:use`+`admin`) | `dev-secret` |
 | `OP_AI_GATEWAY_DEV_PASSWORD` | Password for the seeded dev user (`usr_dev` / `dev@example.test`, role `system_admin`) | `dev-secret` |
 | `OP_AI_GATEWAY_DEV_AGENT_TOKEN` | Agent bearer secret seeded for the mock AI server | `dev-agent-secret` |
+
+### Vendor accounts (system settings, no env-var form)
+
+The external-vendor-accounts ("Anbieter") feature is governed by **two system
+settings** held in the `system_settings` store and edited in the portal's System
+settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for either:
+
+| System setting | Values | Default | Effect |
+|---|---|---|---|
+| `vendor_accounts_enabled` | `bool` | **off** | The master module flag. When off the "Anbieter" nav item is hidden, the CRUD/connect endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch + model-listing overlay are no-ops. |
+| `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor account and the self-hosted/shared routes (an invalid value is rejected with `system.vendor_account_routing_mode_invalid`). |
+
+See [External Vendor Accounts §6](../cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode).
+The subscription path additionally requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY`
+(above) on a disk-backed store.
 
 ## Agent (`OP_AGENT_*`)
 

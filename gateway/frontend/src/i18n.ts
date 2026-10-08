@@ -2351,6 +2351,144 @@ const de = {
   resourceGroupProvisionKindAdminGroup: 'Verwaltungsgruppe',
   resourceGroupProvisionKindService: 'Dienst',
   errorResourceGroupProvisionTargetInvalid: 'Das gewählte Ziel ist ungültig oder nicht sichtbar.',
+  // Vendor accounts ("Anbieter"): the user's own accounts at external AI
+  // vendors. The error* labels each carry exactly one backend code
+  // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
+  providers: 'Anbieter',
+  providersIntro:
+    'Eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) verwalten. Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
+  vendorAccountListTitle: 'Anbieter-Konten',
+  vendorAccountListEmpty: 'Noch keine Anbieter-Konten angelegt.',
+  vendorAccountCreate: 'Anbieter-Konto anlegen',
+  vendorAccountNameLabel: 'Name',
+  vendorAccountVendorLabel: 'Anbieter',
+  vendorAccountAuthTypeLabel: 'Authentifizierung',
+  vendorAccountStatusLabel: 'Status',
+  vendorAccountColVendor: 'Anbieter',
+  vendorAccountColAuthType: 'Authentifizierung',
+  vendorAccountColCredential: 'Zugangsdaten',
+  vendorAccountCredentialSet: 'Hinterlegt',
+  vendorAccountCredentialMissing: 'Fehlt',
+  vendorAccountStatusNeedsReconnect: 'Neu verbinden',
+  vendorOpenAI: 'OpenAI',
+  vendorAnthropic: 'Anthropic',
+  vendorAuthApiKey: 'API-Schlüssel',
+  vendorAuthSubscription: 'Abonnement',
+  vendorAccountApiKeyLabel: 'API-Schlüssel',
+  vendorAccountApiKeySetPlaceholder: '•••• gesetzt',
+  vendorAccountApiKeyClear: 'Schlüssel löschen',
+  vendorAccountApiKeyNote:
+    'Der Schlüssel wird nur gespeichert und nie wieder angezeigt. Einen neuen Schlüssel eingeben, um ihn zu ersetzen.',
+  vendorAccountSettingsTitle: 'Einstellungen',
+  vendorAccountActionDelete: 'Löschen',
+  vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
+  vendorAccountSubscriptionCreateNote:
+    'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
+  vendorConnectTitle: 'Abonnement verbinden',
+  vendorConnectIntro:
+    'Dieses Konto mit einem Abonnement verbinden (z. B. Claude Pro/Max oder ChatGPT). Zugangsdaten werden nur gespeichert und nie wieder angezeigt.',
+  vendorConnectStatusLabel: 'Verbindung',
+  vendorConnectStatusConnected: 'Verbunden',
+  vendorConnectStatusNotConnected: 'Nicht verbunden',
+  vendorConnectReconnectNote: 'Ein erneutes Verbinden ersetzt die gespeicherten Zugangsdaten.',
+  vendorConnectNeedsReconnectNote:
+    'Die gespeicherte Anmeldung konnte nicht erneuert werden. Das Konto muss neu verbunden werden.',
+  vendorConnectSuccess: 'Konto verbunden',
+  vendorConnectBrowserTitle: 'Browser-Login',
+  vendorConnectBrowserIntro:
+    'Beim Anbieter anmelden und den danach angezeigten Code hier einfügen.',
+  vendorConnectBeginAction: 'Verbinden',
+  vendorConnectBeginAgainAction: 'Neu starten',
+  vendorConnectStepOpen: '1. Anmeldung öffnen',
+  vendorConnectStepOpenNote:
+    'Die Anmeldung öffnet sich in einem neuen Tab. Danach zu diesem Tab zurückkehren.',
+  vendorConnectOpenLogin: 'Login öffnen',
+  vendorConnectStepPaste: '2. Code einfügen',
+  vendorConnectCodeLabel: 'Code',
+  vendorConnectCodeNote:
+    'Den Code einfügen, den der Anbieter nach der Anmeldung anzeigt, alternativ „Code#State“ oder die vollständige Adresse der Weiterleitung (auch wenn die Seite nicht lädt).',
+  vendorConnectCompleteAction: 'Fertigstellen',
+  vendorConnectImportTitle: 'Token-Import',
+  vendorConnectImportIntro:
+    'Bereits vorhandene Tokens einfügen, z. B. aus der Zugangsdaten-Datei eines Kommandozeilen-Clients. Sie werden nur gespeichert und nie wieder angezeigt.',
+  vendorConnectAccessTokenLabel: 'Access-Token',
+  vendorConnectRefreshTokenLabel: 'Refresh-Token (optional)',
+  vendorConnectExpiresAtLabel: 'Gültig bis (optional)',
+  vendorConnectExpiresAtNote: 'Ohne Angabe gilt das Ablaufdatum als unbekannt.',
+  vendorConnectImportAction: 'Tokens importieren',
+  vendorConnectGuideTitle: 'Wo finde ich das Token?',
+  vendorConnectGuideClaudeTitle: 'Claude Code',
+  vendorConnectGuideClaudeBody:
+    'Datei ~/.claude/.credentials.json, Feld claudeAiOauth.accessToken. Unter macOS alternativ der Schlüsselbund-Eintrag „Claude Code-credentials“. Ein langlebiges Token erzeugt der Befehl claude setup-token.',
+  vendorConnectGuideCodexTitle: 'Codex',
+  vendorConnectGuideCodexBody: 'Datei ~/.codex/auth.json, Feld tokens.access_token.',
+  vendorConnectDeviceTitle: 'Device-Code',
+  vendorConnectDeviceIntro:
+    'Nur für OpenAI. Einen kurzen Code auf der Seite des Anbieters eingeben; die Verbindung schließt sich danach hier automatisch ab. Funktioniert auch bei einem entfernten Gateway.',
+  vendorConnectDeviceStartAction: 'Device-Code starten',
+  vendorConnectDeviceCodeLabel: 'Bestätigungscode',
+  vendorConnectDeviceInstructions:
+    'Die Seite des Anbieters öffnen, diesen Code dort eingeben und die Anmeldung bestätigen. Diese Seite wartet und schließt die Verbindung automatisch ab.',
+  vendorConnectDeviceOpenAction: 'Seite öffnen',
+  vendorConnectDeviceWaiting: 'Warte auf die Bestätigung beim Anbieter …',
+  vendorConnectDeviceRetrying:
+    'Der Anbieter ist gerade nicht erreichbar. Es wird weiter versucht …',
+  vendorConnectDeviceTimedOut:
+    'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
+  vendorUsageTitle: 'Nutzung & Limits',
+  vendorUsageIntro:
+    'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
+  vendorUsageFiveHour: '5-Stunden-Limit',
+  vendorUsageWeekly: 'Wochen-Limit',
+  vendorUsagePercentUsed: (pct: number) => `${pct} % genutzt`,
+  vendorUsageResetsIn: (time: string) => `Zurückgesetzt in ${time}`,
+  vendorUsageResetPassed:
+    'Das Zeitfenster wurde inzwischen zurückgesetzt; der Wert wird mit der nächsten Anfrage aktualisiert.',
+  vendorUsageNoData: 'Noch keine Daten',
+  vendorUsageCreditBalance: 'Guthaben',
+  vendorUsageUpdatedAt: (ago: string) => `Zuletzt aktualisiert: ${ago}`,
+  errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
+  errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
+  errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
+  errorVendorAccountAuthTypeInvalid: 'Ungültige Authentifizierungsart',
+  errorVendorAccountStatusInvalid: 'Ungültiger Status des Anbieter-Kontos',
+  errorVendorAccountForbidden: 'Anbieter-Konten können nur mit einem Benutzerkonto angelegt werden',
+  errorVendorAccountApiKeyNotAllowed:
+    'Ein API-Schlüssel kann nur bei einem Konto mit API-Schlüssel-Authentifizierung gesetzt werden',
+  errorVendorAccountApiKeyInvalid:
+    'Der API-Schlüssel darf nicht leer sein; zum Entfernen die Schaltfläche „Schlüssel löschen“ verwenden',
+  errorVendorAccountApiKeyKeyRequired:
+    'Zum Speichern eines API-Schlüssels ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
+  errorVendorAccountsModuleDisabled:
+    'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
+  errorVendorAccountNotSubscription:
+    'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
+  errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
+  errorVendorAccountConnectCodeRequired:
+    'Den Code einfügen, den der Anbieter nach der Anmeldung angezeigt hat',
+  errorVendorAccountConnectState:
+    'Für dieses Konto läuft keine Anmeldung, sie ist abgelaufen oder der eingefügte State passt nicht. Die Anmeldung neu starten.',
+  errorVendorAccountConnectRejected:
+    'Der Anbieter hat den Code abgelehnt. Den Code prüfen oder die Anmeldung neu starten.',
+  errorVendorAccountConnectUpstream:
+    'Der Anbieter ist nicht erreichbar oder hat unerwartet geantwortet. Später erneut versuchen.',
+  errorVendorAccountConnectKeyRequired:
+    'Zum Speichern eines Abonnements ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
+  errorVendorAccountConnectFailed: 'Das Konto konnte nicht verbunden werden',
+  errorVendorAccountDeviceNotSupported: 'Der Device-Code-Login ist nur für OpenAI-Konten verfügbar',
+  errorVendorAccountDeviceConnectState:
+    'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
+  // System settings: the vendor-accounts master flag and the routing precedence.
+  systemVendorAccountsIntro:
+    'Optionales Anbieter-Modul: Benutzer können eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) hinterlegen.',
+  systemVendorAccountsEnabledLabel: 'Anbieter aktivieren',
+  systemVendorAccountsEnabledNote:
+    'Aus (Standard): Der Menüpunkt „Anbieter“ ist ausgeblendet und alle Anbieter-Funktionen sind deaktiviert. Bereits angelegte Konten bleiben erhalten.',
+  systemVendorAccountRoutingModeLabel: 'Vorrang bei der Anbieter-Auswahl',
+  systemVendorAccountRoutingModeNote:
+    'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
+  vendorRoutingModeVendorFirst: 'Eigenes Anbieter-Konto zuerst',
+  vendorRoutingModeFallbackOnly: 'Anbieter-Konto nur als Ausweichlösung',
   settingsResourceProvisioningEnforceLabel: 'Ressourcengruppen-Bereitstellung erzwingen',
   settingsResourceProvisioningEnforceHelp:
     'Aus: bereitgestellte Ziele sind eine zusätzliche Freigabe (Opt-in). An: nur bereitgestellte Benutzer/Gruppen/Dienste dürfen die Server der Ressourcengruppe nutzen (Deny-by-default).',
@@ -4759,6 +4897,140 @@ const en: PortalMessages = {
   resourceGroupProvisionKindAdminGroup: 'Admin group',
   resourceGroupProvisionKindService: 'Service',
   errorResourceGroupProvisionTargetInvalid: 'The selected target is invalid or not visible.',
+  // Vendor accounts ("Anbieter"): the user's own accounts at external AI
+  // vendors. The error* labels each carry exactly one backend code
+  // (portal_vendor_account_endpoints.go); they stay distinct on purpose.
+  providers: 'Providers',
+  providersIntro:
+    'Manage your own accounts with external AI providers (e.g. OpenAI, Anthropic). Credentials are only stored and never shown again.',
+  vendorAccountListTitle: 'Provider accounts',
+  vendorAccountListEmpty: 'No provider accounts yet.',
+  vendorAccountCreate: 'Add provider account',
+  vendorAccountNameLabel: 'Name',
+  vendorAccountVendorLabel: 'Provider',
+  vendorAccountAuthTypeLabel: 'Authentication',
+  vendorAccountStatusLabel: 'Status',
+  vendorAccountColVendor: 'Provider',
+  vendorAccountColAuthType: 'Authentication',
+  vendorAccountColCredential: 'Credentials',
+  vendorAccountCredentialSet: 'Stored',
+  vendorAccountCredentialMissing: 'Missing',
+  vendorAccountStatusNeedsReconnect: 'Reconnect',
+  vendorOpenAI: 'OpenAI',
+  vendorAnthropic: 'Anthropic',
+  vendorAuthApiKey: 'API key',
+  vendorAuthSubscription: 'Subscription',
+  vendorAccountApiKeyLabel: 'API key',
+  vendorAccountApiKeySetPlaceholder: '•••• set',
+  vendorAccountApiKeyClear: 'Clear key',
+  vendorAccountApiKeyNote:
+    'The key is only stored and never shown again. Enter a new key to replace it.',
+  vendorAccountSettingsTitle: 'Settings',
+  vendorAccountActionDelete: 'Delete',
+  vendorAccountDeleteConfirm: 'Delete this provider account?',
+  vendorAccountSubscriptionCreateNote:
+    'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
+  vendorConnectTitle: 'Connect subscription',
+  vendorConnectIntro:
+    'Connect this account to a subscription (for example Claude Pro/Max or ChatGPT). Credentials are only stored and never shown again.',
+  vendorConnectStatusLabel: 'Connection',
+  vendorConnectStatusConnected: 'Connected',
+  vendorConnectStatusNotConnected: 'Not connected',
+  vendorConnectReconnectNote: 'Connecting again replaces the stored credentials.',
+  vendorConnectNeedsReconnectNote:
+    'The stored sign-in could not be renewed. The account needs to be connected again.',
+  vendorConnectSuccess: 'Account connected',
+  vendorConnectBrowserTitle: 'Browser sign-in',
+  vendorConnectBrowserIntro: 'Sign in at the provider, then paste the code it shows afterwards.',
+  vendorConnectBeginAction: 'Connect',
+  vendorConnectBeginAgainAction: 'Start over',
+  vendorConnectStepOpen: '1. Open the sign-in',
+  vendorConnectStepOpenNote: 'The sign-in opens in a new tab. Come back to this tab afterwards.',
+  vendorConnectOpenLogin: 'Open login',
+  vendorConnectStepPaste: '2. Paste the code',
+  vendorConnectCodeLabel: 'Code',
+  vendorConnectCodeNote:
+    'Paste the code the provider shows after the sign-in, or "code#state", or the full address you were redirected to (even if that page does not load).',
+  vendorConnectCompleteAction: 'Complete',
+  vendorConnectImportTitle: 'Token import',
+  vendorConnectImportIntro:
+    "Paste tokens you already hold, for example from a command-line client's credentials file. They are only stored and never shown again.",
+  vendorConnectAccessTokenLabel: 'Access token',
+  vendorConnectRefreshTokenLabel: 'Refresh token (optional)',
+  vendorConnectExpiresAtLabel: 'Expires at (optional)',
+  vendorConnectExpiresAtNote: 'If left empty, the expiry is treated as unknown.',
+  vendorConnectImportAction: 'Import tokens',
+  vendorConnectGuideTitle: 'Where do I find the token?',
+  vendorConnectGuideClaudeTitle: 'Claude Code',
+  vendorConnectGuideClaudeBody:
+    'File ~/.claude/.credentials.json, field claudeAiOauth.accessToken. On macOS, alternatively the Keychain entry "Claude Code-credentials". The command claude setup-token creates a long-lived token.',
+  vendorConnectGuideCodexTitle: 'Codex',
+  vendorConnectGuideCodexBody: 'File ~/.codex/auth.json, field tokens.access_token.',
+  vendorConnectDeviceTitle: 'Device code',
+  vendorConnectDeviceIntro:
+    'OpenAI only. Enter a short code on the provider page; the connection then completes here automatically. Works for a remote gateway too.',
+  vendorConnectDeviceStartAction: 'Start device code',
+  vendorConnectDeviceCodeLabel: 'Confirmation code',
+  vendorConnectDeviceInstructions:
+    'Open the provider page, enter this code there and confirm the sign-in. This page waits and completes the connection automatically.',
+  vendorConnectDeviceOpenAction: 'Open page',
+  vendorConnectDeviceWaiting: 'Waiting for approval at the provider …',
+  vendorConnectDeviceRetrying: 'The provider cannot be reached right now. Still trying …',
+  vendorConnectDeviceTimedOut:
+    'Timed out: the code was not confirmed in time. Start the device code again.',
+  vendorUsageTitle: 'Usage & limits',
+  vendorUsageIntro:
+    'Usage as a percentage of the provider limit; the provider does not publish absolute values. The figures are refreshed with every request the gateway serves.',
+  vendorUsageFiveHour: '5-hour limit',
+  vendorUsageWeekly: 'Weekly limit',
+  vendorUsagePercentUsed: (pct: number) => `${pct}% used`,
+  vendorUsageResetsIn: (time: string) => `Resets in ${time}`,
+  vendorUsageResetPassed: 'The window has since reset; the value updates with the next request.',
+  vendorUsageNoData: 'No data yet',
+  vendorUsageCreditBalance: 'Credit balance',
+  vendorUsageUpdatedAt: (ago: string) => `Last updated: ${ago}`,
+  errorVendorAccountNotFound: 'Provider account not found',
+  errorVendorAccountNameRequired: 'Provider account name is required',
+  errorVendorAccountVendorInvalid: 'Invalid provider',
+  errorVendorAccountAuthTypeInvalid: 'Invalid authentication type',
+  errorVendorAccountStatusInvalid: 'Invalid provider account status',
+  errorVendorAccountForbidden: 'Provider accounts can only be created with a user account',
+  errorVendorAccountApiKeyNotAllowed:
+    'An API key can only be set on an account with API-key authentication',
+  errorVendorAccountApiKeyInvalid:
+    'The API key must not be blank; use the "Clear key" button to remove it',
+  errorVendorAccountApiKeyKeyRequired:
+    'An encryption key is required on the gateway to store an API key',
+  errorVendorAccountsModuleDisabled:
+    'Provider accounts are disabled. A system administrator can enable them in the system settings.',
+  errorVendorAccountNotSubscription:
+    'Only an account with subscription authentication can be connected to a subscription',
+  errorVendorAccountConnectTokenRequired: 'An access token is required',
+  errorVendorAccountConnectCodeRequired: 'Paste the code the provider showed after the sign-in',
+  errorVendorAccountConnectState:
+    'No sign-in is in progress for this account, it has expired, or the pasted state does not match. Start the sign-in again.',
+  errorVendorAccountConnectRejected:
+    'The provider rejected the code. Check it or start the sign-in again.',
+  errorVendorAccountConnectUpstream:
+    'The provider could not be reached or answered unexpectedly. Try again later.',
+  errorVendorAccountConnectKeyRequired:
+    'An encryption key on the gateway is required to store a subscription',
+  errorVendorAccountConnectFailed: 'The account could not be connected',
+  errorVendorAccountDeviceNotSupported:
+    'The device-code login is available for OpenAI accounts only',
+  errorVendorAccountDeviceConnectState:
+    'No device-code login is in progress for this account, or it has expired. Start the device code again.',
+  // System settings: the vendor-accounts master flag and the routing precedence.
+  systemVendorAccountsIntro:
+    'Optional provider module: users can store their own accounts with external AI providers (e.g. OpenAI, Anthropic).',
+  systemVendorAccountsEnabledLabel: 'Enable providers',
+  systemVendorAccountsEnabledNote:
+    'Off (default): the "Providers" menu item is hidden and all provider features are disabled. Existing accounts are kept.',
+  systemVendorAccountRoutingModeLabel: 'Provider routing precedence',
+  systemVendorAccountRoutingModeNote:
+    "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",
+  vendorRoutingModeVendorFirst: 'Own provider account first',
+  vendorRoutingModeFallbackOnly: 'Provider account as fallback only',
   settingsResourceProvisioningEnforceLabel: 'Enforce resource-group provisioning',
   settingsResourceProvisioningEnforceHelp:
     "Off: provisioned targets are an additional grant (opt-in). On: only provisioned users/groups/services may use the resource group's servers (deny-by-default).",

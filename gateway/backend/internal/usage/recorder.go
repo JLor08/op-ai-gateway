@@ -34,9 +34,15 @@ type Event struct {
 	RouteID        string `json:"route_id,omitempty"`
 	Provider       string `json:"provider"`
 	Host           string `json:"host"`
-	InputTokens    int    `json:"input_tokens"`
-	OutputTokens   int    `json:"output_tokens"`
-	TotalTokens    int    `json:"total_tokens"`
+	// AccountID attributes a request to the VENDOR ACCOUNT ("Anbieter") that served
+	// it (routing.Target.VendorAccountID): the per-user external OpenAI/Anthropic
+	// account, api-key or subscription alike. "" for the ordinary self-hosted
+	// AI-server path (the overwhelming default; existing rows read back "" via the
+	// usage_events.account_id column default).
+	AccountID    string `json:"account_id,omitempty"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+	TotalTokens  int    `json:"total_tokens"`
 	// CachedTokens = prompt cache READ tokens; CacheWriteTokens = prompt cache WRITE
 	// (Anthropic cache_creation, 0 for OpenAI/Responses). Disjoint from InputTokens
 	// here (the accounting split happens in gateway.recordUsage), so

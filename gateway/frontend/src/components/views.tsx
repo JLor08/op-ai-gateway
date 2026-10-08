@@ -15,6 +15,7 @@ import {
   Activity as ActivityIcon,
   Bot,
   Boxes,
+  Cloud,
   Cpu,
   FolderKanban,
   KeyRound,
@@ -42,6 +43,7 @@ import { ModelGroupSection } from './ModelGroupSection';
 import { ServerList } from './ServerList';
 import { ResourceGroupsView } from './ResourceGroupsView';
 import { ServicesView } from './ServicesView';
+import { VendorAccountsView } from './VendorAccountsView';
 import { UsersView } from './UsersView';
 import { GroupsView } from './GroupsView';
 import { ProjectsView } from './ProjectsView';
@@ -62,6 +64,9 @@ export type ViewGateCtx = {
   systemAdminMode: boolean;
   netbirdModuleEnabled: boolean;
   certificatesModuleEnabled: boolean;
+  // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
+  // off by default); gates the "providers" view for every authenticated user.
+  vendorAccountsEnabled: boolean;
 };
 
 // Everything a `render` needs to produce a view's content. Extends
@@ -215,6 +220,19 @@ export const viewRegistry: Record<View, ViewEntry> = {
         loading={ctx.loading}
       />
     ),
+  },
+  // Vendor accounts ("Anbieter"): every authenticated user manages their OWN
+  // accounts at external AI vendors, so there is deliberately NO role gate --
+  // only the vendor_accounts_enabled master flag (off by default) that hides
+  // the nav item + view and that the backend enforces with 409
+  // vendor_accounts.module_disabled.
+  providers: {
+    id: 'providers',
+    labelKey: 'providers',
+    href: '/providers',
+    icon: Cloud,
+    gate: (ctx) => ctx.vendorAccountsEnabled,
+    render: (ctx) => <VendorAccountsView t={ctx.t} api={ctx.api} />,
   },
   resourceGroups: {
     id: 'resourceGroups',

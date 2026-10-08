@@ -1081,6 +1081,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CertEdgeRequireHTTPSDisable:     cfg.CertEdgeRequireHTTPSDisable,
 		CertMeshRequireTLSDisable:       cfg.CertMeshRequireTLSDisable,
 		Cipher:                          b.Cipher,
+		SettingsVolatile:                b.SettingsVolatile,
 		Captures:                        b.Captures,
 		CaptureMaxBytes:                 b.CaptureMaxBytes,
 		CaptureEnabled:                  func() bool { return captureFlagsHook().Enabled },
@@ -1273,6 +1274,17 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// dialect too, and shares this client (not ollama's) so the images
 		// relay's native passthrough works -- see the constant's doc comment.
 		routing.ProviderStableDiffusionCpp: openAICompatible,
+		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
+		// dialect, so a vendor-account target reuses the same client.
+		routing.ProviderVendorOpenAI: openAICompatible,
+		// ProviderVendorOpenAISubscription: the ChatGPT backend speaks the Responses
+		// protocol ONLY. Its dedicated client serves BOTH the native passthrough of an
+		// inbound /v1/responses (Codex) request and the translate of a chat/completions
+		// (portal-chat) request to that protocol.
+		routing.ProviderVendorOpenAISubscription: provider.NewOpenAIResponsesClient(appHTTPClient),
+		// ProviderVendorAnthropic: api.anthropic.com has no chat-completions
+		// surface; the native /v1/messages client translates to and from it.
+		routing.ProviderVendorAnthropic: provider.NewAnthropicClient(appHTTPClient),
 	}, nil)
 }
 

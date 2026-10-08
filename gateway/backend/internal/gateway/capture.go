@@ -107,13 +107,15 @@ const redactedMarker = "[redacted]"
 
 // redactedCaptureHeaders lists request headers whose VALUE must be replaced with
 // redactedMarker before a capture is stored (token secret, session cookie, CSRF,
-// run-as token). Compared case-insensitively because net/http canonicalizes
-// header names (auth.go:18-20).
+// run-as token, and x-api-key -- the header a vendor Anthropic account's upstream
+// credential travels in on the translated request). Compared case-insensitively
+// because net/http canonicalizes header names (auth.go:18-20).
 var redactedCaptureHeaders = map[string]struct{}{
 	"authorization":     {},
 	"cookie":            {},
 	"x-op-csrf":         {},
 	"x-op-run-as-token": {},
+	"x-api-key":         {},
 }
 
 // redactCaptureHeaders copies h, replacing the sensitive request-header VALUES with

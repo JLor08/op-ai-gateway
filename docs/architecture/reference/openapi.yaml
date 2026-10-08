@@ -1100,6 +1100,103 @@ paths:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  # ── 3. Portal: vendor accounts (Anbieter) ─────────────────────────────────
+  /api/portal/vendor-accounts:
+    description: >
+      Per-user external vendor accounts ("Anbieter"). Owner-only inside
+      portal.Service; secrets are write-only; the whole surface 409s with
+      vendor_account(s).module_disabled while vendor_accounts_enabled is off.
+      See api-surface.md for the request/response shapes and error codes.
+    get:
+      tags: [portal]
+      summary: List the caller's own vendor accounts
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    post:
+      tags: [portal]
+      summary: Create a vendor account
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '201': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/enabled:
+    get:
+      tags: [portal]
+      summary: Whether the vendor-accounts module is enabled (boolean only)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Vendor-account detail (includes the usage snapshot)
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    patch:
+      tags: [portal]
+      summary: Update a vendor account (write-only api_key sentinel)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+    delete:
+      tags: [portal]
+      summary: Delete a vendor account
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}/connect/import:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Connect a subscription account from imported OAuth tokens
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}/connect/begin:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Start the OAuth code-paste connect (returns authorize_url)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}/connect/complete:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Finish the OAuth code-paste connect (exchange the pasted code)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}/connect/device/begin:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Start the OpenAI-only device-code login (returns user_code)
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/vendor-accounts/{id}/connect/device/poll:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Poll a begun device login (returns {connected})
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+
   # ── 3. Portal: feature flags / read-only status ───────────────────────────
   /api/portal/netbird/enabled:
     get:

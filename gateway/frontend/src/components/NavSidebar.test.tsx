@@ -4,6 +4,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  Cloud,
   LayoutDashboard,
   MessageSquare,
   Network,
@@ -20,6 +21,7 @@ import type { NavItem } from './shared/types';
 const navItems: NavItem[] = [
   { id: 'dashboard', labelKey: 'dashboard', href: '/dashboard', icon: LayoutDashboard },
   { id: 'chat', labelKey: 'chat', href: '/chat', icon: MessageSquare },
+  { id: 'providers', labelKey: 'providers', href: '/providers', icon: Cloud },
   { id: 'tools', labelKey: 'tools', href: '/tools', icon: Wrench },
   { id: 'system', labelKey: 'system', href: '/system', icon: SlidersHorizontal },
   { id: 'netbird', labelKey: 'settingsNetbirdTitle', href: '/netbird', icon: Network },
@@ -297,6 +299,76 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         />,
       );
       expect(screen.getByRole('link', { name: t.settingsNetbirdTitle })).toBeInTheDocument();
+    });
+
+    it('hides the providers (vendor accounts) item for EVERY role while vendorAccountsEnabled is off (the default)', () => {
+      for (const role of ['user', 'admin', 'system_admin']) {
+        // Default (prop omitted) and an explicit false behave the same; an elevated
+        // system admin does not bypass the module flag either.
+        render(
+          <NavSidebar
+            navItems={navItems}
+            view="dashboard"
+            onSelect={vi.fn()}
+            currentUser={asUser(role)}
+            expanded
+            systemAdminMode={role === 'system_admin'}
+            t={t}
+          />,
+        );
+        expect(screen.queryByRole('link', { name: t.providers })).not.toBeInTheDocument();
+        cleanup();
+
+        render(
+          <NavSidebar
+            navItems={navItems}
+            view="dashboard"
+            onSelect={vi.fn()}
+            currentUser={asUser(role)}
+            expanded
+            systemAdminMode={role === 'system_admin'}
+            vendorAccountsEnabled={false}
+            t={t}
+          />,
+        );
+        expect(screen.queryByRole('link', { name: t.providers })).not.toBeInTheDocument();
+        cleanup();
+      }
+    });
+
+    it('shows the providers (vendor accounts) item to every authenticated role once vendorAccountsEnabled is on, with no admin gate', () => {
+      for (const role of ['user', 'admin', 'system_admin']) {
+        render(
+          <NavSidebar
+            navItems={navItems}
+            view="dashboard"
+            onSelect={vi.fn()}
+            currentUser={asUser(role)}
+            expanded
+            vendorAccountsEnabled
+            t={t}
+          />,
+        );
+        expect(screen.getByRole('link', { name: t.providers })).toBeInTheDocument();
+        cleanup();
+      }
+    });
+
+    it('selects the providers view when its item is clicked', () => {
+      const onSelect = vi.fn();
+      render(
+        <NavSidebar
+          navItems={navItems}
+          view="dashboard"
+          onSelect={onSelect}
+          currentUser={asUser('user')}
+          expanded
+          vendorAccountsEnabled
+          t={t}
+        />,
+      );
+      fireEvent.click(screen.getByRole('link', { name: t.providers }));
+      expect(onSelect).toHaveBeenCalledWith('providers');
     });
 
     it('never renders a Policies item and orders Tools before System, NetBird after System', () => {

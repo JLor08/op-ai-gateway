@@ -32,6 +32,8 @@ type API interface {
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
+	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
+	BeginVendorAccountDeviceConnect(context.Context, auth.Token, string) (string, string, error)
 	BenchmarkOverrideLeases(context.Context) (map[string]BenchmarkOverrideLease, error)
 	CaptureDetail(auth.Token, string) (CaptureDetail, error)
 	CertEdgeRequireHTTPSChecked(context.Context) bool
@@ -43,6 +45,8 @@ type API interface {
 	CertificatesView(context.Context) ([]CertificateDTO, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
+	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)
+	ConnectVendorAccountImport(context.Context, auth.Token, string, ConnectVendorAccountImportRequest) (VendorAccountDTO, error)
 	CreateApplication(context.Context, auth.Token, string, CreateApplicationRequest) (ApplicationDTO, error)
 	CreateChat(context.Context, auth.Token, CreateChatRequest) (ChatDTO, error)
 	CreateGatewaySetupKey(context.Context, auth.Token) (string, string, error)
@@ -55,6 +59,7 @@ type API interface {
 	CreateService(context.Context, auth.Token, CreateServiceRequest) (ServiceDTO, error)
 	CreateServiceToken(context.Context, auth.Token, string, CreateServiceTokenRequest) (CreateServiceTokenResponse, error)
 	CreateToken(context.Context, auth.Token, CreateTokenRequest) (CreateTokenResponse, error)
+	CreateVendorAccount(context.Context, auth.Token, CreateVendorAccountRequest) (VendorAccountDTO, error)
 	CurrencyUsdPerEur(context.Context) float64
 	CurrentUser(context.Context, auth.Token) (CurrentUser, error)
 	Dashboard(context.Context, auth.Token) DashboardResponse
@@ -71,6 +76,7 @@ type API interface {
 	DeleteService(context.Context, auth.Token, string) error
 	DeleteServiceToken(context.Context, auth.Token, string, string) error
 	DeleteToken(context.Context, auth.Token, string) error
+	DeleteVendorAccount(context.Context, auth.Token, string) (bool, error)
 	DemoteManager(context.Context, auth.Token, string, string) error
 	DetachProjectToken(context.Context, auth.Token, string, string) error
 	DisplayNames(context.Context, []string) map[string]string
@@ -96,6 +102,7 @@ type API interface {
 	GetServer(context.Context, auth.Token, string) (ServerDTO, error)
 	GetServerGPUBudgets(context.Context, auth.Token, string) ([]GPUBudgetDTO, error)
 	GetService(context.Context, auth.Token, string) (ServiceDTO, error)
+	GetVendorAccount(context.Context, auth.Token, string) (VendorAccountDTO, error)
 	GroupMemberCandidates(context.Context, auth.Token, string) ([]UserRefDTO, error)
 	GroupMembers(context.Context, auth.Token, string) ([]UserGroupMemberDTO, error)
 	HealthCheckIntervalSeconds(context.Context) int
@@ -111,6 +118,7 @@ type API interface {
 	ListServiceTokens(context.Context, auth.Token, string) ([]ServiceTokenDTO, error)
 	ListServices(context.Context, auth.Token) ([]ServiceDTO, error)
 	ListTokens(context.Context, auth.Token) (TokenListResponse, error)
+	ListVendorAccounts(context.Context, auth.Token) (VendorAccountListResponse, error)
 	ManageableUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	ManageModels(context.Context, auth.Token) ModelsResponse
 	MappingBenchmarks(context.Context, auth.Token, string, int) ([]BenchmarkRunDTO, error)
@@ -131,6 +139,7 @@ type API interface {
 	NetbirdPeers(context.Context) ([]netbird.Peer, error)
 	NetbirdPolicyContext(context.Context) NetbirdPolicyContextDTO
 	NetbirdTokenStatus(context.Context) (NetbirdTokenStatusDTO, error)
+	PollVendorAccountDeviceConnect(context.Context, auth.Token, string) (bool, error)
 	PrepareChatRun(context.Context, auth.Token, string, PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error)
 	ProbeEdgeTLS(context.Context) (EdgeProbeDTO, error)
 	ProjectCandidates(context.Context, auth.Token, string) ([]UserRefDTO, []GroupRefDTO, error)
@@ -215,6 +224,7 @@ type API interface {
 	UpdateService(context.Context, auth.Token, string, UpdateServiceRequest) (ServiceDTO, error)
 	UpdateSystemSettings(context.Context, auth.Token, UpdateSystemSettingsRequest) (SystemSettingsDTO, error)
 	UpdateToken(context.Context, auth.Token, string, UpdateTokenRequest) (TokenDTO, error)
+	UpdateVendorAccount(context.Context, auth.Token, string, UpdateVendorAccountRequest) (VendorAccountDTO, error)
 	Usage(auth.Token, usage.Query) (usage.Page, error)
 	UsageGroups(auth.Token, usage.Query, string) ([]UsageGroupDTO, error)
 	UsageStats(auth.Token, usage.Query) (usage.Stats, error)
@@ -222,6 +232,8 @@ type API interface {
 	UserLimits(context.Context, string) (UserLimitsDTO, error)
 	UserPreferences(context.Context, string) (map[string]json.RawMessage, error)
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
+	VendorAccountRoutingMode(context.Context) string
+	VendorAccountsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string
 }

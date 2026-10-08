@@ -17,6 +17,7 @@ export function NavSidebar({
   expanded,
   netbirdModuleEnabled = false,
   certificatesModuleEnabled = false,
+  vendorAccountsEnabled = false,
   systemAdminMode = false,
   t,
 }: Readonly<{
@@ -30,6 +31,10 @@ export function NavSidebar({
   // "netbird" (raw module-enabled checkbox, so the item appears as soon as it's
   // flipped on, before the rest of the module is configured).
   certificatesModuleEnabled?: boolean;
+  // Gates the "providers" (vendor accounts) nav item: the vendor_accounts_enabled
+  // master flag, off by default. Unlike netbird/certificates it needs no admin
+  // role -- every authenticated user sees the item once the flag is on.
+  vendorAccountsEnabled?: boolean;
   // System-admin step-up mode: a system_admin session starts as a plain admin
   // (system scope withheld) until it elevates. The system/netbird/certificates/
   // logs items require the ELEVATED capability, not just the role -- see App.tsx.
@@ -49,6 +54,7 @@ export function NavSidebar({
     systemAdminMode,
     netbirdModuleEnabled,
     certificatesModuleEnabled,
+    vendorAccountsEnabled,
   };
   const visible = navItems.filter((item) => viewRegistry[item.id].gate(gateCtx));
 

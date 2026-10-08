@@ -99,6 +99,7 @@ var allowedDeps = map[string][]string{
 		"internal/totp",
 		"internal/tracing",
 		"internal/usage",
+		"internal/vendorauth",
 	},
 	"internal/gateway/visionassets": {},
 	"internal/inference":            {},
@@ -116,6 +117,7 @@ var allowedDeps = map[string][]string{
 		"internal/store",
 		"internal/theme",
 		"internal/usage",
+		"internal/vendorauth",
 	},
 	"internal/provider": {
 		"internal/inference",
@@ -141,6 +143,12 @@ var allowedDeps = map[string][]string{
 		"internal/routing",
 	},
 	"internal/usage": {},
+	// vendorauth is the vendor-subscription OAuth library (reverse-engineered,
+	// experimental). It reaches only into capture for the enc:/plain: secret
+	// scheme, so portal and gateway can import it later without a cycle.
+	"internal/vendorauth": {
+		"internal/capture",
+	},
 }
 
 // TestAllowlistFrozen freezes the current internal import graph. Any new

@@ -110,7 +110,7 @@ func TestUsageEventsSchemaColumnsAllCovered(t *testing.T) {
 		assertColumnCoverage(context.Background(), t, s, "usage_events", columnCoverage{
 			bools: []string{"stream"},
 			seeded: []string{
-				"agent_id", "api_flavor", "billing_quantity", "billing_unit",
+				"account_id", "agent_id", "api_flavor", "billing_quantity", "billing_unit",
 				"cache_write_tokens", "cached_tokens", "content_type", "created_at",
 				"energy_marginal_wh", "energy_source", "energy_wh", "error_code",
 				"host", "http_status", "id", "input_tokens", "latency_ms", "model",

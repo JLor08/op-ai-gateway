@@ -138,6 +138,10 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.route_affinity_session_mode_invalid", "route affinity session mode must be client_session or legacy_header", ""))
 				return
 			}
+			if errors.Is(err, portal.ErrVendorAccountRoutingModeInvalid) {
+				writeJSON(w, http.StatusBadRequest, apierror.Response("system.vendor_account_routing_mode_invalid", "vendor account routing mode must be vendor_first or fallback_only", ""))
+				return
+			}
 			if errors.Is(err, portal.ErrEnergyDefaultInvalid) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("system.energy_default_invalid", "energy defaults must be non-negative", ""))
 				return
@@ -204,6 +208,12 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		// Same reasoning for the mesh gate's cached switch.
 		if req.CertMeshRequireTLS != nil {
 			s.invalidateMeshRequireTLSCache()
+		}
+		// Drop the resolver's cached vendor-account flag/mode reads so a toggle of
+		// the master flag or the routing mode takes effect on the very next resolve
+		// rather than after vendorSettingsCacheTTL.
+		if req.VendorAccountsEnabled != nil || req.VendorAccountRoutingMode != nil {
+			s.invalidateVendorSettingsCache()
 		}
 		writeJSON(w, http.StatusOK, dto)
 	default:

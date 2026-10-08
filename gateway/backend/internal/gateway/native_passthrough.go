@@ -68,6 +68,22 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case "openai_responses":
+		// An OpenAI SUBSCRIPTION target (Milestone 5b) forwards to the ChatGPT
+		// backend, whose Responses endpoint is .../backend-api/codex/responses — the
+		// Codex CLI's own path, NOT the OpenAI-platform /v1/responses. The Endpoint
+		// already carries the .../codex prefix, so the path is the bare /responses.
+		// Every other Responses upstream (self-hosted llama.cpp/vLLM, an api_key
+		// OpenAI vendor account or app) keeps the standard /v1/responses.
+		//
+		// The trigger is the explicit Subscription flag plus an OpenAI vendor provider
+		// (ProviderVendorOpenAI or the M5c ProviderVendorOpenAISubscription), NOT
+		// VendorAccountID: M6a now sets VendorAccountID on api-key OpenAI vendor
+		// targets too (for usage attribution), so keying on it here would also route an
+		// api-key OpenAI target to the Codex backend -- the exact conflation
+		// Target.Subscription removed.
+		if target.Subscription && routing.IsOpenAIVendorProvider(target.Provider) {
+			return "/responses", target.ResponsesMode
+		}
 		return "/v1/responses", target.ResponsesMode
 	case "anthropic_messages":
 		return "/v1/messages", target.MessagesMode
@@ -130,11 +146,12 @@ func targetIsImagesOnly(target routing.Target) bool {
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
 // RESOLVED target + client API flavor: the native passthrough path when the
 // effective mode for that flavor is passthrough, otherwise the built-in
-// translation's chat-completions path (per provider — ollama speaks /api/chat, all
-// OpenAI-compatible providers speak /v1/chat/completions). It returns "" for an
+// translation's chat-completions path (per provider — ollama speaks /api/chat, the
+// native Anthropic vendor client speaks /v1/messages, all OpenAI-compatible
+// providers speak /v1/chat/completions). It returns "" for an
 // unresolved target (e.g. a resolve failure, where no upstream was called). This
 // mirrors the paths hardcoded in the provider clients (openai_compatible.go,
-// ollama.go) and in proxyNative, kept here in one gateway-visible place so the
+// ollama.go, anthropic_messages.go) and in proxyNative, kept here in one gateway-visible place so the
 // persisted usage row + the live ActiveRequest agree on the value.
 //
 // KNOWN LIMIT (cosmetic, diagnostic field only): a translate handler derives the
@@ -158,8 +175,17 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
 	}
-	if target.Provider == routing.ProviderOllama {
+	switch target.Provider {
+	case routing.ProviderOllama:
 		return "/api/chat"
+	case routing.ProviderVendorAnthropic:
+		return "/v1/messages"
+	case routing.ProviderVendorOpenAISubscription:
+		// The OpenAI subscription translate path (chat -> Responses) POSTs to the
+		// ChatGPT backend's bare /responses, not /v1/chat/completions (the backend has
+		// no chat-completions surface) -- provider.OpenAIResponsesClient's path. This
+		// keeps the usage label consistent with endpointModeFor's passthrough answer.
+		return "/responses"
 	}
 	return "/v1/chat/completions"
 }
@@ -249,7 +275,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			ireq := req
 			slog.Warn("native passthrough admission rejected", "path", r.URL.Path, "api_flavor", apiFlavor, "model", model, "code", completionErrorCode(err), "status", completionHTTPStatus(err))
 			body := writeCompletionErrorCaptured(w, err)
-			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor))
+			s.recordUsage(start, *token, ireq, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), apiFlavor), nil)
 			return true
 		}
 		// Routing failed (no route for the model, or the application is currently
@@ -306,7 +332,7 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
 			"server", s.serverName(target.ServerID), "code", code, "status", status)
 		body := writeJSONCaptured(w, status, apierror.Response(code, msgEndpointDisabled, ""))
-		s.recordUsage(start, *token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor))
+		s.recordUsage(start, *token, req, target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, apiFlavor), nil)
 		return true
 	default:
 		// translate (or an unpopulated "" mode — treated as translate, the safe
@@ -373,7 +399,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// passthrough flavor, so the images unit must come from the CALLER's
 		// own endpoint identity here too, not only in images_handler.go's own
 		// two call sites.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor), nil)
 		return
 	}
 
@@ -505,7 +531,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// Same reasoning as the provider.unavailable branch above: this is a
 		// pre-response failure (nothing came back from sd-server at all), and
 		// it is still a non-token images request when pfReq.APIFlavor says so.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor))
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor), nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -632,7 +658,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the count comes off the RESPONSE and why a counted zero is logged rather
 	// than quietly recorded.
 	setImagesBillingQuantity(&meta, ex, imgCounter, status)
-	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor))
+	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
+	// path holds them directly), threaded in for the best-effort vendor rate-limit
+	// scrape -- a no-op for a non-vendor target.
+	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor), resp.Header)
 }
 
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native

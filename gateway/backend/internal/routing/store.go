@@ -28,6 +28,27 @@ const (
 	// type that must NOT be borrowed for this, since it is bound to its own
 	// client which does not implement provider.NativeProxyClient.
 	ProviderStableDiffusionCpp = "stable_diffusion_cpp"
+	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
+	// a vendor-account target: inference served by a hosted vendor API
+	// (api.openai.com / api.anthropic.com) instead of an on-prem application.
+	// vendor_openai speaks the OpenAI-compatible dialect and shares that client;
+	// vendor_anthropic has its own native /v1/messages client
+	// (provider.AnthropicClient), so its translate path is /v1/messages rather
+	// than /v1/chat/completions.
+	ProviderVendorOpenAI    = "vendor_openai"
+	ProviderVendorAnthropic = "vendor_anthropic"
+	// ProviderVendorOpenAISubscription is the provider kind of an OpenAI
+	// SUBSCRIPTION (Codex ChatGPT Pro/Plus/Team OAuth) target (Milestone 5c). Its
+	// upstream is the reverse-engineered ChatGPT backend
+	// (https://chatgpt.com/backend-api/codex), which speaks the Responses protocol
+	// ONLY — it has no /v1/chat/completions surface. The dedicated
+	// provider.OpenAIResponsesClient therefore serves BOTH paths of such a target:
+	// a lossless native passthrough of an inbound /v1/responses (Codex) request,
+	// and a TRANSLATE path that renders a chat/completions (portal-chat) request as
+	// a Responses body and parses the Responses SSE back. Kept distinct from the
+	// api-key ProviderVendorOpenAI (api.openai.com, OpenAI-compatible client) so the
+	// two never share a client or an endpoint. EXPERIMENTAL / ToS-sensitive.
+	ProviderVendorOpenAISubscription = "vendor_openai_subscription"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -69,6 +90,16 @@ const (
 	PrincipalTypeService = "service"
 	PrincipalTypeUser    = "user"
 )
+
+// IsOpenAIVendorProvider reports whether provider is one of the two OpenAI vendor
+// provider kinds: the api-key ProviderVendorOpenAI (api.openai.com) or the
+// subscription ProviderVendorOpenAISubscription (the ChatGPT backend). The
+// dispatch, usage-scrape and account-header paths that are OpenAI-vendor-specific
+// but auth-type-agnostic key on this so neither provider is forgotten when one is
+// added. It is deliberately NOT true for ProviderVendorAnthropic.
+func IsOpenAIVendorProvider(provider string) bool {
+	return provider == ProviderVendorOpenAI || provider == ProviderVendorOpenAISubscription
+}
 
 type AIServer struct {
 	ID     string
@@ -174,6 +205,71 @@ type AIServer struct {
 	LastSeenAt         *time.Time
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+const (
+	VendorOpenAI    = "openai"
+	VendorAnthropic = "anthropic"
+
+	VendorAuthAPIKey       = "api_key"
+	VendorAuthSubscription = "subscription"
+
+	VendorAccountStatusActive         = "active"
+	VendorAccountStatusDisabled       = "disabled"
+	VendorAccountStatusNeedsReconnect = "needs_reconnect"
+)
+
+// VendorAccount is a per-user external AI vendor account ("Anbieter"): either a
+// plain API key or a consumer-subscription OAuth connection. Credentials are
+// SEALED (enc:/plain:); routing never decrypts them. Distinct from the
+// provider-adapter "Provider*" constants and from AIServer.
+type VendorAccount struct {
+	ID          string
+	OwnerUserID string
+	Vendor      string // VendorOpenAI | VendorAnthropic
+	AuthType    string // VendorAuthAPIKey | VendorAuthSubscription
+	Name        string
+	Status      string // VendorAccountStatus*
+	// APIKey holds the sealed API key when AuthType == api_key, else "".
+	APIKey string
+	// OAuthTokens holds the sealed JSON token blob when AuthType == subscription,
+	// else "". Shape (plaintext, before sealing): {access, refresh, expires_at,
+	// account_id, plan_type, scope}. See internal/vendorauth.TokenSet.
+	OAuthTokens string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// VendorAccountModel is one model a vendor account serves: the public id a
+// caller asks the gateway for (GatewayModel), the id sent to the vendor
+// (UpstreamModel) and the wire dialect used to reach it (APIFlavor, one of
+// APIFlavorOpenAI / APIFlavorAnthropic). For the vendors served today the two
+// ids coincide. (AccountID, GatewayModel) is the primary key.
+type VendorAccountModel struct {
+	AccountID     string
+	GatewayModel  string
+	UpstreamModel string
+	APIFlavor     string
+}
+
+// VendorAccountUsage is the latest rate-limit usage snapshot scraped from a
+// vendor account's upstream responses (vendor_account_usage, one row per account,
+// migration 82). The two percentages are NORMALIZED to a percent scale (0..100)
+// across vendors (Anthropic reports a 0..1 utilization fraction, OpenAI/Codex a
+// 0..100 used-percent); a value of -1 means UNKNOWN -- the header was absent or
+// unparseable, deliberately distinct from a real 0% so the panel can show "n/a"
+// rather than a false "0% used". The reset times are nil when the vendor sent no
+// reset; CreditBalance is the vendor's raw credit string ("" when none). The
+// scraper upserts this best-effort after a served request; a parse/store failure
+// never faults the inference request.
+type VendorAccountUsage struct {
+	AccountID       string
+	FiveHourPct     float64    // 0..100, or -1 = unknown (the five-hour / "primary" window)
+	FiveHourResetAt *time.Time // when the five-hour window resets; nil = unknown
+	WeeklyPct       float64    // 0..100, or -1 = unknown (the weekly / "secondary" window)
+	WeeklyResetAt   *time.Time // when the weekly window resets; nil = unknown
+	CreditBalance   string     // the vendor's raw credit-balance string; "" = unknown/none
+	UpdatedAt       time.Time
 }
 
 // Service is a Service Account (Phase 1 service accounts): an autonomous
@@ -2105,6 +2201,60 @@ type RuntimeStore interface {
 	ServerRuntimeReportByServer(ctx context.Context, serverID string) (ServerRuntimeReport, bool, error)
 }
 
+// VendorAccountStore is per-user external-vendor-account CRUD. Credentials ride
+// sealed; the cipher-holding layers open them at dispatch.
+//
+// UpdateVendorAccount rewrites auth_type, name, status, api_key, oauth_tokens
+// and updated_at; the account's identity — id, owner_user_id, vendor and
+// created_at — is immutable, so every driver ignores a changed value there. An
+// unknown id is ErrNotFound on Update and Delete, a duplicate id is ErrConflict
+// on Create. Deleting an account (or its owning user) cascades its dependent
+// rows.
+type VendorAccountStore interface {
+	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
+	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
+	// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens column (plus
+	// updated_at) of an existing account. It exists alongside the full-row
+	// UpdateVendorAccount so a dispatch-time token refresh persists the resealed
+	// blob without clobbering a concurrent rename/status change: the two writers
+	// touch disjoint columns. sealed is the already-sealed envelope (enc:/plain:).
+	// An unknown id is ErrNotFound.
+	SetVendorAccountOAuthTokens(ctx context.Context, accountID, sealed string) error
+	// SetVendorAccountStatus writes ONLY the status column (plus updated_at) of an
+	// existing account — the narrow writer the dispatch path uses to flip an
+	// account to needs_reconnect after a refresh rejection, again without
+	// clobbering a concurrent full-row update. An unknown id is ErrNotFound.
+	SetVendorAccountStatus(ctx context.Context, accountID, status string) error
+	VendorAccountByID(ctx context.Context, id string) (VendorAccount, error)
+	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
+	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
+	DeleteVendorAccount(ctx context.Context, id string) error
+
+	// VendorAccountModels returns the models accountID serves, sorted by
+	// gateway_model. Always non-nil (empty when the account has none, or does
+	// not exist).
+	VendorAccountModels(ctx context.Context, accountID string) ([]VendorAccountModel, error)
+	// SetVendorAccountModels atomically REPLACES accountID's whole model set
+	// (delete-then-insert; a rejected set leaves the previous one in place).
+	// Every row is stored under accountID whatever its own AccountID says. An
+	// unknown account is ErrNotFound (even for an empty set); a duplicate
+	// GatewayModel within the set is ErrConflict.
+	SetVendorAccountModels(ctx context.Context, accountID string, models []VendorAccountModel) error
+
+	// UpsertVendorAccountUsage inserts or replaces the single rate-limit usage
+	// snapshot row for u.AccountID (one row per account). The account must exist --
+	// an unknown id is ErrNotFound (the FK). The whole row is overwritten on
+	// conflict, so an UNKNOWN field must be passed as -1 / nil / "" (never a
+	// fabricated 0), matching the snapshot's own unknown convention. Called
+	// best-effort by the usage scraper; a failure is logged, never propagated into
+	// the inference request.
+	UpsertVendorAccountUsage(ctx context.Context, u VendorAccountUsage) error
+	// VendorAccountUsageByID returns accountID's usage snapshot. ok is false when
+	// no snapshot has been scraped for that account yet (not an error), mirroring
+	// RuntimeSpecByMapping's absent-read contract.
+	VendorAccountUsageByID(ctx context.Context, accountID string) (VendorAccountUsage, bool, error)
+}
+
 // Store is the full routing persistence surface: the composition of every
 // role-scoped sub-interface above, grouped by concern. *MemoryStore (this
 // package) and *store.SQLStore implement Store by implementing each
@@ -2128,6 +2278,7 @@ type Store interface {
 	LimitsStore
 	CertificateStore
 	RuntimeStore
+	VendorAccountStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.

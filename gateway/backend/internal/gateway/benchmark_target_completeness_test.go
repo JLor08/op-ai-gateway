@@ -42,6 +42,14 @@ var benchmarkOmits = map[string]bool{
 	// gated on RouteID != ""; a benchmark computes its own throughput and must not
 	// EWMA-update the mapping from its own synthetic stream.
 	"OpportunisticMetrics": true,
+	// The vendor-subscription fields are set only on a hand-built vendor
+	// subscription Target; a benchmark never runs against a vendor subscription
+	// account (it measures on-prem server throughput), so benchmarkTargetReq
+	// leaves all three zero.
+	"ExtraHeaders":    true, // static upstream headers only a vendor subscription target carries
+	"Masquerade":      true, // no client-side disguise on a benchmark stream
+	"VendorAccountID": true, // a benchmark measures on-prem server throughput, never a vendor account
+	"Subscription":    true, // a benchmark never dispatches a vendor subscription bearer
 }
 
 // TestBenchmarkTargetReqSetsEveryFieldOrDocumentsOmission guards the SECOND real

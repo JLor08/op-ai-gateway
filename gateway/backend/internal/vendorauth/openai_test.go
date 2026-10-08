@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package vendorauth
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+// stubJWT builds an unsigned three-segment JWT carrying claims, the shape the
+// OpenAI token endpoint returns for id_token (the library never verifies it).
+func stubJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc([]byte(`{"alg":"none","typ":"JWT"}`)) + "." + enc(payload) + "."
+}
+
+func openAIClaims(accountID, plan string) map[string]any {
+	return map[string]any{
+		"sub":                    "user-1",
+		OpenAIAuthClaimNamespace: map[string]any{OpenAIClaimAccountID: accountID, OpenAIClaimPlanType: plan},
+	}
+}
+
+// openAIStub starts an httptest token endpoint and returns the default OpenAI
+// endpoints re-pointed at it. handler receives the request path and the parsed
+// form body.
+func openAIStub(t *testing.T, handler func(w http.ResponseWriter, path string, form url.Values)) Endpoints {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", got)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		handler(w, r.URL.Path, r.PostForm)
+	}))
+	t.Cleanup(srv.Close)
+	ep := DefaultOpenAIEndpoints()
+	ep.TokenURL = srv.URL + "/oauth/token"
+	return ep
+}
+
+func expectForm(t *testing.T, got url.Values, want map[string]string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("form = %v, want exactly %v", got, want)
+	}
+	for k, v := range want {
+		if got.Get(k) != v {
+			t.Errorf("form[%s] = %q, want %q", k, got.Get(k), v)
+		}
+	}
+}
+
+func TestBuildOpenAIAuthorizeURL(t *testing.T) {
+	ep := DefaultOpenAIEndpoints()
+	verifier, challenge, err := GeneratePKCE()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := BuildOpenAIAuthorizeURL(ep, verifier, "state-xyz")
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("authorize URL does not parse: %v", err)
+	}
+	if got := u.Scheme + "://" + u.Host + u.Path; got != ep.AuthorizeURL {
+		t.Fatalf("base = %q, want %q", got, ep.AuthorizeURL)
+	}
+	want := map[string]string{
+		"response_type":              "code",
+		"client_id":                  OpenAIClientID,
+		"redirect_uri":               OpenAIRedirectURI,
+		"scope":                      OpenAIScopes,
+		"code_challenge":             challenge,
+		"code_challenge_method":      "S256",
+		"state":                      "state-xyz",
+		"id_token_add_organizations": "true",
+		"codex_cli_simplified_flow":  "true",
+		"originator":                 "codex_cli_rs",
+	}
+	q := u.Query()
+	for k, v := range want {
+		if got := q.Get(k); got != v {
+			t.Errorf("query %s = %q, want %q", k, got, v)
+		}
+	}
+	if len(q) != len(want) {
+		t.Errorf("query has %d params, want exactly %d: %v", len(q), len(want), q)
+	}
+	if strings.Contains(raw, verifier) {
+		t.Errorf("authorize URL must carry the challenge, never the verifier")
+	}
+}
+
+func TestBuildOpenAIAuthorizeURLKeepsCodexParamsOnHandBuiltEndpoints(t *testing.T) {
+	ep := Endpoints{ClientID: "cid", AuthorizeURL: "http://127.0.0.1:9/authorize", RedirectURI: "http://127.0.0.1:9/cb", Scopes: "openid"}
+	q := mustQuery(t, BuildOpenAIAuthorizeURL(ep, "v", "s"))
+	for _, k := range []string{"id_token_add_organizations", "codex_cli_simplified_flow", "originator"} {
+		if q.Get(k) == "" {
+			t.Errorf("hand-built endpoints lost the %s parameter", k)
+		}
+	}
+}
+
+func mustQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Query()
+}
+
+func TestExchangeOpenAICode(t *testing.T) {
+	idToken := stubJWT(t, openAIClaims("acct-42", "plus"))
+	ep := openAIStub(t, func(w http.ResponseWriter, path string, form url.Values) {
+		if path != "/oauth/token" {
+			t.Errorf("path = %s, want the token endpoint", path)
+		}
+		expectForm(t, form, map[string]string{
+			"grant_type":    "authorization_code",
+			"code":          "the-code",
+			"redirect_uri":  OpenAIRedirectURI,
+			"client_id":     OpenAIClientID,
+			"code_verifier": "the-verifier",
+		})
+		writeJSON(w, 200, `{"access_token":"at","refresh_token":"rt","id_token":"`+idToken+`","expires_in":3600,"scope":"openid profile"}`)
+	})
+	before := time.Now()
+	ts, err := ExchangeOpenAICode(context.Background(), http.DefaultClient, ep, "the-code", "the-verifier")
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("ExchangeOpenAICode: %v", err)
+	}
+	if ts.AccessToken != "at" || ts.RefreshToken != "rt" || ts.AccountID != "acct-42" || ts.PlanType != "plus" || ts.Scope != "openid profile" {
+		t.Fatalf("TokenSet = %+v", ts)
+	}
+	if ts.ExpiresAt.Before(before.Add(time.Hour)) || ts.ExpiresAt.After(after.Add(time.Hour)) {
+		t.Fatalf("ExpiresAt = %v, want now+1h", ts.ExpiresAt)
+	}
+}
+
+func TestExchangeOpenAICodeFallsBackToAccessTokenClaims(t *testing.T) {
+	// No id_token claim, but the access token is itself a JWT with the
+	// https://api.openai.com/auth object.
+	accessJWT := stubJWT(t, openAIClaims("acct-from-access", "pro"))
+	ep := openAIStub(t, func(w http.ResponseWriter, _ string, _ url.Values) {
+		writeJSON(w, 200, `{"access_token":"`+accessJWT+`","refresh_token":"rt","expires_in":"3600"}`)
+	})
+	ts, err := ExchangeOpenAICode(context.Background(), http.DefaultClient, ep, "c", "v")
+	if err != nil {
+		t.Fatalf("ExchangeOpenAICode: %v", err)
+	}
+	if ts.AccountID != "acct-from-access" || ts.PlanType != "pro" {
+		t.Fatalf("TokenSet = %+v, want claims recovered from the access token", ts)
+	}
+	if ts.ExpiresAt.IsZero() {
+		t.Fatalf("a numeric-string expires_in must still set ExpiresAt")
+	}
+}
+
+func TestExchangeOpenAICodeWithoutClaimsLeavesIdentityEmpty(t *testing.T) {
+	ep := openAIStub(t, func(w http.ResponseWriter, _ string, _ url.Values) {
+		writeJSON(w, 200, `{"access_token":"opaque","id_token":"garbled","expires_in":60}`)
+	})
+	ts, err := ExchangeOpenAICode(context.Background(), http.DefaultClient, ep, "c", "v")
+	if err != nil {
+		t.Fatalf("a token response without claims must still succeed: %v", err)
+	}
+	if ts.AccessToken != "opaque" || ts.AccountID != "" || ts.PlanType != "" {
+		t.Fatalf("TokenSet = %+v", ts)
+	}
+}
+
+func TestParseOpenAIIDTokenClaims(t *testing.T) {
+	enc := base64.RawURLEncoding.EncodeToString
+	jwtOf := func(payload string) string { return "h." + enc([]byte(payload)) + ".s" }
+	cases := []struct {
+		name        string
+		token       string
+		wantAccount string
+		wantPlan    string
+	}{
+		{"valid", stubJWT(t, openAIClaims("a1", "plus")), "a1", "plus"},
+		{"padded base64 segment", "h." + base64.URLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"a2"}}`)) + ".s", "a2", ""},
+		{"only plan", jwtOf(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"team"}}`), "", "team"},
+		{"empty string", "", "", ""},
+		{"not a jwt", "garbled", "", ""},
+		{"two segments", "a.b", "", ""},
+		{"four segments", "a.b.c.d", "", ""},
+		{"payload not base64", "h.!!!notbase64!!!.s", "", ""},
+		{"payload not json", jwtOf(`not json`), "", ""},
+		{"payload json null", jwtOf(`null`), "", ""},
+		{"payload json array", jwtOf(`[1,2]`), "", ""},
+		{"namespace missing", jwtOf(`{"sub":"x"}`), "", ""},
+		{"namespace is a string", jwtOf(`{"https://api.openai.com/auth":"nope"}`), "", ""},
+		{"namespace is null", jwtOf(`{"https://api.openai.com/auth":null}`), "", ""},
+		{"claims of the wrong type", jwtOf(`{"https://api.openai.com/auth":{"chatgpt_account_id":7,"chatgpt_plan_type":["x"]}}`), "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			account, plan := parseOpenAIIDTokenClaims(tc.token)
+			if account != tc.wantAccount || plan != tc.wantPlan {
+				t.Fatalf("got (%q, %q), want (%q, %q)", account, plan, tc.wantAccount, tc.wantPlan)
+			}
+		})
+	}
+}
+
+func TestOpenAIClaimsFromJWT(t *testing.T) {
+	if account, plan := OpenAIClaimsFromJWT(stubJWT(t, openAIClaims("acct-7", "pro"))); account != "acct-7" || plan != "pro" {
+		t.Fatalf("got (%q, %q), want (acct-7, pro)", account, plan)
+	}
+	// A pasted token that is not a JWT (or has no claim) is not an error.
+	for _, token := range []string{"", "sk-not-a-jwt", "a.b.c", stubJWT(t, map[string]any{"sub": "u"})} {
+		if account, plan := OpenAIClaimsFromJWT(token); account != "" || plan != "" {
+			t.Fatalf("token %q: got (%q, %q), want empty", token, account, plan)
+		}
+	}
+}
+
+func TestRefreshOpenAI(t *testing.T) {
+	t.Run("re-issues tokens and identity", func(t *testing.T) {
+		idToken := stubJWT(t, openAIClaims("acct-9", "pro"))
+		ep := openAIStub(t, func(w http.ResponseWriter, _ string, form url.Values) {
+			expectForm(t, form, map[string]string{"grant_type": "refresh_token", "refresh_token": "old-r", "client_id": OpenAIClientID})
+			writeJSON(w, 200, `{"access_token":"new-a","refresh_token":"new-r","id_token":"`+idToken+`","expires_in":3600}`)
+		})
+		ts, err := RefreshOpenAI(context.Background(), http.DefaultClient, ep, "old-r")
+		if err != nil {
+			t.Fatalf("RefreshOpenAI: %v", err)
+		}
+		if ts.AccessToken != "new-a" || ts.RefreshToken != "new-r" || ts.AccountID != "acct-9" || ts.PlanType != "pro" || ts.ExpiresAt.IsZero() {
+			t.Fatalf("TokenSet = %+v", ts)
+		}
+	})
+	t.Run("response without refresh token or id_token keeps the old refresh token", func(t *testing.T) {
+		ep := openAIStub(t, func(w http.ResponseWriter, _ string, _ url.Values) {
+			writeJSON(w, 200, `{"access_token":"new-a","expires_in":3600}`)
+		})
+		ts, err := RefreshOpenAI(context.Background(), http.DefaultClient, ep, "keep-me")
+		if err != nil {
+			t.Fatalf("RefreshOpenAI: %v", err)
+		}
+		if ts.RefreshToken != "keep-me" || ts.AccountID != "" {
+			t.Fatalf("TokenSet = %+v; identity must be left for the caller to carry forward", ts)
+		}
+	})
+}
+
+func TestOpenAIErrorMapping(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		body         string
+		wantRejected bool
+	}{
+		{"401", 401, `{"error":{"message":"bad","type":"invalid_request_error","code":"token_expired"}}`, true},
+		{"403", 403, `forbidden`, true},
+		{"400 invalid_grant", 400, `{"error":"invalid_grant","error_description":"refresh token reused"}`, true},
+		{"400 invalid_request", 400, `{"error":"invalid_request"}`, false},
+		{"429", 429, `{"error":"rate_limit"}`, false},
+		{"503", 503, `unavailable`, false},
+	}
+	calls := map[string]func(ep Endpoints) error{
+		"exchange": func(ep Endpoints) error {
+			_, err := ExchangeOpenAICode(context.Background(), http.DefaultClient, ep, "SECRET-CODE", "v")
+			return err
+		},
+		"refresh": func(ep Endpoints) error {
+			_, err := RefreshOpenAI(context.Background(), http.DefaultClient, ep, "SECRET-REFRESH")
+			return err
+		},
+	}
+	for _, tc := range cases {
+		for name, call := range calls {
+			t.Run(tc.name+"/"+name, func(t *testing.T) {
+				ep := openAIStub(t, func(w http.ResponseWriter, _ string, _ url.Values) { writeJSON(w, tc.status, tc.body) })
+				err := call(ep)
+				if err == nil {
+					t.Fatal("want an error")
+				}
+				if got := errors.Is(err, ErrAuthRejected); got != tc.wantRejected {
+					t.Fatalf("errors.Is(ErrAuthRejected) = %v, want %v (err: %v)", got, tc.wantRejected, err)
+				}
+				var se *StatusError
+				if !errors.As(err, &se) || se.Status != tc.status || !strings.Contains(err.Error(), "HTTP") {
+					t.Fatalf("error is not a *StatusError for HTTP %d: %v", tc.status, err)
+				}
+				for _, secret := range []string{"SECRET-CODE", "SECRET-REFRESH"} {
+					if strings.Contains(err.Error(), secret) {
+						t.Errorf("error leaks request secret %q: %v", secret, err)
+					}
+				}
+			})
+		}
+	}
+}

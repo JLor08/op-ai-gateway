@@ -79,7 +79,7 @@ func speculatingCompletion(t *testing.T, srv *Server, draftTokens int, id string
 		InputTokens: 10, OutputTokens: 12, TotalTokens: 22, DraftTokens: draftTokens,
 	}}
 	srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "qwen-coder"},
-		target, resp, "", "success", usageMeta{}, id, nil)
+		target, resp, "", "success", usageMeta{}, id, nil, nil)
 }
 
 // speculationRow reads the seeded mapping's speculation_observed row straight

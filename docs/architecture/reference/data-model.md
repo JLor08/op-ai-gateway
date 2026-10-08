@@ -26,7 +26,7 @@ not route-based).
 |---|---|
 | `api_tokens` | Bearer API tokens. `user_id` is nullable (a *service* token has none instead); carries the per-token model catch-all override and override-rule map (`model_override_map`, a JSON string of `requested -> {to, offer, hide_target}`), the unknown-model redirect settings and the `last_used_model` marker it aims at, log-communication and secret-capture flags, optional project attribution, and an optional per-token AI-server override. |
 | `route_affinity` | Sticky-routing memory: which application/server a given `(token, model, api_flavor, session)` was last routed to, with a TTL. |
-| `usage_events` | One row per completed/failed request: tokens in/out/cached/cache-write, latency, status, provider/model, the client's originally-requested model (`requested_model`, since migration 61; `''` on rows recorded before it), session/service/project attribution, P1 energy-attribution fields (`energy_wh`, `energy_marginal_wh`, `energy_source`), and the non-token billable measure as a **(unit, quantity) pair** (`billing_unit`, `billing_quantity`, since migration 81). The pair is an XOR with the token columns: `billing_unit = ''` is a POSITIVE assertion that the row is token-metered — so the column's default backfills all history truthfully — while any other value means `billing_quantity` is the measure and all seven token-denominated columns are `0` ([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). Deliberately carries **no foreign keys** on `user_id`/`token_id`/`host`/`service_id`/`project_id` — usage history must survive the deletion of the user, token, server, service, or project it references. |
+| `usage_events` | One row per completed/failed request: tokens in/out/cached/cache-write, latency, status, provider/model, the client's originally-requested model (`requested_model`, since migration 61; `''` on rows recorded before it), session/service/project attribution, the vendor account that served the request (`account_id`, since migration 82; `''` on the ordinary AI-server path and on rows recorded before it — needed so two accounts of the same vendor are distinguishable in analytics, which `provider` + `host` alone cannot), P1 energy-attribution fields (`energy_wh`, `energy_marginal_wh`, `energy_source`), and the non-token billable measure as a **(unit, quantity) pair** (`billing_unit`, `billing_quantity`, since migration 81). The pair is an XOR with the token columns: `billing_unit = ''` is a POSITIVE assertion that the row is token-metered — so the column's default backfills all history truthfully — while any other value means `billing_quantity` is the measure and all seven token-denominated columns are `0` ([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). Deliberately carries **no foreign keys** on `user_id`/`token_id`/`host`/`service_id`/`project_id`/`account_id` — usage history must survive the deletion of the user, token, server, service, project, or vendor account it references. |
 | `captures` | Optional encrypted request/response payload capture, one row per `usage_events` row (FK cascade — a capture cannot outlive its usage event). |
 | `principal_limits` | Optional per-principal (`user` or `service`) rate/quota/budget limits, keyed by `(principal_type, principal_id)`. |
 
@@ -61,6 +61,22 @@ what these five tables are for, and §4 below for their field semantics.
 |---|---|
 | `model_groups` | A named priority-failover group offered to clients as a single synthetic gateway model (failover mode, subgroup traversal order, and the four combinable selection settings: `loaded_only`, `member_order`, `climb_speed_margin_percent`, `min_tokens_per_second` + `min_speed_fallback`). |
 | `model_group_members` | Ordered members of a model group (a gateway model name + priority). |
+
+### External vendor accounts (Anbieter)
+
+A per-user external AI vendor account ("Anbieter"): a plain platform API key, or
+an experimental consumer-subscription OAuth connection, routed as the user's own
+candidate. Distinct from the overloaded "provider" adapter term and from
+`AIServer` ([ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)).
+See [External Vendor Accounts](../cross-cutting/external-vendor-accounts.md) for
+what these tables are for; all three plus the `usage_events.account_id` column
+below are migration 82.
+
+| Table | Purpose |
+|---|---|
+| `vendor_accounts` | One account per `(owner_user_id` → `users(id)` `on delete cascade)`: `vendor` (`openai`/`anthropic`), `auth_type` (`api_key`/`subscription`), `name`, `status` (`active`/`disabled`/`needs_reconnect`), and the two **sealed** credential columns — `api_key` (`text not null default ''`, populated when `auth_type = api_key`) and `oauth_tokens` (`text not null default ''`, the sealed OAuth token-set JSON, populated when `auth_type = subscription`). At most one credential column is set per row — an unconnected subscription account or a keyless api-key account has neither (the exclusivity is enforced in the service, not the schema); both hold the `enc:`/`plain:` envelope ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-the-encplain-scheme)), never plaintext. Indexed on `owner_user_id`. |
+| `vendor_account_models` | The curated model catalog an account serves, PK `(account_id, gateway_model)`, `account_id` → `vendor_accounts(id)` `on delete cascade`: `upstream_model` (the vendor's real id) and `api_flavor` (`openai`/`anthropic`). Seeded from the static per-vendor catalog **on create only** (`SetVendorAccountModels`); there is no catalog-edit endpoint in this release, so the set is not user-narrowable yet, and no backfill exists for pre-existing accounts. |
+| `vendor_account_usage` | The latest rate-limit snapshot scraped off the account's upstream responses, one row per account (PK `account_id` → `vendor_accounts(id)` `on delete cascade`): `five_hour_pct`/`weekly_pct` (`double precision not null default -1`, `-1` = that window is **unknown**, never a real 0 %), the nullable `five_hour_reset_at`/`weekly_reset_at` reset times, an opaque `credit_balance` string, and `updated_at`. Written best-effort at the usage choke point; neither vendor exposes an absolute cap, so there is deliberately no "N of M". |
 
 ### Telemetry, availability & hardware
 
@@ -187,8 +203,30 @@ erDiagram
         string token_id "denormalized, no FK"
         string model
         string host "denormalized server id"
+        string account_id "denormalized vendor account id, '' off-path"
         string status
         int total_tokens
+    }
+    VENDOR_ACCOUNTS {
+        string id PK
+        string owner_user_id FK "on delete cascade"
+        string vendor "openai | anthropic"
+        string auth_type "api_key | subscription"
+        string status "active | disabled | needs_reconnect"
+        string api_key "sealed, '' unless api_key"
+        string oauth_tokens "sealed, '' unless subscription"
+    }
+    VENDOR_ACCOUNT_MODELS {
+        string account_id FK "PK part, on delete cascade"
+        string gateway_model "PK part"
+        string upstream_model
+        string api_flavor "openai | anthropic"
+    }
+    VENDOR_ACCOUNT_USAGE {
+        string account_id PK "FK, on delete cascade"
+        float five_hour_pct "-1 = unknown"
+        float weekly_pct "-1 = unknown"
+        string credit_balance
     }
 
     USERS ||--o{ SESSIONS : "authenticates"
@@ -201,6 +239,9 @@ erDiagram
     MODEL_MAPPINGS ||--o{ MODEL_MAPPING_CAPABILITIES : "has verdicts for"
     USERS ||--o{ USAGE_EVENTS : "records (denormalized)"
     API_TOKENS ||--o{ USAGE_EVENTS : "records (denormalized)"
+    USERS ||--o{ VENDOR_ACCOUNTS : "owns"
+    VENDOR_ACCOUNTS ||--o{ VENDOR_ACCOUNT_MODELS : "serves"
+    VENDOR_ACCOUNTS ||--o| VENDOR_ACCOUNT_USAGE : "has snapshot"
 ```
 
 `MODEL_MAPPING_CAPABILITIES` is on the request path: the candidate query joins
@@ -240,9 +281,12 @@ service, or project that produced it.
 | `routing.AgentToken` | `internal/routing/store.go` | The per-server ServerAgent bearer credential. |
 | `routing.Certificate` | `internal/routing/store.go` | One ACME-managed TLS certificate (sealed key, fingerprints, issue/error state). |
 | `routing.LimitConfig` | `internal/routing/store.go` | A principal's optional rate/quota/budget limits. |
+| `routing.VendorAccount` | `internal/routing/store.go` | A per-user external vendor account ("Anbieter"): vendor, auth type, status, and the two **sealed** credential fields (`APIKey`, `OAuthTokens`). Distinct from the `Provider*` adapter constants and from `AIServer` ([ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)). |
+| `routing.VendorAccountModel` / `VendorAccountUsage` | `internal/routing/store.go` | A catalog row an account serves (gateway↔upstream model + flavor), and the latest scraped rate-limit snapshot (`-1` = unknown window). |
+| `vendorauth.TokenSet` | `internal/vendorauth/tokens.go` | The OAuth token set sealed into `VendorAccount.OAuthTokens`: access/refresh tokens, expiry, and the OpenAI ChatGPT account id + plan type. |
 | `usage.Event` | `internal/usage/recorder.go` | One recorded request: tokens, latency, status, attribution, energy fields, and the `(BillingUnit, BillingQuantity)` billable measure. `usage.Row` embeds it, so the pair reaches the Activity list API with no DTO in between. |
 
-## 4. Migration history (81 migrations)
+## 4. Migration history (82 migrations)
 
 All migrations live in `internal/store/migrate.go`, are forward-only, and
 are applied — only the pending ones, each in its own transaction — by
@@ -471,6 +515,12 @@ catch-all `model_override`, which has its own column).
 | # | Migration | Purpose |
 |---|---|---|
 | 81 | `usage_events_billing_unit` | Adds `usage_events.billing_unit` (`text not null default ''`) and `billing_quantity` (`double precision not null default 0`): the non-token billable measure as a **(unit, quantity) pair**, never a scalar ([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). Both columns land in the **same** migration by necessity — a quantity without its unit is the scalar that decision rejects, and a unit without its quantity records nothing. `''` means token-metered, and it is a **one-way positive assertion** rather than an "unknown": every request recorded before this migration really was token-metered, so the two DDL defaults backfill the whole of history *truthfully* and no LLM path changes — the same no-op upgrade argument migrations 74 and 80 make, but resting on a semantic claim about the data rather than only on a default value. Nothing may ever default *to* `''` from an unrecognised unit; `usage.ValidateBillingXOR` returns an error instead of clamping. `double precision`, not `real`, per [ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types). Both columns via `addColumnIfMissing`, so a replay is idempotent; does not touch `baselineCreateStatements` (frozen at v60) or `migration43FloatColumns`. |
+
+### External vendor accounts
+
+| # | Migration | Purpose |
+|---|---|---|
+| 82 | `vendor_accounts` | Creates the three external-vendor-account tables — `vendor_accounts`, `vendor_account_models` (PK `account_id, gateway_model`), `vendor_account_usage` (PK `account_id`) — and adds `usage_events.account_id` (`text not null default ''`) so a recorded request can name the vendor account that served it ([ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)). `owner_user_id` cascades from `users`, and both child tables cascade from `vendor_accounts`, so deleting a user or an account leaves no dangling rows. The credential columns (`api_key`, `oauth_tokens`) hold **sealed** values (`capture.SealSecret`), never plaintext ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-the-encplain-scheme)). Wide Go values need wide Postgres columns, so the usage percentages are `double precision` (`-1` = unknown, [ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types)) and the nullable reset times use `dl.timestampType()`. The tables and the `usage_events` column via create-if-not-exists / `addColumnIfMissing`, so a replay is idempotent; does not touch `baselineCreateStatements` (frozen at v60). |
 
 Field semantics in these tables that are **not** self-evident, and where a
 plausible-looking validation rule would break the normal case:

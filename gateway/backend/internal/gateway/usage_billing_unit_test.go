@@ -30,7 +30,7 @@ func TestRecordUsageWritesTokenMeteredByDefault(t *testing.T) {
 		provider.Response{Usage: inference.Usage{InputTokens: 10, OutputTokens: 20, TotalTokens: 30}},
 		"", "success",
 		usageMeta{ReqPath: "/v1/chat/completions", HTTPStatus: 200, ContentType: "application/json"},
-		"req_billing_default", nil,
+		"req_billing_default", nil, nil,
 	)
 
 	events := srv.Usage.ByUser("usr_billing")
@@ -68,7 +68,7 @@ func TestRecordUsageCarriesBillingPairFromUsageMeta(t *testing.T) {
 			BillingUnit:     usage.BillingUnitImage,
 			BillingQuantity: 2,
 		},
-		"req_billing_image", nil,
+		"req_billing_image", nil, nil,
 	)
 
 	events := srv.Usage.ByUser("usr_billing_img")
@@ -109,7 +109,7 @@ func TestRecordUsageRecordsAnXORViolationUnmodified(t *testing.T) {
 		provider.Response{Usage: inference.Usage{OutputTokens: 7, TotalTokens: 7}},
 		"", "success",
 		usageMeta{ReqPath: "/v1/images/generations", HTTPStatus: 200, BillingUnit: usage.BillingUnitImage, BillingQuantity: 1},
-		"req_billing_violation", nil,
+		"req_billing_violation", nil, nil,
 	)
 
 	events := srv.Usage.ByUser("usr_billing_bad")

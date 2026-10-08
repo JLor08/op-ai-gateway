@@ -121,7 +121,40 @@ type Target struct {
 	// application, "" otherwise -- the only shape evidence available for a child
 	// whose application type says nothing about it.
 	LiveProgressSpecType string
+	// ExtraHeaders are STATIC headers the dispatch layer attaches to the upstream
+	// request verbatim, on top of any credential header. A vendor SUBSCRIPTION
+	// (OAuth) Anthropic target carries the required anthropic-version and
+	// anthropic-beta oauth headers here; an ordinary self-hosted target leaves it
+	// nil. They never carry a secret (the credential rides separately via the
+	// upstream-auth context), so they are safe to log.
+	ExtraHeaders map[string]string
+	// Masquerade selects a client-side request disguise: "" (none) or
+	// "claude_code" (MasqueradeClaudeCode), which makes the Anthropic client
+	// prepend the Claude-Code system block required on the subscription/OAuth
+	// Messages path. Only subscription targets set it.
+	Masquerade string
+	// VendorAccountID, when non-empty, names the vendor account that serves this
+	// target, for per-account USAGE ATTRIBUTION (the recorded usage_events.account_id
+	// and the scraped rate-limit snapshot). EVERY vendor target carries it now --
+	// api-key and subscription alike -- so it is no longer the subscription-bearer
+	// trigger it once was: that trigger moved to the explicit Subscription flag
+	// below. A self-hosted target leaves this "".
+	VendorAccountID string
+	// Subscription marks a SUBSCRIPTION (OAuth) vendor target whose upstream bearer
+	// is NOT carried in APIToken but resolved -- and refreshed if stale -- at
+	// dispatch time from the account's sealed OAuth tokens (upstreamAuthCtx keys the
+	// subscription-bearer path on THIS flag, not on VendorAccountID, so an API-KEY
+	// vendor target that now also carries a VendorAccountID keeps using its sealed
+	// APIToken). True only on the two subscription targets
+	// (vendorSubscription{Anthropic,OpenAI}Target); false on the api-key
+	// vendorAccountTarget and every self-hosted target.
+	Subscription bool
 }
+
+// MasqueradeClaudeCode is the Target.Masquerade value that makes the Anthropic
+// client prepend the exact Claude-Code first system block (the subscription /
+// OAuth serving path). Kept with Target because it is a Target field value.
+const MasqueradeClaudeCode = "claude_code"
 
 // ReachabilityChecker reports whether an application is currently reachable.
 // The resolver gates candidate selection and affinity reuse through it so that
@@ -343,6 +376,15 @@ type resolverStore interface {
 	// guard test in internal/portal, so adding it here costs nothing but this
 	// line.
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
+	// VendorAccountsByOwner and VendorAccountModels are the per-user vendor-account
+	// surface resolveVendorAccount reads: the owner's accounts (sorted by id) and,
+	// for one account, the gateway models it serves (sorted by GatewayModel). Both
+	// are already on routing.Store and both drivers (*MemoryStore, *store.SQLStore)
+	// implement them, so widening this narrow interface stays compile-safe and
+	// needs no tracing-decorator regeneration (the decorator wraps routing.Store,
+	// which already declares them).
+	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
+	VendorAccountModels(ctx context.Context, accountID string) ([]VendorAccountModel, error)
 }
 
 type Resolver struct {
@@ -360,7 +402,37 @@ type Resolver struct {
 	groups            GroupResolver
 	warmer            ModelWarmer
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
+	// vendorEnabled / vendorRoutingMode gate and steer the per-user vendor-account
+	// branch (resolveVendorAccount). Both are injected by the gateway from a CACHED
+	// read of the vendor_accounts_enabled master flag and the
+	// vendor_account_routing_mode setting (SetVendorAccountAccessors). Both are
+	// nil-safe: a nil vendorEnabled means the whole branch is OFF (the no-op
+	// invariant — a resolver built without these accessors is byte-identical to
+	// today), and a nil / unknown vendorRoutingMode means vendor_first.
+	vendorEnabled     func() bool
+	vendorRoutingMode func() string
 }
+
+// Vendor-account routing modes, mirrored as local string literals so routing
+// does not import internal/portal (which would be an import cycle — the portal
+// package imports routing). They must stay equal to portal's
+// VendorRoutingModeVendorFirst / VendorRoutingModeFallbackOnly.
+const (
+	vendorRoutingModeVendorFirst  = "vendor_first"
+	vendorRoutingModeFallbackOnly = "fallback_only"
+)
+
+// vendorAccountDefaultTimeout is the per-request upstream timeout a vendor-account
+// Target carries. Vendor APIs (api.openai.com / api.anthropic.com) are hosted and
+// can be slow on a cold large-model request, so this is generous relative to the
+// on-prem default; it is a fixed default because a vendor account has no per-app
+// TimeoutMS column of its own.
+const vendorAccountDefaultTimeout = 120 * time.Second
+
+// vendorRoutePrefix is the RouteID namespace every vendor-account target shares
+// ("vendor:<accountID>:<model>"), so the format lives in one place across the
+// api_key and the two subscription target builders.
+const vendorRoutePrefix = "vendor:"
 
 func NewResolver(store resolverStore, clock func() time.Time, checker ReachabilityChecker) *Resolver {
 	if clock == nil {
@@ -425,6 +497,38 @@ func (r *Resolver) SetModelWarmer(w ModelWarmer) { r.warmer = w }
 // extracted ClientSessionID. Safe to call live (atomic).
 func (r *Resolver) SetAffinitySessionMode(legacy bool) { r.legacyAffinity.Store(legacy) }
 
+// SetVendorAccountAccessors installs the two accessors that gate and steer the
+// per-user vendor-account branch: enabled reports the vendor_accounts_enabled
+// master flag, mode reports the vendor_account_routing_mode. The gateway wires
+// these from a CACHED read of system settings (invalidated on a settings PUT),
+// so resolveVendorAccount never issues a settings store read on the hot path.
+// Leaving them unset (nil) keeps the branch OFF (nil enabled) and the mode at
+// vendor_first (nil mode) — the no-op invariant a resolver built without them
+// relies on. Mirrors the other optional-dependency setters above.
+func (r *Resolver) SetVendorAccountAccessors(enabled func() bool, mode func() string) {
+	r.vendorEnabled = enabled
+	r.vendorRoutingMode = mode
+}
+
+// vendorOn reports whether the vendor-account branch is enabled. Nil-safe: a
+// resolver with no enabled accessor is OFF.
+func (r *Resolver) vendorOn() bool {
+	return r.vendorEnabled != nil && r.vendorEnabled()
+}
+
+// vendorMode reports the effective vendor routing mode, defaulting to
+// vendor_first for a nil accessor or any value that is not fallback_only (a
+// lenient read matching portal's own default-on-unknown behaviour).
+func (r *Resolver) vendorMode() string {
+	if r.vendorRoutingMode == nil {
+		return vendorRoutingModeVendorFirst
+	}
+	if r.vendorRoutingMode() == vendorRoutingModeFallbackOnly {
+		return vendorRoutingModeFallbackOnly
+	}
+	return vendorRoutingModeVendorFirst
+}
+
 // resolveTracer is resolved ONCE from the OTel global provider (installed by
 // internal/tracing.Setup) and reused per call, so Resolve avoids the two
 // process-global tracer-provider lookup mutexes otel.Tracer(name) takes on every
@@ -455,6 +559,45 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 	if req.ServerOverrideID != "" {
 		return r.resolveServerOverride(ctx, req, apiFlavor)
 	}
+	// Vendor-account precedence (Milestone 3). The master flag + routing mode are
+	// read through the injected accessors (nil-safe → OFF / vendor_first), and the
+	// branch only ever matches a USER principal's OWN active account serving the
+	// requested model (see resolveVendorAccount). A server-override request never
+	// reaches here (handled above), so a vendor account can never shadow an
+	// explicit override.
+	//   - vendor_first: an own account wins before any self-hosted/shared route, so
+	//     it is tried right after the override short-circuit.
+	//   - fallback_only: self-hosted/shared wins; the account is tried only where
+	//     the standard path has NO route (every ErrNoModelRoute exit — locked
+	//     group, affinity, and fresh selection — funnels through the one check
+	//     below, because resolveStandard returns ErrNoModelRoute at each of them).
+	mode := r.vendorMode()
+	if mode == vendorRoutingModeVendorFirst {
+		if target, ok, err := r.resolveVendorAccount(ctx, token, req, apiFlavor); err != nil {
+			return Target{}, err
+		} else if ok {
+			return target, nil
+		}
+	}
+	target, err := r.resolveStandard(ctx, token, req, apiFlavor, now)
+	if mode == vendorRoutingModeFallbackOnly && errors.Is(err, ErrNoModelRoute) {
+		if vendorTarget, ok, verr := r.resolveVendorAccount(ctx, token, req, apiFlavor); verr != nil {
+			return Target{}, verr
+		} else if ok {
+			return vendorTarget, nil
+		}
+	}
+	return target, err
+}
+
+// resolveStandard is the self-hosted/shared resolution path: model-group dispatch,
+// route affinity, then fresh candidate selection (ActiveMappingsForModel →
+// filterProvisioned → filterServesEndpoint → filterCapable → selectCandidate →
+// targetFrom). It is everything Resolve did below the server-override short-circuit
+// before the vendor-account branch was layered on top; extracting it verbatim lets
+// Resolve wrap it with the vendor precedence without duplicating any of its
+// ErrNoModelRoute exits. now and apiFlavor are passed in, computed once by Resolve.
+func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string, now time.Time) (Target, error) {
 	affinitySession := req.ClientSessionID
 	if r.legacyAffinity.Load() {
 		affinitySession = req.SessionID
@@ -645,6 +788,276 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 		}
 		return target, nil
 	}
+}
+
+// resolveVendorAccount resolves the request against the PRINCIPAL's own vendor
+// accounts (Milestone 3). It returns (Target, true, nil) on a match, (Target{},
+// false, nil) for no match, and a non-nil error only on a store failure.
+//
+// It matches only when EVERY precondition holds, each a deliberate guard:
+//   - r.vendorOn(): the vendor_accounts_enabled master flag is on. Off → the
+//     whole branch is invisible (the no-op invariant).
+//   - token.UserID != "": the principal is a USER. A SERVICE token (UserID=="")
+//     owns no vendor accounts and must never borrow a user's — service dispatch
+//     is a later milestone.
+//   - req.ServerOverrideID == "": a server-override request is a distinct routing
+//     path (handled before this is ever called) and must never land on a vendor.
+//     Re-checked here so the guarantee holds at this method's own boundary.
+//   - len(req.RequiredCapabilities) == 0: capability-gated routing (vision/image
+//     verdicts) is a self-hosted-mapping concern; a vendor Target carries no
+//     per-capability verdicts, so such a request skips the branch entirely.
+//   - apiFlavor != APIFlavorOpenAIImages: the images relay has no vendor path in
+//     this milestone (the Target serves the text flavors via translate only).
+//
+// The matched Target is built BY HAND (not via targetFrom, which only knows
+// self-hosted mappings): the sealed account API key is carried as APIToken (the
+// cipher-holding gateway layer opens it exactly as for an app credential), the
+// provider + endpoint + auth header are chosen from the account's vendor, and the
+// effective flavors are [openai, anthropic] with the endpoint modes left zero
+// (translate) so the native-passthrough layer translates either inbound dialect
+// to the vendor's native wire format. Accounts are iterated in the store's
+// deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
+// account with a model row whose GatewayModel equals the request model wins.
+func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
+	if !r.vendorAccountRoutingEligible(token, req, apiFlavor) {
+		return Target{}, false, nil
+	}
+	accounts, err := r.store.VendorAccountsByOwner(ctx, token.UserID)
+	if err != nil {
+		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
+	}
+	for _, acc := range accounts {
+		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
+		// disabled accounts are skipped and fall through to the standard path.
+		if acc.Status != VendorAccountStatusActive {
+			continue
+		}
+		// An OpenAI SUBSCRIPTION account now serves BOTH openai inbound shapes
+		// (Milestone 5c): a fine openai_responses request is forwarded LOSSLESSLY to
+		// the ChatGPT backend via native passthrough (unchanged M5b behaviour), and a
+		// chat-flavor request is TRANSLATED to the Responses protocol by
+		// provider.OpenAIResponsesClient. vendorSubscriptionOpenAITarget reads
+		// req.APIFlavor (the FINE flavor, not the coarse apiFlavor param, which folds
+		// the two to "openai") to pick passthrough vs translate. It does NOT serve the
+		// anthropic dialect (the ChatGPT backend speaks Responses only, and the target
+		// carries [openai] only), so an anthropic_messages request to one is skipped
+		// here and falls through to the standard path and ErrNoModelRoute — the
+		// resolveVendorAccount branch bypasses filterServesEndpoint, so this flavor
+		// guard is explicit. (Anthropic subscription and every api_key account serve
+		// both dialects via translate and are unaffected.)
+		if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
+			continue
+		}
+		models, err := r.store.VendorAccountModels(ctx, acc.ID)
+		if err != nil {
+			return Target{}, false, fmt.Errorf("resolve vendor account models: %w", err)
+		}
+		if t, ok := vendorAccountModelMatch(acc, models, req, apiFlavor); ok {
+			return t, true, nil
+		}
+	}
+	return Target{}, false, nil
+}
+
+// vendorAccountModelMatch returns the dispatch target for the FIRST model row whose
+// GatewayModel equals the request model. ok is false when no row matches, and also
+// when the one match is a subscription account with an unknown vendor
+// (vendorAccountModelTarget fails closed) — in both cases the caller falls through
+// to the next account.
+func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+	for _, m := range models {
+		if m.GatewayModel != req.Model {
+			continue
+		}
+		return vendorAccountModelTarget(acc, m, req, apiFlavor)
+	}
+	return Target{}, false
+}
+
+// vendorAccountRoutingEligible reports whether the request is one the vendor-account
+// path may serve at all, before any store lookup. A request that overrides the
+// server, demands capabilities, or is the images flavor (none of which a vendor
+// account models) is left to the standard path.
+func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.Request, apiFlavor string) bool {
+	return r.vendorOn() &&
+		token.UserID != "" &&
+		req.ServerOverrideID == "" &&
+		len(req.RequiredCapabilities) == 0 &&
+		apiFlavor != APIFlavorOpenAIImages
+}
+
+// vendorAccountModelTarget builds the dispatch target for a matched account+model
+// row. The bool reports whether a target was built: it is false only for a
+// subscription account whose vendor is unknown, which FAILS CLOSED (no target)
+// rather than defaulting to either vendor's endpoint, which would misroute its
+// sealed OAuth token. An api_key account always builds a target.
+func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+	if acc.AuthType != VendorAuthSubscription {
+		return vendorAccountTarget(acc, m, req.Model, apiFlavor), true
+	}
+	// Subscription (OAuth): the bearer is resolved + refreshed at dispatch from the
+	// account's sealed OAuth tokens, so the target carries VendorAccountID and the
+	// vendor's required headers, and NO APIToken.
+	switch acc.Vendor {
+	case VendorAnthropic:
+		// Anthropic: translate either inbound dialect to Messages; carries the
+		// Claude-Code masquerade + the OAuth version/beta headers.
+		return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true
+	case VendorOpenAI:
+		// OpenAI: native passthrough of an inbound Responses request, or translate of
+		// a chat request, both to the ChatGPT backend. The FINE req.APIFlavor picks
+		// which (see vendorSubscriptionOpenAITarget).
+		return vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true
+	default:
+		return Target{}, false
+	}
+}
+
+// vendorAccountTarget assembles the Target for a matched vendor account + model
+// row. Split out from resolveVendorAccount so the construction is testable on its
+// own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
+// one table. The provider/endpoint/auth-header triple is the only thing the
+// account's vendor decides; everything else is the same for both.
+func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+	provider := ProviderVendorOpenAI
+	endpoint := "https://api.openai.com"
+	tokenHeader := ""
+	if acc.Vendor == VendorAnthropic {
+		provider = ProviderVendorAnthropic
+		endpoint = "https://api.anthropic.com"
+		// The native Anthropic client authenticates with x-api-key, not the
+		// Authorization: Bearer default the OpenAI-compatible client uses.
+		tokenHeader = "x-api-key"
+	}
+	return Target{
+		RouteID:        vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:       "",
+		Provider:       provider,
+		Endpoint:       endpoint,
+		Model:          model,
+		ProviderModel:  m.UpstreamModel,
+		Timeout:        vendorAccountDefaultTimeout,
+		APIFlavor:      apiFlavor,
+		APIToken:       acc.APIKey, // still sealed; upstreamAuthCtx opens it, as for an app credential
+		APITokenHeader: tokenHeader,
+		// VendorAccountID names the serving account for USAGE ATTRIBUTION (the
+		// recorded usage_events.account_id and the scraped rate-limit snapshot). It
+		// is NOT the subscription-bearer trigger -- Subscription stays false, so
+		// upstreamAuthCtx keeps using the sealed APIToken above, not an OAuth bearer.
+		VendorAccountID: acc.ID,
+		// Both inbound dialects are served; the zero endpoint modes mean translate,
+		// so native-passthrough converts whichever one the caller used to the
+		// vendor's native wire format.
+		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
+	}
+}
+
+// vendorSubscriptionAnthropicTarget assembles the Target for a matched ANTHROPIC
+// SUBSCRIPTION (Claude Pro/Max OAuth) account + model row (Milestone 5a). It
+// differs from the api_key vendorAccountTarget in exactly the subscription-path
+// concerns:
+//
+//   - The bearer is NOT carried in APIToken. A subscription account holds OAuth
+//     tokens that must be opened, refreshed when stale, and attached at dispatch
+//     time; VendorAccountID names the account the dispatch layer (upstreamAuthCtx)
+//     resolves the bearer from, and APIToken/APITokenHeader stay empty.
+//   - Masquerade = claude_code makes the Anthropic client prepend the exact
+//     Claude-Code system block the OAuth Messages path requires.
+//   - ExtraHeaders carries the two headers the OAuth path needs on every call:
+//     anthropic-version and the anthropic-beta oauth opt-in. (anthropic-version is
+//     also set intrinsically by the client; repeating it here is harmless and
+//     keeps the subscription requirement explicit in one place.)
+//
+// Only an Anthropic subscription account reaches here (an OpenAI one builds
+// vendorSubscriptionOpenAITarget instead). The values below are the live
+// REVERSE-ENGINEERED Claude Code constants; see internal/vendorauth for their
+// canonical home and the ToS caveat.
+func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+	return Target{
+		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:        "",
+		Provider:        ProviderVendorAnthropic,
+		Endpoint:        "https://api.anthropic.com",
+		Model:           model,
+		ProviderModel:   m.UpstreamModel,
+		Timeout:         vendorAccountDefaultTimeout,
+		APIFlavor:       apiFlavor,
+		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:  "",
+		VendorAccountID: acc.ID,
+		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
+		Masquerade:      MasqueradeClaudeCode,
+		ExtraHeaders: map[string]string{
+			"anthropic-version": "2023-06-01",
+			"anthropic-beta":    "oauth-2025-04-20",
+		},
+		// Both inbound dialects are served via translate (zero endpoint modes).
+		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
+	}
+}
+
+// vendorSubscriptionOpenAITarget assembles the Target for a matched OPENAI
+// SUBSCRIPTION (Codex ChatGPT Pro/Plus/Team OAuth) account + model row. The target
+// always points at the ChatGPT backend and carries the subscription-bearer trigger;
+// the FINE request flavor (fineFlavor) decides HOW that one upstream is reached:
+//
+//   - fineFlavor == "openai_responses": ResponsesMode passthrough, so the
+//     native-passthrough layer relays the inbound Responses body/SSE VERBATIM
+//     (lossless Codex passthrough — the Milestone 5b behaviour). The upstream path
+//     is the bare /responses (not /v1/responses) — see endpointModeFor.
+//   - any other openai flavor (chat/completions, portal chat): ResponsesMode left
+//     zero == TRANSLATE, so dispatch calls provider.OpenAIResponsesClient's
+//     Complete/CompleteStream, which render the request as a Responses body and
+//     parse the Responses SSE back (Milestone 5c). The client POSTs the same bare
+//     /responses path.
+//
+// Either way it differs from the Anthropic subscription target in these respects:
+//
+//   - Provider ProviderVendorOpenAISubscription (its own client, the ChatGPT
+//     backend speaks Responses only — no /v1/chat/completions surface) + the
+//     ChatGPT backend Endpoint (https://chatgpt.com/backend-api/codex).
+//   - APIFlavors is [openai] ONLY: an OpenAI subscription account does NOT serve the
+//     anthropic dialect (resolveVendorAccount's flavor guard enforces the same).
+//   - NO Masquerade: the ChatGPT backend wants the real Codex body, not a system
+//     block injected by a translate client.
+//   - ExtraHeaders carries the two STATIC Codex headers every call needs. The
+//     chatgpt-account-id header is NOT here — it is a per-account value resolved
+//     from the sealed tokens at dispatch (subscriptionAuthCtx), the same place the
+//     bearer is attached.
+//
+// As with the Anthropic target, VendorAccountID names the account the dispatch
+// layer resolves + refreshes the bearer from, and APIToken/APITokenHeader stay
+// empty. The header values below are the live REVERSE-ENGINEERED Codex CLI
+// constants; see internal/vendorauth for their canonical home and the ToS caveat
+// (routing cannot import vendorauth, so they are string literals here, mirroring
+// the Anthropic target's approach).
+func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
+	t := Target{
+		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:        "",
+		Provider:        ProviderVendorOpenAISubscription,
+		Endpoint:        "https://chatgpt.com/backend-api/codex",
+		Model:           model,
+		ProviderModel:   m.UpstreamModel,
+		Timeout:         vendorAccountDefaultTimeout,
+		APIFlavor:       apiFlavor,
+		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:  "",
+		VendorAccountID: acc.ID,
+		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
+		ExtraHeaders: map[string]string{
+			"OpenAI-Beta": "responses=experimental",
+			"originator":  "codex_cli_rs",
+		},
+		// The anthropic dialect is never served by an OpenAI subscription account.
+		APIFlavors: []string{APIFlavorOpenAI},
+	}
+	// openai_responses is served LOSSLESSLY via native passthrough; every other
+	// openai flavor is translated (ResponsesMode left zero == translate).
+	if fineFlavor == "openai_responses" {
+		t.ResponsesMode = EndpointModePassthrough
+	}
+	return t
 }
 
 // resolveServerOverride forces routing to exactly req.ServerOverrideID, bypassing the

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/certissue"
@@ -21,6 +22,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/theme"
 	"op-ai-gateway/internal/usage"
+	"op-ai-gateway/internal/vendorauth"
 	"slices"
 	"sort"
 	"strconv"
@@ -37,6 +39,10 @@ const (
 	CodeTokenNotFound   = "portal.token_not_found"
 	CodeServerNotFound  = "server.not_found"
 	CodeServiceNotFound = "service.not_found"
+	// CodeVendorAccountNotFound is ErrVendorAccountNotFound's API error code,
+	// exported so internal/gateway/portal_vendor_account_endpoints.go shares the
+	// exact value instead of re-hardcoding it.
+	CodeVendorAccountNotFound = "vendor_account.not_found"
 )
 
 var (
@@ -109,6 +115,67 @@ var (
 	ErrServiceNotFound   = errors.New(CodeServiceNotFound)
 	ErrServiceForbidden  = errors.New("service.forbidden")
 	ErrServiceValidation = errors.New("service.validation_failed")
+
+	// Vendor accounts ("Anbieter"): per-user external AI vendor accounts.
+	// ErrVendorAccountNotFound covers both "no such account" AND "principal does
+	// not own it" (no existence leak, mirrors ErrServerNotFound).
+	// ErrVendorAccountForbidden is the create gate for a principal that is not a
+	// real user (no UserID to own the account).
+	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
+	// account, whose only credential is the OAuth token set.
+	// ErrVendorAccountAPIKeyInvalid rejects a whitespace-only api_key on update:
+	// only an explicit "" clears a key, so a blank value is a paste slip, not
+	// an instruction.
+	ErrVendorAccountNotFound         = errors.New(CodeVendorAccountNotFound)
+	ErrVendorAccountForbidden        = errors.New("vendor_account.forbidden")
+	ErrVendorAccountNameRequired     = errors.New("vendor_account.name_required")
+	ErrVendorAccountVendorInvalid    = errors.New("vendor_account.vendor_invalid")
+	ErrVendorAccountAuthTypeInvalid  = errors.New("vendor_account.auth_type_invalid")
+	ErrVendorAccountStatusInvalid    = errors.New("vendor_account.status_invalid")
+	ErrVendorAccountAPIKeyNotAllowed = errors.New("vendor_account.api_key_not_allowed")
+	ErrVendorAccountAPIKeyInvalid    = errors.New("vendor_account.api_key_invalid")
+
+	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
+	// (system setting vendor_accounts_enabled, off by default): every
+	// vendor-account service method returns it, before doing anything, while
+	// the flag is off. Mirrors ErrNetbirdModuleDisabled; mapped to a 409.
+	ErrVendorAccountsDisabled = errors.New("vendor_accounts.module_disabled")
+
+	// Subscription connect (the OAuth code-paste flow and the token import).
+	// ErrVendorAccountNotSubscription: connect operates on an auth_type
+	// subscription account only (the auth type is immutable, so an api_key account
+	// can never become one).
+	// ErrVendorAccountConnectTokenRequired: an import without an access token.
+	// ErrVendorAccountConnectCodeRequired: a complete whose pasted value carries
+	// no authorization code.
+	// ErrVendorAccountConnectState: nothing to complete -- no connect was begun,
+	// it expired, or the pasted state is not the one issued by begin.
+	// ErrVendorAccountConnectRejected: the vendor refused the pasted code (a typo,
+	// an already-used or expired code). Deliberately NOT mapped to a 401: the
+	// portal treats a 401 from this API as an expired session.
+	// ErrVendorAccountConnectUpstream: the vendor could not be reached or
+	// answered with something unusable (a 5xx, a malformed reply).
+	// ErrVendorAccountConnectKeyRequired: the token set cannot be sealed -- a
+	// disk-backed store with no encryption key (wraps capture.ErrKeyRequired).
+	ErrVendorAccountNotSubscription      = errors.New("vendor_account.not_subscription")
+	ErrVendorAccountConnectTokenRequired = errors.New("vendor_account.connect_token_required")
+	ErrVendorAccountConnectCodeRequired  = errors.New("vendor_account.connect_code_required")
+	ErrVendorAccountConnectState         = errors.New("vendor_account.connect_state")
+	ErrVendorAccountConnectRejected      = errors.New("vendor_account.connect_rejected")
+	ErrVendorAccountConnectUpstream      = errors.New("vendor_account.connect_upstream_failed")
+	ErrVendorAccountConnectKeyRequired   = errors.New("vendor_account.connect_key_required")
+
+	// Device-code connect (the OPTIONAL Codex deviceauth flow; see
+	// service_vendor_device_connect.go). It reuses the connect sentinels above for
+	// a vendor refusal / upstream failure / unsealable store, and adds two of its
+	// own.
+	// ErrVendorAccountDeviceUnsupported: the device flow exists for OpenAI only,
+	// so a begin/poll on any other vendor's subscription account is refused (a 400,
+	// the subscription-account equivalent of not_subscription).
+	// ErrVendorAccountDeviceConnectState: a poll with no device connect in progress
+	// -- none was begun, or it outlived its TTL.
+	ErrVendorAccountDeviceUnsupported  = errors.New("vendor_account.device_not_supported")
+	ErrVendorAccountDeviceConnectState = errors.New("vendor_account.device_connect_state")
 )
 
 // ChatSessionTokenID is the sentinel id of the synthetic, non-deletable
@@ -438,6 +505,16 @@ type ServiceDeps struct {
 	// place an order (issueCertificate returns an error); the self_signed mode
 	// needs no challenge store at all.
 	ACMEChallenges certissue.ChallengeStore
+	// VendorAnthropicEndpoints / VendorOpenAIEndpoints are the OAuth endpoints the
+	// subscription connect flow (begin/complete) uses. The zero value (a deps
+	// literal that omits them) means the reverse-engineered vendor defaults
+	// (vendorauth.DefaultAnthropicEndpoints / DefaultOpenAIEndpoints); tests
+	// inject httptest endpoints here.
+	VendorAnthropicEndpoints vendorauth.Endpoints
+	VendorOpenAIEndpoints    vendorauth.Endpoints
+	// VendorHTTPClient performs the connect flow's token exchange. nil means a
+	// client with a 30s timeout.
+	VendorHTTPClient *http.Client
 	// SettingsVolatile is true only when the SystemSettings store is the
 	// volatile in-memory store (memory driver). It gates the plaintext SMTP
 	// password fallback: a disk store without a cipher refuses to store a
@@ -630,6 +707,13 @@ type Service struct {
 	// Always non-nil after NewService -- a nil deps.Themes is defaulted to an
 	// empty *theme.Registry so every reader can call its methods unguarded.
 	themes *theme.Registry
+	// vendorConnect holds the subscription connect flow's endpoints, http client
+	// and in-memory pending state (see vendorConnectState).
+	vendorConnect vendorConnectState
+	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
+	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
+	// OpenAI endpoints and http client, so it needs no wiring of its own.
+	vendorDeviceConnect vendorDeviceConnectState
 	// reconcileMu serializes the store-mutating critical section of
 	// reconcileApplicationModels across all callers (manual sync + the
 	// background model_sync probe loop, which reconciles many applications
@@ -685,6 +769,18 @@ func NewService(deps ServiceDeps) *Service {
 	if themes == nil {
 		themes = &theme.Registry{}
 	}
+	vendorAnthropic := deps.VendorAnthropicEndpoints
+	if vendorAnthropic == (vendorauth.Endpoints{}) {
+		vendorAnthropic = vendorauth.DefaultAnthropicEndpoints()
+	}
+	vendorOpenAI := deps.VendorOpenAIEndpoints
+	if vendorOpenAI == (vendorauth.Endpoints{}) {
+		vendorOpenAI = vendorauth.DefaultOpenAIEndpoints()
+	}
+	vendorClient := deps.VendorHTTPClient
+	if vendorClient == nil {
+		vendorClient = &http.Client{Timeout: vendorConnectHTTPTimeout}
+	}
 	svc := &Service{
 		users:            deps.Users,
 		tokens:           deps.Tokens,
@@ -718,6 +814,11 @@ func NewService(deps ServiceDeps) *Service {
 			keyFile:                  deps.NetbirdKeyFile,
 			onDomainChanged:          deps.OnNetbirdDomainChanged,
 			tokenRotateBeforeDefault: tokenRotateDefault,
+		},
+		vendorConnect: vendorConnectState{
+			anthropic: vendorAnthropic,
+			openai:    vendorOpenAI,
+			client:    vendorClient,
 		},
 		agentPort:                   agentPort,
 		agentBindHost:               deps.AgentBindHost,
@@ -2321,6 +2422,19 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 				}
 			}
+			// Owner overlay: fold in the principal's own vendor-account models
+			// (Milestone 3) so the chat picker and /api/v0/models show exactly what
+			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
+			// suppress==true is Models() (the picker / inference discovery); the
+			// admin management surface (ManageModels(), suppress==false) shows the
+			// system's real models and must not be filled with one principal's
+			// personal vendor models. A vendor model name that coincides with an
+			// existing one is unioned into that row (deduped); a vendor-only name
+			// gets a fresh row that the assembly below renders with the zero listing
+			// data (not loaded, offered-on 0, context unknown), Visibility "shown".
+			if suppress {
+				s.overlayVendorModels(ctx, token, flavors)
+			}
 			ids := make([]string, 0, len(flavors))
 			for id := range flavors {
 				ids = append(ids, id)
@@ -3830,7 +3944,17 @@ func isSeedAPIFlavor(flavor string) bool {
 // same three layers (see the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
-	return sets, err
+	if err != nil {
+		return sets, err
+	}
+	// Owner overlay: fold in the principal's own vendor-account models (Milestone
+	// 3) so the per-flavor listings (/v1/models, the Anthropic list) advertise
+	// exactly what resolveVendorAccount will dispatch for them. Applied here, on
+	// the public method ModelsForFlavor consumes, rather than inside
+	// modelFlavorSetsWithPreSuppress, so the preSuppress-reading callers (the
+	// unknown-model redirect's reachability set) are left untouched.
+	s.overlayVendorModels(ctx, token, sets)
+	return sets, nil
 }
 
 // modelFlavorSetsWithPreSuppress is modelFlavorSets plus the second map its

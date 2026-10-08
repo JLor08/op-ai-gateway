@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/config"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
@@ -1112,6 +1113,60 @@ func TestProviderClientsWireModelListerForEveryApplicationType(t *testing.T) {
 			mu.Unlock()
 			if path != tc.wantPath {
 				t.Fatalf("ListModels(%q) hit %s, want %s (wrong client wired in the provider map)", tc.providerType, path, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestProviderClientsWireVendorProviderKinds guards the vendor-account provider
+// seam end to end through the real Multiplexer: vendor_openai must reach the
+// OpenAI-compatible client (chat completions) and vendor_anthropic the native
+// Anthropic client (/v1/messages, with its intrinsic anthropic-version header).
+func TestProviderClientsWireVendorProviderKinds(t *testing.T) {
+	mux := providerClients(0, false, nil)
+
+	var mu sync.Mutex
+	var gotPath, gotVersion string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath, gotVersion = r.URL.Path, r.Header.Get("anthropic-version")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"openai ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		case "/v1/messages":
+			_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"anthropic ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	tests := []struct {
+		providerType string
+		wantPath     string
+		wantText     string
+		wantVersion  string
+	}{
+		{routing.ProviderVendorOpenAI, "/v1/chat/completions", "openai ok", ""},
+		{routing.ProviderVendorAnthropic, "/v1/messages", "anthropic ok", "2023-06-01"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.providerType, func(t *testing.T) {
+			resp, err := mux.Complete(context.Background(), routing.Target{Provider: tc.providerType, Endpoint: upstream.URL, Timeout: 5 * time.Second}, inference.Request{
+				Model:    "m",
+				Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}},
+			})
+			if err != nil {
+				t.Fatalf("Complete(%q) error = %v, want nil", tc.providerType, err)
+			}
+
+			mu.Lock()
+			path, version := gotPath, gotVersion
+			mu.Unlock()
+			if path != tc.wantPath || resp.Text != tc.wantText || version != tc.wantVersion {
+				t.Fatalf("Complete(%q) hit %s (text %q, anthropic-version %q), want %s (%q, %q): wrong client wired in the provider map", tc.providerType, path, resp.Text, version, tc.wantPath, tc.wantText, tc.wantVersion)
 			}
 		})
 	}

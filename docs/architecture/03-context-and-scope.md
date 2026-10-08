@@ -65,6 +65,7 @@ flowchart TB
 | Public ACME | Edge (public-facing) TLS certificates | Optional |
 | SMTP | Invite and password/e-mail delivery | Optional |
 | OTLP endpoint | OpenTelemetry trace export | Optional |
+| External vendor clouds (OpenAI `api.openai.com`, Anthropic `api.anthropic.com`, the ChatGPT backend `chatgpt.com`) | Serving a user's own connected **vendor account** ("Anbieter") — API key or experimental subscription OAuth ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)) | Optional, **off by default** |
 
 ## 3.3 Scope
 

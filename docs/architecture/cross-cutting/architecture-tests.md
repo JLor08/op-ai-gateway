@@ -18,7 +18,7 @@ Two test families per module:
 
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
-   compared against a checked-in allowlist — 60 edges across 25 packages in
+   compared against a checked-in allowlist — 63 edges across 26 packages in
    `op-ai-gateway`, 24 edges across 12 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed

@@ -47,7 +47,7 @@ func TestStreamSharesEventIDWithSSEChunks(t *testing.T) {
 // recordUsage stamps the event with the id it is given, not a freshly minted one.
 func TestRecordUsageUsesPassedID(t *testing.T) {
 	srv := NewTestServer()
-	srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_explicit_id", nil)
+	srv.recordUsage(time.Now(), auth.Token{UserID: "usr_x"}, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_explicit_id", nil, nil)
 	events := srv.Usage.ByUser("usr_x")
 	if len(events) != 1 || events[0].ID != "req_explicit_id" {
 		t.Fatalf("event = %#v, want ID req_explicit_id", events)

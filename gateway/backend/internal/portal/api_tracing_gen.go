@@ -215,6 +215,30 @@ func (_d *APIWithTracing) AuthorizeServerManage(ctx context.Context, t1 auth.Tok
 	return _d.API.AuthorizeServerManage(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) BeginVendorAccountConnect(ctx context.Context, t1 auth.Token, s1 string) (s2 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BeginVendorAccountConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.BeginVendorAccountConnect(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) BeginVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (s2 string, s3 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BeginVendorAccountDeviceConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.BeginVendorAccountDeviceConnect(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) BenchmarkOverrideLeases(ctx context.Context) (m1 map[string]BenchmarkOverrideLease, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.BenchmarkOverrideLeases")
 	defer span.End()
@@ -319,6 +343,30 @@ func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1
 		}
 	}()
 	return _d.API.CommitAssistant(ctx, t1, s1, a1, s2)
+}
+
+func (_d *APIWithTracing) CompleteVendorAccountConnect(ctx context.Context, t1 auth.Token, s1 string, s2 string) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CompleteVendorAccountConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CompleteVendorAccountConnect(ctx, t1, s1, s2)
+}
+
+func (_d *APIWithTracing) ConnectVendorAccountImport(ctx context.Context, t1 auth.Token, s1 string, c2 ConnectVendorAccountImportRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ConnectVendorAccountImport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ConnectVendorAccountImport(ctx, t1, s1, c2)
 }
 
 func (_d *APIWithTracing) CreateApplication(ctx context.Context, t1 auth.Token, s1 string, c2 CreateApplicationRequest) (a1 ApplicationDTO, err error) {
@@ -463,6 +511,18 @@ func (_d *APIWithTracing) CreateToken(ctx context.Context, t1 auth.Token, c2 Cre
 		}
 	}()
 	return _d.API.CreateToken(ctx, t1, c2)
+}
+
+func (_d *APIWithTracing) CreateVendorAccount(ctx context.Context, t1 auth.Token, c2 CreateVendorAccountRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CreateVendorAccount")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.CreateVendorAccount(ctx, t1, c2)
 }
 
 func (_d *APIWithTracing) CurrencyUsdPerEur(ctx context.Context) (f1 float64) {
@@ -635,6 +695,18 @@ func (_d *APIWithTracing) DeleteToken(ctx context.Context, t1 auth.Token, s1 str
 		}
 	}()
 	return _d.API.DeleteToken(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) DeleteVendorAccount(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteVendorAccount")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteVendorAccount(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) DemoteManager(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
@@ -869,6 +941,18 @@ func (_d *APIWithTracing) GetService(ctx context.Context, t1 auth.Token, s1 stri
 	return _d.API.GetService(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) GetVendorAccount(ctx context.Context, t1 auth.Token, s1 string) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GetVendorAccount")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.GetVendorAccount(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) GroupMemberCandidates(ctx context.Context, t1 auth.Token, s1 string) (ua1 []UserRefDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.GroupMemberCandidates")
 	defer span.End()
@@ -1049,6 +1133,18 @@ func (_d *APIWithTracing) ListTokens(ctx context.Context, t1 auth.Token) (t2 Tok
 	return _d.API.ListTokens(ctx, t1)
 }
 
+func (_d *APIWithTracing) ListVendorAccounts(ctx context.Context, t1 auth.Token) (v1 VendorAccountListResponse, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ListVendorAccounts")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ListVendorAccounts(ctx, t1)
+}
+
 func (_d *APIWithTracing) ManageModels(ctx context.Context, t1 auth.Token) (m1 ModelsResponse) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ManageModels")
 	defer span.End()
@@ -1225,6 +1321,18 @@ func (_d *APIWithTracing) NetbirdTokenStatus(ctx context.Context) (n1 NetbirdTok
 		}
 	}()
 	return _d.API.NetbirdTokenStatus(ctx)
+}
+
+func (_d *APIWithTracing) PollVendorAccountDeviceConnect(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PollVendorAccountDeviceConnect")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PollVendorAccountDeviceConnect(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) PrepareChatRun(ctx context.Context, t1 auth.Token, s1 string, p1 PrepareRunRequest) (ca1 []ChatAPIMessage, c2 ChatRunSettings, err error) {
@@ -2210,6 +2318,18 @@ func (_d *APIWithTracing) UpdateToken(ctx context.Context, t1 auth.Token, s1 str
 	return _d.API.UpdateToken(ctx, t1, s1, u1)
 }
 
+func (_d *APIWithTracing) UpdateVendorAccount(ctx context.Context, t1 auth.Token, s1 string, u1 UpdateVendorAccountRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.UpdateVendorAccount")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.UpdateVendorAccount(ctx, t1, s1, u1)
+}
+
 func (_d *APIWithTracing) Usage(t1 auth.Token, q1 usage.Query) (p1 usage.Page, err error) {
 	return _d.API.Usage(t1, q1)
 }
@@ -2260,6 +2380,18 @@ func (_d *APIWithTracing) UserTokens(ctx context.Context, t1 auth.Token, s1 stri
 		}
 	}()
 	return _d.API.UserTokens(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 string) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountRoutingMode")
+	defer span.End()
+	return _d.API.VendorAccountRoutingMode(ctx)
+}
+
+func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsEnabled")
+	defer span.End()
+	return _d.API.VendorAccountsEnabled(ctx)
 }
 
 func (_d *APIWithTracing) VisibleUserIDs(ctx context.Context, t1 auth.Token) (m1 map[string]bool, err error) {

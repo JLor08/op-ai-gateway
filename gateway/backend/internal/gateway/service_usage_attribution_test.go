@@ -22,7 +22,7 @@ import (
 func TestRecordUsageAttributesServiceIDAndName(t *testing.T) {
 	srv := NewTestServer()
 	tok := auth.Token{ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Nightly Batch", Kind: "service"}
-	srv.recordUsage(time.Now(), tok, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_svc_attr", nil)
+	srv.recordUsage(time.Now(), tok, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_svc_attr", nil, nil)
 
 	events := srv.Usage.All()
 	idx := -1
@@ -46,7 +46,7 @@ func TestRecordUsageAttributesServiceIDAndName(t *testing.T) {
 // pre-feature behavior.
 func TestRecordUsageServiceAttributionEmptyForUserToken(t *testing.T) {
 	srv := NewTestServer()
-	srv.recordUsage(time.Now(), auth.Token{ID: "tok_user", UserID: "usr_x"}, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_user_attr", nil)
+	srv.recordUsage(time.Now(), auth.Token{ID: "tok_user", UserID: "usr_x"}, inference.Request{Model: "m"}, routing.Target{}, provider.Response{}, "", "success", usageMeta{}, "req_user_attr", nil, nil)
 
 	events := srv.Usage.ByUser("usr_x")
 	if len(events) != 1 {
