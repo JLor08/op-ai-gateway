@@ -815,7 +815,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // provider + endpoint + auth header are chosen from the account's vendor, and the
 // effective flavors are [openai, anthropic] with the endpoint modes left zero
 // (translate) so the native-passthrough layer translates either inbound dialect
-// to the vendor's native wire format. Accounts are iterated in the store's
+// to the vendor's native wire format -- except an OpenAI account reached over the
+// fine openai_responses flavor, whose ResponsesMode is passthrough (see
+// vendorAccountTarget). Accounts are iterated in the store's
 // deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
 // account with a model row whose GatewayModel equals the request model wins.
 func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
@@ -844,7 +846,8 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		// here and falls through to the standard path and ErrNoModelRoute — the
 		// resolveVendorAccount branch bypasses filterServesEndpoint, so this flavor
 		// guard is explicit. (Anthropic subscription and every api_key account serve
-		// both dialects via translate and are unaffected.)
+		// both dialects and are unaffected: translate, apart from an OpenAI api_key
+		// account's openai_responses passthrough.)
 		if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
 			continue
 		}
@@ -893,7 +896,7 @@ func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.
 // sealed OAuth token. An api_key account always builds a target.
 func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
 	if acc.AuthType != VendorAuthSubscription {
-		return vendorAccountTarget(acc, m, req.Model, apiFlavor), true
+		return vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true
 	}
 	// Subscription (OAuth): the bearer is resolved + refreshed at dispatch from the
 	// account's sealed OAuth tokens, so the target carries VendorAccountID and the
@@ -917,8 +920,12 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req infer
 // row. Split out from resolveVendorAccount so the construction is testable on its
 // own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
 // one table. The provider/endpoint/auth-header triple is the only thing the
-// account's vendor decides; everything else is the same for both.
-func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
+// account's vendor decides; everything else is the same for both, with ONE
+// exception keyed on the FINE request flavor (fineFlavor, not the coarse
+// apiFlavor, which folds every openai_* flavor to "openai"): an OpenAI account
+// reached over openai_responses is served by native passthrough (see the
+// ResponsesMode comment below).
+func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
 	provider := ProviderVendorOpenAI
 	endpoint := "https://api.openai.com"
 	tokenHeader := ""
@@ -929,7 +936,7 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		// Authorization: Bearer default the OpenAI-compatible client uses.
 		tokenHeader = "x-api-key"
 	}
-	return Target{
+	t := Target{
 		RouteID:        vendorRoutePrefix + acc.ID + ":" + model,
 		ServerID:       "",
 		Provider:       provider,
@@ -947,9 +954,21 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		VendorAccountID: acc.ID,
 		// Both inbound dialects are served; the zero endpoint modes mean translate,
 		// so native-passthrough converts whichever one the caller used to the
-		// vendor's native wire format.
+		// vendor's native wire format. The one exception is set below: an OpenAI
+		// account + openai_responses.
 		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
 	}
+	// An inbound Responses request to an OpenAI api-key account is relayed LOSSLESSLY
+	// to api.openai.com/v1/responses (native passthrough: only the model field is
+	// rewritten) instead of being translated to /v1/chat/completions, which would
+	// drop everything the chat shape cannot carry (tools, reasoning, previous
+	// response, ...). Chat and every other openai flavor stay translated, and so
+	// does the Anthropic api-key branch (its upstream is /v1/messages; there is no
+	// Responses surface to pass through to). Mirrors vendorSubscriptionOpenAITarget.
+	if acc.Vendor == VendorOpenAI && fineFlavor == "openai_responses" {
+		t.ResponsesMode = EndpointModePassthrough
+	}
+	return t
 }
 
 // vendorSubscriptionAnthropicTarget assembles the Target for a matched ANTHROPIC

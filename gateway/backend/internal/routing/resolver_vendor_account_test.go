@@ -264,14 +264,109 @@ func TestVendorAccountSkippedForImagesCapabilityAndOverride(t *testing.T) {
 	})
 }
 
+// TestVendorAccountOpenAIAPIKeyResponsesResolvesToPassthroughTarget is the core
+// proof of the api-key Responses passthrough: an OpenAI API-KEY account reached
+// over the FINE openai_responses flavor resolves to a NATIVE-PASSTHROUGH target at
+// api.openai.com (ResponsesMode passthrough, so the dispatch layer relays the
+// inbound Responses body/SSE verbatim to /v1/responses instead of translating it
+// to /v1/chat/completions). It is still an api-key target: the sealed key rides in
+// APIToken, Subscription stays false, and the bare slug is the upstream model.
+func TestVendorAccountOpenAIAPIKeyResponsesResolvesToPassthroughTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-4o", APIFlavor: "openai_responses"})
+	if err != nil {
+		t.Fatalf("Resolve(openai_responses) = %v, want a passthrough target", err)
+	}
+	if target.Provider != ProviderVendorOpenAI {
+		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorOpenAI)
+	}
+	if target.Endpoint != "https://api.openai.com" {
+		t.Errorf("Endpoint = %q, want https://api.openai.com", target.Endpoint)
+	}
+	if target.ResponsesMode != EndpointModePassthrough {
+		t.Errorf("ResponsesMode = %q, want %q (lossless native passthrough to /v1/responses)", target.ResponsesMode, EndpointModePassthrough)
+	}
+	if target.Subscription {
+		t.Error("Subscription = true, want false for an api-key target (the bearer rides in APIToken)")
+	}
+	if target.APIToken != vendorKey {
+		t.Errorf("APIToken = %q, want the sealed account key %q", target.APIToken, vendorKey)
+	}
+	if target.ProviderModel != "gpt-4o-2024" {
+		t.Errorf("ProviderModel = %q, want gpt-4o-2024 (the bare upstream slug)", target.ProviderModel)
+	}
+	if target.VendorAccountID != "acc_openai" {
+		t.Errorf("VendorAccountID = %q, want acc_openai", target.VendorAccountID)
+	}
+	if target.MessagesMode != "" {
+		t.Errorf("MessagesMode = %q, want zero (the api-key target has no messages passthrough)", target.MessagesMode)
+	}
+	if len(target.APIFlavors) != 2 || target.APIFlavors[0] != APIFlavorOpenAI || target.APIFlavors[1] != APIFlavorAnthropic {
+		t.Errorf("APIFlavors = %v, want [openai anthropic] unchanged", target.APIFlavors)
+	}
+}
+
+// TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero pins the scope of
+// the passthrough: it is OpenAI api-key + openai_responses ONLY. Chat and
+// anthropic_messages to the same OpenAI account stay TRANSLATE (ResponsesMode
+// zero), and an ANTHROPIC api-key account stays translate for EVERY inbound
+// dialect, openai_responses included (its upstream is /v1/messages, which has no
+// Responses surface to pass through to).
+func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name         string
+		vendor       string
+		model        string
+		modelFlavor  string
+		reqFlavor    string
+		wantProvider string
+	}{
+		{"openai account, openai_chat", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "openai_chat", ProviderVendorOpenAI},
+		{"openai account, openai_chat_completions", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "openai_chat_completions", ProviderVendorOpenAI},
+		{"openai account, anthropic_messages", VendorOpenAI, "gpt-4o", APIFlavorOpenAI, "anthropic_messages", ProviderVendorOpenAI},
+		{"anthropic account, openai_responses", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "openai_responses", ProviderVendorAnthropic},
+		{"anthropic account, openai_chat", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "openai_chat", ProviderVendorAnthropic},
+		{"anthropic account, anthropic_messages", VendorAnthropic, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages", ProviderVendorAnthropic},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, tc.model, tc.model+"-upstream", tc.modelFlavor)
+			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+			target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: tc.model, APIFlavor: tc.reqFlavor})
+			if err != nil {
+				t.Fatalf("Resolve(%s) = %v, want a vendor target", tc.reqFlavor, err)
+			}
+			if target.Provider != tc.wantProvider {
+				t.Errorf("Provider = %q, want %q", target.Provider, tc.wantProvider)
+			}
+			if target.ResponsesMode != "" {
+				t.Errorf("ResponsesMode = %q, want zero (translate) for %s", target.ResponsesMode, tc.name)
+			}
+			if target.Subscription {
+				t.Error("Subscription = true, want false for an api-key target")
+			}
+		})
+	}
+}
+
 // vendorTargetMayBeZero names the Target fields the hand-built vendor Target
 // legitimately leaves at their zero value, each with a reason — the vendor
 // analogue of targetFromMayLeaveZero. The assertion below fails on any OTHER
 // zero field, so a field added to Target that a vendor Target should carry
-// cannot be silently forgotten here.
+// cannot be silently forgotten here. It describes the openai_responses
+// (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
 	"ServerID":                    true, // a vendor target has no on-prem server
-	"ResponsesMode":               true, // zero == translate (native-passthrough default)
 	"MessagesMode":                true, // zero == translate
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
@@ -291,7 +386,11 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	acc := VendorAccount{ID: "acc_openai", OwnerUserID: vendorOwner, Vendor: VendorOpenAI, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, CreatedAt: now, UpdatedAt: now}
 	m := VendorAccountModel{AccountID: "acc_openai", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024", APIFlavor: APIFlavorOpenAI}
-	target := vendorAccountTarget(acc, m, "gpt-4o", APIFlavorOpenAI)
+	// The openai_responses (passthrough) shape: the one api-key OpenAI target whose
+	// ResponsesMode is non-zero (lossless native passthrough), so ResponsesMode is
+	// NOT in vendorTargetMayBeZero. The translate shapes leave it zero by design and
+	// are pinned in TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero.
+	target := vendorAccountTarget(acc, m, "gpt-4o", APIFlavorOpenAI, "openai_responses")
 
 	tv := reflect.ValueOf(target)
 	tt := tv.Type()
