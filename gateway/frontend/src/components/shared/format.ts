@@ -147,7 +147,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.api_key_not_allowed': 'errorVendorAccountApiKeyNotAllowed',
   'vendor_account.api_key_invalid': 'errorVendorAccountApiKeyInvalid',
   'vendor_account.api_key_key_required': 'errorVendorAccountApiKeyKeyRequired',
-  // Subscription connect (token import and code-paste): the sentinels of
+  // Subscription connect (token import, code-paste and device code): the sentinels of
   // portal/service_vendor_connect.go, wired in the same errRow table. A vendor
   // refusal of the code is a 400 (connect_rejected), never a 401 -- the portal
   // treats a 401 from this API as an expired session.
@@ -159,6 +159,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.connect_upstream_failed': 'errorVendorAccountConnectUpstream',
   'vendor_account.connect_key_required': 'errorVendorAccountConnectKeyRequired',
   'vendor_account.connect_failed': 'errorVendorAccountConnectFailed',
+  // The OpenAI-only device-code connect's two own refusals (both 400s), wired in
+  // the same errRow table. Its poll loop also meets connect_rejected and
+  // connect_upstream_failed above: the latter is transient (keep polling).
+  'vendor_account.device_not_supported': 'errorVendorAccountDeviceNotSupported',
+  'vendor_account.device_connect_state': 'errorVendorAccountDeviceConnectState',
   // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
   // although the portal hides the area in that state: a stale tab or a flag
   // flipped mid-session still reaches it.

@@ -2416,6 +2416,25 @@ const de = {
   vendorConnectExpiresAtLabel: 'Gültig bis (optional)',
   vendorConnectExpiresAtNote: 'Ohne Angabe gilt das Ablaufdatum als unbekannt.',
   vendorConnectImportAction: 'Tokens importieren',
+  vendorConnectGuideTitle: 'Wo finde ich das Token?',
+  vendorConnectGuideClaudeTitle: 'Claude Code',
+  vendorConnectGuideClaudeBody:
+    'Datei ~/.claude/.credentials.json, Feld claudeAiOauth.accessToken. Unter macOS alternativ der Schlüsselbund-Eintrag „Claude Code-credentials“. Ein langlebiges Token erzeugt der Befehl claude setup-token.',
+  vendorConnectGuideCodexTitle: 'Codex',
+  vendorConnectGuideCodexBody: 'Datei ~/.codex/auth.json, Feld tokens.access_token.',
+  vendorConnectDeviceTitle: 'Device-Code',
+  vendorConnectDeviceIntro:
+    'Nur für OpenAI. Einen kurzen Code auf der Seite des Anbieters eingeben; die Verbindung schließt sich danach hier automatisch ab. Funktioniert auch bei einem entfernten Gateway.',
+  vendorConnectDeviceStartAction: 'Device-Code starten',
+  vendorConnectDeviceCodeLabel: 'Bestätigungscode',
+  vendorConnectDeviceInstructions:
+    'Die Seite des Anbieters öffnen, diesen Code dort eingeben und die Anmeldung bestätigen. Diese Seite wartet und schließt die Verbindung automatisch ab.',
+  vendorConnectDeviceOpenAction: 'Seite öffnen',
+  vendorConnectDeviceWaiting: 'Warte auf die Bestätigung beim Anbieter …',
+  vendorConnectDeviceRetrying:
+    'Der Anbieter ist gerade nicht erreichbar. Es wird weiter versucht …',
+  vendorConnectDeviceTimedOut:
+    'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
   errorVendorAccountNotFound: 'Anbieter-Konto nicht gefunden',
   errorVendorAccountNameRequired: 'Name des Anbieter-Kontos ist erforderlich',
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
@@ -2444,6 +2463,9 @@ const de = {
   errorVendorAccountConnectKeyRequired:
     'Zum Speichern eines Abonnements ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
   errorVendorAccountConnectFailed: 'Das Konto konnte nicht verbunden werden',
+  errorVendorAccountDeviceNotSupported: 'Der Device-Code-Login ist nur für OpenAI-Konten verfügbar',
+  errorVendorAccountDeviceConnectState:
+    'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optionales Anbieter-Modul: Benutzer können eigene Konten bei externen KI-Anbietern (z. B. OpenAI, Anthropic) hinterlegen.',
@@ -4926,6 +4948,24 @@ const en: PortalMessages = {
   vendorConnectExpiresAtLabel: 'Expires at (optional)',
   vendorConnectExpiresAtNote: 'If left empty, the expiry is treated as unknown.',
   vendorConnectImportAction: 'Import tokens',
+  vendorConnectGuideTitle: 'Where do I find the token?',
+  vendorConnectGuideClaudeTitle: 'Claude Code',
+  vendorConnectGuideClaudeBody:
+    'File ~/.claude/.credentials.json, field claudeAiOauth.accessToken. On macOS, alternatively the Keychain entry "Claude Code-credentials". The command claude setup-token creates a long-lived token.',
+  vendorConnectGuideCodexTitle: 'Codex',
+  vendorConnectGuideCodexBody: 'File ~/.codex/auth.json, field tokens.access_token.',
+  vendorConnectDeviceTitle: 'Device code',
+  vendorConnectDeviceIntro:
+    'OpenAI only. Enter a short code on the provider page; the connection then completes here automatically. Works for a remote gateway too.',
+  vendorConnectDeviceStartAction: 'Start device code',
+  vendorConnectDeviceCodeLabel: 'Confirmation code',
+  vendorConnectDeviceInstructions:
+    'Open the provider page, enter this code there and confirm the sign-in. This page waits and completes the connection automatically.',
+  vendorConnectDeviceOpenAction: 'Open page',
+  vendorConnectDeviceWaiting: 'Waiting for approval at the provider …',
+  vendorConnectDeviceRetrying: 'The provider cannot be reached right now. Still trying …',
+  vendorConnectDeviceTimedOut:
+    'Timed out: the code was not confirmed in time. Start the device code again.',
   errorVendorAccountNotFound: 'Provider account not found',
   errorVendorAccountNameRequired: 'Provider account name is required',
   errorVendorAccountVendorInvalid: 'Invalid provider',
@@ -4953,6 +4993,10 @@ const en: PortalMessages = {
   errorVendorAccountConnectKeyRequired:
     'An encryption key on the gateway is required to store a subscription',
   errorVendorAccountConnectFailed: 'The account could not be connected',
+  errorVendorAccountDeviceNotSupported:
+    'The device-code login is available for OpenAI accounts only',
+  errorVendorAccountDeviceConnectState:
+    'No device-code login is in progress for this account, or it has expired. Start the device code again.',
   // System settings: the vendor-accounts master flag and the routing precedence.
   systemVendorAccountsIntro:
     'Optional provider module: users can store their own accounts with external AI providers (e.g. OpenAI, Anthropic).',
