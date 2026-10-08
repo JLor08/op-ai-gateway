@@ -101,6 +101,29 @@ func TestParseVendorAccountUsage(t *testing.T) {
 			want: routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "7.00", UpdatedAt: now},
 		},
 		{
+			name:     "anthropic NaN is unknown not stored",
+			provider: routing.ProviderVendorAnthropic,
+			headers: hdr(map[string]string{
+				"anthropic-ratelimit-unified-5h-utilization": "NaN",
+				"anthropic-ratelimit-unified-7d-utilization": "0.1",
+			}),
+			wantOK: true,
+			// strconv.ParseFloat accepts "NaN"; stored, it would make the usage DTO
+			// unmarshalable as JSON (a 500 on the detail GET), so it stays -1 (unknown).
+			want: routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: 10, UpdatedAt: now},
+		},
+		{
+			name:     "openai NaN percent is unknown not stored",
+			provider: routing.ProviderVendorOpenAI,
+			headers: hdr(map[string]string{
+				"x-codex-primary-used-percent":   "NaN",
+				"x-codex-secondary-used-percent": "nan",
+				"x-codex-credits-balance":        "7.00",
+			}),
+			wantOK: true,
+			want:   routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "7.00", UpdatedAt: now},
+		},
+		{
 			name:     "no recognized headers -> not ok",
 			provider: routing.ProviderVendorAnthropic,
 			headers:  hdr(map[string]string{"content-type": "application/json"}),

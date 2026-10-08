@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useState, type SubmitEvent } from 'react';
+import { useEffect, useRef, useState, type SubmitEvent } from 'react';
 import { Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -141,6 +141,12 @@ export function VendorAccountsView({
   const accounts = accountsData ?? [];
 
   const [mode, setMode] = useState<Mode>('list');
+  // The latest mode, for callbacks an async connect holds across renders: the
+  // closure it captured would still see the detail view it was started from.
+  const modeRef = useRef<Mode>(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
   const [busy, setBusy] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
 
@@ -235,10 +241,17 @@ export function VendorAccountsView({
   }
 
   // A connect succeeded: the account now reads as connected (and active), so
-  // refresh it everywhere the view holds it. Only the status select is re-seeded
-  // from the server; an unsaved rename in the settings form is left alone.
+  // refresh it in the list. When the user is still on that account's detail view,
+  // re-seed it too -- only the status select from the server; an unsaved rename in
+  // the settings form is left alone. A connect that completes after the user has
+  // navigated away (back to the list, or into another account) must NOT touch the
+  // view: it would re-open the wrong account, and a later Save would PATCH the
+  // wrong name/status onto it.
   function accountConnected(updated: VendorAccount) {
     setAccountsData((current) => (current ?? []).map((a) => (a.id === updated.id ? updated : a)));
+    const current = modeRef.current;
+    if (typeof current === 'string' || current.kind !== 'detail') return;
+    if (current.account.id !== updated.id) return;
     setMode({ kind: 'detail', account: updated });
     setStatus(updated.status);
   }

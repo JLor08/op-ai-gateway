@@ -398,7 +398,16 @@ func anthropicToolInput(arguments string) json.RawMessage {
 func anthropicImageSourceFor(url string) *anthropicImageSource {
 	if rest, ok := strings.CutPrefix(url, "data:"); ok {
 		meta, data, found := strings.Cut(rest, ",")
-		mediaType, isBase64 := strings.CutSuffix(meta, ";base64")
+		// The media type is everything up to the FIRST ";" (a URI may carry extra
+		// parameters, e.g. "image/png;charset=utf-8;base64", that Anthropic would
+		// reject inside media_type); the trailing "base64" marker is matched
+		// case-insensitively.
+		mediaType, params, _ := strings.Cut(meta, ";")
+		marker := params
+		if i := strings.LastIndex(params, ";"); i >= 0 {
+			marker = params[i+1:]
+		}
+		isBase64 := strings.EqualFold(strings.TrimSpace(marker), "base64")
 		if !found || !isBase64 || mediaType == "" || data == "" {
 			return nil
 		}
@@ -437,7 +446,8 @@ func anthropicInputSchema(parameters map[string]any) map[string]any {
 }
 
 // anthropicToolChoiceFor maps the neutral tool_choice (the OpenAI form:
-// "auto" / "required" / "none" / {"type":"function","function":{"name":...}}) to
+// "auto" / "required" / "none" / {"type":"function","function":{"name":...}}, or
+// the Responses flat {"type":"function","name":...}) to
 // Anthropic's {type: auto|any|none|tool, name?}. An already Anthropic-shaped
 // object passes through. Anything unrecognised yields nil (the upstream default,
 // which for Anthropic is auto).
@@ -456,8 +466,15 @@ func anthropicToolChoiceFor(choice any) map[string]any {
 		kind, _ := c["type"].(string)
 		switch kind {
 		case "function":
+			// Chat nests the name under "function"; the Responses API's forced-tool
+			// form is FLAT ({"type":"function","name":"x"}), so fall back to it
+			// rather than silently downgrading a forced tool to auto.
 			fn, _ := c["function"].(map[string]any)
-			if name, _ := fn["name"].(string); name != "" {
+			name, _ := fn["name"].(string)
+			if name == "" {
+				name, _ = c["name"].(string)
+			}
+			if name != "" {
 				return map[string]any{"type": "tool", "name": name}
 			}
 		case "tool":

@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net/http"
 	"op-ai-gateway/internal/routing"
 	"strconv"
@@ -142,8 +143,9 @@ func lowerHeaderValues(h http.Header) map[string]string {
 
 // parseScaledPercent parses a numeric header value and multiplies it by scale
 // (100 for an Anthropic 0..1 fraction, 1 for a Codex 0..100 percent). ok is false
-// for a missing or non-numeric value. A negative result is rejected (-1 is the
-// reserved unknown sentinel, so a real reading must never be negative), and the
+// for a missing or non-numeric value. A negative or NaN result is rejected (-1 is
+// the reserved unknown sentinel, so a real reading must never be negative, and a
+// NaN would make the usage DTO unmarshalable as JSON), and the
 // scaled result is clamped to <=100 so a malformed over-range value (e.g. an
 // Anthropic fraction >1 scaling past 100) cannot report an impossible percent.
 func parseScaledPercent(s string, scale float64) (float64, bool) {
@@ -152,7 +154,7 @@ func parseScaledPercent(s string, scale float64) (float64, bool) {
 		return 0, false
 	}
 	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || f < 0 {
+	if err != nil || f < 0 || math.IsNaN(f) {
 		return 0, false
 	}
 	pct := f * scale

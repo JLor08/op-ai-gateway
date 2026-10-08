@@ -6,11 +6,13 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/vendorauth"
@@ -651,6 +653,140 @@ func TestOpenAISubscriptionDispatchRejectionMarksNeedsReconnect(t *testing.T) {
 	if acc.OAuthTokens != originalSealed {
 		t.Fatal("status flip must not rewrite the OAuth tokens column")
 	}
+}
+
+// failingTokenWriteStore fails the narrow OAuth-token writer, so a refreshed set
+// cannot be persisted.
+type failingTokenWriteStore struct {
+	routing.Store
+}
+
+func (failingTokenWriteStore) SetVendorAccountOAuthTokens(context.Context, string, string) error {
+	return errors.New("simulated store failure")
+}
+
+// warnRecords returns the WARN-level records whose message contains substr.
+func warnRecords(recs []logbuffer.Record, substr string) []logbuffer.Record {
+	var out []logbuffer.Record
+	for _, r := range recs {
+		if r.Level == "WARN" && strings.Contains(r.Msg, substr) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestResolveSubscriptionBearerLogsGenuineFailuresAtWarn pins the level, not just
+// the behavior: the gateway's default log level is info, so a failed or rejected
+// refresh logged at Debug would leave a subscription account that silently stops
+// serving with nothing in any log a default deployment keeps. The capture runs at
+// INFO for that reason. Every record names the account and never a token.
+func TestResolveSubscriptionBearerLogsGenuineFailuresAtWarn(t *testing.T) {
+	const staleRefresh = "stale-refresh-secret"
+	staleTokens := vendorauth.TokenSet{
+		AccessToken: "stale-access-secret", RefreshToken: staleRefresh,
+		ExpiresAt: time.Now().Add(-time.Second), // expired => a refresh is attempted
+	}
+	oauthWith := func(status int, body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+		}))
+	}
+	assertNoSecrets := func(t *testing.T, recs []logbuffer.Record) {
+		t.Helper()
+		for _, secret := range []string{"stale-access-secret", staleRefresh, "fresh-access-secret", "fresh-refresh-secret"} {
+			assertNoSecretInLogs(t, recs, secret)
+		}
+	}
+
+	t.Run("refresh rejection warns and flips needs_reconnect", func(t *testing.T) {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
+		oauth := oauthWith(http.StatusBadRequest, `{"error":"invalid_grant","error_description":"refresh token revoked"}`)
+		defer oauth.Close()
+		store := routing.NewMemoryStore()
+		cipher := newDispatchCipher(t)
+		seedSubscriptionAccount(t, store, cipher, "acc_warn_rej", routing.VendorOpenAI, staleTokens)
+		ep := vendorauth.DefaultOpenAIEndpoints()
+		ep.TokenURL = oauth.URL
+		s := &Server{Cipher: cipher, Routes: store, vendorOpenAIEndpoints: ep}
+
+		if _, _, ok := s.resolveSubscriptionBearer(context.Background(), "acc_warn_rej"); ok {
+			t.Fatal("a rejected refresh must serve no bearer")
+		}
+		recs := buf.Snapshot()
+		got := warnRecords(recs, "refresh rejected")
+		if len(got) != 1 || got[0].Attrs["account"] != "acc_warn_rej" {
+			t.Fatalf("want exactly one WARN naming the account for the rejection at the default level (info); records = %+v", recs)
+		}
+		assertNoSecrets(t, recs)
+	})
+
+	t.Run("transient refresh failure warns", func(t *testing.T) {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
+		oauth := oauthWith(http.StatusInternalServerError, `{"error":"server_error"}`)
+		defer oauth.Close()
+		store := routing.NewMemoryStore()
+		cipher := newDispatchCipher(t)
+		seedSubscriptionAccount(t, store, cipher, "acc_warn_5xx", routing.VendorOpenAI, staleTokens)
+		ep := vendorauth.DefaultOpenAIEndpoints()
+		ep.TokenURL = oauth.URL
+		s := &Server{Cipher: cipher, Routes: store, vendorOpenAIEndpoints: ep}
+
+		if _, _, ok := s.resolveSubscriptionBearer(context.Background(), "acc_warn_5xx"); ok {
+			t.Fatal("a failed refresh must serve no bearer")
+		}
+		recs := buf.Snapshot()
+		if got := warnRecords(recs, "refresh failed"); len(got) != 1 || got[0].Attrs["account"] != "acc_warn_5xx" {
+			t.Fatalf("want exactly one WARN naming the account for the failed refresh; records = %+v", recs)
+		}
+		assertNoSecrets(t, recs)
+		acc, err := store.VendorAccountByID(context.Background(), "acc_warn_5xx")
+		if err != nil {
+			t.Fatalf("VendorAccountByID: %v", err)
+		}
+		if acc.Status != routing.VendorAccountStatusActive {
+			t.Fatalf("status = %q, want active (a transient failure is not a dead refresh token)", acc.Status)
+		}
+	})
+
+	t.Run("persist failure warns but still serves the refreshed bearer", func(t *testing.T) {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
+		oauth := oauthWith(http.StatusOK, `{"access_token":"fresh-access-secret","refresh_token":"fresh-refresh-secret","expires_in":3600}`)
+		defer oauth.Close()
+		store := routing.NewMemoryStore()
+		cipher := newDispatchCipher(t)
+		seedSubscriptionAccount(t, store, cipher, "acc_warn_persist", routing.VendorOpenAI, staleTokens)
+		ep := vendorauth.DefaultOpenAIEndpoints()
+		ep.TokenURL = oauth.URL
+		s := &Server{Cipher: cipher, Routes: failingTokenWriteStore{Store: store}, vendorOpenAIEndpoints: ep}
+
+		access, _, ok := s.resolveSubscriptionBearer(context.Background(), "acc_warn_persist")
+		if !ok || access != "fresh-access-secret" {
+			t.Fatalf("resolveSubscriptionBearer = (%q, %v), want the refreshed bearer served even when persisting failed", access, ok)
+		}
+		recs := buf.Snapshot()
+		if got := warnRecords(recs, "persist failed"); len(got) != 1 || got[0].Attrs["account"] != "acc_warn_persist" {
+			t.Fatalf("want exactly one WARN naming the account for the failed persist; records = %+v", recs)
+		}
+		assertNoSecrets(t, recs)
+	})
+
+	t.Run("unknown vendor stays quiet at the default level", func(t *testing.T) {
+		buf := withCapturedSlogAtTheDefaultLevel(t)
+		store := routing.NewMemoryStore()
+		cipher := newDispatchCipher(t)
+		seedSubscriptionAccount(t, store, cipher, "acc_quiet", "mystery-vendor", staleTokens)
+		s := &Server{Cipher: cipher, Routes: store}
+
+		if _, _, ok := s.resolveSubscriptionBearer(context.Background(), "acc_quiet"); ok {
+			t.Fatal("an unknown vendor must serve no bearer")
+		}
+		if recs := buf.Snapshot(); len(recs) != 0 {
+			t.Fatalf("the fail-closed unknown-vendor path must not log above Debug; records = %+v", recs)
+		}
+	})
 }
 
 // TestUpstreamAuthCtxKeysOnSubscriptionFlagNotAccountID is the M6a decoupling

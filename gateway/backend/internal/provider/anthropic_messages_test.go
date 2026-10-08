@@ -320,6 +320,9 @@ func TestAnthropicToolChoiceMapsOpenAIForms(t *testing.T) {
 		{"none", "none", `{"type":"none"}`},
 		{"named function", map[string]any{"type": "function", "function": map[string]any{"name": "f"}}, `{"type":"tool","name":"f"}`},
 		{"named function without a name", map[string]any{"type": "function", "function": map[string]any{}}, ""},
+		{"responses flat forced function", map[string]any{"type": "function", "name": "f"}, `{"type":"tool","name":"f"}`},
+		{"nested function name wins over a flat one", map[string]any{"type": "function", "name": "flat", "function": map[string]any{"name": "nested"}}, `{"type":"tool","name":"nested"}`},
+		{"function with no name anywhere", map[string]any{"type": "function"}, ""},
 		{"anthropic shaped tool", map[string]any{"type": "tool", "name": "f"}, `{"type":"tool","name":"f"}`},
 		{"anthropic shaped any", map[string]any{"type": "any"}, `{"type":"any"}`},
 		{"unknown string", "bogus", ""},
@@ -335,6 +338,40 @@ func TestAnthropicToolChoiceMapsOpenAIForms(t *testing.T) {
 				return
 			}
 			assertJSON(t, "tool_choice", got, tc.want)
+		})
+	}
+}
+
+func TestAnthropicImageSourceForParsesDataURIs(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string // JSON of the source, or "" when the image is dropped
+	}{
+		{"plain base64", "data:image/png;base64,QUJD", `{"type":"base64","media_type":"image/png","data":"QUJD"}`},
+		{"extra params stay out of media_type", "data:image/png;charset=utf-8;base64,QUJD", `{"type":"base64","media_type":"image/png","data":"QUJD"}`},
+		{"base64 marker is case-insensitive", "data:image/jpeg;BASE64,QUJD", `{"type":"base64","media_type":"image/jpeg","data":"QUJD"}`},
+		{"extra params and mixed-case marker", "data:image/webp;name=a.webp;Base64,QUJD", `{"type":"base64","media_type":"image/webp","data":"QUJD"}`},
+		{"non-base64 data URI is dropped", "data:image/svg+xml;utf8,%3Csvg%3E", ""},
+		{"no media type is dropped", "data:;base64,QUJD", ""},
+		{"empty payload is dropped", "data:image/png;base64,", ""},
+		{"no comma is dropped", "data:image/png;base64", ""},
+		{"http URL", "https://example.test/cat.jpg", `{"type":"url","url":"https://example.test/cat.jpg"}`},
+		{"file URL is dropped", "file:///etc/passwd", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := anthropicImageSourceFor(tc.url)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("anthropicImageSourceFor(%q) = %#v, want nil", tc.url, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("anthropicImageSourceFor(%q) = nil, want %s", tc.url, tc.want)
+			}
+			assertJSON(t, "source", got, tc.want)
 		})
 	}
 }

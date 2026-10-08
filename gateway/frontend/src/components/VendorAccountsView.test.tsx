@@ -702,6 +702,84 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Renamed, not saved');
       });
 
+      // A connect is async: the user can leave the detail view while it is still
+      // in flight. When it then completes it must refresh the list, but never
+      // re-open its own account over wherever the user went (a later Save would
+      // PATCH the wrong account's name and status).
+      describe('when the connect resolves after the user navigated away', () => {
+        function startSlowImport() {
+          let resolveImport!: (account: VendorAccount) => void;
+          const pending = new Promise<VendorAccount>((resolve) => {
+            resolveImport = resolve;
+          });
+          const view = renderView({
+            accounts: [
+              makeVendorAccount({ ...SUBSCRIPTION }),
+              makeVendorAccount({ id: 'va_other', name: 'Other OpenAI', status: 'disabled' }),
+            ],
+            connectVendorAccountImport: () => pending,
+          });
+          const connected = () =>
+            makeVendorAccount({ ...SUBSCRIPTION, status: 'active', subscription_connected: true });
+          return { ...view, resolveImport, connected };
+        }
+
+        async function openRow(name: string) {
+          const row = (await screen.findByText(name)).closest('tr')!;
+          fireEvent.click(within(row).getByRole('button', { name: t.modelDetailsAction }));
+          await screen.findByText(t.vendorAccountSettingsTitle);
+        }
+
+        async function beginImportThenLeave() {
+          const started = startSlowImport();
+          await openRow('Team Claude Max');
+          fillAccess();
+          fireEvent.click(screen.getByRole('button', { name: t.vendorConnectImportAction }));
+          await waitFor(() =>
+            expect(started.fakeApi.connectVendorAccountImport).toHaveBeenCalledTimes(1),
+          );
+          fireEvent.click(screen.getByRole('button', { name: t.providers }));
+          return started;
+        }
+
+        it('stays on the list and still refreshes the account in it', async () => {
+          const { resolveImport, connected } = await beginImportThenLeave();
+          await screen.findByText('Other OpenAI');
+
+          await act(async () => resolveImport(connected()));
+          await screen.findByText(t.vendorConnectSuccess);
+
+          expect(screen.queryByText(t.vendorAccountSettingsTitle)).not.toBeInTheDocument();
+          const row = screen.getByText('Team Claude Max').closest('tr')!;
+          expect(within(row).getByText(t.vendorAccountCredentialSet)).toBeInTheDocument();
+        });
+
+        it("does not re-seed another account's detail view, so a later Save patches the right account", async () => {
+          const { fakeApi, resolveImport, connected } = await beginImportThenLeave();
+          await openRow('Other OpenAI');
+          expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(
+            t.statusDisabled,
+          );
+
+          await act(async () => resolveImport(connected()));
+          await screen.findByText(t.vendorConnectSuccess);
+
+          // Still the other account: its own name and status, not the connected one's.
+          expect(screen.getByLabelText(t.vendorAccountNameLabel)).toHaveValue('Other OpenAI');
+          expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toHaveTextContent(
+            t.statusDisabled,
+          );
+          fireEvent.click(screen.getByRole('button', { name: t.save }));
+          await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+          expect(fakeApi.updateVendorAccount.mock.calls[0][0]).toBe('va_other');
+
+          // ... while the connected account was still refreshed in the list.
+          fireEvent.click(screen.getByRole('button', { name: t.providers }));
+          const row = (await screen.findByText('Team Claude Max')).closest('tr')!;
+          expect(within(row).getByText(t.vendorAccountCredentialSet)).toBeInTheDocument();
+        });
+      });
+
       it('shows a refused import as a localized toast and keeps what was typed', async () => {
         const { fakeApi } = renderSubscription(
           {},

@@ -1873,7 +1873,11 @@ func copyStringMap(m map[string]string) map[string]string {
 // goes only to the Anthropic token endpoint and the OpenAI token only to the
 // OpenAI one. The whole sequence runs under lockVendorAccount(accountID) so
 // concurrent dispatches for one account single-flight the refresh instead of each
-// burning the refresh token.
+// burning the refresh token. Genuine failures (a failed or rejected refresh, a
+// failed reseal or persist, a failed needs_reconnect flip) log at Warn -- the
+// default log level is info, and a subscription account that stops serving must
+// leave a trace -- naming only the account id and a token-free error; the other
+// no-bearer cases (account lookup, token open, unknown vendor) stay at Debug.
 func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string) (string, string, bool) {
 	if s.Routes == nil {
 		return "", "", false
@@ -1916,18 +1920,19 @@ func (s *Server) resolveSubscriptionBearer(ctx context.Context, accountID string
 			// The refresh token is dead: the account must be reconnected. Flip the
 			// status (narrow writer) and serve no bearer, so the request fails cleanly.
 			if serr := s.Routes.SetVendorAccountStatus(ctx, accountID, routing.VendorAccountStatusNeedsReconnect); serr != nil {
-				slog.Debug("mark subscription account needs_reconnect failed", "account", accountID, "err", serr)
+				slog.Warn("mark subscription account needs_reconnect failed", "account", accountID, "err", serr)
 			}
+			slog.Warn("subscription token refresh rejected; the account needs reconnecting", "account", accountID, "err", err)
 			return "", "", false
 		}
-		slog.Debug("subscription token refresh failed; proceeding without bearer", "account", accountID, "err", err)
+		slog.Warn("subscription token refresh failed; proceeding without bearer", "account", accountID, "err", err)
 		return "", "", false
 	}
 	if changed {
 		if sealed, serr := vendorauth.SealTokenSet(s.Cipher, s.settingsVolatile, fresh); serr != nil {
-			slog.Debug("subscription token reseal failed; serving refreshed token without persisting", "account", accountID)
+			slog.Warn("subscription token reseal failed; serving refreshed token without persisting", "account", accountID)
 		} else if perr := s.Routes.SetVendorAccountOAuthTokens(ctx, accountID, sealed); perr != nil {
-			slog.Debug("subscription token persist failed; serving refreshed token without persisting", "account", accountID, "err", perr)
+			slog.Warn("subscription token persist failed; serving refreshed token without persisting", "account", accountID, "err", perr)
 		}
 	}
 	if fresh.AccessToken == "" {
