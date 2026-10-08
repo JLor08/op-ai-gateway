@@ -54,7 +54,8 @@ flowchart TB
         portal["portal<br/>portal/system service boundary"]
         routing["routing<br/>resolver, scoring, capacity"]
         inference["inference<br/>provider-neutral model"]
-        provider["provider<br/>Ollama / OpenAI-compat / mock"]
+        provider["provider<br/>Ollama / OpenAI-compat / Anthropic Messages / OpenAI Responses / mock"]
+        vendorauth["vendorauth<br/>vendor OAuth connect + refresh"]
         usage["usage<br/>usage events"]
         capture["capture<br/>payload capture"]
         netbird["netbird<br/>mesh peers/policies/token"]
@@ -74,6 +75,7 @@ flowchart TB
     cmd --> gateway
     gateway --> compat & apierror & account & auth & totp & portal
     portal --> routing & usage & capture & netbird & certissue & theme
+    gateway & portal --> vendorauth
     routing --> inference --> provider
     account & portal & routing & usage --> store
     routing --> storeerr
@@ -92,10 +94,11 @@ flowchart TB
 | `account` | Auth + session + user management: login, session resolution, logout, set/change password, invite/list/update users, last-admin guard. |
 | `auth` | Token authentication primitives; bcrypt password hashing/policy. |
 | `totp` | TOTP 2FA enrollment and verification. |
-| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings. |
-| `routing` | Candidate scoring, the mapping-based resolver, AI-server/routing repository interfaces, domain types (`AiServer`, `Application`, `ModelMapping`), affinity, capacity/admission. |
+| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings, and the per-user external **vendor accounts** ("Anbieter") CRUD + subscription connect ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)). |
+| `routing` | Candidate scoring, the mapping-based resolver, AI-server/routing repository interfaces, domain types (`AiServer`, `Application`, `ModelMapping`, `VendorAccount`), affinity, capacity/admission. The resolver's vendor-account candidate source turns a caller's own account into an owner-scoped `Target`. |
 | `inference` | The internal provider-neutral inference model. |
-| `provider` | Provider client interface (incl. `ModelLister`), Ollama adapter, OpenAI-compatible adapter (vLLM/llama.cpp), mock provider. |
+| `provider` | Provider client interface (incl. `ModelLister`), Ollama adapter, OpenAI-compatible adapter (vLLM/llama.cpp + the OpenAI api-key vendor path), the native **Anthropic Messages** client and the **OpenAI Responses** translate client (the two vendor-subscription serving clients), mock provider. |
+| `vendorauth` | The vendor OAuth subsystem for the subscription path: PKCE, authorize-URL build, code/device-code exchange, token-set sealing and refresh. All reverse-engineered vendor constants live here (VERIFY-LIVE); imports `capture` only ([External Vendor Accounts §3](cross-cutting/external-vendor-accounts.md#3-connect-flows-internalvendorauth)). |
 | `usage` | Usage-event recording and aggregation inputs. |
 | `capture` | Opt-in payload capture (encrypted-at-rest or volatile-RAM), header redaction. |
 | `netbird` | NetBird integration: peers, groups, policies, the gateway-managed PAT and its rotation. |
@@ -145,7 +148,8 @@ so a stale entry can never make a lookup return true for a live server.
 
 A single SPA under `gateway/frontend/src`: an app shell (`App.tsx`, topbar +
 collapsible `NavSidebar`), feature views (Dashboard, Chat, Tokens, Activity,
-Models, AI Servers, Users, Tools, System, NetBird, Logs, legal pages), shared
+Models, AI Servers, **Providers / "Anbieter"** (`VendorAccountsView`), Users,
+Tools, System, NetBird, Logs, legal pages), shared
 components, a **view registry** (`components/views.tsx`) as the single source
 of truth for "who may see which view" — one entry per view id carries the
 same `gate` function for both the nav item (`NavSidebar` filters with it) and
@@ -154,9 +158,13 @@ to the dashboard), so nav visibility and content access can never diverge;
 adding a view is one registry entry plus the `View` union member. Further:
 an `api.ts` typed client (a barrel re-exporting the domain
 modules under `api/` — auth, tokens, users, groups, resourceGroups, projects,
-servers, services, models, usage, system, netbird, chat), a `theme/` subsystem
-(MUI + CSS-variable bridge + `ThemeRoot`), and `i18n.ts` (de/en). It talks
-only to the gateway HTTP APIs.
+servers, services, models, usage, system, netbird, chat, vendorAccounts), a
+`theme/` subsystem (MUI + CSS-variable bridge + `ThemeRoot`), and `i18n.ts`
+(de/en). It talks only to the gateway HTTP APIs. The `providers` view is gated on
+the `vendorAccountsEnabled` flag — threaded through `App.tsx` and `NavSidebar`
+from `GET /api/portal/vendor-accounts/enabled` — so the nav item and the routed
+content are both hidden while the vendor-accounts module is off
+([External Vendor Accounts §6](cross-cutting/external-vendor-accounts.md#6-feature-flag-and-routing-mode)).
 
 Two additions worth knowing when looking for code on this side:
 

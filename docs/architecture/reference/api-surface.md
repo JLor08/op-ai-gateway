@@ -766,6 +766,54 @@ above were added. The three live-timings codes are wired on the same pattern:
 — each of those three rows with an `msgFn` rather than a static `msg`, so the
 message names the offending type.
 
+### Vendor accounts (Anbieter)
+
+Per-user external AI vendor accounts ("Anbieter"): a plain API key or an
+experimental consumer-subscription OAuth connection
+([External Vendor Accounts](../cross-cutting/external-vendor-accounts.md),
+[ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)).
+All routes take scope `gateway:use`; **object-level authorization is owner-only
+inside `portal.Service`** — a non-owner gets `404 vendor_account.not_found`, the
+same no-existence-leak posture as servers. The `system` scope may **read** an
+account (GET), but listing and every **write** (create/update/delete/connect) are
+owner-only. Secrets are **write-only**: no response ever carries the API key or an
+OAuth token. The whole surface is gated by the `vendor_accounts_enabled` master
+flag — every CRUD/connect route answers `409 vendor_accounts.module_disabled`
+while it is off.
+
+| Path | Methods | Purpose |
+|---|---|---|
+| `/api/portal/vendor-accounts` | GET/POST | List the caller's own accounts (`{data:[…]}`); create one (`{vendor, auth_type, name, status?, api_key?}` → `201` with the credential-free DTO). `api_key` is meaningful only for an `api_key` account; a `subscription` account is created unconnected. |
+| `/api/portal/vendor-accounts/{id}` | GET/PATCH/DELETE | Detail (GET also fills the `usage` rate-limit snapshot); partial update (`{name?, status?, api_key?}`, `api_key` the `null`=keep / `""`=clear / value=replace sentinel; vendor and auth type are immutable); delete (`{ok:true}`). |
+| `/api/portal/vendor-accounts/enabled` | GET | Whether the vendor-accounts master flag is on (`{module_enabled}`, boolean only). Readable by any user **even while the module is off** — it exists so the shell can show/hide the "Anbieter" nav item without the system-scoped settings read. The exact path wins over the `{id}` subtree because account ids are `va_`-prefixed. |
+| `/api/portal/vendor-accounts/{id}/connect/import` | POST | Token-import connect: `{access_token, refresh_token?, expires_at?}` (write-only). No live probe; the first request validates the tokens. |
+| `/api/portal/vendor-accounts/{id}/connect/begin` | POST | Start the authorization-code-paste flow; no body, returns `{authorize_url}`. |
+| `/api/portal/vendor-accounts/{id}/connect/complete` | POST | Finish the code-paste flow: `{code}` (a bare code, `code#state`, or a whole callback URL). |
+| `/api/portal/vendor-accounts/{id}/connect/device/begin` | POST | Start the OpenAI-only Codex device-code login; no body, returns `{user_code, verification_url}`. |
+| `/api/portal/vendor-accounts/{id}/connect/device/poll` | POST | One poll of a begun device login; no body, returns `{connected}`; never returns a token. |
+
+Error codes specific to this surface (all `vendor_account.*` except the module
+flag), with their HTTP status:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `vendor_accounts.module_disabled` | 409 | The master flag is off (like `netbird.module_disabled`). |
+| `vendor_account.not_found` | 404 | No such account, or not owned by the caller (no-existence-leak). |
+| `vendor_account.name_required` | 400 | The name is blank. |
+| `vendor_account.vendor_invalid` / `.auth_type_invalid` / `.status_invalid` | 400 | An enum field is outside its allowed set. |
+| `vendor_account.api_key_not_allowed` | 400 | An API key was sent to a non-`api_key` account. |
+| `vendor_account.api_key_invalid` | 400 | A blank (whitespace-only) API key; send `""` to clear instead. |
+| `vendor_account.api_key_key_required` | 400 | No encryption key to seal the API key on a disk-backed store. |
+| `vendor_account.forbidden` | 403 | A write the caller may not make on an account it can otherwise reach. |
+| `vendor_account.not_subscription` | 400 | A connect was attempted on an `api_key` account. |
+| `vendor_account.connect_token_required` / `.connect_code_required` | 400 | The import token / the pasted code is missing. |
+| `vendor_account.connect_state` / `.device_connect_state` | 400 | No connect (or device connect) is in progress, it expired, or the pasted state does not match. |
+| `vendor_account.connect_rejected` | 400 | The vendor rejected the code. **Never a 401** — the portal treats a 401 from this API as an expired session. |
+| `vendor_account.connect_upstream_failed` | 502 | The vendor was unreachable or answered unusably. |
+| `vendor_account.connect_key_required` | 400 | No encryption key to seal the OAuth token set on a disk-backed store. |
+| `vendor_account.device_not_supported` | 400 | The device-code flow was attempted for a non-OpenAI account. |
+| `vendor_account.{list,create,get,update,delete,connect}_failed` | 500 | The uncategorized fallback for each operation. |
+
 ### Groups, projects, services, resource-groups (governance model)
 
 | Path | Methods | Purpose |
@@ -784,6 +832,7 @@ message names the offending type.
 |---|---|
 | `/api/portal/netbird/enabled` | Whether NetBird integration is enabled (boolean only, no config leak) |
 | `/api/portal/certificates/enabled` | Whether the certificate module is enabled |
+| `/api/portal/vendor-accounts/enabled` | Whether the vendor-accounts ("Anbieter") module is enabled (`{module_enabled}`; readable by any user even while off, to gate the nav item) |
 | `/api/portal/health-check-interval` | Live app-health probe cadence (read-only mirror of a system setting) |
 | `/api/portal/agent-presence-timeout` | Live agent-presence timeout (read-only mirror of a system setting) |
 
