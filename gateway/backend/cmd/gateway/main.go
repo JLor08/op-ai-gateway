@@ -1277,6 +1277,11 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
 		// dialect, so a vendor-account target reuses the same client.
 		routing.ProviderVendorOpenAI: openAICompatible,
+		// ProviderVendorOpenAISubscription: the ChatGPT backend speaks the Responses
+		// protocol ONLY. Its dedicated client serves BOTH the native passthrough of an
+		// inbound /v1/responses (Codex) request and the translate of a chat/completions
+		// (portal-chat) request to that protocol.
+		routing.ProviderVendorOpenAISubscription: provider.NewOpenAIResponsesClient(appHTTPClient),
 		// ProviderVendorAnthropic: api.anthropic.com has no chat-completions
 		// surface; the native /v1/messages client translates to and from it.
 		routing.ProviderVendorAnthropic: provider.NewAnthropicClient(appHTTPClient),

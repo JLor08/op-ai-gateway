@@ -37,6 +37,18 @@ const (
 	// than /v1/chat/completions.
 	ProviderVendorOpenAI    = "vendor_openai"
 	ProviderVendorAnthropic = "vendor_anthropic"
+	// ProviderVendorOpenAISubscription is the provider kind of an OpenAI
+	// SUBSCRIPTION (Codex ChatGPT Pro/Plus/Team OAuth) target (Milestone 5c). Its
+	// upstream is the reverse-engineered ChatGPT backend
+	// (https://chatgpt.com/backend-api/codex), which speaks the Responses protocol
+	// ONLY — it has no /v1/chat/completions surface. The dedicated
+	// provider.OpenAIResponsesClient therefore serves BOTH paths of such a target:
+	// a lossless native passthrough of an inbound /v1/responses (Codex) request,
+	// and a TRANSLATE path that renders a chat/completions (portal-chat) request as
+	// a Responses body and parses the Responses SSE back. Kept distinct from the
+	// api-key ProviderVendorOpenAI (api.openai.com, OpenAI-compatible client) so the
+	// two never share a client or an endpoint. EXPERIMENTAL / ToS-sensitive.
+	ProviderVendorOpenAISubscription = "vendor_openai_subscription"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -78,6 +90,16 @@ const (
 	PrincipalTypeService = "service"
 	PrincipalTypeUser    = "user"
 )
+
+// IsOpenAIVendorProvider reports whether provider is one of the two OpenAI vendor
+// provider kinds: the api-key ProviderVendorOpenAI (api.openai.com) or the
+// subscription ProviderVendorOpenAISubscription (the ChatGPT backend). The
+// dispatch, usage-scrape and account-header paths that are OpenAI-vendor-specific
+// but auth-type-agnostic key on this so neither provider is forgotten when one is
+// added. It is deliberately NOT true for ProviderVendorAnthropic.
+func IsOpenAIVendorProvider(provider string) bool {
+	return provider == ProviderVendorOpenAI || provider == ProviderVendorOpenAISubscription
+}
 
 type AIServer struct {
 	ID     string
