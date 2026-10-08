@@ -84,9 +84,10 @@ func OpenAIDevicePoll(ctx context.Context, httpClient *http.Client, ep Endpoints
 	if status < 200 || status > 299 {
 		return "", "", false, newStatusError(status, body)
 	}
+	// The 2xx answer also carries code_challenge, which this flow does not need
+	// (it exchanges the code with the returned code_verifier); it is left unparsed.
 	var resp struct {
 		AuthorizationCode string `json:"authorization_code"`
-		CodeChallenge     string `json:"code_challenge"`
 		CodeVerifier      string `json:"code_verifier"`
 	}
 	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {

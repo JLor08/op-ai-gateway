@@ -319,15 +319,22 @@ func TestPollVendorAccountDeviceConnectAfterTheTTL(t *testing.T) {
 	}
 }
 
-func TestPollVendorAccountDeviceConnectTerminalErrorsClearThePending(t *testing.T) {
+// A poll error keeps or clears the pending entry by KIND: a transient upstream
+// error (5xx, 429) is retryable and KEEPS the entry, so a single blip during the
+// ~15-minute unattended poll loop does not abort the authorization; a genuine
+// rejection CLEARS it. The failure is a poll error here and an exchange error in
+// TestPollVendorAccountDeviceConnectExchangeFailure.
+func TestPollVendorAccountDeviceConnectPollErrorKeepsPendingOnlyWhenTransient(t *testing.T) {
 	for name, tc := range map[string]struct {
-		status     int
-		body       string
-		wantErr    error
-		wantNotErr error
+		status      int
+		body        string
+		wantErr     error
+		wantNotErr  error
+		wantCleared bool
 	}{
-		"server error": {http.StatusInternalServerError, `{"error":"server_error"}`, ErrVendorAccountConnectUpstream, ErrVendorAccountConnectRejected},
-		"rejected":     {http.StatusUnauthorized, `{"error":"invalid_grant"}`, ErrVendorAccountConnectRejected, nil},
+		"server error keeps pending":   {http.StatusInternalServerError, `{"error":"server_error"}`, ErrVendorAccountConnectUpstream, ErrVendorAccountConnectRejected, false},
+		"rate limited keeps pending":   {http.StatusTooManyRequests, `{"error":"rate_limited"}`, ErrVendorAccountConnectUpstream, ErrVendorAccountConnectRejected, false},
+		"rejection clears the pending": {http.StatusUnauthorized, `{"error":"invalid_grant"}`, ErrVendorAccountConnectRejected, nil, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, routeStore, stub := newVendorDeviceConnectTestService(t)
@@ -344,34 +351,62 @@ func TestPollVendorAccountDeviceConnectTerminalErrorsClearThePending(t *testing.
 			if tc.wantNotErr != nil && errors.Is(err, tc.wantNotErr) {
 				t.Fatalf("err = %v, must not also be %v", err, tc.wantNotErr)
 			}
-			if svc.vendorDeviceConnect.count() != 0 {
-				t.Fatal("a terminal poll error must clear the pending entry")
+			if gotCleared := svc.vendorDeviceConnect.count() == 0; gotCleared != tc.wantCleared {
+				t.Fatalf("pending cleared = %v, want %v (a transient error must keep pending, a rejection must clear it)", gotCleared, tc.wantCleared)
+			}
+			if !tc.wantCleared {
+				// A kept entry is retryable: a following authorized poll connects it.
+				pendingDeviceConnect(t, svc, acc.ID)
+				idToken := connectTestJWT(t, "acct-dev", "pro")
+				stub.setToken(http.StatusOK, `{"authorization_code":"auth-code","code_verifier":"ver"}`)
+				stub.setExchange(http.StatusOK, `{"access_token":"`+connectTestAccess+`","id_token":"`+idToken+`","expires_in":3600}`)
+				if ok, err := svc.PollVendorAccountDeviceConnect(context.Background(), ownerToken(), acc.ID); err != nil || !ok {
+					t.Fatalf("retry after a transient error = (%v, %v), want (true, nil)", ok, err)
+				}
+			}
+			if !tc.wantCleared {
+				return
 			}
 			if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
-				t.Fatalf("tokens stored after a terminal error: %q", row.OAuthTokens)
+				t.Fatalf("tokens stored after a rejection: %q", row.OAuthTokens)
 			}
 		})
 	}
 }
 
-func TestPollVendorAccountDeviceConnectExchangeFailureClearsThePending(t *testing.T) {
-	svc, routeStore, stub := newVendorDeviceConnectTestService(t)
-	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
-	if _, _, err := svc.BeginVendorAccountDeviceConnect(context.Background(), ownerToken(), acc.ID); err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	stub.setToken(http.StatusOK, `{"authorization_code":"auth-code","code_verifier":"ver"}`)
-	stub.setExchange(http.StatusBadRequest, `{"error":"invalid_grant"}`)
+// An exchange failure follows the same keep-or-clear rule as a poll error: a
+// rejection (invalid_grant) clears the pending entry, a transient upstream failure
+// keeps it for the next poll to retry.
+func TestPollVendorAccountDeviceConnectExchangeFailure(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status      int
+		body        string
+		wantErr     error
+		wantCleared bool
+	}{
+		"rejection clears": {http.StatusBadRequest, `{"error":"invalid_grant"}`, ErrVendorAccountConnectRejected, true},
+		"transient keeps":  {http.StatusBadGateway, `{"error":"bad_gateway"}`, ErrVendorAccountConnectUpstream, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, routeStore, stub := newVendorDeviceConnectTestService(t)
+			acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
+			if _, _, err := svc.BeginVendorAccountDeviceConnect(context.Background(), ownerToken(), acc.ID); err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			stub.setToken(http.StatusOK, `{"authorization_code":"auth-code","code_verifier":"ver"}`)
+			stub.setExchange(tc.status, tc.body)
 
-	connected, err := svc.PollVendorAccountDeviceConnect(context.Background(), ownerToken(), acc.ID)
-	if connected || !errors.Is(err, ErrVendorAccountConnectRejected) {
-		t.Fatalf("poll = (%v, %v), want (false, ErrVendorAccountConnectRejected)", connected, err)
-	}
-	if svc.vendorDeviceConnect.count() != 0 {
-		t.Fatal("an exchange failure must clear the pending entry")
-	}
-	if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
-		t.Fatalf("tokens stored after an exchange failure: %q", row.OAuthTokens)
+			connected, err := svc.PollVendorAccountDeviceConnect(context.Background(), ownerToken(), acc.ID)
+			if connected || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("poll = (%v, %v), want (false, %v)", connected, err, tc.wantErr)
+			}
+			if gotCleared := svc.vendorDeviceConnect.count() == 0; gotCleared != tc.wantCleared {
+				t.Fatalf("pending cleared = %v, want %v", gotCleared, tc.wantCleared)
+			}
+			if row, _ := routeStore.VendorAccountByID(context.Background(), acc.ID); row.OAuthTokens != "" {
+				t.Fatalf("tokens stored after an exchange failure: %q", row.OAuthTokens)
+			}
+		})
 	}
 }
 

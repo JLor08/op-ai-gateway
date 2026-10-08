@@ -131,13 +131,28 @@ func (s *Service) deviceConnectableVendorAccount(ctx context.Context, principal 
 // classifyVendorDeviceError maps a vendorauth failure to the connect sentinels a
 // device begin/poll reports: a vendor refusal is ErrVendorAccountConnectRejected
 // (never a 401 -- the portal reads a 401 from this API as an expired session),
-// anything else (network, 5xx, malformed reply) ErrVendorAccountConnectUpstream.
+// anything else (network, 5xx, 429, malformed reply) ErrVendorAccountConnectUpstream.
 // The wrapped cause is a vendorauth error that carries no request or response body.
 func classifyVendorDeviceError(err error) error {
 	if errors.Is(err, vendorauth.ErrAuthRejected) {
 		return fmt.Errorf("%w: %w", ErrVendorAccountConnectRejected, err)
 	}
 	return fmt.Errorf("%w: %w", ErrVendorAccountConnectUpstream, err)
+}
+
+// terminalDeviceError classifies a failed poll or exchange and clears the pending
+// entry ONLY on a genuine rejection; a transient upstream error (network, 5xx,
+// 429) keeps the entry. A device poll loop runs unattended for ~15 minutes, so one
+// transient blip -- including just after the user approved the code -- must not
+// abort the authorization and force a full begin + re-approval. This mirrors the
+// code-paste CompleteVendorAccountConnect, which also keeps pending on an upstream
+// failure. An abandoned entry still expires by its TTL.
+func (s *Service) terminalDeviceError(accountID, deviceAuthID string, err error) error {
+	mapped := classifyVendorDeviceError(err)
+	if errors.Is(mapped, ErrVendorAccountConnectRejected) {
+		s.vendorDeviceConnect.clear(accountID, deviceAuthID)
+	}
+	return mapped
 }
 
 // BeginVendorAccountDeviceConnect starts the Codex device login for an OpenAI
@@ -177,12 +192,13 @@ func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal
 // finished approving the code (the frontend keeps polling). When the vendor
 // authorizes, it exchanges the code for tokens, seals them, marks the account an
 // active subscription, clears the pending entry and returns connected=true. A
-// vendor refusal or any other vendor failure (ErrVendorAccountConnectRejected /
-// ErrVendorAccountConnectUpstream) is terminal: it clears the pending entry, so
-// the user must begin again. With no device connect in progress (never begun or
-// past the TTL) it is ErrVendorAccountDeviceConnectState. The response never
-// carries a token. OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the
-// master flag is off.
+// vendor REFUSAL (ErrVendorAccountConnectRejected) clears the pending entry -- the
+// user must begin again -- but a TRANSIENT upstream failure
+// (ErrVendorAccountConnectUpstream: network, 5xx, 429) KEEPS it, so the frontend's
+// next poll simply retries rather than aborting a ~15-minute authorization on one
+// blip. With no device connect in progress (never begun or past the TTL) it is
+// ErrVendorAccountDeviceConnectState. The response never carries a token.
+// OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (connected bool, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -200,16 +216,14 @@ func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal 
 	}
 	code, verifier, stillPending, err := vendorauth.OpenAIDevicePoll(ctx, s.vendorConnect.client, s.vendorConnect.openai, pending.deviceAuthID, pending.userCode)
 	if err != nil {
-		s.vendorDeviceConnect.clear(acc.ID, pending.deviceAuthID)
-		return false, classifyVendorDeviceError(err)
+		return false, s.terminalDeviceError(acc.ID, pending.deviceAuthID, err)
 	}
 	if stillPending {
 		return false, nil
 	}
 	ts, err := vendorauth.ExchangeOpenAIDeviceCode(ctx, s.vendorConnect.client, s.vendorConnect.openai, code, verifier)
 	if err != nil {
-		s.vendorDeviceConnect.clear(acc.ID, pending.deviceAuthID)
-		return false, classifyVendorDeviceError(err)
+		return false, s.terminalDeviceError(acc.ID, pending.deviceAuthID, err)
 	}
 	// The poll and exchange are network round trips; re-load the account so a
 	// rename or status change made meanwhile is not overwritten by the stale copy.
