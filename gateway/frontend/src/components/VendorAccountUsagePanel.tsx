@@ -246,3 +246,40 @@ export function VendorAccountUsage({
     />
   );
 }
+
+/**
+ * The detail view's usage block for one account. A subscription that was never
+ * connected has served nothing, so it has no usage to show and renders nothing;
+ * every other account (an api key, a connected subscription) gets the usage panel.
+ * Only an account the gateway can actively ask (hasActiveUsagePull: a connected
+ * OpenAI subscription) is handed `onRefresh`, which gives it the refresh button and
+ * the one on-view refresh; the others only learn their usage from the requests they
+ * serve. The panel is keyed by the account id, so another account never inherits the
+ * previous one's snapshot, outcome or on-view refresh.
+ */
+export function VendorAccountUsageSection({
+  t,
+  api,
+  account,
+  refreshKey,
+  onRefresh,
+}: Readonly<{
+  t: Translation;
+  api: Pick<PortalApi, 'vendorAccount' | 'refreshUsage'>;
+  account: VendorAccount;
+  refreshKey: number;
+  onRefresh: (id: VendorAccount['id']) => Promise<VendorUsageRefresh>;
+}>) {
+  const usageCapable = account.auth_type === 'api_key' || account.subscription_connected;
+  if (!usageCapable) return null;
+  return (
+    <VendorAccountUsage
+      key={account.id}
+      t={t}
+      api={api}
+      accountId={account.id}
+      refreshKey={refreshKey}
+      onRefresh={hasActiveUsagePull(account) ? onRefresh : undefined}
+    />
+  );
+}

@@ -24,7 +24,7 @@ import { vendorLabel } from './shared/vendorLabel';
 import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
 import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 import { VendorAccountModels } from './VendorAccountModels';
-import { hasActiveUsagePull, VendorAccountUsage } from './VendorAccountUsagePanel';
+import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
@@ -81,11 +81,11 @@ function hasCredential(account: VendorAccount): boolean {
  * The detail view also shows a "Check credentials" panel
  * (VendorConnectionTest): a "Test connection" button whose verdict is about the
  * stored credential only, not about any model -- and a "Usage & limits" panel
- * (VendorAccountUsage) for any account that can have a rate-limit snapshot: an api
- * key or a connected subscription. The panel is always there for such an account
- * (its limits, or an empty-state line) and shows only the limits the vendor
- * actually reports; it reads the snapshot from the single-account GET so it can
- * re-read it on its own. A connected OpenAI subscription -- the one account the
+ * (VendorAccountUsageSection) for any account that can have a rate-limit
+ * snapshot: an api key or a connected subscription. The panel is always there for
+ * such an account (its limits, or an empty-state line) and shows only the limits
+ * the vendor actually reports; it reads the snapshot from the single-account GET so
+ * it can re-read it on its own. A connected OpenAI subscription -- the one account the
  * gateway can actively ask -- also gets a "Refresh" button (a forced usage refresh,
  * independent of the models refresh) and one on-view refresh when the detail opens.
  */
@@ -653,21 +653,16 @@ export function VendorAccountsView({
           />
         </Box>
 
-        {/* A subscription that was never connected has served nothing, so it
-            has no usage to show; everything else gets the frame. Only an account
-            the gateway can actively ask (a connected OpenAI subscription) gets the
-            refresh button and the one on-view refresh; the others only learn their
-            usage from the requests they serve. */}
-        {(account.auth_type === 'api_key' || account.subscription_connected) && (
-          <VendorAccountUsage
-            key={account.id}
-            t={t}
-            api={api}
-            accountId={account.id}
-            refreshKey={usageRefreshes}
-            onRefresh={hasActiveUsagePull(account) ? refreshAccountUsage : undefined}
-          />
-        )}
+        {/* The usage frame for every usage-capable account; the refresh button and
+            the one on-view refresh only for an account the gateway can actively ask
+            (see VendorAccountUsageSection). */}
+        <VendorAccountUsageSection
+          t={t}
+          api={api}
+          account={account}
+          refreshKey={usageRefreshes}
+          onRefresh={refreshAccountUsage}
+        />
 
         {account.auth_type === 'subscription' && (
           <Box sx={{ mt: 3 }}>
