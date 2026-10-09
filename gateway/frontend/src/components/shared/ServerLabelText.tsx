@@ -12,11 +12,11 @@ export function ServerLabelText({
   row,
   t,
   fallback = '',
-}: {
+}: Readonly<{
   row: ServerLabelRow;
   t: Translation;
   fallback?: string;
-}) {
+}>) {
   const label = serverLabel(t, row);
   if (label.text === '') return <>{fallback}</>;
   return label.title ? <span title={label.title}>{label.text}</span> : <>{label.text}</>;
