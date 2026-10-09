@@ -742,9 +742,11 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// load-bearing:
 	//   - TokensPerSecond == 0: a provider-reported rate is a measurement and is
 	//     never replaced by this estimate.
-	//   - VendorAccountID != "": VENDOR targets only. For a self-hosted target a 0
-	//     rate means "the server did not say"; a gateway-derived number there is a
-	//     different quantity and would pollute the speed histogram.
+	//   - VendorAccountID != "": VENDOR targets only. A vendor row has NO provider
+	//     rate at all (no vendor reports one), so the gateway substitutes its own.
+	//     For a self-hosted target a 0 means the server withheld a rate it could
+	//     have reported, and the gateway must NOT substitute its own estimate
+	//     there: it is a different quantity from the server's own measurement.
 	//   - BillingUnit == "": token-metered rows only (ValidateBillingXOR demands
 	//     zero in every token column on an image/audio row).
 	//   - OutputTokens > 0 and a stamped GenStart: a real window and a real count

@@ -517,7 +517,9 @@ Every served request (success or failure) produces exactly one `usage.Event`
 (`gateway/backend/internal/usage/query.go`), recorded once at the single accounting
 choke point, `Server.recordUsage` (`inference_complete.go`). Its fields cover full attribution:
 user/token/service/project id+name, session id/source/agent id, the vendor
-account id that served it (`account_id`, `''` off the vendor path), API flavor, model
+account id that served it (`account_id`, `''` off the vendor path; the account's
+display name is a separate, read-time-only `account_name` on the list DTO, see
+"Vendor-account rows" below), API flavor, model
 (requested + effective provider model), route/provider/host, token counts, latency,
 HTTP status/error code, content type, and (additively) energy/cost.
 
@@ -558,6 +560,106 @@ per-endpoint header, which beats a per-endpoint request-body field:
 Because Codex and generic OpenAI traffic share `api_flavor="openai"`, the
 discriminator is the **endpoint**, not the flavor — `sessionEndpoint` distinguishes
 them explicitly.
+
+**Vendor-account rows: an attributed Server cell and a gateway-derived
+tokens/s** (#182). A request served by an external vendor account
+([External Vendor Accounts](external-vendor-accounts.md)) has no AI server, so
+its `host` and `server_name` are empty, and what identifies it is `provider`
+(`vendor_openai`, `vendor_openai_subscription`, `vendor_anthropic`) plus
+`account_id`. No vendor reports a generation rate (no `timings` object of any
+kind), so without help such a row also stores `tokens_per_second = 0` and
+Activity renders it as never measured. Two things make it readable:
+
+- **`account_name`: a transient, read-time attribute of the list DTO.** `usage.Row`
+  (which embeds `usage.Event`) carries `account_name` (`json:"account_name,omitempty"`)
+  next to the event's persisted `account_id`. It is not a column and no store
+  selects it: `Portal.Service.Usage` fills it after the page is read
+  (`attachUsageAccountNames`), resolving once per **distinct** account id, and
+  only for the account's **owner** or an elevated **system admin** — the same read
+  rule as the account itself ([External Vendor Accounts
+  §8](external-vendor-accounts.md#8-owner-scope-rbac)), because an account is a
+  personal credential rather than shared infrastructure. For every other viewer
+  (a plain admin or a project member looking at someone else's row) the name is
+  withheld and the row still carries `account_id`. It is fail-soft by
+  construction — a nil routing store, a hard-deleted account (`usage_events.account_id`
+  has no foreign key, so ids dangle on purpose) or any lookup error leaves the name
+  empty rather than failing the list — and it is deliberately **not** gated on the
+  `vendor_accounts_enabled` flag, so history keeps its names after an operator
+  switches the feature off. The portal's Server cell (`vendorServerLabel.ts`,
+  `ServerLabelText`) renders a vendor row as `<vendor label> · <account_name>`, or,
+  when no name was resolved for this viewer, `<vendor label> · <short account_id>`
+  with the full id in a tooltip; a self-hosted row is unchanged (`server_name`,
+  else `host`).
+- **A derived rate over the generation window.** The stored row's
+  `tokens_per_second` is the exact output-token count over the **generation
+  window** — first token of any kind (reasoning included) to the end of the stream —
+  through the same `minGatewayRateWindow` (50 ms) floor every other gateway
+  derivation uses (`flooredRate`). It is **streaming only** and it is derived
+  **only when the provider reported no rate of its own**: a reported rate is a
+  measurement and is never replaced by an estimate. Three paths do it:
+
+  | Path | Window opens at | Window ends at | Derived by |
+  |---|---|---|---|
+  | **Translate stream** (all three client flavors served by a vendor target through `CompleteStream`) | the first Text **or** Reasoning delta (the `requestProgress` first-token stamp; `streamSession.finish` hands it to `recordUsage` as `usageMeta.GenStart`) | the moment `recordUsage` runs | `recordUsage`, on the **stored event only** |
+  | **OpenAI Responses passthrough** (vendor targets only) | the first of the four Responses content frames: `response.output_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_text.delta`, `response.function_call_arguments.delta` | the last observed byte of the stream | `usageScanner.usage()`, which also requires the authoritative `response.completed` frame |
+  | **Anthropic Messages passthrough** | the first `content_block_delta` | the last observed byte | `usageScanner.usage()`, requiring the authoritative `message_delta`; unchanged by #182 and **not** vendor-gated |
+
+  The translate derivation has four guards, each load-bearing: the provider rate
+  must be `0`; the target must be a **vendor** target (`VendorAccountID != ""`);
+  the row must be **token-metered** (`billing_unit == ''`, since the XOR above
+  demands zero in every token column and both rates of a non-token row); and
+  `OutputTokens > 0` with a stamped `GenStart` (a tool-only translate stream, whose
+  argument fragments surface only once it ends, stamps none, and neither does any
+  non-stream call site). The Responses passthrough derivation is admitted by the
+  scanner's `vendorTarget` flag (`derivesGatewayRate`), because for a
+  **self-hosted** upstream a missing rate means "the server did not say": it is
+  left at `0`, since a gateway-side figure there is a different quantity from
+  llama.cpp's own `predicted_per_second`. Reasoning is counted on both vendor paths
+  on purpose: a reasoning model's `output_tokens` **includes** its reasoning
+  tokens, so a window that opened at the first answer text would leave the
+  reasoning phase out of the denominator and inflate the rate. What stays `0`: a
+  non-streaming (buffered) response, a passthrough stream cut off before its
+  terminal frame, a translate stream that never produced a countable delta, a
+  window under the 50 ms floor, and any self-hosted target.
+- **Where the derived figure goes — and where it does not.** The derived rate
+  **does** enter the Stats tokens/s histograms (§8.4.2) and the Activity
+  tokens/s sort and range filter, because both read the stored event rows. That is
+  accepted and consistent: it is the same quantity the portal chat run shows for
+  the same request, and the Anthropic passthrough already stores a gateway-derived
+  rate on its rows in exactly the same way (the benchmark runner derives its own
+  figure with the same arithmetic). It does **not** feed
+  the routing throughput EWMA. The translate path writes the figure to the stored
+  event only and never to `resp.Usage`, which is what the EWMA feed reads; the
+  Responses passthrough figure does arrive in the returned usage, but the EWMA
+  feed requires the serving application's opportunistic-metrics opt-in
+  (`Target.OpportunisticMetrics`), which no vendor target carries. So a gateway
+  estimate on a vendor row can never become a routing input (see "a recorded rate
+  is a routing input" in §8.4.3).
+- **Verify-live caveat: Responses clients that do not ask for a reasoning
+  summary.** The OpenAI platform and the Codex backend stream a reasoning model's
+  reasoning only as `response.reasoning_summary_text.delta`, and only when the
+  client's request asked for it (`reasoning.summary`). A Responses client that does
+  **not** request a summary emits no reasoning deltas at all, so the window opens
+  at the first text delta, the reasoning phase falls out of the denominator, and
+  the derived rate is **overstated for that client**. Codex and any
+  summary-requesting client are unaffected. This is read off the wire contract
+  and **not yet measured against a live OpenAI endpoint**; treat the figure for a
+  non-summary client as an upper bound until it is.
+- **The Server and tokens/s columns ship hidden.** In the Activity table
+  `server_name` (the Server column) and `tokens_per_second` are both
+  `defaultVisible: false` (`activityColumns.ts`), so the attributed Server cell and
+  the derived rate appear only once a user enables those columns from the column
+  menu. This is a note on the current default, not a requirement.
+- **Known gaps, recorded as follow-ups rather than implied away.** (1) The live
+  **ActiveRequestsPanel** row of an in-flight vendor request is **not**
+  attributed: the live DTO (§8.4.3) carries no provider or account fields, so
+  showing `<vendor> · <account>` there needs a backend DTO change. (2) The
+  Activity **`server` text filter and the `server` group-by match `server_name`
+  server-side** (the filter also `host`, both empty on a vendor row), so a vendor
+  row cannot be found, or grouped, by vendor or account name; closing that needs a
+  SQL join against the account table in the store. Until then vendor rows fold
+  into the empty-server bucket, and the expanded member rows show the attributed
+  label.
 
 **The billable measure is a `(billing_unit, billing_quantity)` pair** (migration
 v81), not a scalar, and it is an **XOR** with the token columns.
@@ -858,7 +960,8 @@ from an absent field) and exactly one of three values:
   delta would divide an exact count by ~0 and render an absurd figure for one
   poll, and the row simply keeps the em dash it was already showing. The same
   constant now floors two more sites that divide an exact output-token count
-  by a wall-clock window: the native-passthrough Anthropic fallback below, and
+  by a wall-clock window: the native-passthrough derived rate below (Anthropic,
+  and the OpenAI Responses shape for a vendor target), and
   the benchmark runner, whose copy of this guard matters more than either —
   see "a recorded rate is a routing input" further down.
 - `""` (empty) — not measured.
@@ -927,7 +1030,7 @@ feature:
 
 | | `anthropic_messages` | `openai_responses` |
 |---|---|---|
-| TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.function_call_arguments.delta` stamps it |
+| TTFT | yes — the first `content_block_delta` stamps it | yes — the first of `response.output_text.delta` / `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` / `response.function_call_arguments.delta` stamps it |
 | output tokens | yes, from the first `message_delta` on: it carries the message's cumulative `usage.output_tokens` | **yes, once the outgoing body carries `timings_per_token`** — those partials then carry llama.cpp's own `timings.predicted_n`, and that is the count. The column that renders it ships **hidden** and is revealed from the panel's column menu (the column inventory at the top of this section). Without the flag there is no mid-stream source at all: the `*.delta` partials carry no usage object, and counting deltas as tokens is the option this feature already rejected above. **It is an UPSTREAM count, not a count of what the client has received.** It advances only on the partials that happen to carry a `timings` object, so the series is monotone but **not contiguous** (a measured run ran 1…27 on the reasoning deltas, then 30, 31, 32 — two tokens generated across frames that carry no `timings`), and mid-stream it can trail the terminal `response.usage.output_tokens` by a token or two. That is why it travels in a field of its own (`inference.Usage.LiveOutputTokens`, never `OutputTokens`) and reaches the live counter only: the recorded row, `usage_events`, the Activity totals, the usage timeseries and the rate limiter are all built from the accumulator and never see it. **No test may assert equality between the last partial count and the recorded total** — such a test passes on cap-truncated data, where both numbers are the cap, and fails on a naturally ending generation. |
 | rate | derived over the window from that exact count, labelled `gateway`; llama.cpp attaches no `timings` object to any Anthropic frame, so the derivation is the only source, exactly as for this flavor's recorded rate further down | mid-stream when the outgoing body carries `timings_per_token` — the **client's own**, or the one the **operator's** per-endpoint opt-in injects — and then labelled `upstream`: a `timings` object attached by the upstream to a PARTIAL frame is the only upstream source, and the gateway reads one off whatever partial carries it. A `gateway`-labelled rate is reachable here too since this flavor gained a mid-stream count, in the narrow window where a timings-bearing partial carries a `predicted_n` but a `predicted_per_second` of `0.0` — the measured series opens at exactly that, and only a positive rate is stored, so the earliest flagged partials give the row an exact count and no rate, and the feature's one derivation runs over that count. That is accepted and pinned rather than suppressed: the structural invariant is that a gateway-derived rate is only ever computed over an **exact upstream count**, and `predicted_n` is exactly that, so suppressing it would mean inventing a per-flavor exception inside the single derivation this feature has. That llama.cpp's Responses implementation does attach one is now MEASURED, not carried over from its chat streams: on the operator's deployment (build `b10448-ad1de39e0`, § "the bias … are measured" below) a flagged request measured DIRECT to the runtime router had 39 of its 48 frames carry a top-level `timings` object, on `response.reasoning_text.delta` and `response.output_text.delta` alike — one build on one deployment, not a general guarantee. Either way the flag is the only thing that can put an UPSTREAM-reported rate on this cell mid-stream: **the same prompt replayed WITHOUT the flag produced exactly one timings-bearing frame** — the terminal one, which is the next paragraph's subject, not this cell's. (A replay, not the same request: a request either carried the flag or it did not.) |
 
@@ -2082,7 +2185,9 @@ is the per-flavor table above. Everything native passthrough reports comes from
 reading the *response* rather than from asking for anything extra in the
 request: `mergePassthroughUsage` now also reads llama.cpp's `timings` object off
 the Responses shape, and — for the Anthropic shape, which carries no timings on
-any frame — `usageScanner`
+any frame, and for the OpenAI Responses shape **when the target is a vendor
+account** (OpenAI's platform and the Codex backend report no `timings` either) —
+`usageScanner`
 derives a rate from the exact output-token count over the generation window
 (first content frame → last observed byte), mirroring the benchmark runner's
 own arithmetic — literally the same `minGatewayRateWindow` floor, not merely
@@ -2090,6 +2195,28 @@ a similar one: a window under 50 ms is suppressed rather than divided into,
 for the same reason the live-progress cell above suppresses one (a warm pass
 whose whole completion arrives microseconds after the first byte would divide
 an exact count by ~0 and yield an implausible rate).
+
+**The Responses derivation is vendor-gated, and its window opens at the first
+token of any kind.** `newUsageScanner` is told whether the relay's target is a
+vendor account (`vendorTarget`, from `Target.VendorAccountID != ""`), and
+`derivesGatewayRate` admits the Responses flavor only then: for a **self-hosted**
+Responses upstream an absent `timings` object means "the server did not say" and
+stays `0`, because a gateway-side figure there is a different quantity from
+llama.cpp's own `predicted_per_second`. For both flavors the figure also needs
+the authoritative terminal frame (below) and a non-streaming body derives
+nothing, since a buffered body has no content frame and so no window. The
+Responses content frames that open the window are **four**:
+`response.output_text.delta`, `response.reasoning_text.delta`,
+`response.reasoning_summary_text.delta` and
+`response.function_call_arguments.delta` — the summary delta is the one the
+OpenAI platform and the Codex backend actually stream for a reasoning model, and
+it is counted so that the window covers the reasoning phase (the output-token
+count includes reasoning tokens; see the verify-live caveat for a client that
+requests no summary in §8.4.1, "Vendor-account rows"). The first-content stamp
+this scan publishes is the same one the live TTFT cell reads, so the TTFT cell's
+frame list above gained the summary delta with it. The translate path derives its
+own figure in `recordUsage` instead; the full rule, the statistics it enters and
+the routing input it deliberately does not reach are in §8.4.1.
 
 That derived rate requires an **authoritative terminal usage frame**
 (`isTerminalUsageFrame`, defined per flavor beside the content-frame
@@ -2258,9 +2385,9 @@ distinguish. That is the whole reason the two travel in different fields: the
 gate exists to keep a placeholder off the live column, and an upstream's own
 per-frame count is not one. One predicate, one definition per flavor, three
 consumers — the derived rate, the frame that freezes the recorded rate's
-capture, and the live count — so the predicate's Responses branch now has two
-readers of its own (the live count, and the rate capture above) where the
-Anthropic-only derived rate gives it none.
+capture, and the live count — so the predicate's Responses branch has three
+readers of its own (the live count, the rate capture above, and the derived rate
+that a **vendor** Responses target now takes).
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds
@@ -2274,7 +2401,10 @@ reports a rate, it can contribute — which is why the rate it reports must come
 from an exact, authoritative count and never from a placeholder. The window
 floor above matters here for the same reason: an implausible passthrough
 sample would blend into that EWMA and stay there until enough real samples
-diluted it back out.
+diluted it back out. The vendor Responses derivation above does not widen that
+surface: the EWMA feed needs the serving application's opportunistic-metrics
+opt-in (`Target.OpportunisticMetrics`), which no vendor target carries, so a
+derived vendor rate is stored and displayed but never blended into routing.
 
 **The benchmark runner's own copy of this floor (`benchmark_runner.go`'s
 `streamOnce`) matters MORE than either of the two above, because its result
