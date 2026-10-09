@@ -178,3 +178,125 @@ func TestOpenAIAPIKeyResponsesDispatchIsLosslessPassthrough(t *testing.T) {
 		t.Fatal("the key leaked into the relayed stream")
 	}
 }
+
+// openAIPacedResponsesStub is an httptest stand-in for api.openai.com's
+// /v1/responses that serves a reasoning model's stream the way a real one
+// arrives: the first reasoning-summary delta, then -- after a real gap, because
+// the usage scanner's generation window is measured between arrivals -- the text
+// delta and the terminal response.completed. Like the real OpenAI platform it
+// carries no `timings` on any frame.
+func newOpenAIPacedResponsesStub(t *testing.T, gap time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hm\"}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(gap)
+		_, _ = io.WriteString(w,
+			"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n"+
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_paced\",\"usage\":{\"input_tokens\":4,\"output_tokens\":6,\"total_tokens\":10}}}\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow proves
+// the #182 headline end to end for a vendor Responses passthrough: the REAL
+// proxyNative relays a resolver-built api-key OpenAI target's stream, and the
+// recorded usage row carries a gateway-derived tokens/s (OpenAI reports none),
+// attributed to the vendor account. The upstream pauses for gap between the first
+// (reasoning) delta and the rest, which gives the scanner a generation window
+// comfortably wider than minGatewayRateWindow; the exact figures are pinned by the
+// scanner tests, so this one only proves the rate reaches the recorded row.
+func TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow(t *testing.T) {
+	// Generous against the 50ms window floor: the scanner measures between the two
+	// READ times, and a loaded machine can delay the first read by tens of ms.
+	const gap = 300 * time.Millisecond
+	upstream := newOpenAIPacedResponsesStub(t, gap)
+	srv, _, _ := newVendorAccountSettingsTestServer(t, true)
+	cipher := newDispatchCipher(t)
+	srv.Cipher = cipher
+	srv.Provider = provider.NewMultiplexer(map[string]provider.Client{
+		routing.ProviderVendorOpenAI: provider.NewOpenAICompatibleClient(upstream.Client()),
+	}, provider.NewMock())
+	target := resolveAPIKeyOpenAITarget(t, cipher, "openai_responses", upstream.URL)
+	if target.VendorAccountID != apiKeyAccountID || target.ResponsesMode != routing.EndpointModePassthrough {
+		t.Fatalf("resolver-built target = %+v, want a vendor Responses passthrough target for %s", target, apiKeyAccountID)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(apiKeyResponsesBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+vaOwnerSecret)
+	rec := httptest.NewRecorder()
+	srv.proxyNative(rec, req, nativeRelay{
+		token:    auth.Token{ID: "tok_rate", UserID: "usr_va_a", Active: true},
+		target:   target,
+		path:     upstreamPath(target, "openai_responses"),
+		raw:      []byte(apiKeyResponsesBody),
+		pfReq:    inference.Request{Model: target.Model, RequestedModel: target.Model, APIFlavor: "openai_responses", Stream: true},
+		endpoint: endpointResponses,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxyNative status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.AccountID != apiKeyAccountID || ev.OutputTokens != 6 {
+		t.Fatalf("usage row = account %q / output %d, want %s / 6", ev.AccountID, ev.OutputTokens, apiKeyAccountID)
+	}
+	// Only "a derived rate was recorded" is asserted here. The exact values are
+	// pinned deterministically by the scanner tests (controlled timestamps); this
+	// test's real-time window is T_read(chunk 2) - T_read(chunk 1), which shrinks
+	// under scheduler/CPU load, so any upper bound derived from the upstream's
+	// sleep would be a flake. The > 0 is still meaningful end to end: the stream's
+	// only content before the pause is a reasoning-summary delta, so without
+	// reasoning counted as content the window would collapse to the single chunk
+	// carrying the text delta and the terminal frame, below the floor, and the
+	// rate would be 0.
+	if ev.TokensPerSecond <= 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want > 0 (a gateway-derived rate on the vendor row; the window opens at the reasoning delta)", ev.TokensPerSecond)
+	}
+}
+
+// TestSelfHostedResponsesPassthroughRecordsNoDerivedRate is the negative control
+// through the same proxyNative wiring: a self-hosted (non-vendor) target relaying
+// the same paced stream with no `timings` records rate 0 -- the vendor flag the
+// scanner is built with must be false there.
+func TestSelfHostedResponsesPassthroughRecordsNoDerivedRate(t *testing.T) {
+	prov := pacedNativeProxyProvider{
+		pieces: []string{
+			"event: response.reasoning_summary_text.delta\n" + `data: {"type":"response.reasoning_summary_text.delta","delta":"hm"}` + "\n\n",
+			"event: response.output_text.delta\n" + `data: {"type":"response.output_text.delta","delta":"Hello"}` + "\n\n" +
+				"event: response.completed\n" + `data: {"type":"response.completed","response":{"id":"r","usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}}` + "\n\n",
+		},
+		gap: 80 * time.Millisecond,
+	}
+	srv := newNativeProxyTestServer(prov, true, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gw-model","stream":true,"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	if events[0].OutputTokens != 6 {
+		t.Fatalf("recorded OutputTokens = %d, want 6", events[0].OutputTokens)
+	}
+	if events[0].TokensPerSecond != 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want 0 (a self-hosted Responses stream without upstream timings stays unrated)", events[0].TokensPerSecond)
+	}
+}

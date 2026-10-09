@@ -127,6 +127,66 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(table).getByRole('cell', { name: '14 ms' })).toBeInTheDocument();
     });
 
+    describe('Server cell for vendor-account rows (#182)', () => {
+      const ACCOUNT_ID = 'va_0123456789abcdef0123456789abcdef';
+      // A vendor row has NO server_name/host: the Server cell attributes it to the
+      // vendor account instead of leaving it blank.
+      const vendorRow = (overrides: Partial<UsageEvent> = {}) =>
+        makeRow({
+          server_name: '',
+          host: '',
+          provider: 'vendor_openai',
+          account_id: ACCOUNT_ID,
+          account_name: 'Work key',
+          ...overrides,
+        });
+
+      it('shows "<vendor> · <account name>" when the name is resolved', () => {
+        renderTable({ columns: columnsWithServer, rows: [vendorRow()] });
+        expect(
+          within(screen.getByRole('table')).getByRole('cell', {
+            name: `${t.vendorOpenAI} · Work key`,
+          }),
+        ).toBeInTheDocument();
+      });
+
+      it('shows the short account id with the full id as title when the name is not resolved', () => {
+        renderTable({ columns: columnsWithServer, rows: [vendorRow({ account_name: undefined })] });
+        const cell = within(screen.getByRole('table')).getByRole('cell', {
+          name: `${t.vendorOpenAI} · va_01234567…`,
+        });
+        expect(cell.querySelector('[title]')).toHaveAttribute('title', ACCOUNT_ID);
+        expect(cell).not.toHaveTextContent(ACCOUNT_ID);
+      });
+
+      it('shows the OpenAI label for the subscription provider and the Anthropic label for vendor_anthropic', () => {
+        renderTable({
+          columns: columnsWithServer,
+          rows: [
+            vendorRow({
+              id: 'r_sub',
+              provider: 'vendor_openai_subscription',
+              account_name: 'Seat',
+            }),
+            vendorRow({ id: 'r_ant', provider: 'vendor_anthropic', account_name: 'Claude' }),
+          ],
+        });
+        const table = screen.getByRole('table');
+        expect(
+          within(table).getByRole('cell', { name: `${t.vendorOpenAI} · Seat` }),
+        ).toBeInTheDocument();
+        expect(
+          within(table).getByRole('cell', { name: `${t.vendorAnthropic} · Claude` }),
+        ).toBeInTheDocument();
+      });
+
+      it('leaves a self-hosted row unchanged (server_name, no title)', () => {
+        renderTable({ columns: columnsWithServer, rows: [makeRow()] });
+        const cell = within(screen.getByRole('table')).getByRole('cell', { name: 'GPU 1' });
+        expect(cell.querySelector('[title]')).toBeNull();
+      });
+    });
+
     it('renders an em dash for a legacy row with no recorded requested_model', () => {
       renderTable({
         columns: columnsWithServer,

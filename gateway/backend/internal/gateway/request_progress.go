@@ -31,7 +31,11 @@ type requestProgress struct {
 	// decimal is displayed, so this is ample, and it avoids float bit-punning in
 	// an atomic). 0 means the upstream reported no rate.
 	upstreamTPSMilli atomic.Int64
-	// firstTokenUnixNano stamps the first delta that carried content. 0 = none yet.
+	// firstTokenUnixNano stamps the first delta that carried content, of ANY kind:
+	// the first Text OR Reasoning delta (a reasoning-only opening counts, so the
+	// stamp is the first token the model produced, not the first visible answer
+	// text). 0 = none yet -- on the translate path a tool-only stream never stamps
+	// one (its argument fragments surface only once the stream ends).
 	firstTokenUnixNano atomic.Int64
 }
 
@@ -59,6 +63,22 @@ func (p *requestProgress) observeDelta(at time.Time, prog *inference.StreamProgr
 	if prog.TokensPerSecond > 0 {
 		p.upstreamTPSMilli.Store(int64(prog.TokensPerSecond * 1000))
 	}
+}
+
+// firstTokenAt returns the instant the first content delta was stamped, or the
+// zero time when none has been (a tool-only turn never stamps one). Nil-safe like
+// observeDelta: a request with no progress struct has no first token. It is the
+// read side of the stamp observeDelta writes, exposed so the usage epilogue can
+// derive a rate over the same generation window the live DTO uses.
+func (p *requestProgress) firstTokenAt() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	n := p.firstTokenUnixNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 // minGatewayRateWindow floors the generation window a GATEWAY-derived rate may be

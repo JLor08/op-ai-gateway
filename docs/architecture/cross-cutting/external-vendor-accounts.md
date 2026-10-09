@@ -1088,6 +1088,10 @@ scope too, because each sends the stored credential to the vendor: they are
 authorized like a write, not like a metadata read. Routing and the model
 listings (§6.7) enforce the same owner scope by enumerating only the principal's
 own accounts, so one user's account can never serve, or be listed to, another.
+The Activity list follows the same read rule for the account's **name**: a usage
+row carries its `account_id` for every viewer, but the transient `account_name` is
+resolved only for the owner or a `system` admin and stays empty for anyone else
+([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
 ## 9. Secrets at rest
 

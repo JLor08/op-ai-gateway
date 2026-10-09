@@ -108,3 +108,35 @@ func TestUsageStatsJSONKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageRowMarshalsAccountNameNextToAccountID proves the vendor-account
+// attribution reaches the wire through the embedded Event: account_id comes
+// from Event, account_name from the transient Row field, and an unresolved
+// name is omitted rather than serialized as "".
+func TestUsageRowMarshalsAccountNameNextToAccountID(t *testing.T) {
+	marshal := func(row Row) map[string]any {
+		t.Helper()
+		blob, err := json.Marshal(row)
+		if err != nil {
+			t.Fatalf("marshal row: %v", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(blob, &m); err != nil {
+			t.Fatalf("unmarshal row: %v", err)
+		}
+		return m
+	}
+
+	resolved := marshal(Row{Event: Event{ID: "req_1", AccountID: "vacc_1"}, AccountName: "Work Claude"})
+	if resolved["account_id"] != "vacc_1" || resolved["account_name"] != "Work Claude" {
+		t.Fatalf("resolved row = account_id %v account_name %v, want vacc_1 / Work Claude", resolved["account_id"], resolved["account_name"])
+	}
+
+	unresolved := marshal(Row{Event: Event{ID: "req_2", AccountID: "vacc_1"}})
+	if unresolved["account_id"] != "vacc_1" {
+		t.Fatalf("unresolved row account_id = %v, want vacc_1", unresolved["account_id"])
+	}
+	if _, present := unresolved["account_name"]; present {
+		t.Fatalf("unresolved row serialized account_name = %v, want it omitted", unresolved["account_name"])
+	}
+}

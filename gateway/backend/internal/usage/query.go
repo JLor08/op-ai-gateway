@@ -165,8 +165,15 @@ type GroupBucket struct {
 // filled only for ScopeAll queries. Event stays untouched; UserName is read-only.
 type Row struct {
 	Event
-	UserName   string `json:"user_name,omitempty"`
-	HasCapture bool   `json:"has_capture"`
+	UserName string `json:"user_name,omitempty"`
+	// AccountName is the display name of the vendor account that served the row
+	// (Event.AccountID), resolved at read time by the portal layer — never
+	// persisted, never selected by a store. It is filled only for a viewer who
+	// may see that account (its owner, or a system admin) and stays empty for
+	// everyone else, for a non-vendor row, and for an account that has since
+	// been deleted; Event.AccountID itself is always on the row.
+	AccountName string `json:"account_name,omitempty"`
+	HasCapture  bool   `json:"has_capture"`
 	// CaptureLocked is true when a capture exists but is secret and the viewer
 	// is an admin who is not the owner: the Activity list shows a lock (SP-2e),
 	// never the content. Mutually exclusive with HasCapture per row.

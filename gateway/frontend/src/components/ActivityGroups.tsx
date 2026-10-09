@@ -27,6 +27,7 @@ import { isTokenMetered } from './billingUnit';
 import { TokenAggregateValue } from './TokenAggregateValue';
 import { SettingsMenu } from './SettingsMenu';
 import { useColumnSettings } from './shared/useColumnSettings';
+import { ServerLabelText } from './shared/ServerLabelText';
 import { dimLabel } from './GroupByChainBuilder';
 
 // Members shown per page inside an expanded group.
@@ -412,7 +413,9 @@ export function ActivityGroups({
             {memberRows.map((m) => (
               <TableRow key={m.id}>
                 <TableCell>{m.model}</TableCell>
-                <TableCell>{m.server_name || '-'}</TableCell>
+                <TableCell>
+                  <ServerLabelText row={m} t={t} fallback="-" />
+                </TableCell>
                 <TableCell align="right">
                   {isTokenMetered(m) ? (
                     m.total_tokens

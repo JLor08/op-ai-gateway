@@ -558,6 +558,41 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getAllByRole('button', { name: t.listColumns })).toHaveLength(1);
     });
 
+    it("attributes an expanded vendor member to its account in the member table's Server cell (#182)", async () => {
+      const accountId = 'va_0123456789abcdef0123456789abcdef';
+      const activity = vi.fn(async () =>
+        makePage([
+          makeMember({
+            id: 'm_named',
+            model: 'gpt-named',
+            server_name: '',
+            host: '',
+            provider: 'vendor_openai',
+            account_id: accountId,
+            account_name: 'Work key',
+          }),
+          makeMember({
+            id: 'm_unnamed',
+            model: 'claude-unnamed',
+            server_name: '',
+            host: '',
+            provider: 'vendor_anthropic',
+            account_id: accountId,
+          }),
+        ]),
+      );
+      const api = renderGroups({ activity }, ['server']);
+
+      fireEvent.click(await screen.findByText('GPU A'));
+      await waitFor(() => expect(api.activity).toHaveBeenCalled());
+
+      const namedRow = (await screen.findByText('gpt-named')).closest('tr') as HTMLElement;
+      expect(within(namedRow).getByText(`${t.vendorOpenAI} · Work key`)).toBeInTheDocument();
+      const unnamedRow = (await screen.findByText('claude-unnamed')).closest('tr') as HTMLElement;
+      const shortCell = within(unnamedRow).getByText(`${t.vendorAnthropic} · va_01234567…`);
+      expect(shortCell).toHaveAttribute('title', accountId);
+    });
+
     describe('billable unit (#70): the three-state rule for a group', () => {
       it('marks a mixed-unit group and dashes an all-non-token group', async () => {
         const usageGroups = vi.fn(async () => ({

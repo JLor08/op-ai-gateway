@@ -255,9 +255,11 @@ func (ss *streamSession) terminalStatus(streamErr error) (status, errorCode stri
 // finish runs the recordUsage/capture epilogue common to all three flavors: the
 // SSE response headers (200, text/event-stream) were already written before
 // streaming began, regardless of any mid-stream error, so both are always
-// reported as such here.
+// reported as such here. GenStart is the live progress counter's first-token
+// stamp (zero for a tool-only stream): recordUsage uses it to derive a tokens/s
+// for a vendor-account row whose provider reported none.
 func (ss *streamSession) finish(usage inference.Usage, status, errorCode string) {
 	streamCI := buildCaptureInput(ss.capturing, ss.token.UserID, ss.token.Secret, ss.r, ss.raw, ss.w.Header(), ss.respBuf.Bytes(), http.StatusOK, ss.req.APIFlavor)
 	attachTranslatedCapture(streamCI, ss.captureSink)
-	ss.s.recordUsage(ss.start, ss.token, ss.req, ss.target, provider.Response{Usage: usage}, errorCode, status, usageMeta{ReqPath: ss.r.URL.Path, HTTPStatus: http.StatusOK, ContentType: "text/event-stream"}, ss.id, streamCI, ss.captureSink.ResponseHeaders())
+	ss.s.recordUsage(ss.start, ss.token, ss.req, ss.target, provider.Response{Usage: usage}, errorCode, status, usageMeta{ReqPath: ss.r.URL.Path, HTTPStatus: http.StatusOK, ContentType: "text/event-stream", GenStart: ss.progress.firstTokenAt()}, ss.id, streamCI, ss.captureSink.ResponseHeaders())
 }
