@@ -416,30 +416,44 @@ func (s *Service) discoverSubscriptionModels(ctx context.Context, vendor string,
 	}
 }
 
-// refreshVendorUsage pulls an OpenAI subscription account's usage snapshot (the
+// refreshVendorUsage is the best-effort usage pull the models refresh runs after
+// its model write: fetchVendorUsage with its status discarded, so it returns
+// nothing and cannot change a refresh's outcome. ts is the account's current token
+// set, the one the model discovery opened and, if it was expired, renewed through
+// the gateway's locked refresher: this path never opens or renews a token itself.
+func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) {
+	_ = s.fetchVendorUsage(ctx, acc, ts)
+}
+
+// fetchVendorUsage pulls an OpenAI subscription account's usage snapshot (the
 // five-hour and weekly windows, the credit balance and, for a Business plan, the
 // spend control and the credit state) and stores it MERGED over
 // the stored one (routing.MergeVendorAccountUsage: a field the pull does not know
 // never blanks one the passive header scrape already stored). ts is the account's
-// current token set, the one the model discovery opened and, if it was expired,
-// renewed through the gateway's locked refresher: this path never opens or renews
-// a token itself.
+// current token set; the caller opened (and, if it was expired, renewed) it, so
+// this never opens or renews a token itself.
 //
 // It runs ONLY for an OpenAI subscription account that has an access token (an
 // api_key account and every Anthropic account are skipped, the fetcher is never
-// called) and is purely ADDITIVE and BEST EFFORT: it returns nothing, so it cannot
-// change a refresh's outcome. An unverifiable fetch (a 401 included: only the
-// dispatch flips an account to needs_reconnect), a failed read of the stored
-// snapshot or a failed write is logged at Debug with the account id (never a token)
-// and leaves the stored snapshot exactly as it was.
-func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) {
-	if acc.AuthType != routing.VendorAuthSubscription || acc.Vendor != routing.VendorOpenAI || ts.AccessToken == "" {
-		return
+// called) and is purely ADDITIVE and BEST EFFORT: it answers a status and never an
+// error. The status is VendorUsageRefreshOK when a snapshot was stored,
+// VendorUsageRefreshUnsupported when the gate above fails, and
+// VendorUsageRefreshUnverifiable for a fetch that was not OK (a 401 included: only
+// the dispatch flips an account to needs_reconnect), a failed read of the stored
+// snapshot or a failed write -- each logged at Debug with the account id (never a
+// token) and leaving the stored snapshot exactly as it was.
+//
+// Once the vendor was asked, whatever it answered, the attempt is recorded as the
+// account's last active pull (vendorUsagePulls), which the lazy refresh's TTL reads.
+func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) string {
+	if !hasActiveVendorUsagePull(acc) || ts.AccessToken == "" {
+		return VendorUsageRefreshUnsupported
 	}
 	usage, status := s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
+	s.vendorUsagePulls.record(acc.ID, s.clock())
 	if status != vendorauth.DiscoveryOK {
 		slog.Debug("vendor account usage fetch was unverifiable; the stored usage is kept", "account", acc.ID)
-		return
+		return VendorUsageRefreshUnverifiable
 	}
 	snapshot := routing.VendorAccountUsage{
 		AccountID:       acc.ID,
@@ -462,14 +476,16 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 	existing, found, err := s.routes.VendorAccountUsageByID(ctx, acc.ID)
 	if err != nil {
 		slog.Debug("vendor account usage read for merge failed; the stored usage is kept", "account", acc.ID, "err", err)
-		return
+		return VendorUsageRefreshUnverifiable
 	}
 	if found {
 		snapshot = routing.MergeVendorAccountUsage(existing, snapshot)
 	}
 	if err := s.routes.UpsertVendorAccountUsage(ctx, snapshot); err != nil {
 		slog.Debug("vendor account usage write failed; the stored usage is kept", "account", acc.ID, "err", err)
+		return VendorUsageRefreshUnverifiable
 	}
+	return VendorUsageRefreshOK
 }
 
 // noVendorDiscoveryNote is the note for an account whose vendor or auth type has

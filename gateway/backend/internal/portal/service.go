@@ -763,6 +763,10 @@ type Service struct {
 	// discovery's replace and a prefix re-label) per account, so they cannot undo
 	// each other (see accountLocks).
 	vendorModelWrites accountLocks
+	// vendorUsagePulls remembers when each account's usage was last pulled from the
+	// vendor (in memory, zero value ready), so the on-view lazy usage refresh can
+	// skip a pull that is still fresh (see vendorUsagePullTracker).
+	vendorUsagePulls vendorUsagePullTracker
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.

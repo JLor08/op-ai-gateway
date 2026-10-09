@@ -154,6 +154,7 @@ type API interface {
 	ReconcileCertificates(context.Context)
 	ReconcileGatewayPeer(context.Context) (string, bool, error)
 	RefreshVendorAccountModels(context.Context, auth.Token, string) (VendorAccountDTO, RefreshResult, error)
+	RefreshVendorAccountUsage(context.Context, auth.Token, string, time.Duration) (*VendorAccountUsageDTO, VendorUsageRefreshResult, error)
 	RegenerateNetbirdKey(context.Context, auth.Token, string) (string, string, error)
 	ReissueAllCertificates(context.Context, auth.Token) error
 	ReissueEdgeCertificate(context.Context, auth.Token) error
