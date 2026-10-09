@@ -3088,6 +3088,30 @@ portal dashboard's live-routes table, while the admin Models management page
 views differ on purpose.
 → [External Vendor Accounts §6](cross-cutting/external-vendor-accounts.md#6-dynamic-model-discovery-and-the-model-prefix).
 
+**Follow-up: usage and limits made visible and refreshable (also no new
+decision).** An OpenAI subscription's usage snapshot used to be refreshed only as
+the last step of a models refresh or connect, and only the account's detail view
+showed it. It now has its own owner-only
+`POST /api/portal/vendor-accounts/{id}/usage/refresh`, which pulls the usage
+without re-listing the models and is fail-soft the way the models refresh is. The
+detail view's usage panel calls it **lazily when opened** and from a refresh
+button, and a server-side TTL of five minutes, kept in memory per account and
+recorded only when the vendor was actually reached, stops a view-triggered pull from
+asking the vendor again and again. The list endpoint now carries each row's snapshot
+(fail-soft, so a snapshot that cannot be read never fails the list), and the portal
+dashboard gains a flag-gated "Anbieter — Nutzung & Limits" section that reads only
+those stored snapshots and never calls the vendor. The panel shows only the limits
+the vendor reports and keeps a titled frame with an empty-state line for an account
+that reports none. Choice (c) extends rather than changes: the ChatGPT usage endpoint
+is one more reverse-engineered, ToS-restricted vendor call, so it is asked only when
+a person looks (human-correlated, TTL-capped), not on a timer; its Business-plan
+response has been confirmed live once, while the Plus/Pro `rate_limit` window shape
+is still unconfirmed ([§11.1](11-risks-and-technical-debt.md#111-operational-risks)).
+A **background refresher** that keeps every account's usage current without anyone
+opening it is deliberately not built and remains a follow-up, to be opt-in and
+default-off.
+→ [External Vendor Accounts §5](cross-cutting/external-vendor-accounts.md#5-usage--limits).
+
 → [External Vendor Accounts](cross-cutting/external-vendor-accounts.md),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
