@@ -38,6 +38,14 @@ export type UsageEvent = {
   stream: boolean;
   token_name: string;
   server_name: string;
+  // The vendor account (an external AI vendor such as OpenAI/Anthropic) that
+  // served the request. A vendor row has an EMPTY server_name and host and a
+  // `vendor_*` provider; account_id identifies the account and is always present
+  // on such a row. account_name is resolved by the backend only for the account's
+  // owner or an elevated system admin, and is absent for everyone else (and for a
+  // deleted account) -- so render "account_id present, account_name empty" too.
+  account_id?: string;
+  account_name?: string;
   // ServiceID / ServiceName attribute the request to a Service Account (Phase 1
   // service accounts) when it was served by a service token; empty/absent for
   // ordinary user-token/session usage. Mirrors token_id/token_name.

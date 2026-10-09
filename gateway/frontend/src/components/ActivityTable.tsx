@@ -27,6 +27,7 @@ import { formatCost, type CurrencyUnit } from '../currency';
 import { formatMetric } from './shared/format';
 import type { Translation } from './shared/types';
 import { IconAction } from './shared/IconAction';
+import { ServerLabelText } from './shared/ServerLabelText';
 import { StatusChip } from './shared/StatusChip';
 import { usageChipStatus } from './shared/status';
 import { ColumnFilter } from './shared/ColumnFilter';
@@ -129,7 +130,7 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
     case 'model':
       return row.model;
     case 'server_name':
-      return row.server_name || row.host;
+      return <ServerLabelText row={row} t={t} />;
     case 'http_status':
       return (
         <StatusChip
