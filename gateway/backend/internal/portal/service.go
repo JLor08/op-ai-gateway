@@ -4618,7 +4618,8 @@ func encodeVendorAccessDTO(d *VendorAccessDTO) string {
 		entry := auth.VendorAccessEntry{AccountID: strings.TrimSpace(e.AccountID)}
 		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
 			entry.OverrideEnabled = true
-			entry.OverridePrefix = e.PrefixOverride.Value
+			// Store the value validateVendorAccess validated (it trims).
+			entry.OverridePrefix = strings.TrimSpace(e.PrefixOverride.Value)
 		}
 		v.Accounts = append(v.Accounts, entry)
 	}

@@ -205,6 +205,34 @@ func TestCreateTokenVendorAccessDisabledOverrideIsInert(t *testing.T) {
 	}
 }
 
+// validateVendorAccess checks the TRIMMED override value, so that is the value
+// that must be stored: a padded " work/" would otherwise pass validation as
+// "work/" yet persist (and later be served as a public model id) with the
+// leading space the prefix charset forbids.
+func TestCreateTokenVendorAccessTrimsOverrideValue(t *testing.T) {
+	fx := newTokenVendorAccessFixture(t)
+	ctx := context.Background()
+	resp, err := fx.svc.CreateToken(ctx, fx.owner, CreateTokenRequest{
+		Name: "trim", Scopes: []string{"gateway:use"},
+		VendorAccess: &VendorAccessDTO{Accounts: []VendorAccessEntryDTO{
+			{AccountID: "acc_a", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: " work/ "}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if va := resp.Token.VendorAccess; va == nil || len(va.Accounts) != 1 || va.Accounts[0].PrefixOverride == nil || va.Accounts[0].PrefixOverride.Value != "work/" {
+		t.Fatalf("DTO = %+v, want the override value trimmed to %q", va, "work/")
+	}
+	rec, err := fx.dir.TokenByID(ctx, resp.Token.ID)
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if !strings.Contains(rec.VendorProviderAccess, `"value":"work/"`) {
+		t.Fatalf("stored policy = %s, want the trimmed value %q persisted", rec.VendorProviderAccess, "work/")
+	}
+}
+
 func TestCreateTokenVendorAccessStrictDefault(t *testing.T) {
 	fx := newTokenVendorAccessFixture(t)
 	resp, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{Name: "plain", Scopes: []string{"gateway:use"}})
