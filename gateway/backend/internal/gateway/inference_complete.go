@@ -651,6 +651,13 @@ type usageMeta struct {
 	// usage.ValidateBillingXOR for the contract.
 	BillingUnit     string
 	BillingQuantity float64
+	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
+	// requestProgress first-token stamp); the zero time means "no generation
+	// window" -- every non-stream call site, native passthrough, and a tool-only
+	// stream that never produced a text/reasoning delta. recordUsage uses it
+	// ONLY to derive a tokens/s for a vendor-account row whose provider reported
+	// none (see the fallback there); it never reaches resp.Usage.
+	GenStart time.Time
 }
 
 // opportunisticEWMAAlpha weights each live throughput sample against the running
@@ -726,6 +733,27 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		CreatedAt:        time.Now().UTC(),
 		BillingUnit:      meta.BillingUnit,
 		BillingQuantity:  meta.BillingQuantity,
+	}
+	// Vendor-account rows: no vendor provider reports timings, so
+	// resp.Usage.TokensPerSecond is 0 and the Activity list rendered an em-dash
+	// for the row (#182). Fill the STORED row (and only it) with output tokens over
+	// the generation window -- first content delta to now -- floored exactly like
+	// the chat run's own end-of-chat figure, so the two agree. Every guard is
+	// load-bearing:
+	//   - TokensPerSecond == 0: a provider-reported rate is a measurement and is
+	//     never replaced by this estimate.
+	//   - VendorAccountID != "": VENDOR targets only. For a self-hosted target a 0
+	//     rate means "the server did not say"; a gateway-derived number there is a
+	//     different quantity and would pollute the speed histogram.
+	//   - BillingUnit == "": token-metered rows only (ValidateBillingXOR demands
+	//     zero in every token column on an image/audio row).
+	//   - OutputTokens > 0 and a stamped GenStart: a real window and a real count
+	//     (tool-only turns and every non-stream call site leave GenStart zero).
+	// resp.Usage is deliberately NOT touched: the opportunistic EWMA below reads
+	// it, and a gateway-side estimate must never become a routing input.
+	if event.TokensPerSecond == 0 && target.VendorAccountID != "" && meta.BillingUnit == "" &&
+		event.OutputTokens > 0 && !meta.GenStart.IsZero() {
+		event.TokensPerSecond = flooredRate(event.OutputTokens, event.CreatedAt.Sub(meta.GenStart))
 	}
 	// The XOR is an invariant of the row, not a suggestion. A violation means a
 	// producer is wrong, so it is logged at Error and the row is written

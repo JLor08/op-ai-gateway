@@ -61,6 +61,22 @@ func (p *requestProgress) observeDelta(at time.Time, prog *inference.StreamProgr
 	}
 }
 
+// firstTokenAt returns the instant the first content delta was stamped, or the
+// zero time when none has been (a tool-only turn never stamps one). Nil-safe like
+// observeDelta: a request with no progress struct has no first token. It is the
+// read side of the stamp observeDelta writes, exposed so the usage epilogue can
+// derive a rate over the same generation window the live DTO uses.
+func (p *requestProgress) firstTokenAt() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	n := p.firstTokenUnixNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
 // minGatewayRateWindow floors the generation window a GATEWAY-derived rate may be
 // computed over. Without it a DTO built microseconds after the first delta divides
 // an exact count by a window of ~0 and renders something like "1000000.0" for one

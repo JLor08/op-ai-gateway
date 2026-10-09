@@ -248,3 +248,23 @@ func TestLiveProgressDTO(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestProgressFirstTokenAt covers the read side of the first-token stamp:
+// nil and unstamped both mean "no first token" (zero time), and a stamped value
+// round-trips to the instant observeDelta recorded.
+func TestRequestProgressFirstTokenAt(t *testing.T) {
+	var nilProgress *requestProgress
+	if got := nilProgress.firstTokenAt(); !got.IsZero() {
+		t.Fatalf("nil progress firstTokenAt = %v, want zero", got)
+	}
+	p := &requestProgress{}
+	if got := p.firstTokenAt(); !got.IsZero() {
+		t.Fatalf("unstamped firstTokenAt = %v, want zero", got)
+	}
+	at := time.Unix(1_700_000_000, 123)
+	p.observeDelta(at, nil)
+	p.observeDelta(at.Add(time.Second), nil) // a later delta must not move the stamp
+	if got := p.firstTokenAt(); !got.Equal(at) {
+		t.Fatalf("firstTokenAt = %v, want %v", got, at)
+	}
+}
