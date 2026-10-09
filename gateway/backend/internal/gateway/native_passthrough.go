@@ -352,11 +352,15 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 // streams the raw response back byte-for-byte, so protocol-specific content (Codex
 // tool calls, reasoning items, Claude Code content blocks) is preserved exactly. It
 // mirrors completeStream's idle-watchdog / write-deadline / capture / usage-record
-// machinery. Exactly two body edits are possible, both value-lossless and both
-// described at the body-building step below: the `model` field is rewritten to
-// the upstream's mapped name, and -- only where the operator switched it on for
+// machinery. Exactly two body edits are possible HERE, both value-lossless and
+// both described at the body-building step below: the `model` field is rewritten
+// to the upstream's mapped name, and -- only where the operator switched it on for
 // a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
-// field reaches the upstream as the client wrote it.
+// field reaches the upstream as the client wrote it. One more edit can happen
+// below this layer, in the provider client rather than here: an Anthropic
+// subscription target (Masquerade == claude_code) has the Claude-Code system
+// block injected by AnthropicClient.ProxyNative (also value-lossless, idempotent);
+// an api-key target's body is never touched.
 //
 // Everything the caller decides about the relay arrives in rel; see
 // nativeRelay below for what each of its fields is and why it cannot be
@@ -894,6 +898,9 @@ func anthropicPassthroughHeaderOverrides(target routing.Target, clientHeader htt
 		return nil
 	}
 	client := clientHeader.Values(anthropicBetaHeader)
+	// Merged against an empty static value first purely to ask "does the client
+	// carry any real token?" (blank, whitespace-only and comma-only values do
+	// not); the real merge with the target's own beta follows below.
 	if mergeAnthropicBeta("", client) == "" {
 		return nil
 	}

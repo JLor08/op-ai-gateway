@@ -173,6 +173,19 @@ func TestAnthropicClientProxyNativeMasqueradeInjectsClaudeCodeBlock(t *testing.T
 			`[` + claudeCodeBlockJSON + `,"Be terse."]`,
 		},
 		{
+			// The text equals the Claude-Code line exactly; only the `type` conjunct of
+			// startsWithClaudeCodeBlock says it is not the block, so it must NOT be
+			// taken for the one already present.
+			"array whose first block has the exact text but type image",
+			`,"system":[{"type":"image","text":"You are Claude Code, Anthropic's official CLI for Claude."}]`,
+			`[` + claudeCodeBlockJSON + `,{"type":"image","text":"You are Claude Code, Anthropic's official CLI for Claude."}]`,
+		},
+		{
+			"array whose first block has the exact text but no type",
+			`,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude."}]`,
+			`[` + claudeCodeBlockJSON + `,{"text":"You are Claude Code, Anthropic's official CLI for Claude."}]`,
+		},
+		{
 			"array holding the block but not first",
 			`,"system":[{"type":"text","text":"Be terse."},` + claudeCodeBlockJSON + `]`,
 			`[` + claudeCodeBlockJSON + `,{"type":"text","text":"Be terse."},` + claudeCodeBlockJSON + `]`,
@@ -180,10 +193,11 @@ func TestAnthropicClientProxyNativeMasqueradeInjectsClaudeCodeBlock(t *testing.T
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// 12345678901234567890 exceeds float64 precision: a decode that is not
-			// value-lossless would rewrite it.
+			// 12345678901234567890 exceeds float64 precision, and 1.50 would lose its
+			// trailing zero as a float64: a decode that is not value-lossless
+			// (UseNumber) would rewrite either.
 			in := `{"model":"claude-sonnet-4-5-20250929","max_tokens":64,"stream":true` + tc.system +
-				`,"messages":[{"role":"user","content":"h\u00e9llo <b>"}],"x_big":12345678901234567890,"x_unknown":{"b":1,"a":[3,2,1]}}`
+				`,"messages":[{"role":"user","content":"h\u00e9llo <b>"}],"x_big":12345678901234567890,"x_float":1.50,"x_unknown":{"b":1,"a":[3,2,1]}}`
 
 			capture := proxyNativeCapture(t, masqueradeTarget, in)
 
@@ -208,6 +222,9 @@ func TestAnthropicClientProxyNativeMasqueradeInjectsClaudeCodeBlock(t *testing.T
 			assertJSON(t, "body without system", got, mustJSON(t, want))
 			if !strings.Contains(string(raw), "12345678901234567890") {
 				t.Fatalf("forwarded body = %s, want the big integer relayed value-lossless", raw)
+			}
+			if !strings.Contains(string(raw), `"x_float":1.50`) {
+				t.Fatalf("forwarded body = %s, want the float's spelling 1.50 relayed value-lossless", raw)
 			}
 		})
 	}

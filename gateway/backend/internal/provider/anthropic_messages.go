@@ -48,8 +48,10 @@ const (
 //     inference.Request into a Messages body and parses the Messages response /
 //     SSE stream back into neutral values.
 //   - NATIVE PASSTHROUGH (NativeProxyClient): ProxyNative relays an inbound
-//     /v1/messages body to the same endpoint verbatim, the lossless Claude Code
-//     path, via doNativeProxyWithDefaults.
+//     /v1/messages body to the same endpoint, the lossless Claude Code path, via
+//     doNativeProxyWithDefaults. The body is verbatim except that a subscription
+//     (Masquerade) target gets the Claude-Code system block injected first (see
+//     ProxyNative); an api-key target's body is never touched.
 //
 // It deliberately has no model lister or prober.
 //
