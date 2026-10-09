@@ -7,7 +7,7 @@ import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
 import type { VendorAccount, VendorModelsRefresh, VendorUsageRefresh } from '../api';
-import type { BadgeStatus, PortalApi, Translation } from './shared/types';
+import type { PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
 import { PageTitle } from './shared/PageTitle';
@@ -21,6 +21,7 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { vendorLabel } from './shared/vendorLabel';
+import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
 import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 import { VendorAccountModels } from './VendorAccountModels';
 import { hasActiveUsagePull, VendorAccountUsage } from './VendorAccountUsagePanel';
@@ -43,32 +44,6 @@ function authTypeLabel(t: Translation, authType: string): string {
       return t.vendorAuthSubscription;
     default:
       return authType;
-  }
-}
-
-function statusLabel(t: Translation, status: string): string {
-  switch (status) {
-    case 'active':
-      return t.statusActive;
-    case 'disabled':
-      return t.statusDisabled;
-    case 'needs_reconnect':
-      return t.vendorAccountStatusNeedsReconnect;
-    default:
-      return status;
-  }
-}
-
-// needs_reconnect is system-managed (a failed subscription token refresh) and
-// reads as a warning, not as an active or a switched-off account.
-function statusBadge(status: string): BadgeStatus {
-  switch (status) {
-    case 'active':
-      return 'active';
-    case 'needs_reconnect':
-      return 'watch';
-    default:
-      return 'disabled';
   }
 }
 
@@ -401,8 +376,10 @@ export function VendorAccountsView({
       value: (a) => a.status,
       filter: 'enum',
       searchable: false,
-      enumLabel: (v) => statusLabel(t, v),
-      render: (a) => <StatusChip status={statusBadge(a.status)} label={statusLabel(t, a.status)} />,
+      enumLabel: (v) => vendorStatusLabel(t, v),
+      render: (a) => (
+        <StatusChip status={vendorStatusBadge(a.status)} label={vendorStatusLabel(t, a.status)} />
+      ),
     },
     {
       id: 'credential',
