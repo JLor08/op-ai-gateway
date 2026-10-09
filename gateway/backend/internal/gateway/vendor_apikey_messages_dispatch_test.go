@@ -171,9 +171,11 @@ func assertAnthropicAPIKeyPassthroughWire(t *testing.T, stub *anthropicPlatformM
 			}
 		}
 	}
-	// anthropic-version is mandatory on api.anthropic.com; the client guarantees it.
-	if got := stub.gotHeader.Values("anthropic-version"); len(got) != 1 || got[0] == "" {
-		t.Fatalf("anthropic-version = %v, want exactly one non-empty value", got)
+	// anthropic-version is mandatory on api.anthropic.com; the client guarantees it
+	// and pins the exact value, so a wrong default (or an inbound client's own version
+	// leaking through) fails here as well as in the provider tests.
+	if got := stub.gotHeader.Values("anthropic-version"); len(got) != 1 || got[0] != "2023-06-01" {
+		t.Fatalf("anthropic-version = %v, want exactly [2023-06-01]", got)
 	}
 	// An api-key target is no subscription target: no OAuth bearer, no OAuth beta.
 	if got := stub.gotHeader.Get("Authorization"); got != "" {
@@ -212,20 +214,29 @@ func assertAnthropicAPIKeyPassthroughWire(t *testing.T, stub *anthropicPlatformM
 }
 
 // TestAnthropicAPIKeyTranslateFlavorsDoNotSelectMessagesPassthrough pins the scope
-// at the dispatch seam: the passthrough is chosen by the resolved target, so a
-// chat or Responses request to the same Anthropic api-key account resolves a
-// target whose Messages mode is zero (translate), and tryProxyNative therefore
-// hands it to the translate dispatch.
+// of the Messages passthrough: it is chosen by the resolved target and only for an
+// anthropic_messages request, so a chat or Responses request to the same Anthropic
+// api-key account resolves a target whose Messages mode is zero (translate). Each
+// subtest asserts the guarantee that flavor's dispatch actually depends on:
+//
+//   - openai_responses reaches tryProxyNative, which reads the Responses mode via
+//     endpointModeFor(target, "openai_responses"); an empty mode means it hands the
+//     request to the translate dispatch.
+//   - chat completions never reaches tryProxyNative (it has no native endpoint and
+//     is always translated), so the only guarantee to pin is that the resolved
+//     target carries no Messages passthrough mode.
 func TestAnthropicAPIKeyTranslateFlavorsDoNotSelectMessagesPassthrough(t *testing.T) {
 	cipher := newDispatchCipher(t)
 	for _, flavor := range []string{"openai_chat_completions", "openai_responses"} {
 		t.Run(flavor, func(t *testing.T) {
 			target := resolveAPIKeyAnthropicTarget(t, cipher, flavor, "https://api.anthropic.com")
-			if _, mode := endpointModeFor(target, "anthropic_messages"); mode == routing.EndpointModePassthrough {
-				t.Fatalf("a %s-resolved target selects Messages passthrough, want translate", flavor)
+			if flavor == "openai_responses" {
+				if path, mode := endpointModeFor(target, flavor); mode != "" {
+					t.Fatalf("endpointModeFor(%s) = (%q, %q), want an empty mode (translate)", flavor, path, mode)
+				}
 			}
 			if target.MessagesMode != "" {
-				t.Fatalf("MessagesMode = %q, want zero (translate)", target.MessagesMode)
+				t.Fatalf("MessagesMode = %q, want zero (translate): a %s request must never select the Messages passthrough", target.MessagesMode, flavor)
 			}
 		})
 	}
