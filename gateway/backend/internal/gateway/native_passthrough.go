@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -350,11 +352,15 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 // streams the raw response back byte-for-byte, so protocol-specific content (Codex
 // tool calls, reasoning items, Claude Code content blocks) is preserved exactly. It
 // mirrors completeStream's idle-watchdog / write-deadline / capture / usage-record
-// machinery. Exactly two body edits are possible, both value-lossless and both
-// described at the body-building step below: the `model` field is rewritten to
-// the upstream's mapped name, and -- only where the operator switched it on for
+// machinery. Exactly two body edits are possible HERE, both value-lossless and
+// both described at the body-building step below: the `model` field is rewritten
+// to the upstream's mapped name, and -- only where the operator switched it on for
 // a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
-// field reaches the upstream as the client wrote it.
+// field reaches the upstream as the client wrote it. One more edit can happen
+// below this layer, in the provider client rather than here: an Anthropic
+// subscription target (Masquerade == claude_code) has the Claude-Code system
+// block injected by AnthropicClient.ProxyNative (also value-lossless, idempotent);
+// an api-key target's body is never touched.
 //
 // Everything the caller decides about the relay arrives in rel; see
 // nativeRelay below for what each of its fields is and why it cannot be
@@ -519,8 +525,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings)
 
-	// Attach the resolved application's per-app upstream credential (fail-open).
-	ctx = s.upstreamAuthCtx(ctx, rel.target)
+	// Attach the resolved application's per-app upstream credential (fail-open),
+	// plus -- for an Anthropic passthrough only -- the client's anthropic-beta
+	// merged with the target's own (anthropicPassthroughHeaderOverrides is nil
+	// everywhere else, which leaves the call exactly as upstreamAuthCtx builds it).
+	ctx = s.upstreamAuthCtxWithHeaders(ctx, rel.target, anthropicPassthroughHeaderOverrides(rel.target, r.Header))
 	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
@@ -828,6 +837,89 @@ func (s *Server) nativeTerminalStatus(r *http.Request, upstreamStatus int, pfReq
 		slog.Debug("inference native passthrough ok", "path", r.URL.Path, "api_flavor", pfReq.APIFlavor, "model", pfReq.Model, "server", serverName, "status", upstreamStatus, "duration_ms", time.Since(start).Milliseconds())
 	}
 	return status, errorCode
+}
+
+// anthropicBetaHeader is the Anthropic opt-in header for beta API features. The
+// value is a comma-separated token list (a client may also repeat the header).
+const anthropicBetaHeader = "anthropic-beta"
+
+// mergeAnthropicBeta returns the de-duplicated, order-stable union of the target's
+// static anthropic-beta value (its tokens come first) and the client's header
+// value(s): each value is split on commas, each token trimmed of surrounding
+// whitespace, empty tokens dropped, and a token kept only the first time it
+// appears (an exact, case-sensitive match). The result is comma-joined with no
+// spaces, and is "" when neither side carries a token.
+//
+// The client's tokens are forwarded VERBATIM -- there is deliberately no allow-list
+// (Anthropic's guidance is open-ended: a client may send any beta the API knows,
+// including ones newer than this gateway). The merge only exists so a target that
+// needs its own token (a subscription's oauth-2025-04-20) keeps it alongside the
+// client's, once.
+func mergeAnthropicBeta(static string, clientHeader []string) string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(list string) {
+		for _, tok := range strings.Split(list, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			if _, dup := seen[tok]; dup {
+				continue
+			}
+			seen[tok] = struct{}{}
+			out = append(out, tok)
+		}
+	}
+	add(static)
+	for _, v := range clientHeader {
+		add(v)
+	}
+	return strings.Join(out, ",")
+}
+
+// anthropicPassthroughHeaderOverrides returns the per-request upstream header
+// overrides for a request relayed to target, keyed by the header name to Set on the
+// upstream call. Today that is one entry: the client's anthropic-beta, merged with
+// the target's static one (mergeAnthropicBeta), so a beta the client opted into
+// (extended thinking interleaving, 1M context, ...) reaches Anthropic instead of
+// being silently dropped.
+//
+// It answers nil -- change nothing -- unless target is an ANTHROPIC passthrough
+// (Provider vendor_anthropic AND MessagesMode passthrough): the client's header is
+// never forwarded to an OpenAI or self-hosted target, nor on a translate path (a
+// translated request is the gateway's own rendering, which has no use for the
+// client's beta). nil is also the answer when the client sent no beta token, so
+// such a request goes out exactly as it did before this existed. The inbound
+// anthropic-version is never forwarded: the version is pinned by the Anthropic
+// client (the body format it relays is tied to it).
+func anthropicPassthroughHeaderOverrides(target routing.Target, clientHeader http.Header) map[string]string {
+	if target.Provider != routing.ProviderVendorAnthropic || target.MessagesMode != routing.EndpointModePassthrough {
+		return nil
+	}
+	client := clientHeader.Values(anthropicBetaHeader)
+	// Merged against an empty static value first purely to ask "does the client
+	// carry any real token?" (blank, whitespace-only and comma-only values do
+	// not); the real merge with the target's own beta follows below.
+	if mergeAnthropicBeta("", client) == "" {
+		return nil
+	}
+	static := strings.Join(headerValuesFold(target.ExtraHeaders, anthropicBetaHeader), ",")
+	return map[string]string{anthropicBetaHeader: mergeAnthropicBeta(static, client)}
+}
+
+// headerValuesFold returns the values of every entry of m whose key equals name
+// ignoring case, in sorted-key order (so the result is deterministic even for a
+// map that spells one header two ways). Target.ExtraHeaders is a plain map, not an
+// http.Header, so its keys carry whatever spelling their author used.
+func headerValuesFold(m map[string]string, name string) []string {
+	var out []string
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		if strings.EqualFold(k, name) {
+			out = append(out, m[k])
+		}
+	}
+	return out
 }
 
 // rewriteModelField returns raw with its top-level "model" field set to

@@ -48,8 +48,10 @@ const (
 //     inference.Request into a Messages body and parses the Messages response /
 //     SSE stream back into neutral values.
 //   - NATIVE PASSTHROUGH (NativeProxyClient): ProxyNative relays an inbound
-//     /v1/messages body to the same endpoint verbatim, the lossless Claude Code
-//     path, via doNativeProxyWithDefaults.
+//     /v1/messages body to the same endpoint, the lossless Claude Code path, via
+//     doNativeProxyWithDefaults. The body is verbatim except that a subscription
+//     (Masquerade) target gets the Claude-Code system block injected first (see
+//     ProxyNative); an api-key target's body is never touched.
 //
 // It deliberately has no model lister or prober.
 //
@@ -75,27 +77,113 @@ var (
 )
 
 // ProxyNative forwards the raw inbound /v1/messages body to the upstream's own
-// endpoint path VERBATIM and returns the upstream response, Body still open, for
-// the gateway to relay byte-for-byte. It never rewrites the body (the gateway has
-// already set the upstream model name) and never applies the translate path's
-// Claude-Code masquerade system block: Target.Masquerade only shapes a rendered
-// request, and a passthrough has none.
+// endpoint path and returns the upstream response, Body still open, for the
+// gateway to relay byte-for-byte. The body is relayed VERBATIM (the gateway has
+// already set the upstream model name) with one exception: for a subscription
+// (OAuth) target, Target.Masquerade == MasqueradeClaudeCode, the Claude-Code
+// system block is injected as the first `system` block, exactly as the translate
+// path renders it (see injectClaudeCodeSystemBlock). An api-key target (empty
+// Masquerade) is never touched, so its body stays byte-identical.
 //
 // api.anthropic.com REQUIRES anthropic-version on every call, so ProxyNative
 // guarantees it ITSELF (as the default set passed to doNativeProxyWithDefaults)
 // instead of relying on the caller's target carrying it: the header can never go
 // missing whatever resolved the target. A ctx-carried anthropic-version (the
 // target's ExtraHeaders) still overrides the default, exactly as on the translate
-// path. The inbound client's own anthropic-version is not forwarded, as no inbound
-// header is. The credential (x-api-key, or a bearer) is the ctx's, applied by
-// applyUpstreamAuth.
+// path. The inbound client's own anthropic-version is not forwarded. The
+// credential (x-api-key, or a bearer) is the ctx's, applied by applyUpstreamAuth.
 //
 // Redirects are not followed: net/http strips only Authorization, not x-api-key,
 // from a request that follows a redirect off the host, so following one could
 // carry the credential elsewhere. api.anthropic.com does not redirect; a 3xx is
 // returned to the caller as the upstream's answer.
 func (c *AnthropicClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+	if target.Masquerade == routing.MasqueradeClaudeCode {
+		body = injectClaudeCodeSystemBlock(body)
+	}
 	return doNativeProxyWithDefaults(ctx, withoutRedirects(c.http), target, path, body, map[string]string{anthropicVersionHeader: anthropicAPIVersion})
+}
+
+// injectClaudeCodeSystemBlock returns body with the Claude-Code system block
+// (claudeCodeSystemPrompt) as the first `system` block, the shape
+// anthropicSystemField renders on the translate path and the one api.anthropic.com's
+// OAuth bearer path expects. It is a pure function of its argument: body is never
+// written to, and an edited body is always a FRESH slice from json.Marshal.
+//
+// The edit depends on the client's `system`:
+//
+//   - an array already starting with the exact block (the real Claude Code client):
+//     body is returned UNCHANGED, so the injection is idempotent;
+//   - any other array: the block is prepended, every existing block kept as
+//     written, cache_control included;
+//   - a non-empty string s: [block, {"type":"text","text":s}];
+//   - absent, null or "": [block].
+//
+// The body is decoded with UseNumber and re-marshalled, so every value (a large
+// integer, a float's exact spelling) is relayed losslessly; only key order and
+// insignificant whitespace/escaping change. It fails OPEN: a body that is not a
+// single JSON object, or whose `system` is of a type the Messages API does not
+// accept (an object, a number, a bool), is returned unchanged for the upstream to
+// reject itself.
+func injectClaudeCodeSystemBlock(body []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return body
+	}
+	// Decode stops after the first value; trailing data means this is not the
+	// single object the upstream would parse, so leave the body alone.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return body
+	}
+	system, ok := claudeCodeSystemFor(obj["system"])
+	if !ok {
+		return body
+	}
+	obj["system"] = system
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// claudeCodeSystemFor maps a client's decoded `system` value to the one carrying
+// the Claude-Code block first. ok is false when the value needs no edit (the block
+// is already first) or is of a type this does not edit.
+func claudeCodeSystemFor(system any) (any, bool) {
+	switch s := system.(type) {
+	case nil:
+		return anthropicSystemField("", routing.MasqueradeClaudeCode), true
+	case string:
+		return anthropicSystemField(s, routing.MasqueradeClaudeCode), true
+	case []any:
+		if startsWithClaudeCodeBlock(s) {
+			return nil, false
+		}
+		blocks := make([]any, 0, len(s)+1)
+		blocks = append(blocks, anthropicSystemBlock{Type: "text", Text: claudeCodeSystemPrompt})
+		return append(blocks, s...), true
+	default:
+		return nil, false
+	}
+}
+
+// startsWithClaudeCodeBlock reports whether blocks' first element is a text block
+// whose text is exactly claudeCodeSystemPrompt. Other fields on it (cache_control)
+// do not matter.
+func startsWithClaudeCodeBlock(blocks []any) bool {
+	if len(blocks) == 0 {
+		return false
+	}
+	first, ok := blocks[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	typ, _ := first["type"].(string)
+	text, _ := first["text"].(string)
+	return typ == "text" && text == claudeCodeSystemPrompt
 }
 
 // withoutRedirects returns a copy of c that hands a 3xx answer back instead of

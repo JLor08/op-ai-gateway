@@ -149,13 +149,15 @@ func TestAnthropicAPIKeyMessagesDispatchIsLosslessPassthrough(t *testing.T) {
 	relayed, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	assertAnthropicAPIKeyPassthroughWire(t, stub, relayed, apiKeyMessagesBody)
+	assertAnthropicAPIKeyPassthroughWire(t, stub, relayed, apiKeyMessagesBody, "")
 }
 
 // assertAnthropicAPIKeyPassthroughWire checks what the stub upstream saw for an
 // api-key Messages passthrough: path, credential, version header, no OAuth/
 // masquerade, the body verbatim but for the model, and the SSE relayed verbatim.
-func assertAnthropicAPIKeyPassthroughWire(t *testing.T, stub *anthropicPlatformMessagesStub, relayed []byte, clientBody string) {
+// wantBeta is the exact anthropic-beta value the upstream must have received (the
+// client's own tokens, merged): empty means the header must be absent.
+func assertAnthropicAPIKeyPassthroughWire(t *testing.T, stub *anthropicPlatformMessagesStub, relayed []byte, clientBody, wantBeta string) {
 	t.Helper()
 	if stub.gotPath != "/v1/messages" {
 		t.Fatalf("upstream path = %q, want /v1/messages", stub.gotPath)
@@ -177,12 +179,16 @@ func assertAnthropicAPIKeyPassthroughWire(t *testing.T, stub *anthropicPlatformM
 	if got := stub.gotHeader.Values("anthropic-version"); len(got) != 1 || got[0] != "2023-06-01" {
 		t.Fatalf("anthropic-version = %v, want exactly [2023-06-01]", got)
 	}
-	// An api-key target is no subscription target: no OAuth bearer, no OAuth beta.
+	// An api-key target is no subscription target: no OAuth bearer, and no OAuth
+	// beta -- the only anthropic-beta it may carry is the client's own, forwarded.
 	if got := stub.gotHeader.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization = %q, want absent on an api-key passthrough (no OAuth bearer)", got)
 	}
-	if got := stub.gotHeader.Get("anthropic-beta"); got != "" {
-		t.Fatalf("anthropic-beta = %q, want absent on an api-key passthrough (the oauth opt-in is subscription-only)", got)
+	switch got := stub.gotHeader.Values("anthropic-beta"); {
+	case wantBeta == "" && len(got) != 0:
+		t.Fatalf("anthropic-beta = %q, want absent (the client sent none, and the oauth opt-in is subscription-only)", got)
+	case wantBeta != "" && (len(got) != 1 || got[0] != wantBeta):
+		t.Fatalf("anthropic-beta = %q, want exactly [%q] (the client's tokens, forwarded)", got, wantBeta)
 	}
 
 	// The body is the client's, verbatim, except for the model field.
@@ -286,7 +292,8 @@ func TestAnthropicAPIKeyMessagesEndToEndThroughTheGateway(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(apiKeyMessagesBody))
 	req.Header.Set("Authorization", "Bearer "+vaOwnerSecret)
 	req.Header.Set("Content-Type", "application/json")
-	// The inbound client's own anthropic headers are never forwarded.
+	// The client's own anthropic-version is never forwarded (the gateway pins it);
+	// its anthropic-beta is.
 	req.Header.Set("anthropic-version", "1999-01-01")
 	req.Header.Set("anthropic-beta", "client-beta-1")
 	rec := httptest.NewRecorder()
@@ -298,12 +305,9 @@ func TestAnthropicAPIKeyMessagesEndToEndThroughTheGateway(t *testing.T) {
 	if len(transport.gotHosts) != 1 || transport.gotHosts[0] != "https://api.anthropic.com" {
 		t.Fatalf("upstream hosts = %v, want exactly one call to https://api.anthropic.com", transport.gotHosts)
 	}
-	assertAnthropicAPIKeyPassthroughWire(t, stub, rec.Body.Bytes(), apiKeyMessagesBody)
+	assertAnthropicAPIKeyPassthroughWire(t, stub, rec.Body.Bytes(), apiKeyMessagesBody, "client-beta-1")
 	if got := stub.gotHeader.Get("anthropic-version"); got == "1999-01-01" {
 		t.Fatalf("anthropic-version = %q: the inbound client's header must not be forwarded", got)
-	}
-	if got := stub.gotHeader.Get("anthropic-beta"); got != "" {
-		t.Fatalf("anthropic-beta = %q: the inbound client's header must not be forwarded", got)
 	}
 
 	events := srv.Usage.ByUser("usr_va_a")

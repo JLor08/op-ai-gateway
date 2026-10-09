@@ -44,8 +44,12 @@ func newAnthropicMessagesStub(t *testing.T) *anthropicMessagesStub {
 	return st
 }
 
-// subscriptionTarget builds the hand-shaped target the routing resolver produces
-// for an Anthropic subscription account, pointed at the given messages endpoint.
+// subscriptionTarget builds the hand-shaped TRANSLATE-mode target (MessagesMode
+// left zero) -- the shape the routing resolver produces for an openai_* request
+// to an Anthropic subscription account -- pointed at the given messages endpoint.
+// An anthropic_messages request to the same account resolves to the PASSTHROUGH
+// shape instead (MessagesMode = passthrough; see
+// vendor_subscription_messages_dispatch_test.go).
 func subscriptionTarget(accountID, endpoint string) routing.Target {
 	return routing.Target{
 		RouteID:         "vendor:" + accountID + ":claude-sonnet",
