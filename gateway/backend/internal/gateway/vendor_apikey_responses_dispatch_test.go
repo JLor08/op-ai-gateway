@@ -209,11 +209,13 @@ func newOpenAIPacedResponsesStub(t *testing.T, gap time.Duration) *httptest.Serv
 // proxyNative relays a resolver-built api-key OpenAI target's stream, and the
 // recorded usage row carries a gateway-derived tokens/s (OpenAI reports none),
 // attributed to the vendor account. The upstream pauses for gap between the first
-// (reasoning) delta and the rest, so the window is at least gap and the rate is
-// at most 6 tokens / gap -- an upper bound that a missing or whole-request window
-// could not respect.
+// (reasoning) delta and the rest, which gives the scanner a generation window
+// comfortably wider than minGatewayRateWindow; the exact figures are pinned by the
+// scanner tests, so this one only proves the rate reaches the recorded row.
 func TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow(t *testing.T) {
-	const gap = 80 * time.Millisecond
+	// Generous against the 50ms window floor: the scanner measures between the two
+	// READ times, and a loaded machine can delay the first read by tens of ms.
+	const gap = 300 * time.Millisecond
 	upstream := newOpenAIPacedResponsesStub(t, gap)
 	srv, _, _ := newVendorAccountSettingsTestServer(t, true)
 	cipher := newDispatchCipher(t)
@@ -250,9 +252,17 @@ func TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow(t *t
 	if ev.AccountID != apiKeyAccountID || ev.OutputTokens != 6 {
 		t.Fatalf("usage row = account %q / output %d, want %s / 6", ev.AccountID, ev.OutputTokens, apiKeyAccountID)
 	}
-	maxRate := 6 / gap.Seconds() // the window is at least gap
-	if ev.TokensPerSecond <= 0 || ev.TokensPerSecond > maxRate {
-		t.Fatalf("recorded TokensPerSecond = %v, want in (0, %v] -- a rate derived over the generation window that opens at the reasoning delta (>= the %v gap)", ev.TokensPerSecond, maxRate, gap)
+	// Only "a derived rate was recorded" is asserted here. The exact values are
+	// pinned deterministically by the scanner tests (controlled timestamps); this
+	// test's real-time window is T_read(chunk 2) - T_read(chunk 1), which shrinks
+	// under scheduler/CPU load, so any upper bound derived from the upstream's
+	// sleep would be a flake. The > 0 is still meaningful end to end: the stream's
+	// only content before the pause is a reasoning-summary delta, so without
+	// reasoning counted as content the window would collapse to the single chunk
+	// carrying the text delta and the terminal frame, below the floor, and the
+	// rate would be 0.
+	if ev.TokensPerSecond <= 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want > 0 (a gateway-derived rate on the vendor row; the window opens at the reasoning delta)", ev.TokensPerSecond)
 	}
 }
 
