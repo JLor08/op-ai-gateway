@@ -371,11 +371,13 @@ func TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget(t *test
 }
 
 // TestVendorAccountTranslateFlavorsLeaveMessagesModeZero pins the scope of the
-// Messages passthrough: it is ANTHROPIC api-key + anthropic_messages ONLY. Every
-// openai_* flavor to the same Anthropic account stays TRANSLATE (MessagesMode
-// zero), anthropic_messages to an OpenAI api-key account stays translate (its
-// upstream has no Messages surface), and the Anthropic SUBSCRIPTION target stays
-// translate for both dialects (a deliberate follow-up, not part of this slice).
+// Messages passthrough: it is an ANTHROPIC account (api-key or subscription) +
+// anthropic_messages ONLY. Every openai_* flavor to the same Anthropic account
+// stays TRANSLATE (MessagesMode zero), and anthropic_messages to an OpenAI api-key
+// account stays translate (its upstream has no Messages surface). The two
+// passthrough cases are pinned in
+// TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget and
+// TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget.
 func TestVendorAccountTranslateFlavorsLeaveMessagesModeZero(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
@@ -394,7 +396,6 @@ func TestVendorAccountTranslateFlavorsLeaveMessagesModeZero(t *testing.T) {
 		{"openai api-key, anthropic_messages", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "anthropic_messages", ProviderVendorOpenAI},
 		{"openai api-key, openai_chat_completions", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "openai_chat_completions", ProviderVendorOpenAI},
 		{"openai api-key, openai_responses", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "openai_responses", ProviderVendorOpenAI},
-		{"anthropic subscription, anthropic_messages", VendorAnthropic, true, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages", ProviderVendorAnthropic},
 		{"anthropic subscription, openai_chat_completions", VendorAnthropic, true, "claude-sonnet", APIFlavorAnthropic, "openai_chat_completions", ProviderVendorAnthropic},
 	}
 	for _, tc := range cases {

@@ -166,16 +166,25 @@ func (h *betaPassthroughHarness) apiKeyAnthropicTarget(t *testing.T) routing.Tar
 	return target
 }
 
-// subscriptionPassthroughTarget is the Anthropic SUBSCRIPTION target shape with
-// the Messages passthrough mode on and an account holding a live OAuth token. The
-// resolver does not produce this combination yet, so it is built by hand.
+// subscriptionPassthroughTarget is the Anthropic SUBSCRIPTION Messages passthrough
+// target exactly as the REAL resolver produces it for an account holding a live
+// OAuth token (the production target, not a hand-built look-alike), pointed at the
+// stub. It is checked against the shape this file's tests rely on: a subscription
+// target (OAuth bearer from the account), passthrough mode, the Claude-Code
+// masquerade, and the two static OAuth headers whose beta the client's is merged
+// into.
 func (h *betaPassthroughHarness) subscriptionPassthroughTarget(t *testing.T) routing.Target {
 	t.Helper()
-	seedSubscriptionAccount(t, h.routes, h.cipher, "acc_sub", routing.VendorAnthropic, vendorauth.TokenSet{
+	seedSubscriptionAnthropicRoutableAccount(t, h.routes, h.cipher, "acc_sub", apiKeyAnthropicOwnerID, vendorauth.TokenSet{
 		AccessToken: "live-access", RefreshToken: "live-refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "acct-1",
 	})
-	target := subscriptionTarget("acc_sub", h.stub.srv.URL)
-	target.MessagesMode = routing.EndpointModePassthrough
+	target := resolveSubscriptionAnthropicTarget(t, h.routes, apiKeyAnthropicOwnerID, "anthropic_messages", h.stub.srv.URL)
+	wantHeaders := map[string]string{"anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
+	if target.Provider != routing.ProviderVendorAnthropic || target.MessagesMode != routing.EndpointModePassthrough ||
+		!target.Subscription || target.VendorAccountID != "acc_sub" ||
+		target.Masquerade != routing.MasqueradeClaudeCode || !reflect.DeepEqual(target.ExtraHeaders, wantHeaders) {
+		t.Fatalf("resolver-built target = %+v, want an Anthropic SUBSCRIPTION Messages passthrough target (account acc_sub, claude_code masquerade, headers %v)", target, wantHeaders)
+	}
 	return target
 }
 

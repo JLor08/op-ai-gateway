@@ -32,7 +32,11 @@ func seedVendorSubscriptionAccount(t *testing.T, store *MemoryStore, now time.Ti
 // TestVendorSubscriptionAnthropicResolvesToDispatchTarget is the core M5a proof:
 // an ACTIVE Anthropic subscription account resolves to a target that carries the
 // account id (so dispatch resolves the bearer), the Claude-Code masquerade, the
-// two OAuth headers, and NO APIToken.
+// two OAuth headers, and NO APIToken. The fields asserted here hold for BOTH
+// inbound dialects; the one thing that differs between them (MessagesMode:
+// passthrough for anthropic_messages, translate for the openai flavors) is pinned
+// by TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget and
+// TestVendorSubscriptionAnthropicOpenAIFlavorsStayTranslate.
 func TestVendorSubscriptionAnthropicResolvesToDispatchTarget(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
@@ -40,7 +44,7 @@ func TestVendorSubscriptionAnthropicResolvesToDispatchTarget(t *testing.T) {
 	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-3-7-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
-	// Reach it over both inbound dialects (translate both).
+	// Reach it over both inbound dialects.
 	for _, flavor := range []string{"anthropic_messages", "openai_chat"} {
 		target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: flavor})
 		if err != nil {
@@ -76,6 +80,103 @@ func TestVendorSubscriptionAnthropicResolvesToDispatchTarget(t *testing.T) {
 		if target.RouteID != "vendor:acc_sub:claude-sonnet" {
 			t.Errorf("flavor=%q: RouteID = %q", flavor, target.RouteID)
 		}
+	}
+}
+
+// TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget is the core
+// proof of the subscription Messages passthrough (#188): an ACTIVE Anthropic
+// SUBSCRIPTION account reached over the FINE anthropic_messages flavor resolves to
+// a NATIVE-PASSTHROUGH target at api.anthropic.com (MessagesMode passthrough, so
+// the dispatch layer relays the inbound Messages body/SSE to /v1/messages instead
+// of parsing it to the neutral request and re-rendering it, which would drop
+// thinking, cache_control, server tools, ...). It is still a SUBSCRIPTION target:
+// the account id names where the OAuth bearer is resolved at dispatch, the
+// Claude-Code masquerade is what AnthropicClient.ProxyNative injects into the
+// relayed body, and the two static OAuth headers (the oauth anthropic-beta is the
+// base the client's own beta is merged into) are carried; there is no APIToken or
+// x-api-key.
+func TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: "anthropic_messages"})
+	if err != nil {
+		t.Fatalf("Resolve(anthropic_messages) = %v, want a passthrough target", err)
+	}
+	if target.MessagesMode != EndpointModePassthrough {
+		t.Errorf("MessagesMode = %q, want %q (lossless native passthrough to /v1/messages)", target.MessagesMode, EndpointModePassthrough)
+	}
+	if target.Provider != ProviderVendorAnthropic {
+		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorAnthropic)
+	}
+	if target.Endpoint != "https://api.anthropic.com" {
+		t.Errorf("Endpoint = %q, want https://api.anthropic.com", target.Endpoint)
+	}
+	if !target.Subscription {
+		t.Error("Subscription = false, want true (the OAuth bearer is resolved at dispatch)")
+	}
+	if target.VendorAccountID != "acc_sub" {
+		t.Errorf("VendorAccountID = %q, want acc_sub", target.VendorAccountID)
+	}
+	if target.Masquerade != MasqueradeClaudeCode {
+		t.Errorf("Masquerade = %q, want %q (ProxyNative injects the Claude-Code block for it)", target.Masquerade, MasqueradeClaudeCode)
+	}
+	if target.APIToken != "" || target.APITokenHeader != "" {
+		t.Errorf("APIToken/APITokenHeader = %q/%q, want empty (bearer resolved at dispatch, not an x-api-key)", target.APIToken, target.APITokenHeader)
+	}
+	wantHeaders := map[string]string{"anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
+	if !reflect.DeepEqual(target.ExtraHeaders, wantHeaders) {
+		t.Errorf("ExtraHeaders = %v, want %v", target.ExtraHeaders, wantHeaders)
+	}
+	if target.ProviderModel != "claude-sonnet-4-5-20250929" {
+		t.Errorf("ProviderModel = %q, want the bare upstream slug", target.ProviderModel)
+	}
+	if target.RouteID != "vendor:acc_sub:claude-sonnet" {
+		t.Errorf("RouteID = %q, want vendor:acc_sub:claude-sonnet", target.RouteID)
+	}
+	if target.ResponsesMode != "" {
+		t.Errorf("ResponsesMode = %q, want zero (an Anthropic upstream has no Responses surface)", target.ResponsesMode)
+	}
+	if len(target.APIFlavors) != 2 || target.APIFlavors[0] != APIFlavorOpenAI || target.APIFlavors[1] != APIFlavorAnthropic {
+		t.Errorf("APIFlavors = %v, want [openai anthropic] unchanged", target.APIFlavors)
+	}
+}
+
+// TestVendorSubscriptionAnthropicOpenAIFlavorsStayTranslate pins the scope of the
+// subscription Messages passthrough: it is chosen by the FINE flavor
+// anthropic_messages ONLY. Every openai_* flavor reaching the same Anthropic
+// subscription account is still TRANSLATED (MessagesMode zero) -- the neutral
+// request is rendered as a Messages body, with the Claude-Code masquerade -- and
+// stays a subscription target (bearer resolved at dispatch, same headers).
+func TestVendorSubscriptionAnthropicOpenAIFlavorsStayTranslate(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	for _, flavor := range []string{"openai_chat_completions", "openai_responses", "openai_chat"} {
+		t.Run(flavor, func(t *testing.T) {
+			store := NewMemoryStore()
+			seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+			target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: flavor})
+			if err != nil {
+				t.Fatalf("Resolve(%s) = %v, want a translate target", flavor, err)
+			}
+			if target.MessagesMode != "" {
+				t.Errorf("MessagesMode = %q, want zero (translate) for %s", target.MessagesMode, flavor)
+			}
+			if target.ResponsesMode != "" {
+				t.Errorf("ResponsesMode = %q, want zero (an Anthropic upstream has no Responses surface)", target.ResponsesMode)
+			}
+			if target.Provider != ProviderVendorAnthropic || !target.Subscription || target.Masquerade != MasqueradeClaudeCode {
+				t.Errorf("Provider=%q Subscription=%v Masquerade=%q, want the unchanged Anthropic subscription shape", target.Provider, target.Subscription, target.Masquerade)
+			}
+			if got := target.ExtraHeaders["anthropic-beta"]; got != "oauth-2025-04-20" {
+				t.Errorf("anthropic-beta = %q, want oauth-2025-04-20", got)
+			}
+		})
 	}
 }
 
@@ -228,15 +329,18 @@ func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
 }
 
 // vendorSubscriptionTargetMayBeZero names the fields the subscription ANTHROPIC
-// target legitimately leaves zero (the subscription analogue of
-// vendorTargetMayBeZero). Crucially ExtraHeaders/Masquerade/VendorAccountID are
-// NOT listed — an Anthropic subscription target that forgot any of them is a bug.
+// target legitimately leaves zero for its anthropic_messages (passthrough) shape
+// (the subscription analogue of vendorAnthropicMessagesTargetMayBeZero).
+// MessagesMode is deliberately NOT listed: lossless native passthrough to
+// /v1/messages is the whole point of this shape, and the translate shapes that
+// leave it zero are pinned in TestVendorSubscriptionAnthropicOpenAIFlavorsStayTranslate.
+// Crucially ExtraHeaders/Masquerade/VendorAccountID are NOT listed either -- an
+// Anthropic subscription target that forgot any of them is a bug.
 var vendorSubscriptionTargetMayBeZero = map[string]bool{
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here
 	"APITokenHeader":              true, // Authorization is set by the dispatch layer, not a static header
-	"ResponsesMode":               true, // zero == translate
-	"MessagesMode":                true, // zero == translate
+	"ResponsesMode":               true, // zero == translate; Anthropic has no Responses surface
 	"OpportunisticMetrics":        true, // no per-app toggle for a vendor
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only; N/A
 	"LiveProgressSupport":         true, // mapping-persisted; a vendor carries none
@@ -277,7 +381,9 @@ func TestVendorSubscriptionTargetCompleteness(t *testing.T) {
 		target    Target
 		mayBeZero map[string]bool
 	}{
-		{"anthropic", "vendorSubscriptionAnthropicTarget", vendorSubscriptionAnthropicTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic), vendorSubscriptionTargetMayBeZero},
+		// The anthropic case uses the anthropic_messages (passthrough) shape, whose
+		// MessagesMode is non-zero -- the complete shape the may-be-zero set expects.
+		{"anthropic", "vendorSubscriptionAnthropicTarget", vendorSubscriptionAnthropicTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages"), vendorSubscriptionTargetMayBeZero},
 		// The openai case uses the openai_responses (passthrough) shape, whose
 		// ResponsesMode is non-zero — the complete shape the may-be-zero set expects.
 		{"openai", "vendorSubscriptionOpenAITarget", vendorSubscriptionOpenAITarget(openAIAcc, openAIModel, "gpt-5-codex", APIFlavorOpenAI, "openai_responses"), vendorSubscriptionOpenAITargetMayBeZero},

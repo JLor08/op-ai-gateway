@@ -903,9 +903,12 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req infer
 	// vendor's required headers, and NO APIToken.
 	switch acc.Vendor {
 	case VendorAnthropic:
-		// Anthropic: translate either inbound dialect to Messages; carries the
-		// Claude-Code masquerade + the OAuth version/beta headers.
-		return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor), true
+		// Anthropic: an inbound Messages request is relayed via native passthrough
+		// (with the Claude-Code block injected), an openai_* one is translated to
+		// Messages; either way the target carries the Claude-Code masquerade + the
+		// OAuth version/beta headers. The FINE req.APIFlavor picks which (see
+		// vendorSubscriptionAnthropicTarget).
+		return vendorSubscriptionAnthropicTarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true
 	case VendorOpenAI:
 		// OpenAI: native passthrough of an inbound Responses request, or translate of
 		// a chat request, both to the ChatGPT backend. The FINE req.APIFlavor picks
@@ -977,8 +980,9 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 	// would drop everything the compat shape cannot carry (cache_control, thinking,
 	// server tools, metadata, ...). Only the api-key branch is touched here: chat
 	// and Responses requests to the same account, and anthropic_messages to an
-	// OpenAI account, stay translated, and so does the Anthropic SUBSCRIPTION target
-	// (vendorSubscriptionAnthropicTarget, deliberately left for a follow-up).
+	// OpenAI account, stay translated. The Anthropic SUBSCRIPTION target gets the
+	// same passthrough mode for the same flavor in vendorSubscriptionAnthropicTarget
+	// (with the Claude-Code block injected, which this api-key relay never is).
 	//
 	// Deliberately NO ExtraHeaders: the credential rides in APIToken as x-api-key
 	// (upstreamAuthCtx opens it), and anthropic-version is guaranteed by
@@ -998,19 +1002,37 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 //     tokens that must be opened, refreshed when stale, and attached at dispatch
 //     time; VendorAccountID names the account the dispatch layer (upstreamAuthCtx)
 //     resolves the bearer from, and APIToken/APITokenHeader stay empty.
-//   - Masquerade = claude_code makes the Anthropic client prepend the exact
-//     Claude-Code system block the OAuth Messages path requires.
+//   - Masquerade = claude_code makes the Anthropic client put the exact
+//     Claude-Code system block first, which the OAuth Messages path requires:
+//     prepended to the rendered request on the translate path, and injected into
+//     the relayed body by AnthropicClient.ProxyNative on the passthrough path.
 //   - ExtraHeaders carries the two headers the OAuth path needs on every call:
 //     anthropic-version and the anthropic-beta oauth opt-in. (anthropic-version is
 //     also set intrinsically by the client; repeating it here is harmless and
-//     keeps the subscription requirement explicit in one place.)
+//     keeps the subscription requirement explicit in one place.) On the
+//     passthrough path the client's own anthropic-beta is merged into the oauth
+//     one per request (anthropicPassthroughHeaderOverrides); this static map is
+//     never mutated.
+//
+// The FINE request flavor (fineFlavor, not the coarse apiFlavor, which folds every
+// openai_* flavor to "openai") decides HOW that one upstream is reached, mirroring
+// vendorSubscriptionOpenAITarget:
+//
+//   - fineFlavor == "anthropic_messages": MessagesMode passthrough, so the
+//     native-passthrough layer relays the inbound Messages body/SSE to
+//     /v1/messages instead of parsing it to the neutral request and re-rendering
+//     it, which would drop everything the compat shape cannot carry (thinking,
+//     cache_control, server tools, metadata, ...). The one body edit is the
+//     Claude-Code block ProxyNative injects for the masquerade.
+//   - any other flavor (openai chat/Responses): MessagesMode left zero ==
+//     TRANSLATE, so dispatch renders the neutral request as a Messages body.
 //
 // Only an Anthropic subscription account reaches here (an OpenAI one builds
 // vendorSubscriptionOpenAITarget instead). The values below are the live
 // REVERSE-ENGINEERED Claude Code constants; see internal/vendorauth for their
 // canonical home and the ToS caveat.
-func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor string) Target {
-	return Target{
+func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
+	t := Target{
 		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
 		ServerID:        "",
 		Provider:        ProviderVendorAnthropic,
@@ -1028,9 +1050,15 @@ func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, 
 			"anthropic-version": "2023-06-01",
 			"anthropic-beta":    "oauth-2025-04-20",
 		},
-		// Both inbound dialects are served via translate (zero endpoint modes).
+		// Both inbound dialects are served; the zero endpoint modes mean translate.
 		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
 	}
+	// anthropic_messages is served via native passthrough; every openai_* flavor
+	// is translated (MessagesMode left zero == translate).
+	if fineFlavor == "anthropic_messages" {
+		t.MessagesMode = EndpointModePassthrough
+	}
+	return t
 }
 
 // vendorSubscriptionOpenAITarget assembles the Target for a matched OPENAI
