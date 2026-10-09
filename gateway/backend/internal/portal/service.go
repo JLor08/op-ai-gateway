@@ -1930,6 +1930,7 @@ func (s *Service) Usage(principal auth.Token, q usage.Query) (usage.Page, error)
 		return page, fmt.Errorf("usage: %w", err)
 	}
 	s.attachUsageCost(context.Background(), page.Data)
+	s.attachUsageAccountNames(context.Background(), principal, page.Data)
 	if len(page.Data) == 0 || s.captures == nil {
 		return page, nil
 	}
@@ -2052,6 +2053,60 @@ func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 		}
 		rows[i].CostEUR = rows[i].EnergyWh / 1000 * price
 	}
+}
+
+// attachUsageAccountNames sets AccountName on each vendor row (non-empty
+// AccountID) to the name of the vendor account that served it, so the Activity
+// list can show "vendor · account" instead of a bare vendor host. Like
+// attachUsageCost it resolves ONCE per DISTINCT account id (not once per row)
+// and the name is a transient display field: never persisted, never selected
+// by a store.
+//
+// Visibility follows authorizeVendorAccount's read rule, because an account is a
+// personal credential, not shared infrastructure: the name is set only when the
+// principal owns the account or is a system admin. For anyone else (a plain
+// admin or a project member looking at someone else's row) it stays empty — the
+// row's AccountID is still on the wire, only the name is withheld.
+//
+// Everything else is fail-soft and leaves the name empty rather than failing
+// the list: a nil routing store, an account that no longer exists (usage_events.
+// account_id has no foreign key, so a hard-deleted account leaves dangling
+// ids by design) and any lookup error. It is deliberately NOT gated on the
+// vendor_accounts_enabled master flag, so historical rows keep their name
+// after an operator switches the feature off.
+func (s *Service) attachUsageAccountNames(ctx context.Context, principal auth.Token, rows []usage.Row) {
+	if s.routes == nil {
+		return
+	}
+	nameByID := make(map[string]string)
+	for i := range rows {
+		id := rows[i].AccountID
+		if id == "" {
+			continue
+		}
+		name, cached := nameByID[id]
+		if !cached {
+			name = s.visibleVendorAccountName(ctx, principal, id)
+			nameByID[id] = name
+		}
+		rows[i].AccountName = name
+	}
+}
+
+// visibleVendorAccountName returns the name of the vendor account id when the
+// principal may see it (owner, or system scope — authorizeVendorAccount's read
+// rule), else "". A missing account and a stranger's account are both
+// ErrVendorAccountNotFound and both yield ""; any other lookup error is logged
+// and also yields "" (the Activity list must never fail over a display name).
+func (s *Service) visibleVendorAccountName(ctx context.Context, principal auth.Token, id string) string {
+	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
+	if err != nil {
+		if !errors.Is(err, ErrVendorAccountNotFound) {
+			log.Printf("portal: usage account-name lookup failed for %q: %v", id, err)
+		}
+		return ""
+	}
+	return acc.Name
 }
 
 // applyUsageScope is the single server-side authority gate for cross-user
