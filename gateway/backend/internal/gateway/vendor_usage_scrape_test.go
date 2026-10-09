@@ -246,6 +246,10 @@ func TestScrapeVendorAccountUsageUpsertsForVendorTarget(t *testing.T) {
 // x-codex-credits-balance, which is the common case) must leave a previously
 // stored CreditBalance -- e.g. one the active fetch wrote -- and any window the
 // response did not mention intact, while the windows it does report are updated.
+// The response headers never carry the Business spend control (#195) either, so a
+// stored spend snapshot must survive the scrape whole: parseVendorAccountUsage
+// leaves SpendUsedPct at the unknown -1 (the zero value would be a known 0 % and
+// overwrite the stored percent in the merge).
 func TestScrapeVendorAccountUsageMergesOverStoredSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := routing.NewMemoryStore()
@@ -259,9 +263,12 @@ func TestScrapeVendorAccountUsageMergesOverStoredSnapshot(t *testing.T) {
 	storedAt := time.Now().Add(-time.Hour).UTC()
 	storedFiveReset := time.Date(2026, 10, 8, 14, 0, 0, 0, time.UTC)
 	storedWeekReset := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
+	storedSpendReset := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
 	if err := store.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
 		AccountID: "acc_merge", FiveHourPct: 10, FiveHourResetAt: &storedFiveReset,
 		WeeklyPct: 20, WeeklyResetAt: &storedWeekReset, CreditBalance: "42.50", UpdatedAt: storedAt,
+		SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500", SpendRemaining: "4500",
+		SpendUsedPct: 25, SpendResetAt: &storedSpendReset, CreditStatus: "has_credits",
 	}); err != nil {
 		t.Fatalf("seed usage snapshot: %v", err)
 	}
@@ -287,6 +294,10 @@ func TestScrapeVendorAccountUsageMergesOverStoredSnapshot(t *testing.T) {
 	}
 	if got.WeeklyPct != 20 || got.WeeklyResetAt == nil || !got.WeeklyResetAt.Equal(storedWeekReset) {
 		t.Fatalf("weekly = %v reset %v, want the stored 20 / %v kept (the scrape had no secondary headers)", got.WeeklyPct, got.WeeklyResetAt, storedWeekReset)
+	}
+	if got.SpendUnit != "credit" || got.SpendLimit != "6000" || got.SpendUsed != "1500" || got.SpendRemaining != "4500" ||
+		got.SpendUsedPct != 25 || got.SpendResetAt == nil || !got.SpendResetAt.Equal(storedSpendReset) || got.CreditStatus != "has_credits" {
+		t.Fatalf("spend snapshot = %+v, want the stored spend control kept whole (the scrape carries none)", got)
 	}
 	if !got.UpdatedAt.After(storedAt) {
 		t.Fatalf("UpdatedAt = %v, want it advanced past the stored %v (it comes from the scrape)", got.UpdatedAt, storedAt)
@@ -320,8 +331,8 @@ func TestScrapeVendorAccountUsageReadErrorFallsBackToParsedSnapshot(t *testing.T
 	if err != nil || !ok {
 		t.Fatalf("snapshot after a failed merge read: ok = %v, err = %v; want the parsed snapshot upserted", ok, err)
 	}
-	if got.FiveHourPct != 55 || got.WeeklyPct != -1 || got.CreditBalance != "" {
-		t.Fatalf("snapshot = %+v, want exactly the parsed one (5h 55, weekly unknown, no credit)", got)
+	if got.FiveHourPct != 55 || got.WeeklyPct != -1 || got.CreditBalance != "" || got.SpendUsedPct != -1 {
+		t.Fatalf("snapshot = %+v, want exactly the parsed one (5h 55, weekly unknown, no credit, spend unknown)", got)
 	}
 }
 

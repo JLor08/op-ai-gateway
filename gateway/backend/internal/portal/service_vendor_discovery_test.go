@@ -64,7 +64,7 @@ type fakeUsageResult struct {
 
 // unknownUsage is the all-unknown usage snapshot (-1 / nil / "").
 func unknownUsage() vendorauth.OpenAISubscriptionUsage {
-	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1}
+	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1}
 }
 
 // fakeVendorDiscoverers replaces the vendorauth fetchers a models refresh runs (the

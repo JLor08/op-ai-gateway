@@ -61,6 +61,13 @@ function makeUsage(overrides: Partial<VendorAccountUsage> = {}): VendorAccountUs
     weekly_pct: 7,
     weekly_reset_at: new Date(now + (3 * 24 + 4) * 3_600_000 + 30_000).toISOString(),
     credit_balance: '',
+    spend_unit: '',
+    spend_limit: '',
+    spend_used: '',
+    spend_remaining: '',
+    spend_used_pct: -1,
+    spend_reset_at: null,
+    credit_status: '',
     updated_at: new Date(now - 5 * 60_000).toISOString(),
     ...overrides,
   };

@@ -90,7 +90,7 @@ func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
 // vaNoNetworkUsage is the usage fetch of an OpenAI subscription that cannot be
 // asked: Unverifiable and all-unknown, like the real fetcher's failure answer.
 func vaNoNetworkUsage(context.Context, *http.Client, string, string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
-	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1}, vendorauth.DiscoveryUnverifiable
+	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1}, vendorauth.DiscoveryUnverifiable
 }
 
 // newVendorAccountSettingsTestServerWithDeps is newVendorAccountSettingsTestServer

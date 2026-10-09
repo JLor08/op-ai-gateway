@@ -85,10 +85,11 @@ func (s *Server) scrapeVendorAccountUsage(target routing.Target, h http.Header) 
 func parseVendorAccountUsage(provider, accountID string, h http.Header, now time.Time) (routing.VendorAccountUsage, bool) {
 	hdr := lowerHeaderValues(h)
 	snapshot := routing.VendorAccountUsage{
-		AccountID:   accountID,
-		FiveHourPct: -1, // unknown until a header says otherwise
-		WeeklyPct:   -1,
-		UpdatedAt:   now,
+		AccountID:    accountID,
+		FiveHourPct:  -1, // unknown until a header says otherwise
+		WeeklyPct:    -1,
+		SpendUsedPct: -1, // the response headers never carry spend control: unknown, so the merge keeps the stored one
+		UpdatedAt:    now,
 	}
 	// Normalize the OpenAI subscription provider to the OpenAI vendor case: both
 	// scrape the same Codex rate-limit headers off the ChatGPT backend's response.

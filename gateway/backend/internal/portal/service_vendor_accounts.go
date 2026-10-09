@@ -45,12 +45,26 @@ type VendorAccountModelDTO struct {
 // 0..100, or -1 when that window is UNKNOWN (never observed): the portal must
 // not read -1 as a real 0 % used. A reset time is nil when the vendor sent none;
 // CreditBalance is the vendor's raw credit string ("" = none).
+//
+// A Business plan's spend control and credit state (#195) ride along: SpendUnit
+// (e.g. "credit") and the vendor's raw SpendLimit / SpendUsed / SpendRemaining
+// strings (never parsed, so the exact digits survive), SpendUsedPct (0..100, or -1
+// = unknown, like the windows), SpendResetAt (nil = unknown) and CreditStatus
+// ("unlimited" | "has_credits" | "none", "" = unknown). Every one is always on the
+// wire; an account with no spend control reads "" / -1 / null.
 type VendorAccountUsageDTO struct {
 	FiveHourPct     float64    `json:"five_hour_pct"`
 	FiveHourResetAt *time.Time `json:"five_hour_reset_at"`
 	WeeklyPct       float64    `json:"weekly_pct"`
 	WeeklyResetAt   *time.Time `json:"weekly_reset_at"`
 	CreditBalance   string     `json:"credit_balance"`
+	SpendUnit       string     `json:"spend_unit"`
+	SpendLimit      string     `json:"spend_limit"`
+	SpendUsed       string     `json:"spend_used"`
+	SpendRemaining  string     `json:"spend_remaining"`
+	SpendUsedPct    float64    `json:"spend_used_pct"`
+	SpendResetAt    *time.Time `json:"spend_reset_at"`
+	CreditStatus    string     `json:"credit_status"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
@@ -162,6 +176,13 @@ func (s *Service) vendorAccountUsageDTO(ctx context.Context, accountID string) (
 		WeeklyPct:       usage.WeeklyPct,
 		WeeklyResetAt:   usage.WeeklyResetAt,
 		CreditBalance:   usage.CreditBalance,
+		SpendUnit:       usage.SpendUnit,
+		SpendLimit:      usage.SpendLimit,
+		SpendUsed:       usage.SpendUsed,
+		SpendRemaining:  usage.SpendRemaining,
+		SpendUsedPct:    usage.SpendUsedPct,
+		SpendResetAt:    usage.SpendResetAt,
+		CreditStatus:    usage.CreditStatus,
 		UpdatedAt:       usage.UpdatedAt,
 	}, nil
 }

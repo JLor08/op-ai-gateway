@@ -417,7 +417,8 @@ func (s *Service) discoverSubscriptionModels(ctx context.Context, vendor string,
 }
 
 // refreshVendorUsage pulls an OpenAI subscription account's usage snapshot (the
-// five-hour and weekly windows and the credit balance) and stores it MERGED over
+// five-hour and weekly windows, the credit balance and, for a Business plan, the
+// spend control and the credit state) and stores it MERGED over
 // the stored one (routing.MergeVendorAccountUsage: a field the pull does not know
 // never blanks one the passive header scrape already stored). ts is the account's
 // current token set, the one the model discovery opened and, if it was expired,
@@ -447,6 +448,13 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 		WeeklyPct:       usage.WeeklyPct,
 		WeeklyResetAt:   usage.WeeklyResetAt,
 		CreditBalance:   usage.CreditBalance,
+		SpendUnit:       usage.SpendUnit,
+		SpendLimit:      usage.SpendLimit,
+		SpendUsed:       usage.SpendUsed,
+		SpendRemaining:  usage.SpendRemaining,
+		SpendUsedPct:    usage.SpendUsedPct,
+		SpendResetAt:    usage.SpendResetAt,
+		CreditStatus:    usage.CreditStatus,
 		UpdatedAt:       s.clock().UTC(),
 	}
 	// An account with no stored snapshot is written as fetched: merging with the

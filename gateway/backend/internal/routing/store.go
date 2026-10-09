@@ -272,6 +272,16 @@ type VendorAccountModel struct {
 // reset; CreditBalance is the vendor's raw credit string ("" when none). The
 // scraper upserts this best-effort after a served request; a parse/store failure
 // never faults the inference request.
+//
+// The Spend* fields and CreditStatus (migration 84, #195) carry the Business-plan
+// spend control and the credit state the active Codex usage fetch reports; the
+// passive header scrape never sets them. The vendor's amounts (SpendLimit,
+// SpendUsed, SpendRemaining) are kept as the raw strings it sent, never parsed to
+// a float, so the unit (SpendUnit, for example "credit") and the exact digits
+// survive. They use the same unknown sentinels as the windows above: "" for a
+// string, -1 for SpendUsedPct and nil for SpendResetAt. A writer building a
+// snapshot that has no spend data MUST therefore set SpendUsedPct to -1 -- the
+// zero value 0 is a KNOWN 0 % and would overwrite a stored percent in the merge.
 type VendorAccountUsage struct {
 	AccountID       string
 	FiveHourPct     float64    // 0..100, or -1 = unknown (the five-hour / "primary" window)
@@ -279,6 +289,13 @@ type VendorAccountUsage struct {
 	WeeklyPct       float64    // 0..100, or -1 = unknown (the weekly / "secondary" window)
 	WeeklyResetAt   *time.Time // when the weekly window resets; nil = unknown
 	CreditBalance   string     // the vendor's raw credit-balance string; "" = unknown/none
+	SpendUnit       string     // the unit of the spend-control figures (e.g. "credit"); "" = unknown
+	SpendLimit      string     // the vendor's raw spend-control limit string; "" = unknown
+	SpendUsed       string     // the vendor's raw spend-control used string; "" = unknown
+	SpendRemaining  string     // the vendor's raw spend-control remaining string; "" = unknown
+	SpendUsedPct    float64    // 0..100 share of the spend-control limit used, or -1 = unknown
+	SpendResetAt    *time.Time // when the spend-control period resets; nil = unknown
+	CreditStatus    string     // "unlimited" | "has_credits" | "none"; "" = unknown
 	UpdatedAt       time.Time
 }
 
@@ -288,9 +305,11 @@ type VendorAccountUsage struct {
 // header scrape and the active fetch cannot clobber each other. For each field the
 // result takes incoming when incoming KNOWS it and keeps existing otherwise:
 // FiveHourPct/WeeklyPct are known when >= 0 (-1 = unknown; a real 0 is known),
-// FiveHourResetAt/WeeklyResetAt when non-nil, CreditBalance when non-empty. AccountID
-// and UpdatedAt always come from incoming (it is the newer observation of the same
-// account). Pure: no I/O, and no unknown field is ever turned into a fabricated 0.
+// FiveHourResetAt/WeeklyResetAt/SpendResetAt when non-nil, CreditBalance and the
+// other string fields (SpendUnit, SpendLimit, SpendUsed, SpendRemaining,
+// CreditStatus) when non-empty, SpendUsedPct when >= 0. AccountID and UpdatedAt
+// always come from incoming (it is the newer observation of the same account).
+// Pure: no I/O, and no unknown field is ever turned into a fabricated 0.
 func MergeVendorAccountUsage(existing, incoming VendorAccountUsage) VendorAccountUsage {
 	merged := incoming
 	if incoming.FiveHourPct < 0 {
@@ -307,6 +326,27 @@ func MergeVendorAccountUsage(existing, incoming VendorAccountUsage) VendorAccoun
 	}
 	if incoming.CreditBalance == "" {
 		merged.CreditBalance = existing.CreditBalance
+	}
+	if incoming.SpendUnit == "" {
+		merged.SpendUnit = existing.SpendUnit
+	}
+	if incoming.SpendLimit == "" {
+		merged.SpendLimit = existing.SpendLimit
+	}
+	if incoming.SpendUsed == "" {
+		merged.SpendUsed = existing.SpendUsed
+	}
+	if incoming.SpendRemaining == "" {
+		merged.SpendRemaining = existing.SpendRemaining
+	}
+	if incoming.SpendUsedPct < 0 {
+		merged.SpendUsedPct = existing.SpendUsedPct
+	}
+	if incoming.SpendResetAt == nil {
+		merged.SpendResetAt = existing.SpendResetAt
+	}
+	if incoming.CreditStatus == "" {
+		merged.CreditStatus = existing.CreditStatus
 	}
 	return merged
 }

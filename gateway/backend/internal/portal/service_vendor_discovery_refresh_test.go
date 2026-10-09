@@ -1102,7 +1102,8 @@ func passiveUsage(id string) routing.VendorAccountUsage {
 	return routing.VendorAccountUsage{
 		AccountID: id, FiveHourPct: 40, FiveHourResetAt: usageAt(1),
 		WeeklyPct: 70, WeeklyResetAt: usageAt(90), CreditBalance: "99.00",
-		UpdatedAt: discoveryTestNow.Add(-6 * time.Hour),
+		SpendUsedPct: -1, // the passive scrape never carries spend data
+		UpdatedAt:    discoveryTestNow.Add(-6 * time.Hour),
 	}
 }
 
@@ -1132,7 +1133,7 @@ func (f failUsageStore) UpsertVendorAccountUsage(ctx context.Context, u routing.
 func TestRefreshVendorAccountModelsStoresTheUsageSnapshot(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
 	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34"})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34", SpendUsedPct: -1})
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "chatgpt/")
 
 	dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
@@ -1148,7 +1149,7 @@ func TestRefreshVendorAccountModelsStoresTheUsageSnapshot(t *testing.T) {
 	}
 	want := routing.VendorAccountUsage{
 		AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2),
-		WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34", UpdatedAt: discoveryTestNow,
+		WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34", SpendUsedPct: -1, UpdatedAt: discoveryTestNow,
 	}
 	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
 		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
@@ -1164,7 +1165,7 @@ func TestRefreshVendorAccountModelsMergesTheUsageOverThePassiveSnapshot(t *testi
 	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
 	// Five-hour percent and the credit balance are known; the five-hour reset and
 	// the whole weekly window are not.
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: -1, CreditBalance: "12.34"})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: -1, CreditBalance: "12.34", SpendUsedPct: -1})
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
 	seedUsage(t, routeStore, passiveUsage(acc.ID))
 
@@ -1178,6 +1179,7 @@ func TestRefreshVendorAccountModelsMergesTheUsageOverThePassiveSnapshot(t *testi
 		WeeklyPct:       70,         // unknown to the pull: the stored one survives
 		WeeklyResetAt:   usageAt(90),
 		CreditBalance:   "12.34", // the pull knows it: replaced
+		SpendUsedPct:    -1,      // nobody knows spend: stays the unknown sentinel
 		UpdatedAt:       discoveryTestNow,
 	}
 	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
@@ -1188,7 +1190,7 @@ func TestRefreshVendorAccountModelsMergesTheUsageOverThePassiveSnapshot(t *testi
 // A real 0% is a known value and replaces a stored 40%; only -1 means unknown.
 func TestRefreshVendorAccountModelsTreatsARealZeroPercentAsKnown(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 0, WeeklyPct: -1})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 0, WeeklyPct: -1, SpendUsedPct: -1})
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
 	seedUsage(t, routeStore, passiveUsage(acc.ID))
 
@@ -1205,23 +1207,108 @@ func TestRefreshVendorAccountModelsTreatsARealZeroPercentAsKnown(t *testing.T) {
 // unknown fields stay unknown (-1 / nil / ""), never a fabricated 0%.
 func TestRefreshVendorAccountModelsWritesAPartialUsageWithoutFabricatingZeros(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1, SpendUsedPct: -1})
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
 
 	if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
 		t.Fatalf("RefreshVendorAccountModels: %v", err)
 	}
-	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1, UpdatedAt: discoveryTestNow}
+	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 12, FiveHourResetAt: usageAt(3), WeeklyPct: -1, SpendUsedPct: -1, UpdatedAt: discoveryTestNow}
 	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
 		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
 	}
+}
+
+// spendUsage is a Business-plan snapshot: the spend-control limit with its used
+// share and reset, plus the credit state, on top of the rate-limit windows.
+func spendUsage() vendorauth.OpenAISubscriptionUsage {
+	return vendorauth.OpenAISubscriptionUsage{
+		FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34",
+		SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500.5", SpendRemaining: "4499.5",
+		SpendUsedPct: 25.008, SpendResetAt: usageAt(300), CreditStatus: "has_credits",
+	}
+}
+
+// The Business spend control and the credit state the fetch reports are stored on
+// the snapshot verbatim (the amounts stay the vendor's strings).
+func TestRefreshVendorAccountModelsStoresTheSpendControlFields(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+	fake.okUsage(spendUsage())
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+	if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+		t.Fatalf("result = %+v, err = %v, want ok", res, err)
+	}
+	want := routing.VendorAccountUsage{
+		AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2),
+		WeeklyPct: 61, WeeklyResetAt: usageAt(100), CreditBalance: "12.34",
+		SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500.5", SpendRemaining: "4499.5",
+		SpendUsedPct: 25.008, SpendResetAt: usageAt(300), CreditStatus: "has_credits",
+		UpdatedAt: discoveryTestNow,
+	}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+	}
+}
+
+// The merge also covers the spend fields: a pull that knows none of them (a
+// non-Business plan) keeps what an earlier pull stored, while a field it does
+// know replaces the stored one -- and a real 0% spend share is known.
+func TestRefreshVendorAccountModelsMergesTheSpendFieldsOverTheStoredSnapshot(t *testing.T) {
+	stored := func(accountID string) routing.VendorAccountUsage {
+		u := passiveUsage(accountID)
+		u.SpendUnit, u.SpendLimit, u.SpendUsed, u.SpendRemaining = "credit", "6000", "1500", "4500"
+		u.SpendUsedPct, u.SpendResetAt, u.CreditStatus = 25, usageAt(200), "has_credits"
+		return u
+	}
+
+	t.Run("unknown spend keeps the stored spend", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+		// Only the five-hour percent is known; every spend field is unknown.
+		fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: -1, SpendUsedPct: -1})
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+		seedUsage(t, routeStore, stored(acc.ID))
+
+		if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+			t.Fatalf("RefreshVendorAccountModels: %v", err)
+		}
+		want := stored(acc.ID)
+		want.FiveHourPct, want.UpdatedAt = 23, discoveryTestNow
+		if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+			t.Fatalf("stored usage = %+v (found %v), want the spend fields kept: %+v", got, found, want)
+		}
+	})
+	t.Run("known spend replaces the stored spend, a real 0 percent included", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
+		fake.okUsage(vendorauth.OpenAISubscriptionUsage{
+			FiveHourPct: -1, WeeklyPct: -1,
+			SpendUnit: "usd", SpendLimit: "100", SpendUsed: "0", SpendRemaining: "100",
+			SpendUsedPct: 0, SpendResetAt: usageAt(400), CreditStatus: "none",
+		})
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+		seedUsage(t, routeStore, stored(acc.ID))
+
+		if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+			t.Fatalf("RefreshVendorAccountModels: %v", err)
+		}
+		want := stored(acc.ID)
+		want.SpendUnit, want.SpendLimit, want.SpendUsed, want.SpendRemaining = "usd", "100", "0", "100"
+		want.SpendUsedPct, want.SpendResetAt, want.CreditStatus = 0, usageAt(400), "none"
+		want.UpdatedAt = discoveryTestNow
+		if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+			t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+		}
+	})
 }
 
 // An Unverifiable usage fetch (a 401, a timeout, a body with nothing in it) leaves
 // the stored snapshot untouched, whatever payload came with it, and creates none
 // when there was none.
 func TestRefreshVendorAccountModelsKeepsTheStoredUsageWhenTheFetchIsUnverifiable(t *testing.T) {
-	junk := vendorauth.OpenAISubscriptionUsage{FiveHourPct: 99, FiveHourResetAt: usageAt(5), WeeklyPct: 99, WeeklyResetAt: usageAt(5), CreditBalance: "junk"}
+	junk := vendorauth.OpenAISubscriptionUsage{FiveHourPct: 99, FiveHourResetAt: usageAt(5), WeeklyPct: 99, WeeklyResetAt: usageAt(5), CreditBalance: "junk", SpendUsedPct: -1}
 
 	t.Run("a stored snapshot is untouched", func(t *testing.T) {
 		svc, routeStore, fake := newDiscoveryTestService(t)
@@ -1277,7 +1364,7 @@ func TestRefreshVendorAccountModelsSkipsTheUsageFetchForEveryOtherAccountKind(t 
 			svc, routeStore, fake := newDiscoveryTestService(t)
 			fake.okSlugs(tc.kind, "gpt-6-luna")
 			// An answer that WOULD be stored if the fetcher were consulted.
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, CreditBalance: "12.34"})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, CreditBalance: "12.34", SpendUsedPct: -1})
 			acc := tc.make(t, svc, routeStore)
 
 			_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
@@ -1295,7 +1382,7 @@ func TestRefreshVendorAccountModelsSkipsTheUsageFetchForEveryOtherAccountKind(t 
 // A subscription with nothing to ask with (never connected) is not asked either.
 func TestRefreshVendorAccountModelsSkipsTheUsageFetchWithoutAnAccessToken(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, SpendUsedPct: -1})
 	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "Not connected")
 
 	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
@@ -1314,7 +1401,7 @@ func TestRefreshVendorAccountModelsSkipsTheUsageFetchWithoutAnAccessToken(t *tes
 func TestRefreshVendorAccountModelsFetchesUsageWithTheRenewedTokenWithoutRenewingTwice(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
 	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, SpendUsedPct: -1})
 	refresher := installTokenRefresher(t, svc, routeStore)
 	acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
 
@@ -1348,7 +1435,7 @@ func TestRefreshVendorAccountModelsSkipsTheUsageFetchWhenTheTokenCannotBeRenewed
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, routeStore, fake := newDiscoveryTestService(t)
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, SpendUsedPct: -1})
 			tc.wire(t, svc, routeStore)
 			acc := expiredSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
 			before := passiveUsage(acc.ID)
@@ -1371,7 +1458,7 @@ func TestRefreshVendorAccountModelsSkipsTheUsageFetchWhenTheTokenCannotBeRenewed
 func TestRefreshVendorAccountModelsPullsUsageEvenWhenTheModelListIsUnusable(t *testing.T) {
 	svc, routeStore, fake := newDiscoveryTestService(t)
 	// The model fetcher stays Unverifiable (its default).
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, WeeklyPct: 61, SpendUsedPct: -1})
 	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "chatgpt/")
 	seed := storedModels(t, routeStore, acc.ID)
 
@@ -1416,15 +1503,15 @@ func TestRefreshVendorAccountModelsAnswerIsIndependentOfTheUsagePull(t *testing.
 		snapshotKept bool
 	}{
 		{"usage ok", func() {
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6, CreditBalance: "1.00"})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6, CreditBalance: "1.00", SpendUsedPct: -1})
 		}, false},
 		{"usage unverifiable", func() { fake.failUsage(unknownUsage()) }, true},
 		{"usage ok, snapshot read fails", func() {
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6, SpendUsedPct: -1})
 			svc.routes = failUsageStore{Store: routeStore, readErr: errors.New("usage table unavailable")}
 		}, true},
 		{"usage ok, snapshot write fails", func() {
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: 6, SpendUsedPct: -1})
 			svc.routes = failUsageStore{Store: routeStore, writeErr: errors.New("usage table unavailable")}
 		}, true},
 	} {
@@ -1464,14 +1551,14 @@ func TestRefreshVendorAccountModelsUsageLogsCarryNoCredential(t *testing.T) {
 		want string
 	}{
 		{"unverifiable", func(_ *Service, _ *routing.MemoryStore, fake *fakeVendorDiscoverers) {
-			fake.failUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, CreditBalance: "payload-do-not-echo"})
+			fake.failUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, CreditBalance: "payload-do-not-echo", SpendUsedPct: -1})
 		}, "usage fetch was unverifiable"},
 		{"read fails", func(svc *Service, routeStore *routing.MemoryStore, fake *fakeVendorDiscoverers) {
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2, SpendUsedPct: -1})
 			svc.routes = failUsageStore{Store: routeStore, readErr: errors.New("usage read down")}
 		}, "usage read down"},
 		{"write fails", func(svc *Service, routeStore *routing.MemoryStore, fake *fakeVendorDiscoverers) {
-			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2})
+			fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 1, WeeklyPct: 2, SpendUsedPct: -1})
 			svc.routes = failUsageStore{Store: routeStore, writeErr: errors.New("usage write down")}
 		}, "usage write down"},
 	} {
@@ -1504,7 +1591,7 @@ func TestConnectVendorAccountImportPullsTheUsageSnapshot(t *testing.T) {
 	svc, routeStore, _ := newVendorConnectTestService(t)
 	fake := installFakeVendorDiscoverers(svc)
 	fake.okSlugs(kindOpenAISubscription, "gpt-6-luna")
-	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, CreditBalance: "12.34"})
+	fake.okUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, CreditBalance: "12.34", SpendUsedPct: -1})
 	acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorOpenAI, "ChatGPT Plus")
 
 	dto, err := svc.ConnectVendorAccountImport(context.Background(), ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess, RefreshToken: connectTestRefresh})
@@ -1514,7 +1601,7 @@ func TestConnectVendorAccountImportPullsTheUsageSnapshot(t *testing.T) {
 	if call := fake.onlyUsageCall(t); call.accessToken != connectTestAccess {
 		t.Fatalf("usage call = %+v, want the freshly connected access token", call)
 	}
-	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: nil, CreditBalance: "12.34", UpdatedAt: svc.clock().UTC()}
+	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 23, FiveHourResetAt: usageAt(2), WeeklyPct: 61, WeeklyResetAt: nil, CreditBalance: "12.34", SpendUsedPct: -1, UpdatedAt: svc.clock().UTC()}
 	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
 		t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
 	}

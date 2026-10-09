@@ -23,6 +23,13 @@ function makeUsage(overrides: Partial<VendorAccountUsage> = {}): VendorAccountUs
     weekly_pct: 7,
     weekly_reset_at: at(3 * DAY + 4 * HOUR),
     credit_balance: '',
+    spend_unit: '',
+    spend_limit: '',
+    spend_used: '',
+    spend_remaining: '',
+    spend_used_pct: -1,
+    spend_reset_at: null,
+    credit_status: '',
     updated_at: at(-5 * MIN),
     ...overrides,
   };

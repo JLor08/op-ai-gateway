@@ -192,20 +192,32 @@ func (s *SQLiteStore) SetVendorAccountModels(ctx context.Context, accountID stri
 // UpsertVendorAccountUsage inserts or replaces accountID's single rate-limit
 // usage-snapshot row (vendor_account_usage, keyed by account_id). The whole row
 // is overwritten on conflict. An unknown account id is ErrNotFound (the FK). The
-// nullable reset columns take the *time.Time pointers directly (nil => NULL).
+// nullable reset columns (five-hour, weekly and spend) take the *time.Time
+// pointers directly (nil => NULL).
 func (s *SQLiteStore) UpsertVendorAccountUsage(ctx context.Context, u routing.VendorAccountUsage) error {
 	_, err := s.exec(ctx, `
 		insert into vendor_account_usage (
-			account_id, five_hour_pct, five_hour_reset_at, weekly_pct, weekly_reset_at, credit_balance, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?)
+			account_id, five_hour_pct, five_hour_reset_at, weekly_pct, weekly_reset_at, credit_balance,
+			spend_unit, spend_limit, spend_used, spend_remaining, spend_used_pct, spend_reset_at, credit_status,
+			updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(account_id) do update set
 			five_hour_pct = excluded.five_hour_pct,
 			five_hour_reset_at = excluded.five_hour_reset_at,
 			weekly_pct = excluded.weekly_pct,
 			weekly_reset_at = excluded.weekly_reset_at,
 			credit_balance = excluded.credit_balance,
+			spend_unit = excluded.spend_unit,
+			spend_limit = excluded.spend_limit,
+			spend_used = excluded.spend_used,
+			spend_remaining = excluded.spend_remaining,
+			spend_used_pct = excluded.spend_used_pct,
+			spend_reset_at = excluded.spend_reset_at,
+			credit_status = excluded.credit_status,
 			updated_at = excluded.updated_at`,
-		u.AccountID, u.FiveHourPct, u.FiveHourResetAt, u.WeeklyPct, u.WeeklyResetAt, u.CreditBalance, u.UpdatedAt)
+		u.AccountID, u.FiveHourPct, u.FiveHourResetAt, u.WeeklyPct, u.WeeklyResetAt, u.CreditBalance,
+		u.SpendUnit, u.SpendLimit, u.SpendUsed, u.SpendRemaining, u.SpendUsedPct, u.SpendResetAt, u.CreditStatus,
+		u.UpdatedAt)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
 			return ErrNotFound
@@ -219,7 +231,9 @@ func (s *SQLiteStore) UpsertVendorAccountUsage(ctx context.Context, u routing.Ve
 // snapshot row exists yet (not an error).
 func (s *SQLiteStore) VendorAccountUsageByID(ctx context.Context, accountID string) (routing.VendorAccountUsage, bool, error) {
 	row := s.queryRow(ctx, `
-		select account_id, five_hour_pct, five_hour_reset_at, weekly_pct, weekly_reset_at, credit_balance, updated_at
+		select account_id, five_hour_pct, five_hour_reset_at, weekly_pct, weekly_reset_at, credit_balance,
+			spend_unit, spend_limit, spend_used, spend_remaining, spend_used_pct, spend_reset_at, credit_status,
+			updated_at
 		from vendor_account_usage where account_id = ?`, accountID)
 	u, err := scanVendorAccountUsage(row)
 	if errors.Is(err, ErrNotFound) {
@@ -233,8 +247,10 @@ func (s *SQLiteStore) VendorAccountUsageByID(ctx context.Context, accountID stri
 
 func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) {
 	var u routing.VendorAccountUsage
-	var fiveHourReset, weeklyReset sql.NullTime
-	err := row.Scan(&u.AccountID, &u.FiveHourPct, &fiveHourReset, &u.WeeklyPct, &weeklyReset, &u.CreditBalance, &u.UpdatedAt)
+	var fiveHourReset, weeklyReset, spendReset sql.NullTime
+	err := row.Scan(&u.AccountID, &u.FiveHourPct, &fiveHourReset, &u.WeeklyPct, &weeklyReset, &u.CreditBalance,
+		&u.SpendUnit, &u.SpendLimit, &u.SpendUsed, &u.SpendRemaining, &u.SpendUsedPct, &spendReset, &u.CreditStatus,
+		&u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccountUsage{}, ErrNotFound
 	}
@@ -246,6 +262,9 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 	}
 	if weeklyReset.Valid {
 		u.WeeklyResetAt = &weeklyReset.Time
+	}
+	if spendReset.Valid {
+		u.SpendResetAt = &spendReset.Time
 	}
 	return u, nil
 }
