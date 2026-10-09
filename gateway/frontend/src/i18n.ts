@@ -2489,7 +2489,7 @@ const de = {
   vendorUsageNoData: 'Noch keine Daten',
   vendorUsageCreditBalance: 'Guthaben',
   vendorUsageIntroSpend:
-    'Verbrauch beim Anbieter: Anteil am Limit sowie das Credit-Kontingent des Tarifs, soweit der Anbieter es nennt. Der Stand wird mit jeder über das Gateway bedienten Anfrage und beim Aktualisieren der Modelle aktualisiert.',
+    'Verbrauch beim Anbieter: Anteil am Limit sowie das Credit-Kontingent des Tarifs, soweit der Anbieter es nennt. Das Credit-Kontingent wird beim Aktualisieren der Modelle oder beim erneuten Verbinden des Kontos aktualisiert, nicht mit jeder Anfrage.',
   vendorUsageSpendLabel: 'Credit-Kontingent',
   vendorUsageCredits: 'Credits',
   vendorUsageSpendNumber: (n: number) =>
@@ -5104,7 +5104,7 @@ const en: PortalMessages = {
   vendorUsageNoData: 'No data yet',
   vendorUsageCreditBalance: 'Credit balance',
   vendorUsageIntroSpend:
-    'Usage at the provider: the share of the limit and the credit allowance of the plan, as far as the provider reports it. The figures are refreshed with every request the gateway serves and when the models are refreshed.',
+    'Usage at the provider: the share of the limit and the credit allowance of the plan, as far as the provider reports it. The credit allowance is updated when the models are refreshed or the account is reconnected, not with every request.',
   vendorUsageSpendLabel: 'Credit allowance',
   vendorUsageCredits: 'Credits',
   vendorUsageSpendNumber: (n: number) =>
