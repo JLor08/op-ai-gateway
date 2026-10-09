@@ -415,6 +415,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByText(spend.unlimited)).not.toBeInTheDocument();
       });
 
+      it('lets the spend line win over a stored credit balance', () => {
+        renderPanel(makeBusinessUsage({ credit_balance: '9.00' }));
+
+        expect(screen.getByText(spend.line)).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorUsageCreditBalance)).not.toBeInTheDocument();
+        expect(screen.queryByText('9.00')).not.toBeInTheDocument();
+      });
+
+      it('still shows the panel for spend data alone: no window, no balance and an empty credit status', () => {
+        // The backend emits credit_status "" when the credits flags are absent
+        // while spend_control is present, so the spend data is the ONLY reason
+        // the panel may show. This pins the spend clause of the render guard.
+        renderPanel(makeBusinessUsage({ credit_status: '' }));
+
+        expect(screen.getByRole('heading', { name: t.vendorUsageTitle })).toBeInTheDocument();
+        expect(screen.getByText(spend.line)).toBeInTheDocument();
+        expect(screen.getByText(t.vendorUsageResetsIn('6 d 4 h'))).toBeInTheDocument();
+      });
+
       it('leaves an old-style snapshot (windows and balance, no spend fields) exactly as it was', () => {
         renderPanel(makeUsage({ credit_balance: '12.34' }));
 
