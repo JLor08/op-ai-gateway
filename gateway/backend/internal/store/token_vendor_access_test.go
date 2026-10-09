@@ -43,3 +43,24 @@ func TestDecodeVendorAccessTolerant(t *testing.T) {
 		}
 	}
 }
+
+// The wire "enabled" flag is honored: an override object with enabled=false is
+// NOT an active override, so presence AND enabled <=> OverrideEnabled. Encode only
+// ever emits enabled=true, so a decoded policy re-encodes without the dead object.
+func TestDecodeVendorAccessHonorsOverrideEnabledFlag(t *testing.T) {
+	got := DecodeVendorAccess(`{"accounts":[` +
+		`{"account_id":"off","prefix_override":{"enabled":false,"value":"x"}},` +
+		`{"account_id":"on","prefix_override":{"enabled":true,"value":"y"}},` +
+		`{"account_id":"none"}]}`)
+	want := auth.VendorAccess{Accounts: []auth.VendorAccessEntry{
+		{AccountID: "off"},
+		{AccountID: "on", OverrideEnabled: true, OverridePrefix: "y"},
+		{AccountID: "none"},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Decode = %#v, want %#v", got, want)
+	}
+	if enc := EncodeVendorAccess(got); enc != `{"accounts":[{"account_id":"off"},{"account_id":"on","prefix_override":{"enabled":true,"value":"y"}},{"account_id":"none"}]}` {
+		t.Fatalf("Encode(Decode(..)) = %q", enc)
+	}
+}

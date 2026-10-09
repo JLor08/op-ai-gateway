@@ -26,7 +26,8 @@ type prefixOverrideWire struct {
 
 // DecodeVendorAccess parses api_tokens.vendor_provider_access. Blank or malformed
 // yields the strict default (All=false, no accounts) — a bad row never breaks
-// token resolution. Entries with a blank account_id are dropped.
+// token resolution. Entries with a blank account_id are dropped, and a
+// prefix_override object only counts when its enabled flag is set.
 func DecodeVendorAccess(s string) auth.VendorAccess {
 	if strings.TrimSpace(s) == "" {
 		return auth.VendorAccess{}
@@ -42,7 +43,9 @@ func DecodeVendorAccess(s string) auth.VendorAccess {
 			continue
 		}
 		entry := auth.VendorAccessEntry{AccountID: id}
-		if e.PrefixOverride != nil {
+		// presence AND enabled <=> override on: a stored {"enabled":false,...}
+		// object is a switched-off override, not an active one.
+		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
 			entry.OverrideEnabled = true
 			entry.OverridePrefix = e.PrefixOverride.Value
 		}
