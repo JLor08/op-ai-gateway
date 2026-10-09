@@ -359,14 +359,14 @@ func TestGetVendorAccountIncludesTheUsageSnapshotWhenOneExists(t *testing.T) {
 		t.Fatalf("usage JSON = %v", wire.Usage)
 	}
 
-	// The list endpoint stays snapshot-free: reading one row per account would
-	// be an N+1 on the list, and the panel lives on the detail view only.
+	// The list carries the same snapshot (the dashboard's Provider usage section
+	// reads every account's usage in one call).
 	list, err := svc.ListVendorAccounts(ctx, ownerToken())
 	if err != nil || len(list.Data) != 1 {
 		t.Fatalf("ListVendorAccounts = %#v, %v", list, err)
 	}
-	if list.Data[0].Usage != nil {
-		t.Fatalf("list Usage = %#v, want nil (detail-only)", list.Data[0].Usage)
+	if list.Data[0].Usage == nil || list.Data[0].Usage.FiveHourPct != 42.5 || list.Data[0].Usage.CreditBalance != "12.34" {
+		t.Fatalf("list Usage = %#v, want the stored snapshot", list.Data[0].Usage)
 	}
 
 	// A system-scope operator reads the same snapshot with the account.
@@ -539,6 +539,115 @@ func TestListVendorAccountsReturnsOnlyThePrincipalsOwn(t *testing.T) {
 	empty, err := svc.ListVendorAccounts(ctx, auth.Token{UserID: "usr_admin", Scopes: []string{"gateway:use"}})
 	if err != nil || empty.Data == nil || len(empty.Data) != 0 {
 		t.Fatalf("empty list = %#v, %v, want a non-nil empty Data slice", empty, err)
+	}
+}
+
+// The list carries each account's rate-limit snapshot (the same DTO as the
+// detail read) so the dashboard can show every provider's usage from one call;
+// an account the gateway has not seen a snapshot for has a nil Usage, which is
+// omitted from the JSON (omitempty), never a zeroed object.
+func TestListVendorAccountsCarriesUsagePerAccount(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	withUsage := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("With snapshot"))
+	without := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Without snapshot"))
+	resetAt := now.Add(2 * time.Hour)
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID:       withUsage.ID,
+		FiveHourPct:     64,
+		FiveHourResetAt: &resetAt,
+		WeeklyPct:       -1,
+		UpdatedAt:       now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil {
+		t.Fatalf("ListVendorAccounts: %v", err)
+	}
+	byID := map[string]VendorAccountDTO{}
+	for _, dto := range list.Data {
+		byID[dto.ID] = dto
+	}
+	if len(byID) != 2 {
+		t.Fatalf("list = %#v, want both accounts", list.Data)
+	}
+	got := byID[withUsage.ID].Usage
+	if got == nil {
+		t.Fatal("account with a snapshot has nil Usage on the list")
+	}
+	if got.FiveHourPct != 64 || got.WeeklyPct != -1 || got.FiveHourResetAt == nil || !got.FiveHourResetAt.Equal(resetAt) {
+		t.Fatalf("list Usage = %#v, want 64 / -1 / %v", got, resetAt)
+	}
+	if byID[without.ID].Usage != nil {
+		t.Fatalf("account without a snapshot has Usage = %#v, want nil", byID[without.ID].Usage)
+	}
+
+	raw, err := json.Marshal(list)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, row := range wire.Data {
+		var id string
+		if err := json.Unmarshal(row["id"], &id); err != nil {
+			t.Fatalf("id: %v", err)
+		}
+		_, has := row["usage"]
+		if want := id == withUsage.ID; has != want {
+			t.Fatalf("account %s: usage key present = %v, want %v: %s", id, has, want, raw)
+		}
+	}
+}
+
+// failingUsageStore wraps a routing.Store so reading an account's usage snapshot
+// fails, as a transient database error would.
+type failingUsageStore struct {
+	routing.Store
+	err error
+}
+
+func (f failingUsageStore) VendorAccountUsageByID(context.Context, string) (routing.VendorAccountUsage, bool, error) {
+	return routing.VendorAccountUsage{}, false, f.err
+}
+
+// The usage snapshot is a decoration on the list: a failing snapshot read leaves
+// that row's Usage nil instead of failing the whole Providers list (the detail
+// read, by contrast, surfaces the error).
+func TestListVendorAccountsUsageReadFailureIsFailSoft(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	acc := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Work"))
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: 10, WeeklyPct: 20, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+	boom := errors.New("usage boom")
+	svc.routes = failingUsageStore{Store: routeStore, err: boom}
+
+	list, err := svc.ListVendorAccounts(ctx, ownerToken())
+	if err != nil {
+		t.Fatalf("ListVendorAccounts err = %v, want the list to survive a usage read failure", err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID != acc.ID {
+		t.Fatalf("list = %#v, want the account", list.Data)
+	}
+	if list.Data[0].Usage != nil {
+		t.Fatalf("Usage = %#v, want nil after a failed snapshot read", list.Data[0].Usage)
+	}
+	if len(list.Data[0].Models) == 0 {
+		t.Fatalf("models = %#v, want the rest of the row intact", list.Data[0].Models)
+	}
+
+	if _, err := svc.GetVendorAccount(ctx, ownerToken(), acc.ID); !errors.Is(err, boom) {
+		t.Fatalf("detail Get err = %v, want the usage read error surfaced", err)
 	}
 }
 

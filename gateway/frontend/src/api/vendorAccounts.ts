@@ -91,9 +91,9 @@ export type VendorAccount = {
   api_key_set: boolean;
   subscription_connected: boolean;
   models: VendorAccountModel[];
-  // The rate-limit snapshot. ONLY the single-account read (GET .../{id}, i.e.
-  // vendorAccount(id)) carries it, and only once the gateway has scraped one;
-  // the list and the create/update/connect responses omit it.
+  // The rate-limit snapshot. The single-account read (GET .../{id}, i.e.
+  // vendorAccount(id)) and the list carry it, and only once the gateway has
+  // scraped one; the create/update/connect responses omit it.
   usage?: VendorAccountUsage;
   created_at: string;
   updated_at: string;
