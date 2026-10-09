@@ -14,6 +14,7 @@ import type {
   VendorAccount,
   VendorAccountModel,
   VendorAccountUsage,
+  VendorAccountUsageRefresh,
   VendorConnectionCheck,
   VendorModelsRefresh,
 } from '../api';
@@ -48,6 +49,17 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
   name: 'Team Claude Max',
   api_key_set: false,
   subscription_connected: false,
+};
+
+// A connected OpenAI subscription: the one kind of account the gateway can actively
+// ask for its usage (the refresh button and the on-view refresh).
+const OPENAI_SUBSCRIPTION: Partial<VendorAccount> = {
+  id: 'va_oai_sub',
+  vendor: 'openai',
+  auth_type: 'subscription',
+  name: 'ChatGPT Plus',
+  api_key_set: false,
+  subscription_connected: true,
 };
 
 // A rate-limit snapshot as the single-account GET returns it. The 5-hour window
@@ -112,6 +124,15 @@ const PREFIXED_MODELS: VendorAccountModel[] = [
   },
 ];
 
+// The usage-refresh answer as POST .../usage/refresh gives it. The detail is the
+// token-free ENGLISH phrase the backend sends whatever the portal locale.
+function makeUsageRefresh(
+  status: VendorAccountUsageRefresh['refresh']['status'] = 'ok',
+  usage: VendorAccountUsage | null = null,
+): VendorAccountUsageRefresh {
+  return { usage, refresh: { status, detail: 'raw English detail' } };
+}
+
 // The models-refresh outcome as POST .../models/refresh answers it. The detail is
 // the token-free ENGLISH phrase the backend sends whatever the portal locale.
 function makeRefresh(overrides: Partial<VendorModelsRefresh> = {}): VendorModelsRefresh {
@@ -126,6 +147,8 @@ afterEach(() => {
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
+  // The retired "no data yet" placeholder of a limit the vendor does not report.
+  const noData = locale === 'de' ? 'Noch keine Daten' : 'No data yet';
 
   function renderView(
     opts: {
@@ -141,6 +164,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       vendorAccount?: PortalApi['vendorAccount'];
       testConnection?: PortalApi['testConnection'];
       refreshModels?: PortalApi['refreshModels'];
+      refreshUsage?: PortalApi['refreshUsage'];
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -224,6 +248,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             account: makeVendorAccount({ id }),
             refresh: makeRefresh(),
           })),
+      ),
+      // The on-view refresh defaults to the TTL skipping the vendor ("fresh"), which
+      // leaves the stored snapshot as it is.
+      refreshUsage: vi.fn<PortalApi['refreshUsage']>(
+        opts.refreshUsage ?? (async () => makeUsageRefresh('fresh')),
       ),
     };
     const view = render(
@@ -2246,7 +2275,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText('12.34')).toBeInTheDocument();
     });
 
-    it('shows "no data yet" for a window the gateway has not observed, with no bar for it', async () => {
+    it('draws no row, and no placeholder, for a window the vendor does not report', async () => {
       renderView({
         accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
         vendorAccount: withUsage(makeUsage({ weekly_pct: -1, weekly_reset_at: null })),
@@ -2254,13 +2283,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await openDetail();
 
       await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
-      expect(screen.getByText(t.vendorUsageNoData)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageWeekly)).not.toBeInTheDocument();
+      expect(screen.queryByText(noData)).not.toBeInTheDocument();
       expect(
         screen.queryByRole('progressbar', { name: t.vendorUsageWeekly }),
       ).not.toBeInTheDocument();
     });
 
-    it('hides the panel for an account the gateway has no snapshot for', async () => {
+    it('keeps the frame with an empty-state line for an account the gateway has no snapshot for', async () => {
       const { fakeApi } = renderView({
         accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
         vendorAccount: withUsage(undefined),
@@ -2268,10 +2298,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await openDetail();
 
       await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub'));
-      expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+      expect(await screen.findByText(t.vendorUsageEmpty)).toBeInTheDocument();
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
     });
 
-    it('hides the panel for a snapshot that knows no window, balance, spend or credit status yet', async () => {
+    it('keeps the frame with an empty-state line for a snapshot that knows no window, balance, spend or credit status yet', async () => {
       const { fakeApi } = renderView({
         accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
         vendorAccount: withUsage(
@@ -2294,7 +2326,29 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await openDetail();
 
       await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub'));
-      expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+      expect(await screen.findByText(t.vendorUsageEmpty)).toBeInTheDocument();
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+    });
+
+    it('shows ONLY the credit row for a Business snapshot, and no empty shell for a bare has_credits flag', async () => {
+      renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(
+          makeUsage({
+            five_hour_pct: -1,
+            five_hour_reset_at: null,
+            weekly_pct: -1,
+            weekly_reset_at: null,
+            credit_status: 'has_credits',
+          }),
+        ),
+      });
+      await openDetail();
+
+      expect(await screen.findByText(t.vendorUsageEmpty)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageFiveHour)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageWeekly)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageSpendLabel)).not.toBeInTheDocument();
     });
 
     it('shows the panel with the spend-control credits for a Business snapshot that knows no window', async () => {
@@ -2352,7 +2406,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
     });
 
-    it('leaves the panel out, without an error toast, when the snapshot cannot be read', async () => {
+    it('shows no rows and raises no error toast when the snapshot cannot be read', async () => {
       renderView({
         accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
         vendorAccount: async () => {
@@ -2361,8 +2415,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
       await openDetail();
 
-      // The settings panel is fully usable; only the optional usage panel is absent.
-      await waitFor(() => expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument());
+      // The settings panel is fully usable; the optional usage panel is just its
+      // frame, with its empty-state line, and says nothing about the failed read.
+      expect(await screen.findByText(t.vendorUsageEmpty)).toBeInTheDocument();
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
       expect(screen.getByLabelText(t.vendorAccountNameLabel)).toBeInTheDocument();
     });
@@ -2383,6 +2439,327 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(await screen.findByText(t.save, { selector: '[role="alert"] *' })).toBeInTheDocument();
       expect(screen.getByText(t.vendorUsageTitle)).toBeInTheDocument();
       expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeInTheDocument();
+    });
+
+    describe('usage refresh button and on-view refresh', () => {
+      const usageButton = () => screen.queryByRole('button', { name: t.vendorUsageRefreshAction });
+      const oaiAccount = () => makeVendorAccount(OPENAI_SUBSCRIPTION);
+      const oaiRead = (usage?: VendorAccountUsage) => async (id: string) =>
+        makeVendorAccount({ ...OPENAI_SUBSCRIPTION, id, usage });
+      // A GET whose five-hour window moves on with every read: 42 %, then 55 %.
+      const movingWindow = () => {
+        const pcts = [42, 55];
+        let reads = 0;
+        return async (id: string) =>
+          makeVendorAccount({
+            ...OPENAI_SUBSCRIPTION,
+            id,
+            usage: makeUsage({ five_hour_pct: pcts[Math.min(reads++, pcts.length - 1)] }),
+          });
+      };
+
+      it('shows the frame and the button for a connected OpenAI subscription even without a snapshot', async () => {
+        renderView({ accounts: [oaiAccount()], vendorAccount: oaiRead(undefined) });
+        await openDetail();
+
+        expect(await screen.findByText(t.vendorUsageEmpty)).toBeInTheDocument();
+        const panel = screen.getByRole('region', { name: t.vendorUsageTitle });
+        expect(
+          within(panel).getByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).toBeEnabled();
+        expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+      });
+
+      it.each([
+        ['an api-key account', makeVendorAccount({ id: 'va_key' }), 'va_key'],
+        [
+          'an OpenAI api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'openai', auth_type: 'api_key' }),
+          'va_key',
+        ],
+        [
+          'an Anthropic api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'anthropic', auth_type: 'api_key' }),
+          'va_key',
+        ],
+        [
+          'a connected Anthropic subscription',
+          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
+          'va_sub',
+        ],
+      ])('hides the button for %s, which has no active usage pull', async (_name, account) => {
+        renderView({
+          accounts: [account],
+          vendorAccount: async (id: string) =>
+            makeVendorAccount({ ...account, id, usage: makeUsage() }),
+        });
+        await openDetail();
+
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        expect(usageButton()).not.toBeInTheDocument();
+      });
+
+      it('forces the refresh when the button is clicked and shows the figures it re-reads', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: movingWindow(),
+          refreshUsage: async (_id, opts) =>
+            opts?.force ? makeUsageRefresh('ok') : makeUsageRefresh('fresh'),
+        });
+        await openDetail();
+        expect(
+          await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour }),
+        ).toHaveAttribute('aria-valuenow', '42');
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+
+        fireEvent.click(usageButton()!);
+
+        await waitFor(() =>
+          expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toHaveAttribute(
+            'aria-valuenow',
+            '55',
+          ),
+        );
+        expect(fakeApi.refreshUsage).toHaveBeenLastCalledWith('va_oai_sub', { force: true });
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+        expect(fakeApi.vendorAccount).toHaveBeenLastCalledWith('va_oai_sub');
+        // It is the usage refresh only: the models were not asked.
+        expect(fakeApi.refreshModels).not.toHaveBeenCalled();
+        expect(await screen.findByText(t.vendorUsageRefreshed)).toBeInTheDocument();
+      });
+
+      it('keeps showing the previous snapshot while the forced refresh and the re-read run', async () => {
+        const pull = deferred<VendorAccountUsageRefresh>();
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage({ credit_balance: '12.34' })),
+          refreshUsage: async (_id, opts) =>
+            opts?.force ? pull.promise : makeUsageRefresh('fresh'),
+        });
+        await openDetail();
+        await screen.findByText('12.34');
+
+        fireEvent.click(usageButton()!);
+
+        await waitFor(() => expect(usageButton()).toBeDisabled());
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+        await act(async () => pull.resolve(makeUsageRefresh('ok')));
+        await waitFor(() => expect(usageButton()).toBeEnabled());
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+      });
+
+      it('shows an unverifiable answer as a gentle note by its status, and still reads the stored snapshot again', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage()),
+          refreshUsage: async (_id, opts) =>
+            opts?.force ? makeUsageRefresh('unverifiable') : makeUsageRefresh('fresh'),
+        });
+        await openDetail();
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+
+        fireEvent.click(usageButton()!);
+
+        const note = await screen.findByRole('status');
+        expect(within(note).getByText(t.vendorUsageRefreshUnverifiable)).toBeInTheDocument();
+        expect(within(note).getByText(t.vendorUsageRefreshUnchanged)).toBeInTheDocument();
+        expect(screen.queryByText(/raw English detail/)).not.toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2));
+        expect(
+          screen.getByRole('progressbar', { name: t.vendorUsageFiveHour }),
+        ).toBeInTheDocument();
+      });
+
+      it('toasts the localized error and does not read again when the forced refresh fails', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage({ credit_balance: '12.34' })),
+          refreshUsage: async (_id, opts) => {
+            if (!opts?.force) return makeUsageRefresh('fresh');
+            throw new PortalApiError(
+              500,
+              'vendor_account.usage_refresh_failed',
+              'vendor account request failed',
+            );
+          },
+        });
+        await openDetail();
+        await screen.findByText('12.34');
+
+        fireEvent.click(usageButton()!);
+
+        expect(
+          await screen.findByText(
+            `vendor_account.usage_refresh_failed: ${t.errorVendorAccountUsageRefreshFailed}`,
+          ),
+        ).toBeInTheDocument();
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+        expect(usageButton()).toBeEnabled();
+      });
+
+      it('does not hold the account-write flag: a running usage refresh leaves the models refresh and the save usable', async () => {
+        const pull = deferred<VendorAccountUsageRefresh>();
+        renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage()),
+          refreshUsage: async (_id, opts) =>
+            opts?.force ? pull.promise : makeUsageRefresh('fresh'),
+        });
+        await openDetail();
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+
+        fireEvent.click(usageButton()!);
+        await waitFor(() => expect(usageButton()).toBeDisabled());
+
+        expect(screen.getByRole('button', { name: t.vendorModelsRefreshAction })).toBeEnabled();
+        expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+        await act(async () => pull.resolve(makeUsageRefresh('ok')));
+      });
+
+      it('fires ONE lazy refresh without force when the detail of an OpenAI subscription opens', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage()),
+        });
+        await openDetail();
+
+        await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+        // Exactly the account id: no options, so no ?force=1 on the wire.
+        expect(fakeApi.refreshUsage.mock.calls[0]).toEqual(['va_oai_sub']);
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        // It is not a poll: nothing fires it again.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1);
+      });
+
+      it.each([
+        ['an OpenAI api-key account', makeVendorAccount({ id: 'va_key' })],
+        [
+          'a connected Anthropic subscription',
+          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
+        ],
+        [
+          'an Anthropic api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'anthropic', auth_type: 'api_key' }),
+        ],
+        [
+          'an OpenAI subscription that was never connected',
+          makeVendorAccount({ ...OPENAI_SUBSCRIPTION, subscription_connected: false }),
+        ],
+      ])('does not fire the lazy refresh for %s', async (_name, account) => {
+        const { fakeApi } = renderView({
+          accounts: [account],
+          vendorAccount: async (id: string) =>
+            makeVendorAccount({ ...account, id, usage: makeUsage() }),
+        });
+        await openDetail();
+
+        if (account.subscription_connected || account.auth_type === 'api_key') {
+          await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(fakeApi.refreshUsage).not.toHaveBeenCalled();
+      });
+
+      it('reads the snapshot again when the lazy refresh really pulled (ok)', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: movingWindow(),
+          refreshUsage: async () => makeUsageRefresh('ok'),
+        });
+        await openDetail();
+
+        await waitFor(() =>
+          expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toHaveAttribute(
+            'aria-valuenow',
+            '55',
+          ),
+        );
+        expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1);
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2);
+      });
+
+      it.each(['fresh', 'unverifiable', 'unsupported'] as const)(
+        'does not read again when the lazy refresh answers %s: nothing was stored',
+        async (status) => {
+          const { fakeApi } = renderView({
+            accounts: [oaiAccount()],
+            vendorAccount: oaiRead(makeUsage()),
+            refreshUsage: async () => makeUsageRefresh(status),
+          });
+          await openDetail();
+
+          await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+          await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+          // The lazy call is silent: no outcome note and no toast.
+          expect(screen.queryByRole('status')).not.toBeInTheDocument();
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        },
+      );
+
+      it('keeps the stored snapshot, silently, when the lazy refresh fails', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage({ credit_balance: '12.34' })),
+          refreshUsage: async () => {
+            throw new PortalApiError(500, 'vendor_account.usage_refresh_failed', 'raw server text');
+          },
+        });
+        await openDetail();
+
+        await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+        expect(await screen.findByText('12.34')).toBeInTheDocument();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(screen.getByText('12.34')).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(1);
+      });
+
+      it('shows the stored snapshot at once without waiting for the lazy refresh', async () => {
+        const pull = deferred<VendorAccountUsageRefresh>();
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage({ credit_balance: '12.34' })),
+          refreshUsage: () => pull.promise,
+        });
+        await openDetail();
+
+        // The vendor call is still in flight, and the stored figures are on screen.
+        expect(await screen.findByText('12.34')).toBeInTheDocument();
+        expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1);
+        await act(async () => pull.resolve(makeUsageRefresh('fresh')));
+      });
+
+      it('does not fire the lazy refresh again after the models refresh or a forced refresh re-reads', async () => {
+        const { fakeApi } = renderView({
+          accounts: [oaiAccount()],
+          vendorAccount: oaiRead(makeUsage()),
+          refreshModels: async (id: string) => ({
+            account: makeVendorAccount({ ...OPENAI_SUBSCRIPTION, id }),
+            refresh: makeRefresh(),
+          }),
+          refreshUsage: async (_id, opts) =>
+            opts?.force ? makeUsageRefresh('ok') : makeUsageRefresh('fresh'),
+        });
+        await openDetail();
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+
+        fireEvent.click(screen.getByRole('button', { name: t.vendorModelsRefreshAction }));
+        await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(2));
+        fireEvent.click(usageButton()!);
+        await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledTimes(3));
+
+        // One lazy call (no force) plus the one forced click; the re-reads fired no more.
+        expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(2);
+        expect(fakeApi.refreshUsage.mock.calls[0]).toEqual(['va_oai_sub']);
+        expect(fakeApi.refreshUsage.mock.calls[1]).toEqual(['va_oai_sub', { force: true }]);
+      });
     });
 
     describe('after a models refresh', () => {
@@ -2853,7 +3230,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         async function typeAndSave(name: string, prefix: string) {
           await openDetail();
           // The usage panel reads the account once when the detail opens.
-          await waitFor(() => expect(screen.queryByText(t.vendorUsageTitle)).toBeNull());
+          await screen.findByText(t.vendorUsageEmpty);
           fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
             target: { value: name },
           });

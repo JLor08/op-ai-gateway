@@ -1,238 +1,173 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Box, LinearProgress, Typography } from '@mui/material';
-import type { VendorAccount, VendorAccountUsage } from '../api';
+import { useEffect, useRef, useState } from 'react';
+import { Alert, AlertTitle, Box, Button, CircularProgress, Typography } from '@mui/material';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import type { VendorAccount, VendorAccountUsage, VendorUsageRefresh } from '../api';
 import type { PortalApi, Translation } from './shared/types';
+import { formatPortalError } from './shared/format';
 import { Panel } from './shared/Panel';
-import { formatCountdown } from './shared/countdown';
 import { useLatestFetch } from './shared/useLatestFetch';
+import { useToast } from './shared/ToastProvider';
+import {
+  hasSpendControl,
+  VendorAccountUsageRows,
+  visibleUsageRows,
+} from './VendorAccountUsageRows';
 
-// A bar turns amber, then red, as a window fills up. Presentation only: the
-// vendors publish no thresholds, so these are just visual warning steps.
-const WARNING_PCT = 75;
-const CRITICAL_PCT = 90;
-
-function barColor(pct: number): 'primary' | 'warning' | 'error' {
-  if (pct >= CRITICAL_PCT) return 'error';
-  if (pct >= WARNING_PCT) return 'warning';
-  return 'primary';
-}
-
-// "Resets in ..." for a window whose reset time is known: the countdown while
-// it is still ahead of us, and a note once it has passed (the stored percentage
-// then describes the window BEFORE the reset until the next served request
-// refreshes the snapshot). No reset time -> no line at all.
-function resetLine(t: Translation, resetAt: string | null, now: number): string | null {
-  if (!resetAt) return null;
-  const at = new Date(resetAt).getTime();
-  if (Number.isNaN(at)) return null;
-  return at > now ? t.vendorUsageResetsIn(formatCountdown(at - now)) : t.vendorUsageResetPassed;
-}
-
-function UsageWindow({
-  t,
-  label,
-  pct,
-  resetAt,
-  now,
-  valueText,
-}: Readonly<{
-  t: Translation;
-  label: string;
-  pct: number;
-  resetAt: string | null;
-  now: number;
-  // Replaces the "N % used" text, for a row that carries amounts as well (the
-  // spend-control credits). With it, an unknown percentage (-1) keeps the text
-  // but draws no bar, instead of the "no data yet" row.
-  valueText?: string;
-}>) {
-  const known = pct >= 0;
-  // -1 is "never observed", deliberately not a 0 % bar.
-  if (!known && valueText === undefined) {
-    return (
-      <Box>
-        <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
-        <Typography variant="body2" color="text.secondary">
-          {t.vendorUsageNoData}
-        </Typography>
-      </Box>
-    );
-  }
-  const shown = known ? Math.min(100, Math.round(pct)) : 0;
-  const reset = resetLine(t, resetAt, now);
+/**
+ * Whether the gateway can ASK the vendor for this account's usage, as opposed to
+ * only learning it passively from the responses it serves: today that is a
+ * connected OpenAI subscription (the account whose usage endpoint the gateway
+ * pulls). Every other account -- an api key, an Anthropic subscription -- has no
+ * active pull (the backend answers "unsupported"), so it gets neither the refresh
+ * button nor the on-view refresh.
+ */
+export function hasActiveUsagePull(
+  account: Pick<VendorAccount, 'vendor' | 'auth_type' | 'subscription_connected'>,
+): boolean {
   return (
-    <Box>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, mb: 0.75 }}>
-        <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
-        <Typography>{valueText ?? t.vendorUsagePercentUsed(shown)}</Typography>
-      </Box>
-      {known && (
-        <LinearProgress
-          variant="determinate"
-          value={shown}
-          color={barColor(pct)}
-          aria-label={label}
-          sx={{ height: 8, borderRadius: 4 }}
-        />
-      )}
-      {reset !== null && (
-        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
-          {reset}
-        </Typography>
-      )}
-    </Box>
+    account.vendor === 'openai' &&
+    account.auth_type === 'subscription' &&
+    account.subscription_connected
   );
 }
 
-// The vendor's spend-control strings are raw and not validated as numbers. Only a
-// plain decimal that a double holds exactly is reformatted (one decimal, the portal
-// locale); anything else -- "n/a", "1e3", "0x10", a 20-digit integer -- is shown as
-// the vendor sent it rather than guessed at or turned into NaN.
-const PLAIN_DECIMAL = /^-?\d+(\.\d+)?$/;
-
-function formatSpendAmount(t: Translation, raw: string): string {
-  const trimmed = raw.trim();
-  if (!PLAIN_DECIMAL.test(trimmed)) return trimmed;
-  const n = Number(trimmed);
-  return Number.isFinite(n) && Math.abs(n) <= Number.MAX_SAFE_INTEGER
-    ? t.vendorUsageSpendNumber(n)
-    : trimmed;
-}
-
-// "credit"/"credits" (what the vendor reports today) and an unreported unit both
-// read "Credits"; any other unit is shown as the vendor named it.
-function spendUnit(t: Translation, raw: string): string {
-  const unit = raw.trim();
-  return unit === '' || /^credits?$/i.test(unit) ? t.vendorUsageCredits : unit;
-}
-
-// Spend control is present when the vendor reported a percentage or an amount.
-function hasSpend(usage: VendorAccountUsage): boolean {
-  return (
-    usage.spend_used_pct >= 0 || usage.spend_limit.trim() !== '' || usage.spend_used.trim() !== ''
-  );
-}
-
-// "42,5 / 6000 Credits (1 %)". The used amount is formatted for display; the
-// limit is shown as the vendor sent it. A missing half degrades to "N Credits used"
-// / "Limit: N Credits", and an unknown percentage leaves off the parenthesis.
-function spendLine(t: Translation, usage: VendorAccountUsage): string {
-  const unit = spendUnit(t, usage.spend_unit);
-  const used = usage.spend_used.trim() === '' ? '' : formatSpendAmount(t, usage.spend_used);
-  const limit = usage.spend_limit.trim();
-  let amount = '';
-  if (used !== '' && limit !== '') amount = `${used} / ${limit} ${unit}`;
-  else if (used !== '') amount = t.vendorUsageSpendUsed(used, unit);
-  else if (limit !== '') amount = t.vendorUsageSpendLimit(limit, unit);
-  if (usage.spend_used_pct < 0) return amount;
-  const shown = Math.min(100, Math.round(usage.spend_used_pct));
-  return amount === '' ? t.vendorUsagePercentUsed(shown) : t.vendorUsageSpendLine(amount, shown);
-}
-
-function CreditRow({ label, value }: Readonly<{ label: string; value: string }>) {
-  return (
-    <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-      <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
-      <Typography>{value}</Typography>
-    </Box>
-  );
-}
-
-// The credit side of the panel, one state by priority: the spend-control credits
-// (a Business plan) win; else "unlimited"; else the vendor's credit balance (the
-// plans that report one); else an explicit "no credits". "has_credits" with no
-// amounts or balance has nothing more to say, and an unknown status says nothing.
-function CreditState({
-  t,
-  usage,
-  now,
-}: Readonly<{ t: Translation; usage: VendorAccountUsage; now: number }>) {
-  if (hasSpend(usage)) {
-    return (
-      <UsageWindow
-        t={t}
-        label={t.vendorUsageSpendLabel}
-        pct={usage.spend_used_pct}
-        resetAt={usage.spend_reset_at}
-        now={now}
-        valueText={spendLine(t, usage)}
-      />
-    );
+// What a usage-refresh answer reads as. ok and fresh (the server's TTL skipped the
+// vendor call) are both a success: the figures are as current as they can be.
+// unsupported says the account has no active pull. Anything else -- unverifiable, or
+// a status a newer backend adds -- is NEUTRAL (info): the stored figures were kept
+// and it says nothing about the credential, so it is neither success nor error. The
+// answer is keyed by `status` only; the backend's English `detail` is never shown.
+function outcomePresentation(
+  t: Translation,
+  refresh: VendorUsageRefresh,
+): { severity: 'success' | 'info'; headline: string; unchanged: boolean } {
+  switch (refresh.status) {
+    case 'ok':
+    case 'fresh':
+      return { severity: 'success', headline: t.vendorUsageRefreshed, unchanged: false };
+    case 'unsupported':
+      return { severity: 'info', headline: t.vendorUsageRefreshUnsupported, unchanged: false };
+    default:
+      return { severity: 'info', headline: t.vendorUsageRefreshUnverifiable, unchanged: true };
   }
-  if (usage.credit_status === 'unlimited') {
-    return <CreditRow label={t.vendorUsageSpendLabel} value={t.vendorUsageUnlimited} />;
-  }
-  if (usage.credit_balance !== '') {
-    return <CreditRow label={t.vendorUsageCreditBalance} value={usage.credit_balance} />;
-  }
-  if (usage.credit_status === 'none') {
-    return <CreditRow label={t.vendorUsageSpendLabel} value={t.vendorUsageNoCredits} />;
-  }
-  return null;
 }
 
 /**
- * The "Usage & limits" panel of a vendor account's detail view: the 5-hour and
- * the weekly window as progress bars with "resets in ..." under them, plus the
- * credit side: the vendor's credit balance when it reported one, or -- for a
- * Codex Business plan, whose quota is spend-control credits rather than rate-limit
- * windows -- "used / limit Credits" with a bar and its reset (#195), or the
- * unlimited / no-credits state. The windows are PERCENTAGES ONLY (neither vendor
- * publishes an absolute cap); only the spend-control credits carry amounts.
+ * The "Usage & limits" panel of a vendor account's detail view: a titled frame
+ * around the account's limits (VendorAccountUsageRows -- the 5-hour and the weekly
+ * window as bars with "resets in ...", the credit side), showing only the limits
+ * the vendor actually provides (visibleUsageRows). An account whose snapshot has no
+ * visible row -- none yet, or one that reported nothing usable, e.g. only a bare
+ * `has_credits` flag -- keeps the frame and shows one short empty-state line instead
+ * of an empty shell, so the refresh button below stays reachable.
  *
- * It renders nothing at all without a snapshot, or when the snapshot knows
- * nothing yet: no window (every percentage -1), no credit balance, no spend
- * control and no credit status. An account the gateway has not seen a rate-limit
- * header for has nothing to show. A single unknown window next to a known one
- * reads "No data yet" instead of a 0 % bar.
- * `now` is injectable so the countdowns are deterministic in tests.
+ * `onRefresh` is present only for an account with an active usage pull
+ * (hasActiveUsagePull): it puts an "Aktualisieren" button into the frame's actions
+ * that asks the parent to refresh now (the parent re-reads the snapshot) and shows
+ * the answer inline by its `status`, styled apart from a failure, like the models
+ * refresh: an answer the gateway delivered is not an error. A thrown error means the
+ * call itself failed and is a toast. Absent, there is no button at all.
+ *
+ * `pending` is true while the first read of the snapshot is still in flight, so the
+ * empty-state line does not flash before the rows arrive. `now` is injectable so the
+ * countdowns are deterministic in tests.
  */
 export function VendorAccountUsagePanel({
   t,
   usage,
   now = Date.now(),
+  pending = false,
+  onRefresh,
 }: Readonly<{
   t: Translation;
   usage: VendorAccountUsage | null | undefined;
   now?: number;
+  pending?: boolean;
+  onRefresh?: () => Promise<VendorUsageRefresh>;
 }>) {
-  if (!usage) return null;
-  const hasWindow = usage.five_hour_pct >= 0 || usage.weekly_pct >= 0;
-  const spend = hasSpend(usage);
-  if (!hasWindow && usage.credit_balance === '' && !spend && usage.credit_status === '') {
-    return null;
+  const { showError } = useToast();
+  const [running, setRunning] = useState(false);
+  const [outcome, setOutcome] = useState<VendorUsageRefresh | null>(null);
+  // Latest-wins token, bumped on unmount: an answer that arrives after the panel
+  // went away (the user left the account) is dropped, with no outcome and no toast.
+  const requestRef = useRef(0);
+  useEffect(
+    () => () => {
+      ++requestRef.current;
+    },
+    [],
+  );
+
+  async function refresh() {
+    if (!onRefresh) return;
+    const request = ++requestRef.current;
+    setRunning(true);
+    // Never leave an earlier outcome up beside a refresh that is running.
+    setOutcome(null);
+    try {
+      const result = await onRefresh();
+      if (request !== requestRef.current) return;
+      setOutcome(result);
+    } catch (err) {
+      if (request !== requestRef.current) return;
+      showError(formatPortalError(err, t));
+    } finally {
+      if (request === requestRef.current) setRunning(false);
+    }
   }
 
-  const updatedAt = new Date(usage.updated_at).getTime();
+  const rowsUsage = usage != null && visibleUsageRows(usage).length > 0 ? usage : null;
+  const presentation = outcome === null ? null : outcomePresentation(t, outcome);
   return (
     <Box sx={{ mt: 3 }}>
       <Panel
         titleId="vendor-account-usage-heading"
         title={t.vendorUsageTitle}
-        subtitle={spend ? t.vendorUsageIntroSpend : t.vendorUsageIntro}
+        subtitle={
+          usage != null && hasSpendControl(usage) ? t.vendorUsageIntroSpend : t.vendorUsageIntro
+        }
+        actions={
+          onRefresh && (
+            <Button
+              type="button"
+              variant="outlined"
+              disabled={running}
+              startIcon={
+                running ? (
+                  <CircularProgress size={16} color="inherit" />
+                ) : (
+                  <RefreshIcon fontSize="small" />
+                )
+              }
+              onClick={() => void refresh()}
+            >
+              {t.vendorUsageRefreshAction}
+            </Button>
+          )
+        }
       >
-        <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
-          <UsageWindow
-            t={t}
-            label={t.vendorUsageFiveHour}
-            pct={usage.five_hour_pct}
-            resetAt={usage.five_hour_reset_at}
-            now={now}
-          />
-          <UsageWindow
-            t={t}
-            label={t.vendorUsageWeekly}
-            pct={usage.weekly_pct}
-            resetAt={usage.weekly_reset_at}
-            now={now}
-          />
-          <CreditState t={t} usage={usage} now={now} />
-          {!Number.isNaN(updatedAt) && (
-            <Typography variant="caption" color="text.secondary">
-              {t.vendorUsageUpdatedAt(t.activityRelativeTime((now - updatedAt) / 1000))}
-            </Typography>
+        <Box sx={{ display: 'grid', gap: 2.25 }}>
+          {presentation !== null && (
+            // role="status": a polite live region, so the outcome is announced when it
+            // lands and is told apart from the assertive toasts (role="alert").
+            <Alert severity={presentation.severity} role="status">
+              <AlertTitle sx={presentation.unchanged ? undefined : { mb: 0 }}>
+                {presentation.headline}
+              </AlertTitle>
+              {presentation.unchanged && (
+                <Typography variant="body2" color="text.secondary">
+                  {t.vendorUsageRefreshUnchanged}
+                </Typography>
+              )}
+            </Alert>
+          )}
+          {rowsUsage !== null ? (
+            <VendorAccountUsageRows t={t} usage={rowsUsage} now={now} />
+          ) : (
+            !pending && <Typography color="text.secondary">{t.vendorUsageEmpty}</Typography>
           )}
         </Box>
       </Panel>
@@ -241,31 +176,73 @@ export function VendorAccountUsagePanel({
 }
 
 /**
- * Fetches the account's usage snapshot and renders the panel. The list carries
- * no snapshot (one read per row would be an N+1), so the detail view reads it
- * from the single-account GET. The panel is auxiliary: a failed read simply
- * leaves it out rather than raising a toast on every detail open.
+ * Fetches the account's usage snapshot and renders the panel. The list rows do
+ * carry a snapshot, but the detail view reads the single-account GET so that the
+ * panel can re-read it on its own after a refresh. The panel is auxiliary: a failed
+ * read leaves the frame with its empty-state line rather than raising a toast on
+ * every detail open.
  *
  * `refreshKey` is a counter the parent bumps when something happened that can
  * have changed the snapshot behind this panel's back -- the models refresh pulls
- * the vendor's usage, and neither `account.id` nor `account.updated_at` change
- * with it. A new value re-reads the snapshot; the panel keeps showing the
- * previous one meanwhile instead of blinking out.
+ * the vendor's usage, and so does the refresh button, and neither `account.id` nor
+ * `account.updated_at` change with it. A new value re-reads the snapshot; the panel
+ * keeps showing the previous one meanwhile instead of blinking out.
+ *
+ * `onRefresh` is given only for an account with an active usage pull
+ * (hasActiveUsagePull). It is the explicit refresh the button runs (the parent
+ * forces the pull and bumps `refreshKey`); and its presence also makes the panel fire
+ * ONE lazy `refreshUsage` (no `force`) when it mounts -- i.e. when the account's
+ * detail view is opened. The server skips the vendor call while its last pull is
+ * younger than its TTL, so that is a cheap stored read unless the figures are stale;
+ * an answer that actually re-pulled (`ok`) makes the panel read the snapshot again.
+ * It is best effort: a failed lazy call leaves the stored snapshot, silently. There
+ * is no polling and no loop -- one call per mount.
  */
 export function VendorAccountUsage({
   t,
   api,
   accountId,
   refreshKey = 0,
+  onRefresh,
 }: Readonly<{
   t: Translation;
-  api: Pick<PortalApi, 'vendorAccount'>;
+  api: Pick<PortalApi, 'vendorAccount' | 'refreshUsage'>;
   accountId: VendorAccount['id'];
   refreshKey?: number;
+  onRefresh?: (id: VendorAccount['id']) => Promise<VendorUsageRefresh>;
 }>) {
-  const { data } = useLatestFetch(
+  // Bumped when the lazy refresh stored a new snapshot, to read it again.
+  const [lazyReads, setLazyReads] = useState(0);
+  const { data, status } = useLatestFetch(
     () => api.vendorAccount(accountId).then((account) => account.usage ?? null),
-    [api, accountId, refreshKey],
+    [api, accountId, refreshKey, lazyReads],
   );
-  return <VendorAccountUsagePanel t={t} usage={data} />;
+
+  const activePull = onRefresh !== undefined;
+  useEffect(() => {
+    if (!activePull) return;
+    let cancelled = false;
+    api
+      .refreshUsage(accountId)
+      .then(({ refresh }) => {
+        // Only a call that really pulled changed the stored snapshot ("fresh" is
+        // the TTL skipping the vendor, so the read already made shows it).
+        if (!cancelled && refresh.status === 'ok') setLazyReads((n) => n + 1);
+      })
+      .catch(() => {
+        // Best effort: the stored snapshot stays.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, accountId, activePull]);
+
+  return (
+    <VendorAccountUsagePanel
+      t={t}
+      usage={data}
+      pending={data === null && (status === 'idle' || status === 'loading')}
+      onRefresh={onRefresh && (() => onRefresh(accountId))}
+    />
+  );
 }

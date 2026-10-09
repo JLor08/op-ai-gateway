@@ -124,13 +124,14 @@ describe('formatPortalError', () => {
   });
 
   // The refusals the vendor model discovery adds: a malformed model prefix, a
-  // stored credential the models refresh cannot open, the refresh's own 500 and a
-  // malformed Codex client_version. Each renders its localized label, never the
+  // stored credential the models refresh cannot open, the models and the usage
+  // refresh's own 500s and a malformed Codex client_version. Each renders its localized label, never the
   // server's English text, in both locales.
   it.each([
     [400, 'vendor_account.model_prefix_invalid', 'errorVendorAccountModelPrefixInvalid'],
     [409, 'vendor_account.credential_unreadable', 'errorVendorAccountCredentialUnreadable'],
     [500, 'vendor_account.refresh_failed', 'errorVendorAccountRefreshFailed'],
+    [500, 'vendor_account.usage_refresh_failed', 'errorVendorAccountUsageRefreshFailed'],
     [
       400,
       'system.vendor_openai_codex_client_version_invalid',
@@ -490,8 +491,9 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `connect_failed`. `credential_unreadable` is the 409 of the connection test and of
    * the models refresh for a stored credential that cannot be opened (a lost key, a
    * corrupt blob). `model_prefix_invalid` is the 400 of create and update for a
-   * malformed model prefix, and `refresh_failed` the models refresh's 500 fallback,
-   * mapped for the same reason as `check_failed`. The five CRUD 500
+   * malformed model prefix, `refresh_failed` the models refresh's 500 fallback and
+   * `usage_refresh_failed` the usage refresh's, both mapped for the same reason as
+   * `check_failed`. The five CRUD 500
    * `vendor_account.*_failed` fallbacks (list/create/get/update/delete) are left
    * unmapped on purpose: they carry the server's own message.
    */
@@ -520,6 +522,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'vendor_account.credential_unreadable',
     'vendor_account.model_prefix_invalid',
     'vendor_account.refresh_failed',
+    'vendor_account.usage_refresh_failed',
   ] as const;
 
   it('carries every vendor-account refusal code, by its exact wire string', () => {

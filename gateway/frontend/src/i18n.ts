@@ -2479,17 +2479,17 @@ const de = {
     'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
   vendorUsageTitle: 'Nutzung & Limits',
   vendorUsageIntro:
-    'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
+    'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Angezeigt werden nur die Limits, die der Anbieter für dieses Konto meldet. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
   vendorUsageFiveHour: '5-Stunden-Limit',
   vendorUsageWeekly: 'Wochen-Limit',
   vendorUsagePercentUsed: (pct: number) => `${pct} % genutzt`,
   vendorUsageResetsIn: (time: string) => `Zurückgesetzt in ${time}`,
   vendorUsageResetPassed:
     'Das Zeitfenster wurde inzwischen zurückgesetzt; der Wert wird mit der nächsten Anfrage aktualisiert.',
-  vendorUsageNoData: 'Noch keine Daten',
+  vendorUsageEmpty: 'Für dieses Konto sind noch keine Limits des Anbieters bekannt.',
   vendorUsageCreditBalance: 'Guthaben',
   vendorUsageIntroSpend:
-    'Verbrauch beim Anbieter: Anteil am Limit sowie das Credit-Kontingent des Tarifs, soweit der Anbieter es nennt. Das Credit-Kontingent wird beim Aktualisieren der Modelle oder beim erneuten Verbinden des Kontos aktualisiert, nicht mit jeder Anfrage.',
+    'Verbrauch beim Anbieter: Anteil am Limit sowie das Credit-Kontingent des Tarifs, soweit der Anbieter es nennt. Das Credit-Kontingent wird nicht mit jeder Anfrage aktualisiert, sondern beim Öffnen dieser Ansicht (höchstens alle fünf Minuten), per Schaltfläche, beim Aktualisieren der Modelle und beim erneuten Verbinden des Kontos.',
   vendorUsageSpendLabel: 'Credit-Kontingent',
   vendorUsageCredits: 'Credits',
   vendorUsageSpendNumber: (n: number) =>
@@ -2500,6 +2500,12 @@ const de = {
   vendorUsageUnlimited: 'Unbegrenzt',
   vendorUsageNoCredits: 'Keine Credits',
   vendorUsageUpdatedAt: (ago: string) => `Zuletzt aktualisiert: ${ago}`,
+  vendorUsageRefreshAction: 'Aktualisieren',
+  vendorUsageRefreshed: 'Nutzung aktualisiert',
+  vendorUsageRefreshUnverifiable: 'Nutzung konnte nicht aktualisiert werden',
+  vendorUsageRefreshUnchanged: 'Der bisherige Stand bleibt unverändert.',
+  vendorUsageRefreshUnsupported:
+    'Für dieses Konto lässt sich die Nutzung nicht beim Anbieter abfragen.',
   vendorCheckTitle: 'Zugangsdaten prüfen',
   vendorCheckIntro:
     'Der Test fragt nur beim Anbieter nach, ob die gespeicherten Zugangsdaten akzeptiert werden. Er prüft nicht, ob ein bestimmtes Modell verfügbar ist: Schlägt ein Chat trotz gültiger Zugangsdaten fehl, liegt es am Modell und nicht an der Anmeldung.',
@@ -2547,6 +2553,7 @@ const de = {
   errorVendorAccountModelPrefixInvalid:
     'Ungültiges Modell-Präfix: erlaubt sind höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ ~ : / @ + -, ohne „..“',
   errorVendorAccountRefreshFailed: 'Die Modelle konnten nicht aktualisiert werden',
+  errorVendorAccountUsageRefreshFailed: 'Die Nutzung konnte nicht aktualisiert werden',
   errorSystemVendorOpenAICodexClientVersionInvalid:
     'Ungültige Codex-Client-Version: mit einer Ziffer beginnen, höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.
@@ -5095,16 +5102,16 @@ const en: PortalMessages = {
     'Timed out: the code was not confirmed in time. Start the device code again.',
   vendorUsageTitle: 'Usage & limits',
   vendorUsageIntro:
-    'Usage as a percentage of the provider limit; the provider does not publish absolute values. The figures are refreshed with every request the gateway serves.',
+    'Usage as a percentage of the provider limit; the provider does not publish absolute values. Only the limits the provider reports for this account are shown. The figures are refreshed with every request the gateway serves.',
   vendorUsageFiveHour: '5-hour limit',
   vendorUsageWeekly: 'Weekly limit',
   vendorUsagePercentUsed: (pct: number) => `${pct}% used`,
   vendorUsageResetsIn: (time: string) => `Resets in ${time}`,
   vendorUsageResetPassed: 'The window has since reset; the value updates with the next request.',
-  vendorUsageNoData: 'No data yet',
+  vendorUsageEmpty: 'No limits from the provider are known for this account yet.',
   vendorUsageCreditBalance: 'Credit balance',
   vendorUsageIntroSpend:
-    'Usage at the provider: the share of the limit and the credit allowance of the plan, as far as the provider reports it. The credit allowance is updated when the models are refreshed or the account is reconnected, not with every request.',
+    'Usage at the provider: the share of the limit and the credit allowance of the plan, as far as the provider reports it. The credit allowance is not updated with every request, but when this view is opened (at most every five minutes), with the refresh button, when the models are refreshed and when the account is reconnected.',
   vendorUsageSpendLabel: 'Credit allowance',
   vendorUsageCredits: 'Credits',
   vendorUsageSpendNumber: (n: number) =>
@@ -5115,6 +5122,11 @@ const en: PortalMessages = {
   vendorUsageUnlimited: 'Unlimited',
   vendorUsageNoCredits: 'No credits',
   vendorUsageUpdatedAt: (ago: string) => `Last updated: ${ago}`,
+  vendorUsageRefreshAction: 'Refresh',
+  vendorUsageRefreshed: 'Usage refreshed',
+  vendorUsageRefreshUnverifiable: 'Usage could not be refreshed',
+  vendorUsageRefreshUnchanged: 'The existing figures are unchanged.',
+  vendorUsageRefreshUnsupported: 'The usage of this account cannot be queried from the provider.',
   vendorCheckTitle: 'Check credentials',
   vendorCheckIntro:
     'The test only asks the provider whether the stored credentials are accepted. It does not check whether a specific model is available: if a chat fails although the credentials are valid, the cause is the model, not the login.',
@@ -5162,6 +5174,7 @@ const en: PortalMessages = {
   errorVendorAccountModelPrefixInvalid:
     'Invalid model prefix: at most 64 characters of letters, digits and . _ ~ : / @ + -, without ".."',
   errorVendorAccountRefreshFailed: 'The models could not be refreshed',
+  errorVendorAccountUsageRefreshFailed: 'The usage could not be refreshed',
   errorSystemVendorOpenAICodexClientVersionInvalid:
     'Invalid Codex client version: start with a digit, at most 64 characters of letters, digits and . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.

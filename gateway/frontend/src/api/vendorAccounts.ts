@@ -191,6 +191,24 @@ export type VendorAccountModelsRefresh = {
   refresh: VendorModelsRefresh;
 };
 
+// POST .../usage/refresh -- mirrors portal.VendorUsageRefreshResult and the
+// gateway's {usage, refresh} answer. `status` is what to key off (never the raw
+// English `detail`): ok = the vendor was asked and the snapshot stored; fresh = the
+// server's recent-pull TTL skipped the call (the stored snapshot is returned, the
+// vendor was NOT called); unverifiable = the vendor could not be asked or answered
+// unusably (the stored snapshot is kept); unsupported = the account has no active
+// usage pull (only an OpenAI subscription has one). `usage` is the same snapshot
+// the single-account read carries, or null when none is stored.
+export type VendorUsageRefreshStatus = 'ok' | 'fresh' | 'unverifiable' | 'unsupported';
+export type VendorUsageRefresh = {
+  status: VendorUsageRefreshStatus;
+  detail: string;
+};
+export type VendorAccountUsageRefresh = {
+  usage: VendorAccountUsage | null;
+  refresh: VendorUsageRefresh;
+};
+
 export function vendorAccountsApi(fetcher: Fetcher) {
   return {
     // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled,
@@ -244,6 +262,23 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<VendorAccountModelsRefresh>(
         fetcher,
         `/api/portal/vendor-accounts/${encodeURIComponent(id)}/models/refresh`,
+        { method: 'POST' },
+      ),
+    // The explicit / on-view "refresh usage": the gateway asks the vendor for the
+    // account's current limits and stores them, WITHOUT touching the models. Only an
+    // OpenAI subscription has such an active pull; any other account answers
+    // refresh.status "unsupported". Without `force` the server skips the vendor call
+    // while its last pull is younger than its TTL (5 min; status "fresh"), which is
+    // what the on-view call relies on; `{force: true}` (?force=1) bypasses the TTL
+    // for the explicit button. Fail-soft like the models refresh: a vendor that
+    // cannot be asked is a 200 with "unverifiable". Owner-only (404 for anybody
+    // else's id); 409 vendor_account.credential_unreadable for a stored credential
+    // that cannot be opened, 500 vendor_account.usage_refresh_failed otherwise. No
+    // request body.
+    refreshUsage: (id: string, opts: { force?: boolean } = {}) =>
+      request<VendorAccountUsageRefresh>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/usage/refresh${opts.force ? '?force=1' : ''}`,
         { method: 'POST' },
       ),
     // Subscription connect, path 1: attach tokens the user already holds. The

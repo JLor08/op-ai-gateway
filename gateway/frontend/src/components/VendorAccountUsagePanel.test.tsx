@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { ComponentProps } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { VendorAccountUsagePanel } from './VendorAccountUsagePanel';
+import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
-import type { VendorAccountUsage } from '../api';
+import { PortalApiError } from '../api';
+import type { VendorAccountUsage, VendorUsageRefresh } from '../api';
 
 afterEach(cleanup);
 
@@ -83,8 +86,20 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
   const spend = SPEND[locale];
 
-  function renderPanel(usage: VendorAccountUsage | null | undefined) {
-    return render(<VendorAccountUsagePanel t={t} usage={usage} now={NOW} />);
+  // The "retired" placeholder of a limit the vendor does not provide, per locale:
+  // it must never come back now that such a limit has no row at all.
+  const noData = locale === 'de' ? 'Noch keine Daten' : 'No data yet';
+
+  // The panel can toast a failed refresh, so it always renders inside a provider.
+  function renderPanel(
+    usage: VendorAccountUsage | null | undefined,
+    extra: Partial<ComponentProps<typeof VendorAccountUsagePanel>> = {},
+  ) {
+    return render(
+      <ToastProvider>
+        <VendorAccountUsagePanel t={t} usage={usage} now={NOW} {...extra} />
+      </ToastProvider>,
+    );
   }
 
   describe(`VendorAccountUsagePanel [${locale}]`, () => {
@@ -124,25 +139,33 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         '0',
       );
       expect(screen.getByText(t.vendorUsagePercentUsed(0))).toBeInTheDocument();
-      expect(screen.queryByText(t.vendorUsageNoData)).not.toBeInTheDocument();
+      expect(screen.queryByText(noData)).not.toBeInTheDocument();
     });
 
-    it('shows "no data yet" instead of a bar for a window that was never observed (-1)', () => {
+    it('draws no row at all for a window that was never observed (-1), not even a placeholder', () => {
       renderPanel(makeUsage({ weekly_pct: -1, weekly_reset_at: null }));
 
       expect(screen.getByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeInTheDocument();
       expect(
         screen.queryByRole('progressbar', { name: t.vendorUsageWeekly }),
       ).not.toBeInTheDocument();
-      expect(screen.getByText(t.vendorUsageWeekly)).toBeInTheDocument();
-      expect(screen.getByText(t.vendorUsageNoData)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageWeekly)).not.toBeInTheDocument();
+      expect(screen.queryByText(noData)).not.toBeInTheDocument();
       // The unknown window is not a "0 % used".
       expect(screen.queryByText(t.vendorUsagePercentUsed(0))).not.toBeInTheDocument();
       expect(screen.queryByText(t.vendorUsagePercentUsed(-1))).not.toBeInTheDocument();
     });
 
-    it('renders nothing when the snapshot knows no window, no balance, no spend and no credit status', () => {
-      const { container } = renderPanel(
+    it('draws only the window the vendor reported when the 5-hour one is unknown', () => {
+      renderPanel(makeUsage({ five_hour_pct: -1, five_hour_reset_at: null }));
+
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageWeekly })).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageFiveHour)).not.toBeInTheDocument();
+      expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+    });
+
+    it('keeps the titled frame with an empty-state line when the snapshot knows no window, no balance, no spend and no credit status', () => {
+      renderPanel(
         makeUsage({
           five_hour_pct: -1,
           weekly_pct: -1,
@@ -157,13 +180,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         }),
       );
 
-      expect(container).toBeEmptyDOMElement();
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageEmpty)).toBeInTheDocument();
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+      // No stale caption for rows that are not there.
+      expect(
+        screen.queryByText(t.vendorUsageUpdatedAt(t.activityRelativeTime(5 * 60))),
+      ).not.toBeInTheDocument();
     });
 
-    it('renders nothing without a snapshot', () => {
-      expect(renderPanel(undefined).container).toBeEmptyDOMElement();
+    it('keeps the titled frame with an empty-state line without a snapshot', () => {
+      renderPanel(undefined);
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageEmpty)).toBeInTheDocument();
+
       cleanup();
-      expect(renderPanel(null).container).toBeEmptyDOMElement();
+      renderPanel(null);
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageEmpty)).toBeInTheDocument();
+    });
+
+    it('withholds the empty-state line while the first read of the snapshot is still pending', () => {
+      renderPanel(null, { pending: true });
+
+      expect(screen.getByRole('region', { name: t.vendorUsageTitle })).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageEmpty)).not.toBeInTheDocument();
+    });
+
+    it('shows no empty-state line next to rows', () => {
+      renderPanel(makeUsage());
+
+      expect(screen.queryByText(t.vendorUsageEmpty)).not.toBeInTheDocument();
     });
 
     it('shows the credit balance as the vendor reported it, and only when there is one', () => {
@@ -181,7 +228,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       renderPanel(makeUsage({ five_hour_pct: -1, weekly_pct: -1, credit_balance: '5.00' }));
 
       expect(screen.getByText('5.00')).toBeInTheDocument();
-      expect(screen.getAllByText(t.vendorUsageNoData)).toHaveLength(2);
+      // Only the credit row: the unknown windows have no rows, not "no data" ones.
+      expect(screen.queryByText(t.vendorUsageFiveHour)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorUsageWeekly)).not.toBeInTheDocument();
+      expect(screen.queryByText(noData)).not.toBeInTheDocument();
       expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
     });
 
@@ -241,10 +291,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByText(t.vendorUsageResetsIn('6 d 4 h'))).toBeInTheDocument();
         const bar = screen.getByRole('progressbar', { name: t.vendorUsageSpendLabel });
         expect(bar).toHaveAttribute('aria-valuenow', '1');
-        // The windows stay "no data yet", never a 0 % bar.
+        // ONLY the credit row: the windows the vendor does not provide have no row
+        // at all (no 0 % bar, no "no data yet" placeholder).
         expect(screen.queryByRole('progressbar', { name: t.vendorUsageFiveHour })).toBeNull();
         expect(screen.queryByRole('progressbar', { name: t.vendorUsageWeekly })).toBeNull();
-        expect(screen.getAllByText(t.vendorUsageNoData)).toHaveLength(2);
+        expect(screen.queryByText(t.vendorUsageFiveHour)).not.toBeInTheDocument();
+        expect(screen.queryByText(t.vendorUsageWeekly)).not.toBeInTheDocument();
+        expect(screen.queryByText(noData)).not.toBeInTheDocument();
+        expect(screen.getAllByRole('progressbar')).toHaveLength(1);
         // The credit-flag states stay out of the way when the spend line is shown.
         expect(screen.queryByText(spend.unlimited)).not.toBeInTheDocument();
         expect(screen.queryByText(spend.none)).not.toBeInTheDocument();
@@ -386,10 +440,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByText(spend.unlimited)).not.toBeInTheDocument();
       });
 
-      it('shows nothing special for has_credits without spend data or balance, but keeps the panel', () => {
+      it('shows no rows for has_credits without spend data or balance, only the frame with its empty-state line', () => {
         renderPanel(makeUsage({ five_hour_pct: -1, weekly_pct: -1, credit_status: 'has_credits' }));
 
         expect(screen.getByRole('heading', { name: t.vendorUsageTitle })).toBeInTheDocument();
+        expect(screen.getByText(t.vendorUsageEmpty)).toBeInTheDocument();
         expect(screen.queryByText(spend.unlimited)).not.toBeInTheDocument();
         expect(screen.queryByText(spend.none)).not.toBeInTheDocument();
         expect(screen.queryByText(t.vendorUsageCreditBalance)).not.toBeInTheDocument();
@@ -447,6 +502,157 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByText(spend.unlimited)).not.toBeInTheDocument();
         expect(screen.queryByText(spend.none)).not.toBeInTheDocument();
         expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+      });
+    });
+
+    describe('refresh button', () => {
+      const answer = (
+        status: VendorUsageRefresh['status'],
+        detail = 'raw English detail',
+      ): VendorUsageRefresh => ({ status, detail });
+      const button = () => screen.getByRole('button', { name: t.vendorUsageRefreshAction });
+      const panel = () => screen.getByRole('region', { name: t.vendorUsageTitle });
+
+      it('shows no button for an account without an active usage pull', () => {
+        renderPanel(makeUsage());
+
+        expect(
+          screen.queryByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).not.toBeInTheDocument();
+      });
+
+      it('shows the frame, the empty-state line and the button even without a snapshot', () => {
+        renderPanel(null, { onRefresh: vi.fn(async () => answer('ok')) });
+
+        expect(within(panel()).getByText(t.vendorUsageEmpty)).toBeInTheDocument();
+        expect(
+          within(panel()).getByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).toBeEnabled();
+      });
+
+      it('keeps the button next to the rows once there is a snapshot', () => {
+        renderPanel(makeUsage(), { onRefresh: vi.fn(async () => answer('ok')) });
+
+        expect(
+          within(panel()).getByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).toBeEnabled();
+        expect(
+          screen.getByRole('progressbar', { name: t.vendorUsageFiveHour }),
+        ).toBeInTheDocument();
+      });
+
+      it('asks the parent to refresh once per click and is disabled with a spinner while it runs', async () => {
+        let resolve!: (value: VendorUsageRefresh) => void;
+        const onRefresh = vi.fn(
+          () =>
+            new Promise<VendorUsageRefresh>((r) => {
+              resolve = r;
+            }),
+        );
+        renderPanel(makeUsage(), { onRefresh });
+
+        fireEvent.click(button());
+
+        expect(onRefresh).toHaveBeenCalledTimes(1);
+        expect(button()).toBeDisabled();
+        // The button's spinner is a circular progressbar next to the two bars.
+        expect(within(button()).getByRole('progressbar')).toBeInTheDocument();
+        fireEvent.click(button());
+        expect(onRefresh).toHaveBeenCalledTimes(1);
+
+        await act(async () => resolve(answer('ok')));
+        expect(button()).toBeEnabled();
+        expect(within(button()).queryByRole('progressbar')).not.toBeInTheDocument();
+      });
+
+      it.each(['ok', 'fresh'] as const)('reads a %s answer as a plain success', async (status) => {
+        renderPanel(makeUsage(), { onRefresh: vi.fn(async () => answer(status)) });
+
+        fireEvent.click(button());
+
+        const note = await screen.findByRole('status');
+        expect(within(note).getByText(t.vendorUsageRefreshed)).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorUsageRefreshUnchanged)).not.toBeInTheDocument();
+        // The raw English detail is never what the user reads.
+        expect(screen.queryByText(/raw English detail/)).not.toBeInTheDocument();
+      });
+
+      it('reads an unverifiable answer as a gentle note that the figures are unchanged, not as an error', async () => {
+        renderPanel(makeUsage(), { onRefresh: vi.fn(async () => answer('unverifiable')) });
+
+        fireEvent.click(button());
+
+        const note = await screen.findByRole('status');
+        expect(within(note).getByText(t.vendorUsageRefreshUnverifiable)).toBeInTheDocument();
+        expect(within(note).getByText(t.vendorUsageRefreshUnchanged)).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.queryByText(/raw English detail/)).not.toBeInTheDocument();
+      });
+
+      it('reads an unsupported answer as a gentle note', async () => {
+        renderPanel(null, { onRefresh: vi.fn(async () => answer('unsupported')) });
+
+        fireEvent.click(button());
+
+        const note = await screen.findByRole('status');
+        expect(within(note).getByText(t.vendorUsageRefreshUnsupported)).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('reads a status a newer backend adds as the neutral unverifiable note', async () => {
+        renderPanel(makeUsage(), {
+          onRefresh: vi.fn(async () => answer('something-new' as VendorUsageRefresh['status'])),
+        });
+
+        fireEvent.click(button());
+
+        const note = await screen.findByRole('status');
+        expect(within(note).getByText(t.vendorUsageRefreshUnverifiable)).toBeInTheDocument();
+      });
+
+      it('toasts the localized error code when the call fails, and leaves the button usable', async () => {
+        const onRefresh = vi
+          .fn<() => Promise<VendorUsageRefresh>>()
+          .mockRejectedValueOnce(
+            new PortalApiError(500, 'vendor_account.usage_refresh_failed', 'raw server text'),
+          )
+          .mockResolvedValueOnce(answer('ok'));
+        renderPanel(makeUsage(), { onRefresh });
+
+        fireEvent.click(button());
+
+        const toast = await screen.findByRole('alert');
+        expect(toast).toHaveTextContent(t.errorVendorAccountUsageRefreshFailed);
+        expect(toast).not.toHaveTextContent('raw server text');
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+        await waitFor(() => expect(button()).toBeEnabled());
+
+        // The next click works and clears nothing it should not.
+        fireEvent.click(button());
+        expect(await screen.findByRole('status')).toBeInTheDocument();
+        expect(onRefresh).toHaveBeenCalledTimes(2);
+      });
+
+      it('drops the previous outcome as soon as the next refresh starts', async () => {
+        let resolve!: (value: VendorUsageRefresh) => void;
+        const onRefresh = vi
+          .fn<() => Promise<VendorUsageRefresh>>()
+          .mockResolvedValueOnce(answer('unverifiable'))
+          .mockImplementationOnce(
+            () =>
+              new Promise<VendorUsageRefresh>((r) => {
+                resolve = r;
+              }),
+          );
+        renderPanel(makeUsage(), { onRefresh });
+
+        fireEvent.click(button());
+        await screen.findByText(t.vendorUsageRefreshUnverifiable);
+        fireEvent.click(button());
+
+        expect(screen.queryByText(t.vendorUsageRefreshUnverifiable)).not.toBeInTheDocument();
+        await act(async () => resolve(answer('ok')));
+        expect(await screen.findByText(t.vendorUsageRefreshed)).toBeInTheDocument();
       });
     });
   });
