@@ -2271,7 +2271,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
     });
 
-    it('hides the panel for a snapshot that knows no window and no balance yet', async () => {
+    it('hides the panel for a snapshot that knows no window, balance, spend or credit status yet', async () => {
       const { fakeApi } = renderView({
         accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
         vendorAccount: withUsage(
@@ -2280,6 +2280,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             five_hour_reset_at: null,
             weekly_pct: -1,
             weekly_reset_at: null,
+            credit_balance: '',
+            spend_unit: '',
+            spend_limit: '',
+            spend_used: '',
+            spend_remaining: '',
+            spend_used_pct: -1,
+            spend_reset_at: null,
+            credit_status: '',
           }),
         ),
       });
@@ -2287,6 +2295,40 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       await waitFor(() => expect(fakeApi.vendorAccount).toHaveBeenCalledWith('va_sub'));
       expect(screen.queryByText(t.vendorUsageTitle)).not.toBeInTheDocument();
+    });
+
+    it('shows the panel with the spend-control credits for a Business snapshot that knows no window', async () => {
+      renderView({
+        accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+        vendorAccount: withUsage(
+          makeUsage({
+            five_hour_pct: -1,
+            five_hour_reset_at: null,
+            weekly_pct: -1,
+            weekly_reset_at: null,
+            spend_unit: 'credit',
+            spend_limit: '6000',
+            spend_used: '42.5',
+            spend_remaining: '5957.5',
+            spend_used_pct: 1,
+            spend_reset_at: new Date(Date.now() + 6 * 24 * 3_600_000 + 30_000).toISOString(),
+            credit_status: 'has_credits',
+          }),
+        ),
+      });
+      await openDetail();
+
+      expect(await screen.findByText(t.vendorUsageTitle)).toBeInTheDocument();
+      expect(screen.getByRole('progressbar', { name: t.vendorUsageSpendLabel })).toHaveAttribute(
+        'aria-valuenow',
+        '1',
+      );
+      expect(
+        screen.getByText(
+          t.vendorUsageSpendLine(t.vendorUsageSpendNumber(42.5) + ' / 6000 Credits', 1),
+        ),
+      ).toBeInTheDocument();
+      expect(screen.getByText(t.vendorUsageResetsIn('6 d'))).toBeInTheDocument();
     });
 
     it('is also available for an api-key account that has a snapshot', async () => {

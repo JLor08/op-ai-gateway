@@ -2488,6 +2488,17 @@ const de = {
     'Das Zeitfenster wurde inzwischen zurückgesetzt; der Wert wird mit der nächsten Anfrage aktualisiert.',
   vendorUsageNoData: 'Noch keine Daten',
   vendorUsageCreditBalance: 'Guthaben',
+  vendorUsageIntroSpend:
+    'Verbrauch beim Anbieter: Anteil am Limit sowie das Credit-Kontingent des Tarifs, soweit der Anbieter es nennt. Der Stand wird mit jeder über das Gateway bedienten Anfrage und beim Aktualisieren der Modelle aktualisiert.',
+  vendorUsageSpendLabel: 'Credit-Kontingent',
+  vendorUsageCredits: 'Credits',
+  vendorUsageSpendNumber: (n: number) =>
+    n.toLocaleString('de-DE', { maximumFractionDigits: 1, useGrouping: false }),
+  vendorUsageSpendLine: (amount: string, pct: number) => `${amount} (${pct} %)`,
+  vendorUsageSpendUsed: (used: string, unit: string) => `${used} ${unit} genutzt`,
+  vendorUsageSpendLimit: (limit: string, unit: string) => `Limit: ${limit} ${unit}`,
+  vendorUsageUnlimited: 'Unbegrenzt',
+  vendorUsageNoCredits: 'Keine Credits',
   vendorUsageUpdatedAt: (ago: string) => `Zuletzt aktualisiert: ${ago}`,
   vendorCheckTitle: 'Zugangsdaten prüfen',
   vendorCheckIntro:
@@ -5092,6 +5103,17 @@ const en: PortalMessages = {
   vendorUsageResetPassed: 'The window has since reset; the value updates with the next request.',
   vendorUsageNoData: 'No data yet',
   vendorUsageCreditBalance: 'Credit balance',
+  vendorUsageIntroSpend:
+    'Usage at the provider: the share of the limit and the credit allowance of the plan, as far as the provider reports it. The figures are refreshed with every request the gateway serves and when the models are refreshed.',
+  vendorUsageSpendLabel: 'Credit allowance',
+  vendorUsageCredits: 'Credits',
+  vendorUsageSpendNumber: (n: number) =>
+    n.toLocaleString('en-US', { maximumFractionDigits: 1, useGrouping: false }),
+  vendorUsageSpendLine: (amount: string, pct: number) => `${amount} (${pct}%)`,
+  vendorUsageSpendUsed: (used: string, unit: string) => `${used} ${unit} used`,
+  vendorUsageSpendLimit: (limit: string, unit: string) => `Limit: ${limit} ${unit}`,
+  vendorUsageUnlimited: 'Unlimited',
+  vendorUsageNoCredits: 'No credits',
   vendorUsageUpdatedAt: (ago: string) => `Last updated: ${ago}`,
   vendorCheckTitle: 'Check credentials',
   vendorCheckIntro:
