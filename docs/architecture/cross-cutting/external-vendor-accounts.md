@@ -340,8 +340,8 @@ matrix:
 | Account | Serves | How |
 |---|---|---|
 | **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. |
-| **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. |
-| **Anthropic subscription** | the `openai` **and** `anthropic` dialects | same `[openai, anthropic]` translate, into `/v1/messages` with the masquerade + beta headers, for **every** inbound flavor, `anthropic_messages` included: `MessagesMode` stays zero. A lossless Messages passthrough for the subscription is a documented follow-up (§4.1). |
+| **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
+| **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
 
 The vendor branch is **skipped entirely** — the request falls through to the
@@ -360,7 +360,7 @@ target:
 | `VendorAccountID` | Names the serving account, for usage attribution (§5) and for the dispatch layer to resolve the subscription bearer. Set on **every** vendor target, api-key included. |
 | `Subscription` | `true` only on a subscription (OAuth) target. **This**, not `VendorAccountID`, is the subscription-bearer trigger, so an api-key target that also carries a `VendorAccountID` keeps using its sealed `APIToken`. |
 | `ExtraHeaders` | A small static header set attached to the upstream request (§4.1/§4.2). |
-| `Masquerade` | `""` (none) or `claude_code` (`routing.MasqueradeClaudeCode`), which makes the Anthropic client prepend the required Claude-Code system block (§4.1). |
+| `Masquerade` | `""` (none) or `claude_code` (`routing.MasqueradeClaudeCode`), which makes the Anthropic client put the required Claude-Code system block first: prepended to the rendered request on the translate path, injected into the relayed body on the passthrough path (§4.1). |
 
 Three provider kinds select the client at dispatch: `vendor_openai`
 (`ProviderVendorOpenAI`, the api-key OpenAI path via the existing
@@ -377,29 +377,34 @@ subscription), and `vendor_openai_subscription`
   (the subscription target repeats it).
 - **api_key**: the credential rides the `x-api-key` header.
 - **subscription**: `Authorization: Bearer <oauth-access-token>` plus
-  `anthropic-beta: oauth-2025-04-20`, plus the **Claude-Code masquerade** — the
-  request's system content is prefixed with the exact block
+  `anthropic-beta: oauth-2025-04-20` (on the passthrough, merged with the client's
+  own betas), plus the **Claude-Code masquerade** — the request's system content
+  is prefixed with the exact block
   `You are Claude Code, Anthropic's official CLI for Claude.`, which the OAuth
-  Messages path requires. Endpoint `https://api.anthropic.com`.
+  Messages path requires (rendered into the request on the translate path,
+  injected into the relayed body on the passthrough path). Endpoint
+  `https://api.anthropic.com`.
 
 Anthropic serves only `/v1/messages` (not `/v1/chat/completions`). Two paths reach
 it, both through the **native Anthropic Messages client**
 (`internal/provider/anthropic_messages.go`):
 
 - **Translate (the default).** A vendor target leaves `MessagesMode` zero, bar the
-  one api-key case below, so **both** inbound dialects — OpenAI and Anthropic — are translated through the
+  `anthropic_messages` case below, so the OpenAI dialect is translated through the
   neutral model into `/v1/messages`: the client renders the neutral `inference`
   request to a `/v1/messages` body and parses the response/SSE back. It renders and
   parses itself rather than importing `internal/compat` (an architecture-test
   boundary). This serves chat completions and every `openai` flavor to any
-  Anthropic account, and **every** inbound flavor to an Anthropic **subscription**
-  account.
-- **Native passthrough, api-key only.** The client also implements the
+  Anthropic account, api-key or subscription (a subscription's rendered request
+  carries the masquerade block).
+- **Native passthrough, api-key and subscription.** The client also implements the
   native-proxy interface (`ProxyNative`), and the resolver selects it for exactly
-  one case: an inbound `anthropic_messages` request to an Anthropic **api-key**
-  account (below). The vendor's passthroughs are therefore three: the OpenAI
-  subscription's and the OpenAI api-key account's `/v1/responses` (§4.2), and the
-  Anthropic api-key account's `/v1/messages`.
+  one case: an inbound `anthropic_messages` request to an Anthropic account,
+  **api-key** (*Api-key Messages passthrough*, below) or **subscription**
+  (*Anthropic subscription Messages passthrough*, below). The vendor's
+  passthroughs are therefore four: the OpenAI subscription's and the OpenAI
+  api-key account's `/v1/responses` (§4.2), and the Anthropic api-key and
+  subscription accounts' `/v1/messages`.
 
 #### Api-key Messages passthrough
 
@@ -430,36 +435,32 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   client wrote it. The relay is value-lossless rather than byte-identical when a
   rewrite happens (key order may change). The response and its SSE are relayed
   unchanged and are not rewritten back (§6.5).
-- **The headers are the gateway's, not the client's.** Besides `Content-Type`, the
+- **The headers are the gateway's, bar one.** Besides `Content-Type`, the
   upstream request carries `x-api-key` (the opened credential) and
   `anthropic-version: 2023-06-01`, which `ProxyNative` guarantees itself, so a
   target that forgot it cannot make Anthropic answer 400. There is **no**
-  `Authorization` bearer, **no** `anthropic-beta` and **no** Claude-Code
-  masquerade block, all three being subscription-only, and the resolver's target
-  sets no `ExtraHeaders` for this path. The client's own `anthropic-version` and
-  `anthropic-beta` headers are **not** forwarded, as no inbound header is. Redirects
-  from the upstream are not followed, because net/http strips `Authorization` but
-  not `x-api-key` when a redirect leaves the host.
-- **Known limitation: verbatim body, not header-lossless.** Because the client's
-  `anthropic-beta` is dropped and the gateway pins its own `anthropic-version`, a
-  request that relies on a beta-gated body feature together with its `anthropic-beta`
-  header (for example a `context_management` field) reaches Anthropic with the field
-  but without the opt-in, so Anthropic may reject the request or ignore the field.
-  Forwarding an allow-listed client `anthropic-beta` is a candidate follow-up and
-  is not implemented.
+  `Authorization` bearer and **no** Claude-Code masquerade block, both being
+  subscription-only, and the resolver's target sets no `ExtraHeaders` for this
+  path. The one value taken from the inbound request is the client's
+  `anthropic-beta` (*Client `anthropic-beta` on the Messages passthrough*, below);
+  an api-key target has no beta of its own, so that is the whole header, and a
+  request without one sends none. No other inbound header is forwarded, the
+  client's own `anthropic-version` included. Redirects from the upstream are not
+  followed, because net/http strips `Authorization` but not `x-api-key` when a
+  redirect leaves the host.
+- **Verbatim in body and in beta opt-in, pinned in version.** A beta-gated body
+  feature (for example a `context_management` field) reaches Anthropic together
+  with the opt-in the client sent for it. The one header the relay does not take
+  from the client is `anthropic-version`, which stays the gateway's pin.
 - **Unchanged:** chat completions and every `openai` flavor to an Anthropic api-key
   account (still translated to `/v1/messages`; an inbound `openai_responses` request
   there has no Responses surface to pass through to), an `anthropic_messages` request
   to an **OpenAI** account (still translated to `/v1/chat/completions`) and the
   `count_tokens` utility route (a local estimate that never reaches an upstream).
-- **Subscription stays translate (follow-up).** An Anthropic *subscription* account
-  still translates an inbound Messages request: the OAuth Messages path requires
-  the Claude-Code block as the **first** system block, which only the translate
-  client's rendered request can carry; a verbatim relay would have to edit the
-  client's own `system` field to inject it, which is the body edit it exists to
-  avoid. A lossless subscription passthrough is a documented follow-up, and the
-  subscription target is deliberately unchanged here (`MessagesMode` zero, with
-  `Masquerade` and `ExtraHeaders`).
+- **Subscription account.** An Anthropic *subscription* account takes the same
+  passthrough for an inbound Messages request, with the one body edit this api-key
+  relay never makes: the Claude-Code system block (*Anthropic subscription
+  Messages passthrough*, below).
 - **Behaviour change.** A request the translate path tolerated or reshaped now
   meets Anthropic's own validation, because Anthropic receives the body as the
   client wrote it. The relay was exercised against a stub upstream, not a live
@@ -468,6 +469,138 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   alias) is relayed to the vendor. The gateway registers no other Anthropic route
   that relays to one, so a client cannot call, say, the Message Batches API through
   an account.
+
+#### Client `anthropic-beta` on the Messages passthrough
+
+On **either** Anthropic passthrough, api-key or subscription, the client's
+`anthropic-beta` header reaches Anthropic instead of being dropped. A Claude Code
+or SDK client uses it to opt into beta features (interleaved thinking, a larger
+context window, `context_management`, ...), and a beta-gated field that arrives
+without its opt-in is rejected or ignored upstream. `proxyNative` builds the
+upstream call's context through `upstreamAuthCtxWithHeaders`, fed by
+`anthropicPassthroughHeaderOverrides`:
+
+- **Gate.** Only a target whose provider is the Anthropic vendor client **and**
+  whose `MessagesMode` is `passthrough`, and only when the client's header carries
+  at least one non-blank token. An OpenAI or self-hosted target, and the translate
+  path (a translated request is the gateway's own rendering, which has no use for
+  the client's beta), forward nothing, and a request without a client beta goes
+  out exactly as it would have before.
+- **Merge.** The value sent is the target's own static `anthropic-beta` (none for
+  an api-key target, `oauth-2025-04-20` for a subscription one) followed by the
+  client's tokens. Each header value (a client may repeat the header) is split on
+  commas, each token is trimmed, empty tokens are dropped, and a token is kept
+  only the first time it appears (an exact, case-sensitive match); the result is
+  comma-joined with no spaces. A subscription's OAuth opt-in is therefore always
+  present, and present once, even when the client names it too.
+- **Per-request copy.** The merged value is overlaid on a per-request copy of the
+  target's `ExtraHeaders` (a differently-cased spelling of the header is replaced,
+  not sent beside it). The shared resolved `Target` is never mutated, and the
+  api-key and subscription credential paths (§4.3) are used unchanged.
+- **Verbatim, not allow-listed.** Issue #188 proposed forwarding an *allow-listed*
+  `anthropic-beta`; the implementation forwards the client's tokens **verbatim**
+  instead (an open list). That matches the other lossless passthroughs (the
+  gateway does not curate what a client's body may carry) and Anthropic's own
+  guidance for a gateway in front of Claude Code, which is to pass the client's
+  `anthropic-beta` through. An allow-list would also go stale silently: a beta the
+  gateway has not heard of would be dropped without a trace, the very loss the
+  passthrough exists to remove, and keeping the list current would be upkeep for
+  no protection the vendor does not already apply.
+- **Deliberate consequence: any client of the account can opt it into any beta.**
+  Because the tokens are forwarded verbatim, a gateway client (anything holding a
+  token that routes to the connected account) can request **any** Anthropic beta
+  for it, **including billing-affecting ones**: a beta that changes how a request
+  is billed, or that the account's plan does not include, is sent exactly as the
+  client names it, and whether it is accepted is Anthropic's to decide, its answer
+  being relayed as-is. This is the intended behavior of an open list, not a
+  defect. The exposure is bounded by the account being personal (§1): the clients
+  are its owner's own tokens and portal chat.
+- **`anthropic-version` stays pinned.** The client's own `anthropic-version` is
+  **not** forwarded; `ProxyNative` sends the gateway's `2023-06-01` (the
+  subscription target repeats the same value in its `ExtraHeaders`). The version
+  is the one the body format is tied to, whereas a feature opt-in is
+  `anthropic-beta`'s job.
+
+#### Anthropic subscription Messages passthrough
+
+An inbound **Anthropic Messages** request (`POST /v1/messages`, also served as
+`/anthropic/v1/messages`; the **fine** `anthropic_messages` flavor) to an Anthropic
+**subscription** account is relayed to `https://api.anthropic.com/v1/messages`
+rather than translated, for the same reason as the api-key relay above: the
+translate path parses the request into the neutral model and renders it back, and
+loses everything that model cannot carry (the structured `system` array and its
+`cache_control`, `thinking`, `metadata`, server tools, ...). The resolver sets
+`MessagesMode = passthrough` for exactly this one case
+(`vendorSubscriptionAnthropicTarget`, keyed on the **fine** request flavor, since
+the coarse `apiFlavor` folds every `openai_*` flavor together, exactly as
+`vendorSubscriptionOpenAITarget` is keyed). Every `openai_*` flavor to the same
+account is still translated. The target keeps everything a subscription target
+carries (`Subscription`, `Masquerade = claude_code`, the `anthropic-version` and
+`anthropic-beta: oauth-2025-04-20` `ExtraHeaders`), and the rest is the existing
+native-passthrough layer: `tryProxyNative` reading `MessagesMode` through
+`endpointModeFor`, `subscriptionAuthCtx` resolving the OAuth bearer (§4.3), the
+Anthropic client's `ProxyNative`, and the usual usage attribution to the serving
+account (§5).
+
+- **What reaches Anthropic.** `Authorization: Bearer <oauth access token>` (no
+  `x-api-key`), `anthropic-version: 2023-06-01` once, `Content-Type`, and
+  `anthropic-beta` = `oauth-2025-04-20` followed by the client's own tokens,
+  deduplicated (*Client `anthropic-beta`*, above). No other inbound header is
+  forwarded. The response and its SSE are relayed unchanged and are not rewritten
+  back (§6.5); redirects are not followed, as for the api-key relay.
+- **The body is verbatim except two edits.** The gateway layer rewrites `model` to
+  the account's bare upstream id (equal to the requested name when the account has
+  no prefix). `AnthropicClient.ProxyNative` then **injects the Claude-Code block**
+  the OAuth Messages path requires: the exact
+  `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}`
+  becomes the **first** `system` block (the same block the translate path renders,
+  so the two paths cannot drift). It happens only when the target's `Masquerade`
+  is `claude_code`; an api-key target's body is never touched, byte for byte. How
+  the client's `system` is handled:
+
+  | Client `system` | Sent upstream |
+  |---|---|
+  | absent, `null` or `""` | `[block]` |
+  | a non-empty string `s` | `[block, {"type":"text","text":s}]` |
+  | an array not starting with the block (including `[]`) | the block prepended; every existing block kept as written, `cache_control` included |
+  | an array whose first element is already a `text` block with exactly the Claude-Code text (any other field on it, such as `cache_control`, is ignored) | **unchanged**: no block is added, so the injection is idempotent and a real Claude Code client is not doubled |
+  | anything else (the body is not a single JSON object, or `system` is an object, number or bool) | **unchanged** (fail-open): Anthropic's own 400 is the answer, not a gateway-made one |
+
+- **Value-lossless when edited.** An edited body is decoded with `UseNumber` and
+  re-marshalled, so every value (a large integer, a float's exact spelling such
+  as `1.50`, every client field, `cache_control` and all) arrives as the client
+  wrote it. Only object key order (nested objects included) and insignificant
+  whitespace and escaping may change, and a body that needs no injection (the
+  idempotent and fail-open rows above) keeps the exact bytes the gateway layer
+  handed to the provider client, which are the client's own unless `model` needed
+  its rewrite. The payload capture records the body as the client sent it, before
+  either edit.
+- **Behaviour change.** A request the translate path tolerated or reshaped now
+  meets Anthropic's own validation, because Anthropic receives the body as the
+  client wrote it. The relay was exercised end to end against a stub upstream
+  (bearer, merged beta, block first with the client's `system` and `cache_control`
+  intact, body otherwise verbatim, SSE byte for byte, usage attributed to the
+  account), not against a live Anthropic OAuth session.
+
+**Scope decision: no CLI-fingerprint headers.** The passthrough sends **none** of
+the headers a real Claude Code client sends to identify itself: no `x-app: cli`,
+no `claude-cli` `User-Agent`, no `X-Stainless-*` SDK headers and no outbound
+`X-Claude-Code-Session-Id`, and the client's own copies of them are not forwarded
+(only `anthropic-beta` is taken from the inbound request). It therefore keeps
+exactly the **same impersonation depth as the existing translate masquerade**
+(the system block, the OAuth beta and the bearer), just lossless. Whether
+Anthropic's OAuth path checks anything beyond that is unknown, and a deeper
+fingerprint set is a **VERIFY-LIVE** follow-up that would sit behind its own flag,
+not something this passthrough does by default.
+
+**VERIFY-LIVE.** The subscription OAuth path is reverse-engineered and has not been
+confirmed against a live account (§10): that Anthropic accepts the injected block
+together with the merged `anthropic-beta` is assumed, on the same footing as the
+translate path it replaces. The idempotency assumes that a real Claude Code client
+sends the exact Claude-Code block as `system[0]`. If a client version puts some
+other block ahead of its own Claude-Code block, the gateway cannot tell and
+**prepends a second copy** of the block, so Anthropic would see the Claude-Code
+line twice; whether it objects is likewise unverified.
 
 ### 4.2 OpenAI
 
@@ -566,8 +699,9 @@ to the serving account (§5).
 ### 4.3 Credential resolution at the edge
 
 For a subscription target, `subscriptionAuthCtx` resolves (and refreshes, §3.4)
-the OAuth bearer, attaches it plus the target's static `ExtraHeaders`, and — for
-OpenAI — the per-account `chatgpt-account-id`. The static headers are attached
+the OAuth bearer, attaches it plus the target's static `ExtraHeaders` (on an
+Anthropic Messages passthrough, with the client's `anthropic-beta` merged into
+them per request, §4.1), and — for OpenAI — the per-account `chatgpt-account-id`. The static headers are attached
 even when no bearer is available, so an auth failure reads as an auth error
 upstream rather than a missing API version. The api-key path is unchanged: its
 sealed `APIToken` rides the vendor's own API-key header. The custom `x-api-key`
@@ -863,9 +997,10 @@ Two behaviours to know:
   Different prefixes are also how a user keeps two accounts that offer the same
   model both reachable.
 - On the native-passthrough path (an OpenAI subscription's or an OpenAI api-key
-  account's `/v1/responses`, §4.2, or an Anthropic api-key account's
-  `/v1/messages`, §4.1) the gateway rewrites only the request's `model`
-  field to the bare slug. The vendor's response is relayed verbatim and there is
+  account's `/v1/responses`, §4.2, or an Anthropic api-key or subscription
+  account's `/v1/messages`, §4.1) the gateway rewrites only the request's `model`
+  field to the bare slug (the Anthropic subscription's relay additionally
+  injects the Claude-Code system block, which does not touch `model`). The vendor's response is relayed verbatim and there is
   no response-side rewrite, so its `model` field echoes the **bare** slug, not
   the prefixed name the client asked for. A recorded usage event keeps the
   requested (prefixed) name as its model and the bare slug as the provider
@@ -998,7 +1133,8 @@ reasons are recorded deliberately, not in denial of them
   two subscription model-list endpoints, §6.1, and the ChatGPT usage endpoint,
   §5.2),
   client id, redirect URI, scope, beta header, device-code path, token-claim name,
-  masquerade requirement, serving host, request/refresh body encoding, and the
+  masquerade requirement (including the passthrough's injected block and merged
+  `anthropic-beta`, §4.1), serving host, request/refresh body encoding, and the
   rate-limit response-header names can change without notice.
   They are confined to `internal/vendorauth/constants.go` and the resolver's
   dispatch literals (routing cannot import `vendorauth`), all marked VERIFY-LIVE,
