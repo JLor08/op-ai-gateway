@@ -557,7 +557,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-84-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -613,7 +613,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-84-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -782,7 +782,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-84-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -967,7 +967,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-84-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1182,7 +1182,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-84-migrations),
+[§4](reference/data-model.md#4-migration-history-85-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1408,7 +1408,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-84-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-85-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1533,7 +1533,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-84-migrations),
+[§4](reference/data-model.md#4-migration-history-85-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3118,3 +3118,88 @@ default-off.
 [Data Model §1](reference/data-model.md#external-vendor-accounts-anbieter),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Configuration & Environment Variables](reference/config-env.md).
+
+
+## ADR-050 — Vendor-account access is a per-token opt-in, enforced in listing and routing through one prefix helper
+**Context:** a vendor account ([ADR-049](#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted))
+is personal, but until now **every** API token its owner had ever issued could route
+through it: connecting an account silently exposed it (a subscription, with its own
+usage limits and ToS risk, included) to each key the owner had handed to a script, a
+CI job or a colleague's tool, and there was no way to say "this key may use my
+OpenAI account but not my Claude subscription". A second need rode along: two
+accounts of one vendor can only be told apart by their account-level `model_prefix`,
+which is the same for every key, so a client that must see a vendor's models under
+their original names (or under a different namespace than the portal uses) had no
+way to.
+
+**Decision — five choices, taken together.**
+- **(a) A per-token policy, stored as one JSON column.** `api_tokens.vendor_provider_access`
+  (migration 85, `text not null default ''`) holds `{"all", "accounts":
+  [{"account_id", "prefix_override"?: {"enabled", "value"}}]}`. `all: true` grants every
+  active account of the owner — future ones included — under each account's own
+  `model_prefix`; `all: false` grants only the listed accounts, an empty list none.
+  Per listed account an optional **prefix override** replaces the account's prefix for
+  that token, and **an enabled override with an empty value serves the account's
+  models under their original names, with no prefix**. One JSON value, not a link
+  table: the policy is a small atomic document that rides on the token row already read
+  at every lookup (no extra query on the hot path), and a deleted account needs no
+  cleanup because a stored id that names no account matches nothing.
+- **(b) Enforcement in both the listing and the routing path, through one helper.**
+  `routing.TokenVendorPrefix(access, account) → (prefix, allowed)` is the single
+  source: the model-listing overlay (`ownVendorAccountModels`) and the resolver
+  (`resolveVendorAccount`) both skip a denied account and use `prefix +
+  upstream_model` as the public name, so **an advertised name is a routable name and
+  the reverse**. The resolver matches on that name and reverse-maps it to the raw
+  vendor slug for dispatch (`ProviderModel`), so an override is a per-token naming
+  layer over the account's one stored catalog. A listing alone is not access control;
+  routing alone would advertise names it refuses.
+- **(c) Strict opt-in, existing tokens included, no backfill.** A new token and every
+  token that exists at upgrade default to no vendor access (the column's empty
+  default *is* the policy). Granting access is an explicit act of the owner in the
+  token editor.
+- **(d) Collisions: reject at save, with a deterministic backstop.** With `all: false`,
+  a policy whose effective public names collide across the selected accounts'
+  current models is refused at create/update with `400
+  portal.token_vendor_access_conflict` (unknown, foreign or repeated accounts and
+  malformed override values are `400 portal.token_vendor_access_invalid`). Because a
+  vendor can ship a colliding model after the save, the resolver keeps a backstop: it
+  walks the accounts in stable id order and the first match wins, so a collision
+  never makes routing ambiguous. `all: true` has no save-time check (it names no
+  accounts) and rests on the same backstop.
+- **(e) The opt-in binds API tokens, not the owner's own session.** The interactive
+  portal session (and the trusted loopback chat acting for it) has no `api_tokens`
+  row to opt in on and must keep every account in the chat picker, the Models page and
+  the dashboard, so `sessionPrincipal` carries `VendorAccess{All: true}`. A run-as
+  token honors its own stored policy; a service token (no user id) owns no vendor
+  accounts and stays inert.
+
+**Consequence:** the change is a deliberate **breaking default** for any token that
+was already calling a vendor model: after the upgrade it is refused as an unknown
+model and no longer listed until its owner opts it in
+([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)); it
+is bounded by the default-off master flag, so only a deployment that enabled vendor
+accounts is affected. The parity contract is one function, so the two paths cannot
+drift, and the stored `gateway_model` is no longer the routing key (it equals
+`model_prefix + upstream_model`, which is what the resolver computes, so the native
+prefix is unchanged). An empty override can place a vendor's own names next to a
+self-hosted model of the same name; the existing `vendor_account_routing_mode`
+decides which answers, as it does today. A collision that emerges after the save
+shadows the later account's model under that name until the owner separates the
+prefixes. A token's policy can only narrow, never widen, owner scope: it names only
+accounts the owner owns.
+
+**Rejected:** defaulting existing tokens to `all: true` (keeps every old key working
+but leaves every previously issued key with access to accounts it was never meant
+for — the exposure this decision exists to close); per-vendor rather than
+per-account granularity (it cannot separate two accounts of one vendor, or a
+subscription from an API key); a junction table (more moving parts and orphan
+cleanup for a small per-token document); enforcing in routing only or in the listing
+only (the listing would advertise names routing refuses, or the reverse); applying
+the strict default to the owner's interactive session too (it would empty the chat
+picker and dashboard of an owner's own accounts, with no token row to repair it on);
+an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
+needed for this need).
+→ [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
+[Data Model](reference/data-model.md#4-migration-history-85-migrations) (migration 85),
+[API Surface](reference/api-surface.md#token-vendor-access),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

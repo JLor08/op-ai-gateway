@@ -30,12 +30,16 @@ Messages client and an OpenAI Responses translate client (`internal/provider`,
 §4), a usage/limits snapshot fed by the vendor's rate-limit response headers and,
 for an OpenAI subscription, an active usage pull with its own refresh endpoint (§5),
 and a discovery of each account's real model catalog from the vendor, served under
-an optional per-account prefix (§6).
+an optional per-account prefix (§6). Which of a user's accounts each API token may
+use is the token's own, strictly opt-in decision, with an optional per-token
+prefix override (§11).
 
 ## 1. The entity and its ownership
 
 A `vendor_account` is **personal**: owned by the connecting user and usable only
-for that user's own requests (portal chat and the user's own API tokens). Sharing
+for that user's own requests: the owner's interactive portal session, and the
+owner's own API tokens **that have been opted in to it** (§11; a token reaches no
+account until the owner grants it). Sharing
 an account across users via resource groups is deliberately deferred to a later
 phase; the entity and ownership model are shaped so that becomes additive (a
 sharing link table plus a resolver filter extension), not a rewrite.
@@ -322,17 +326,22 @@ A connected account becomes a routable candidate **without touching the hot
 scoring path, the multiplexer, or the `Target` core** beyond a small, additive
 dispatch extension. The resolver (`internal/routing/resolver.go`) gains a
 vendor-account candidate source consulted for a resolve carrying a known **user**
-principal: it enumerates the principal's **own** active accounts and builds a
-`Target` directly for the **first** active account that has a
-`vendor_account_models` row whose `gateway_model` equals the requested model.
-Owner-scope is intrinsic — only the principal's accounts are enumerated — so one
-user's account can never serve another user's request. Precedence against
+principal: it enumerates the principal's **own** active accounts, keeps only those the
+principal's **token** may use (§11), and builds a `Target` directly for the
+**first** such account that has a `vendor_account_models` row whose public name
+under the token's effective prefix equals the requested model. Owner-scope is
+intrinsic — only the principal's accounts are enumerated — so one user's account
+can never serve another user's request. Precedence against
 self-hosted/shared routes is configurable (§7).
 
-The match is on the **model name only** (`gateway_model == req.Model`). That name
-is the account's `model_prefix` plus the vendor's id (§6.5), so a prefixed account
-does not answer to the bare vendor id, and two accounts serving the same vendor
-model under different prefixes each route to their own account. The resolver
+The match is on the **model name only**: the requested name must equal the
+**effective prefix plus the row's `upstream_model`**. For an all-access token or an
+opted-in account without an override that prefix is the account's own
+`model_prefix` (§6.5), so the match is exactly the stored `gateway_model`, a
+prefixed account does not answer to the bare vendor id, and two accounts serving
+the same vendor model under different prefixes each route to their own account. A
+per-token prefix override changes the prefix, and so the name the token matches
+on, without touching the stored rows (§11.2). Whatever the prefix, the resolver
 sends the vendor the row's `upstream_model`, the bare id, as the target's
 `ProviderModel`. The catalog row's `api_flavor` is stored metadata and is **not**
 read by the resolver or the listing overlay. What flavor each account serves is
@@ -348,7 +357,8 @@ matrix:
 
 The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted/shared path — when the module flag is off, the principal has no user
-id (a **service token**), a **server-override** is set, the request is
+id (a **service token**; and a token the owner has not opted in enumerates no
+account at all, §11), a **server-override** is set, the request is
 **capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
 flavor is **images** (`openai_images`). That the resolver and the listing overlay
 agree on what each account serves is what makes the "served-flavors parity"
@@ -1236,7 +1246,8 @@ Two behaviours to know:
 
 - With a prefix set, the bare vendor id is **not** served by that account.
   Different prefixes are also how a user keeps two accounts that offer the same
-  model both reachable.
+  model both reachable. The prefix above is the account's **native** one; an
+  API token can be given a different one, or none, per account (§11.1).
 - On the native-passthrough path (an OpenAI subscription's or an OpenAI api-key
   account's `/v1/responses`, §4.2, or an Anthropic api-key or subscription
   account's `/v1/messages`, §4.1) the gateway rewrites only the request's `model`
@@ -1267,8 +1278,12 @@ resolver, so it needs no cache (§7).
 ### 6.7 Where an account's models show up
 
 Every listing reads **one** source, `ownVendorAccountModels`: the principal's
-own **active** vendor accounts and their rows, behind the master flag, for a user
-principal only (a service token owns no account) and fail-open per account. What
+own **active** vendor accounts and their rows that the principal's **token may
+use** (§11) — each named under the token's effective prefix — behind the master
+flag, for a user principal only (a service token owns no account) and fail-open
+per account. The owner's interactive portal session may use all of them, so the
+table below describes what a session sees; an API token sees the subset, and the
+names, its policy grants. What
 the listings advertise and what the dashboard shows therefore cannot drift, and a
 vendor model is never subject to the gateway-wide hidden/locked suppression,
 which applies to self-hosted models.
@@ -1329,6 +1344,8 @@ owner-only for the `system` scope too, because each sends the stored credential 
 the vendor: they are authorized like a write, not like a metadata read. Routing and
 the model listings (§6.7) enforce the same owner scope by enumerating only the
 principal's own accounts, so one user's account can never serve, or be listed to, another.
+A token's vendor-access policy (§11) narrows that further, never widens it: it can
+name only accounts the token's owner owns, and a stale id matches nothing.
 The Activity list follows the same read rule for the account's **name**: a usage
 row carries its `account_id` for every viewer, but the transient `account_name` is
 resolved only for the owner or a `system` admin and stays empty for anyone else
@@ -1434,6 +1451,144 @@ reasons are recorded deliberately, not in denial of them
   token — and let a discovery and a prefix re-label undo each other. The feature is an operator-only experiment, so
   one gateway process is assumed.
 
+## 11. Per-token vendor access
+
+An account is personal to its owner (§1), but **which of the owner's API tokens may
+use it is the token's own decision**, made by the owner in the token editor. The
+default is strict opt-in: a token reaches **no** vendor account until it is
+granted one, so connecting an account never silently exposes it to every key the
+owner has issued, and a leaked or shared key cannot spend a subscription the
+owner never meant it to reach
+([ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)).
+
+### 11.1 The policy
+
+The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
+(column, a JSON string on `api_tokens`, migration 85;
+[Data Model](../reference/data-model.md#4-migration-history-85-migrations)):
+
+```json
+{ "all": false,
+  "accounts": [
+    { "account_id": "va_…" },
+    { "account_id": "va_…", "prefix_override": { "enabled": true, "value": "work/" } }
+  ] }
+```
+
+| Setting | Effect |
+|---|---|
+| **No policy** / `all: false` with an empty list | **No vendor access.** The default for every new token, and — because migration 85 adds the column with an empty default and backfills nothing — for every token that existed at upgrade. `""` is how it is stored. |
+| `all: true` | Every **active** account the owner has, **including accounts connected later**, each under its **own** `model_prefix`. The account list is ignored. |
+| `all: false` + a list | Only the listed accounts. Each entry may carry a **prefix override**. |
+| `prefix_override` `{enabled: true, value}` | The token sees that account's models under `value` **instead of** the account's `model_prefix`. |
+| `prefix_override` with **`enabled: true` and an empty `value`** | The account's models are served under their **original vendor names, with no prefix** (`gpt-5` rather than `chatgpt/gpt-5`). This is a real, supported setting, not an unset field. |
+| No `prefix_override`, or `enabled: false` | The account's own `model_prefix`. A stored override only counts while it is enabled, so an object with `enabled: false` is a switched-off override. |
+
+An override value follows the account-prefix rule (§1: at most 64 bytes from
+`A-Z a-z 0-9 - _ . ~ : / @ +`, no `..`); an enabled one that breaks it is refused at
+save. Only **active** accounts are ever reachable — a `disabled` or
+`needs_reconnect` account is neither listed nor routed whatever the policy says —
+and the master flag (§7) still gates the whole feature. The stored policy decodes
+tolerantly: a blank or malformed value reads as the strict default and an entry
+without an account id is dropped, so a bad row can never break token resolution or
+open access. An account deleted after a grant leaves a stale id behind, which
+simply matches nothing.
+
+The token editor (portal, **Provider access** / "Anbieter-Zugriff") exposes it as
+an "All providers (incl. future)" switch, a checkbox per connected account and,
+for each ticked account, an "Override prefix" toggle with a prefix field whose
+hint states that empty means no prefix. The whole section is hidden while the
+master flag is off, and the field is then left out of the request so an edit
+cannot disturb a stored policy ([API surface: token vendor
+access](../reference/api-surface.md#token-vendor-access)).
+
+### 11.2 One helper, so a listed name is a routable name
+
+The effective public name of a vendor model, for a given token, is
+**`prefix + upstream_model`**. Both places that need it ask one function,
+`routing.TokenVendorPrefix(access, account) → (prefix, allowed)`:
+
+| Policy | Result for an account |
+|---|---|
+| `all: true` | allowed, the account's own `model_prefix` |
+| listed, no (or disabled) override | allowed, the account's own `model_prefix` |
+| listed, override enabled | allowed, the override value (possibly `""`) |
+| not listed (and not `all`) | **denied** |
+
+- **Listing.** `ownVendorAccountModels` (§6.7) skips a denied account and
+  re-labels each remaining account's rows to `prefix + upstream_model`, so
+  `/v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v0/models` and
+  every consumer of that one source advertise exactly the token's names.
+- **Routing.** `resolveVendorAccount` (§4) skips a denied account and matches the
+  request model against `prefix + upstream_model`. **The resolver reverse-maps the
+  token's public name back to the raw vendor slug**: the target keeps the public
+  name as the request model (usage rows record what the client asked for) and
+  carries the row's `upstream_model` as its `ProviderModel`, which is what the
+  vendor is sent. Matching the stored `gateway_model` instead would pin every token
+  to the account's native prefix.
+
+Sharing the helper is the parity contract: an advertised name cannot be
+unroutable, and a routable name cannot be unadvertised. An override is purely a
+**naming layer per token** — the stored catalog is the account's, written once by
+discovery (§6) under its native prefix, and nothing is copied per token.
+
+An empty override puts a vendor's own names into the token's namespace, so it can
+share a name with a self-hosted model. The existing routing mode decides (§7): under
+`vendor_first` the token's vendor account answers that name, under `fallback_only`
+the self-hosted route does. That is the point of choosing bare names, but it is also
+the reason to prefer a distinct prefix when both exist.
+
+### 11.3 Name collisions
+
+Two accounts can offer the same effective name: two accounts of one vendor with no
+prefix, or an override that lands on another account's prefix. Two layers handle it:
+
+- **Rejected at save** (`all: false` only). Creating or updating a token checks the
+  effective names across the selected accounts' **current** models and refuses a
+  duplicate with `400 portal.token_vendor_access_conflict`; the owner resolves it by
+  giving one account a distinct override. The same save also refuses an unknown,
+  foreign or repeated account id and a malformed enabled override value with
+  `400 portal.token_vendor_access_invalid`. A transient failure to read the owner's
+  accounts is a `500`, and a failure to read one account's models is logged and
+  skipped rather than failing the save (the backstop below still applies).
+  `all: true` has no save-time check, because it names no accounts.
+- **A deterministic backstop at routing.** A collision that only emerges later —
+  the vendor ships a model after the save, or an account's own prefix is changed —
+  cannot be caught at save. The resolver enumerates accounts in **stable account-id
+  order** and the **first** match wins, the same rule that already applies to
+  colliding native prefixes, while the model listings show a name once. Routing is therefore
+  never ambiguous; the cost is that a shadowed account's model is unreachable under
+  that name until the owner separates the prefixes.
+
+### 11.4 Who is restricted: API tokens, not the owner's session
+
+The opt-in binds **API tokens**, and only those:
+
+| Principal | Vendor access |
+|---|---|
+| **API token** (user-owned) | Its stored policy; strict default none. |
+| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's active accounts under their native prefixes (`VendorAccess{All: true}`). It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account. |
+| **A run-as token** (a chat run that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. |
+| **Service token** (no user id) | **None, and inert**: it owns no vendor accounts (§4), so its policy is never consulted. A service-token create has no `vendor_access`. |
+
+So a user always sees and can chat with every account they connect, while a key
+they hand to a script reaches only what they ticked for it. The token list's
+synthetic "chat session" row carries no `vendor_access` for the same reason.
+
+### 11.5 Upgrade behavior
+
+The strict default is a **deliberate behavior change** for any token that was
+already calling a vendor model: after migration 85 its requests for those names fall
+through to the self-hosted path and, finding no such model, end as
+`routing.no_model_route`, and the model listings no longer advertise them, until the
+owner opens the token and opts it in. The trade is accepted over the alternative of
+defaulting existing tokens to `all: true`, which would leave every previously issued
+key with access to accounts it was never meant for
+([ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper),
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+The feature is behind the default-off master flag (§7), so only a deployment that
+enabled vendor accounts is affected.
+
 ## Related chapters
 
 - [Routing & Model Selection](routing-and-model-selection.md) — the resolver and
@@ -1444,12 +1599,16 @@ reasons are recorded deliberately, not in denial of them
   object-level authorization.
 - [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter) — the
   three tables and the `usage_events.account_id` column (migration 82), the
-  prefix and display-name columns (migration 83) and the usage snapshot's
-  spend-control columns (migration 84).
+  prefix and display-name columns (migration 83), the usage snapshot's
+  spend-control columns (migration 84) and the per-token
+  `api_tokens.vendor_provider_access` column (migration 85).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
   `/api/portal/vendor-accounts*` routes (the model and usage refreshes included) and
-  their error codes.
+  their error codes; [token vendor access](../reference/api-surface.md#token-vendor-access)
+  for the per-token `vendor_access` field and its two error codes.
 - [Configuration & Environment Variables](../reference/config-env.md) — the cipher
   key and the three system settings.
 - [ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)
   — the first-class-entity and experimental-subscription decisions.
+- [ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)
+  — the per-token opt-in, the shared prefix helper and the collision policy.

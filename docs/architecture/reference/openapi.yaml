@@ -377,29 +377,93 @@ paths:
 
   # ── 3. Portal: tokens, chats, usage ───────────────────────────────────────
   /api/portal/tokens:
+    description: >
+      Own API tokens. Besides the model-settings fields, a token carries a
+      vendor_access policy (see the TokenVendorAccess schema): which of the
+      owner's vendor ("Anbieter") accounts the token may use. Strict opt-in:
+      a token without the field has NO vendor access. The same field is
+      writable on create and update and readable on the list.
     get:
       tags: [portal]
-      summary: List own API tokens
+      summary: List own API tokens (each row carries vendor_access when the token has any)
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: >
+            The caller's tokens, the synthetic non-deletable chat-session row
+            first. vendor_access is omitted for a token with no vendor access
+            (and for the chat-session row, whose session always sees all of
+            the owner's accounts). Other row fields are defined by the Go DTO
+            (see api-surface.md).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
     post:
       tags: [portal]
-      summary: Create an API token
+      summary: Create an API token (optionally with a vendor_access policy)
+      description: >
+        An absent vendor_access is the strict default (no vendor access). A
+        supplied policy is validated against the caller's own accounts: an
+        unknown, foreign or repeated account id, or an enabled override prefix
+        that is not a valid model prefix, is a 400
+        portal.token_vendor_access_invalid; with all=false, two selected
+        accounts whose effective public model names collide is a 400
+        portal.token_vendor_access_conflict. A failure to read the caller's
+        accounts is a 500, not one of these.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >
+                Token fields as defined by the Go DTO (see api-surface.md);
+                only vendor_access is modeled here.
+              additionalProperties: true
+              properties:
+                vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/tokens/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
     patch:
       tags: [portal]
-      summary: Update an own API token
+      summary: Update an own API token (vendor_access replaces the stored policy wholesale)
+      description: >
+        An absent vendor_access keeps the stored policy; a present one
+        REPLACES it wholesale (an empty one resets to the strict default of no
+        vendor access) after the same validation as on create
+        (portal.token_vendor_access_invalid / portal.token_vendor_access_conflict,
+        both 400).
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >
+                Token fields as defined by the Go DTO (see api-surface.md);
+                only vendor_access is modeled here.
+              additionalProperties: true
+              properties:
+                vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
     delete:
       tags: [portal]
       summary: Delete an own API token
@@ -2009,6 +2073,43 @@ components:
               description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
             message: { type: string }
             request_id: { type: string }
+    TokenVendorAccess:
+      type: object
+      description: >
+        An API token's vendor-account ("Anbieter") access policy. Strict
+        opt-in: a token with no policy (field absent on a response, absent or
+        null on create) has no vendor access. all=true lets the token use
+        EVERY active account the owner has (future accounts included) under
+        each account's own model_prefix, and accounts is then ignored.
+        all=false limits it to the listed accounts; an empty list means no
+        vendor access. A response always carries accounts as an array. The
+        public model name a token sees for an account's model is the
+        effective prefix plus the vendor's own model id, in both the model
+        listing and routing.
+      properties:
+        all: { type: boolean }
+        accounts:
+          type: array
+          items: { $ref: '#/components/schemas/TokenVendorAccessEntry' }
+    TokenVendorAccessEntry:
+      type: object
+      required: [account_id]
+      properties:
+        account_id:
+          type: string
+          description: Id of one of the token owner's own vendor accounts (va_...).
+        prefix_override:
+          type: object
+          description: >
+            Optional per-token replacement for the account's model_prefix.
+            Counts only while enabled is true. enabled with an empty value
+            serves the account's models under their original vendor names,
+            with no prefix. A non-empty value follows the same rules as
+            vendor_account.model_prefix (at most 64 bytes from
+            A-Z a-z 0-9 - _ . ~ : / @ +, no "..").
+          properties:
+            enabled: { type: boolean }
+            value: { type: string }
     Healthz:
       type: object
       required: [ok]
