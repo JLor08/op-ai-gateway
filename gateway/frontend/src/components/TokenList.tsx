@@ -16,6 +16,8 @@ import type {
   ProjectRef,
   ServerModelOption,
   UpdateTokenRequest,
+  VendorAccessDTO,
+  VendorAccount,
 } from '../api';
 import type { Translation, MessageKey, PortalApi } from './shared/types';
 import { formatPortalError } from './shared/format';
@@ -57,6 +59,7 @@ import {
   type OverrideRow,
 } from './shared/ModelOverrideEditor';
 import { OverrideTargetSelect, overrideTargets } from './shared/OverrideTargetSelect';
+import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 
 const allTokenScopes = ['gateway:use', 'admin'] as const;
 
@@ -67,6 +70,16 @@ const tokenStatusLabelByKey: Record<PortalToken['status'], MessageKey> = {
 };
 
 type Mode = 'list' | 'create' | { edit: PortalToken };
+
+// One vendor account (by its stable id) the token is opted in to, plus the form
+// state of its optional prefix override. The override is ON only while
+// overrideEnabled; prefix is then the value that replaces the account's own
+// model prefix for this token ("" = no prefix, the bare original model names).
+type VendorAccessEntryState = {
+  accountId: string;
+  overrideEnabled: boolean;
+  prefix: string;
+};
 
 function toggleScope(list: string[], scope: string): string[] {
   return list.includes(scope) ? list.filter((s) => s !== scope) : [...list, scope];
@@ -80,6 +93,7 @@ export function TokenList({
   role,
   models,
   servers = [],
+  vendorAccountsEnabled = false,
   loading = false,
 }: Readonly<{
   t: Translation;
@@ -92,6 +106,7 @@ export function TokenList({
     | 'serverModels'
     | 'updateChatSettings'
     | 'updateToken'
+    | 'vendorAccounts'
   >;
   tokens: PortalToken[];
   setTokens: Dispatch<SetStateAction<PortalToken[]>>;
@@ -103,6 +118,13 @@ export function TokenList({
   // its option list. Optional so pre-existing test renders that never touch
   // the picker keep working unchanged; defaults to [].
   servers?: PortalServer[];
+  // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled).
+  // Off hides the whole vendor-access section, skips the account fetch (the
+  // endpoint 409s vendor_accounts.module_disabled while the flag is off) and
+  // keeps vendor_access out of every request body, so an edit leaves the stored
+  // policy untouched. Optional so pre-existing renders keep working; defaults to
+  // false.
+  vendorAccountsEnabled?: boolean;
   loading?: boolean;
 }>) {
   const selectableScopes: string[] =
@@ -151,6 +173,17 @@ export function TokenList({
   const [projectId, setProjectId] = useState('');
   const [myProjects, setMyProjects] = useState<ProjectRef[]>([]);
   const projectsReqIdRef = useRef(0);
+  // Vendor-account ("Anbieter") access (flag-gated, see vendorAccountsEnabled):
+  // vaAll = every account the owner has, also future ones, under its own prefix;
+  // otherwise vaAccounts is the explicit opt-in list. vendorAccounts is the
+  // caller's OWN account list api.vendorAccounts() returns, loaded lazily each
+  // time the form opens with the same latest-wins guard as the project picker;
+  // null = not loaded for this open (in flight or failed), so nothing can be
+  // judged stale yet.
+  const [vaAll, setVaAll] = useState(false);
+  const [vaAccounts, setVaAccounts] = useState<VendorAccessEntryState[]>([]);
+  const [vendorAccounts, setVendorAccounts] = useState<VendorAccount[] | null>(null);
+  const vendorAccountsReqIdRef = useRef(0);
 
   // Synthetic, token-less ChatSession pseudo-token (own settings panel).
   const chatSession = tokens.find((row) => row.is_chat_session) ?? null;
@@ -172,6 +205,19 @@ export function TokenList({
         /* best-effort: fall through with the previously-loaded list */
       });
   }, [mode, api]);
+
+  useEffect(() => {
+    if (mode === 'list' || !vendorAccountsEnabled) return;
+    const reqId = ++vendorAccountsReqIdRef.current;
+    api
+      .vendorAccounts()
+      .then((resp) => {
+        if (vendorAccountsReqIdRef.current === reqId) setVendorAccounts(resp.data);
+      })
+      .catch(() => {
+        /* best-effort: the list stays unloaded and the section renders without options */
+      });
+  }, [mode, api, vendorAccountsEnabled]);
 
   // Load the selected override server's offered models so the model-override
   // map's "to" dropdown can narrow to them. Latest-wins guard so a
@@ -200,6 +246,14 @@ export function TokenList({
   // overrideSummary and the row editor itself are shared with ServicesView via
   // ./shared/ModelOverrideEditor (FV-3).
   const overrideInvalid = overrideRowsInvalid(overrideRows);
+  // An enabled per-account prefix override with a malformed value blocks the
+  // save (the same client-side mirror of the backend rule the provider form
+  // uses); a disabled override is never sent, so its value is not judged. Moot
+  // while the section is hidden or the all switch is on.
+  const vendorAccessInvalid =
+    vendorAccountsEnabled &&
+    !vaAll &&
+    vaAccounts.some((entry) => entry.overrideEnabled && !isValidModelPrefix(entry.prefix));
 
   function openCreate() {
     setName('');
@@ -215,6 +269,9 @@ export function TokenList({
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
+    setVaAll(false);
+    setVaAccounts([]);
+    setVendorAccounts(null);
     setMode('create');
   }
 
@@ -245,7 +302,59 @@ export function TokenList({
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
+    // A token without vendor_access (the strict default) reads as no access.
+    setVaAll(row.vendor_access?.all ?? false);
+    setVaAccounts(
+      (row.vendor_access?.accounts ?? []).map((entry) => ({
+        accountId: entry.account_id,
+        // The override is ON only for a present prefix_override with enabled
+        // true; a missing one (or enabled:false) is OFF.
+        overrideEnabled: entry.prefix_override?.enabled === true,
+        prefix: entry.prefix_override?.value ?? '',
+      })),
+    );
+    setVendorAccounts(null);
     setMode({ edit: row });
+  }
+
+  // The vendor_access request value: undefined while the flag is off (the
+  // section is hidden and the field stays out of the body); { all: true } alone
+  // for "all providers"; otherwise the explicit opt-in list. An override that is
+  // off omits prefix_override entirely (never enabled:false), and an enabled one
+  // sends its trimmed value ("" = no prefix). Once this open's account list has
+  // loaded, an opt-in for an account that is no longer in it (deleted since) is
+  // dropped: the backend rejects an unknown account id (400
+  // portal.token_vendor_access_invalid) and the form has no way to show, let
+  // alone remove, it.
+  function buildVendorAccess(): VendorAccessDTO | undefined {
+    if (!vendorAccountsEnabled) return undefined;
+    if (vaAll) return { all: true };
+    const knownIds = vendorAccounts ? new Set(vendorAccounts.map((acc) => acc.id)) : null;
+    return {
+      all: false,
+      accounts: vaAccounts
+        .filter((entry) => !knownIds || knownIds.has(entry.accountId))
+        .map((entry) => ({
+          account_id: entry.accountId,
+          ...(entry.overrideEnabled
+            ? { prefix_override: { enabled: true, value: normalizeModelPrefix(entry.prefix) } }
+            : {}),
+        })),
+    };
+  }
+
+  function toggleVendorAccount(accountId: string) {
+    setVaAccounts((current) =>
+      current.some((entry) => entry.accountId === accountId)
+        ? current.filter((entry) => entry.accountId !== accountId)
+        : [...current, { accountId, overrideEnabled: false, prefix: '' }],
+    );
+  }
+
+  function updateVendorEntry(accountId: string, patch: Partial<VendorAccessEntryState>) {
+    setVaAccounts((current) =>
+      current.map((entry) => (entry.accountId === accountId ? { ...entry, ...patch } : entry)),
+    );
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -267,6 +376,7 @@ export function TokenList({
         log_communication: logCommunication,
         secret,
         project_id: projectId,
+        vendor_access: buildVendorAccess(),
       });
       setTokens((current) => [response.token, ...current]);
       setCreatedSecret(response.secret);
@@ -298,6 +408,10 @@ export function TokenList({
       body.log_communication = logCommunication;
       body.secret = secret;
       body.project_id = projectId;
+      // Omitted while the flag is off: the section is hidden, and an absent
+      // vendor_access keeps the stored policy.
+      const vendorAccess = buildVendorAccess();
+      if (vendorAccess) body.vendor_access = vendorAccess;
       const updated = await api.updateToken(id, body);
       setTokens((current) => current.map((row) => (row.id === id ? updated : row)));
       setMode('list');
@@ -462,6 +576,13 @@ export function TokenList({
     // (unlike overrideModelTargets above): the redirect is unrelated to a
     // server override.
     const unknownFallbackTargets = overrideTargets(models, null);
+    // Vendor-access section: the opted-in accounts in the account list's own
+    // order, so each one's override controls sit in a stable place.
+    const vendorAccessById = new Map(vaAccounts.map((entry) => [entry.accountId, entry]));
+    const optedInAccounts = (vendorAccounts ?? []).flatMap((acc) => {
+      const entry = vendorAccessById.get(acc.id);
+      return entry ? [{ acc, entry }] : [];
+    });
     return (
       <>
         <Breadcrumbs
@@ -605,6 +726,97 @@ export function TokenList({
                   : t.tokenLastUsedModelNone}
               </Typography>
             </Box>
+            {/* The vendor-access section is hidden entirely while the vendor-accounts
+                master flag is off. Account names are vendor/owner-supplied text:
+                rendered as text only. */}
+            {vendorAccountsEnabled && (
+              <Box
+                role="group"
+                aria-labelledby="token-vendor-access-heading"
+                sx={{ display: 'grid', gap: 1 }}
+              >
+                <Typography id="token-vendor-access-heading" variant="subtitle2">
+                  {t.tokenVendorAccessLabel}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {t.tokenVendorAccessNote}
+                </Typography>
+                <FormControlLabel
+                  control={
+                    <Checkbox checked={vaAll} onChange={(e) => setVaAll(e.target.checked)} />
+                  }
+                  label={t.tokenVendorAccessAll}
+                />
+                {vaAll ? (
+                  <Typography variant="caption" color="text.secondary">
+                    {t.tokenVendorAccessAllHint}
+                  </Typography>
+                ) : (
+                  <>
+                    {vendorAccounts !== null && vendorAccounts.length === 0 && (
+                      <Typography variant="body2" color="text.secondary">
+                        {t.tokenVendorAccessNone}
+                      </Typography>
+                    )}
+                    {vendorAccounts !== null && vendorAccounts.length > 0 && (
+                      <CheckboxGroup
+                        legend={t.tokenVendorAccessAccountsLabel}
+                        options={vendorAccounts.map((acc) => ({ value: acc.id, label: acc.name }))}
+                        selected={vaAccounts.map((entry) => entry.accountId)}
+                        onToggle={toggleVendorAccount}
+                      />
+                    )}
+                    {optedInAccounts.map(({ acc, entry }) => {
+                      const prefixValid = isValidModelPrefix(entry.prefix);
+                      return (
+                        <Box
+                          key={acc.id}
+                          role="group"
+                          aria-labelledby={`token-va-${acc.id}-heading`}
+                          sx={{ display: 'grid', gap: 1, pl: 2 }}
+                        >
+                          <Typography
+                            id={`token-va-${acc.id}-heading`}
+                            variant="body2"
+                            color="text.secondary"
+                          >
+                            {acc.name}
+                          </Typography>
+                          <FormControlLabel
+                            control={
+                              <Checkbox
+                                checked={entry.overrideEnabled}
+                                onChange={(e) =>
+                                  updateVendorEntry(acc.id, { overrideEnabled: e.target.checked })
+                                }
+                              />
+                            }
+                            label={t.tokenVendorAccessPrefixToggle}
+                          />
+                          {entry.overrideEnabled && (
+                            <Field
+                              id={`token-va-${acc.id}-prefix`}
+                              label={t.tokenVendorAccessPrefixLabel}
+                              value={entry.prefix}
+                              onChange={(e) =>
+                                updateVendorEntry(acc.id, { prefix: e.target.value })
+                              }
+                              autoComplete="off"
+                              error={!prefixValid}
+                              helperText={
+                                prefixValid
+                                  ? t.tokenVendorAccessPrefixEmptyHint
+                                  : t.errorVendorAccountModelPrefixInvalid
+                              }
+                            />
+                          )}
+                        </Box>
+                      );
+                    })}
+                  </>
+                )}
+              </Box>
+            )}
             <SearchableSelect
               id="token-project"
               label={t.tokenProjectLabel}
@@ -627,7 +839,11 @@ export function TokenList({
               label={t.tokenSecretLabel}
             />
             <Box sx={{ display: 'flex', gap: 1.5 }}>
-              <Button type="submit" variant="contained" disabled={busy || overrideInvalid}>
+              <Button
+                type="submit"
+                variant="contained"
+                disabled={busy || overrideInvalid || vendorAccessInvalid}
+              >
                 {editing ? t.tokenActionSave : t.tokenCreate}
               </Button>
               <Button

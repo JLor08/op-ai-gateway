@@ -55,6 +55,13 @@ var (
 	ErrTokenNotFound             = errors.New(CodeTokenNotFound)
 	ErrTokenStatusInvalid        = errors.New("portal.token_status_invalid")
 	ErrTokenModelOverrideInvalid = errors.New("portal.token_model_override_invalid")
+	// ErrTokenVendorAccessInvalid: a token's vendor-account access policy names an
+	// account the owner does not own (or that does not exist), repeats an account,
+	// or carries an override prefix that fails normalizeVendorAccountModelPrefix.
+	ErrTokenVendorAccessInvalid = errors.New("portal.token_vendor_access_invalid")
+	// ErrTokenVendorAccessConflict: with all=false, two of the selected accounts
+	// would advertise the same public model name under their effective prefixes.
+	ErrTokenVendorAccessConflict = errors.New("portal.token_vendor_access_conflict")
 	ErrTokenNotDeletable         = errors.New("token.not_deletable")
 
 	ErrServerNotFound       = errors.New(CodeServerNotFound)
@@ -1037,6 +1044,33 @@ type TokenDTO struct {
 	UnknownModelRedirect        bool   `json:"unknown_model_redirect,omitempty"`
 	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
 	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
+	// VendorAccess is the token's vendor-account (Anbieter) access policy; nil is
+	// the strict default (no vendor-account models).
+	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+}
+
+// VendorAccessDTO is a token's vendor-account access policy on the wire. All
+// grants every owner account under its own model_prefix (Accounts is then
+// ignored); otherwise Accounts lists the opted-in accounts. Mirrors the stored
+// vendor_provider_access shape (see store.DecodeVendorAccess).
+type VendorAccessDTO struct {
+	All      bool                   `json:"all"`
+	Accounts []VendorAccessEntryDTO `json:"accounts"`
+}
+
+// VendorAccessEntryDTO opts one vendor account in, by its stable account id.
+// A nil PrefixOverride (or one with Enabled=false) uses the account's own
+// model_prefix.
+type VendorAccessEntryDTO struct {
+	AccountID      string             `json:"account_id"`
+	PrefixOverride *PrefixOverrideDTO `json:"prefix_override,omitempty"`
+}
+
+// PrefixOverrideDTO replaces the account's model_prefix for this token when
+// Enabled. Value "" with Enabled=true means no prefix (bare upstream model id).
+type PrefixOverrideDTO struct {
+	Enabled bool   `json:"enabled"`
+	Value   string `json:"value"`
 }
 
 type TokenListResponse struct {
@@ -1069,6 +1103,10 @@ type CreateTokenRequest struct {
 	UnknownModelRedirect        bool   `json:"unknown_model_redirect"`
 	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked"`
 	UnknownModelFallback        string `json:"unknown_model_fallback"`
+	// VendorAccess optionally grants the token vendor-account models; nil (the
+	// field omitted) is the strict default: no vendor-account access. Validated
+	// by validateVendorAccess.
+	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 }
 
 type CreateTokenResponse struct {
@@ -1103,6 +1141,9 @@ type UpdateTokenRequest struct {
 	UnknownModelRedirect        *bool   `json:"unknown_model_redirect,omitempty"`
 	UnknownModelRedirectBlocked *bool   `json:"unknown_model_redirect_blocked,omitempty"`
 	UnknownModelFallback        *string `json:"unknown_model_fallback,omitempty"`
+	// VendorAccess: nil = keep the stored policy; a non-nil value REPLACES it
+	// wholesale (an empty one resets to the strict default) after validation.
+	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1517,6 +1558,9 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
+	if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+		return CreateTokenResponse{}, err
+	}
 	projectID, err := s.assignTokenProject(ctx, owner.UserID, req.ProjectID)
 	if err != nil {
 		return CreateTokenResponse{}, err
@@ -1553,6 +1597,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		UnknownModelRedirect:        redirect,
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
+		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1629,6 +1674,12 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 			return TokenDTO{}, err
 		}
 		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
+	}
+	if req.VendorAccess != nil {
+		if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+			return TokenDTO{}, err
+		}
+		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
 	}
 	if req.LogCommunication != nil {
 		record.LogCommunication = *req.LogCommunication
@@ -4514,6 +4565,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		UnknownModelRedirect:           record.UnknownModelRedirect,
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
+		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -4548,7 +4600,163 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		UnknownModelRedirect:           record.UnknownModelRedirect,
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
+		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
 	}
+}
+
+// encodeVendorAccessDTO serializes the wire policy into the stored
+// vendor_provider_access column. nil and the empty policy encode to "" (the strict
+// default). An override object only counts when Enabled is set (presence AND
+// enabled <=> override on), so a stored policy decodes back to what the owner
+// meant; account ids are trimmed so a padded id cannot be stored un-matchable.
+func encodeVendorAccessDTO(d *VendorAccessDTO) string {
+	if d == nil {
+		return ""
+	}
+	v := auth.VendorAccess{All: d.All}
+	for _, e := range d.Accounts {
+		entry := auth.VendorAccessEntry{AccountID: strings.TrimSpace(e.AccountID)}
+		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
+			entry.OverrideEnabled = true
+			// Store the value validateVendorAccess validated (it trims).
+			entry.OverridePrefix = strings.TrimSpace(e.PrefixOverride.Value)
+		}
+		v.Accounts = append(v.Accounts, entry)
+	}
+	return store.EncodeVendorAccess(v)
+}
+
+// decodeVendorAccessDTO renders the stored column as the wire policy; nil for the
+// strict default (blank, malformed, or empty) so the field is omitted.
+func decodeVendorAccessDTO(s string) *VendorAccessDTO {
+	v := store.DecodeVendorAccess(s)
+	if !v.All && len(v.Accounts) == 0 {
+		return nil
+	}
+	// Accounts is always an array on the wire (never null), even for all=true.
+	d := &VendorAccessDTO{All: v.All, Accounts: []VendorAccessEntryDTO{}}
+	for _, e := range v.Accounts {
+		entry := VendorAccessEntryDTO{AccountID: e.AccountID}
+		if e.OverrideEnabled {
+			entry.PrefixOverride = &PrefixOverrideDTO{Enabled: true, Value: e.OverridePrefix}
+		}
+		d.Accounts = append(d.Accounts, entry)
+	}
+	return d
+}
+
+// validateVendorAccess checks a token's requested vendor-access policy against
+// the owner's own accounts: every account_id must be one the owner owns (and
+// appear once), every ENABLED override prefix must pass
+// normalizeVendorAccountModelPrefix, and (all=false) the effective public names
+// -- effective prefix + upstream model id -- must not collide across the selected
+// accounts' current models. A nil policy, all=true (the resolver ignores the
+// account list and keeps first-wins + dedup) and an empty list need no checks.
+// A collision that only emerges later (a vendor ships a new model after save) is
+// caught by the routing backstop, so a per-account models-read failure is logged
+// and skipped rather than failing the save; a failure to read the owner's
+// accounts at all is an infrastructure error and is returned raw (a 500, not the
+// 400 reserved for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict).
+func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d *VendorAccessDTO) error {
+	if d == nil || d.All || len(d.Accounts) == 0 {
+		return nil
+	}
+	if s.routes == nil {
+		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
+	}
+	byID, err := s.ownerVendorAccountsByID(ctx, owner.UserID)
+	if err != nil {
+		return err
+	}
+	check := vendorAccessCheck{
+		byID:  byID,
+		seen:  make(map[string]struct{}, len(d.Accounts)),
+		names: make(map[string]string),
+	}
+	for _, e := range d.Accounts {
+		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// vendorAccessCheck is the working state of one validateVendorAccess run.
+type vendorAccessCheck struct {
+	byID  map[string]routing.VendorAccount // the owner's accounts by id
+	seen  map[string]struct{}              // account ids already listed in the policy
+	names map[string]string                // effective public name -> id of the account that first produced it
+}
+
+// ownerVendorAccountsByID loads userID's vendor accounts keyed by id. A read
+// failure is an infrastructure error and is returned raw, so the endpoints answer
+// 500 rather than a 400 the client cannot act on.
+func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (map[string]routing.VendorAccount, error) {
+	accounts, err := s.routes.VendorAccountsByOwner(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]routing.VendorAccount, len(accounts))
+	for _, a := range accounts {
+		byID[a.ID] = a
+	}
+	return byID, nil
+}
+
+// checkVendorAccessEntry validates one policy entry in order -- the account is
+// owned, is listed once, carries a valid override prefix, and its effective public
+// names do not collide with those already claimed by earlier entries -- so the
+// first failure is the one reported. An unreadable model list skips the collision
+// check for that account only (logged; the routing backstop still applies).
+func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAccessCheck, e VendorAccessEntryDTO) error {
+	id := strings.TrimSpace(e.AccountID)
+	acc, ok := check.byID[id]
+	if !ok {
+		return fmt.Errorf("%w: unknown account %q", ErrTokenVendorAccessInvalid, id)
+	}
+	if _, dup := check.seen[id]; dup {
+		return fmt.Errorf("%w: account %q listed more than once", ErrTokenVendorAccessInvalid, id)
+	}
+	check.seen[id] = struct{}{}
+	prefix, err := tokenVendorEntryPrefix(acc, e)
+	if err != nil {
+		return err
+	}
+	models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+	if err != nil {
+		slog.Warn("portal: token vendor-access collision check skipped for an account whose models could not be read; the routing backstop still applies",
+			"account_id", acc.ID, "error", err)
+		return nil
+	}
+	return claimVendorAccessNames(check.names, id, prefix, models)
+}
+
+// tokenVendorEntryPrefix resolves the prefix an entry serves its account's models
+// under: the account's own model_prefix, or -- when the entry carries an ENABLED
+// override -- the normalized (trimmed, charset-checked) override value.
+func tokenVendorEntryPrefix(acc routing.VendorAccount, e VendorAccessEntryDTO) (string, error) {
+	if e.PrefixOverride == nil || !e.PrefixOverride.Enabled {
+		return acc.ModelPrefix, nil
+	}
+	norm, err := normalizeVendorAccountModelPrefix(e.PrefixOverride.Value)
+	if err != nil {
+		return "", fmt.Errorf("%w: account %q: %w", ErrTokenVendorAccessInvalid, acc.ID, err)
+	}
+	return norm, nil
+}
+
+// claimVendorAccessNames records the effective public name (prefix + upstream
+// model id) of each of accountID's models in names, and reports
+// ErrTokenVendorAccessConflict when another account already produced one of them.
+func claimVendorAccessNames(names map[string]string, accountID, prefix string, models []routing.VendorAccountModel) error {
+	for _, m := range models {
+		name := prefix + m.UpstreamModel
+		if prior, clash := names[name]; clash && prior != accountID {
+			return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, accountID)
+		}
+		names[name] = accountID
+	}
+	return nil
 }
 
 // resolveProjectName returns projectID's display name, or "" when projectID

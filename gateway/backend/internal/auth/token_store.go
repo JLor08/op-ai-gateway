@@ -40,6 +40,10 @@ type Token struct {
 	ModelOverrideRules map[string]ModelOverrideRule
 	LogCommunication   bool
 	Secret             bool
+	// VendorAccess is the token's vendor-account (Anbieter) access policy, mirrored
+	// from store.TokenRecord.VendorProviderAccess. Zero value (All=false, no
+	// accounts) = no vendor access.
+	VendorAccess VendorAccess
 	// ServiceID / ServiceName / Kind identify a SERVICE token (Kind=="service"):
 	// it belongs to a routing.Service, not a user (UserID is then empty).
 	// ServiceName is resolved at lookup time for display only (never persisted
@@ -132,6 +136,7 @@ func (s *TokenStore) AddPlainToken(token Token, secret string) {
 	token.Scopes = append([]string(nil), token.Scopes...)
 	token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 	token.AllowedModels = cloneStrings(token.AllowedModels)
+	token.VendorAccess = cloneVendorAccess(token.VendorAccess)
 	s.tokens[HashSecret(secret)] = token
 }
 
@@ -145,6 +150,7 @@ func (s *TokenStore) UpdateToken(token Token) {
 			token.Scopes = append([]string(nil), token.Scopes...)
 			token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 			token.AllowedModels = cloneStrings(token.AllowedModels)
+			token.VendorAccess = cloneVendorAccess(token.VendorAccess)
 			s.tokens[hash] = token
 			return
 		}
@@ -215,6 +221,7 @@ func (s *TokenStore) LookupBearer(header string) (Token, bool) {
 	token.Scopes = append([]string(nil), token.Scopes...)
 	token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
 	token.AllowedModels = cloneStrings(token.AllowedModels)
+	token.VendorAccess = cloneVendorAccess(token.VendorAccess)
 	return token, true
 }
 

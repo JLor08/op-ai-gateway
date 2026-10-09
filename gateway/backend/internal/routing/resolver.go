@@ -819,7 +819,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // fine openai_responses flavor, whose ResponsesMode is passthrough (see
 // vendorAccountTarget). Accounts are iterated in the store's
 // deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
-// account with a model row whose GatewayModel equals the request model wins.
+// account with a model row whose token-effective public name (prefix +
+// UpstreamModel, see vendorAccountModelMatch) equals the request model wins; a
+// token only sees the accounts its VendorAccess policy allows.
 func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
 	if !r.vendorAccountRoutingEligible(token, req, apiFlavor) {
 		return Target{}, false, nil
@@ -832,6 +834,15 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 		// disabled accounts are skipped and fall through to the standard path.
 		if acc.Status != VendorAccountStatusActive {
+			continue
+		}
+		// Per-token access (the boundary): a token only reaches the accounts its
+		// VendorAccess policy lists (or all of them), under the token-effective
+		// prefix. The zero policy denies every account, so a token that was never
+		// granted vendor access resolves nothing here. TokenVendorPrefix is the same
+		// helper the model listing uses, so advertised names equal routable names.
+		prefix, allowed := TokenVendorPrefix(token.VendorAccess, acc)
+		if !allowed {
 			continue
 		}
 		// An OpenAI SUBSCRIPTION account now serves BOTH openai inbound shapes
@@ -855,7 +866,7 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		if err != nil {
 			return Target{}, false, fmt.Errorf("resolve vendor account models: %w", err)
 		}
-		if t, ok := vendorAccountModelMatch(acc, models, req, apiFlavor); ok {
+		if t, ok := vendorAccountModelMatch(acc, models, prefix, req, apiFlavor); ok {
 			return t, true, nil
 		}
 	}
@@ -863,13 +874,20 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 }
 
 // vendorAccountModelMatch returns the dispatch target for the FIRST model row whose
-// GatewayModel equals the request model. ok is false when no row matches, and also
-// when the one match is a subscription account with an unknown vendor
-// (vendorAccountModelTarget fails closed) — in both cases the caller falls through
-// to the next account.
-func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+// token-effective public name equals the request model. The public name is
+// reverse-mapped from the row: prefix + UpstreamModel, where prefix is what
+// TokenVendorPrefix yields for this token and account (the account's own
+// ModelPrefix for an all-access or no-override token, an override prefix -- possibly
+// empty, i.e. the bare slug -- otherwise). Matching the stored GatewayModel instead
+// would pin every token to the account's native prefix; for the native prefix the
+// two are identical (GatewayModel == ModelPrefix + UpstreamModel). The dispatch
+// target keeps req.Model as the public name and carries the raw UpstreamModel as
+// the provider model. ok is false when no row matches, and also when the one match
+// is a subscription account with an unknown vendor (vendorAccountModelTarget fails
+// closed) — in both cases the caller falls through to the next account.
+func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, prefix string, req inference.Request, apiFlavor string) (Target, bool) {
 	for _, m := range models {
-		if m.GatewayModel != req.Model {
+		if prefix+m.UpstreamModel != req.Model {
 			continue
 		}
 		return vendorAccountModelTarget(acc, m, req, apiFlavor)

@@ -131,8 +131,13 @@ type TokenRecord struct {
 	// model), stored as a JSON object string in the api_tokens.model_override_map
 	// column. Empty string = no per-model entries. ModelOverride stays the catch-all.
 	ModelOverrideMap string
-	LogCommunication bool
-	Secret           bool
+	// VendorProviderAccess is the per-token vendor-account (Anbieter) access policy,
+	// stored as a JSON object string in api_tokens.vendor_provider_access.
+	// "" = the strict default (no vendor access). Decoded/encoded at the edges by
+	// DecodeVendorAccess / EncodeVendorAccess.
+	VendorProviderAccess string
+	LogCommunication     bool
+	Secret               bool
 	// ServiceID / Kind identify a SERVICE token (Kind==TokenKindService): it
 	// belongs to a routing.Service, not a user — UserID is then empty and
 	// ServiceID is the owning service's id. Kind==""/TokenKindUser is a normal

@@ -551,6 +551,18 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     );
   });
 
+  // The per-token vendor-access refusals (`portal.token_vendor_access_*`, the
+  // errRow table in portal_token_endpoints.go), pinned as literals: a code the
+  // map does not carry falls back to the raw English the server sent.
+  it('maps the token vendor-access refusals by their exact wire strings', () => {
+    expect(errorLabelByCode['portal.token_vendor_access_invalid']).toBe(
+      'errorTokenVendorAccessInvalid',
+    );
+    expect(errorLabelByCode['portal.token_vendor_access_conflict']).toBe(
+      'errorTokenVendorAccessConflict',
+    );
+  });
+
   it('reuses a label for two codes only where that is deliberate', () => {
     // The realistic defect in a hand-maintained map this size is a new entry
     // pointed at its neighbour's label by copy-paste. Every shared label is

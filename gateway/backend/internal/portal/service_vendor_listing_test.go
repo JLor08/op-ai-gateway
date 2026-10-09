@@ -33,6 +33,16 @@ func seedActiveSubscriptionAccount(t *testing.T, routeStore *routing.MemoryStore
 	}
 }
 
+// withAllVendorAccess opts a token into every vendor account of its owner under
+// the native prefixes (auth.VendorAccess{All: true}). Per-token vendor access is
+// strict by default (a token lists no vendor models until it opts in), so the
+// owner-listing tests below, which exercise the overlay itself, use it; the
+// token-access filtering has its own tests (service_vendor_listing_access_test.go).
+func withAllVendorAccess(token auth.Token) auth.Token {
+	token.VendorAccess = auth.VendorAccess{All: true}
+	return token
+}
+
 // modelDTONamed returns the Models() row for name, or a zero DTO and false.
 func modelDTONamed(data []ModelDTO, name string) (ModelDTO, bool) {
 	for _, row := range data {
@@ -52,7 +62,7 @@ func TestVendorModelsAppearInOwnerListings(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
 
 	// A catalog model (the first OpenAI one, gpt-5) is listed in the picker under both flavors.
@@ -85,11 +95,11 @@ func TestVendorModelsHiddenFromNonOwner(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
 
 	const vendorModel = "gpt-5"
-	other := auth.Token{UserID: "usr_other", Scopes: []string{"gateway:use"}}
+	other := withAllVendorAccess(auth.Token{UserID: "usr_other", Scopes: []string{"gateway:use"}})
 	if _, ok := modelDTONamed(svc.Models(ctx, other).Data, vendorModel); ok {
 		t.Errorf("Models() for a non-owner lists %q; vendor models must be owner-scoped", vendorModel)
 	}
@@ -110,7 +120,7 @@ func TestVendorModelsHiddenWhenFlagOff(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
 
 	setVendorAccountsEnabled(t, svc, false)
@@ -134,7 +144,7 @@ func TestVendorModelsOpenAISubscriptionAdvertisedUnderOpenAIOnly(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 
 	// An api_key OpenAI account (its catalog models stay visible under both dialects).
 	createTestVendorAccount(t, svc, owner, apiKeyAccountRequest("My OpenAI"))
@@ -172,7 +182,7 @@ func TestVendorModelsAnthropicAccountListings(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	svc, _ := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	createTestVendorAccount(t, svc, owner, CreateVendorAccountRequest{
 		Vendor:   routing.VendorAnthropic,
 		AuthType: routing.VendorAuthAPIKey,
@@ -201,7 +211,7 @@ func TestVendorModelsAreAdvertisedUnderTheirPrefixedName(t *testing.T) {
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorAccountTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 
 	// api_key account created WITH a prefix: the seeded catalog rows are prefixed.
 	req := apiKeyAccountRequest("Work OpenAI")
@@ -322,7 +332,7 @@ func TestVendorModelsAppearInTheOwnersDashboardRoutes(t *testing.T) {
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorDashboardTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 
 	// A self-hosted route, so the table proves the two kinds sit side by side.
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv_1", Name: "Server One", Domain: "s1.test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -362,7 +372,7 @@ func TestVendorDashboardRoutesAreOwnerScopedAndGated(t *testing.T) {
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorDashboardTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_active", "Active", routing.VendorAccountStatusActive, "a/", "m1")
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_disabled", "Disabled", routing.VendorAccountStatusDisabled, "d/", "m2")
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_reconnect", "Reconnect", routing.VendorAccountStatusNeedsReconnect, "r/", "m3")
@@ -378,8 +388,8 @@ func TestVendorDashboardRoutesAreOwnerScopedAndGated(t *testing.T) {
 	}
 
 	for name, token := range map[string]auth.Token{
-		"another user":  otherToken(),
-		"service token": {Scopes: []string{"gateway:use"}},
+		"another user":  withAllVendorAccess(otherToken()),
+		"service token": withAllVendorAccess(auth.Token{Scopes: []string{"gateway:use"}}),
 	} {
 		if got := routesForModel(svc.Dashboard(ctx, token).Routes, "a/m1"); len(got) != 0 {
 			t.Errorf("%s sees the owner's vendor model on the dashboard: %#v", name, got)
@@ -400,7 +410,7 @@ func TestVendorDashboardRoutesKeepADeterministicOrder(t *testing.T) {
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	svc, routeStore := newVendorDashboardTestService(t, now)
 	ctx := context.Background()
-	owner := ownerToken()
+	owner := withAllVendorAccess(ownerToken())
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_b", "Beta", routing.VendorAccountStatusActive, "", "shared")
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_a", "Alpha", routing.VendorAccountStatusActive, "", "shared")
 	seedPrefixedVendorAccount(t, routeStore, now, owner, "acc_c", "Alpha", routing.VendorAccountStatusActive, "", "shared")

@@ -197,3 +197,40 @@ func TestTokenStoreRemoveToken(t *testing.T) {
 		t.Fatalf("removed token should not authenticate")
 	}
 }
+
+// TestTokenStoreVendorAccessIsCloned pins the deep copy at all three places the
+// store hands a Token across its boundary: AddPlainToken and UpdateToken copy in,
+// LookupBearer copies out. Mutating the caller's Accounts slice (before) or the
+// returned one (after) must never reach the stored policy.
+func TestTokenStoreVendorAccessIsCloned(t *testing.T) {
+	s := NewTokenStore()
+	in := []VendorAccessEntry{{AccountID: "acc_1"}, {AccountID: "acc_2", OverrideEnabled: true, OverridePrefix: "p/"}}
+	s.AddPlainToken(Token{ID: "tok_1", Active: true, VendorAccess: VendorAccess{Accounts: in}}, "secret-1")
+	in[0].AccountID = "mutated-after-add"
+
+	got, ok := s.LookupBearer("Bearer secret-1")
+	if !ok || got.VendorAccess.Accounts[0].AccountID != "acc_1" {
+		t.Fatalf("AddPlainToken aliased the caller's slice: ok=%v token=%#v", ok, got.VendorAccess)
+	}
+	got.VendorAccess.Accounts[1].OverridePrefix = "mutated-after-lookup"
+	again, _ := s.LookupBearer("Bearer secret-1")
+	if again.VendorAccess.Accounts[1].OverridePrefix != "p/" {
+		t.Fatalf("LookupBearer returned an aliased slice: %#v", again.VendorAccess)
+	}
+
+	upd := []VendorAccessEntry{{AccountID: "acc_3"}}
+	s.UpdateToken(Token{ID: "tok_1", Active: true, VendorAccess: VendorAccess{All: true, Accounts: upd}})
+	upd[0].AccountID = "mutated-after-update"
+	updated, ok := s.LookupBearer("Bearer secret-1")
+	if !ok || !updated.VendorAccess.All || updated.VendorAccess.Accounts[0].AccountID != "acc_3" {
+		t.Fatalf("UpdateToken aliased the caller's slice: ok=%v token=%#v", ok, updated.VendorAccess)
+	}
+
+	// The zero policy stays the zero policy (no accidental empty-but-non-nil slice
+	// that would not DeepEqual the strict default).
+	s.AddPlainToken(Token{ID: "tok_2", Active: true}, "secret-2")
+	zero, _ := s.LookupBearer("Bearer secret-2")
+	if zero.VendorAccess.All || zero.VendorAccess.Accounts != nil {
+		t.Fatalf("zero VendorAccess = %#v, want the strict default", zero.VendorAccess)
+	}
+}

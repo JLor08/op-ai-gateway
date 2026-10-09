@@ -13,20 +13,23 @@ import (
 	"time"
 )
 
-// seedVendorAccount creates an active vendor account owned by ownerUserID and
-// gives it one model row (gatewayModel → upstreamModel) in the given coarse
-// flavor. Mirrors how portal.CreateVendorAccount + the catalog seed populate the
-// store, but kept local so the resolver tests do not depend on the portal layer.
-func seedVendorAccount(t *testing.T, store *MemoryStore, now time.Time, id, ownerUserID, vendor, sealedKey, gatewayModel, upstreamModel, flavor string) {
+// seedVendorAccount creates an active vendor account owned by ownerUserID, served
+// under ModelPrefix prefix, and gives it one model row for slug in the given
+// coarse flavor. The row has the shape the portal always stores
+// (GatewayModel = prefix + UpstreamModel), because the resolver reverse-maps the
+// token-effective prefix onto UpstreamModel rather than reading GatewayModel.
+// Mirrors how portal.CreateVendorAccount + the catalog seed populate the store,
+// but kept local so the resolver tests do not depend on the portal layer.
+func seedVendorAccount(t *testing.T, store *MemoryStore, now time.Time, id, ownerUserID, vendor, sealedKey, prefix, slug, flavor string) {
 	t.Helper()
 	ctx := context.Background()
 	must(t, store.CreateVendorAccount(ctx, VendorAccount{
 		ID: id, OwnerUserID: ownerUserID, Vendor: vendor, AuthType: VendorAuthAPIKey,
-		Name: id, Status: VendorAccountStatusActive, APIKey: sealedKey,
+		Name: id, Status: VendorAccountStatusActive, APIKey: sealedKey, ModelPrefix: prefix,
 		CreatedAt: now, UpdatedAt: now,
 	}))
 	must(t, store.SetVendorAccountModels(ctx, id, []VendorAccountModel{
-		{AccountID: id, GatewayModel: gatewayModel, UpstreamModel: upstreamModel, APIFlavor: flavor},
+		{AccountID: id, GatewayModel: prefix + slug, UpstreamModel: slug, APIFlavor: flavor},
 	}))
 }
 
@@ -45,8 +48,13 @@ const (
 	vendorKey     = "enc:owner-openai-key"
 )
 
+// ownerToken is the owner using their own vendor accounts: it carries
+// VendorAccess{All: true}, the same semantics a logged-in session principal has.
+// The zero VendorAccess is the strict default (no vendor account reachable), so
+// tests that exercise vendor routing in general need this explicit grant; tests of
+// the per-token policy itself override it (see tokenWithAccess).
 func ownerToken() auth.Token {
-	return auth.Token{ID: vendorTokenID, UserID: vendorOwner, Active: true}
+	return auth.Token{ID: vendorTokenID, UserID: vendorOwner, Active: true, VendorAccess: auth.VendorAccess{All: true}}
 }
 
 // TestVendorAccountOwnerResolvesToVendorTarget is the core proof: the OWNER's
@@ -57,7 +65,7 @@ func TestVendorAccountOwnerResolvesToVendorTarget(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-4o", APIFlavor: "openai_chat"})
@@ -70,8 +78,8 @@ func TestVendorAccountOwnerResolvesToVendorTarget(t *testing.T) {
 	if target.Endpoint != "https://api.openai.com" {
 		t.Errorf("Endpoint = %q, want https://api.openai.com", target.Endpoint)
 	}
-	if target.ProviderModel != "gpt-4o-2024" {
-		t.Errorf("ProviderModel = %q, want gpt-4o-2024 (the UpstreamModel)", target.ProviderModel)
+	if target.ProviderModel != "gpt-4o" {
+		t.Errorf("ProviderModel = %q, want gpt-4o (the UpstreamModel)", target.ProviderModel)
 	}
 	if target.APIToken != vendorKey {
 		t.Errorf("APIToken = %q, want the sealed account key %q", target.APIToken, vendorKey)
@@ -98,7 +106,7 @@ func TestVendorAccountAnthropicTargetShape(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_anthropic", vendorOwner, VendorAnthropic, "enc:owner-anthropic-key", "claude-sonnet", "claude-3-7-sonnet", APIFlavorAnthropic)
+	seedVendorAccount(t, store, now, "acc_anthropic", vendorOwner, VendorAnthropic, "enc:owner-anthropic-key", "", "claude-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	// Reach it over BOTH inbound dialects: the Target serves either via translate.
@@ -129,7 +137,7 @@ func TestVendorAccountDoesNotLeakAcrossPrincipals(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	cases := []struct {
@@ -155,7 +163,7 @@ func TestVendorAccountDisabledFlagSkipsBranch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
 
 	// Flag off via the accessor, and also the nil-accessor path (never wired).
 	for _, name := range []string{"flag off", "accessors never wired"} {
@@ -186,7 +194,7 @@ func TestVendorAccountPrecedenceAgainstSelfHostedMapping(t *testing.T) {
 		must(t, store.CreateApplication(ctx, Application{ID: "app_fast", ServerID: "srv_fast", Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, AffinityTTLSeconds: 1800, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 		must(t, store.CreateMapping(ctx, ModelMapping{ID: "map_fast", ApplicationID: "app_fast", GatewayModelName: "shared-model", AppModelName: "self-hosted-7b", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 		must(t, store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv_fast", ReportedAt: now, LatencyMS: 100, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}))
-		seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "shared-model", "gpt-4o-2024", APIFlavorOpenAI)
+		seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "shared-model", APIFlavorOpenAI)
 		return store
 	}
 
@@ -214,7 +222,7 @@ func TestVendorAccountPrecedenceAgainstSelfHostedMapping(t *testing.T) {
 
 	t.Run("fallback_only uses vendor when no self-hosted route", func(t *testing.T) {
 		store := NewMemoryStore()
-		seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "shared-model", "gpt-4o-2024", APIFlavorOpenAI)
+		seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "shared-model", APIFlavorOpenAI)
 		resolver := vendorResolver(store, now, true, vendorRoutingModeFallbackOnly)
 		target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "shared-model", APIFlavor: "openai_chat"})
 		if err != nil {
@@ -233,7 +241,7 @@ func TestVendorAccountSkippedForImagesCapabilityAndOverride(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	t.Run("images request skips vendor", func(t *testing.T) {
@@ -275,7 +283,7 @@ func TestVendorAccountOpenAIAPIKeyResponsesResolvesToPassthroughTarget(t *testin
 	ctx := context.Background()
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "gpt-4o", "gpt-4o-2024", APIFlavorOpenAI)
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-4o", APIFlavor: "openai_responses"})
@@ -297,8 +305,8 @@ func TestVendorAccountOpenAIAPIKeyResponsesResolvesToPassthroughTarget(t *testin
 	if target.APIToken != vendorKey {
 		t.Errorf("APIToken = %q, want the sealed account key %q", target.APIToken, vendorKey)
 	}
-	if target.ProviderModel != "gpt-4o-2024" {
-		t.Errorf("ProviderModel = %q, want gpt-4o-2024 (the bare upstream slug)", target.ProviderModel)
+	if target.ProviderModel != "gpt-4o" {
+		t.Errorf("ProviderModel = %q, want gpt-4o (the bare upstream slug)", target.ProviderModel)
 	}
 	if target.VendorAccountID != "acc_openai" {
 		t.Errorf("VendorAccountID = %q, want acc_openai", target.VendorAccountID)
@@ -325,7 +333,7 @@ func TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget(t *test
 	ctx := context.Background()
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorAccount(t, store, now, "acc_anthropic", vendorOwner, VendorAnthropic, vendorKey, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+	seedVendorAccount(t, store, now, "acc_anthropic", vendorOwner, VendorAnthropic, vendorKey, "", "claude-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: "anthropic_messages"})
@@ -356,7 +364,7 @@ func TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget(t *test
 	if len(target.ExtraHeaders) != 0 {
 		t.Errorf("ExtraHeaders = %v, want none (ProxyNative guarantees anthropic-version itself)", target.ExtraHeaders)
 	}
-	if target.ProviderModel != "claude-sonnet-4-5-20250929" {
+	if target.ProviderModel != "claude-sonnet" {
 		t.Errorf("ProviderModel = %q, want the bare upstream slug", target.ProviderModel)
 	}
 	if target.VendorAccountID != "acc_anthropic" {
@@ -402,9 +410,9 @@ func TestVendorAccountTranslateFlavorsLeaveMessagesModeZero(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := NewMemoryStore()
 			if tc.subscription {
-				seedVendorSubscriptionAccount(t, store, now, "acc_sub", tc.vendor, "enc:sealed-tokens", VendorAccountStatusActive, tc.model, tc.model+"-upstream", tc.modelFlavor)
+				seedVendorSubscriptionAccount(t, store, now, "acc_sub", tc.vendor, "enc:sealed-tokens", VendorAccountStatusActive, "", tc.model, tc.modelFlavor)
 			} else {
-				seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, tc.model, tc.model+"-upstream", tc.modelFlavor)
+				seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, "", tc.model, tc.modelFlavor)
 			}
 			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
@@ -454,7 +462,7 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := NewMemoryStore()
-			seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, tc.model, tc.model+"-upstream", tc.modelFlavor)
+			seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, "", tc.model, tc.modelFlavor)
 			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 			target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: tc.model, APIFlavor: tc.reqFlavor})

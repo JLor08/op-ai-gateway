@@ -67,6 +67,17 @@ func (s *Server) handlePortalTokens(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, apierror.Response("portal.token_model_override_invalid", "token model override is invalid", ""))
 				return
 			}
+			// Vendor-account (Anbieter) access: same story as above -- the PATCH
+			// path maps both through portalTokenErrRows, and a sentinel missing
+			// here would surface as the generic 500 on create only.
+			if errors.Is(err, portal.ErrTokenVendorAccessInvalid) {
+				writeJSON(w, http.StatusBadRequest, apierror.Response("portal.token_vendor_access_invalid", "token vendor access is invalid", ""))
+				return
+			}
+			if errors.Is(err, portal.ErrTokenVendorAccessConflict) {
+				writeJSON(w, http.StatusBadRequest, apierror.Response("portal.token_vendor_access_conflict", "token vendor access names collide", ""))
+				return
+			}
 			// Project attribution (spec: 2026-08-08-projects-design.md §6/§9):
 			// CreateToken's assignTokenProject enforces membership; this handler
 			// predates that (its error mapping was hand-inlined rather than routed
@@ -186,6 +197,8 @@ var portalTokenErrRows = []errRow{
 	{err: portal.ErrTokenScopeForbidden, status: http.StatusForbidden, code: "portal.token_scope_forbidden", msg: "token scope is not allowed"},
 	{err: portal.ErrTokenStatusInvalid, status: http.StatusBadRequest, code: "portal.token_status_invalid", msg: "token status is invalid"},
 	{err: portal.ErrTokenModelOverrideInvalid, status: http.StatusBadRequest, code: "portal.token_model_override_invalid", msg: "token model override is invalid"},
+	{err: portal.ErrTokenVendorAccessInvalid, status: http.StatusBadRequest, code: "portal.token_vendor_access_invalid", msg: "token vendor access is invalid"},
+	{err: portal.ErrTokenVendorAccessConflict, status: http.StatusBadRequest, code: "portal.token_vendor_access_conflict", msg: "token vendor access names collide"},
 	{err: portal.ErrTokenNotDeletable, status: http.StatusBadRequest, code: "token.not_deletable", msg: "token cannot be modified or deleted"},
 	{err: portal.ErrTokenNotFound, status: http.StatusNotFound, code: portal.CodeTokenNotFound, msg: msgTokenNotFound},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeTokenNotFound, msg: msgTokenNotFound},

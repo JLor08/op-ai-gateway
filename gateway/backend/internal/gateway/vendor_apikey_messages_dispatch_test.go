@@ -25,8 +25,13 @@ const (
 	apiKeyAnthropicAccountID = "acc_apikey_anthropic"
 	apiKeyAnthropicPlainKey  = "sk-ant-test-opened-key"
 	apiKeyAnthropicOwnerID   = "usr_apikey_anthropic_owner"
-	apiKeyAnthropicModel     = "claude-sonnet"
-	apiKeyAnthropicUpstream  = "claude-sonnet-4-5-20250929"
+	// The account is served under a model prefix, so the public name a client asks
+	// for (apiKeyAnthropicModel) differs from the raw slug the vendor is sent
+	// (apiKeyAnthropicUpstream). The stored row is prefix + upstream, as the portal
+	// always writes it; the resolver reverse-maps the prefix onto the upstream slug.
+	apiKeyAnthropicPrefix   = "ant/"
+	apiKeyAnthropicUpstream = "claude-sonnet-4-5-20250929"
+	apiKeyAnthropicModel    = apiKeyAnthropicPrefix + apiKeyAnthropicUpstream
 )
 
 // seedAPIKeyAnthropicAccount stores one ACTIVE Anthropic api-key vendor account
@@ -41,7 +46,7 @@ func seedAPIKeyAnthropicAccount(t *testing.T, routes *routing.MemoryStore, ciphe
 	ctx := context.Background()
 	if err := routes.CreateVendorAccount(ctx, routing.VendorAccount{
 		ID: apiKeyAnthropicAccountID, OwnerUserID: ownerID, Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthAPIKey,
-		Name: apiKeyAnthropicAccountID, Status: routing.VendorAccountStatusActive, APIKey: sealed, CreatedAt: now, UpdatedAt: now,
+		Name: apiKeyAnthropicAccountID, Status: routing.VendorAccountStatusActive, APIKey: sealed, ModelPrefix: apiKeyAnthropicPrefix, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateVendorAccount: %v", err)
 	}
@@ -67,7 +72,7 @@ func resolveAPIKeyAnthropicTarget(t *testing.T, cipher *capture.Cipher, fineFlav
 	resolver := routing.NewResolver(store, func() time.Time { return now }, nil)
 	resolver.SetVendorAccountAccessors(func() bool { return true }, nil) // flag on, mode defaults to vendor_first
 
-	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_apikey_anthropic", UserID: apiKeyAnthropicOwnerID, Active: true}, inference.Request{Model: apiKeyAnthropicModel, APIFlavor: fineFlavor})
+	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_apikey_anthropic", UserID: apiKeyAnthropicOwnerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}, inference.Request{Model: apiKeyAnthropicModel, APIFlavor: fineFlavor})
 	if err != nil {
 		t.Fatalf("Resolve(%s): %v", fineFlavor, err)
 	}
@@ -114,7 +119,7 @@ func newAnthropicPlatformMessagesStub(t *testing.T) *anthropicPlatformMessagesSt
 // `thinking`, `metadata`, ...). Passthrough must forward every field verbatim, the
 // model aside. It deliberately carries no Claude-Code system block: the gateway
 // must NOT inject the masquerade the subscription translate client prepends.
-const apiKeyMessagesBody = `{"model":"claude-sonnet","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"Be terse.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"shell","description":"run","input_schema":{"type":"object"}}],"thinking":{"type":"enabled","budget_tokens":2048},"metadata":{"user_id":"u1"}}`
+const apiKeyMessagesBody = `{"model":"ant/claude-sonnet-4-5-20250929","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"Be terse.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"shell","description":"run","input_schema":{"type":"object"}}],"thinking":{"type":"enabled","budget_tokens":2048},"metadata":{"user_id":"u1"}}`
 
 // TestAnthropicAPIKeyMessagesDispatchIsLosslessPassthrough proves the full serving
 // path for an anthropic_messages request to an ANTHROPIC API-KEY vendor account:

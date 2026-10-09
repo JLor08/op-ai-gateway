@@ -4,9 +4,13 @@
 package gateway
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/routing"
 	"testing"
+	"time"
 )
 
 // This file targets portal_token_endpoints.go's request-shape/dispatch
@@ -139,5 +143,145 @@ func TestHandlePortalTokensCreateInvalidModelSettingReturns400(t *testing.T) {
 	}
 	if code := errorBodyOf(t, rec); code != "portal.token_model_override_invalid" {
 		t.Fatalf("error code = %q, want portal.token_model_override_invalid", code)
+	}
+}
+
+// seedTokenVendorAccounts gives the test server's dev user (usr_dev, the owner of
+// every token these requests create) two vendor accounts, acc_a ("a/") and acc_b
+// ("b/"), that each serve upstream model gpt-4o.
+func seedTokenVendorAccounts(t *testing.T, srv *Server) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	for _, prefix := range []string{"a", "b"} {
+		id := "acc_" + prefix
+		if err := srv.Routes.CreateVendorAccount(ctx, routing.VendorAccount{
+			ID: id, OwnerUserID: "usr_dev", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+			Name: id, Status: routing.VendorAccountStatusActive, ModelPrefix: prefix + "/", CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateVendorAccount %s: %v", id, err)
+		}
+		if err := srv.Routes.SetVendorAccountModels(ctx, id, []routing.VendorAccountModel{
+			{GatewayModel: prefix + "/gpt-4o", UpstreamModel: "gpt-4o", APIFlavor: routing.APIFlavorOpenAI},
+		}); err != nil {
+			t.Fatalf("SetVendorAccountModels %s: %v", id, err)
+		}
+	}
+}
+
+// TestPortalTokensVendorAccessErrorsMapToBadRequest pins that both new vendor-
+// access sentinels reach the client as a 400 with their own code on BOTH ladders:
+// the hand-inlined one in handlePortalTokens (create) and portalTokenErrRows
+// (PATCH). A sentinel missing from either one falls through to a generic 500.
+func TestPortalTokensVendorAccessErrorsMapToBadRequest(t *testing.T) {
+	invalid := `{"vendor_access":{"accounts":[{"account_id":"acc_not_mine"}]}}`
+	conflict := `{"vendor_access":{"accounts":[` +
+		`{"account_id":"acc_a","prefix_override":{"enabled":true,"value":""}},` +
+		`{"account_id":"acc_b","prefix_override":{"enabled":true,"value":""}}]}}`
+	cases := []struct {
+		name, body, code string
+	}{
+		{"invalid", invalid, "portal.token_vendor_access_invalid"},
+		{"conflict", conflict, "portal.token_vendor_access_conflict"},
+	}
+	for _, tc := range cases {
+		t.Run("create/"+tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedTokenVendorAccounts(t, srv)
+			body := `{"name":"va-` + tc.name + `","scopes":["gateway:use"],` + tc.body[1:]
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/tokens", body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			if code := errorBodyOf(t, rec); code != tc.code {
+				t.Fatalf("error code = %q, want %q", code, tc.code)
+			}
+		})
+		t.Run("patch/"+tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedTokenVendorAccounts(t, srv)
+			id := createEditableToken(t, srv, "va-patch-"+tc.name)
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/tokens/"+id, tc.body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+			}
+			if code := errorBodyOf(t, rec); code != tc.code {
+				t.Fatalf("error code = %q, want %q", code, tc.code)
+			}
+		})
+	}
+}
+
+// TestPortalTokensVendorAccessRoundTrip drives the happy path over HTTP: create
+// with a policy, read it back from the list, PATCH an unrelated field (policy
+// kept), then PATCH it to the strict default.
+func TestPortalTokensVendorAccessRoundTrip(t *testing.T) {
+	srv := NewTestServer()
+	seedTokenVendorAccounts(t, srv)
+
+	type vendorAccess struct {
+		All      bool `json:"all"`
+		Accounts []struct {
+			AccountID      string `json:"account_id"`
+			PrefixOverride *struct {
+				Enabled bool   `json:"enabled"`
+				Value   string `json:"value"`
+			} `json:"prefix_override"`
+		} `json:"accounts"`
+	}
+	decodeToken := func(rec *httptest.ResponseRecorder, wrapped bool) (string, *vendorAccess) {
+		t.Helper()
+		var tok struct {
+			ID           string        `json:"id"`
+			VendorAccess *vendorAccess `json:"vendor_access"`
+		}
+		if wrapped {
+			var body struct {
+				Token struct {
+					ID           string        `json:"id"`
+					VendorAccess *vendorAccess `json:"vendor_access"`
+				} `json:"token"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("unmarshal: %v, body = %s", err, rec.Body.String())
+			}
+			return body.Token.ID, body.Token.VendorAccess
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &tok); err != nil {
+			t.Fatalf("unmarshal: %v, body = %s", err, rec.Body.String())
+		}
+		return tok.ID, tok.VendorAccess
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/tokens",
+		`{"name":"va-ok","scopes":["gateway:use"],"vendor_access":{"accounts":[`+
+			`{"account_id":"acc_a","prefix_override":{"enabled":true,"value":""}},{"account_id":"acc_b"}]}}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	id, va := decodeToken(rec, true)
+	if va == nil || len(va.Accounts) != 2 || va.Accounts[0].PrefixOverride == nil || !va.Accounts[0].PrefixOverride.Enabled || va.Accounts[1].PrefixOverride != nil {
+		t.Fatalf("created policy = %+v", va)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/tokens/"+id, `{"name":"va-ok-renamed"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, va = decodeToken(rec, false); va == nil || len(va.Accounts) != 2 {
+		t.Fatalf("policy after an unrelated PATCH = %+v, want it kept", va)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/tokens/"+id, `{"vendor_access":{"all":false,"accounts":[]}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, va = decodeToken(rec, false); va != nil {
+		t.Fatalf("policy after reset = %+v, want omitted", va)
 	}
 }

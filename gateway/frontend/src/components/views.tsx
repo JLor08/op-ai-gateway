@@ -153,6 +153,7 @@ export const viewRegistry: Record<View, ViewEntry> = {
         role={ctx.role}
         models={ctx.models}
         servers={ctx.servers}
+        vendorAccountsEnabled={ctx.vendorAccountsEnabled}
         loading={ctx.loading}
       />
     ),

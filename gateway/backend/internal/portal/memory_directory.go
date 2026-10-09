@@ -154,6 +154,7 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		UnknownModelRedirect:           token.UnknownModelRedirect,
 		UnknownModelRedirectBlocked:    token.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           token.UnknownModelFallback,
+		VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 	}, secret)
 	return nil
 }
@@ -210,6 +211,7 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			UnknownModelRedirect:           token.UnknownModelRedirect,
 			UnknownModelRedirectBlocked:    token.UnknownModelRedirectBlocked,
 			UnknownModelFallback:           token.UnknownModelFallback,
+			VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 		})
 	}
 	return nil
@@ -296,6 +298,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.UnknownModelRedirect = token.UnknownModelRedirect
 	existing.UnknownModelRedirectBlocked = token.UnknownModelRedirectBlocked
 	existing.UnknownModelFallback = token.UnknownModelFallback
+	existing.VendorProviderAccess = token.VendorProviderAccess
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -323,6 +326,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		UnknownModelRedirect:           existing.UnknownModelRedirect,
 		UnknownModelRedirectBlocked:    existing.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           existing.UnknownModelFallback,
+		VendorAccess:                   store.DecodeVendorAccess(existing.VendorProviderAccess),
 	})
 	return nil
 }

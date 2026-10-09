@@ -388,6 +388,7 @@ func testTokenRedirectSettingsRoundTrip(t *testing.T, s *SQLStore) {
 		UnknownModelRedirectBlocked: true,
 		UnknownModelFallback:        "fallback-model",
 		LastUsedModel:               "qwen3-32b",
+		VendorProviderAccess:        EncodeVendorAccess(auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1", OverrideEnabled: true, OverridePrefix: "foo/"}}}),
 	}
 	if err := s.CreatePlainToken(ctx, rec, "redirect-secret-value"); err != nil {
 		t.Fatalf("CreatePlainToken: %v", err)
@@ -405,6 +406,70 @@ func testTokenRedirectSettingsRoundTrip(t *testing.T, s *SQLStore) {
 	rules := DecodeModelOverrideRules(got.ModelOverrideMap)
 	if !rules["gpt-4o"].Offer || rules["gpt-4o"].To != "qwen3-32b" {
 		t.Fatalf("rules lost: %#v", rules)
+	}
+	if got.VendorProviderAccess != rec.VendorProviderAccess {
+		t.Fatalf("VendorProviderAccess = %q, want %q", got.VendorProviderAccess, rec.VendorProviderAccess)
+	}
+}
+
+// TestConformanceTokenVendorProviderAccessUpdateAndLookup proves
+// api_tokens.vendor_provider_access is rewritten by UpdateTokenMetadata (it is
+// user-editable, unlike last_used_model) and decoded onto the auth.Token that
+// LookupBearer returns -- on both dialects, so the Postgres leg exercises the
+// widened INSERT/UPDATE/SELECT lock-step, not only the SQLite one.
+func TestConformanceTokenVendorProviderAccessUpdateAndLookup(t *testing.T) {
+	forEachDialect(t, testTokenVendorProviderAccessUpdateAndLookup)
+}
+
+func testTokenVendorProviderAccessUpdateAndLookup(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_vpa", "vpa@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	rec := TokenRecord{ID: "tok_vpa", UserID: "usr_vpa", Name: "vpa", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, rec, "vpa-secret-value"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	// A token created without the field is the strict default on both read paths.
+	before, err := s.TokenByID(ctx, "tok_vpa")
+	if err != nil {
+		t.Fatalf("TokenByID(before): %v", err)
+	}
+	if before.VendorProviderAccess != "" {
+		t.Fatalf("default VendorProviderAccess = %q, want empty", before.VendorProviderAccess)
+	}
+	tok, ok := s.LookupBearer("Bearer vpa-secret-value")
+	if !ok {
+		t.Fatal("LookupBearer failed for the default token")
+	}
+	if tok.VendorAccess.All || len(tok.VendorAccess.Accounts) != 0 {
+		t.Fatalf("default VendorAccess = %#v, want the strict default", tok.VendorAccess)
+	}
+
+	want := auth.VendorAccess{Accounts: []auth.VendorAccessEntry{
+		{AccountID: "acc_1"},
+		{AccountID: "acc_2", OverrideEnabled: true, OverridePrefix: ""},
+	}}
+	before.VendorProviderAccess = EncodeVendorAccess(want)
+	before.UpdatedAt = now.Add(time.Minute)
+	if err := s.UpdateTokenMetadata(ctx, before); err != nil {
+		t.Fatalf("UpdateTokenMetadata: %v", err)
+	}
+	after, err := s.TokenByID(ctx, "tok_vpa")
+	if err != nil {
+		t.Fatalf("TokenByID(after): %v", err)
+	}
+	if after.VendorProviderAccess != before.VendorProviderAccess {
+		t.Fatalf("VendorProviderAccess after update = %q, want %q", after.VendorProviderAccess, before.VendorProviderAccess)
+	}
+	tok, ok = s.LookupBearer("Bearer vpa-secret-value")
+	if !ok {
+		t.Fatal("LookupBearer failed after update")
+	}
+	if !reflect.DeepEqual(tok.VendorAccess, want) {
+		t.Fatalf("LookupBearer VendorAccess = %#v, want %#v", tok.VendorAccess, want)
 	}
 }
 
@@ -500,7 +565,8 @@ func testTokenDefaultsUnchanged(t *testing.T, s *SQLStore) {
 		t.Fatalf("TokenByID: %v", err)
 	}
 	if got.UnknownModelRedirect || got.UnknownModelRedirectBlocked ||
-		got.UnknownModelFallback != "" || got.LastUsedModel != "" {
+		got.UnknownModelFallback != "" || got.LastUsedModel != "" ||
+		got.VendorProviderAccess != "" {
 		t.Fatalf("defaults changed: %+v", got)
 	}
 }
@@ -5963,6 +6029,10 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		}
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column unknown_model_fallback text not null default ''`); err != nil {
 			t.Fatalf("reapply api_tokens.unknown_model_fallback after migration40RawUp: %v", err)
+		}
+		// ...and v85's per-token vendor-account access policy.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column vendor_provider_access text not null default ''`); err != nil {
+			t.Fatalf("reapply api_tokens.vendor_provider_access after migration40RawUp: %v", err)
 		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW
