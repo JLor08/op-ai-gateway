@@ -6,8 +6,8 @@ import { Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
-import type { VendorAccount, VendorModelsRefresh } from '../api';
-import type { BadgeStatus, PortalApi, Translation } from './shared/types';
+import type { VendorAccount, VendorModelsRefresh, VendorUsageRefresh } from '../api';
+import type { PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
 import { PageTitle } from './shared/PageTitle';
@@ -21,9 +21,10 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { vendorLabel } from './shared/vendorLabel';
+import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
 import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 import { VendorAccountModels } from './VendorAccountModels';
-import { VendorAccountUsage } from './VendorAccountUsagePanel';
+import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
 
@@ -43,32 +44,6 @@ function authTypeLabel(t: Translation, authType: string): string {
       return t.vendorAuthSubscription;
     default:
       return authType;
-  }
-}
-
-function statusLabel(t: Translation, status: string): string {
-  switch (status) {
-    case 'active':
-      return t.statusActive;
-    case 'disabled':
-      return t.statusDisabled;
-    case 'needs_reconnect':
-      return t.vendorAccountStatusNeedsReconnect;
-    default:
-      return status;
-  }
-}
-
-// needs_reconnect is system-managed (a failed subscription token refresh) and
-// reads as a warning, not as an active or a switched-off account.
-function statusBadge(status: string): BadgeStatus {
-  switch (status) {
-    case 'active':
-      return 'active';
-    case 'needs_reconnect':
-      return 'watch';
-    default:
-      return 'disabled';
   }
 }
 
@@ -106,9 +81,13 @@ function hasCredential(account: VendorAccount): boolean {
  * The detail view also shows a "Check credentials" panel
  * (VendorConnectionTest): a "Test connection" button whose verdict is about the
  * stored credential only, not about any model -- and a "Usage & limits" panel
- * (VendorAccountUsage) for any account that can have a rate-limit snapshot -- in
- * practice a connected subscription. The list carries no snapshot, so the panel
- * reads it from the single-account GET.
+ * (VendorAccountUsageSection) for any account that can have a rate-limit
+ * snapshot: an api key or a connected subscription. The panel is always there for
+ * such an account (its limits, or an empty-state line) and shows only the limits
+ * the vendor actually reports; it reads the snapshot from the single-account GET so
+ * it can re-read it on its own. A connected OpenAI subscription -- the one account the
+ * gateway can actively ask -- also gets a "Refresh" button (a forced usage refresh,
+ * independent of the models refresh) and one on-view refresh when the detail opens.
  */
 export function VendorAccountsView({
   t,
@@ -129,6 +108,7 @@ export function VendorAccountsView({
     | 'vendorAccount'
     | 'testConnection'
     | 'refreshModels'
+    | 'refreshUsage'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -154,9 +134,10 @@ export function VendorAccountsView({
     modeRef.current = mode;
   }, [mode]);
   const [busy, setBusy] = useState(false);
-  // Bumped after every models refresh that the gateway answered: that call also
-  // pulls the vendor's usage, which changes neither the account's id nor its
-  // updated_at, so the usage panel needs this to know it should read again.
+  // Bumped after every models refresh and every explicit usage refresh that the
+  // gateway answered: both pull the vendor's usage, which changes neither the
+  // account's id nor its updated_at, so the usage panel needs this to know it
+  // should read again.
   const [usageRefreshes, setUsageRefreshes] = useState(0);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState('');
 
@@ -342,6 +323,19 @@ export function VendorAccountsView({
     }
   }
 
+  // The explicit "refresh usage": force the gateway to ask the vendor for the
+  // account's limits NOW (past its server-side TTL), without touching the models,
+  // and hand the answer to the usage panel, which shows it by its status. Unlike
+  // the models refresh it neither writes the account nor sets `busy`: the panel
+  // keeps its own running state, so it never blocks (or is blocked by) a settings
+  // save. A thrown error is the panel's to show; any answered call -- whatever its
+  // outcome -- makes the panel read the stored snapshot again.
+  async function refreshAccountUsage(id: string): Promise<VendorUsageRefresh> {
+    const { refresh } = await api.refreshUsage(id, { force: true });
+    setUsageRefreshes((n) => n + 1);
+    return refresh;
+  }
+
   async function removeAccount(id: string) {
     try {
       await api.deleteVendorAccount(id);
@@ -382,8 +376,10 @@ export function VendorAccountsView({
       value: (a) => a.status,
       filter: 'enum',
       searchable: false,
-      enumLabel: (v) => statusLabel(t, v),
-      render: (a) => <StatusChip status={statusBadge(a.status)} label={statusLabel(t, a.status)} />,
+      enumLabel: (v) => vendorStatusLabel(t, v),
+      render: (a) => (
+        <StatusChip status={vendorStatusBadge(a.status)} label={vendorStatusLabel(t, a.status)} />
+      ),
     },
     {
       id: 'credential',
@@ -657,17 +653,16 @@ export function VendorAccountsView({
           />
         </Box>
 
-        {/* A subscription that was never connected has served nothing, so it
-            has no usage snapshot to read; everything else may. */}
-        {(account.auth_type === 'api_key' || account.subscription_connected) && (
-          <VendorAccountUsage
-            key={account.id}
-            t={t}
-            api={api}
-            accountId={account.id}
-            refreshKey={usageRefreshes}
-          />
-        )}
+        {/* The usage frame for every usage-capable account; the refresh button and
+            the one on-view refresh only for an account the gateway can actively ask
+            (see VendorAccountUsageSection). */}
+        <VendorAccountUsageSection
+          t={t}
+          api={api}
+          account={account}
+          refreshKey={usageRefreshes}
+          onRefresh={refreshAccountUsage}
+        />
 
         {account.auth_type === 'subscription' && (
           <Box sx={{ mt: 3 }}>

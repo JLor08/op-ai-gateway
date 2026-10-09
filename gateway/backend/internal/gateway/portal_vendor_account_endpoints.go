@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +26,10 @@ const (
 	codeVendorAccountConnectFailed = "vendor_account.connect_failed"
 	codeVendorAccountCheckFailed   = "vendor_account.check_failed"
 	codeVendorAccountRefreshFailed = "vendor_account.refresh_failed"
+
+	// codeVendorAccountUsageRefreshFailed is the uncategorized fallback of the
+	// dedicated usage refresh (POST .../usage/refresh): a store failure.
+	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
 )
 
 // handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
@@ -90,8 +95,9 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // "/api/portal/vendor-accounts/{id}/connect/{import|begin|complete}" (POST), and
 // the OPTIONAL device-code connect sub-resources
 // "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST), the
-// test-connection action "/api/portal/vendor-accounts/{id}/check" (POST) and the
-// model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST).
+// test-connection action "/api/portal/vendor-accounts/{id}/check" (POST), the
+// model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST)
+// and the usage-pull action "/api/portal/vendor-accounts/{id}/usage/refresh" (POST).
 // Any other deeper path is answered with the same 404 as an unknown id.
 func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
@@ -131,9 +137,10 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 }
 
 // routeVendorAccountSubpath dispatches the sub-routes of
-// /api/portal/vendor-accounts/{id}/... (the /check and /models/refresh actions and
-// the /connect/... family) and reports whether it handled the request. The item handler falls
-// through to the {id} GET/PATCH/DELETE surface when this returns false.
+// /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh and
+// /usage/refresh actions and the /connect/... family) and reports whether it
+// handled the request. The item handler falls through to the {id}
+// GET/PATCH/DELETE surface when this returns false.
 func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "check" {
 		s.handlePortalVendorAccountCheck(w, r, token, parts[0])
@@ -141,6 +148,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 	}
 	if len(parts) == 3 && parts[0] != "" && parts[1] == "models" && parts[2] == "refresh" {
 		s.handlePortalVendorAccountModelsRefresh(w, r, token, parts[0])
+		return true
+	}
+	if len(parts) == 3 && parts[0] != "" && parts[1] == "usage" && parts[2] == "refresh" {
+		s.handlePortalVendorAccountUsageRefresh(w, r, token, parts[0])
 		return true
 	}
 	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
@@ -243,6 +254,57 @@ func (s *Server) handlePortalVendorAccountModelsRefresh(w http.ResponseWriter, r
 		return
 	}
 	writeJSON(w, http.StatusOK, vendorAccountModelsRefreshResponse{Account: dto, Refresh: result})
+}
+
+// vendorAccountUsageRefreshResponse is the response of POST
+// /api/portal/vendor-accounts/{id}/usage/refresh: the account's stored usage
+// snapshot as it is after the refresh (null when none has been stored, which is
+// always the case for an account with no usage to show), and what the refresh did
+// (status ok, fresh, unverifiable or unsupported, and a short phrase for the portal
+// to show). Both keys are always on the wire.
+type vendorAccountUsageRefreshResponse struct {
+	Usage   *portal.VendorAccountUsageDTO   `json:"usage"`
+	Refresh portal.VendorUsageRefreshResult `json:"refresh"`
+}
+
+// vendorUsageForce reports whether the request asks for a forced (manual) usage
+// refresh: ?force=1 (or any other value strconv.ParseBool reads as true). Anything
+// else -- absent, false, empty, unparsable -- is the lazy default, so the vendor
+// stays protected by the TTL unless the caller clearly asked to bypass it.
+func vendorUsageForce(r *http.Request) bool {
+	force, err := strconv.ParseBool(r.URL.Query().Get("force"))
+	return err == nil && force
+}
+
+// handlePortalVendorAccountUsageRefresh (POST .../usage/refresh) is the dedicated
+// usage-pull action of the Usage & Limits panel: the gateway asks the vendor for the
+// account's usage snapshot and stores it, WITHOUT the model discovery the models
+// refresh runs. It serves both the panel's on-view lazy pull and its refresh button.
+// A plain call is the lazy one: when the account's usage was pulled less than the
+// lazy TTL ago the vendor is not asked and the stored snapshot is answered with
+// refresh.status "fresh". ?force=1 (the button) bypasses the TTL and always asks.
+// It is fail-soft: a vendor that cannot be asked, or an account with no usable
+// token, leaves the stored snapshot as it was and is still a 200, with
+// refresh.status "unverifiable" and the reason in refresh.detail; an account with
+// no active pull (anything but an OpenAI subscription) is a 200 "unsupported" and
+// opens no credential. The request has no body and no credential is ever returned.
+// Owner-only and gated by the vendor_accounts_enabled master flag (both in
+// portal.Service): any other principal gets the same 404 as an unknown id; a stored
+// credential that cannot be opened is a 409 vendor_account.credential_unreadable.
+func (s *Server) handlePortalVendorAccountUsageRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	maxAge := portal.VendorUsageLazyTTL
+	if vendorUsageForce(r) {
+		maxAge = 0
+	}
+	usage, result, err := s.Portal.RefreshVendorAccountUsage(r.Context(), token, id, maxAge)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountUsageRefreshFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, vendorAccountUsageRefreshResponse{Usage: usage, Refresh: result})
 }
 
 // vendorAccountConnectCompleteRequest is the body of POST

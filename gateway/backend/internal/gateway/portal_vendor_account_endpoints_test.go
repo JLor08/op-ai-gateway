@@ -227,8 +227,8 @@ func TestVendorAccountEndpointsCreateListGet(t *testing.T) {
 	}
 }
 
-// The detail GET -- and only it -- carries the scraped rate-limit snapshot under
-// "usage"; the list and a snapshot-less detail read leave the key out.
+// The detail GET and the list carry the scraped rate-limit snapshot under
+// "usage"; a snapshot-less account leaves the key out of both.
 func TestVendorAccountEndpointsGetCarriesTheUsageSnapshot(t *testing.T) {
 	srv, routeStore := newVendorAccountTestServer(t, true)
 	created := vaCreate(t, srv, vaOwnerSecret, "Owner's")
@@ -271,9 +271,43 @@ func TestVendorAccountEndpointsGetCarriesTheUsageSnapshot(t *testing.T) {
 		t.Fatalf("usage = %v", usage)
 	}
 
+	// The list carries the same snapshot for the account that has one.
 	rec := vaDo(t, srv, http.MethodGet, "/api/portal/vendor-accounts", vaOwnerSecret, "")
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), `"usage"`) {
-		t.Fatalf("list = %d %s, want no usage on the list", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		Data []struct {
+			ID    string         `json:"id"`
+			Usage map[string]any `json:"usage"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID != created.ID {
+		t.Fatalf("list = %s, want the one account", rec.Body.String())
+	}
+	if u := list.Data[0].Usage; u["five_hour_pct"] != float64(64) || u["weekly_pct"] != float64(-1) || u["five_hour_reset_at"] != "2026-10-07T17:00:00Z" {
+		t.Fatalf("list usage = %v, want the stored snapshot", u)
+	}
+	// ... and omits the key (omitempty) for one with no snapshot.
+	bare := vaCreate(t, srv, vaOwnerSecret, "Owner's second")
+	rec = vaDo(t, srv, http.MethodGet, "/api/portal/vendor-accounts", vaOwnerSecret, "")
+	var rows struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	for _, row := range rows.Data {
+		var id string
+		if err := json.Unmarshal(row["id"], &id); err != nil {
+			t.Fatalf("id: %v", err)
+		}
+		if _, has := row["usage"]; has != (id == created.ID) {
+			t.Fatalf("list row %s (bare=%v): usage key present = %v: %s", id, id == bare.ID, has, rec.Body.String())
+		}
 	}
 	if rec := vaDo(t, srv, http.MethodGet, path, vaOtherSecret, ""); rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), `"usage"`) {
 		t.Fatalf("non-owner detail = %d %s, want the plain 404", rec.Code, rec.Body.String())

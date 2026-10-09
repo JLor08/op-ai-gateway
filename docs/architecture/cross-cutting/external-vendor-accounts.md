@@ -28,8 +28,9 @@ tells a rejected login from a wrong model (§3.5), a small native Anthropic
 Messages client and an OpenAI Responses translate client (`internal/provider`,
 §4), two static dispatch extensions (extra headers + a system-prompt masquerade,
 §4), a usage/limits snapshot fed by the vendor's rate-limit response headers and,
-for an OpenAI subscription, an active usage pull (§5), and a discovery of each account's real model catalog from the vendor,
-served under an optional per-account prefix (§6).
+for an OpenAI subscription, an active usage pull with its own refresh endpoint (§5),
+and a discovery of each account's real model catalog from the vendor, served under
+an optional per-account prefix (§6).
 
 ## 1. The entity and its ownership
 
@@ -717,9 +718,10 @@ quota is a number of credits rather than a window: the panel shows it as
 "used / limit Credits" (§5.2, §5.4). Everything lives in one per-account snapshot
 (`vendor_account_usage`) that two independent, best-effort writers fill: a
 **passive header scrape** on every served request (§5.1) and, for an OpenAI
-subscription only, an **active pull** from the vendor's usage endpoint whenever
-the account's models are refreshed (§5.2). Both write through the same **merge
-rule** (§5.3), so neither can blank what the other learned.
+subscription only, an **active pull** from the vendor's usage endpoint: on its own
+when the account's usage view is opened or refreshed, and as the last step of a
+models refresh or connect (§5.2). Both write through the same **merge rule**
+(§5.3), so neither can blank what the other learned.
 
 ### 5.1 Passive header scraping
 
@@ -830,16 +832,32 @@ and an empty answer is deliberately not "OK, nothing known", for the reason give
 for discovery (§6.3): it must not be able to wipe a stored snapshot. The response
 is capped at the same 8 MiB as a discovery fetch (§6.4).
 
-**When it runs.** The pull is the **last, best-effort step of
-`RefreshVendorAccountModels`** (§6), so it runs wherever that does: on the explicit
-`POST .../models/refresh` ("Modelle aktualisieren") and, because the connect flows
-call the same function, at the end of every OpenAI-subscription connect (§6.2). There is
-no separate usage endpoint, trigger, background job or startup step. Specifically:
+**When it runs.** There is **one pull, `fetchVendorUsage`** (the fetch, the merge
+over the stored row and the store write, all fail-soft), and it has two callers.
+Nothing else triggers it: there is no background job and no startup step (a
+background refresher is a deferred follow-up, §5.4).
+
+1. **As the last, best-effort step of `RefreshVendorAccountModels`** (§6), so it
+   runs wherever that does: on the explicit `POST .../models/refresh` ("Modelle
+   aktualisieren") and, because the connect flows call the same function, at the end
+   of every OpenAI-subscription connect (§6.2).
+2. **On its own, through the dedicated usage refresh** (§5.5), which is what the
+   usage panel calls when its account's detail view is opened and when its refresh
+   button is pressed. It is the only caller that does not also run the model
+   discovery.
+
+Both callers record the attempt as the account's **last active pull** (§5.5), so the
+on-view refresh does not ask the vendor again right after a models refresh or a
+connect. The passive scrape (§5.1) is **not** a pull and records nothing.
+
+As the models-refresh step the pull behaves as follows:
 
 - It reuses the **token set the model discovery already opened** and, if it had
-  expired, renewed through the gateway's locked refresher (§6.3). The usage code
+  expired, renewed through the gateway's locked refresher (§6.3). `fetchVendorUsage`
   never opens, renews or refreshes a token itself, and a token that could not be
-  renewed means no pull.
+  renewed means no pull. (The dedicated refresh opens and renews the token set
+  itself, through the same helper the model discovery uses, before it calls
+  `fetchVendorUsage`.)
 - It runs only when the refresh itself did not fail with an error, and **also when
   the model list was unusable** (the refresh then reads `unverifiable` and keeps
   the models): the usage endpoint is a separate request that may well succeed.
@@ -850,14 +868,15 @@ no separate usage endpoint, trigger, background job or startup step. Specificall
   the account id (and, on a store read or write failure, that store error) at
   Debug — never the token, the ChatGPT account id or any vendor text.
 
-**Time budget.** The explicit refresh now makes up to **two** vendor requests, each
-bounded by the discovery client's 10 seconds (the model list, then usage), so it can
-take about 20 seconds against the server's 30 second write timeout. The connect
-flows stay inside their single 5 second budget (§6.2), which the usage pull
-**shares** with the token renewal, the model list and the model write: behind a
-slow model list the budget is spent and the pull degrades to `unverifiable`,
-leaving the snapshot as it was. That is acceptable for an advisory number, and the
-next refresh or served request fills it in.
+**Time budget.** The explicit models refresh makes up to **two** vendor requests,
+each bounded by the discovery client's 10 seconds (the model list, then usage), so
+it can take about 20 seconds against the server's 30 second write timeout. The
+dedicated usage refresh makes at most one (plus a token renewal when the token had
+expired). The connect flows stay inside their single 5 second budget (§6.2), which
+the usage pull **shares** with the token renewal, the model list and the model
+write: behind a slow model list the budget is spent and the pull degrades to
+`unverifiable`, leaving the snapshot as it was. That is acceptable for an advisory
+number, and the next refresh or served request fills it in.
 
 ### 5.3 The merge rule
 
@@ -902,10 +921,19 @@ Two consequences to know:
 
 ### 5.4 Reading it, and what is deferred
 
-The snapshot is exposed only on the **detail** read (`GET /api/portal/vendor-accounts/{id}`
-→ `VendorAccountDTO.Usage`, `omitempty`), never on the list (one snapshot read per
-row would be an N+1). `VendorAccountUsageDTO` (and the frontend's `VendorAccountUsage`
-type) carries, always on the wire, the three windows' `five_hour_pct`,
+The snapshot is exposed on both **read** endpoints, as `VendorAccountDTO.Usage`
+(`omitempty`, so an account the gateway has no snapshot for omits it): the **detail**
+read (`GET /api/portal/vendor-accounts/{id}`), which the account's usage panel reads,
+and the **list** (`GET /api/portal/vendor-accounts`), whose `data[]` rows carry it so
+the dashboard's usage section (below) gets every account's figures in one call. The
+create, update and connect responses and the models refresh's `account` carry none.
+The list reads the snapshot **once per row** and is **fail-soft** about it: a
+snapshot that cannot be read leaves that row's `usage` out (a Debug log with the
+account id) instead of failing the whole list, whereas the detail read still returns
+the error. That is not a new N+1 shape: the list already reads each account's model
+rows per row, so each account costs one more small primary-key read.
+`VendorAccountUsageDTO` (and the frontend's `VendorAccountUsage` type) is the same on
+both and carries, always on the wire, the three windows' `five_hour_pct`,
 `five_hour_reset_at`, `weekly_pct`, `weekly_reset_at`, the raw `credit_balance`, the
 spend-control and credit-state fields `spend_unit`, `spend_limit`, `spend_used`,
 `spend_remaining` (the vendor's raw strings), `spend_used_pct` (`0..100`),
@@ -916,17 +944,34 @@ reads `""` / `-1` / `null` for all of the spend fields. They are stored in the
 seven columns migration 84 adds to `vendor_account_usage`
 ([Data Model](../reference/data-model.md#external-vendor-accounts-anbieter)).
 
-The detail view's usage panel **re-reads** the account after a successful models
-refresh — whatever its `ok` / `unverifiable` answer, since the pull may have changed
-the snapshot either way — so a fresh pull shows without reloading the page; a
-refresh that failed with an error does not trigger it. The spend-control figures
-change only through that pull: the passive scrape never carries them (§5.1), so a
-Business account's credits are as fresh as its last models refresh or connect.
+The detail view's usage panel **re-reads** the account after anything that may have
+changed the snapshot behind its back, so a fresh pull shows without reloading the
+page: a successful models refresh — whatever its `ok` / `unverifiable` answer, since
+the pull may have changed the snapshot either way; a refresh that failed with an
+error does not trigger it — and a usage refresh the gateway answered (§5.5), the
+panel's own button or, when it really pulled (`ok`), its on-view call. The
+spend-control figures change only through an active pull: the passive scrape never
+carries them (§5.1), so a Business account's credits are as fresh as its last pull —
+the on-view refresh (at most every five minutes while its view is opened), the
+refresh button, a models refresh or a connect.
 
-**What the panel shows.** It renders nothing when the snapshot knows nothing (no
-window, no balance, no spend, no credit status). Otherwise the two window rows
-always appear, and a window that was never observed (`-1`) reads "No data yet"
-rather than a real 0 %. The credit side is **one row, chosen by priority**:
+**What the panel shows.** The panel (`VendorAccountUsage` /
+`VendorAccountUsagePanel`) is **availability-aware**: it shows only the limits the
+vendor provides for the account, and it is **always there** for an account that can
+have usage — an `api_key` account or a connected subscription (a never-connected
+subscription has served nothing and gets no panel). The titled frame (the "Nutzung &
+Limits" panel; English "Usage & limits") stays even when no row would be drawn, and
+then holds one empty-state line (English: "No limits from the provider are known for
+this account yet.") instead of vanishing, so the refresh button (below) stays
+reachable; the line is held back only while the first read of the snapshot is still
+in flight, and a failed read of the snapshot also leaves the frame with that line
+rather than a toast. An
+`api_key` account normally has no snapshot at all, since its responses carry none of
+the headers of §5.1, so it shows the empty-state line. A window the vendor did not
+report (`-1`, never observed) has **no row at all** — it is hidden, not drawn as
+"no data" and never as a real 0 % (a real `0` is a known value and is shown). The
+rows are therefore a subset of: the five-hour window, the weekly window and one
+credit row. The credit side is **one row, chosen by priority**:
 
 | Snapshot | Row |
 |---|---|
@@ -947,12 +992,104 @@ capped at 100; the bar turns amber from 75 % and red from 90 %, and is left off
 off the parenthesis. For 42.5 of 6000 credits used (1 %) the German row reads
 "42,5 / 6000 Credits (1 %)" and the English one "42.5 / 6000 Credits (1%)".
 
-API-key accounts carry no subscription window; absolute €/$ spend accounting is
-deferred.
+A Business account whose snapshot carries only the spend control therefore shows just
+its credit row, with no empty window placeholders. Under the rows the panel prints
+"Zuletzt aktualisiert: …" ("Last updated: …") from `updated_at`, which is the time of
+the last write, not a per-field freshness (§5.3).
 
-Deliberately **not** in this change, and listed as a follow-up: a **dedicated
-`POST .../usage/refresh` endpoint**, so the usage can be refreshed without also
-re-listing the models.
+**Refreshing it from the panel.** For the one account the gateway can actively ask — a
+connected **OpenAI subscription** — the panel's frame also carries an "Aktualisieren"
+button ("Refresh") that calls the dedicated refresh with `?force=1` (§5.5), shows the
+answer inline by its `status` (an answer the gateway delivered is not an error:
+`ok` and `fresh` read as a success, "Nutzung aktualisiert"; `unverifiable` reads as a
+neutral, informational note that the usage could not be refreshed and the existing
+figures are unchanged; `unsupported` says the account's usage cannot be queried from
+the provider), and re-reads the snapshot; a call that itself failed is a toast. The
+same account also gets **one on-view-lazy refresh** (the plain call, no `force`) when
+its detail view opens, so figures that went stale while nobody looked are renewed
+without a click; it is best effort, its failure is silent and it never loops or
+polls. Every other account (an `api_key`, an Anthropic subscription) gets neither the
+button nor the call: it learns its usage only from the requests it serves.
+
+**On the dashboard.** The portal dashboard has a flag-gated section "Anbieter —
+Nutzung & Limits" (English "Providers — usage & limits") that shows the user's own
+vendor accounts and their limits side by side, one compact card per account (name,
+vendor, a status chip when the account is not active, and the same rows in a tighter
+layout). It reads the **stored snapshots through the list endpoint**
+(`GET /api/portal/vendor-accounts`) and **never calls the vendor**: it makes no
+refresh request, so it is safe to poll, which it does about once a minute so the
+figures and the countdowns do not go stale on a dashboard left open. A card appears
+only for an account that can report usage (an `api_key` account or a connected
+subscription) **and** has at least one visible row; an account with no snapshot yet
+is left out rather than drawn empty. When no account qualifies, before the first read,
+and when the read fails, the section renders nothing, and the dashboard keeps its
+tiles and routes. It is mounted only while the `vendor_accounts_enabled` master flag
+is on, so a deployment that leaves the flag off never makes the request. Because it
+shows only what the gateway has already learned, its figures move with the served
+requests and the active pulls (§5.5), not with the vendor's own changes.
+
+**Deferred.** API-key accounts carry no subscription window; absolute €/$ spend
+accounting is deferred. A **background refresher** — a periodic active pull that would
+keep every OpenAI-subscription account's snapshot current without anyone opening its
+view — is deliberately **not** built, and would be an opt-in, default-off follow-up. The
+usage endpoint is reverse-engineered and ToS-restricted like the rest of the
+subscription path (§10), so the gateway asks it only when a person looks (§5.5:
+human-correlated and capped by the TTL), never on an idle timer: the usage is
+refreshed when somebody opens or refreshes it, or when the account is refreshed or
+connected.
+
+### 5.5 The dedicated usage refresh and its lazy TTL
+
+`POST /api/portal/vendor-accounts/{id}/usage/refresh` (no body;
+[API Surface](../reference/api-surface.md#vendor-accounts-anbieter)) pulls an OpenAI
+subscription's usage **without re-listing the models**, so the usage panel can keep
+its figures current on its own (`RefreshVendorAccountUsage`,
+`internal/portal/service_vendor_usage_refresh.go`). It is **owner-only, system scope
+included** (it opens the owner's sealed credential and sends it to the vendor, so it
+is authorized like a write, §8), and gated by the master flag.
+
+| Call | `maxAge` | Behavior |
+|---|---|---|
+| plain `POST .../usage/refresh` — the **on-view-lazy** call | the lazy TTL, **5 minutes** (`portal.VendorUsageLazyTTL`) | When the account's last active pull is strictly younger than the TTL the vendor is **not asked**: the stored snapshot is answered with `refresh.status: fresh`. Otherwise it pulls. |
+| `POST .../usage/refresh?force=1` — the **manual** button | `0` | Always asks the vendor. |
+
+**The TTL is enforced on the server**, so a client that opens the view in a loop
+cannot hammer the vendor. It is keyed off an **in-memory, per-account** "last active
+pull" time held by the portal service (a mutex-guarded map, no column and no
+migration); a restart forgets it, which costs at most one extra pull per account,
+and deleting the account drops its entry. The time is **recorded only when the
+vendor was actually reached**: a vendor that answered with an error, or an unusable
+body, counts (a failing vendor is not asked again on every view), but a refresh that
+never got that far does not. That covers an account with no usable token (not
+connected, or an expired token that could not be renewed) and a context that had
+already ended when the fetch returned (the connect flows' shared 5 second budget
+spent on a slow model list, a cancelled request). Without that rule a pull that
+never happened would make the next lazy call answer `fresh` with no snapshot for the
+whole TTL. A clock stepped backward never keeps an entry fresh (a negative age is
+not "fresh"), and two concurrent calls for one account may both ask the vendor (the
+merged write is idempotent).
+
+**The answer** is `200 {"usage": <the stored snapshot, as GET .usage, or null>,
+"refresh": {"status", "detail"}}`, the snapshot read **after** the pull:
+
+| `refresh.status` | Meaning |
+|---|---|
+| `ok` | The vendor was asked, answered usably and the snapshot was stored (merged, §5.3). |
+| `fresh` | The lazy TTL skipped the pull; the vendor was **not** called. It says the pull was skipped, not that the data is current: the last attempt may have failed, so the stored snapshot can be older than the TTL, or `usage` can be `null`. |
+| `unverifiable` | Nothing usable could be had: no usable token, the vendor unreachable or answering with an error or an unusable body, or a snapshot that could not be stored. The stored snapshot is kept. It says nothing about the credential (only the dispatch moves an account to `needs_reconnect`, §3.4). |
+| `unsupported` | Not an OpenAI subscription: an `api_key` account of either vendor and an Anthropic subscription have no active pull, their snapshot only ever comes from the scrape. No credential is opened. |
+
+`refresh.detail` is a short English phrase for diagnostics; the portal keys off
+`status` only. The endpoint is **fail-soft** like the models refresh: an
+unreachable vendor is a `200` with `unverifiable`, never an error. The only errors
+are a stranger's or unknown id (`404`, no existence leak), the master flag off
+(`409`), a stored credential that cannot be opened (`409
+vendor_account.credential_unreadable`) and a store failure (`500
+vendor_account.usage_refresh_failed`).
+
+**What the portal does with it.** The usage panel (§5.4) calls the plain form once
+when an OpenAI-subscription account's detail view opens — a cheap stored read while
+the TTL holds — and the `?force=1` form from its refresh button. Nothing polls it.
 
 ## 6. Dynamic model discovery and the model prefix
 
@@ -1186,12 +1323,12 @@ A non-owner gets the **same `404 vendor_account.not_found`** as for a
 non-existent account (the no-existence-leak rule). The `system` scope may **read**
 any account (`GetVendorAccount`), but `ListVendorAccounts` and every **write**
 (create/update/delete/connect) are owner-only — a deliberate read/write
-asymmetry. The **test-connection** action (§3.5) and the **model refresh** (§6.3)
-are not writes of the account's credential but are owner-only for the `system`
-scope too, because each sends the stored credential to the vendor: they are
-authorized like a write, not like a metadata read. Routing and the model
-listings (§6.7) enforce the same owner scope by enumerating only the principal's
-own accounts, so one user's account can never serve, or be listed to, another.
+asymmetry. The **test-connection** action (§3.5), the **model refresh** (§6.3) and
+the **usage refresh** (§5.5) are not writes of the account's credential but are
+owner-only for the `system` scope too, because each sends the stored credential to
+the vendor: they are authorized like a write, not like a metadata read. Routing and
+the model listings (§6.7) enforce the same owner scope by enumerating only the
+principal's own accounts, so one user's account can never serve, or be listed to, another.
 The Activity list follows the same read rule for the account's **name**: a usage
 row carries its `account_id` for every viewer, but the transient `account_name` is
 resolved only for the owner or a `system` admin and stays empty for anyone else
@@ -1310,8 +1447,8 @@ reasons are recorded deliberately, not in denial of them
   prefix and display-name columns (migration 83) and the usage snapshot's
   spend-control columns (migration 84).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
-  `/api/portal/vendor-accounts*` routes (the model refresh included) and their
-  error codes.
+  `/api/portal/vendor-accounts*` routes (the model and usage refreshes included) and
+  their error codes.
 - [Configuration & Environment Variables](../reference/config-env.md) — the cipher
   key and the three system settings.
 - [ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)

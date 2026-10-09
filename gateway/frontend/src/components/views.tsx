@@ -121,7 +121,13 @@ export const viewRegistry: Record<View, ViewEntry> = {
     icon: LayoutDashboard,
     gate: alwaysVisible,
     render: (ctx) => (
-      <Dashboard t={ctx.t} dashboard={ctx.dashboard} productName={ctx.productName} />
+      <Dashboard
+        t={ctx.t}
+        dashboard={ctx.dashboard}
+        productName={ctx.productName}
+        vendorAccountsEnabled={ctx.vendorAccountsEnabled}
+        api={ctx.api}
+      />
     ),
   },
   chat: {

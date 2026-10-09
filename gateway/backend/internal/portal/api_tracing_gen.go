@@ -1504,6 +1504,18 @@ func (_d *APIWithTracing) RefreshVendorAccountModels(ctx context.Context, t1 aut
 	return _d.API.RefreshVendorAccountModels(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) RefreshVendorAccountUsage(ctx context.Context, t1 auth.Token, s1 string, d1 time.Duration) (vp1 *VendorAccountUsageDTO, v1 VendorUsageRefreshResult, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RefreshVendorAccountUsage")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RefreshVendorAccountUsage(ctx, t1, s1, d1)
+}
+
 func (_d *APIWithTracing) RegenerateNetbirdKey(ctx context.Context, t1 auth.Token, s1 string) (s2 string, s3 string, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RegenerateNetbirdKey")
 	defer span.End()

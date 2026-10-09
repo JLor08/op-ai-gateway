@@ -171,6 +171,10 @@ the `vendorAccountsEnabled` flag — threaded through `App.tsx` and `NavSidebar`
 from `GET /api/portal/vendor-accounts/enabled` — so the nav item and the routed
 content are both hidden while the vendor-accounts module is off
 ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)).
+The same flag decides whether the Dashboard mounts its "Anbieter — Nutzung & Limits"
+section (`DashboardVendorUsage`, which reads the stored usage snapshots from the
+vendor-accounts list and never calls a vendor,
+[§5.4](cross-cutting/external-vendor-accounts.md#54-reading-it-and-what-is-deferred)).
 
 Two additions worth knowing when looking for code on this side:
 

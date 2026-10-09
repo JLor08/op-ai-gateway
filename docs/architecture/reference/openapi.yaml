@@ -1113,7 +1113,11 @@ paths:
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
-          description: The caller's own accounts, oldest first
+          description: >
+            The caller's own accounts, oldest first. Each row carries its
+            rate-limit usage snapshot when one has been stored (omitted
+            otherwise, and omitted for a row whose snapshot could not be read:
+            the list never fails over it).
           content:
             application/json:
               schema:
@@ -1291,6 +1295,74 @@ paths:
             vendor_account.refresh_failed -- the refresh failed for a reason
             outside the known states (a store failure). A vendor that cannot be
             asked is not this: it is a 200 with refresh.status unverifiable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/vendor-accounts/{id}/usage/refresh:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Refresh the account's usage snapshot from the vendor (OpenAI subscription only)
+      description: >
+        No request body. Pulls the account's usage snapshot from the vendor
+        without re-listing its models and answers the stored snapshot as it is
+        after the pull, plus a VendorUsageRefreshResult. Only an OpenAI
+        subscription has an active pull; any other account answers
+        refresh.status unsupported and no credential is opened. Without a query
+        it is the on-view-lazy call: when the account's last active pull (held
+        in memory per account, recorded only when the vendor was actually
+        reached) is younger than the server's TTL of 5 minutes the vendor is not
+        asked and the answer is fresh. force=1 (the manual refresh button)
+        bypasses the TTL and always asks. An expired subscription token is
+        renewed first through the gateway's own locked token refresh.
+        Fail-soft: a vendor that cannot be asked is a 200 with refresh.status
+        unverifiable and the stored snapshot kept. Strictly owner-only (system
+        scope included); a non-owner gets the same 404 as an unknown id. A
+        stored credential that cannot be opened is a 409
+        vendor_account.credential_unreadable; an uncategorized failure (a store
+        error) is a 500 vendor_account.usage_refresh_failed.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      parameters:
+        - name: force
+          in: query
+          required: false
+          description: >
+            1 or true (also t, T, TRUE, True) bypasses the lazy TTL; absent,
+            false or any other value is the lazy call.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The stored usage snapshot after the call, and what the refresh did
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [usage, refresh]
+                properties:
+                  usage:
+                    description: The account's stored usage snapshot (the same object as the detail read's usage), or null when none has been stored.
+                    oneOf:
+                      - { $ref: '#/components/schemas/VendorAccountUsage' }
+                      - { type: 'null' }
+                  refresh: { $ref: '#/components/schemas/VendorUsageRefreshResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The usage cannot be refreshed -- vendor_account.credential_unreadable
+            (the stored credential cannot be opened; reconnect the account) or
+            vendor_accounts.module_disabled while the master flag is off. The
+            Error envelope carries the stable code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: >
+            vendor_account.usage_refresh_failed -- the refresh failed for a
+            reason outside the known states (a store failure). A vendor that
+            cannot be asked is not this: it is a 200 with refresh.status
+            unverifiable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -2071,34 +2143,62 @@ components:
           description: The models the account serves; always an array, never null.
           items: { $ref: '#/components/schemas/VendorAccountModel' }
         usage:
-          type: object
-          description: >
-            The usage snapshot (portal.VendorAccountUsageDTO); present on the
-            detail read only, and only once one has been stored. The rate-limit
-            windows are percentages and reset times only; a Codex Business
-            plan's spend control and credit state ride along as the spend_*
-            fields and credit_status. Every field is always on the wire, with an
-            unknown one reading -1 (a percent), null (a time) or "" (a string),
-            never a fabricated 0.
-          properties:
-            five_hour_pct: { type: number, description: 'Used share of the five-hour window, 0..100; -1 = unknown.' }
-            five_hour_reset_at: { type: [string, 'null'], format: date-time }
-            weekly_pct: { type: number, description: 'Used share of the weekly window, 0..100; -1 = unknown.' }
-            weekly_reset_at: { type: [string, 'null'], format: date-time }
-            credit_balance: { type: string, description: 'The vendor''s raw credit-balance string; empty = none or unknown.' }
-            spend_unit: { type: string, description: 'Unit of the spend-control figures, e.g. credit; empty = unknown.' }
-            spend_limit: { type: string, description: 'The vendor''s raw spend-control limit string; empty = unknown.' }
-            spend_used: { type: string, description: 'The vendor''s raw spend-control used string; empty = unknown.' }
-            spend_remaining: { type: string, description: 'The vendor''s raw spend-control remaining string; empty = unknown.' }
-            spend_used_pct: { type: number, description: 'Used share of the spend-control limit, 0..100; -1 = unknown.' }
-            spend_reset_at: { type: [string, 'null'], format: date-time }
-            credit_status:
-              type: string
-              enum: ['', unlimited, has_credits, none]
-              description: The credit state the vendor's credit flags report; empty = unknown.
-            updated_at: { type: string, format: date-time }
+          $ref: '#/components/schemas/VendorAccountUsage'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+    VendorAccountUsage:
+      type: object
+      description: >
+        The account's rate-limit usage snapshot (portal.VendorAccountUsageDTO).
+        Present as VendorAccount.usage on the detail read and on every row of
+        the list, and only once one has been stored (the key is omitted
+        otherwise); also the usage of the usage-refresh answer. The rate-limit
+        windows are percentages and reset times only; a Codex Business plan's
+        spend control and credit state ride along as the spend_* fields and
+        credit_status. Every field is always on the wire, with an unknown one
+        reading -1 (a percent), null (a time) or "" (a string), never a
+        fabricated 0. A client shows only the limits it knows (a -1 window is
+        hidden, not drawn as zero).
+      properties:
+        five_hour_pct: { type: number, description: 'Used share of the five-hour window, 0..100; -1 = unknown.' }
+        five_hour_reset_at: { type: [string, 'null'], format: date-time }
+        weekly_pct: { type: number, description: 'Used share of the weekly window, 0..100; -1 = unknown.' }
+        weekly_reset_at: { type: [string, 'null'], format: date-time }
+        credit_balance: { type: string, description: 'The vendor''s raw credit-balance string; empty = none or unknown.' }
+        spend_unit: { type: string, description: 'Unit of the spend-control figures, e.g. credit; empty = unknown.' }
+        spend_limit: { type: string, description: 'The vendor''s raw spend-control limit string; empty = unknown.' }
+        spend_used: { type: string, description: 'The vendor''s raw spend-control used string; empty = unknown.' }
+        spend_remaining: { type: string, description: 'The vendor''s raw spend-control remaining string; empty = unknown.' }
+        spend_used_pct: { type: number, description: 'Used share of the spend-control limit, 0..100; -1 = unknown.' }
+        spend_reset_at: { type: [string, 'null'], format: date-time }
+        credit_status:
+          type: string
+          enum: ['', unlimited, has_credits, none]
+          description: The credit state the vendor's credit flags report; empty = unknown.
+        updated_at: { type: string, format: date-time }
+    VendorUsageRefreshResult:
+      type: object
+      description: >
+        What POST /api/portal/vendor-accounts/{id}/usage/refresh did
+        (portal.VendorUsageRefreshResult). Credential-free.
+      required: [status, detail]
+      properties:
+        status:
+          type: string
+          enum: [ok, fresh, unverifiable, unsupported]
+          description: >
+            ok - the vendor was asked and the snapshot was stored. fresh - the
+            lazy TTL (the account's last active pull was younger than 5 minutes)
+            skipped the pull: the vendor was not called and the stored snapshot
+            is answered as it is (never with ?force=1). unverifiable - nothing
+            usable could be had (no usable token, vendor unreachable or
+            unusable answer, snapshot not storable); the stored snapshot was
+            kept; says nothing about the credential. unsupported - the account
+            has no active usage pull (only an OpenAI subscription has one); no
+            credential was opened.
+        detail:
+          type: string
+          description: Short English phrase (what happened, or why nothing was pulled). Never a credential or vendor text; key off status, not this.
     VendorAccountCreateRequest:
       type: object
       description: portal.CreateVendorAccountRequest.

@@ -3,7 +3,7 @@
 
 import { type ReactNode } from 'react';
 import type { DashboardResponse } from '../api';
-import type { Translation, MessageKey, RouteStatus } from './shared/types';
+import type { Translation, MessageKey, PortalApi, RouteStatus } from './shared/types';
 import { Box, TableRow, TableCell, Typography } from '@mui/material';
 import { DataTable } from './shared/DataTable';
 import { StatusChip } from './shared/StatusChip';
@@ -11,6 +11,7 @@ import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
 import { StatTile } from './shared/StatTile';
 import { TokenAggregateValue } from './TokenAggregateValue';
+import { DashboardVendorUsage } from './DashboardVendorUsage';
 
 type Metric = {
   labelKey: MessageKey;
@@ -31,10 +32,17 @@ export function Dashboard({
   t,
   dashboard,
   productName,
+  vendorAccountsEnabled = false,
+  api,
 }: Readonly<{
   t: Translation;
   dashboard: DashboardResponse | null;
   productName: string;
+  // The vendor-accounts master flag and the API the usage section reads its
+  // accounts from. Optional: without BOTH the section is not mounted, so it makes
+  // no request and the dashboard is exactly what it was before the feature.
+  vendorAccountsEnabled?: boolean;
+  api?: Pick<PortalApi, 'vendorAccounts'>;
 }>) {
   const metricRows: Metric[] = dashboard
     ? [
@@ -105,6 +113,8 @@ export function Dashboard({
           />
         ))}
       </Box>
+
+      {vendorAccountsEnabled && api && <DashboardVendorUsage t={t} api={api} />}
 
       <Panel titleId="route-heading" title={t.liveModelRoutes} subtitle={t.liveModelRoutesSubtitle}>
         <DataTable

@@ -171,6 +171,9 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // The "refresh models" action's 500 fallback: like check_failed, its server
   // message is only the generic English "vendor account request failed".
   'vendor_account.refresh_failed': 'errorVendorAccountRefreshFailed',
+  // The "refresh usage" action's 500 fallback (explicit button and the on-view
+  // call): its server message is likewise only the generic English sentence.
+  'vendor_account.usage_refresh_failed': 'errorVendorAccountUsageRefreshFailed',
   // The connection test and the models refresh could not open the stored
   // credential (a lost encryption key, a corrupt blob): a 409, never a 401 (the
   // portal reads a 401 as an expired session). The label is about READING it --

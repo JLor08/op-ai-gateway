@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -78,11 +79,14 @@ type VendorAccountUsageDTO struct {
 // model id (a model's GatewayModel), while the vendor is still asked for its own
 // id (UpstreamModel).
 //
-// Usage is the rate-limit snapshot and is filled by GetVendorAccount ONLY (the
-// detail view's Usage & Limits panel): the list and the write endpoints leave it
-// nil -- one snapshot read per row would be an N+1 on the list -- and so does a
-// detail read of an account the gateway has not yet seen a rate-limit header
-// for. A nil Usage is omitted from the JSON.
+// Usage is the rate-limit snapshot. The two read endpoints fill it -- the detail
+// view's Usage & Limits panel (GetVendorAccount) and the list
+// (ListVendorAccounts, so the dashboard's provider usage section reads every
+// account's usage in one call); the write endpoints leave it nil. It is also nil
+// for an account the gateway has not yet seen a rate-limit header for, and the
+// list leaves it nil for a row whose snapshot read failed (fail-soft). A nil
+// Usage is omitted from the JSON. The list's per-row snapshot read is bounded and
+// adds no new N+1 shape: that loop already reads each account's model rows.
 type VendorAccountDTO struct {
 	ID                    string                  `json:"id"`
 	Vendor                string                  `json:"vendor"`
@@ -275,7 +279,8 @@ func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Tok
 	return routing.VendorAccount{}, ErrVendorAccountNotFound
 }
 
-// ListVendorAccounts returns the calling principal's OWN accounts, oldest first.
+// ListVendorAccounts returns the calling principal's OWN accounts, oldest first,
+// each with its rate-limit usage snapshot when one exists (see VendorAccountDTO).
 // Like every vendor-account method it is refused with ErrVendorAccountsDisabled
 // (before anything else) while the vendor_accounts_enabled master flag is off.
 // System scope does not widen the list: the page is a personal one and the DTO
@@ -303,15 +308,24 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 		if err != nil {
 			return VendorAccountListResponse{}, err
 		}
+		// The snapshot only decorates the row: a failed read leaves Usage nil
+		// (the row renders without a usage panel) rather than failing the whole
+		// Providers list. GetVendorAccount, the detail read, surfaces the error.
+		if dto.Usage, err = s.vendorAccountUsageDTO(ctx, acc.ID); err != nil {
+			slog.Debug("vendor accounts list: usage snapshot unavailable, listing the account without it",
+				"account_id", acc.ID, "err", err)
+			dto.Usage = nil
+		}
 		out = append(out, dto)
 	}
 	return VendorAccountListResponse{Data: out}, nil
 }
 
 // GetVendorAccount returns one account the principal owns (404-no-leak
-// otherwise); system scope may read any account. It is the only read that also
-// carries the account's rate-limit usage snapshot (Usage; nil until one has been
-// scraped). ErrVendorAccountsDisabled while the master flag is off.
+// otherwise); system scope may read any account. It carries the account's
+// rate-limit usage snapshot (Usage; nil until one has been scraped) and, unlike
+// the list, fails when that snapshot cannot be read. ErrVendorAccountsDisabled
+// while the master flag is off.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
@@ -547,5 +561,6 @@ func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token,
 		}
 		return false, err
 	}
+	s.vendorUsagePulls.forget(acc.ID)
 	return true, nil
 }

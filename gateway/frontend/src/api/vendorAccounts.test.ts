@@ -236,6 +236,62 @@ describe('vendorAccountsApi', () => {
     });
   });
 
+  it('POSTs .../usage/refresh with no body and no query for the on-view (lazy) call', async () => {
+    const answer = {
+      usage: null,
+      refresh: { status: 'fresh', detail: 'the usage was pulled recently' },
+    };
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(answer));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.refreshUsage('va/1');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/usage/refresh');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp).toEqual(answer);
+  });
+
+  it('adds ?force=1 to the usage refresh only when asked to force it past the server TTL', async () => {
+    // A fresh Response per call: a body can only be read once.
+    const fetcher = vi.fn().mockImplementation(async () =>
+      jsonResponse({
+        usage: null,
+        refresh: { status: 'ok', detail: 'usage refreshed' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    await api.refreshUsage('va_1', { force: true });
+    await api.refreshUsage('va_1', { force: false });
+    await api.refreshUsage('va_1', {});
+
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      '/api/portal/vendor-accounts/va_1/usage/refresh?force=1',
+      '/api/portal/vendor-accounts/va_1/usage/refresh',
+      '/api/portal/vendor-accounts/va_1/usage/refresh',
+    ]);
+  });
+
+  it('surfaces a refused usage refresh as a PortalApiError with the backend code', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(
+          { error: { code: 'vendor_account.usage_refresh_failed', message: 'raw server text' } },
+          500,
+        ),
+      );
+    const api = createPortalApi(fetcher);
+
+    await expect(api.refreshUsage('va_1')).rejects.toMatchObject({
+      status: 500,
+      code: 'vendor_account.usage_refresh_failed',
+    });
+  });
+
   it('POSTs .../connect/device/begin with no body and returns the user code and verification URL', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       jsonResponse({
