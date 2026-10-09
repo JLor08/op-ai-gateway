@@ -921,10 +921,11 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req infer
 // own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
 // one table. The provider/endpoint/auth-header triple is the only thing the
 // account's vendor decides; everything else is the same for both, with ONE
-// exception keyed on the FINE request flavor (fineFlavor, not the coarse
-// apiFlavor, which folds every openai_* flavor to "openai"): an OpenAI account
-// reached over openai_responses is served by native passthrough (see the
-// ResponsesMode comment below).
+// exception per vendor keyed on the FINE request flavor (fineFlavor, not the
+// coarse apiFlavor, which folds every openai_* flavor to "openai"): an OpenAI
+// account reached over openai_responses, and an Anthropic account reached over
+// anthropic_messages, are each served by native passthrough (see the
+// ResponsesMode / MessagesMode comments below).
 func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
 	provider := ProviderVendorOpenAI
 	endpoint := "https://api.openai.com"
@@ -954,8 +955,8 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		VendorAccountID: acc.ID,
 		// Both inbound dialects are served; the zero endpoint modes mean translate,
 		// so native-passthrough converts whichever one the caller used to the
-		// vendor's native wire format. The one exception is set below: an OpenAI
-		// account + openai_responses.
+		// vendor's native wire format. The two exceptions are set below: an OpenAI
+		// account + openai_responses, and an Anthropic account + anthropic_messages.
 		APIFlavors: []string{APIFlavorOpenAI, APIFlavorAnthropic},
 	}
 	// An inbound Responses request to an OpenAI api-key account is relayed LOSSLESSLY
@@ -963,10 +964,27 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 	// rewritten) instead of being translated to /v1/chat/completions, which would
 	// drop everything the chat shape cannot carry (tools, reasoning, previous
 	// response, ...). Chat and every other openai flavor stay translated, and so
-	// does the Anthropic api-key branch (its upstream is /v1/messages; there is no
-	// Responses surface to pass through to). Mirrors vendorSubscriptionOpenAITarget.
+	// does the Anthropic api-key branch for every openai_* flavor (its upstream is
+	// /v1/messages; there is no Responses surface to pass through to). Mirrors
+	// vendorSubscriptionOpenAITarget.
 	if acc.Vendor == VendorOpenAI && fineFlavor == inference.APIFlavorOpenAIResponses {
 		t.ResponsesMode = EndpointModePassthrough
+	}
+	// The Anthropic mirror image: an inbound Messages request to an Anthropic
+	// api-key account is relayed LOSSLESSLY to api.anthropic.com/v1/messages (native
+	// passthrough: only the model field is rewritten, no masquerade block, no other
+	// body edit) instead of being parsed to the neutral request and re-rendered, which
+	// would drop everything the compat shape cannot carry (cache_control, thinking,
+	// server tools, metadata, ...). Only the api-key branch is touched here: chat
+	// and Responses requests to the same account, and anthropic_messages to an
+	// OpenAI account, stay translated, and so does the Anthropic SUBSCRIPTION target
+	// (vendorSubscriptionAnthropicTarget, deliberately left for a follow-up).
+	//
+	// Deliberately NO ExtraHeaders: the credential rides in APIToken as x-api-key
+	// (upstreamAuthCtx opens it), and anthropic-version is guaranteed by
+	// provider.AnthropicClient.ProxyNative itself, so the target stays minimal.
+	if acc.Vendor == VendorAnthropic && fineFlavor == "anthropic_messages" {
+		t.MessagesMode = EndpointModePassthrough
 	}
 	return t
 }

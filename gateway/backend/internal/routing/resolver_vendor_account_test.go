@@ -311,12 +311,127 @@ func TestVendorAccountOpenAIAPIKeyResponsesResolvesToPassthroughTarget(t *testin
 	}
 }
 
+// TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget is the core
+// proof of the api-key Messages passthrough: an ANTHROPIC API-KEY account reached
+// over the FINE anthropic_messages flavor resolves to a NATIVE-PASSTHROUGH target
+// at api.anthropic.com (MessagesMode passthrough, so the dispatch layer relays the
+// inbound Messages body/SSE verbatim to /v1/messages instead of translating it
+// through the compat parser, which would drop everything it cannot carry). It is
+// still an api-key target: the sealed key rides in APIToken as x-api-key,
+// Subscription stays false, and no masquerade / OAuth header is set. It also sets
+// NO ExtraHeaders: anthropic-version is guaranteed by AnthropicClient.ProxyNative
+// itself, so the target stays minimal.
+func TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorAccount(t, store, now, "acc_anthropic", vendorOwner, VendorAnthropic, vendorKey, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: "anthropic_messages"})
+	if err != nil {
+		t.Fatalf("Resolve(anthropic_messages) = %v, want a passthrough target", err)
+	}
+	if target.Provider != ProviderVendorAnthropic {
+		t.Errorf("Provider = %q, want %q", target.Provider, ProviderVendorAnthropic)
+	}
+	if target.Endpoint != "https://api.anthropic.com" {
+		t.Errorf("Endpoint = %q, want https://api.anthropic.com", target.Endpoint)
+	}
+	if target.MessagesMode != EndpointModePassthrough {
+		t.Errorf("MessagesMode = %q, want %q (lossless native passthrough to /v1/messages)", target.MessagesMode, EndpointModePassthrough)
+	}
+	if target.APITokenHeader != "x-api-key" {
+		t.Errorf("APITokenHeader = %q, want x-api-key", target.APITokenHeader)
+	}
+	if target.APIToken != vendorKey {
+		t.Errorf("APIToken = %q, want the sealed account key %q", target.APIToken, vendorKey)
+	}
+	if target.Subscription {
+		t.Error("Subscription = true, want false for an api-key target (the key rides in APIToken as x-api-key)")
+	}
+	if target.Masquerade != "" {
+		t.Errorf("Masquerade = %q, want none: the api-key passthrough relays the client's own body verbatim", target.Masquerade)
+	}
+	if len(target.ExtraHeaders) != 0 {
+		t.Errorf("ExtraHeaders = %v, want none (ProxyNative guarantees anthropic-version itself)", target.ExtraHeaders)
+	}
+	if target.ProviderModel != "claude-sonnet-4-5-20250929" {
+		t.Errorf("ProviderModel = %q, want the bare upstream slug", target.ProviderModel)
+	}
+	if target.VendorAccountID != "acc_anthropic" {
+		t.Errorf("VendorAccountID = %q, want acc_anthropic", target.VendorAccountID)
+	}
+	if target.ResponsesMode != "" {
+		t.Errorf("ResponsesMode = %q, want zero (an Anthropic upstream has no Responses surface)", target.ResponsesMode)
+	}
+	if len(target.APIFlavors) != 2 || target.APIFlavors[0] != APIFlavorOpenAI || target.APIFlavors[1] != APIFlavorAnthropic {
+		t.Errorf("APIFlavors = %v, want [openai anthropic] unchanged", target.APIFlavors)
+	}
+}
+
+// TestVendorAccountTranslateFlavorsLeaveMessagesModeZero pins the scope of the
+// Messages passthrough: it is ANTHROPIC api-key + anthropic_messages ONLY. Every
+// openai_* flavor to the same Anthropic account stays TRANSLATE (MessagesMode
+// zero), anthropic_messages to an OpenAI api-key account stays translate (its
+// upstream has no Messages surface), and the Anthropic SUBSCRIPTION target stays
+// translate for both dialects (a deliberate follow-up, not part of this slice).
+func TestVendorAccountTranslateFlavorsLeaveMessagesModeZero(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name         string
+		vendor       string
+		subscription bool
+		model        string
+		modelFlavor  string
+		reqFlavor    string
+		wantProvider string
+	}{
+		{"anthropic api-key, openai_chat_completions", VendorAnthropic, false, "claude-sonnet", APIFlavorAnthropic, "openai_chat_completions", ProviderVendorAnthropic},
+		{"anthropic api-key, openai_responses", VendorAnthropic, false, "claude-sonnet", APIFlavorAnthropic, "openai_responses", ProviderVendorAnthropic},
+		{"openai api-key, anthropic_messages", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "anthropic_messages", ProviderVendorOpenAI},
+		{"openai api-key, openai_chat_completions", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "openai_chat_completions", ProviderVendorOpenAI},
+		{"openai api-key, openai_responses", VendorOpenAI, false, "gpt-4o", APIFlavorOpenAI, "openai_responses", ProviderVendorOpenAI},
+		{"anthropic subscription, anthropic_messages", VendorAnthropic, true, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages", ProviderVendorAnthropic},
+		{"anthropic subscription, openai_chat_completions", VendorAnthropic, true, "claude-sonnet", APIFlavorAnthropic, "openai_chat_completions", ProviderVendorAnthropic},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			if tc.subscription {
+				seedVendorSubscriptionAccount(t, store, now, "acc_sub", tc.vendor, "enc:sealed-tokens", VendorAccountStatusActive, tc.model, tc.model+"-upstream", tc.modelFlavor)
+			} else {
+				seedVendorAccount(t, store, now, "acc_key", vendorOwner, tc.vendor, vendorKey, tc.model, tc.model+"-upstream", tc.modelFlavor)
+			}
+			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+			target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: tc.model, APIFlavor: tc.reqFlavor})
+			if err != nil {
+				t.Fatalf("Resolve(%s) = %v, want a vendor target", tc.reqFlavor, err)
+			}
+			if target.Provider != tc.wantProvider {
+				t.Errorf("Provider = %q, want %q", target.Provider, tc.wantProvider)
+			}
+			if target.MessagesMode != "" {
+				t.Errorf("MessagesMode = %q, want zero (translate) for %s", target.MessagesMode, tc.name)
+			}
+			if target.Subscription != tc.subscription {
+				t.Errorf("Subscription = %v, want %v", target.Subscription, tc.subscription)
+			}
+		})
+	}
+}
+
 // TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero pins the scope of
-// the passthrough: it is OpenAI api-key + openai_responses ONLY. Chat and
+// the Responses passthrough: it is OpenAI api-key + openai_responses ONLY. Chat and
 // anthropic_messages to the same OpenAI account stay TRANSLATE (ResponsesMode
-// zero), and an ANTHROPIC api-key account stays translate for EVERY inbound
-// dialect, openai_responses included (its upstream is /v1/messages, which has no
-// Responses surface to pass through to).
+// zero), and an ANTHROPIC api-key account leaves ResponsesMode zero for EVERY
+// inbound dialect, openai_responses included (its upstream is /v1/messages, which
+// has no Responses surface to pass through to). Its anthropic_messages case DOES
+// get a MessagesMode passthrough, pinned separately in
+// TestVendorAccountAnthropicAPIKeyMessagesResolvesToPassthroughTarget.
 func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
@@ -366,7 +481,7 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 // (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
 	"ServerID":                    true, // a vendor target has no on-prem server
-	"MessagesMode":                true, // zero == translate
+	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
 	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
 	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
@@ -377,29 +492,64 @@ var vendorTargetMayBeZero = map[string]bool{
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 }
 
+// vendorAnthropicMessagesTargetMayBeZero is the Anthropic api-key analogue for the
+// anthropic_messages (passthrough) shape. It differs from the OpenAI set in exactly
+// the places the two shapes differ: MessagesMode is non-zero (lossless native
+// passthrough to /v1/messages — the whole point), so it is NOT listed, and
+// APITokenHeader is non-zero (x-api-key), so it is NOT listed either; ResponsesMode
+// is zero-OK (an Anthropic upstream has no Responses surface). ExtraHeaders stays
+// zero-OK: AnthropicClient.ProxyNative guarantees anthropic-version itself.
+var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
+	"ServerID":                    true, // a vendor target has no on-prem server
+	"ResponsesMode":               true, // zero == translate; Anthropic has no Responses surface
+	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
+	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
+	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
+	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"ExtraHeaders":                true, // ProxyNative sets anthropic-version itself; an API-KEY target carries no static headers
+	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only); the relay is verbatim
+	"Subscription":                true, // false on the API-KEY path -- its x-api-key rides in APIToken, not resolved at dispatch
+}
+
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of
 // TestTargetFromPopulatesEveryField: it reflects over the built Target and
-// requires every field not named in vendorTargetMayBeZero to be non-zero, so a
-// new Target field that a vendor target should populate is caught here too.
+// requires every field not named in the shape's may-be-zero set to be non-zero,
+// so a new Target field that a vendor target should populate is caught here too.
+// Each case is the one api-key shape whose endpoint mode is non-zero (lossless
+// native passthrough), so the mode is NOT in that shape's may-be-zero set. The
+// translate shapes leave it zero by design and are pinned in
+// TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero and
+// TestVendorAccountTranslateFlavorsLeaveMessagesModeZero.
 func TestVendorAccountTargetCompleteness(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
-	acc := VendorAccount{ID: "acc_openai", OwnerUserID: vendorOwner, Vendor: VendorOpenAI, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, CreatedAt: now, UpdatedAt: now}
-	m := VendorAccountModel{AccountID: "acc_openai", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024", APIFlavor: APIFlavorOpenAI}
-	// The openai_responses (passthrough) shape: the one api-key OpenAI target whose
-	// ResponsesMode is non-zero (lossless native passthrough), so ResponsesMode is
-	// NOT in vendorTargetMayBeZero. The translate shapes leave it zero by design and
-	// are pinned in TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero.
-	target := vendorAccountTarget(acc, m, "gpt-4o", APIFlavorOpenAI, "openai_responses")
+	openAIAcc := VendorAccount{ID: "acc_openai", OwnerUserID: vendorOwner, Vendor: VendorOpenAI, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, CreatedAt: now, UpdatedAt: now}
+	openAIModel := VendorAccountModel{AccountID: "acc_openai", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024", APIFlavor: APIFlavorOpenAI}
+	anthropicAcc := VendorAccount{ID: "acc_anthropic", OwnerUserID: vendorOwner, Vendor: VendorAnthropic, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, CreatedAt: now, UpdatedAt: now}
+	anthropicModel := VendorAccountModel{AccountID: "acc_anthropic", GatewayModel: "claude-sonnet", UpstreamModel: "claude-sonnet-4-5", APIFlavor: APIFlavorAnthropic}
 
-	tv := reflect.ValueOf(target)
-	tt := tv.Type()
-	for i := 0; i < tt.NumField(); i++ {
-		name := tt.Field(i).Name
-		if vendorTargetMayBeZero[name] {
-			continue
-		}
-		if tv.Field(i).IsZero() {
-			t.Fatalf("vendorAccountTarget left Target.%s at its zero value. If a vendor Target should carry it, wire it in vendorAccountTarget (internal/routing/resolver.go); if it is legitimately zero, add %q to vendorTargetMayBeZero with a reason.", name, name)
-		}
+	cases := []struct {
+		name      string
+		target    Target
+		mayBeZero map[string]bool
+	}{
+		// OpenAI api-key + openai_responses: ResponsesMode passthrough.
+		{"openai_responses", vendorAccountTarget(openAIAcc, openAIModel, "gpt-4o", APIFlavorOpenAI, "openai_responses"), vendorTargetMayBeZero},
+		// Anthropic api-key + anthropic_messages: MessagesMode passthrough.
+		{"anthropic_messages", vendorAccountTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages"), vendorAnthropicMessagesTargetMayBeZero},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tv := reflect.ValueOf(tc.target)
+			tt := tv.Type()
+			for i := 0; i < tt.NumField(); i++ {
+				name := tt.Field(i).Name
+				if tc.mayBeZero[name] {
+					continue
+				}
+				if tv.Field(i).IsZero() {
+					t.Fatalf("vendorAccountTarget left Target.%s at its zero value. If a vendor Target should carry it, wire it in vendorAccountTarget (internal/routing/resolver.go); if it is legitimately zero, add %q to the %s may-be-zero set with a reason.", name, name, tc.name)
+				}
+			}
+		})
 	}
 }

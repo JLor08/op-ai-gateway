@@ -39,11 +39,24 @@ type NativeProxyClient interface {
 // only Content-Type and — when ctx carries one via WithUpstreamAuth — the per-app
 // UPSTREAM credential (a gateway-held token, distinct from the client's) are set.
 func doNativeProxy(ctx context.Context, httpClient *http.Client, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+	return doNativeProxyWithDefaults(ctx, httpClient, target, path, body, nil)
+}
+
+// doNativeProxyWithDefaults is doNativeProxy plus a set of static default headers
+// the adapter itself guarantees on every upstream call (Anthropic's required
+// anthropic-version). The defaults are set BEFORE the ctx's upstream auth is
+// applied, so a ctx-carried ExtraHeaders entry of the same name still wins — the
+// same precedence the Anthropic translate path has — while a ctx that carries
+// nothing still sends them. A nil/empty set is exactly doNativeProxy.
+func doNativeProxyWithDefaults(ctx context.Context, httpClient *http.Client, target routing.Target, path string, body []byte, defaults map[string]string) (*ProxyResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
 	httpReq.Header.Set(contentTypeHeader, jsonContentType)
+	for name, value := range defaults {
+		httpReq.Header.Set(name, value)
+	}
 	applyUpstreamAuth(ctx, httpReq)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {

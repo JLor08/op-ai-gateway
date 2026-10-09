@@ -42,10 +42,16 @@ const (
 )
 
 // AnthropicClient is the native Anthropic Messages API (/v1/messages) client for
-// a vendor-account target (api.anthropic.com). It is a TRANSLATE-path client: it
-// renders the provider-neutral inference.Request into a Messages body and parses
-// the Messages response / SSE stream back into neutral values. It deliberately
-// has no native passthrough (NativeProxyClient), model lister or prober.
+// a vendor-account target (api.anthropic.com). It serves two paths:
+//
+//   - TRANSLATE (Client / StreamingClient): it renders the provider-neutral
+//     inference.Request into a Messages body and parses the Messages response /
+//     SSE stream back into neutral values.
+//   - NATIVE PASSTHROUGH (NativeProxyClient): ProxyNative relays an inbound
+//     /v1/messages body to the same endpoint verbatim, the lossless Claude Code
+//     path, via doNativeProxyWithDefaults.
+//
+// It deliberately has no model lister or prober.
 //
 // The render and parse live HERE rather than in internal/compat because
 // internal/provider may not import internal/compat (pinned by
@@ -63,9 +69,43 @@ func NewAnthropicClient(httpClient *http.Client) *AnthropicClient {
 }
 
 var (
-	_ Client          = (*AnthropicClient)(nil)
-	_ StreamingClient = (*AnthropicClient)(nil)
+	_ Client            = (*AnthropicClient)(nil)
+	_ StreamingClient   = (*AnthropicClient)(nil)
+	_ NativeProxyClient = (*AnthropicClient)(nil)
 )
+
+// ProxyNative forwards the raw inbound /v1/messages body to the upstream's own
+// endpoint path VERBATIM and returns the upstream response, Body still open, for
+// the gateway to relay byte-for-byte. It never rewrites the body (the gateway has
+// already set the upstream model name) and never applies the translate path's
+// Claude-Code masquerade system block: Target.Masquerade only shapes a rendered
+// request, and a passthrough has none.
+//
+// api.anthropic.com REQUIRES anthropic-version on every call, so ProxyNative
+// guarantees it ITSELF (as the default set passed to doNativeProxyWithDefaults)
+// instead of relying on the caller's target carrying it: the header can never go
+// missing whatever resolved the target. A ctx-carried anthropic-version (the
+// target's ExtraHeaders) still overrides the default, exactly as on the translate
+// path. The inbound client's own anthropic-version is not forwarded, as no inbound
+// header is. The credential (x-api-key, or a bearer) is the ctx's, applied by
+// applyUpstreamAuth.
+//
+// Redirects are not followed: net/http strips only Authorization, not x-api-key,
+// from a request that follows a redirect off the host, so following one could
+// carry the credential elsewhere. api.anthropic.com does not redirect; a 3xx is
+// returned to the caller as the upstream's answer.
+func (c *AnthropicClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+	return doNativeProxyWithDefaults(ctx, withoutRedirects(c.http), target, path, body, map[string]string{anthropicVersionHeader: anthropicAPIVersion})
+}
+
+// withoutRedirects returns a copy of c that hands a 3xx answer back instead of
+// following it. The caller's client (shared across every provider) is left
+// untouched.
+func withoutRedirects(c *http.Client) *http.Client {
+	cc := *c
+	cc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cc
+}
 
 func (c *AnthropicClient) Complete(ctx context.Context, target routing.Target, req inference.Request) (Response, error) {
 	if target.Timeout > 0 {
