@@ -2073,8 +2073,30 @@ components:
         usage:
           type: object
           description: >
-            The rate-limit snapshot (percentages and reset times only); present
-            on the detail read only, and only once one has been scraped.
+            The usage snapshot (portal.VendorAccountUsageDTO); present on the
+            detail read only, and only once one has been stored. The rate-limit
+            windows are percentages and reset times only; a Codex Business
+            plan's spend control and credit state ride along as the spend_*
+            fields and credit_status. Every field is always on the wire, with an
+            unknown one reading -1 (a percent), null (a time) or "" (a string),
+            never a fabricated 0.
+          properties:
+            five_hour_pct: { type: number, description: 'Used share of the five-hour window, 0..100; -1 = unknown.' }
+            five_hour_reset_at: { type: [string, 'null'], format: date-time }
+            weekly_pct: { type: number, description: 'Used share of the weekly window, 0..100; -1 = unknown.' }
+            weekly_reset_at: { type: [string, 'null'], format: date-time }
+            credit_balance: { type: string, description: 'The vendor''s raw credit-balance string; empty = none or unknown.' }
+            spend_unit: { type: string, description: 'Unit of the spend-control figures, e.g. credit; empty = unknown.' }
+            spend_limit: { type: string, description: 'The vendor''s raw spend-control limit string; empty = unknown.' }
+            spend_used: { type: string, description: 'The vendor''s raw spend-control used string; empty = unknown.' }
+            spend_remaining: { type: string, description: 'The vendor''s raw spend-control remaining string; empty = unknown.' }
+            spend_used_pct: { type: number, description: 'Used share of the spend-control limit, 0..100; -1 = unknown.' }
+            spend_reset_at: { type: [string, 'null'], format: date-time }
+            credit_status:
+              type: string
+              enum: ['', unlimited, has_credits, none]
+              description: The credit state the vendor's credit flags report; empty = unknown.
+            updated_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     VendorAccountCreateRequest:
