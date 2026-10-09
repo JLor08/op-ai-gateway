@@ -57,9 +57,12 @@ Self-hosted models remain fully visible/usable regardless of a token's vendor ac
    to all of the owner's active accounts under each account's own `model_prefix` (no
    per-token override, future accounts auto-included).
 4. Storage: **single JSON column** on `api_tokens` (not a junction table).
-5. Collision policy: with `all=false`, **reject at save time** any config whose effective
-   public names collide across the selected accounts (clear 400). With `all=true`, keep
-   today's behavior (first-wins + dedup; future accounts can't be pre-checked).
+5. Collision policy (**b1**): with `all=false`, **reject at save time** any config whose
+   effective public names collide across the selected accounts' current models (clear 400),
+   **and** keep a deterministic resolver backstop (first-wins by account order) for
+   collisions that only emerge later (a vendor ships a new model after save). With
+   `all=true`, keep today's behavior (first-wins + dedup; future accounts can't be
+   pre-checked).
 
 ## 5. Data model
 
@@ -78,7 +81,11 @@ New JSON column `vendor_provider_access` on `api_tokens`. Shape:
 - `all` (bool) — true ⇒ every active owner account, each under its own `model_prefix`;
   `accounts` ignored.
 - `accounts[]` — only meaningful when `all=false`. Each entry:
-  - `account_id` — must be an account the token owner owns.
+  - `account_id` — the **stable vendor-account id** (primary key), not the display name.
+    Survives account renames; display names are not guaranteed unique. Must be an account
+    the token owner owns. The UI resolves it to name/vendor for display (it loads the
+    account list anyway). A deleted account's id simply matches nothing (see §10).
+    The `prefix_override.value` is stored as a literal string, not a reference.
   - `prefix_override.enabled=false` ⇒ use the account's own `model_prefix`.
   - `enabled=true, value="<p>"` ⇒ use `<p>` as the prefix (replaces the account prefix).
   - `enabled=true, value=""` ⇒ **no prefix** (bare `upstream_model`).
@@ -146,7 +153,9 @@ Enforcement MUST be in both the listing and the routing path (the codebase's rec
   sets `Target.Model = req.Model` (public) and `Target.ProviderModel = m.UpstreamModel`
   (upstream) as today. This is the **reverse map** (client sends the token-prefixed name →
   strip → dispatch the raw slug). Keep it inside the resolver's vendor path, independent of
-  the generic `resolveModelOverride`.
+  the generic `resolveModelOverride`. The account iteration order is deterministic
+  (stable account order) so that a collision emerging after save (new upstream model)
+  resolves first-wins — the backstop half of decision 5 (b1).
 - Interaction with `model_override`: `resolveModelOverride` (`inference_handlers.go:223`)
   runs before `Resolve`, rewriting `req.Model`; the vendor reverse-map then applies to the
   already-rewritten name. An alias whose target isn't exposed by the token's vendor access
