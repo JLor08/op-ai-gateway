@@ -409,21 +409,35 @@ func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
 		t.Fatalf("upstreamPath(openai subscription) = %q, want /responses", got)
 	}
 
-	// An API-KEY OpenAI vendor target: Provider vendor_openai and a VendorAccountID
-	// (usage attribution) but Subscription=false and a translate (zero) ResponsesMode,
-	// exactly as the resolver's vendorAccountTarget builds it. It must keep the stock
-	// /v1/responses and still translate -- NOT route to the Codex backend. This is the
-	// M6a decoupling guard: keying on VendorAccountID here would have conflated it with
-	// a subscription target.
-	apiKey := routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_apikey", Subscription: false}
-	if path, mode := endpointModeFor(apiKey, "openai_responses"); path != "/v1/responses" || mode == routing.EndpointModePassthrough {
-		t.Fatalf("endpointModeFor(api-key openai vendor) = (%q, %q), want (/v1/responses, translate/non-passthrough)", path, mode)
+	// An API-KEY OpenAI vendor target, built by the REAL resolver for an
+	// openai_responses request: Provider vendor_openai and a VendorAccountID (usage
+	// attribution) but Subscription=false and ResponsesMode passthrough (lossless
+	// native passthrough to api.openai.com). It must use the stock /v1/responses --
+	// NOT the Codex backend's bare /responses. This is the M6a decoupling guard:
+	// keying on VendorAccountID here would have conflated it with a subscription
+	// target. upstreamPath agrees (the usage label is the path actually called).
+	apiKey := resolveAPIKeyOpenAITarget(t, newDispatchCipher(t), "openai_responses", "https://api.openai.com")
+	if apiKey.Subscription || apiKey.VendorAccountID == "" || apiKey.Provider != routing.ProviderVendorOpenAI {
+		t.Fatalf("resolver-built api-key target = %+v, want a non-subscription vendor_openai target carrying a VendorAccountID", apiKey)
 	}
-	// Because the mode is translate (not passthrough), upstreamPath resolves to the
-	// OpenAI-compatible client's chat-completions endpoint -- the request is
-	// TRANSLATED, never passed through to the Codex backend's /responses.
-	if got := upstreamPath(apiKey, "openai_responses"); got != "/v1/chat/completions" {
-		t.Fatalf("upstreamPath(api-key openai vendor) = %q, want /v1/chat/completions (translate)", got)
+	if path, mode := endpointModeFor(apiKey, "openai_responses"); path != "/v1/responses" || mode != routing.EndpointModePassthrough {
+		t.Fatalf("endpointModeFor(api-key openai vendor) = (%q, %q), want (/v1/responses, passthrough)", path, mode)
+	}
+	if got := upstreamPath(apiKey, "openai_responses"); got != "/v1/responses" {
+		t.Fatalf("upstreamPath(api-key openai vendor) = %q, want /v1/responses (passthrough, not the chat-completions translate path)", got)
+	}
+
+	// The same account reached over a chat request still TRANSLATES: the resolver
+	// leaves ResponsesMode zero on the target (asserted directly -- endpointModeFor
+	// only has a case for the Responses/Messages flavors, so it would say nothing
+	// about a chat target), so upstreamPath keeps the OpenAI-compatible client's
+	// chat-completions endpoint.
+	chat := resolveAPIKeyOpenAITarget(t, newDispatchCipher(t), "openai_chat_completions", "https://api.openai.com")
+	if chat.ResponsesMode != "" {
+		t.Fatalf("api-key openai vendor + chat: ResponsesMode = %q, want zero (translate)", chat.ResponsesMode)
+	}
+	if got := upstreamPath(chat, "openai_chat_completions"); got != "/v1/chat/completions" {
+		t.Fatalf("upstreamPath(api-key openai vendor, chat) = %q, want /v1/chat/completions (translate)", got)
 	}
 
 	// A self-hosted Responses target (no VendorAccountID, no Subscription) keeps

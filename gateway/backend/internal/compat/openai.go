@@ -182,7 +182,7 @@ func ParseOpenAIResponses(raw []byte) (inference.Request, error) {
 		}}, messages...)
 	}
 	req := inference.Request{
-		APIFlavor:   "openai_responses",
+		APIFlavor:   inference.APIFlavorOpenAIResponses,
 		Model:       input.Model,
 		Stream:      input.Stream,
 		Temperature: input.Temperature,

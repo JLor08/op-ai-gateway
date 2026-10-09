@@ -117,13 +117,13 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	var pf preflight
 	var handled bool
 	if model != "" {
-		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: "openai_responses", endpoint: endpointResponses, model: model, stream: stream})
+		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: inference.APIFlavorOpenAIResponses, endpoint: endpointResponses, model: model, stream: stream})
 		if handled {
 			return
 		}
 		// Native passthrough: if the resolved application supports Codex natively,
 		// proxy the raw body to the upstream /v1/responses instead of translating.
-		if s.tryProxyNative(w, r, &token, raw, "openai_responses", endpointResponses, pf) {
+		if s.tryProxyNative(w, r, &token, raw, inference.APIFlavorOpenAIResponses, endpointResponses, pf) {
 			return
 		}
 	}
@@ -133,7 +133,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		// above) and the translate path can't represent a rich Codex body. The
 		// usual cause is that the application serving this model doesn't have
 		// "native passthrough (Codex)" enabled, or it wasn't reachable.
-		slog.Warn("inference request rejected: invalid body", "path", r.URL.Path, "api_flavor", "openai_responses", "err", err,
+		slog.Warn("inference request rejected: invalid body", "path", r.URL.Path, "api_flavor", inference.APIFlavorOpenAIResponses, "err", err,
 			"hint", "for a Codex client, enable native passthrough (Codex) on the application serving this model; set log level to debug to see why passthrough did not apply")
 		writeRequestError(w, err)
 		return
@@ -142,7 +142,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		// The probe found no usable model but the strict parse succeeded anyway
 		// (see the comment above); run the gate now, against the parsed model,
 		// since it never ran above.
-		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: "openai_responses", endpoint: endpointResponses, model: req.Model, stream: req.Stream})
+		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: inference.APIFlavorOpenAIResponses, endpoint: endpointResponses, model: req.Model, stream: req.Stream})
 		if handled {
 			return
 		}

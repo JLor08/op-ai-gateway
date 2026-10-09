@@ -67,7 +67,7 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 // upstreamPath, before the mode lookup this function answers.
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
-	case "openai_responses":
+	case inference.APIFlavorOpenAIResponses:
 		// An OpenAI SUBSCRIPTION target (Milestone 5b) forwards to the ChatGPT
 		// backend, whose Responses endpoint is .../backend-api/codex/responses — the
 		// Codex CLI's own path, NOT the OpenAI-platform /v1/responses. The Endpoint
@@ -974,7 +974,7 @@ func parsePassthroughUsage(apiFlavor string, body []byte) inference.Usage {
 func mergePassthroughUsage(dst *inference.Usage, apiFlavor string, body []byte) {
 	for _, payload := range jsonPayloads(body) {
 		switch apiFlavor {
-		case "openai_responses":
+		case inference.APIFlavorOpenAIResponses:
 			mergeResponsesUsage(dst, payload)
 		case "anthropic_messages":
 			mergeAnthropicUsage(dst, payload)

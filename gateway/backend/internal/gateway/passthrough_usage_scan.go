@@ -837,7 +837,7 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 	switch apiFlavor {
 	case "anthropic_messages":
 		return probe.Type == "content_block_delta"
-	case "openai_responses":
+	case inference.APIFlavorOpenAIResponses:
 		switch probe.Type {
 		case "response.output_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta":
 			return true
@@ -905,7 +905,7 @@ func isTerminalUsageFrame(apiFlavor string, payload []byte) bool {
 	switch apiFlavor {
 	case "anthropic_messages":
 		return probe.Type == "message_delta" || probe.Type == "message"
-	case "openai_responses":
+	case inference.APIFlavorOpenAIResponses:
 		return probe.Type == "response.completed"
 	}
 	return false

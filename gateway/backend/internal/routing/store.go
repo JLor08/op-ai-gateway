@@ -6,6 +6,7 @@ package routing
 import (
 	"context"
 	"fmt"
+	"op-ai-gateway/internal/inference"
 	"strings"
 	"time"
 )
@@ -2341,7 +2342,7 @@ func applicationHasAPIFlavor(app Application, apiFlavor string) bool {
 // endpoint.
 func applicationServesEndpoint(app Application, fineFlavor string) bool {
 	switch fineFlavor {
-	case "openai_responses":
+	case inference.APIFlavorOpenAIResponses:
 		if !applicationHasAPIFlavor(app, APIFlavorOpenAI) {
 			return false
 		}
