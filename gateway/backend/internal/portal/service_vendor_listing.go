@@ -16,6 +16,12 @@ import (
 // /api/v0/models) and the dashboard's route table (vendorDashboardRoutes) both
 // go through it, so which accounts and models they surface cannot drift.
 //
+// Only the accounts the TOKEN may use are listed (token.VendorAccess, strict by
+// default: none unless the token opts in) and each is named under the
+// token-effective prefix (routing.TokenVendorPrefix, the same helper the resolver
+// uses, so a listed name is exactly a routable name). Downstream consumers key on
+// the relabeled GatewayModel.
+//
 // Returns nil (nothing to overlay) unless the vendor_accounts_enabled master flag
 // is on, the principal is a USER (a service token has no UserID and owns no vendor
 // accounts), and a routing store is wired. Best-effort and FAIL-OPEN like the
@@ -35,10 +41,18 @@ func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) 
 		if acc.Status != routing.VendorAccountStatusActive {
 			continue
 		}
+		prefix, allowed := routing.TokenVendorPrefix(token.VendorAccess, acc)
+		if !allowed {
+			continue
+		}
 		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
 		if err != nil {
 			continue
 		}
+		// Token-effective public names (prefix + upstream model). With All or no
+		// override the prefix is the account's own, so this equals the stored
+		// GatewayModel and the listing is unchanged.
+		models, _ = relabelVendorModels(models, prefix)
 		out = append(out, vendorAccountModels{Account: acc, Models: models})
 	}
 	return out
