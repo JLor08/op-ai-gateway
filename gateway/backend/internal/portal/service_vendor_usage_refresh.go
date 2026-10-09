@@ -29,7 +29,9 @@ const (
 	// over the passive scrape's).
 	VendorUsageRefreshOK = "ok"
 	// VendorUsageRefreshFresh: the last active pull was younger than the requested
-	// maxAge, so the vendor was NOT asked and the stored snapshot is answered as it is.
+	// maxAge, so the vendor was NOT asked and the stored snapshot is answered as it
+	// is. That attempt may have failed, so the snapshot can be older than the TTL (or
+	// absent): "fresh" says the pull was skipped, not that the data is current.
 	VendorUsageRefreshFresh = "fresh"
 	// VendorUsageRefreshUnverifiable: nothing usable could be had (no usable token,
 	// the vendor unreachable or answering with an error or an unusable body, or the
@@ -57,7 +59,7 @@ func vendorUsageRefreshDetail(status string) string {
 	case VendorUsageRefreshOK:
 		return "usage refreshed from the vendor"
 	case VendorUsageRefreshFresh:
-		return "usage was refreshed recently; the stored snapshot is current"
+		return "usage was refreshed recently; the stored snapshot was not re-fetched"
 	case VendorUsageRefreshUnsupported:
 		return "usage refresh is only available for OpenAI subscription accounts"
 	default:
@@ -86,8 +88,10 @@ func (t *vendorUsagePullTracker) record(accountID string, at time.Time) {
 }
 
 // within reports whether accountID's last active pull is STRICTLY younger than
-// maxAge at now. A non-positive maxAge is never fresh (the manual refresh), and an
-// account with no recorded pull is not fresh either.
+// maxAge at now. A non-positive maxAge is never fresh (the manual refresh), an
+// account with no recorded pull is not fresh either, and neither is a pull that
+// lies in the future of now: the wall clock stepped backward since (an NTP
+// correction), and a negative age must not keep every later call "fresh".
 func (t *vendorUsagePullTracker) within(accountID string, now time.Time, maxAge time.Duration) bool {
 	if maxAge <= 0 {
 		return false
@@ -95,7 +99,8 @@ func (t *vendorUsagePullTracker) within(accountID string, now time.Time, maxAge 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	last, ok := t.last[accountID]
-	return ok && now.Sub(last) < maxAge
+	age := now.Sub(last)
+	return ok && age >= 0 && age < maxAge
 }
 
 // forget drops accountID's entry (the account was deleted).
@@ -123,10 +128,10 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 // is strictly younger, the vendor is not asked: the stored snapshot is answered
 // with status VendorUsageRefreshFresh. A manual refresh passes 0 and always asks.
 // The lazy path's default is VendorUsageLazyTTL; the caller (the HTTP handler)
-// chooses. The last-pull time is held in memory per account: an
-// attempt counts whether the vendor answered or not (so a failing vendor is not
-// hammered on every view), while a refresh that never reached it (no usable token)
-// does not. Two concurrent calls for the same account may both ask the vendor; the
+// chooses. The last-pull time is held in memory per account: an attempt counts
+// whether the vendor answered or not (so a failing vendor is not hammered on every
+// view), while a refresh that never reached it (no usable token, or a context that
+// ended before the vendor answered) does not. Two concurrent calls for the same account may both ask the vendor; the
 // merged write is idempotent.
 //
 // Statuses (VendorUsageRefreshResult.Status):

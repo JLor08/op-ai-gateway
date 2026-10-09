@@ -6,6 +6,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/vendorauth"
@@ -28,6 +29,12 @@ import (
 // both read it).
 func setUsageClock(svc *Service, now time.Time) {
 	svc.clock = func() time.Time { return now }
+}
+
+// usagePullRecorded reports whether the tracker holds a pull for id that is fresh
+// at the service clock's now (the pull time is the clock's reading when it ran).
+func usagePullRecorded(svc *Service, id string) bool {
+	return svc.vendorUsagePulls.within(id, svc.clock(), VendorUsageLazyTTL)
 }
 
 // usagePulled is the snapshot the usage fake answers in these tests.
@@ -235,8 +242,11 @@ func TestRefreshVendorAccountUsageSkipsTheVendorWhileTheLastPullIsFresh(t *testi
 	// One minute later: fresh, the stored snapshot, no vendor call.
 	setUsageClock(svc, discoveryTestNow.Add(time.Minute))
 	usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL)
-	if err != nil || res.Status != VendorUsageRefreshFresh || res.Detail == "" {
-		t.Fatalf("second lazy call = %+v, err = %v, want fresh with a detail", res, err)
+	if err != nil || res.Status != VendorUsageRefreshFresh || !strings.Contains(res.Detail, "not re-fetched") {
+		t.Fatalf("second lazy call = %+v, err = %v, want fresh whose detail says the snapshot was not re-fetched", res, err)
+	}
+	if strings.Contains(res.Detail, "current") {
+		t.Fatalf("fresh detail = %q, must not claim the snapshot is current (the last attempt may have failed)", res.Detail)
 	}
 	if usage == nil || usage.FiveHourPct != 23 || !usage.UpdatedAt.Equal(discoveryTestNow) {
 		t.Fatalf("fresh usage = %+v, want the stored snapshot", usage)
@@ -476,6 +486,117 @@ func accountRow(t *testing.T, svc *Service, dto VendorAccountDTO) routing.Vendor
 	return row
 }
 
+// A pull that never reached the vendor because the request's context was already
+// dead (a connect's shared budget ran out during the model list, a user navigating
+// away mid-pull) is NOT a recorded pull: it answers unverifiable, and the next lazy
+// call asks the vendor instead of answering "fresh" with no snapshot for the TTL.
+func TestRefreshVendorAccountUsageDeadContextIsNotARecordedPull(t *testing.T) {
+	// cancelDuring: the context ends while the fetch is in flight (the real fetcher
+	// answers Unverifiable then); cancelBefore: it was dead before the call.
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers, id string) (VendorUsageRefreshResult, error)
+	}{
+		{"cancelled during the fetch", func(t *testing.T, svc *Service, _ *fakeVendorDiscoverers, id string) (VendorUsageRefreshResult, error) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			inner := svc.vendorDiscovery.discoverers.OpenAIUsage
+			defer func() { svc.vendorDiscovery.discoverers.OpenAIUsage = inner }()
+			svc.vendorDiscovery.discoverers.OpenAIUsage = func(c context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+				cancel() // the budget runs out while the vendor is being asked
+				usage, _ := inner(c, client, accessToken, accountID)
+				return usage, vendorauth.DiscoveryUnverifiable
+			}
+			_, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), id, VendorUsageLazyTTL)
+			return res, err
+		}},
+		{"cancelled before the call", func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers, id string) (VendorUsageRefreshResult, error) {
+			fake.failUsage(unknownUsage()) // a dead context makes the real fetcher answer Unverifiable
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), id, VendorUsageLazyTTL)
+			return res, err
+		}},
+		{"deadline exceeded", func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers, id string) (VendorUsageRefreshResult, error) {
+			fake.failUsage(unknownUsage())
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			_, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), id, VendorUsageLazyTTL)
+			return res, err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.okUsage(usagePulled())
+			acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+
+			res, err := tc.run(t, svc, fake, acc.ID)
+			if err != nil || res.Status != VendorUsageRefreshUnverifiable {
+				t.Fatalf("result = %+v, err = %v, want unverifiable / nil", res, err)
+			}
+			if usagePullRecorded(svc, acc.ID) {
+				t.Fatal("a pull that never reached the vendor was recorded")
+			}
+			if _, found := storedUsage(t, routeStore, acc.ID); found {
+				t.Fatal("a usage snapshot was stored by a dead-context pull")
+			}
+
+			// The next lazy call (live context, vendor answering again) pulls: it is
+			// neither "fresh" nor snapshot-less for the TTL.
+			fake.okUsage(usagePulled())
+			before := len(fake.usageRecorded())
+			usage, res, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, VendorUsageLazyTTL)
+			if err != nil || res.Status != VendorUsageRefreshOK || usage == nil {
+				t.Fatalf("next lazy call = %+v / %+v, err = %v, want ok with usage (it must pull again)", usage, res, err)
+			}
+			if after := len(fake.usageRecorded()); after != before+1 {
+				t.Fatalf("usage fetcher calls = %d -> %d, want the next lazy call to ask the vendor once", before, after)
+			}
+		})
+	}
+
+	t.Run("a live context still records an unverifiable attempt", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.failUsage(unknownUsage())
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+		if _, res, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshUnverifiable {
+			t.Fatalf("result = %+v, err = %v, want unverifiable / nil", res, err)
+		}
+		if !usagePullRecorded(svc, acc.ID) {
+			t.Fatal("a real (vendor-answered) unverifiable attempt was not recorded")
+		}
+	})
+}
+
+// A wall clock that steps backward after a pull (an NTP correction) must not make
+// every later lazy call "fresh" for as long as the clock stays behind: a negative
+// age is stale, so the call pulls.
+func TestRefreshVendorAccountUsageBackwardClockStepPullsAgain(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okUsage(usagePulled())
+	acc := connectedSubscription(t, svc, routeStore, routing.VendorOpenAI, "")
+	ctx := context.Background()
+
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshOK {
+		t.Fatalf("first call = %+v, err = %v, want ok", res, err)
+	}
+	setUsageClock(svc, discoveryTestNow.Add(-time.Hour))
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshOK {
+		t.Fatalf("lazy call after a backward clock step = %+v, err = %v, want ok (a negative age is stale)", res, err)
+	}
+	if n := len(fake.usageRecorded()); n != 2 {
+		t.Fatalf("usage fetcher calls = %d, want 2", n)
+	}
+	// A forced refresh asks whatever the clock did.
+	setUsageClock(svc, discoveryTestNow.Add(-2*time.Hour))
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0); err != nil || res.Status != VendorUsageRefreshOK {
+		t.Fatalf("forced call after a backward clock step = %+v, err = %v, want ok", res, err)
+	}
+	if n := len(fake.usageRecorded()); n != 3 {
+		t.Fatalf("usage fetcher calls = %d, want 3", n)
+	}
+}
+
 // A token that cannot be had is the models refresh's fail-soft answer, not an
 // error: unverifiable with the credential-free note as the detail, no vendor call
 // and the stored snapshot answered. The vendor was never asked, so it is not
@@ -639,6 +760,25 @@ func TestVendorUsagePullTracker(t *testing.T) {
 	}
 	if tr.within("va_2", at, time.Minute) {
 		t.Fatal("another account reads as fresh")
+	}
+	// A wall clock that stepped BACKWARD since the pull (an NTP correction) gives a
+	// negative age: that is stale, never fresh, and a non-positive maxAge (the
+	// manual refresh) bypasses the TTL whatever the age.
+	for _, tc := range []struct {
+		name   string
+		now    time.Time
+		maxAge time.Duration
+	}{
+		{"one second back", at.Add(-time.Second), time.Minute},
+		{"an hour back", at.Add(-time.Hour), time.Minute},
+		{"one second back, force", at.Add(-time.Second), 0},
+		{"one second back, negative maxAge", at.Add(-time.Second), -time.Minute},
+		{"same instant, force", at, 0},
+		{"later, force", at.Add(time.Second), 0},
+	} {
+		if tr.within("va_1", tc.now, tc.maxAge) {
+			t.Errorf("%s: within = true, want false (a negative age is stale; maxAge <= 0 always bypasses)", tc.name)
+		}
 	}
 	tr.forget("va_1")
 	if tr.within("va_1", at, time.Minute) {

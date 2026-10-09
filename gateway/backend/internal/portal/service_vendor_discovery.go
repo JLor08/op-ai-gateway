@@ -443,14 +443,20 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 // snapshot or a failed write -- each logged at Debug with the account id (never a
 // token) and leaving the stored snapshot exactly as it was.
 //
-// Once the vendor was asked, whatever it answered, the attempt is recorded as the
-// account's last active pull (vendorUsagePulls), which the lazy refresh's TTL reads.
+// Once the vendor was actually reached, whatever it answered, the attempt is
+// recorded as the account's last active pull (vendorUsagePulls), which the lazy
+// refresh's TTL reads. A context that ended during or before the fetch means the
+// vendor may never have been reached (the real fetcher answers Unverifiable on a dead
+// context), so nothing is recorded: a pull that did not happen must not make the
+// next lazy call answer "fresh" without a snapshot for the whole TTL.
 func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) string {
 	if !hasActiveVendorUsagePull(acc) || ts.AccessToken == "" {
 		return VendorUsageRefreshUnsupported
 	}
 	usage, status := s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
-	s.vendorUsagePulls.record(acc.ID, s.clock())
+	if ctx.Err() == nil {
+		s.vendorUsagePulls.record(acc.ID, s.clock())
+	}
 	if status != vendorauth.DiscoveryOK {
 		slog.Debug("vendor account usage fetch was unverifiable; the stored usage is kept", "account", acc.ID)
 		return VendorUsageRefreshUnverifiable
