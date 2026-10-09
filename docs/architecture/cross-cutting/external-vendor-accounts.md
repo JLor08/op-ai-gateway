@@ -357,12 +357,15 @@ matrix:
 
 The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted/shared path — when the module flag is off, the principal has no user
-id (a **service token**; and a token the owner has not opted in enumerates no
-account at all, §11), a **server-override** is set, the request is
+id (a **service token**), a **server-override** is set, the request is
 **capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
 flavor is **images** (`openai_images`). That the resolver and the listing overlay
 agree on what each account serves is what makes the "served-flavors parity"
 between dispatch and the model listing (§6.7) meaningful.
+
+A user token the owner has **not** opted in does not skip the branch: it runs, but
+`TokenVendorPrefix` denies every account (§11.2), so it enumerates nothing and the
+request falls through to the self-hosted/shared path all the same.
 
 `Target` carries four vendor fields, all empty/false for an ordinary AI-server
 target:
@@ -1235,8 +1238,9 @@ requested under. A row carries both names: `gateway_model` is `model_prefix` +
 the vendor's slug, what clients list and request, and `upstream_model` is the
 bare slug, what the vendor is sent. With the prefix `chatgpt/`, the vendor's
 `gpt-6-luna` is advertised and requested as `chatgpt/gpt-6-luna`, and the
-resolver (§4) matches on the first and sets the target's `ProviderModel` to the
-second. The prefix is applied wherever rows are written: to the creation seed, to
+resolver (§4) matches on the effective public name (equal to the stored
+`gateway_model` for the native prefix, §11.2) and sets the target's
+`ProviderModel` to the second. The prefix is applied wherever rows are written: to the creation seed, to
 every discovery, and on a PATCH that carries `model_prefix`, which **re-labels the
 existing rows** without asking the vendor again. Re-sending the stored prefix
 repairs rows a failed re-label left behind. Two rows whose labelled ids collide

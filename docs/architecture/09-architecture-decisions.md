@@ -3119,7 +3119,6 @@ default-off.
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Configuration & Environment Variables](reference/config-env.md).
 
-
 ## ADR-050 — Vendor-account access is a per-token opt-in, enforced in listing and routing through one prefix helper
 **Context:** a vendor account ([ADR-049](#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted))
 is personal, but until now **every** API token its owner had ever issued could route

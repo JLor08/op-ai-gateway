@@ -161,16 +161,17 @@ A **user** API token also carries a vendor-account ("Anbieter") access policy,
 `vendor_access`: which of the token owner's own
 [vendor accounts](#vendor-accounts-anbieter) the token may use, and under which
 model-name prefix. It is writable on `POST /api/portal/tokens` and
-`PATCH /api/portal/tokens/{id}` and readable on `GET /api/portal/tokens`. A
-**service** token has no such field: it owns no vendor accounts, so there is
+`PATCH /api/portal/tokens/{id}` and returned wherever a token DTO is: on
+`GET /api/portal/tokens`, in the create response (`{token, secret}`) and in the
+update response. A **service** token has no such field: it owns no vendor accounts, so there is
 nothing to grant.
 
 | Field | Shape | Meaning |
 |---|---|---|
 | `vendor_access` | object, or absent | **Strict opt-in.** Absent on create is the default — the token has **no** vendor access — and a token with no access reads back with the field omitted. On update, absent **keeps** the stored policy; a present value **replaces it wholesale**, and an empty one (`{"all": false, "accounts": []}`) resets to the default. |
-| `vendor_access.all` | bool | `true` grants **every active account** the owner has, future ones included, each under its **own** `model_prefix`; `accounts` is then ignored (a read still returns it, as an empty array). |
+| `vendor_access.all` | bool | `true` grants **every active account** the owner has, future ones included, each under its **own** `model_prefix`; `accounts` is then ignored for access and is not validated, but the server stores whatever was sent and a read returns what was stored (an empty array if none was sent). |
 | `vendor_access.accounts` | array of `{account_id, prefix_override?}` | With `all` false, only these accounts; an empty list means no vendor access. A read always returns an array, never `null`. |
-| `vendor_access.accounts[].account_id` | string | The id of one of the **owner's own** accounts, at most once per list. |
+| `vendor_access.accounts[].account_id` | string | The id of one of the **owner's own** accounts, at most once per list; both are checked at save when `all` is false. |
 | `vendor_access.accounts[].prefix_override` | `{enabled: bool, value: string}`, or absent | Replaces the account's `model_prefix` for **this token** only while `enabled` is true (an absent object, or `enabled: false`, uses the account's own prefix; the client should omit the object rather than send `enabled: false`). `enabled` with an **empty `value`** serves the account's models under their original vendor names, with **no prefix**. A non-empty value follows the `model_prefix` rule (at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +`, no `..`). |
 
 The policy is **enforced**, not just stored: the token's model listings
@@ -186,12 +187,14 @@ Two stable error codes, both `400`, apply to create and update:
 
 | Code | Status | Meaning |
 |---|---|---|
-| `portal.token_vendor_access_invalid` | 400 | An `account_id` is unknown or not owned by the caller (the same answer for both), appears more than once, or an **enabled** override `value` is not a valid prefix. |
+| `portal.token_vendor_access_invalid` | 400 | With `all` false: an `account_id` is unknown or not owned by the caller (the same answer for both), appears more than once, or an **enabled** override `value` is not a valid prefix. Not raised for `all` true, which is stored without per-account validation. |
 | `portal.token_vendor_access_conflict` | 400 | With `all` false, two of the selected accounts would offer the **same public model name** under their effective prefixes (for example two accounts of one vendor, both without a prefix, both serving the same model). Give one of them a distinct override. Not raised for `all` true. |
 
 Neither code is a read failure: an infrastructure error while reading the
-caller's accounts or their models is a `500`, not a `400`. The collision check
-sees each selected account's **current** model list, so a collision that appears
+caller's accounts is a `500`, not a `400`. A failure to read one selected
+account's models is different: it is logged and **skipped** (fail-open), so the
+collision check may miss that account and the routing backstop below covers it.
+The collision check sees each selected account's **current** model list, so a collision that appears
 only later (a vendor ships a model after the token was saved) is not caught here;
 routing resolves it deterministically instead (first account in id order wins).
 
