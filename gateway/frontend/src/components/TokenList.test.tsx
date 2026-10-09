@@ -14,6 +14,7 @@ import {
   type PortalToken,
   type ProjectRef,
   type ServerModelOption,
+  type VendorAccount,
 } from '../api';
 
 const models = [
@@ -65,6 +66,33 @@ function makeServer(overrides: Partial<PortalServer> = {}): PortalServer {
   };
 }
 
+function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
+  return {
+    id: 'acc_a',
+    vendor: 'openai',
+    auth_type: 'api_key',
+    name: 'Work OpenAI',
+    status: 'active',
+    model_prefix: 'work/',
+    api_key_set: true,
+    subscription_connected: false,
+    models: [],
+    created_at: '2026-08-12T12:00:00Z',
+    updated_at: '2026-08-12T12:00:00Z',
+    ...overrides,
+  };
+}
+
+const defaultVendorAccounts: VendorAccount[] = [
+  makeVendorAccount({ id: 'acc_a', name: 'Work OpenAI', model_prefix: 'work/' }),
+  makeVendorAccount({
+    id: 'acc_b',
+    vendor: 'anthropic',
+    name: 'Team Claude',
+    model_prefix: 'team/',
+  }),
+];
+
 function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
   return {
     id: 'tok_1',
@@ -110,6 +138,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // redirect's fallback-picker test, which needs a group entry (is_group)
     // alongside a plain model in the SAME list (Task 8).
     models?: ModelOption[];
+    // The vendor-accounts master flag (system setting vendor_accounts_enabled):
+    // off by default, like the TokenList prop. vendorAccounts is the caller's
+    // OWN account list api.vendorAccounts() resolves with.
+    vendorAccountsEnabled?: boolean;
+    vendorAccounts?: VendorAccount[];
   }) {
     const created = opts.created ?? [];
     const tokens = opts.tokens ?? [];
@@ -153,6 +186,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       myProjects: vi.fn(async () => opts.myProjects ?? defaultProjects),
       // The server-override picker's filtered-model fetch (Task 6, step 2).
       serverModels: vi.fn(async (serverId: string) => opts.serverModelsByServer?.[serverId] ?? []),
+      // The vendor-access section's account list (the caller's own accounts).
+      // Only fetched while vendorAccountsEnabled is on.
+      vendorAccounts: vi.fn(async () => ({ data: opts.vendorAccounts ?? defaultVendorAccounts })),
     };
 
     render(
@@ -165,6 +201,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           role="admin"
           models={opts.models ?? models}
           servers={servers}
+          vendorAccountsEnabled={opts.vendorAccountsEnabled}
         />
       </ToastProvider>,
     );
@@ -539,6 +576,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         serverModels: vi.fn(async () => []),
         updateChatSettings: vi.fn(),
         updateToken: vi.fn(),
+        vendorAccounts: vi.fn(async () => ({ data: [] })),
       };
 
       render(
@@ -1003,6 +1041,314 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       expect(screen.getByLabelText(t.tokenUnknownFallback)).toHaveValue(unavailable);
       expect(screen.getAllByTestId('searchable-select-unavailable')).toHaveLength(3);
+    });
+  });
+
+  describe(`TokenList vendor-account access (per-token provider access) [${locale}]`, () => {
+    // The last updateToken call's request body.
+    function lastUpdateBody(fakeApi: { updateToken: unknown }): Record<string, unknown> {
+      const calls = (fakeApi.updateToken as { mock: { calls: unknown[][] } }).mock.calls;
+      return calls[calls.length - 1][1] as Record<string, unknown>;
+    }
+
+    // The per-account override group (the toggle + prefix field of one opted-in
+    // account), named by the account.
+    function accountGroup(name: string) {
+      return screen.getByRole('group', { name });
+    }
+
+    it('hides the whole section, and never fetches accounts, while the flag is off', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      await waitFor(() => expect(fakeApi.myProjects).toHaveBeenCalled());
+
+      expect(screen.queryByText(t.tokenVendorAccessLabel)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.tokenVendorAccessAll)).not.toBeInTheDocument();
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+
+      // The flag-off create body carries no vendor_access value (JSON drops the
+      // undefined key): the strict default.
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'No VA' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toBeUndefined();
+    });
+
+    it("with the flag on, shows the all switch and the caller's own accounts", async () => {
+      const { fakeApi } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+
+      expect(screen.getByText(t.tokenVendorAccessLabel)).toBeInTheDocument();
+      expect(screen.getByRole('checkbox', { name: t.tokenVendorAccessAll })).not.toBeChecked();
+      expect(await screen.findByRole('checkbox', { name: 'Work OpenAI' })).not.toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'Team Claude' })).not.toBeChecked();
+      // No account is opted in yet, so no override control shows.
+      expect(screen.queryByLabelText(t.tokenVendorAccessPrefixToggle)).not.toBeInTheDocument();
+    });
+
+    it('creates with the strict default (no accounts) when nothing is picked', async () => {
+      const { fakeApi, created } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      await screen.findByRole('checkbox', { name: 'Work OpenAI' });
+
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'Strict' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toEqual({ all: false, accounts: [] });
+    });
+
+    it('creates with an opted-in account and a prefix override', async () => {
+      const { fakeApi, created } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+
+      // Opting an account in reveals its override toggle; the prefix field only
+      // appears once the toggle is on.
+      const group = accountGroup('Work OpenAI');
+      expect(within(group).queryByLabelText(t.tokenVendorAccessPrefixLabel)).toBeNull();
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'x/' },
+      });
+
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'With VA' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_a', prefix_override: { enabled: true, value: 'x/' } }],
+      });
+    });
+
+    it('omits prefix_override entirely for an opted-in account whose override is off', async () => {
+      const { fakeApi, created } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Team Claude' }));
+
+      // Typing then switching the override off again must not leak the value.
+      const group = accountGroup('Work OpenAI');
+      const toggle = within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle });
+      fireEvent.click(toggle);
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'leaky/' },
+      });
+      fireEvent.click(toggle);
+
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'Off' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_a' }, { account_id: 'acc_b' }],
+      });
+    });
+
+    it('sends an enabled override with an empty value as "no prefix"', async () => {
+      const { fakeApi, created } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      const group = accountGroup('Work OpenAI');
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      // The empty-value hint explains what an empty prefix means.
+      expect(within(group).getByText(t.tokenVendorAccessPrefixEmptyHint)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'Bare' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_a', prefix_override: { enabled: true, value: '' } }],
+      });
+    });
+
+    it('the all switch hides the account list and sends { all: true } only', async () => {
+      const { fakeApi, created } = renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      // A prior opt-in must not leak into the all=true body.
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenVendorAccessAll }));
+
+      expect(screen.getByText(t.tokenVendorAccessAllHint)).toBeInTheDocument();
+      expect(screen.queryByRole('checkbox', { name: 'Work OpenAI' })).not.toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'All' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0].vendor_access).toEqual({ all: true });
+    });
+
+    it('shows the empty state when the caller has no vendor accounts', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: [] });
+      openCreate();
+      expect(await screen.findByText(t.tokenVendorAccessNone)).toBeInTheDocument();
+    });
+
+    it('blocks the save while an enabled override prefix is malformed', async () => {
+      renderTokenList({ vendorAccountsEnabled: true });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      const group = accountGroup('Work OpenAI');
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'bad prefix?' },
+      });
+
+      expect(screen.getByRole('button', { name: t.tokenCreate })).toBeDisabled();
+      expect(within(group).getByText(t.errorVendorAccountModelPrefixInvalid)).toBeInTheDocument();
+
+      // Switching the override off lifts the block: the value is no longer sent.
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      expect(screen.getByRole('button', { name: t.tokenCreate })).toBeEnabled();
+    });
+
+    it("hydrates the edit form from the token's vendor_access and round-trips it", async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [
+          makeToken({
+            vendor_access: {
+              all: false,
+              accounts: [
+                { account_id: 'acc_a', prefix_override: { enabled: true, value: 'p/' } },
+                { account_id: 'acc_b' },
+              ],
+            },
+          }),
+        ],
+      });
+      openEdit();
+
+      expect(await screen.findByRole('checkbox', { name: 'Work OpenAI' })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'Team Claude' })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: t.tokenVendorAccessAll })).not.toBeChecked();
+      const work = accountGroup('Work OpenAI');
+      expect(
+        within(work).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      ).toBeChecked();
+      expect(within(work).getByLabelText(t.tokenVendorAccessPrefixLabel)).toHaveValue('p/');
+      const team = accountGroup('Team Claude');
+      expect(
+        within(team).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      ).not.toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [
+          { account_id: 'acc_a', prefix_override: { enabled: true, value: 'p/' } },
+          { account_id: 'acc_b' },
+        ],
+      });
+    });
+
+    it('hydrates an all=true token with the switch on and sends { all: true } back', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeToken({ vendor_access: { all: true, accounts: [] } })],
+      });
+      openEdit();
+
+      expect(await screen.findByRole('checkbox', { name: t.tokenVendorAccessAll })).toBeChecked();
+      expect(screen.queryByRole('checkbox', { name: 'Work OpenAI' })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({ all: true });
+    });
+
+    it('lets an edit narrow all=true back down to an explicit account list', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeToken({ vendor_access: { all: true, accounts: [] } })],
+      });
+      openEdit();
+      fireEvent.click(await screen.findByRole('checkbox', { name: t.tokenVendorAccessAll }));
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Team Claude' }));
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_b' }],
+      });
+    });
+
+    it('drops an opt-in for an account that no longer exists, so the save is not rejected', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [
+          makeToken({
+            vendor_access: {
+              all: false,
+              accounts: [{ account_id: 'acc_deleted' }, { account_id: 'acc_a' }],
+            },
+          }),
+        ],
+      });
+      openEdit();
+      expect(await screen.findByRole('checkbox', { name: 'Work OpenAI' })).toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_a' }],
+      });
+    });
+
+    it('keeps the stored opt-ins when the account list could not be loaded', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeToken({ vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] } })],
+      });
+      fakeApi.vendorAccounts.mockRejectedValue(new Error('network down'));
+      openEdit();
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+
+      // Without a loaded list nothing can be judged stale: do not prune.
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_a' }],
+      });
+    });
+
+    it.each([
+      ['portal.token_vendor_access_invalid', t.errorTokenVendorAccessInvalid],
+      ['portal.token_vendor_access_conflict', t.errorTokenVendorAccessConflict],
+    ])('shows a specific toast on a %s 400', async (code, label) => {
+      const { fakeApi } = renderTokenList({ vendorAccountsEnabled: true });
+      fakeApi.createToken.mockRejectedValueOnce(new PortalApiError(400, code, 'raw'));
+      openCreate();
+      await screen.findByRole('checkbox', { name: 'Work OpenAI' });
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'T' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+      expect(await screen.findByText(`${code}: ${label}`)).toBeInTheDocument();
+    });
+
+    it('leaves the stored vendor access untouched on an edit while the flag is off', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] } })],
+      });
+      openEdit();
+      await waitFor(() => expect(fakeApi.myProjects).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi)).not.toHaveProperty('vendor_access');
     });
   });
 

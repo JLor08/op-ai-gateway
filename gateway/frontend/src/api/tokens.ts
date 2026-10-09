@@ -14,6 +14,26 @@ export type ModelOverrideEntry = {
   hide_target: boolean;
 };
 
+// One entry of a token's vendor-account access list. `prefix_override` is OFF
+// when absent or when `enabled` is not true; ON with value "" means "no prefix"
+// (the account's models are offered under their bare original names), ON with a
+// value replaces the account's own model_prefix for this token. On write, OMIT
+// `prefix_override` entirely when the override is off (never send enabled:false).
+export type VendorAccessAccountDTO = {
+  account_id: string;
+  prefix_override?: { enabled: boolean; value: string };
+};
+
+// A token's per-vendor-account ("Anbieter") access. `all` = every account the
+// owner has (also future ones) under its own prefix; otherwise `accounts` is the
+// explicit opt-in list. A read ALWAYS carries `accounts` as an array (empty when
+// `all` is true); a write may omit it when `all` is true. A token that omits
+// vendor_access on create has no vendor access.
+export type VendorAccessDTO = {
+  all: boolean;
+  accounts?: VendorAccessAccountDTO[];
+};
+
 export type PortalToken = {
   id: string;
   name: string;
@@ -61,6 +81,9 @@ export type PortalToken = {
   // project no longer exists) — mirrors portal.Service.PortalToken.
   project_id?: string;
   project_name?: string;
+  // Vendor-account access (see VendorAccessDTO); the backend always returns it
+  // on a read.
+  vendor_access?: VendorAccessDTO;
 };
 
 export type CreateTokenRequest = {
@@ -84,6 +107,8 @@ export type CreateTokenRequest = {
   // Optional project attribution (§6); "" = no project. Membership-checked
   // server-side (403 token.project_not_member if the caller isn't a member).
   project_id?: string;
+  // Vendor-account access; omitted = strict default (no vendor access).
+  vendor_access?: VendorAccessDTO;
 };
 
 export type CreateTokenResponse = {
@@ -111,6 +136,8 @@ export type UpdateTokenRequest = {
   // nil (omitted) = keep the current project attribution; "" = clear it;
   // a project id = reassign (membership-checked server-side).
   project_id?: string;
+  // Omitted = keep the stored vendor access; present = replace it wholesale.
+  vendor_access?: VendorAccessDTO;
 };
 
 export function tokensApi(fetcher: Fetcher) {

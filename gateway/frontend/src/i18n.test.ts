@@ -458,6 +458,30 @@ describe('server override i18n keys', () => {
   });
 });
 
+describe('token vendor access i18n keys', () => {
+  it('defines the vendor-access form + error-code keys in de and en', () => {
+    const keys = [
+      'tokenVendorAccessLabel',
+      'tokenVendorAccessNote',
+      'tokenVendorAccessAll',
+      'tokenVendorAccessAllHint',
+      'tokenVendorAccessAccountsLabel',
+      'tokenVendorAccessPrefixToggle',
+      'tokenVendorAccessPrefixLabel',
+      'tokenVendorAccessPrefixEmptyHint',
+      'tokenVendorAccessNone',
+      'errorTokenVendorAccessInvalid',
+      'errorTokenVendorAccessConflict',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('token rotate i18n keys', () => {
   it('defines the rotate keys in de and en', () => {
     const keys = [
