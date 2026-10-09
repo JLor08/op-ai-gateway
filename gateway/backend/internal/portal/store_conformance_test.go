@@ -794,6 +794,12 @@ func TestTokenRepositoryConformance(t *testing.T) {
 		}
 	}
 
+	// Two distinct vendor-access policies (an explicit opted-in account with a
+	// prefix override, then "all"): the create round trip and the editable
+	// UpdateTokenMetadata path must agree on both drivers.
+	vendorAccessOne := store.EncodeVendorAccess(auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_tc", OverrideEnabled: true, OverridePrefix: "tc/"}}})
+	vendorAccessTwo := store.EncodeVendorAccess(auth.VendorAccess{All: true})
+
 	forEachTokenStore(t, seedSQL, func(t *testing.T, tr TokenRepository) {
 		ctx := context.Background()
 		now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
@@ -801,6 +807,7 @@ func TestTokenRepositoryConformance(t *testing.T) {
 		tok1 := store.TokenRecord{
 			ID: "tok_tc1", UserID: "usr_tc1", Name: "primary", CreatedAt: now, UpdatedAt: now,
 			ServerOverride: "srv_x", ServerOverrideForceUnreachable: true,
+			VendorProviderAccess: vendorAccessOne,
 		}
 		if err := tr.CreatePlainToken(ctx, tok1, "tc-secret-one"); err != nil {
 			t.Fatalf("create token 1: %v", err)
@@ -825,9 +832,15 @@ func TestTokenRepositoryConformance(t *testing.T) {
 		if got.ServerOverride != "srv_x" || !got.ServerOverrideForceUnreachable {
 			t.Fatalf("server override not persisted: %+v", got)
 		}
+		if got.VendorProviderAccess != vendorAccessOne {
+			t.Fatalf("VendorProviderAccess = %q, want %q", got.VendorProviderAccess, vendorAccessOne)
+		}
 		gotNoOverride, err := tr.TokenByID(ctx, tok2.ID)
 		if err != nil || gotNoOverride.ServerOverride != "" || gotNoOverride.ServerOverrideForceUnreachable {
 			t.Fatalf("token without override must default empty/false, never inherit: %+v err=%v", gotNoOverride, err)
+		}
+		if gotNoOverride.VendorProviderAccess != "" {
+			t.Fatalf("token without vendor access must default to the strict empty value, never inherit: %+v", gotNoOverride)
 		}
 		if _, err := tr.TokenByID(ctx, "tok_tc_missing"); err != store.ErrNotFound {
 			t.Fatalf("TokenByID(missing) = %v, want ErrNotFound", err)
@@ -868,13 +881,15 @@ func TestTokenRepositoryConformance(t *testing.T) {
 		updated.Status = store.TokenStatusDisabled
 		updated.Scopes = `["gateway:use"]`
 		updated.ProjectID = "proj_tc"
+		updated.VendorProviderAccess = vendorAccessTwo
 		updated.UpdatedAt = now.Add(time.Minute)
 		if err := tr.UpdateTokenMetadata(ctx, updated); err != nil {
 			t.Fatalf("UpdateTokenMetadata: %v", err)
 		}
 		afterUpdate, err := tr.TokenByID(ctx, tok1.ID)
 		if err != nil || afterUpdate.ServerOverride != "srv_y" || afterUpdate.ServerOverrideForceUnreachable ||
-			afterUpdate.Status != store.TokenStatusDisabled || afterUpdate.Scopes != `["gateway:use"]` || afterUpdate.ProjectID != "proj_tc" {
+			afterUpdate.Status != store.TokenStatusDisabled || afterUpdate.Scopes != `["gateway:use"]` || afterUpdate.ProjectID != "proj_tc" ||
+			afterUpdate.VendorProviderAccess != vendorAccessTwo {
 			t.Fatalf("after UpdateTokenMetadata: %+v err=%v", afterUpdate, err)
 		}
 		if err := tr.UpdateTokenMetadata(ctx, store.TokenRecord{ID: "tok_tc_missing", UpdatedAt: now}); err != store.ErrNotFound {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/store"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -485,5 +486,99 @@ func TestMemoryDirectoryRotateTokenSecretUnknownIDReturnsNotFound(t *testing.T) 
 	err := dir.RotateTokenSecret(context.Background(), "tok_missing", auth.HashSecret("x"), "x", time.Now().UTC())
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("RotateTokenSecret error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMemoryDirectoryTokenVendorAccessCarryThrough proves the memory driver
+// mirrors TokenRecord.VendorProviderAccess onto the auth.Token the bearer store
+// hands back, at all three build sites: CreatePlainToken (initial mirror),
+// UpdateTokenMetadata (selective copy-in + rebuilt mirror; the update fixture
+// uses a DIFFERENT value than the create one so a missing copy line cannot pass
+// by coincidence) and SetServiceTokensState (the wholesale service-token rebuild).
+func TestMemoryDirectoryTokenVendorAccessCarryThrough(t *testing.T) {
+	ctx := context.Background()
+	tokens := auth.NewTokenStore()
+	dir := NewMemoryDirectory(tokens)
+	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	dir.AddUser(store.User{ID: "usr_1", Email: "a@b.test", DisplayName: "A", Role: "user", Status: store.UserStatusActive, CreatedAt: now, UpdatedAt: now})
+
+	created := auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1", OverrideEnabled: true, OverridePrefix: ""}}}
+	rec := store.TokenRecord{
+		ID: "tok_1", UserID: "usr_1", Name: "T", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		VendorProviderAccess: store.EncodeVendorAccess(created),
+	}
+	if err := dir.CreatePlainToken(ctx, rec, "sekret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	tok, ok := tokens.LookupBearer("Bearer sekret")
+	if !ok {
+		t.Fatalf("LookupBearer returned ok=false")
+	}
+	if !reflect.DeepEqual(tok.VendorAccess, created) {
+		t.Fatalf("after create, bearer VendorAccess = %#v, want %#v", tok.VendorAccess, created)
+	}
+
+	rec.VendorProviderAccess = store.EncodeVendorAccess(auth.VendorAccess{All: true})
+	rec.UpdatedAt = now.Add(time.Minute)
+	if err := dir.UpdateTokenMetadata(ctx, rec); err != nil {
+		t.Fatalf("UpdateTokenMetadata: %v", err)
+	}
+	got, err := dir.TokenByID(ctx, "tok_1")
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	if got.VendorProviderAccess != rec.VendorProviderAccess {
+		t.Fatalf("after update, TokenRecord.VendorProviderAccess = %q, want %q", got.VendorProviderAccess, rec.VendorProviderAccess)
+	}
+	tok, ok = tokens.LookupBearer("Bearer sekret")
+	if !ok || !tok.VendorAccess.All || len(tok.VendorAccess.Accounts) != 0 {
+		t.Fatalf("after update, bearer VendorAccess = %#v ok=%v, want All=true", tok.VendorAccess, ok)
+	}
+
+	// SetServiceTokensState rebuilds the cached bearer entry wholesale: a service
+	// token must keep whatever vendor access it was created with.
+	svcAccess := auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_svc"}}}
+	svc := store.TokenRecord{
+		ID: "tok_svc", ServiceID: "svc_1", Kind: store.TokenKindService, Name: "S", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		VendorProviderAccess: store.EncodeVendorAccess(svcAccess),
+	}
+	if err := dir.CreatePlainToken(ctx, svc, "svc-sekret"); err != nil {
+		t.Fatalf("CreatePlainToken(service): %v", err)
+	}
+	if err := dir.SetServiceTokensState(ctx, "svc_1", false, []string{"m1"}); err != nil {
+		t.Fatalf("SetServiceTokensState: %v", err)
+	}
+	stok, ok := tokens.LookupBearer("Bearer svc-sekret")
+	if !ok {
+		t.Fatalf("LookupBearer(service) returned ok=false")
+	}
+	if !reflect.DeepEqual(stok.VendorAccess, svcAccess) {
+		t.Fatalf("after SetServiceTokensState, bearer VendorAccess = %#v, want %#v", stok.VendorAccess, svcAccess)
+	}
+}
+
+// TestAuthorizeRunAsTokenCarriesVendorAccess pins that the run-as principal
+// (the token a portal chat request runs under) carries the token's vendor-access
+// policy, exactly as a bearer lookup of the same token would.
+func TestAuthorizeRunAsTokenCarriesVendorAccess(t *testing.T) {
+	ctx := context.Background()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	now := time.Now().UTC()
+	_ = dir.CreateUser(ctx, store.User{ID: "usr_1", Email: "u1@example.test", DisplayName: "U1", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	want := auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1", OverrideEnabled: true, OverridePrefix: "x/"}}}
+	if err := dir.CreatePlainToken(ctx, store.TokenRecord{
+		ID: "tok_va", UserID: "usr_1", Name: "va", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		VendorProviderAccess: store.EncodeVendorAccess(want),
+	}, "secret-va"); err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	svc := NewService(ServiceDeps{Users: dir, Tokens: dir})
+
+	runAs, err := svc.AuthorizeRunAsToken(ctx, auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}, "tok_va")
+	if err != nil {
+		t.Fatalf("AuthorizeRunAsToken: %v", err)
+	}
+	if !reflect.DeepEqual(runAs.VendorAccess, want) {
+		t.Fatalf("run-as VendorAccess = %#v, want %#v", runAs.VendorAccess, want)
 	}
 }

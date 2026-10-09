@@ -4514,6 +4514,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		UnknownModelRedirect:           record.UnknownModelRedirect,
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
+		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
