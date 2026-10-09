@@ -654,7 +654,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// above instead).
 	imgCounter := newImagesDataCounter(rel.pfReq.APIFlavor)
 	var respBuf bytes.Buffer
-	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress)
+	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress, rel.target.VendorAccountID != "")
 	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter}
 	copyErr := copier.run(resp.Body)
 

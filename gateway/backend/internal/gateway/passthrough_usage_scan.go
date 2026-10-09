@@ -10,8 +10,9 @@ import (
 	"time"
 )
 
-// usageScanner incrementally extracts token usage — and, for the Anthropic
-// fallback rate, the generation-window start — from a native-passthrough
+// usageScanner incrementally extracts token usage — and, for the gateway-derived
+// fallback rate (Anthropic; Responses for a vendor target), the
+// generation-window start — from a native-passthrough
 // response AS ITS BYTES PASS THROUGH THE COPIER, independently of the capture
 // tee's cap.
 //
@@ -29,6 +30,13 @@ import (
 // amount of state instead.
 type usageScanner struct {
 	apiFlavor string
+	// vendorTarget records that the relay's resolved target is a VENDOR-account
+	// target (routing.Target.VendorAccountID != ""), as opposed to a self-hosted
+	// server. It is read in exactly one place, usage()'s derived rate, where it
+	// is what admits the Responses flavor: a vendor OpenAI target reports no
+	// `timings` of any kind, whereas an absent `timings` on a self-hosted
+	// Responses upstream means "the server did not say" and must stay 0.
+	vendorTarget bool
 	// capBytes bounds the carry (see feed) — deliberately the SAME budget the
 	// capture tee uses, since both exist to cap gateway memory against a
 	// pathological or enormous upstream response, not because the two features
@@ -131,7 +139,7 @@ type usageScanner struct {
 	finalPromptPerSecond float64
 	finalTokensPerSecond float64
 	// lastAt is the timestamp of the most recent feed/finish call: the best
-	// available estimate of "generation completed" for the Anthropic fallback
+	// available estimate of "generation completed" for the derived fallback
 	// rate's generation-window end (see usage below).
 	lastAt time.Time
 
@@ -158,6 +166,8 @@ type usageScanner struct {
 // progress is the live counter to publish per-frame facts into, or nil for a
 // response whose progress is not displayed (a buffered one, and every test that
 // only cares about the recorded totals).
+// vendorTarget is whether the relay's target is a vendor-account target
+// (VendorAccountID != ""); see the usageScanner field for what it gates.
 //
 // apiFlavorImages gets NO scanner. Every field the scan can produce comes out of
 // mergePassthroughUsage (native_passthrough.go), whose switch has cases for
@@ -173,11 +183,11 @@ type usageScanner struct {
 // usage() are all nil-receiver no-ops, and nativeCopier documents its scanner
 // field as nil-safe for exactly this. The images path's own usage row is the
 // (unit, quantity) pair, not tokens.
-func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) *usageScanner {
+func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress, vendorTarget bool) *usageScanner {
 	if apiFlavor == apiFlavorImages {
 		return nil
 	}
-	return &usageScanner{apiFlavor: apiFlavor, capBytes: capBytes, progress: progress}
+	return &usageScanner{apiFlavor: apiFlavor, vendorTarget: vendorTarget, capBytes: capBytes, progress: progress}
 }
 
 // feed appends chunk (one read from the upstream body) to the carry buffer,
@@ -728,10 +738,12 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // mid-stream peak. The figure is the authoritative terminal frame's own where
 // one arrived, and the last rate the stream reported where none did.
 //
-// For the Anthropic flavor only, when the upstream reported an output-token
-// count but no rate of its own (Anthropic carries no `timings` object on any
-// frame at all — unlike the Responses shape; see parsePassthroughUsage), a rate
-// is derived from that EXACT count over the generation window: first content
+// For the Anthropic flavor, and for the Responses flavor on a vendor target
+// (derivesGatewayRate), when the upstream reported an output-token count but no
+// rate of its own (Anthropic carries no `timings` object on any frame at all —
+// unlike a self-hosted Responses upstream; see parsePassthroughUsage — and no
+// vendor reports one either), a rate is derived from that EXACT count over the
+// generation window: first content
 // frame -> last observed activity (lastAt, stamped by every feed/finish call,
 // so it tracks the true end of the stream). Never over the whole request — that
 // would fold in queueing and prompt processing and stop being the same
@@ -762,10 +774,19 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // gate read -- so an implausible sample would not self-correct, it would be
 // permanently blended into a number that steers request routing.
 //
-// The Responses shape deliberately does NOT get this fallback: llama.cpp
-// attaches no timings to the Anthropic shape at all, which is the only reason
-// Anthropic needs a derived rate here. An absent Responses `timings` object is
-// left at 0 — out of scope for this change.
+// The Responses shape gets the same derivation, but ONLY for a vendor target
+// (vendorTarget; derivesGatewayRate). OpenAI's platform and the Codex backend
+// report no `timings` at all, so without it every vendor Responses row on the
+// Activity page carried no rate (#182). For a SELF-HOSTED Responses upstream an
+// absent `timings` object still means "the server did not say" and is left at 0:
+// a gateway-side figure there is a different quantity from llama.cpp's own
+// predicted_per_second, and would pollute the speed histogram and the throughput
+// EWMA. (That EWMA is additionally unreachable from a vendor row: it needs an
+// application's opportunistic-metrics opt-in, which a vendor target does not
+// carry.) The window for Responses opens at the first token of ANY kind,
+// reasoning included — see isContentFrame for why that matters for the accuracy
+// of the figure. A buffered (non-streaming) body has no content frames, hence no
+// window, hence no derived rate, for either flavor.
 func (s *usageScanner) usage() inference.Usage {
 	if s == nil {
 		return inference.Usage{}
@@ -793,7 +814,7 @@ func (s *usageScanner) usage() inference.Usage {
 	// stands — never that a real measurement is overwritten with a 0.
 	takeLastNonZeroF(&u.PromptPerSecond, s.finalPromptPerSecond)
 	takeLastNonZeroF(&u.TokensPerSecond, s.finalTokensPerSecond)
-	if s.apiFlavor == "anthropic_messages" && u.TokensPerSecond == 0 && u.OutputTokens > 0 &&
+	if s.derivesGatewayRate() && u.TokensPerSecond == 0 && u.OutputTokens > 0 &&
 		s.haveFirstContent && s.haveTerminalUsage {
 		if window := s.lastAt.Sub(s.firstContentAt); window >= minGatewayRateWindow {
 			u.TokensPerSecond = float64(u.OutputTokens) / window.Seconds()
@@ -802,12 +823,28 @@ func (s *usageScanner) usage() inference.Usage {
 	return u
 }
 
+// derivesGatewayRate reports whether usage() may derive a tokens/s from the
+// generation window for this response. Anthropic always may (the shape carries no
+// rate of any kind). Responses may only for a VENDOR target: OpenAI's platform and
+// Codex backend report no `timings`, so without a derived figure every vendor
+// Responses row would show no rate, whereas for a self-hosted Responses upstream
+// an absent `timings` means "the server did not say" and stays 0.
+func (s *usageScanner) derivesGatewayRate() bool {
+	switch s.apiFlavor {
+	case "anthropic_messages":
+		return true
+	case inference.APIFlavorOpenAIResponses:
+		return s.vendorTarget
+	}
+	return false
+}
+
 // isContentFrame reports whether payload — one JSON usage/event object as
 // returned by jsonPayloads (a single SSE `data:` line's payload, or a whole
 // buffered body) — is a frame carrying upstream-GENERATED content, as opposed
 // to a structural/bookkeeping one. This is what stamps the first-content
 // timestamp in scan above, i.e. the start of the generation window usage()'s
-// Anthropic fallback is computed over.
+// derived rate is computed over.
 //
 // Anthropic: a `content_block_delta` is the ONLY event type that carries
 // generated bytes (text/thinking deltas, or tool-call `partial_json`
@@ -815,18 +852,26 @@ func (s *usageScanner) usage() inference.Usage {
 // snapshot — carries no generated content of its own and is explicitly NOT
 // content.
 //
-// Responses: judged the same way. The three `*.delta` event types that carry an
+// Responses: judged the same way. The four `*.delta` event types that carry an
 // actual generated fragment are content: `response.output_text.delta`
-// (assistant text), `response.reasoning_text.delta` (reasoning/thinking text),
-// and `response.function_call_arguments.delta` (tool-call argument bytes).
-// Every structural/bookkeeping event around them — response.created,
-// response.in_progress, response.output_item.added/done,
-// response.content_part.added/done, and the terminal response.completed /
+// (assistant text), `response.reasoning_text.delta` (llama.cpp's reasoning
+// text), `response.reasoning_summary_text.delta` (the reasoning summary the
+// OpenAI platform and Codex backend stream for their reasoning models), and
+// `response.function_call_arguments.delta`
+// (tool-call argument bytes). Every structural/bookkeeping event around them —
+// response.created, response.in_progress, response.output_item.added/done,
+// response.content_part.added/done, response.reasoning_summary_part.added/done,
+// the *.done text events, and the terminal response.completed /
 // response.failed — carries no generated bytes of its own, mirroring
-// message_start's exclusion above. (This flavor's definition is written down
-// here for completeness, and because it shares content-frame stamping with
-// Anthropic in scan above, but the Responses fallback itself stays out of
-// scope: see usage()'s doc comment.)
+// message_start's exclusion above.
+//
+// REASONING COUNTS, deliberately. The generation window usage() divides the
+// output-token count by must open at the first token of ANY kind: a reasoning
+// model's usage.output_tokens INCLUDES its reasoning tokens, so a window that
+// opened at the first text delta would leave the (often seconds-long) reasoning
+// phase out of the denominator and inflate the rate. Counting reasoning here is
+// what keeps this window the same quantity the translate path and the chat run
+// report.
 func isContentFrame(apiFlavor string, payload []byte) bool {
 	var probe struct {
 		Type string `json:"type"`
@@ -839,7 +884,7 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 		return probe.Type == "content_block_delta"
 	case inference.APIFlavorOpenAIResponses:
 		switch probe.Type {
-		case "response.output_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta":
+		case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta":
 			return true
 		}
 	}
@@ -880,8 +925,9 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 // value: the frame this branch identifies FREEZES takeFinalRates's capture, so
 // `response.completed`'s own rate — not the accumulator's mid-stream peak, and
 // not a rate from anything after it — is what the recording path gets. usage()'s
-// DERIVED rate remains Anthropic-only, so the Responses shape still takes none
-// of that (see usage()).
+// DERIVED rate (Anthropic, and Responses for a vendor target) additionally
+// requires this frame to have been seen, so a vendor Responses stream cut off
+// before its `response.completed` records no derived rate (see usage()).
 //
 // What this branch does NOT decide is whether a rate is recorded at all. A
 // response it never matches keeps the last rate its own frames reported, which
