@@ -13,19 +13,21 @@ import (
 )
 
 // seedVendorSubscriptionAccount creates a SUBSCRIPTION vendor account (OAuth
-// tokens, no api key) owned by vendorOwner with one model row, at the given
-// status. Mirrors how the portal connect flow leaves an account: AuthType
-// subscription, a sealed OAuthTokens blob, APIKey empty.
-func seedVendorSubscriptionAccount(t *testing.T, store *MemoryStore, now time.Time, id, vendor, sealedTokens, status, gatewayModel, upstreamModel, flavor string) {
+// tokens, no api key) owned by vendorOwner, served under ModelPrefix prefix, with
+// one model row for slug, at the given status. Mirrors how the portal connect flow
+// leaves an account: AuthType subscription, a sealed OAuthTokens blob, APIKey
+// empty. The row has the stored shape GatewayModel = prefix + UpstreamModel (see
+// seedVendorAccount).
+func seedVendorSubscriptionAccount(t *testing.T, store *MemoryStore, now time.Time, id, vendor, sealedTokens, status, prefix, slug, flavor string) {
 	t.Helper()
 	ctx := context.Background()
 	must(t, store.CreateVendorAccount(ctx, VendorAccount{
 		ID: id, OwnerUserID: vendorOwner, Vendor: vendor, AuthType: VendorAuthSubscription,
-		Name: id, Status: status, APIKey: "", OAuthTokens: sealedTokens,
+		Name: id, Status: status, APIKey: "", OAuthTokens: sealedTokens, ModelPrefix: prefix,
 		CreatedAt: now, UpdatedAt: now,
 	}))
 	must(t, store.SetVendorAccountModels(ctx, id, []VendorAccountModel{
-		{AccountID: id, GatewayModel: gatewayModel, UpstreamModel: upstreamModel, APIFlavor: flavor},
+		{AccountID: id, GatewayModel: prefix + slug, UpstreamModel: slug, APIFlavor: flavor},
 	}))
 }
 
@@ -41,7 +43,7 @@ func TestVendorSubscriptionAnthropicResolvesToDispatchTarget(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-3-7-sonnet", APIFlavorAnthropic)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "", "claude-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	// Reach it over both inbound dialects.
@@ -74,8 +76,8 @@ func TestVendorSubscriptionAnthropicResolvesToDispatchTarget(t *testing.T) {
 		if got := target.ExtraHeaders["anthropic-beta"]; got != "oauth-2025-04-20" {
 			t.Errorf("flavor=%q: anthropic-beta = %q, want oauth-2025-04-20", flavor, got)
 		}
-		if target.ProviderModel != "claude-3-7-sonnet" {
-			t.Errorf("flavor=%q: ProviderModel = %q, want claude-3-7-sonnet", flavor, target.ProviderModel)
+		if target.ProviderModel != "claude-sonnet" {
+			t.Errorf("flavor=%q: ProviderModel = %q, want claude-sonnet", flavor, target.ProviderModel)
 		}
 		if target.RouteID != "vendor:acc_sub:claude-sonnet" {
 			t.Errorf("flavor=%q: RouteID = %q", flavor, target.RouteID)
@@ -99,7 +101,7 @@ func TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget(t *testi
 	ctx := context.Background()
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "", "claude-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: "anthropic_messages"})
@@ -131,7 +133,7 @@ func TestVendorSubscriptionAnthropicMessagesResolvesToPassthroughTarget(t *testi
 	if !reflect.DeepEqual(target.ExtraHeaders, wantHeaders) {
 		t.Errorf("ExtraHeaders = %v, want %v", target.ExtraHeaders, wantHeaders)
 	}
-	if target.ProviderModel != "claude-sonnet-4-5-20250929" {
+	if target.ProviderModel != "claude-sonnet" {
 		t.Errorf("ProviderModel = %q, want the bare upstream slug", target.ProviderModel)
 	}
 	if target.RouteID != "vendor:acc_sub:claude-sonnet" {
@@ -157,7 +159,7 @@ func TestVendorSubscriptionAnthropicOpenAIFlavorsStayTranslate(t *testing.T) {
 	for _, flavor := range []string{"openai_chat_completions", "openai_responses", "openai_chat"} {
 		t.Run(flavor, func(t *testing.T) {
 			store := NewMemoryStore()
-			seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "claude-sonnet", "claude-sonnet-4-5-20250929", APIFlavorAnthropic)
+			seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusActive, "", "claude-sonnet", APIFlavorAnthropic)
 			resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 			target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: flavor})
@@ -187,7 +189,7 @@ func TestVendorSubscriptionNeedsReconnectDoesNotMatch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusNeedsReconnect, "claude-sonnet", "claude-3-7-sonnet", APIFlavorAnthropic)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub", VendorAnthropic, "enc:sealed-tokens", VendorAccountStatusNeedsReconnect, "", "claude-sonnet", APIFlavorAnthropic)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "claude-sonnet", APIFlavor: "anthropic_messages"}); !errors.Is(err, ErrNoModelRoute) {
@@ -205,7 +207,7 @@ func TestVendorSubscriptionOpenAIResolvesToPassthroughTarget(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex-upstream", APIFlavorOpenAI)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_responses"})
@@ -224,8 +226,8 @@ func TestVendorSubscriptionOpenAIResolvesToPassthroughTarget(t *testing.T) {
 	if target.VendorAccountID != "acc_sub_oai" {
 		t.Errorf("VendorAccountID = %q, want acc_sub_oai", target.VendorAccountID)
 	}
-	if target.ProviderModel != "gpt-5-codex-upstream" {
-		t.Errorf("ProviderModel = %q, want gpt-5-codex-upstream", target.ProviderModel)
+	if target.ProviderModel != "gpt-5-codex" {
+		t.Errorf("ProviderModel = %q, want gpt-5-codex", target.ProviderModel)
 	}
 	if target.APIToken != "" || target.APITokenHeader != "" {
 		t.Errorf("APIToken/APITokenHeader = %q/%q, want empty (bearer resolved at dispatch)", target.APIToken, target.APITokenHeader)
@@ -256,7 +258,7 @@ func TestVendorSubscriptionOpenAIChatFlavorResolvesToTranslateTarget(t *testing.
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex-upstream", APIFlavorOpenAI)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	target, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_chat"})
@@ -288,7 +290,7 @@ func TestVendorSubscriptionOpenAIAnthropicFlavorDoesNotMatch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex", APIFlavorOpenAI)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusActive, "", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "anthropic_messages"}); !errors.Is(err, ErrNoModelRoute) {
@@ -302,7 +304,7 @@ func TestVendorSubscriptionOpenAINeedsReconnectDoesNotMatch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusNeedsReconnect, "gpt-5-codex", "gpt-5-codex", APIFlavorOpenAI)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_oai", VendorOpenAI, "enc:sealed-tokens", VendorAccountStatusNeedsReconnect, "", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_responses"}); !errors.Is(err, ErrNoModelRoute) {
@@ -320,7 +322,7 @@ func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()
-	seedVendorSubscriptionAccount(t, store, now, "acc_sub_x", "mystery-vendor", "enc:sealed-tokens", VendorAccountStatusActive, "gpt-5-codex", "gpt-5-codex", APIFlavorOpenAI)
+	seedVendorSubscriptionAccount(t, store, now, "acc_sub_x", "mystery-vendor", "enc:sealed-tokens", VendorAccountStatusActive, "", "gpt-5-codex", APIFlavorOpenAI)
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 
 	if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-5-codex", APIFlavor: "openai_responses"}); !errors.Is(err, ErrNoModelRoute) {

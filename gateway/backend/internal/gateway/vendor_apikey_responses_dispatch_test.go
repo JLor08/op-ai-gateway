@@ -24,11 +24,17 @@ const (
 	apiKeyAccountID = "acc_apikey_oai"
 	apiKeyPlainKey  = "sk-test-opened-key"
 	apiKeyOwnerID   = "usr_apikey_owner"
+	// The account is served under a model prefix: clients ask for apiKeyOpenAIModel
+	// (prefix + slug, the stored row's GatewayModel) while the vendor is sent the raw
+	// apiKeyOpenAIUpstream slug.
+	apiKeyOpenAIPrefix   = "oa/"
+	apiKeyOpenAIUpstream = "gpt-4o-2024-08-06"
+	apiKeyOpenAIModel    = apiKeyOpenAIPrefix + apiKeyOpenAIUpstream
 )
 
 // resolveAPIKeyOpenAITarget resolves a request through the REAL routing.Resolver
 // against a store holding one ACTIVE OpenAI api-key vendor account (key sealed with
-// cipher) serving gpt-4o, and returns the target the dispatch layer would receive.
+// cipher) serving apiKeyOpenAIModel, and returns the target the dispatch layer would receive.
 // endpoint replaces the target's Endpoint (a struct copy, so only the destination
 // moves) so a test can point the otherwise production-shaped target at an httptest
 // stub. Going through the resolver rather than hand-building the target keeps these
@@ -44,19 +50,19 @@ func resolveAPIKeyOpenAITarget(t *testing.T, cipher *capture.Cipher, fineFlavor,
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	if err := store.CreateVendorAccount(ctx, routing.VendorAccount{
 		ID: apiKeyAccountID, OwnerUserID: apiKeyOwnerID, Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
-		Name: apiKeyAccountID, Status: routing.VendorAccountStatusActive, APIKey: sealed, CreatedAt: now, UpdatedAt: now,
+		Name: apiKeyAccountID, Status: routing.VendorAccountStatusActive, APIKey: sealed, ModelPrefix: apiKeyOpenAIPrefix, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateVendorAccount: %v", err)
 	}
 	if err := store.SetVendorAccountModels(ctx, apiKeyAccountID, []routing.VendorAccountModel{
-		{AccountID: apiKeyAccountID, GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024-08-06", APIFlavor: routing.APIFlavorOpenAI},
+		{AccountID: apiKeyAccountID, GatewayModel: apiKeyOpenAIModel, UpstreamModel: apiKeyOpenAIUpstream, APIFlavor: routing.APIFlavorOpenAI},
 	}); err != nil {
 		t.Fatalf("SetVendorAccountModels: %v", err)
 	}
 	resolver := routing.NewResolver(store, func() time.Time { return now }, nil)
 	resolver.SetVendorAccountAccessors(func() bool { return true }, nil) // flag on, mode defaults to vendor_first
 
-	target, err := resolver.Resolve(ctx, auth.Token{ID: "tok_apikey", UserID: apiKeyOwnerID, Active: true}, inference.Request{Model: "gpt-4o", APIFlavor: fineFlavor})
+	target, err := resolver.Resolve(ctx, auth.Token{ID: "tok_apikey", UserID: apiKeyOwnerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}, inference.Request{Model: apiKeyOpenAIModel, APIFlavor: fineFlavor})
 	if err != nil {
 		t.Fatalf("Resolve(%s): %v", fineFlavor, err)
 	}
@@ -100,7 +106,7 @@ func newOpenAIPlatformResponsesStub(t *testing.T) *openAIPlatformResponsesStub {
 // forward every field verbatim, the model aside. It deliberately omits `store`:
 // the gateway must NOT inject store:false the way the subscription translate
 // client does.
-const apiKeyResponsesBody = `{"model":"gpt-4o","stream":true,"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"high"},"previous_response_id":"resp_prev","metadata":{"k":"v"}}`
+const apiKeyResponsesBody = `{"model":"oa/gpt-4o-2024-08-06","stream":true,"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],"reasoning":{"effort":"high"},"previous_response_id":"resp_prev","metadata":{"k":"v"}}`
 
 // TestOpenAIAPIKeyResponsesDispatchIsLosslessPassthrough proves the full serving
 // path for an openai_responses request to an OpenAI API-KEY vendor account: the
@@ -159,10 +165,10 @@ func TestOpenAIAPIKeyResponsesDispatchIsLosslessPassthrough(t *testing.T) {
 	if err := json.Unmarshal([]byte(apiKeyResponsesBody), &want); err != nil {
 		t.Fatalf("fixture body not JSON: %v", err)
 	}
-	if sent["model"] != "gpt-4o-2024-08-06" {
-		t.Fatalf("upstream model = %v, want gpt-4o-2024-08-06 (rewritten to the bare upstream slug)", sent["model"])
+	if sent["model"] != apiKeyOpenAIUpstream {
+		t.Fatalf("upstream model = %v, want %s (rewritten to the bare upstream slug)", sent["model"], apiKeyOpenAIUpstream)
 	}
-	want["model"] = "gpt-4o-2024-08-06"
+	want["model"] = apiKeyOpenAIUpstream
 	if !reflect.DeepEqual(sent, want) {
 		t.Fatalf("upstream body differs from the client's beyond the model field:\n got: %s\nwant: %v", stub.gotBody, want)
 	}

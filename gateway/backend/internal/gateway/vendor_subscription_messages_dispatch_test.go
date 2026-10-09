@@ -24,8 +24,11 @@ import (
 const (
 	subMessagesAccountID   = "acc_sub_anthropic_e2e"
 	subMessagesAccessToken = "sub-e2e-live-access-token"
-	subMessagesModel       = "claude-sonnet"
-	subMessagesUpstream    = "claude-sonnet-4-5-20250929"
+	// Served under a model prefix: the public name (subMessagesModel) differs from
+	// the raw upstream slug, and equals the model of the shared client bodies.
+	subMessagesPrefix   = "ant/"
+	subMessagesUpstream = "claude-sonnet-4-5-20250929"
+	subMessagesModel    = subMessagesPrefix + subMessagesUpstream
 	// claudeCodeLine is the exact first system block the OAuth Messages path needs
 	// (the provider's claudeCodeSystemPrompt, spelled out here on purpose so a
 	// change to the constant shows up as a failing wire assertion).
@@ -45,7 +48,7 @@ func seedSubscriptionAnthropicRoutableAccount(t *testing.T, routes *routing.Memo
 	ctx := context.Background()
 	if err := routes.CreateVendorAccount(ctx, routing.VendorAccount{
 		ID: accountID, OwnerUserID: ownerID, Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription,
-		Name: accountID, Status: routing.VendorAccountStatusActive, OAuthTokens: sealed, CreatedAt: now, UpdatedAt: now,
+		Name: accountID, Status: routing.VendorAccountStatusActive, OAuthTokens: sealed, ModelPrefix: subMessagesPrefix, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateVendorAccount: %v", err)
 	}
@@ -68,7 +71,7 @@ func resolveSubscriptionAnthropicTarget(t *testing.T, routes *routing.MemoryStor
 	resolver := routing.NewResolver(routes, func() time.Time { return now }, nil)
 	resolver.SetVendorAccountAccessors(func() bool { return true }, nil) // flag on, mode defaults to vendor_first
 
-	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_sub_anthropic", UserID: ownerID, Active: true}, inference.Request{Model: subMessagesModel, APIFlavor: fineFlavor})
+	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_sub_anthropic", UserID: ownerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}, inference.Request{Model: subMessagesModel, APIFlavor: fineFlavor})
 	if err != nil {
 		t.Fatalf("Resolve(%s): %v", fineFlavor, err)
 	}
@@ -242,7 +245,7 @@ func TestAnthropicSubscriptionMessagesEndToEndThroughTheGateway(t *testing.T) {
 // subscriptionMessagesBodyWithClaudeCodeBlock is a body from a real Claude Code
 // client: it ALREADY sends the Claude-Code line as the first system block (with a
 // cache_control of its own), followed by its working-directory block.
-const subscriptionMessagesBodyWithClaudeCodeBlock = `{"model":"claude-sonnet","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Working dir: /repo","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":2048}}`
+const subscriptionMessagesBodyWithClaudeCodeBlock = `{"model":"ant/claude-sonnet-4-5-20250929","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Working dir: /repo","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"thinking":{"type":"enabled","budget_tokens":2048}}`
 
 // TestAnthropicSubscriptionMessagesEndToEndDoesNotDoubleTheClaudeCodeBlock is the
 // idempotence case through the whole gateway: a client that already sends the

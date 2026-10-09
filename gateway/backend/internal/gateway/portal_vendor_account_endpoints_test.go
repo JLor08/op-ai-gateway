@@ -105,7 +105,7 @@ func newVendorAccountSettingsTestServerWithDeps(t *testing.T, volatile bool, adj
 	dir := portal.NewMemoryDirectory(tokens)
 	dir.AddUser(store.User{ID: "usr_va_a", Email: "a@example.test", DisplayName: "Owner A", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
 	dir.AddUser(store.User{ID: "usr_va_b", Email: "b@example.test", DisplayName: "Other B", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
-	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_va_a", UserID: "usr_va_a", Name: "Owner Token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, vaOwnerSecret); err != nil {
+	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_va_a", UserID: "usr_va_a", Name: "Owner Token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, VendorProviderAccess: store.EncodeVendorAccess(auth.VendorAccess{All: true}), CreatedAt: now, UpdatedAt: now}, vaOwnerSecret); err != nil {
 		t.Fatalf("CreatePlainToken owner: %v", err)
 	}
 	if err := dir.CreatePlainToken(context.Background(), store.TokenRecord{ID: "tok_va_b", UserID: "usr_va_b", Name: "Other Token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, vaOtherSecret); err != nil {
