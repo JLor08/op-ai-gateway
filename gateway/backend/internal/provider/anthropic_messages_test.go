@@ -97,6 +97,7 @@ func anthropicTarget(endpoint string) routing.Target {
 func TestAnthropicClientImplementsProviderInterfaces(t *testing.T) {
 	var _ Client = NewAnthropicClient(nil)
 	var _ StreamingClient = NewAnthropicClient(nil)
+	var _ NativeProxyClient = NewAnthropicClient(nil)
 }
 
 func TestAnthropicClientCompleteSendsVersionAndApiKeyHeaders(t *testing.T) {
@@ -865,5 +866,210 @@ func TestAnthropicClientCapturesTheTranslatedExchange(t *testing.T) {
 				t.Fatal("response headers were not captured")
 			}
 		})
+	}
+}
+
+// anthropicNativeBody is deliberately NOT what encoding/json would emit for the
+// same value (odd spacing, a newline inside the object, stream before model,
+// \u00e9-style escapes that json.Marshal would turn back into raw runes, and the
+// U+2028 escape), so a passthrough that decoded and re-encoded it would fail the
+// byte-for-byte comparison below.
+const anthropicNativeBody = `{ "stream":true,"model":"claude-sonnet-4-5-20250929",  "max_tokens": 64,
+ "system":"s\u00e9 \u2028 caf\u00e9 \u2603","messages":[{"role":"user","content":[{"type":"text","text":"h\u00e9llo \u2603"}]}],"x_unknown":{"b":1,"a":[3,2,1]} }`
+
+// anthropicNativeSSE is a Messages SSE reply with event: lines, a keepalive
+// comment and a data: line with extra spacing; the passthrough must relay it
+// unchanged, where the translate path would parse and drop all of that.
+const anthropicNativeSSE = ": keepalive\n\n" +
+	"event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+	"event: message_stop\ndata:   {\"type\":\"message_stop\"}\n\n"
+
+func TestAnthropicClientProxyNativeForwardsRawBodyVersionAndAuth(t *testing.T) {
+	capture := &anthropicCapture{}
+	upstream := httptest.NewServer(capture.handler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(contentTypeHeader, "text/event-stream")
+		w.Header().Set("request-id", "req_native_1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, anthropicNativeSSE)
+	}))
+	defer upstream.Close()
+	client := NewAnthropicClient(http.DefaultClient)
+	ctx := WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-native")
+	// MasqueradeClaudeCode is subscription-translate-only: a passthrough must NOT
+	// inject the Claude Code system block even when the target carries the flag.
+	target := anthropicTarget(upstream.URL + "/")
+	target.Masquerade = routing.MasqueradeClaudeCode
+
+	resp, err := client.ProxyNative(ctx, target, "/v1/messages", []byte(anthropicNativeBody))
+	if err != nil {
+		t.Fatalf("ProxyNative returned %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get(contentTypeHeader); got != "text/event-stream" {
+		t.Fatalf("response Content-Type = %q, want text/event-stream", got)
+	}
+	if got := resp.Header.Get("request-id"); got != "req_native_1" {
+		t.Fatalf("response request-id = %q, want the upstream header relayed", got)
+	}
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read relayed body: %v", err)
+	}
+	if string(out) != anthropicNativeSSE {
+		t.Fatalf("relayed SSE = %q, want it byte-for-byte %q", out, anthropicNativeSSE)
+	}
+
+	method, path, header, body := capture.request()
+	if method != http.MethodPost || path != "/v1/messages" {
+		t.Fatalf("request = %s %s, want POST /v1/messages", method, path)
+	}
+	if string(body) != anthropicNativeBody {
+		t.Fatalf("forwarded body = %q, want it verbatim %q", body, anthropicNativeBody)
+	}
+	if got := header.Get(contentTypeHeader); got != jsonContentType {
+		t.Fatalf("Content-Type = %q, want %q", got, jsonContentType)
+	}
+	if got := header.Values("anthropic-version"); len(got) != 1 || got[0] != "2023-06-01" {
+		t.Fatalf("anthropic-version = %v, want exactly [2023-06-01]", got)
+	}
+	if got := header.Get("x-api-key"); got != "sk-ant-native" {
+		t.Fatalf("x-api-key = %q, want the upstream credential from ctx", got)
+	}
+	if got := header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want none (an api-key target sends x-api-key only)", got)
+	}
+}
+
+// TestAnthropicClientProxyNativeAlwaysSendsAnthropicVersion pins the design: the
+// client itself guarantees anthropic-version (api.anthropic.com requires it), so
+// it reaches the upstream whether or not the caller's ctx carried it.
+func TestAnthropicClientProxyNativeAlwaysSendsAnthropicVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want string
+	}{
+		{"no upstream auth on ctx", context.Background(), "2023-06-01"},
+		{"credential without extra headers", WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-x"), "2023-06-01"},
+		{"extra headers without the version", WithUpstreamAuthHeaders(context.Background(), "x-api-key", "sk-ant-x", map[string]string{"anthropic-beta": "b1"}), "2023-06-01"},
+		{"target-carried version is the caller's choice", WithUpstreamAuthHeaders(context.Background(), "x-api-key", "sk-ant-x", map[string]string{"anthropic-version": "2099-01-01"}), "2099-01-01"},
+		{"target-carried version in another case", WithUpstreamAuthHeaders(context.Background(), "x-api-key", "sk-ant-x", map[string]string{"Anthropic-Version": "2099-01-01"}), "2099-01-01"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := &anthropicCapture{}
+			upstream := httptest.NewServer(capture.handler(writeAnthropicOK))
+			defer upstream.Close()
+
+			resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(tc.ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+			if err != nil {
+				t.Fatalf("ProxyNative returned %v", err)
+			}
+			resp.Body.Close()
+
+			_, _, header, _ := capture.request()
+			if got := header.Values("anthropic-version"); len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("anthropic-version = %v, want exactly [%s]", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicClientProxyNativeForwardsTargetExtraHeaders(t *testing.T) {
+	capture := &anthropicCapture{}
+	upstream := httptest.NewServer(capture.handler(writeAnthropicOK))
+	defer upstream.Close()
+	ctx := WithUpstreamAuthHeaders(context.Background(), "x-api-key", "sk-ant-x", map[string]string{"anthropic-beta": "prompt-caching-2024-07-31"})
+
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("ProxyNative returned %v", err)
+	}
+	resp.Body.Close()
+
+	_, _, header, _ := capture.request()
+	if got := header.Get("anthropic-beta"); got != "prompt-caching-2024-07-31" {
+		t.Fatalf("anthropic-beta = %q, want the ctx extra header forwarded", got)
+	}
+}
+
+func TestAnthropicClientProxyNativeRelaysUpstreamErrorStatusVerbatim(t *testing.T) {
+	const errBody = `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(contentTypeHeader, jsonContentType)
+		w.Header().Set("retry-after", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, errBody)
+	}))
+	defer upstream.Close()
+
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("ProxyNative returned %v, want the 429 relayed as a response", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode = %d, want 429", resp.StatusCode)
+	}
+	if got := resp.Header.Get("retry-after"); got != "7" {
+		t.Fatalf("retry-after = %q, want 7", got)
+	}
+	if out, _ := io.ReadAll(resp.Body); string(out) != errBody {
+		t.Fatalf("relayed body = %q, want %q", out, errBody)
+	}
+}
+
+func TestAnthropicClientProxyNativeMapsTransportFailureToUnavailable(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	endpoint := upstream.URL
+	upstream.Close() // nothing listens any more
+
+	_, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(endpoint), "/v1/messages", []byte(`{}`))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
+	}
+}
+
+// TestAnthropicClientProxyNativeDoesNotFollowRedirects pins that the credential
+// (x-api-key survives net/http's cross-host redirect header stripping, which only
+// drops Authorization) never leaves for a redirect target, and that the 3xx is
+// handed back as the upstream's answer instead. The caller's client is untouched.
+func TestAnthropicClientProxyNativeDoesNotFollowRedirects(t *testing.T) {
+	var hits int
+	var mu sync.Mutex
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer elsewhere.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/v1/messages", http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+	httpClient := &http.Client{}
+	ctx := WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-secret")
+
+	resp, err := NewAnthropicClient(httpClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("ProxyNative returned %v, want the 307 handed back as a response", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("StatusCode = %d, want the 307 returned unfollowed", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("the redirect target received %d request(s), want 0 (the credential must not follow a redirect)", hits)
+	}
+	if httpClient.CheckRedirect != nil {
+		t.Fatal("ProxyNative mutated the caller's http.Client.CheckRedirect")
 	}
 }
