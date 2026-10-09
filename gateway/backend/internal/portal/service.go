@@ -4664,49 +4664,97 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 	if s.routes == nil {
 		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
 	}
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, owner.UserID)
+	byID, err := s.ownerVendorAccountsByID(ctx, owner.UserID)
 	if err != nil {
-		// An infrastructure failure, not a client mistake: returned raw so the
-		// endpoints answer 500 rather than a 400 the client cannot act on.
 		return err
+	}
+	check := vendorAccessCheck{
+		byID:  byID,
+		seen:  make(map[string]struct{}, len(d.Accounts)),
+		names: make(map[string]string),
+	}
+	for _, e := range d.Accounts {
+		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// vendorAccessCheck is the working state of one validateVendorAccess run.
+type vendorAccessCheck struct {
+	byID  map[string]routing.VendorAccount // the owner's accounts by id
+	seen  map[string]struct{}              // account ids already listed in the policy
+	names map[string]string                // effective public name -> id of the account that first produced it
+}
+
+// ownerVendorAccountsByID loads userID's vendor accounts keyed by id. A read
+// failure is an infrastructure error and is returned raw, so the endpoints answer
+// 500 rather than a 400 the client cannot act on.
+func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (map[string]routing.VendorAccount, error) {
+	accounts, err := s.routes.VendorAccountsByOwner(ctx, userID)
+	if err != nil {
+		return nil, err
 	}
 	byID := make(map[string]routing.VendorAccount, len(accounts))
 	for _, a := range accounts {
 		byID[a.ID] = a
 	}
-	seen := make(map[string]struct{}, len(d.Accounts))
-	names := make(map[string]string) // effective public name -> id of the account that first produced it
-	for _, e := range d.Accounts {
-		id := strings.TrimSpace(e.AccountID)
-		acc, ok := byID[id]
-		if !ok {
-			return fmt.Errorf("%w: unknown account %q", ErrTokenVendorAccessInvalid, id)
+	return byID, nil
+}
+
+// checkVendorAccessEntry validates one policy entry in order -- the account is
+// owned, is listed once, carries a valid override prefix, and its effective public
+// names do not collide with those already claimed by earlier entries -- so the
+// first failure is the one reported. An unreadable model list skips the collision
+// check for that account only (logged; the routing backstop still applies).
+func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAccessCheck, e VendorAccessEntryDTO) error {
+	id := strings.TrimSpace(e.AccountID)
+	acc, ok := check.byID[id]
+	if !ok {
+		return fmt.Errorf("%w: unknown account %q", ErrTokenVendorAccessInvalid, id)
+	}
+	if _, dup := check.seen[id]; dup {
+		return fmt.Errorf("%w: account %q listed more than once", ErrTokenVendorAccessInvalid, id)
+	}
+	check.seen[id] = struct{}{}
+	prefix, err := tokenVendorEntryPrefix(acc, e)
+	if err != nil {
+		return err
+	}
+	models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+	if err != nil {
+		slog.Warn("portal: token vendor-access collision check skipped for an account whose models could not be read; the routing backstop still applies",
+			"account_id", acc.ID, "error", err)
+		return nil
+	}
+	return claimVendorAccessNames(check.names, id, prefix, models)
+}
+
+// tokenVendorEntryPrefix resolves the prefix an entry serves its account's models
+// under: the account's own model_prefix, or -- when the entry carries an ENABLED
+// override -- the normalized (trimmed, charset-checked) override value.
+func tokenVendorEntryPrefix(acc routing.VendorAccount, e VendorAccessEntryDTO) (string, error) {
+	if e.PrefixOverride == nil || !e.PrefixOverride.Enabled {
+		return acc.ModelPrefix, nil
+	}
+	norm, err := normalizeVendorAccountModelPrefix(e.PrefixOverride.Value)
+	if err != nil {
+		return "", fmt.Errorf("%w: account %q: %w", ErrTokenVendorAccessInvalid, acc.ID, err)
+	}
+	return norm, nil
+}
+
+// claimVendorAccessNames records the effective public name (prefix + upstream
+// model id) of each of accountID's models in names, and reports
+// ErrTokenVendorAccessConflict when another account already produced one of them.
+func claimVendorAccessNames(names map[string]string, accountID, prefix string, models []routing.VendorAccountModel) error {
+	for _, m := range models {
+		name := prefix + m.UpstreamModel
+		if prior, clash := names[name]; clash && prior != accountID {
+			return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, accountID)
 		}
-		if _, dup := seen[id]; dup {
-			return fmt.Errorf("%w: account %q listed more than once", ErrTokenVendorAccessInvalid, id)
-		}
-		seen[id] = struct{}{}
-		prefix := acc.ModelPrefix
-		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
-			norm, err := normalizeVendorAccountModelPrefix(e.PrefixOverride.Value)
-			if err != nil {
-				return fmt.Errorf("%w: account %q: %w", ErrTokenVendorAccessInvalid, id, err)
-			}
-			prefix = norm
-		}
-		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
-		if err != nil {
-			slog.Warn("portal: token vendor-access collision check skipped for an account whose models could not be read; the routing backstop still applies",
-				"account_id", acc.ID, "error", err)
-			continue
-		}
-		for _, m := range models {
-			name := prefix + m.UpstreamModel
-			if prior, clash := names[name]; clash && prior != id {
-				return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, id)
-			}
-			names[name] = id
-		}
+		names[name] = accountID
 	}
 	return nil
 }
