@@ -287,7 +287,7 @@ func TestMergeVendorAccountUsage(t *testing.T) {
 		AccountID: "old", FiveHourPct: 40, FiveHourResetAt: &fiveOld,
 		WeeklyPct: 25, WeeklyResetAt: &weekOld, CreditBalance: "10.00", UpdatedAt: t0,
 	}
-	unknown := VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, UpdatedAt: t1}
+	unknown := VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, UpdatedAt: t1}
 
 	cases := []struct {
 		name     string
@@ -383,14 +383,136 @@ func TestMergeVendorAccountUsage(t *testing.T) {
 		// No stored reading and no new one: the result must be the unknown
 		// sentinels, never a fabricated 0 / zero time / credit.
 		got := MergeVendorAccountUsage(
-			VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1},
+			VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1},
 			unknown,
 		)
 		if got.FiveHourPct != -1 || got.WeeklyPct != -1 || got.FiveHourResetAt != nil ||
-			got.WeeklyResetAt != nil || got.CreditBalance != "" {
+			got.WeeklyResetAt != nil || got.CreditBalance != "" || got.SpendUsedPct != -1 ||
+			got.SpendResetAt != nil || got.SpendUnit != "" || got.SpendLimit != "" ||
+			got.SpendUsed != "" || got.SpendRemaining != "" || got.CreditStatus != "" {
 			t.Fatalf("merged = %+v, want every field still unknown", got)
 		}
 	})
+}
+
+// TestMergeVendorAccountUsageSpendFields pins the "merge, never blank" rule for the
+// Business spend-control fields (#195) the same way TestMergeVendorAccountUsage
+// does for the rate-limit windows: an incoming value that is KNOWN (non-empty
+// string, percent >= 0, non-nil reset) overwrites the stored one, and an UNKNOWN
+// one ("" / -1 / nil) keeps it, field by field -- so a passive header scrape, which
+// never carries spend data, cannot blank what the active fetch stored. A real 0
+// percent is known.
+func TestMergeVendorAccountUsageSpendFields(t *testing.T) {
+	t0 := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	t1 := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	resetOld := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	resetNew := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+
+	existing := VendorAccountUsage{
+		AccountID: "old", FiveHourPct: -1, WeeklyPct: -1, UpdatedAt: t0,
+		SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500", SpendRemaining: "4500",
+		SpendUsedPct: 25, SpendResetAt: &resetOld, CreditStatus: "has_credits",
+	}
+	// unknownSpend knows nothing about spend control (and nothing about the
+	// windows either): every spend field at its unknown sentinel.
+	unknownSpend := VendorAccountUsage{AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, UpdatedAt: t1}
+
+	// with returns unknownSpend after mutate has set the fields the case knows.
+	with := func(mutate func(*VendorAccountUsage)) VendorAccountUsage {
+		in := unknownSpend
+		mutate(&in)
+		return in
+	}
+	// keep is the merge result when nothing about spend is known: every stored
+	// spend field survives, identity and timestamp come from the incoming.
+	keep := func(mutate func(*VendorAccountUsage)) VendorAccountUsage {
+		want := VendorAccountUsage{
+			AccountID: "acc", FiveHourPct: -1, WeeklyPct: -1, UpdatedAt: t1,
+			SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500", SpendRemaining: "4500",
+			SpendUsedPct: 25, SpendResetAt: &resetOld, CreditStatus: "has_credits",
+		}
+		if mutate != nil {
+			mutate(&want)
+		}
+		return want
+	}
+
+	cases := []struct {
+		name     string
+		incoming VendorAccountUsage
+		want     VendorAccountUsage
+	}{
+		{
+			name:     "nothing known keeps every stored spend field",
+			incoming: unknownSpend,
+			want:     keep(nil),
+		},
+		{
+			name:     "spend unit known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendUnit = "usd" }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendUnit = "usd" }),
+		},
+		{
+			name:     "spend limit known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendLimit = "9000" }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendLimit = "9000" }),
+		},
+		{
+			name:     "spend used known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendUsed = "2000" }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendUsed = "2000" }),
+		},
+		{
+			name:     "spend remaining known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendRemaining = "4000" }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendRemaining = "4000" }),
+		},
+		{
+			name:     "spend used percent known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendUsedPct = 33.5 }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendUsedPct = 33.5 }),
+		},
+		{
+			name:     "a real 0 spend percent is known and overrides (not mistaken for unknown)",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendUsedPct = 0 }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendUsedPct = 0 }),
+		},
+		{
+			name:     "spend reset known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.SpendResetAt = &resetNew }),
+			want:     keep(func(u *VendorAccountUsage) { u.SpendResetAt = &resetNew }),
+		},
+		{
+			name:     "credit status known overrides, the rest is kept",
+			incoming: with(func(u *VendorAccountUsage) { u.CreditStatus = "none" }),
+			want:     keep(func(u *VendorAccountUsage) { u.CreditStatus = "none" }),
+		},
+		{
+			name: "everything known overrides every stored spend field",
+			incoming: with(func(u *VendorAccountUsage) {
+				u.SpendUnit, u.SpendLimit, u.SpendUsed, u.SpendRemaining = "usd", "100", "10", "90"
+				u.SpendUsedPct, u.SpendResetAt, u.CreditStatus = 10, &resetNew, "unlimited"
+			}),
+			want: keep(func(u *VendorAccountUsage) {
+				u.SpendUnit, u.SpendLimit, u.SpendUsed, u.SpendRemaining = "usd", "100", "10", "90"
+				u.SpendUsedPct, u.SpendResetAt, u.CreditStatus = 10, &resetNew, "unlimited"
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MergeVendorAccountUsage(existing, tc.incoming)
+			if got.AccountID != tc.want.AccountID || !got.UpdatedAt.Equal(tc.want.UpdatedAt) ||
+				got.SpendUnit != tc.want.SpendUnit || got.SpendLimit != tc.want.SpendLimit ||
+				got.SpendUsed != tc.want.SpendUsed || got.SpendRemaining != tc.want.SpendRemaining ||
+				got.SpendUsedPct != tc.want.SpendUsedPct || got.CreditStatus != tc.want.CreditStatus {
+				t.Fatalf("spend scalar mismatch:\n got  %+v\n want %+v", got, tc.want)
+			}
+			if !mergeTimePtrEqual(got.SpendResetAt, tc.want.SpendResetAt) {
+				t.Fatalf("SpendResetAt = %v, want %v", got.SpendResetAt, tc.want.SpendResetAt)
+			}
+		})
+	}
 }
 
 func mergeTimePtrEqual(a, b *time.Time) bool {

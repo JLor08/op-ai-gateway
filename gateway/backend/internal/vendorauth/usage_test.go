@@ -35,6 +35,33 @@ const usageBody = `{
   "user_id": "usr_x"
 }`
 
+// businessUsageBody mirrors the redacted GET wham/usage answer of a Business plan:
+// no rate-limit windows and no credit balance (both null), the quota under
+// spend_control.individual_limit (limit/used/remaining are JSON strings,
+// used_percent/remaining_percent/reset_after_seconds/reset_at are JSON numbers) and
+// the credit state in the credits flags. Identifiers are placeholders and the
+// figures are illustrative, not a real account's.
+const businessUsageBody = `{
+  "user_id": "usr_x", "account_id": "acc_x", "email": "user@example.test",
+  "plan_type": "business",
+  "rate_limit": null,
+  "code_review_rate_limit": null,
+  "additional_rate_limits": null,
+  "model_usage": {"model-x": {"available": true, "available_at": null, "credits_would_enable": false}},
+  "credits": {"has_credits": true, "unlimited": false, "overage_limit_reached": false, "balance": null, "approx_local_messages": null, "approx_cloud_messages": null},
+  "spend_control": {
+    "reached": false,
+    "individual_limit": {
+      "source": "group_based_spend_controls", "unit": "credit",
+      "limit": "6000", "used": "42.5", "remaining": "5957.5",
+      "used_percent": 1, "remaining_percent": 99,
+      "reset_after_seconds": 1938953, "reset_at": 1793491200
+    }
+  },
+  "rate_limit_reached_type": null, "promo": null,
+  "rate_limit_reset_credits": {"available_count": 0, "applicable_available_count": 0}
+}`
+
 func usageTime(sec int64) *time.Time {
 	t := time.Unix(sec, 0).UTC()
 	return &t
@@ -42,7 +69,7 @@ func usageTime(sec int64) *time.Time {
 
 // wantUnknownUsage is the all-unknown snapshot every Unverifiable answer carries.
 func wantUnknownUsage() OpenAISubscriptionUsage {
-	return OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1}
+	return OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1}
 }
 
 func fetchUsage(t *testing.T, h http.HandlerFunc) (OpenAISubscriptionUsage, DiscoveryStatus, *probeRecorder) {
@@ -131,6 +158,8 @@ func TestFetchOpenAISubscriptionUsageMapsTheRepresentativeBody(t *testing.T) {
 		WeeklyPct:       61,
 		WeeklyResetAt:   usageTime(1760500000),
 		CreditBalance:   "12.34",
+		SpendUsedPct:    -1,
+		CreditStatus:    "has_credits",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("usage = %+v, want %+v", got, want)
@@ -150,103 +179,103 @@ func TestParseOpenAISubscriptionUsageIsTolerant(t *testing.T) {
 		{
 			name:   "float used_percent is kept as sent",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":73.5,"reset_at":1760000000},"secondary_window":{"used_percent":0.25,"reset_at":1760500000}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 73.5, FiveHourResetAt: usageTime(1760000000), WeeklyPct: 0.25, WeeklyResetAt: usageTime(1760500000)},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 73.5, FiveHourResetAt: usageTime(1760000000), WeeklyPct: 0.25, WeeklyResetAt: usageTime(1760500000), SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a real zero percent is known, not unknown",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":0},"secondary_window":{"used_percent":0.0}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 0, WeeklyPct: 0},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 0, WeeklyPct: 0, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "primary window only leaves the weekly window unknown",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":40,"reset_at":1760000000}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 40, FiveHourResetAt: usageTime(1760000000), WeeklyPct: -1},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 40, FiveHourResetAt: usageTime(1760000000), WeeklyPct: -1, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "secondary window only leaves the five-hour window unknown",
 			body:   `{"rate_limit":{"primary_window":null,"secondary_window":{"used_percent":9,"reset_at":1760500000}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 9, WeeklyResetAt: usageTime(1760500000)},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 9, WeeklyResetAt: usageTime(1760500000), SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a null rate_limit keeps the credit balance",
 			body:   `{"rate_limit":null,"credits":{"balance":"5.00"}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "5.00"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "5.00", SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "credits only",
 			body:   `{"credits":{"has_credits":true,"unlimited":false,"balance":"0"}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "0"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "0", SpendUsedPct: -1, CreditStatus: "has_credits"},
 			wantOK: true,
 		},
 		{
 			name:   "a zero reset_at is unknown",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":10,"reset_at":0},"secondary_window":{"used_percent":20,"reset_at":0}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "an absent or null reset_at is unknown",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":10},"secondary_window":{"used_percent":20,"reset_at":null}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a negative or absurd reset_at is unknown",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":10,"reset_at":-5},"secondary_window":{"used_percent":20,"reset_at":9e18}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20},
+			want:   OpenAISubscriptionUsage{FiveHourPct: 10, WeeklyPct: 20, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a fractional reset_at is truncated to the second",
 			body:   `{"rate_limit":{"primary_window":{"reset_at":1760000000.75}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, FiveHourResetAt: usageTime(1760000000), WeeklyPct: -1},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, FiveHourResetAt: usageTime(1760000000), WeeklyPct: -1, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a negative percent is unknown, an over-range one is clamped",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":-3},"secondary_window":{"used_percent":140}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 100},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 100, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a numeric balance is coerced to its string form",
 			body:   `{"credits":{"balance":12.34}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "12.34"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "12.34", SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "an integer balance is coerced to its string form",
 			body:   `{"credits":{"balance":7}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "7"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "7", SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a padded balance is trimmed",
 			body:   `{"credits":{"balance":"  3.10 "}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "3.10"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "3.10", SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a wrong-typed field is skipped without sinking the others",
 			body:   `{"rate_limit":{"primary_window":{"used_percent":"high","reset_at":1760000000},"secondary_window":{"used_percent":61}},"credits":{"balance":true}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, FiveHourResetAt: usageTime(1760000000), WeeklyPct: 61},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, FiveHourResetAt: usageTime(1760000000), WeeklyPct: 61, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a wrong-typed section is skipped without sinking the others",
 			body:   `{"rate_limit":"nope","credits":{"balance":"1.50"}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "1.50"},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "1.50", SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
 			name:   "a wrong-typed window leaves the other window",
 			body:   `{"rate_limit":{"primary_window":[1,2],"secondary_window":{"used_percent":61}}}`,
-			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 61},
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: 61, SpendUsedPct: -1},
 			wantOK: true,
 		},
 		{
@@ -287,6 +316,271 @@ func TestParseOpenAISubscriptionUsageIsTolerant(t *testing.T) {
 	}
 }
 
+func TestFetchOpenAISubscriptionUsageMapsTheBusinessBody(t *testing.T) {
+	// On a Business plan the windows and the balance are null, so the quota is only
+	// readable from spend_control.individual_limit and the credits flags.
+	got, status, _ := fetchUsage(t, respondWith(http.StatusOK, businessUsageBody))
+	if status != DiscoveryOK {
+		t.Fatalf("status = %v, want ok", status)
+	}
+	want := OpenAISubscriptionUsage{
+		FiveHourPct:    -1,
+		WeeklyPct:      -1,
+		SpendUnit:      "credit",
+		SpendLimit:     "6000",
+		SpendUsed:      "42.5",
+		SpendRemaining: "5957.5",
+		SpendUsedPct:   1,
+		SpendResetAt:   usageTime(1793491200),
+		CreditStatus:   "has_credits",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+	if got.SpendResetAt.Location() != time.UTC {
+		t.Errorf("spend reset location = %v, want UTC", got.SpendResetAt.Location())
+	}
+}
+
+func TestParseOpenAISubscriptionUsageSpendControl(t *testing.T) {
+	const spendReset = 1793491200
+	tests := []struct {
+		name   string
+		body   string
+		want   OpenAISubscriptionUsage
+		wantOK bool
+	}{
+		{
+			name:   "only spend_control, no rate_limit and no credits",
+			body:   `{"spend_control":{"individual_limit":{"unit":"credit","limit":"100","used":"7.25","remaining":"92.75","used_percent":7.25,"reset_at":1793491200}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUnit: "credit", SpendLimit: "100", SpendUsed: "7.25", SpendRemaining: "92.75", SpendUsedPct: 7.25, SpendResetAt: usageTime(spendReset)},
+			wantOK: true,
+		},
+		{
+			name:   "the vendor strings are kept verbatim, not float-parsed",
+			body:   `{"spend_control":{"individual_limit":{"limit":"6000.000","used":"0.10","remaining":"5999.90"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendLimit: "6000.000", SpendUsed: "0.10", SpendRemaining: "5999.90", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "padded strings are trimmed",
+			body:   `{"spend_control":{"individual_limit":{"limit":" 50 ","used":"\t5\n","unit":" credit "}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUnit: "credit", SpendLimit: "50", SpendUsed: "5", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a real zero used_percent is known, not unknown",
+			body:   `{"spend_control":{"individual_limit":{"used_percent":0}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: 0},
+			wantOK: true,
+		},
+		{
+			name:   "a negative used_percent is unknown",
+			body:   `{"spend_control":{"individual_limit":{"used_percent":-3,"used":"1"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "1", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "an over-range used_percent is clamped to 100",
+			body:   `{"spend_control":{"individual_limit":{"used_percent":140}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: 100},
+			wantOK: true,
+		},
+		{
+			name:   "a reset_at alone makes the snapshot known",
+			body:   `{"spend_control":{"individual_limit":{"reset_at":1793491200}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, SpendResetAt: usageTime(spendReset)},
+			wantOK: true,
+		},
+		{
+			name:   "a zero reset_at is unknown",
+			body:   `{"spend_control":{"individual_limit":{"used":"1","reset_at":0}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "1", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a negative or absurd reset_at is unknown",
+			body:   `{"spend_control":{"individual_limit":{"used":"1","reset_at":-5}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "1", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "an absurdly large reset_at is unknown",
+			body:   `{"spend_control":{"individual_limit":{"used":"1","reset_at":9e18}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "1", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a wrong-typed limit (number) is dropped, the others stay",
+			body:   `{"spend_control":{"individual_limit":{"limit":6000,"used":"42.5","remaining":"5957.5"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "42.5", SpendRemaining: "5957.5", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a wrong-typed limit (bool) is dropped, the others stay",
+			body:   `{"spend_control":{"individual_limit":{"limit":true,"used":"42.5"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "42.5", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a wrong-typed limit (object) is dropped, the others stay",
+			body:   `{"spend_control":{"individual_limit":{"limit":{"v":"6000"},"used":"42.5","used_percent":1}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: "42.5", SpendUsedPct: 1},
+			wantOK: true,
+		},
+		{
+			name:   "an over-long used string is dropped, the others stay",
+			body:   `{"spend_control":{"individual_limit":{"limit":"6000","used":"` + strings.Repeat("9", maxSpendValueLen+1) + `"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendLimit: "6000", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a string at the length bound is kept",
+			body:   `{"spend_control":{"individual_limit":{"used":"` + strings.Repeat("9", maxSpendValueLen) + `"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsed: strings.Repeat("9", maxSpendValueLen), SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "wrong-typed percent and reset are dropped, the strings stay",
+			body:   `{"spend_control":{"individual_limit":{"limit":"6000","used_percent":"high","reset_at":"soon"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendLimit: "6000", SpendUsedPct: -1},
+			wantOK: true,
+		},
+		{
+			name:   "a wrong-typed individual_limit leaves the credits and windows",
+			body:   `{"rate_limit":{"primary_window":{"used_percent":5}},"credits":{"has_credits":true},"spend_control":{"individual_limit":["x"]}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: 5, WeeklyPct: -1, SpendUsedPct: -1, CreditStatus: "has_credits"},
+			wantOK: true,
+		},
+		{
+			name:   "a wrong-typed spend_control leaves the credits",
+			body:   `{"spend_control":"nope","credits":{"unlimited":true}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, CreditStatus: "unlimited"},
+			wantOK: true,
+		},
+		{
+			name:   "spend_control rides alongside the windows and the balance",
+			body:   `{"rate_limit":{"primary_window":{"used_percent":23,"reset_at":1760000000}},"credits":{"has_credits":true,"balance":"12.34"},"spend_control":{"individual_limit":{"limit":"10","used":"1","used_percent":10}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: 23, FiveHourResetAt: usageTime(1760000000), WeeklyPct: -1, CreditBalance: "12.34", SpendLimit: "10", SpendUsed: "1", SpendUsedPct: 10, CreditStatus: "has_credits"},
+			wantOK: true,
+		},
+		{
+			name:   "an empty or null spend_control reads nothing",
+			body:   `{"spend_control":{"reached":false,"individual_limit":null}}`,
+			want:   wantUnknownUsage(),
+			wantOK: false,
+		},
+		{
+			name:   "an individual_limit with only unmapped keys reads nothing",
+			body:   `{"spend_control":{"individual_limit":{"source":"group_based_spend_controls","remaining_percent":99,"reset_after_seconds":3600}}}`,
+			want:   wantUnknownUsage(),
+			wantOK: false,
+		},
+		{
+			name:   "an individual_limit of blank strings reads nothing",
+			body:   `{"spend_control":{"individual_limit":{"unit":"  ","limit":"","used":"   ","remaining":null}}}`,
+			want:   wantUnknownUsage(),
+			wantOK: false,
+		},
+		{
+			name:   "a unit alone is not enough to be known",
+			body:   `{"spend_control":{"individual_limit":{"unit":"credit"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUnit: "credit", SpendUsedPct: -1},
+			wantOK: false,
+		},
+		{
+			name:   "a remaining string alone is not enough to be known",
+			body:   `{"spend_control":{"individual_limit":{"remaining":"5"}}}`,
+			want:   OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendRemaining: "5", SpendUsedPct: -1},
+			wantOK: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseOpenAISubscriptionUsage([]byte(tc.body))
+			if ok != tc.wantOK {
+				t.Errorf("known = %v, want %v", ok, tc.wantOK)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("usage = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseOpenAISubscriptionUsageCreditStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus string
+		wantOK     bool
+	}{
+		{"has_credits true", `{"credits":{"has_credits":true,"unlimited":false}}`, "has_credits", true},
+		{"unlimited true", `{"credits":{"has_credits":true,"unlimited":true}}`, "unlimited", true},
+		{"unlimited wins even without has_credits", `{"credits":{"has_credits":false,"unlimited":true}}`, "unlimited", true},
+		{"unlimited alone", `{"credits":{"unlimited":true}}`, "unlimited", true},
+		{"has_credits false is none", `{"credits":{"has_credits":false,"unlimited":false}}`, "none", true},
+		{"has_credits false with the balance null is none", `{"credits":{"has_credits":false,"balance":null}}`, "none", true},
+		{"has_credits false and nothing else is none", `{"credits":{"has_credits":false}}`, "none", true},
+		{"has_credits true and nothing else", `{"credits":{"has_credits":true}}`, "has_credits", true},
+		{"credits absent", `{"rate_limit":{"primary_window":{"used_percent":5}}}`, "", true},
+		{"credits null", `{"credits":null,"rate_limit":{"primary_window":{"used_percent":5}}}`, "", true},
+		{"credits an empty object", `{"credits":{},"rate_limit":{"primary_window":{"used_percent":5}}}`, "", true},
+		{"credits without the flags", `{"credits":{"balance":"1.00"}}`, "", true},
+		{"has_credits null and unlimited false", `{"credits":{"has_credits":null,"unlimited":false,"balance":"1.00"}}`, "", true},
+		{"wrong-typed flags are unknown", `{"credits":{"has_credits":"yes","unlimited":1,"balance":"1.00"}}`, "", true},
+		{"a wrong-typed unlimited does not hide has_credits", `{"credits":{"has_credits":true,"unlimited":"yes"}}`, "has_credits", true},
+		{"a wrong-typed has_credits does not hide unlimited", `{"credits":{"has_credits":"yes","unlimited":true}}`, "unlimited", true},
+		{"credits of the wrong type", `{"credits":"nope","rate_limit":{"primary_window":{"used_percent":5}}}`, "", true},
+		{"credits an array", `{"credits":[true],"rate_limit":{"primary_window":{"used_percent":5}}}`, "", true},
+		{"the flags alone make the snapshot known", `{"credits":{"has_credits":false}}`, "none", true},
+		{"no flags and nothing else is not known", `{"credits":{"overage_limit_reached":false}}`, "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseOpenAISubscriptionUsage([]byte(tc.body))
+			if ok != tc.wantOK {
+				t.Errorf("known = %v, want %v", ok, tc.wantOK)
+			}
+			if got.CreditStatus != tc.wantStatus {
+				t.Errorf("CreditStatus = %q, want %q", got.CreditStatus, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestFetchOpenAISubscriptionUsageCreditFlagsAloneAreOK(t *testing.T) {
+	// A body whose only readable fact is the credit state is a real answer: it must
+	// not be dropped as Unverifiable.
+	for body, want := range map[string]string{
+		`{"credits":{"has_credits":true,"unlimited":true}}`: "unlimited",
+		`{"credits":{"has_credits":false}}`:                 "none",
+	} {
+		got, status, _ := fetchUsage(t, respondWith(http.StatusOK, body))
+		if status != DiscoveryOK {
+			t.Errorf("%s: status = %v, want ok", body, status)
+		}
+		if got.CreditStatus != want {
+			t.Errorf("%s: CreditStatus = %q, want %q", body, got.CreditStatus, want)
+		}
+	}
+}
+
+func TestFetchOpenAISubscriptionUsageWindowBodyLeavesTheSpendFieldsUnknown(t *testing.T) {
+	// The window/balance shape other plans send must not grow spend facts.
+	got, status, _ := fetchUsage(t, respondWith(http.StatusOK, usageBody))
+	if status != DiscoveryOK {
+		t.Fatalf("status = %v, want ok", status)
+	}
+	if got.SpendUnit != "" || got.SpendLimit != "" || got.SpendUsed != "" || got.SpendRemaining != "" ||
+		got.SpendUsedPct != -1 || got.SpendResetAt != nil {
+		t.Errorf("usage = %+v, want every spend field unknown", got)
+	}
+	if got.FiveHourPct != 23 || got.WeeklyPct != 61 || got.CreditBalance != "12.34" {
+		t.Errorf("usage = %+v, want the windows and the balance unchanged", got)
+	}
+}
+
 func TestFetchOpenAISubscriptionUsageNon2xxIsUnverifiable(t *testing.T) {
 	// A 401 is NOT reported as a bad credential here: the fetch only ever says
 	// "got a snapshot" or "could not verify", so the caller keeps what it stored.
@@ -321,7 +615,7 @@ func TestFetchOpenAISubscriptionUsageJunkBodiesAreUnverifiable(t *testing.T) {
 		"empty windows":          `{"rate_limit":{"primary_window":{},"secondary_window":{}},"credits":{}}`,
 		"null windows":           `{"rate_limit":{"primary_window":null,"secondary_window":null},"credits":null}`,
 		"nothing readable":       `{"rate_limit":{"primary_window":{"used_percent":"x","reset_at":"y"}},"credits":{"balance":[1]}}`,
-		"only unmapped fields":   `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false},"credits":{"has_credits":true,"unlimited":true}}`,
+		"only unmapped fields":   `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false},"credits":{"overage_limit_reached":false},"spend_control":{"reached":false}}`,
 		"only a zero reset time": `{"rate_limit":{"primary_window":{"reset_at":0}}}`,
 	}
 	for name, body := range junk {

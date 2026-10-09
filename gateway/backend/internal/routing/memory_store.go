@@ -2325,11 +2325,13 @@ func sortedByFirstSeen(byID map[string]time.Time) []string {
 // slices or maps, so a stored/returned account never aliases the caller's.
 func copyVendorAccount(a VendorAccount) VendorAccount { return a }
 
-// copyVendorAccountUsage deep-copies the snapshot's two *time.Time fields so a
-// stored/returned value never aliases the caller's reset pointers.
+// copyVendorAccountUsage deep-copies the snapshot's three *time.Time fields so a
+// stored/returned value never aliases the caller's reset pointers. Every other
+// field (the strings and floats, spend control included) is a plain value copy.
 func copyVendorAccountUsage(u VendorAccountUsage) VendorAccountUsage {
 	u.FiveHourResetAt = copyTimePtr(u.FiveHourResetAt)
 	u.WeeklyResetAt = copyTimePtr(u.WeeklyResetAt)
+	u.SpendResetAt = copyTimePtr(u.SpendResetAt)
 	return u
 }
 

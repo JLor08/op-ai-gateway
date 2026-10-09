@@ -36,15 +36,21 @@ function UsageWindow({
   pct,
   resetAt,
   now,
+  valueText,
 }: Readonly<{
   t: Translation;
   label: string;
   pct: number;
   resetAt: string | null;
   now: number;
+  // Replaces the "N % used" text, for a row that carries amounts as well (the
+  // spend-control credits). With it, an unknown percentage (-1) keeps the text
+  // but draws no bar, instead of the "no data yet" row.
+  valueText?: string;
 }>) {
+  const known = pct >= 0;
   // -1 is "never observed", deliberately not a 0 % bar.
-  if (pct < 0) {
+  if (!known && valueText === undefined) {
     return (
       <Box>
         <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
@@ -54,21 +60,23 @@ function UsageWindow({
       </Box>
     );
   }
-  const shown = Math.min(100, Math.round(pct));
+  const shown = known ? Math.min(100, Math.round(pct)) : 0;
   const reset = resetLine(t, resetAt, now);
   return (
     <Box>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, mb: 0.75 }}>
         <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
-        <Typography>{t.vendorUsagePercentUsed(shown)}</Typography>
+        <Typography>{valueText ?? t.vendorUsagePercentUsed(shown)}</Typography>
       </Box>
-      <LinearProgress
-        variant="determinate"
-        value={shown}
-        color={barColor(pct)}
-        aria-label={label}
-        sx={{ height: 8, borderRadius: 4 }}
-      />
+      {known && (
+        <LinearProgress
+          variant="determinate"
+          value={shown}
+          color={barColor(pct)}
+          aria-label={label}
+          sx={{ height: 8, borderRadius: 4 }}
+        />
+      )}
       {reset !== null && (
         <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
           {reset}
@@ -78,16 +86,107 @@ function UsageWindow({
   );
 }
 
+// The vendor's spend-control strings are raw and not validated as numbers. Only a
+// plain decimal that a double holds exactly is reformatted (one decimal, the portal
+// locale); anything else -- "n/a", "1e3", "0x10", a 20-digit integer -- is shown as
+// the vendor sent it rather than guessed at or turned into NaN.
+const PLAIN_DECIMAL = /^-?\d+(\.\d+)?$/;
+
+function formatSpendAmount(t: Translation, raw: string): string {
+  const trimmed = raw.trim();
+  if (!PLAIN_DECIMAL.test(trimmed)) return trimmed;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && Math.abs(n) <= Number.MAX_SAFE_INTEGER
+    ? t.vendorUsageSpendNumber(n)
+    : trimmed;
+}
+
+// "credit"/"credits" (what the vendor reports today) and an unreported unit both
+// read "Credits"; any other unit is shown as the vendor named it.
+function spendUnit(t: Translation, raw: string): string {
+  const unit = raw.trim();
+  return unit === '' || /^credits?$/i.test(unit) ? t.vendorUsageCredits : unit;
+}
+
+// Spend control is present when the vendor reported a percentage or an amount.
+function hasSpend(usage: VendorAccountUsage): boolean {
+  return (
+    usage.spend_used_pct >= 0 || usage.spend_limit.trim() !== '' || usage.spend_used.trim() !== ''
+  );
+}
+
+// "42,5 / 6000 Credits (1 %)". The used amount is formatted for display; the
+// limit is shown as the vendor sent it. A missing half degrades to "N Credits used"
+// / "Limit: N Credits", and an unknown percentage leaves off the parenthesis.
+function spendLine(t: Translation, usage: VendorAccountUsage): string {
+  const unit = spendUnit(t, usage.spend_unit);
+  const used = usage.spend_used.trim() === '' ? '' : formatSpendAmount(t, usage.spend_used);
+  const limit = usage.spend_limit.trim();
+  let amount = '';
+  if (used !== '' && limit !== '') amount = `${used} / ${limit} ${unit}`;
+  else if (used !== '') amount = t.vendorUsageSpendUsed(used, unit);
+  else if (limit !== '') amount = t.vendorUsageSpendLimit(limit, unit);
+  if (usage.spend_used_pct < 0) return amount;
+  const shown = Math.min(100, Math.round(usage.spend_used_pct));
+  return amount === '' ? t.vendorUsagePercentUsed(shown) : t.vendorUsageSpendLine(amount, shown);
+}
+
+function CreditRow({ label, value }: Readonly<{ label: string; value: string }>) {
+  return (
+    <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
+      <Typography sx={{ fontWeight: 600 }}>{label}</Typography>
+      <Typography>{value}</Typography>
+    </Box>
+  );
+}
+
+// The credit side of the panel, one state by priority: the spend-control credits
+// (a Business plan) win; else "unlimited"; else the vendor's credit balance (the
+// plans that report one); else an explicit "no credits". "has_credits" with no
+// amounts or balance has nothing more to say, and an unknown status says nothing.
+function CreditState({
+  t,
+  usage,
+  now,
+}: Readonly<{ t: Translation; usage: VendorAccountUsage; now: number }>) {
+  if (hasSpend(usage)) {
+    return (
+      <UsageWindow
+        t={t}
+        label={t.vendorUsageSpendLabel}
+        pct={usage.spend_used_pct}
+        resetAt={usage.spend_reset_at}
+        now={now}
+        valueText={spendLine(t, usage)}
+      />
+    );
+  }
+  if (usage.credit_status === 'unlimited') {
+    return <CreditRow label={t.vendorUsageSpendLabel} value={t.vendorUsageUnlimited} />;
+  }
+  if (usage.credit_balance !== '') {
+    return <CreditRow label={t.vendorUsageCreditBalance} value={usage.credit_balance} />;
+  }
+  if (usage.credit_status === 'none') {
+    return <CreditRow label={t.vendorUsageSpendLabel} value={t.vendorUsageNoCredits} />;
+  }
+  return null;
+}
+
 /**
  * The "Usage & limits" panel of a vendor account's detail view: the 5-hour and
  * the weekly window as progress bars with "resets in ..." under them, plus the
- * vendor's credit balance when it reported one. PERCENTAGES ONLY -- neither
- * vendor publishes an absolute cap, so there is deliberately no "N of M".
+ * credit side: the vendor's credit balance when it reported one, or -- for a
+ * Codex Business plan, whose quota is spend-control credits rather than rate-limit
+ * windows -- "used / limit Credits" with a bar and its reset (#195), or the
+ * unlimited / no-credits state. The windows are PERCENTAGES ONLY (neither vendor
+ * publishes an absolute cap); only the spend-control credits carry amounts.
  *
- * It renders nothing at all without a snapshot, or when the snapshot knows no
- * window yet and carries no credit balance (every percentage -1): an account
- * the gateway has not seen a rate-limit header for has nothing to show. A single
- * unknown window next to a known one reads "No data yet" instead of a 0 % bar.
+ * It renders nothing at all without a snapshot, or when the snapshot knows
+ * nothing yet: no window (every percentage -1), no credit balance, no spend
+ * control and no credit status. An account the gateway has not seen a rate-limit
+ * header for has nothing to show. A single unknown window next to a known one
+ * reads "No data yet" instead of a 0 % bar.
  * `now` is injectable so the countdowns are deterministic in tests.
  */
 export function VendorAccountUsagePanel({
@@ -101,7 +200,10 @@ export function VendorAccountUsagePanel({
 }>) {
   if (!usage) return null;
   const hasWindow = usage.five_hour_pct >= 0 || usage.weekly_pct >= 0;
-  if (!hasWindow && usage.credit_balance === '') return null;
+  const spend = hasSpend(usage);
+  if (!hasWindow && usage.credit_balance === '' && !spend && usage.credit_status === '') {
+    return null;
+  }
 
   const updatedAt = new Date(usage.updated_at).getTime();
   return (
@@ -109,7 +211,7 @@ export function VendorAccountUsagePanel({
       <Panel
         titleId="vendor-account-usage-heading"
         title={t.vendorUsageTitle}
-        subtitle={t.vendorUsageIntro}
+        subtitle={spend ? t.vendorUsageIntroSpend : t.vendorUsageIntro}
       >
         <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
           <UsageWindow
@@ -126,12 +228,7 @@ export function VendorAccountUsagePanel({
             resetAt={usage.weekly_reset_at}
             now={now}
           />
-          {usage.credit_balance !== '' && (
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2 }}>
-              <Typography sx={{ fontWeight: 600 }}>{t.vendorUsageCreditBalance}</Typography>
-              <Typography>{usage.credit_balance}</Typography>
-            </Box>
-          )}
+          <CreditState t={t} usage={usage} now={now} />
           {!Number.isNaN(updatedAt) && (
             <Typography variant="caption" color="text.secondary">
               {t.vendorUsageUpdatedAt(t.activityRelativeTime((now - updatedAt) / 1000))}

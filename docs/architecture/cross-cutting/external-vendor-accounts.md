@@ -63,7 +63,8 @@ human-readable `display_name` (`''` when it gave none; since migration 83). The
 catalog starts as a small **static guess** keyed by vendor **and** auth type
 (§10), written when the account is created, and is **replaced by the vendor's
 real list** once discovery has run (§6). The three tables and the
-`usage_events.account_id` attribution column are migration 82; see
+`usage_events.account_id` attribution column are migration 82; migration 84 later
+adds the spend-control columns to the usage snapshot (§5.2); see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
 
 The domain type is `routing.VendorAccount`, stored across all three drivers
@@ -709,8 +710,11 @@ header is redacted in payload capture (a latent leak the feature closed).
 
 ## 5. Usage & limits
 
-Neither vendor exposes an absolute subscription cap, so the panel shows
-**percentages and reset times only**. They live in one per-account snapshot
+Neither vendor exposes an absolute cap on its **rate-limit windows**, so those are
+shown as **percentages and reset times only**. The one absolute figure is the
+**spend-control credit allowance** of a Codex *Business* (workspace) plan, whose
+quota is a number of credits rather than a window: the panel shows it as
+"used / limit Credits" (§5.2, §5.4). Everything lives in one per-account snapshot
 (`vendor_account_usage`) that two independent, best-effort writers fill: a
 **passive header scrape** on every served request (§5.1) and, for an OpenAI
 subscription only, an **active pull** from the vendor's usage endpoint whenever
@@ -736,7 +740,10 @@ alone). What it does parse is merged over the stored row (§5.3).
 
 Parsing is **tolerant**: a missing/non-numeric value leaves the window at its
 unknown sentinel (`-1` percent, nil reset), never a fabricated `0`; a scaled
-percent is clamped to `≤ 100`.
+percent is clamped to `≤ 100`. The scrape knows **nothing about spend control or
+the credit state** (the response headers never carry them): it builds its snapshot
+with `SpendUsedPct = -1` and no spend strings, so the merge (§5.3) keeps whatever
+the active pull stored.
 
 ### 5.2 Active pull (OpenAI subscription only)
 
@@ -748,26 +755,77 @@ such endpoint; for Anthropic the header scrape stays the only source.
 
 | Credential | Request | Provenance |
 |---|---|---|
-| OpenAI **subscription** | `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `User-Agent: codex-cli`; no query, no body | reverse-engineered from the open-source Codex client, **VERIFY-LIVE** — not yet confirmed against a live account |
+| OpenAI **subscription** | `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `User-Agent: codex-cli`; no query, no body | reverse-engineered from the open-source Codex client, **VERIFY-LIVE** — the **Business** body below is the first sample confirmed against a live account; the `rate_limit` window shape of the other plans is still unconfirmed |
 
 The fetcher is `vendorauth.FetchOpenAISubscriptionUsage` (`internal/vendorauth/usage.go`),
 built like the discovery fetchers (§6): one GET, **no error return**, only a
 snapshot and a status, `ok` or `unverifiable`. The URL and the `User-Agent` live in
-`constants.go` beside the other VERIFY-LIVE constants. The body is mapped as
-`rate_limit.primary_window` → the five-hour window and `rate_limit.secondary_window`
-→ the weekly one (each `used_percent` and `reset_at`, an absolute unix time in
-seconds), and `credits.balance` → the credit balance. The other fields of the
-`credits` object, `has_credits` and `unlimited`, are **not read** (follow-up, below).
+`constants.go` beside the other VERIFY-LIVE constants.
 
-Parsing is as tolerant as the scrape's, and for the same reason: a percent is
-clamped to `≤ 100` and a negative one is unknown; an absent, null or `0` reset is
-unknown; a balance is kept as the string the vendor wrote (a JSON number is
-coerced to its literal, one longer than 64 bytes is unknown); a field of the wrong
-type is skipped without sinking its siblings. The verdict is `ok` only when **at
-least one** field could be read. Every other answer — any non-2xx (a 401 included:
-it is no verdict on the credential, and only the dispatch moves an account to
-`needs_reconnect`), a redirect (never followed), a timeout, a transport failure, a
-body that is not JSON, or JSON that carries none of the fields — is `unverifiable`,
+**Three quota shapes.** The body carries a plan's quota in one of three shapes, and
+the fetcher reads each independently (a body may carry more than one, and a plan
+reports `null` for the shapes it does not use):
+
+| Shape | Body fields | Snapshot fields | Plans |
+|---|---|---|---|
+| Rate-limit windows | `rate_limit.primary_window` → the five-hour window and `rate_limit.secondary_window` → the weekly one; each `used_percent` and `reset_at` (an absolute unix time in seconds) | `five_hour_pct` / `five_hour_reset_at`, `weekly_pct` / `weekly_reset_at` | Plus / Pro style plans (reverse-engineered, not live-confirmed) |
+| Spend-control credits | `spend_control.individual_limit`: `unit`, `limit`, `used`, `remaining` (JSON **strings**), `used_percent` (number), `reset_at` (unix seconds) | `spend_unit`, `spend_limit`, `spend_used`, `spend_remaining`, `spend_used_pct`, `spend_reset_at` | Business / workspace plans (**live-confirmed**, one sample) |
+| Credit balance | `credits.balance` (a nullable string) | `credit_balance` | plans that report one |
+
+The `credits.unlimited` and `credits.has_credits` flags are read on top of these
+and collapse into one `credit_status` (below).
+
+The first live sample, from a **Business** plan, reads as follows (PII and the exact
+usage figures replaced by placeholders; the types and the shape are the real
+ones). `rate_limit` and `credits.balance` are both `null`, so a fetcher that read
+only those two shapes found nothing to store and the panel stayed empty (#195):
+
+```json
+{
+  "plan_type": "business",
+  "rate_limit": null,
+  "credits": {
+    "has_credits": true, "unlimited": false, "overage_limit_reached": false,
+    "balance": null
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": {
+      "source": "group_based_spend_controls", "unit": "credit",
+      "limit": "<limit>", "used": "<used>", "remaining": "<remaining>",
+      "used_percent": 1, "remaining_percent": 99,
+      "reset_after_seconds": 1938953, "reset_at": 1793491200
+    }
+  }
+}
+```
+
+(Further keys of the real body, among them `user_id`, `account_id`, `email`,
+`model_usage`, `code_review_rate_limit` and `promo`, are ignored and omitted here.)
+
+**The credit status.** The two flags collapse into one store-friendly, unknown-aware
+column, `credit_status`, by priority: `"unlimited"` when `credits.unlimited` is
+`true`; else `"has_credits"` when `credits.has_credits` is `true`; else `"none"` when
+`has_credits` is `false`; else `""` (unknown: no `credits` object, or both flags
+absent, `null` or not booleans). Each flag is read on its own, so a malformed one
+never hides the other. `overage_limit_reached`, `spend_control.reached` and the
+`source`, `remaining_percent` and `reset_after_seconds` fields are **not read**.
+
+Parsing is as tolerant as the scrape's, and for the same reason: a percent
+(window or spend) is clamped to `≤ 100` and a negative one is unknown; an absent,
+null or `0` reset is unknown; a balance is kept as the string the vendor wrote (a
+JSON number is coerced to its literal, one longer than 64 bytes is unknown); the
+spend-control strings (`unit`, `limit`, `used`, `remaining`) are trimmed and kept
+**verbatim, never parsed to a number**, so the unit and the exact digits survive
+(longer than 64 bytes, blank, or a JSON number where a string is expected is
+unknown); a field of the wrong type is skipped without sinking its siblings. The
+verdict is `ok` only when **at least one** field could be read: a window percent
+or reset, a balance, a spend percent, reset, limit or used amount, or a credit
+status (a spend `unit` or `remaining` alone does not count). Every other answer —
+any non-2xx (a 401 included: it is no verdict on the credential, and only the
+dispatch moves an account to `needs_reconnect`), a redirect (never followed), a
+timeout, a transport failure, a body that is not JSON, or JSON that carries none of
+the fields — is `unverifiable`,
 and an empty answer is deliberately not "OK, nothing known", for the reason given
 for discovery (§6.3): it must not be able to wipe a stored snapshot. The response
 is capped at the same 8 MiB as a discovery fetch (§6.4).
@@ -812,10 +870,15 @@ replaces a good snapshot with an all-unknown one".
 Both writers read the stored row and combine it with their reading through
 `routing.MergeVendorAccountUsage(existing, incoming)`, a pure function. Per field the
 result takes `incoming` when it **knows** the field and keeps `existing` otherwise:
-a percent is known when it is `≥ 0` (a real `0` is known, `-1` is not), a reset time
-when non-nil, the credit balance when non-empty. A field no writer has ever seen
-stays unknown (`-1` / nil / `""`) and is never turned into a fabricated `0`: with no
-stored row, the reading is written as it is. A stored row that cannot be read is
+a percent (`five_hour_pct`, `weekly_pct`, `spend_used_pct`) is known when it is
+`≥ 0` (a real `0` is known, `-1` is not), a reset time (`five_hour_reset_at`,
+`weekly_reset_at`, `spend_reset_at`) when non-nil, and each string (`credit_balance`,
+`spend_unit`, `spend_limit`, `spend_used`, `spend_remaining`, `credit_status`) when
+non-empty. A field no writer has ever seen stays unknown (`-1` / nil / `""`) and is
+never turned into a fabricated `0`: with no stored row, the reading is written as
+it is. A writer that has no spend data must therefore set `spend_used_pct` to `-1`,
+not leave the zero value: `0` is a *known* 0 % and would overwrite a stored percent
+(the scrape does so, §5.1). A stored row that cannot be read is
 handled per writer, both best-effort: the scrape writes its own reading as it is,
 the pull writes nothing.
 
@@ -825,6 +888,10 @@ Two consequences to know:
   balance carried over a scrape that only reported the windows still shows the
   fresh `UpdatedAt`, so the panel's "updated" time says when the snapshot was last
   touched, not how old each number is.
+- A field the vendor **stops reporting** is not cleared: the merge reads an unknown
+  incoming field as "no news", never as "gone", so it keeps its last value. A
+  Business account whose spend control disappears from the body keeps showing its
+  last stored credits, with the fresh `UpdatedAt`.
 - The read-merge-write takes **no per-account lock**, in either writer. Two that
   overlap (a scrape during a refresh) can each merge against a read that misses the
   other's newer write, and the later write wins. The worst case is one writer's
@@ -837,16 +904,53 @@ Two consequences to know:
 
 The snapshot is exposed only on the **detail** read (`GET /api/portal/vendor-accounts/{id}`
 → `VendorAccountDTO.Usage`, `omitempty`), never on the list (one snapshot read per
-row would be an N+1), and a `-1` window is hidden in the UI rather than shown as a
-real 0 %. The detail view's usage panel **re-reads** the account after a successful
-models refresh — whatever its `ok` / `unverifiable` answer, since the pull may have
-changed the snapshot either way — so a fresh pull shows without reloading the page;
-a refresh that failed with an error does not trigger it. API-key accounts carry no
-subscription window; absolute €/$ spend accounting is deferred.
+row would be an N+1). `VendorAccountUsageDTO` (and the frontend's `VendorAccountUsage`
+type) carries, always on the wire, the three windows' `five_hour_pct`,
+`five_hour_reset_at`, `weekly_pct`, `weekly_reset_at`, the raw `credit_balance`, the
+spend-control and credit-state fields `spend_unit`, `spend_limit`, `spend_used`,
+`spend_remaining` (the vendor's raw strings), `spend_used_pct` (`0..100`),
+`spend_reset_at` and `credit_status` (`"unlimited"` | `"has_credits"` | `"none"`),
+and `updated_at`. The unknown sentinels travel as they are stored: `-1` for a
+percent, `null` for a reset, `""` for a string, so an account with no spend control
+reads `""` / `-1` / `null` for all of the spend fields. They are stored in the
+seven columns migration 84 adds to `vendor_account_usage`
+([Data Model](../reference/data-model.md#external-vendor-accounts-anbieter)).
 
-Deliberately **not** in this change, and listed as follow-ups: the credit object's
-`has_credits` and `unlimited` flags (so a plan with no credit balance cannot yet be
-told apart from a balance the vendor did not send), and a **dedicated
+The detail view's usage panel **re-reads** the account after a successful models
+refresh — whatever its `ok` / `unverifiable` answer, since the pull may have changed
+the snapshot either way — so a fresh pull shows without reloading the page; a
+refresh that failed with an error does not trigger it. The spend-control figures
+change only through that pull: the passive scrape never carries them (§5.1), so a
+Business account's credits are as fresh as its last models refresh or connect.
+
+**What the panel shows.** It renders nothing when the snapshot knows nothing (no
+window, no balance, no spend, no credit status). Otherwise the two window rows
+always appear, and a window that was never observed (`-1`) reads "No data yet"
+rather than a real 0 %. The credit side is **one row, chosen by priority**:
+
+| Snapshot | Row |
+|---|---|
+| spend control known (`spend_used_pct ≥ 0`, or a non-empty `spend_limit` or `spend_used`) | "Credit-Kontingent" (English: "Credit allowance"): `<used> / <limit> Credits (<pct> %)` with a progress bar and the reset line (`spend_reset_at`); the panel's intro text switches to its spend variant |
+| else `credit_status = "unlimited"` | the same "Credit-Kontingent" label with the value "Unbegrenzt" (English: "Unlimited") |
+| else a non-empty `credit_balance` | "Guthaben" (English: "Credit balance") with the vendor's raw string |
+| else `credit_status = "none"` | the same label with the value "Keine Credits" (English: "No credits") |
+| else (`has_credits`, which has nothing more to say, or unknown) | no credit row |
+
+Display details of the spend row: the used amount is reformatted (at most one
+decimal, the portal locale's decimal separator, no digit grouping) when it is a plain
+decimal, and shown exactly as the vendor sent it otherwise; the limit is always
+shown as the vendor sent it. A unit of `credit` / `credits` (any case) or none reads
+"Credits", any other unit is shown as the vendor named it. The percent is rounded and
+capped at 100; the bar turns amber from 75 % and red from 90 %, and is left off
+(with the text kept) when the percent is unknown. A missing half degrades to
+"`<used>` Credits used" or "Limit: `<limit>` Credits", and an unknown percent leaves
+off the parenthesis. For 42.5 of 6000 credits used (1 %) the German row reads
+"42,5 / 6000 Credits (1 %)" and the English one "42.5 / 6000 Credits (1%)".
+
+API-key accounts carry no subscription window; absolute €/$ spend accounting is
+deferred.
+
+Deliberately **not** in this change, and listed as a follow-up: a **dedicated
 `POST .../usage/refresh` endpoint**, so the usage can be refreshed without also
 re-listing the models.
 
@@ -1202,8 +1306,9 @@ reasons are recorded deliberately, not in denial of them
 - [Security, Authentication & Authorization](security-auth-rbac.md) — scopes and
   object-level authorization.
 - [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter) — the
-  three tables and the `usage_events.account_id` column (migration 82), and the
-  prefix and display-name columns (migration 83).
+  three tables and the `usage_events.account_id` column (migration 82), the
+  prefix and display-name columns (migration 83) and the usage snapshot's
+  spend-control columns (migration 84).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
   `/api/portal/vendor-accounts*` routes (the model refresh included) and their
   error codes.

@@ -199,6 +199,10 @@ func normalizeVendorAccountUsageForCompare(in routing.VendorAccountUsage) routin
 		t := in.WeeklyResetAt.UTC()
 		out.WeeklyResetAt = &t
 	}
+	if in.SpendResetAt != nil {
+		t := in.SpendResetAt.UTC()
+		out.SpendResetAt = &t
+	}
 	return out
 }
 
@@ -212,20 +216,27 @@ func vendorAccountUsageEqual(a, b routing.VendorAccountUsage) bool {
 	}
 	return na.AccountID == nb.AccountID && na.FiveHourPct == nb.FiveHourPct && na.WeeklyPct == nb.WeeklyPct &&
 		na.CreditBalance == nb.CreditBalance && na.UpdatedAt.Equal(nb.UpdatedAt) &&
-		timePtrEq(na.FiveHourResetAt, nb.FiveHourResetAt) && timePtrEq(na.WeeklyResetAt, nb.WeeklyResetAt)
+		timePtrEq(na.FiveHourResetAt, nb.FiveHourResetAt) && timePtrEq(na.WeeklyResetAt, nb.WeeklyResetAt) &&
+		na.SpendUnit == nb.SpendUnit && na.SpendLimit == nb.SpendLimit && na.SpendUsed == nb.SpendUsed &&
+		na.SpendRemaining == nb.SpendRemaining && na.SpendUsedPct == nb.SpendUsedPct &&
+		timePtrEq(na.SpendResetAt, nb.SpendResetAt) && na.CreditStatus == nb.CreditStatus
 }
 
 // TestRoutingStoreVendorAccountUsageUpsertRoundTrip pins the rate-limit
 // usage-snapshot store on every driver (memory + sqlite + postgres): upsert on an
 // unknown account is ErrNotFound; a read before any upsert is ok=false; a first
 // upsert round-trips every field (including a SET five-hour reset, a NIL weekly
-// reset, an UNKNOWN -1 weekly percent, and a credit string); a second upsert
-// OVERWRITES the whole row (the previously-set reset can be cleared back to nil,
-// the unknown filled in).
+// reset, an UNKNOWN -1 weekly percent, a credit string, and the Business
+// spend-control columns of migration 84: the raw limit/used/remaining strings, a
+// fractional used percent, a SET spend reset and the credit status); a second
+// upsert OVERWRITES the whole row (the previously-set reset can be cleared back to
+// nil, the unknown filled in, the spend strings blanked and the spend percent
+// reset to the unknown -1).
 func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	reset5h := now.Add(5 * time.Hour)
 	resetWk := now.Add(7 * 24 * time.Hour)
+	resetSpend := now.Add(20 * 24 * time.Hour)
 	seedSQL := func(t *testing.T, s *SQLStore) {
 		if err := s.CreateUser(context.Background(), newTestUser("u_vu", "vu@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
@@ -255,6 +266,8 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 		first := routing.VendorAccountUsage{
 			AccountID: "va_u", FiveHourPct: 42.5, FiveHourResetAt: &reset5h,
 			WeeklyPct: -1, WeeklyResetAt: nil, CreditBalance: "12.34", UpdatedAt: now,
+			SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500.5", SpendRemaining: "4499.5",
+			SpendUsedPct: 25.008, SpendResetAt: &resetSpend, CreditStatus: "has_credits",
 		}
 		if err := s.UpsertVendorAccountUsage(ctx, first); err != nil {
 			t.Fatalf("first upsert: %v", err)
@@ -264,8 +277,9 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 			t.Fatalf("read after first upsert: ok = %v, err = %v", ok, err)
 		}
 		if !vendorAccountUsageEqual(got, first) {
-			t.Fatalf("first round-trip mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",
-				got, got.FiveHourResetAt, got.WeeklyResetAt, first, first.FiveHourResetAt, first.WeeklyResetAt)
+			t.Fatalf("first round-trip mismatch:\n got  %+v (5h=%v wk=%v spend=%v)\n want %+v (5h=%v wk=%v spend=%v)",
+				got, got.FiveHourResetAt, got.WeeklyResetAt, got.SpendResetAt,
+				first, first.FiveHourResetAt, first.WeeklyResetAt, first.SpendResetAt)
 		}
 
 		// A second upsert OVERWRITES the whole row: the previously-set five-hour
@@ -273,6 +287,7 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 		second := routing.VendorAccountUsage{
 			AccountID: "va_u", FiveHourPct: 0, FiveHourResetAt: nil,
 			WeeklyPct: 88.75, WeeklyResetAt: &resetWk, CreditBalance: "", UpdatedAt: now.Add(time.Minute),
+			SpendUsedPct: -1, CreditStatus: "unlimited",
 		}
 		if err := s.UpsertVendorAccountUsage(ctx, second); err != nil {
 			t.Fatalf("second upsert: %v", err)
@@ -282,8 +297,9 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 			t.Fatalf("read after second upsert: ok = %v, err = %v", ok, err)
 		}
 		if !vendorAccountUsageEqual(got2, second) {
-			t.Fatalf("second round-trip mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",
-				got2, got2.FiveHourResetAt, got2.WeeklyResetAt, second, second.FiveHourResetAt, second.WeeklyResetAt)
+			t.Fatalf("second round-trip mismatch:\n got  %+v (5h=%v wk=%v spend=%v)\n want %+v (5h=%v wk=%v spend=%v)",
+				got2, got2.FiveHourResetAt, got2.WeeklyResetAt, got2.SpendResetAt,
+				second, second.FiveHourResetAt, second.WeeklyResetAt, second.SpendResetAt)
 		}
 	})
 }
@@ -292,11 +308,13 @@ func TestRoutingStoreVendorAccountUsageUpsertRoundTrip(t *testing.T) {
 // (memory + sqlite + postgres), the read -> routing.MergeVendorAccountUsage ->
 // upsert sequence the usage writers run: the unknown sentinels (-1 / nil / "")
 // must survive the persisted representation, so a partial snapshot merged over a
-// stored one keeps the stored credit balance, reset and other window rather than
-// blanking them, while the fields it does know are replaced.
+// stored one keeps the stored credit balance, reset, other window and Business
+// spend-control fields (migration 84) rather than blanking them, while the fields
+// it does know are replaced.
 func TestRoutingStoreVendorAccountUsageMergeKeepsStoredFields(t *testing.T) {
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	resetWk := now.Add(7 * 24 * time.Hour)
+	resetSpend := now.Add(20 * 24 * time.Hour)
 	seedSQL := func(t *testing.T, s *SQLStore) {
 		if err := s.CreateUser(context.Background(), newTestUser("u_vm", "vm@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
@@ -335,16 +353,22 @@ func TestRoutingStoreVendorAccountUsageMergeKeepsStoredFields(t *testing.T) {
 		// First write: only a weekly window and a credit balance are known.
 		first := routing.VendorAccountUsage{
 			AccountID: "va_m", FiveHourPct: -1, WeeklyPct: 30, WeeklyResetAt: &resetWk, CreditBalance: "12.34", UpdatedAt: now,
+			SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500", SpendRemaining: "4500",
+			SpendUsedPct: 25, SpendResetAt: &resetSpend, CreditStatus: "has_credits",
 		}
 		if got := merge(t, first); !vendorAccountUsageEqual(got, first) {
 			t.Fatalf("first write (no stored row) mismatch:\n got  %+v\n want %+v", got, first)
 		}
 
-		// A partial snapshot (five-hour percent only) merged over it keeps the
-		// stored weekly window, its reset and the credit balance.
-		partial := routing.VendorAccountUsage{AccountID: "va_m", FiveHourPct: 55, WeeklyPct: -1, UpdatedAt: now.Add(time.Minute)}
+		// A partial snapshot (five-hour percent only, the way the passive header
+		// scrape builds one: no spend data, so SpendUsedPct is the unknown -1) merged
+		// over it keeps the stored weekly window, its reset, the credit balance and
+		// every spend-control field.
+		partial := routing.VendorAccountUsage{AccountID: "va_m", FiveHourPct: 55, WeeklyPct: -1, SpendUsedPct: -1, UpdatedAt: now.Add(time.Minute)}
 		want := routing.VendorAccountUsage{
 			AccountID: "va_m", FiveHourPct: 55, WeeklyPct: 30, WeeklyResetAt: &resetWk, CreditBalance: "12.34", UpdatedAt: now.Add(time.Minute),
+			SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500", SpendRemaining: "4500",
+			SpendUsedPct: 25, SpendResetAt: &resetSpend, CreditStatus: "has_credits",
 		}
 		if got := merge(t, partial); !vendorAccountUsageEqual(got, want) {
 			t.Fatalf("partial merge mismatch:\n got  %+v (5h=%v wk=%v)\n want %+v (5h=%v wk=%v)",

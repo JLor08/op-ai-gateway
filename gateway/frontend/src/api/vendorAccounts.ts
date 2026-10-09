@@ -53,12 +53,26 @@ export type VendorAccountModel = {
 // 0..100, or -1 when that window has never been observed (unknown, NOT 0 % used);
 // a reset time is null when the vendor sent none; credit_balance is the vendor's
 // raw credit string ("" = none).
+//
+// A Business plan's spend control and credit state ride along (always present on
+// the wire): spend_unit (e.g. "credit") and the vendor's raw spend_limit /
+// spend_used / spend_remaining strings (kept verbatim, never parsed), spend_used_pct
+// (0..100, or -1 = unknown, like the windows), spend_reset_at (null = unknown) and
+// credit_status ("unlimited" | "has_credits" | "none", "" = unknown). An account
+// with no spend control reads "" / -1 / null for all of them.
 export type VendorAccountUsage = {
   five_hour_pct: number;
   five_hour_reset_at: string | null;
   weekly_pct: number;
   weekly_reset_at: string | null;
   credit_balance: string;
+  spend_unit: string;
+  spend_limit: string;
+  spend_used: string;
+  spend_remaining: string;
+  spend_used_pct: number;
+  spend_reset_at: string | null;
+  credit_status: string;
   updated_at: string;
 };
 

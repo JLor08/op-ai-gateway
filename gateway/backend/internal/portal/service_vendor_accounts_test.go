@@ -414,6 +414,89 @@ func TestGetVendorAccountUsagePassesUnknownWindowsThrough(t *testing.T) {
 	}
 }
 
+// The Business spend control and the credit state reach the DTO and the wire as
+// snake_case keys (the portal reads them off "usage"), the amounts as the vendor's
+// raw strings and the reset as a time -- and an account with no spend data (the
+// unknown sentinels) serializes them as explicit "" / -1 / null, never a fabricated
+// 0 % so the panel can tell "no spend control" from "0 % of the limit used".
+func TestGetVendorAccountUsageCarriesTheSpendControlFields(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	spendReset := now.Add(10 * 24 * time.Hour)
+
+	known := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Business"))
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID: known.ID, FiveHourPct: 5, WeeklyPct: 6,
+		SpendUnit: "credit", SpendLimit: "6000", SpendUsed: "1500.5", SpendRemaining: "4499.5",
+		SpendUsedPct: 25.008, SpendResetAt: &spendReset, CreditStatus: "has_credits",
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+	got, err := svc.GetVendorAccount(ctx, ownerToken(), known.ID)
+	if err != nil || got.Usage == nil {
+		t.Fatalf("GetVendorAccount = %#v, %v, want a usage snapshot", got, err)
+	}
+	u := got.Usage
+	if u.SpendUnit != "credit" || u.SpendLimit != "6000" || u.SpendUsed != "1500.5" || u.SpendRemaining != "4499.5" ||
+		u.SpendUsedPct != 25.008 || u.CreditStatus != "has_credits" {
+		t.Fatalf("Usage spend fields = %#v", u)
+	}
+	if u.SpendResetAt == nil || !u.SpendResetAt.Equal(spendReset) {
+		t.Fatalf("SpendResetAt = %v, want %v", u.SpendResetAt, spendReset)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for key, want := range map[string]any{
+		"spend_unit": "credit", "spend_limit": "6000", "spend_used": "1500.5", "spend_remaining": "4499.5",
+		"spend_used_pct": 25.008, "credit_status": "has_credits",
+	} {
+		if wire.Usage[key] != want {
+			t.Fatalf("usage JSON %q = %v, want %v: %s", key, wire.Usage[key], want, raw)
+		}
+	}
+	if _, ok := wire.Usage["spend_reset_at"].(string); !ok {
+		t.Fatalf("usage JSON spend_reset_at = %v, want a time string: %s", wire.Usage["spend_reset_at"], raw)
+	}
+
+	// An account whose snapshot has no spend data: the unknown sentinels pass through.
+	plain := createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("Plain"))
+	if err := routeStore.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{
+		AccountID: plain.ID, FiveHourPct: 5, WeeklyPct: 6, SpendUsedPct: -1, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertVendorAccountUsage: %v", err)
+	}
+	gotPlain, err := svc.GetVendorAccount(ctx, ownerToken(), plain.ID)
+	if err != nil || gotPlain.Usage == nil {
+		t.Fatalf("GetVendorAccount = %#v, %v, want a usage snapshot", gotPlain, err)
+	}
+	rawPlain, _ := json.Marshal(gotPlain)
+	var wirePlain struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(rawPlain, &wirePlain); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for key, want := range map[string]any{
+		"spend_unit": "", "spend_limit": "", "spend_used": "", "spend_remaining": "",
+		"spend_used_pct": -1.0, "credit_status": "", "spend_reset_at": nil,
+	} {
+		v, present := wirePlain.Usage[key]
+		if !present || v != want {
+			t.Fatalf("plain usage JSON %q = %v (present %v), want %v: %s", key, v, present, want, rawPlain)
+		}
+	}
+}
+
 // Another user's account stays a 404-no-leak, snapshot or not.
 func TestGetVendorAccountUsageStaysBehindTheOwnerCheck(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)

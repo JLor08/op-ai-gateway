@@ -17,8 +17,9 @@
 // status and no error, so a caller that cannot get a list simply keeps what it has.
 // FetchOpenAISubscriptionUsage is the same kind of fetch for a ChatGPT
 // subscription's rate-limit usage (five-hour and weekly windows plus the credit
-// balance): a snapshot with -1 / nil / "" for every unknown field and an ok or
-// unverifiable status.
+// balance, and for a Business plan the spend-control limit and the credit state):
+// a snapshot with -1 / nil / "" for every unknown field and an ok or unverifiable
+// status.
 //
 // WARNING: this whole path is REVERSE-ENGINEERED from the official vendor CLIs
 // (Claude Code, Codex CLI). It is UNDOCUMENTED, ToS-sensitive and

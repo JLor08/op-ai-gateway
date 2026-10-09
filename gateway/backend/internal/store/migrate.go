@@ -116,6 +116,7 @@ var migrations = []migration{
 	{version: 81, name: "usage_events_billing_unit", up: migration81Up},
 	{version: 82, name: "vendor_accounts", up: migration82Up},
 	{version: 83, name: "vendor_account_model_discovery", up: migration83Up},
+	{version: 84, name: "vendor_account_usage_spend_control", up: migration84Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3927,4 +3928,40 @@ func migration83Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		return err
 	}
 	return addColumnIfMissing(ctx, tx, dl, "vendor_account_models", "display_name text not null default ''")
+}
+
+// migration84Up gives the vendor-account usage snapshot (vendor_account_usage) the
+// Business-plan spend control and the credit state the active Codex usage fetch
+// reports (#195): spend_unit (e.g. "credit") and the vendor's raw
+// spend_limit / spend_used / spend_remaining strings, the used share
+// spend_used_pct (0..100, -1 = unknown), the nullable spend_reset_at, and
+// credit_status ("unlimited" | "has_credits" | "none", "" = unknown).
+//
+// The amounts are TEXT, not numbers: the vendor's strings are kept verbatim so the
+// unit and the exact digits survive. The defaults are the unknown sentinels the
+// snapshot already uses (the empty string, -1 for a percent, NULL for a time), so
+// every row written before the upgrade reads back "no spend data" -- not a
+// fabricated 0 % -- and the two existing writers (the passive header scrape and
+// the pre-#195 fetch) keep working unchanged. No data is backfilled. The
+// percentage is 'double precision' like the two rate-limit windows (the same
+// invariant migration81Up cites: no 'real' column survives a full chain) and the
+// reset time uses dl.timestampType() like five_hour_reset_at. addColumnIfMissing
+// makes the step replayable on both dialects. baselineCreateStatements is NOT
+// touched (frozen as of v60), so the columns live only here -- the same
+// discipline migration61Up, migration81Up and migration83Up follow.
+func migration84Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"spend_unit text not null default ''",
+		"spend_limit text not null default ''",
+		"spend_used text not null default ''",
+		"spend_remaining text not null default ''",
+		"spend_used_pct double precision not null default -1",
+		"spend_reset_at " + dl.timestampType(),
+		"credit_status text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "vendor_account_usage", col); err != nil {
+			return err
+		}
+	}
+	return nil
 }
