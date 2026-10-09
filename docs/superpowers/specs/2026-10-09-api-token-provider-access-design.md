@@ -38,8 +38,12 @@ In scope: personal API tokens (`TokenList`). Everything behind the existing
 `vendor_accounts` experimental flag; flag off ⇒ feature invisible and inert.
 
 Out of scope:
-- Service tokens / chat-session pseudo-tokens — they own no vendor accounts
-  (`token.UserID == ""` ⇒ `ownVendorAccountModels` returns nil), so the feature is moot.
+- Service tokens (`token.UserID == ""`) — they own no vendor accounts
+  (`ownVendorAccountModels` returns nil), so the feature is moot and they stay inert.
+- The owner's interactive session (chat picker, dashboard, trusted loopback chat) — NOT
+  inert: `sessionPrincipal` carries the logged-in user's `UserID` and is given
+  `VendorAccess{All: true}`, so it sees all of the user's own vendor accounts under their
+  native prefixes exactly as before. Only API tokens are subject to the opt-in.
 - Self-hosted servers/adapters — they have no prefix concept; a token-level prefix there
   would be a new namespacing mechanism (explicitly deferred, "variant B").
 - An "all except X" mode.

@@ -111,6 +111,98 @@ func TestSessionPrincipalInheritsChatFlags(t *testing.T) {
 	}
 }
 
+// TestSessionPrincipalGrantsAllVendorAccess pins that the owner's interactive
+// session (cookie or trusted loopback) sees ALL of their own vendor accounts under
+// each account's native prefix. Per-token vendor access is strict by default for
+// API tokens only; a session principal has no api_tokens row to opt in on, so it
+// carries VendorAccess{All: true} itself. Without it the chat picker and the
+// dashboard (Models(), Dashboard()) would list none of the user's vendor models.
+func TestSessionPrincipalGrantsAllVendorAccess(t *testing.T) {
+	for _, role := range []string{"user", "admin", "system_admin"} {
+		for _, elevated := range []bool{false, true} {
+			p := sessionPrincipal(store.User{ID: "usr_1", Role: role}, elevated)
+			if !p.VendorAccess.All || len(p.VendorAccess.Accounts) != 0 {
+				t.Fatalf("role=%s elevated=%v: VendorAccess = %+v, want {All: true}", role, elevated, p.VendorAccess)
+			}
+		}
+	}
+}
+
+// TestSessionChatPickerListsOwnVendorModelsButStrictTokenDoesNot is the listing
+// proof of the same rule through the real HTTP stack: a logged-in user's session
+// lists their own vendor-account model in the chat picker (/api/portal/models),
+// while a bearer API token of the same user that has not opted in sees none.
+func TestSessionChatPickerListsOwnVendorModelsButStrictTokenDoesNot(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	ts := auth.NewTokenStore()
+	dir := portal.NewMemoryDirectory(ts)
+	acct := account.NewService(account.Deps{Users: dir, Sessions: dir, SetPasswordTokens: dir, SettingsVolatile: true}, account.Config{
+		IdleTTL: time.Hour, MaxTTL: 24 * time.Hour, InviteTTL: 72 * time.Hour, DefaultLanguage: "de",
+	})
+	recorder := usage.NewRecorder()
+	routeStore := routing.NewMemoryStore()
+	settings := portal.NewMemorySystemSettings()
+	if err := settings.SetSystemSetting(ctx, "vendor_accounts_enabled", "true", time.Time{}); err != nil {
+		t.Fatalf("SetSystemSetting: %v", err)
+	}
+	svc := portal.NewService(portal.ServiceDeps{Users: dir, Tokens: dir, Usage: recorder, Routes: routeStore, Groups: dir, Projects: dir, SystemSettings: settings, UIPrefs: portal.NewMemoryUIPreferences()})
+	srv := New(ServerDeps{
+		Tokens: ts, Usage: recorder, Portal: svc, Account: acct, Routes: routeStore,
+		CookieSecure: false, SessionMaxAge: 24 * time.Hour, PublicURL: "http://localhost:8080",
+	})
+	seedLoginUser(t, dir, "usr_vendor", "vendor@example.test", "password-1", "user")
+	const apiSecret = "vendor-owner-api-secret"
+	if err := dir.CreatePlainToken(ctx, store.TokenRecord{ID: "tok_vendor", UserID: "usr_vendor", Name: "API", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, apiSecret); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+	if err := routeStore.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: "acc_vendor", OwnerUserID: "usr_vendor", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "Mine", Status: routing.VendorAccountStatusActive, ModelPrefix: "mine/", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if err := routeStore.SetVendorAccountModels(ctx, "acc_vendor", []routing.VendorAccountModel{
+		{GatewayModel: "mine/gpt-4o", UpstreamModel: "gpt-4o", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+
+	listed := func(req *http.Request) bool {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/portal/models = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Data []portal.ModelDTO `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+		}
+		for _, m := range out.Data {
+			if m.ID == "mine/gpt-4o" {
+				return true
+			}
+		}
+		return false
+	}
+
+	cookie := loginAs(t, srv, "vendor@example.test", "password-1")
+	sessionReq := httptest.NewRequest(http.MethodGet, "/api/portal/models", nil)
+	sessionReq.AddCookie(cookie)
+	if !listed(sessionReq) {
+		t.Fatalf("the owner's session must list their own vendor model mine/gpt-4o in the chat picker")
+	}
+
+	tokenReq := httptest.NewRequest(http.MethodGet, "/api/portal/models", nil)
+	tokenReq.Header.Set("Authorization", "Bearer "+apiSecret)
+	if listed(tokenReq) {
+		t.Fatalf("an API token without vendor access must not list vendor models (strict default)")
+	}
+}
+
 // TestSessionPrincipalElevationGatesSystemScope proves the gating rule: a
 // system_admin only carries the `system` scope when elevated; a plain admin
 // never carries it regardless of the elevated flag.

@@ -17,6 +17,7 @@ func TestTokenVendorPrefix(t *testing.T) {
 		wantAllowed bool
 	}{
 		{"all uses native", auth.VendorAccess{All: true}, "native/", true},
+		{"all wins over listed override", auth.VendorAccess{All: true, Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1", OverrideEnabled: true, OverridePrefix: "x/"}}}, "native/", true},
 		{"not listed -> denied", auth.VendorAccess{}, "", false},
 		{"listed, no override -> native", auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1"}}}, "native/", true},
 		{"listed, override value", auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_1", OverrideEnabled: true, OverridePrefix: "x/"}}}, "x/", true},
