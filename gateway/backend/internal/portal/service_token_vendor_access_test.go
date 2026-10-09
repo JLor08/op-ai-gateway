@@ -5,10 +5,12 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -222,18 +224,142 @@ func TestCreateTokenVendorAccessStrictDefault(t *testing.T) {
 }
 
 // With all=true the account list is ignored by the resolver, so it is not
-// validated or collision-checked: two accounts that WOULD collide under explicit
-// selection (first-wins + dedup keeps today's behavior) must still save.
+// validated or collision-checked: the SAME pair that conflicts under all=false
+// (see TestCreateTokenVendorAccessValidation, "collision on empty prefixes") must
+// still save, and a foreign id riding along is stored inert. Sending the colliding
+// pair (not an empty list) is what makes this guard the all=true short-circuit.
 func TestCreateTokenVendorAccessAllSkipsPerAccountChecks(t *testing.T) {
 	fx := newTokenVendorAccessFixture(t)
+	pair := []VendorAccessEntryDTO{
+		{AccountID: "acc_a", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: ""}},
+		{AccountID: "acc_b", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: ""}},
+	}
+	// The same pair under all=false conflicts: the skip below is the only reason
+	// the all=true create succeeds.
+	_, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
+		Name: "not-all", Scopes: []string{"gateway:use"}, VendorAccess: &VendorAccessDTO{Accounts: pair},
+	})
+	if !errors.Is(err, ErrTokenVendorAccessConflict) {
+		t.Fatalf("all=false control: err = %v, want ErrTokenVendorAccessConflict", err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		accounts []VendorAccessEntryDTO
+	}{
+		{"colliding pair", pair},
+		{"foreign id", []VendorAccessEntryDTO{{AccountID: "acc_other"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
+				Name: "all-" + tc.name, Scopes: []string{"gateway:use"},
+				VendorAccess: &VendorAccessDTO{All: true, Accounts: tc.accounts},
+			})
+			if err != nil {
+				t.Fatalf("CreateToken: %v", err)
+			}
+			if resp.Token.VendorAccess == nil || !resp.Token.VendorAccess.All {
+				t.Fatalf("DTO = %+v, want all=true", resp.Token.VendorAccess)
+			}
+		})
+	}
+}
+
+// An all=true policy with no explicit accounts must serialize its list as an
+// array, not null: the frontend iterates it unconditionally.
+func TestVendorAccessDTOAllSerializesEmptyAccountsArray(t *testing.T) {
+	fx := newTokenVendorAccessFixture(t)
 	resp, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
-		Name: "all", Scopes: []string{"gateway:use"}, VendorAccess: &VendorAccessDTO{All: true},
+		Name: "all-json", Scopes: []string{"gateway:use"}, VendorAccess: &VendorAccessDTO{All: true},
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
 	}
-	if resp.Token.VendorAccess == nil || !resp.Token.VendorAccess.All {
-		t.Fatalf("DTO = %+v, want all=true", resp.Token.VendorAccess)
+	raw, err := json.Marshal(resp.Token.VendorAccess)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if got, want := string(raw), `{"all":true,"accounts":[]}`; got != want {
+		t.Fatalf("vendor_access JSON = %s, want %s", got, want)
+	}
+	// Encode/decode stay symmetric: the empty array re-encodes to the same column.
+	if col := encodeVendorAccessDTO(resp.Token.VendorAccess); col != `{"all":true}` {
+		t.Fatalf("re-encoded column = %q, want %q", col, `{"all":true}`)
+	}
+}
+
+// failingVendorReadsStore makes the two per-owner vendor-account reads the token
+// validator performs fail on demand, to pin how each failure is classified.
+type failingVendorReadsStore struct {
+	*routing.MemoryStore
+	ownerErr  error // VendorAccountsByOwner
+	modelsErr error // VendorAccountModels
+}
+
+func (f *failingVendorReadsStore) VendorAccountsByOwner(ctx context.Context, userID string) ([]routing.VendorAccount, error) {
+	if f.ownerErr != nil {
+		return nil, f.ownerErr
+	}
+	return f.MemoryStore.VendorAccountsByOwner(ctx, userID)
+}
+
+func (f *failingVendorReadsStore) VendorAccountModels(ctx context.Context, accountID string) ([]routing.VendorAccountModel, error) {
+	if f.modelsErr != nil {
+		return nil, f.modelsErr
+	}
+	return f.MemoryStore.VendorAccountModels(ctx, accountID)
+}
+
+// A failing owner-account read is an infrastructure error, not a client mistake:
+// it must come back raw (the endpoints turn it into a 500), never wrapped as
+// ErrTokenVendorAccessInvalid (a 400), on create and on update alike.
+func TestVendorAccessOwnerReadFailureIsNotAClientError(t *testing.T) {
+	fx := newTokenVendorAccessFixture(t)
+	ctx := context.Background()
+	created, err := fx.svc.CreateToken(ctx, fx.owner, CreateTokenRequest{Name: "base", Scopes: []string{"gateway:use"}})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	boom := errors.New("owner read boom")
+	fx.svc.routes = &failingVendorReadsStore{MemoryStore: fx.rs, ownerErr: boom}
+	policy := &VendorAccessDTO{Accounts: []VendorAccessEntryDTO{{AccountID: "acc_a"}}}
+
+	_, err = fx.svc.CreateToken(ctx, fx.owner, CreateTokenRequest{Name: "c", Scopes: []string{"gateway:use"}, VendorAccess: policy})
+	if !errors.Is(err, boom) || errors.Is(err, ErrTokenVendorAccessInvalid) {
+		t.Fatalf("create: err = %v, want the raw read error and not ErrTokenVendorAccessInvalid", err)
+	}
+	_, err = fx.svc.UpdateToken(ctx, fx.owner, created.Token.ID, UpdateTokenRequest{VendorAccess: policy})
+	if !errors.Is(err, boom) || errors.Is(err, ErrTokenVendorAccessInvalid) {
+		t.Fatalf("update: err = %v, want the raw read error and not ErrTokenVendorAccessInvalid", err)
+	}
+}
+
+// A failing per-account models read stays fail-open (the resolver backstop covers
+// a collision the check could not see) but is no longer silent: the skip is
+// logged with the account id.
+func TestVendorAccessModelsReadFailureFailsOpenAndLogs(t *testing.T) {
+	fx := newTokenVendorAccessFixture(t)
+	fx.svc.routes = &failingVendorReadsStore{MemoryStore: fx.rs, modelsErr: errors.New("models read boom")}
+
+	// The pair would conflict if the models could be read; unreadable models
+	// cannot be checked, so the save goes through.
+	var createErr error
+	logged := captureSlog(t, func() {
+		_, createErr = fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
+			Name: "failopen", Scopes: []string{"gateway:use"},
+			VendorAccess: &VendorAccessDTO{Accounts: []VendorAccessEntryDTO{
+				{AccountID: "acc_a", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: ""}},
+				{AccountID: "acc_b", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: ""}},
+			}},
+		})
+	})
+	if createErr != nil {
+		t.Fatalf("CreateToken: %v, want fail-open", createErr)
+	}
+	for _, id := range []string{"acc_a", "acc_b"} {
+		if !strings.Contains(logged, id) || !strings.Contains(logged, "models read boom") {
+			t.Fatalf("log does not name %s and the cause:\n%s", id, logged)
+		}
 	}
 }
 

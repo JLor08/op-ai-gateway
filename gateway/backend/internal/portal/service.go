@@ -4632,7 +4632,8 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	if !v.All && len(v.Accounts) == 0 {
 		return nil
 	}
-	d := &VendorAccessDTO{All: v.All}
+	// Accounts is always an array on the wire (never null), even for all=true.
+	d := &VendorAccessDTO{All: v.All, Accounts: []VendorAccessEntryDTO{}}
 	for _, e := range v.Accounts {
 		entry := VendorAccessEntryDTO{AccountID: e.AccountID}
 		if e.OverrideEnabled {
@@ -4651,8 +4652,10 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 // accounts' current models. A nil policy, all=true (the resolver ignores the
 // account list and keeps first-wins + dedup) and an empty list need no checks.
 // A collision that only emerges later (a vendor ships a new model after save) is
-// caught by the routing backstop, so a models-read failure here is skipped
-// rather than failing the save.
+// caught by the routing backstop, so a per-account models-read failure is logged
+// and skipped rather than failing the save; a failure to read the owner's
+// accounts at all is an infrastructure error and is returned raw (a 500, not the
+// 400 reserved for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict).
 func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d *VendorAccessDTO) error {
 	if d == nil || d.All || len(d.Accounts) == 0 {
 		return nil
@@ -4662,7 +4665,9 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 	}
 	accounts, err := s.routes.VendorAccountsByOwner(ctx, owner.UserID)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrTokenVendorAccessInvalid, err)
+		// An infrastructure failure, not a client mistake: returned raw so the
+		// endpoints answer 500 rather than a 400 the client cannot act on.
+		return err
 	}
 	byID := make(map[string]routing.VendorAccount, len(accounts))
 	for _, a := range accounts {
@@ -4690,6 +4695,8 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 		}
 		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
 		if err != nil {
+			slog.Warn("portal: token vendor-access collision check skipped for an account whose models could not be read; the routing backstop still applies",
+				"account_id", acc.ID, "error", err)
 			continue
 		}
 		for _, m := range models {
