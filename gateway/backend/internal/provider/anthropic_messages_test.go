@@ -895,12 +895,9 @@ func TestAnthropicClientProxyNativeForwardsRawBodyVersionAndAuth(t *testing.T) {
 	defer upstream.Close()
 	client := NewAnthropicClient(http.DefaultClient)
 	ctx := WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-native")
-	// MasqueradeClaudeCode is subscription-translate-only: a passthrough must NOT
-	// inject the Claude Code system block even when the target carries the flag.
-	target := anthropicTarget(upstream.URL + "/")
-	target.Masquerade = routing.MasqueradeClaudeCode
-
-	resp, err := client.ProxyNative(ctx, target, "/v1/messages", []byte(anthropicNativeBody))
+	// An api-key target (no Masquerade) is relayed verbatim; the subscription
+	// masquerade injection is pinned in anthropic_masquerade_test.go.
+	resp, err := client.ProxyNative(ctx, anthropicTarget(upstream.URL+"/"), "/v1/messages", []byte(anthropicNativeBody))
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}
