@@ -1827,6 +1827,42 @@ func (s *Server) upstreamAuthCtx(ctx context.Context, target routing.Target) con
 	return provider.WithUpstreamAuthHeaders(ctx, target.APITokenHeader, token, target.ExtraHeaders)
 }
 
+// upstreamAuthCtxWithHeaders is upstreamAuthCtx plus per-request upstream header
+// overrides (header name -> value), layered over the target's static ExtraHeaders
+// with the override winning. It is how a header that depends on the INBOUND request
+// (the client's anthropic-beta on an Anthropic passthrough) reaches the upstream
+// call, for both credential shapes: it decorates a local COPY of the target
+// (target is passed by value) with a merged COPY of its ExtraHeaders and hands that
+// to upstreamAuthCtx, so the api-key path (WithUpstreamAuthHeaders) and the
+// subscription path (subscriptionAuthCtx: bearer, account-id) are both used
+// unchanged and see the overrides as part of the target's static headers. The
+// resolved Target -- and its ExtraHeaders map -- is shared across requests and is
+// never written to. An empty overrides map is exactly upstreamAuthCtx.
+func (s *Server) upstreamAuthCtxWithHeaders(ctx context.Context, target routing.Target, overrides map[string]string) context.Context {
+	if len(overrides) > 0 {
+		target.ExtraHeaders = overlayHeaders(target.ExtraHeaders, overrides)
+	}
+	return s.upstreamAuthCtx(ctx, target)
+}
+
+// overlayHeaders returns a fresh map holding base's entries with overrides applied
+// on top. A base entry whose name matches an override's ignoring case is replaced
+// rather than kept beside it: applyUpstreamAuth Sets every entry in map order, so
+// two spellings of one header would race and the upstream would see whichever came
+// last. base is never written to.
+func overlayHeaders(base, overrides map[string]string) map[string]string {
+	out := copyStringMap(base)
+	for name, value := range overrides {
+		for k := range out {
+			if strings.EqualFold(k, name) {
+				delete(out, k)
+			}
+		}
+		out[name] = value
+	}
+	return out
+}
+
 // vendorTokenRefreshBuffer is how far ahead of a subscription access token's
 // expiry the dispatch path refreshes it, so an in-flight request does not race
 // the moment of expiry.
