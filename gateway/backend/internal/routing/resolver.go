@@ -935,9 +935,16 @@ func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.
 // row. The bool reports whether a target was built: it is false only for a
 // subscription account whose vendor is unknown, which FAILS CLOSED (no target)
 // rather than defaulting to either vendor's endpoint, which would misroute its
-// sealed OAuth token. An api_key account always builds a target.
+// sealed OAuth token. An api_key account builds a target, except an
+// OpenAI-compatible one with no stored root URL, which fails closed the same way.
 func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
 	if acc.AuthType != VendorAuthSubscription {
+		if IsOpenAICompatibleVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" {
+			// A misconfigured account (no root url) must not route to a broken
+			// "/v1/chat/completions" with no host. Create-time validation
+			// normally prevents this; fail closed so the request falls through.
+			return Target{}, false
+		}
 		return vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor), true
 	}
 	// Subscription (OAuth): the bearer is resolved + refreshed at dispatch from the
@@ -975,24 +982,32 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 	provider := ProviderVendorOpenAI
 	endpoint := "https://api.openai.com"
 	tokenHeader := ""
+	pathPrefix := "" // empty => /v1 (Target.OpenAIPathPrefix)
 	if acc.Vendor == VendorAnthropic {
 		provider = ProviderVendorAnthropic
 		endpoint = "https://api.anthropic.com"
 		// The native Anthropic client authenticates with x-api-key, not the
 		// Authorization: Bearer default the OpenAI-compatible client uses.
 		tokenHeader = "x-api-key"
+	} else if IsOpenAICompatibleVendor(acc.Vendor) {
+		// x.ai / OpenRouter / Kilo / Google Gemini shim / custom: the shared
+		// OpenAI-compatible client against the account's own root URL, Bearer
+		// auth, translate-only (both endpoint modes stay zero below).
+		endpoint = acc.BaseURL
+		pathPrefix = OpenAIPathPrefixFor(acc.Vendor)
 	}
 	t := Target{
-		RouteID:        vendorRoutePrefix + acc.ID + ":" + model,
-		ServerID:       "",
-		Provider:       provider,
-		Endpoint:       endpoint,
-		Model:          model,
-		ProviderModel:  m.UpstreamModel,
-		Timeout:        vendorAccountDefaultTimeout,
-		APIFlavor:      apiFlavor,
-		APIToken:       acc.APIKey, // still sealed; upstreamAuthCtx opens it, as for an app credential
-		APITokenHeader: tokenHeader,
+		RouteID:          vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:         "",
+		Provider:         provider,
+		Endpoint:         endpoint,
+		Model:            model,
+		ProviderModel:    m.UpstreamModel,
+		Timeout:          vendorAccountDefaultTimeout,
+		APIFlavor:        apiFlavor,
+		APIToken:         acc.APIKey, // still sealed; upstreamAuthCtx opens it, as for an app credential
+		APITokenHeader:   tokenHeader,
+		OpenAIPathPrefix: pathPrefix,
 		// VendorAccountID names the serving account for USAGE ATTRIBUTION (the
 		// recorded usage_events.account_id and the scraped rate-limit snapshot). It
 		// is NOT the subscription-bearer trigger -- Subscription stays false, so

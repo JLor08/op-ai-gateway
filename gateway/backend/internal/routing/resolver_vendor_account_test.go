@@ -9,6 +9,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -522,13 +523,35 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 	"OpenAIPathPrefix":            true, // an Anthropic upstream speaks /v1/messages, not the OpenAI dialect; the prefix is N/A
 }
 
+// vendorOpenAICompatibleTargetMayBeZero is the OpenAI-compatible (x.ai / OpenRouter /
+// Kilo / Gemini shim / custom) api-key analogue. It differs from the other two sets
+// in what is NON-zero: Endpoint (the account's own root URL, not api.openai.com)
+// and OpenAIPathPrefix (from the preset) are carried, so neither is listed. Both
+// endpoint modes are zero by design: the compat vendors are translate-only and never
+// enter the OpenAI-Responses / Anthropic-Messages passthrough branches.
+var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
+	"ServerID":                    true, // a vendor target has no on-prem server
+	"ResponsesMode":               true, // zero == translate; the compat vendors never pass Responses through
+	"MessagesMode":                true, // zero == translate; the compat vendors never pass Messages through
+	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
+	"ResponsesLiveTimingsEnabled": true, // llama.cpp-only timings injection; N/A for a vendor
+	"LiveProgressSupport":         true, // mapping-persisted verdict; a vendor carries none
+	"LiveProgressSpecType":        true, // server_agent-only; N/A for a vendor
+	"APITokenHeader":              true, // "" == Authorization: Bearer, which every compat vendor uses
+	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
+	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
+}
+
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of
 // TestTargetFromPopulatesEveryField: it reflects over the built Target and
 // requires every field not named in the shape's may-be-zero set to be non-zero,
 // so a new Target field that a vendor target should populate is caught here too.
-// Each case is the one api-key shape whose endpoint mode is non-zero (lossless
-// native passthrough), so the mode is NOT in that shape's may-be-zero set. The
-// translate shapes leave it zero by design and are pinned in
+// The openai_responses and anthropic_messages cases are the api-key shapes whose
+// endpoint mode is non-zero (lossless native passthrough), so the mode is NOT in
+// that shape's may-be-zero set; the openai_compatible case is translate-only, so
+// both modes ARE in its set but Endpoint and OpenAIPathPrefix are not. The
+// translate shapes leave the mode zero by design and are pinned in
 // TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero and
 // TestVendorAccountTranslateFlavorsLeaveMessagesModeZero.
 func TestVendorAccountTargetCompleteness(t *testing.T) {
@@ -537,6 +560,8 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 	openAIModel := VendorAccountModel{AccountID: "acc_openai", GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o-2024", APIFlavor: APIFlavorOpenAI}
 	anthropicAcc := VendorAccount{ID: "acc_anthropic", OwnerUserID: vendorOwner, Vendor: VendorAnthropic, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, CreatedAt: now, UpdatedAt: now}
 	anthropicModel := VendorAccountModel{AccountID: "acc_anthropic", GatewayModel: "claude-sonnet", UpstreamModel: "claude-sonnet-4-5", APIFlavor: APIFlavorAnthropic}
+	xaiAcc := VendorAccount{ID: "acc_xai", OwnerUserID: vendorOwner, Vendor: VendorXAI, AuthType: VendorAuthAPIKey, Status: VendorAccountStatusActive, APIKey: vendorKey, BaseURL: "https://api.x.ai", CreatedAt: now, UpdatedAt: now}
+	xaiModel := VendorAccountModel{AccountID: "acc_xai", GatewayModel: "grok-4", UpstreamModel: "grok-4", APIFlavor: APIFlavorOpenAI}
 
 	cases := []struct {
 		name      string
@@ -547,6 +572,8 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 		{"openai_responses", vendorAccountTarget(openAIAcc, openAIModel, "gpt-4o", APIFlavorOpenAI, "openai_responses"), vendorTargetMayBeZero},
 		// Anthropic api-key + anthropic_messages: MessagesMode passthrough.
 		{"anthropic_messages", vendorAccountTarget(anthropicAcc, anthropicModel, "claude-sonnet", APIFlavorAnthropic, "anthropic_messages"), vendorAnthropicMessagesTargetMayBeZero},
+		// OpenAI-compatible (x.ai) api-key: translate-only, Endpoint + OpenAIPathPrefix carried.
+		{"openai_compatible", vendorAccountTarget(xaiAcc, xaiModel, "grok-4", APIFlavorOpenAI, "openai_chat"), vendorOpenAICompatibleTargetMayBeZero},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -562,5 +589,81 @@ func TestVendorAccountTargetCompleteness(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestOpenAICompatibleVendorResolvesToTranslateTarget pins the OpenAI-compatible
+// vendor shape end to end through Resolve: the shared vendor_openai provider kind
+// against the account's own stored root, the preset's path prefix, Bearer auth,
+// and -- for EVERY inbound flavor, openai_responses and anthropic_messages
+// included -- translate-only (both endpoint modes empty). The two passthrough
+// branches are keyed on VendorOpenAI / VendorAnthropic, so a compat vendor must
+// never enter them.
+func TestOpenAICompatibleVendorResolvesToTranslateTarget(t *testing.T) {
+	now := time.Now().UTC()
+	store := NewMemoryStore()
+	acc := VendorAccount{
+		ID: "acc_xai", OwnerUserID: vendorOwner, Vendor: VendorXAI, AuthType: VendorAuthAPIKey,
+		Status: VendorAccountStatusActive, APIKey: vendorKey, BaseURL: "https://api.x.ai", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateVendorAccount(context.Background(), acc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := store.SetVendorAccountModels(context.Background(), acc.ID, []VendorAccountModel{
+		{AccountID: acc.ID, GatewayModel: "grok-4", UpstreamModel: "grok-4", APIFlavor: APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("models: %v", err)
+	}
+	r := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	// Both inbound dialects translate (no passthrough) for every flavor.
+	for _, flavor := range []string{"openai_chat", "openai_responses", "anthropic_messages"} {
+		target, err := r.Resolve(context.Background(), ownerToken(), inference.Request{Model: "grok-4", APIFlavor: flavor})
+		if err != nil {
+			t.Fatalf("resolve %s: %v", flavor, err)
+		}
+		if target.Provider != ProviderVendorOpenAI {
+			t.Errorf("%s Provider = %q, want %q", flavor, target.Provider, ProviderVendorOpenAI)
+		}
+		if target.Endpoint != "https://api.x.ai" {
+			t.Errorf("%s Endpoint = %q, want https://api.x.ai", flavor, target.Endpoint)
+		}
+		if target.OpenAIPathPrefix != "/v1" {
+			t.Errorf("%s OpenAIPathPrefix = %q, want /v1", flavor, target.OpenAIPathPrefix)
+		}
+		if target.APITokenHeader != "" {
+			t.Errorf("%s APITokenHeader = %q, want empty (Bearer)", flavor, target.APITokenHeader)
+		}
+		if target.ResponsesMode != "" || target.MessagesMode != "" {
+			t.Errorf("%s modes = (%q,%q), want translate (empty,empty)", flavor, target.ResponsesMode, target.MessagesMode)
+		}
+		if got := strings.Join(target.APIFlavors, ","); got != APIFlavorOpenAI+","+APIFlavorAnthropic {
+			t.Errorf("%s APIFlavors = %q, want openai,anthropic", flavor, got)
+		}
+		if target.VendorAccountID != acc.ID {
+			t.Errorf("%s VendorAccountID = %q, want %q", flavor, target.VendorAccountID, acc.ID)
+		}
+	}
+}
+
+// TestOpenAICompatibleVendorEmptyBaseURLFailsClosed pins the defence in depth for
+// a compat account stored without a root URL: it must not build a hostless target
+// (which would dial "/v1/chat/completions" with no host) but fall through to a
+// no-route error. Create-time validation normally prevents the state.
+func TestOpenAICompatibleVendorEmptyBaseURLFailsClosed(t *testing.T) {
+	now := time.Now().UTC()
+	store := NewMemoryStore()
+	acc := VendorAccount{
+		ID: "acc_custom", OwnerUserID: vendorOwner, Vendor: VendorOpenAICompatible, AuthType: VendorAuthAPIKey,
+		Status: VendorAccountStatusActive, APIKey: vendorKey, BaseURL: "", CreatedAt: now, UpdatedAt: now,
+	}
+	must(t, store.CreateVendorAccount(context.Background(), acc))
+	must(t, store.SetVendorAccountModels(context.Background(), acc.ID, []VendorAccountModel{
+		{AccountID: acc.ID, GatewayModel: "m", UpstreamModel: "m", APIFlavor: APIFlavorOpenAI},
+	}))
+	r := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+	_, err := r.Resolve(context.Background(), ownerToken(), inference.Request{Model: "m", APIFlavor: "openai_chat"})
+	if !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("resolve with empty BaseURL = %v, want ErrNoModelRoute", err)
 	}
 }
