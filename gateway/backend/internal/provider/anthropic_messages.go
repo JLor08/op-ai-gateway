@@ -487,7 +487,7 @@ func anthropicSystemFieldCached(system, masquerade string, cc *anthropicCacheCon
 	switch v := field.(type) {
 	case []anthropicSystemBlock:
 		if len(v) == 0 {
-			return v
+			return nil // never emit "system":[]
 		}
 		v[len(v)-1].CacheControl = cc
 		return v

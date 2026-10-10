@@ -128,7 +128,8 @@ func (s *Server) applyAnthropicCachePolicy(ctx context.Context, target routing.T
 	if !s.anthropicPromptCachingEnabledCached(ctx) {
 		return
 	}
-	if estPrefixTokens(*req) < anthropicCacheMinTokens(target.ProviderModel) {
+	// Look the minimum up under the model the request is actually rendered with.
+	if estPrefixTokens(*req) < anthropicCacheMinTokens(effectiveProviderModel(target, req.Model)) {
 		return
 	}
 	req.PromptCache = &inference.PromptCacheDirective{Enabled: true} // TTL "" = 5m ephemeral

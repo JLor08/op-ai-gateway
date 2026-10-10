@@ -284,15 +284,10 @@ func stripCacheMarkers(t *testing.T, turns []json.RawMessage) []any {
 	return out
 }
 
-// TestAnthropicCachedPrefixIsStableAcrossTurns pins the property prompt caching
-// lives on: across two consecutive turns of a growing conversation, everything the
-// first turn cached is rendered byte-for-byte the same in the second. The `system`
-// and `tools` fields must be byte-identical (not merely structurally equal, so a
-// non-deterministic key order would fail), and the first turn's messages -- minus
-// the moving cache_control marker on its last block -- must be exactly the leading
-// messages of the second. No live API is involved.
-func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
-	tools := []inference.Tool{{
+// stabilityTools is a tool set with nested objects and several properties, so a
+// non-deterministic key order in the rendered schema would show up as a byte diff.
+func stabilityTools() []inference.Tool {
+	return []inference.Tool{{
 		Name:        "shell",
 		Description: "run a shell command",
 		Parameters: map[string]any{
@@ -306,8 +301,87 @@ func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
 			"required": []any{"cmd"},
 		},
 	}}
+}
+
+// stabilityTargets covers both Anthropic accounts: the api-key path and the
+// subscription path with its Claude-Code masquerade system block.
+func stabilityTargets() map[string]routing.Target {
+	return map[string]routing.Target{
+		"api-key":                 {ProviderModel: "claude-sonnet-5-5"},
+		"subscription masquerade": {ProviderModel: "claude-sonnet-5-5", Masquerade: routing.MasqueradeClaudeCode},
+	}
+}
+
+// assertCachedPrefixStable renders turn1 and turn2 (turn2 extends turn1) for
+// target and asserts the property prompt caching lives on: the same request
+// renders to the same bytes every time, the `system` and `tools` fields are
+// byte-identical across the two turns (not merely structurally equal, so a
+// non-deterministic key order would fail), and turn 1's messages -- minus the
+// moving cache_control marker on its last block -- are exactly the leading
+// messages of turn 2.
+func assertCachedPrefixStable(t *testing.T, target routing.Target, turn1, turn2 inference.Request) {
+	t.Helper()
+	b1, err := anthropicRequestBody(target, turn1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := anthropicRequestBody(target, turn2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same request renders to the same bytes every time (Go map
+	// iteration order must not leak into the body).
+	for i := range 20 {
+		again, err := anthropicRequestBody(target, turn1, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(again) != string(b1) {
+			t.Fatalf("render %d of the same request differs:\n%s\n%s", i, b1, again)
+		}
+	}
+
+	var f1, f2 map[string]json.RawMessage
+	if err := json.Unmarshal(b1, &f1); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b2, &f2); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"system", "tools"} {
+		if len(f1[field]) == 0 {
+			t.Fatalf("turn 1 has no %s field: %s", field, b1)
+		}
+		if string(f1[field]) != string(f2[field]) {
+			t.Fatalf("%s (cached stable prefix) differs across turns:\n%s\n%s", field, f1[field], f2[field])
+		}
+	}
+
+	var m1, m2 []json.RawMessage
+	if err := json.Unmarshal(f1["messages"], &m1); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(f2["messages"], &m2); err != nil {
+		t.Fatal(err)
+	}
+	if len(m2) <= len(m1) {
+		t.Fatalf("turn 2 must extend turn 1: %d vs %d messages", len(m2), len(m1))
+	}
+	prefix1, prefix2 := stripCacheMarkers(t, m1), stripCacheMarkers(t, m2[:len(m1)])
+	j1, _ := json.Marshal(prefix1)
+	j2, _ := json.Marshal(prefix2)
+	if string(j1) != string(j2) {
+		t.Fatalf("turn 1's messages are not the leading messages of turn 2 (marker aside):\n%s\n%s", j1, j2)
+	}
+}
+
+// TestAnthropicCachedPrefixIsStableAcrossTurns pins the property prompt caching
+// lives on across two consecutive turns of a growing text conversation: everything
+// the first turn cached is rendered byte-for-byte the same in the second. No live
+// API is involved.
+func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
 	sys := anthropicTextMsg(inference.RoleSystem, strings.Repeat("sys ", 300))
-	cache := &inference.PromptCacheDirective{Enabled: true}
 	turn1 := inference.Request{
 		Messages: []inference.Message{
 			sys,
@@ -315,8 +389,8 @@ func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
 			anthropicTextMsg(inference.RoleAssistant, "a1"),
 			anthropicTextMsg(inference.RoleUser, "q2"),
 		},
-		Tools:       tools,
-		PromptCache: cache,
+		Tools:       stabilityTools(),
+		PromptCache: &inference.PromptCacheDirective{Enabled: true},
 	}
 	turn2 := turn1
 	turn2.Messages = append(append([]inference.Message{}, turn1.Messages...),
@@ -324,65 +398,55 @@ func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
 		anthropicTextMsg(inference.RoleUser, "q3"),
 	)
 
-	targets := map[string]routing.Target{
-		"api-key":                 {ProviderModel: "claude-sonnet-5-5"},
-		"subscription masquerade": {ProviderModel: "claude-sonnet-5-5", Masquerade: routing.MasqueradeClaudeCode},
-	}
-	for name, target := range targets {
+	for name, target := range stabilityTargets() {
 		t.Run(name, func(t *testing.T) {
-			b1, err := anthropicRequestBody(target, turn1, true)
+			assertCachedPrefixStable(t, target, turn1, turn2)
+		})
+	}
+}
+
+// TestAnthropicCachedPrefixIsStableAcrossAgenticToolTurns pins the same property
+// for the dominant caching workload: an agentic conversation whose history holds
+// an assistant tool_use turn and a tool_result turn (the tool result merges with
+// the following user text into one user turn). The tool_use arguments are
+// re-rendered from a JSON string and must not drift between turns.
+func TestAnthropicCachedPrefixIsStableAcrossAgenticToolTurns(t *testing.T) {
+	sys := anthropicTextMsg(inference.RoleSystem, strings.Repeat("sys ", 300))
+	turn1 := inference.Request{
+		Messages: []inference.Message{
+			sys,
+			anthropicTextMsg(inference.RoleUser, "list the files"),
+			{
+				Role:      inference.RoleAssistant,
+				Content:   []inference.ContentPart{{Type: inference.ContentText, Text: "Let me look."}},
+				ToolCalls: []inference.ToolCall{{ID: "toolu_1", Name: "shell", Arguments: `{"cmd":"ls","cwd":"/tmp","env":{"B":"2","A":"1"},"tty":false}`}},
+			},
+			{Role: inference.RoleTool, ToolCallID: "toolu_1", Content: []inference.ContentPart{{Type: inference.ContentText, Text: "a.txt\nb.txt"}}},
+			anthropicTextMsg(inference.RoleUser, "now count them"),
+		},
+		Tools:       stabilityTools(),
+		PromptCache: &inference.PromptCacheDirective{Enabled: true},
+	}
+	turn2 := turn1
+	turn2.Messages = append(append([]inference.Message{}, turn1.Messages...),
+		anthropicTextMsg(inference.RoleAssistant, "There are two."),
+		anthropicTextMsg(inference.RoleUser, "thanks"),
+	)
+
+	for name, target := range stabilityTargets() {
+		t.Run(name, func(t *testing.T) {
+			// The scenario must really exercise the tool blocks, or the
+			// stability assertion below would be vacuous.
+			raw, err := anthropicRequestBody(target, turn1, true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			b2, err := anthropicRequestBody(target, turn2, true)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			// The same request renders to the same bytes every time (Go map
-			// iteration order must not leak into the body).
-			for i := range 20 {
-				again, err := anthropicRequestBody(target, turn1, true)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(again) != string(b1) {
-					t.Fatalf("render %d of the same request differs:\n%s\n%s", i, b1, again)
+			for _, want := range []string{`"type":"tool_use"`, `"type":"tool_result"`} {
+				if !strings.Contains(string(raw), want) {
+					t.Fatalf("turn 1 body has no %s block:\n%s", want, raw)
 				}
 			}
-
-			var f1, f2 map[string]json.RawMessage
-			if err := json.Unmarshal(b1, &f1); err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal(b2, &f2); err != nil {
-				t.Fatal(err)
-			}
-			for _, field := range []string{"system", "tools"} {
-				if len(f1[field]) == 0 {
-					t.Fatalf("turn 1 has no %s field: %s", field, b1)
-				}
-				if string(f1[field]) != string(f2[field]) {
-					t.Fatalf("%s (cached stable prefix) differs across turns:\n%s\n%s", field, f1[field], f2[field])
-				}
-			}
-
-			var m1, m2 []json.RawMessage
-			if err := json.Unmarshal(f1["messages"], &m1); err != nil {
-				t.Fatal(err)
-			}
-			if err := json.Unmarshal(f2["messages"], &m2); err != nil {
-				t.Fatal(err)
-			}
-			if len(m2) <= len(m1) {
-				t.Fatalf("turn 2 must extend turn 1: %d vs %d messages", len(m2), len(m1))
-			}
-			prefix1, prefix2 := stripCacheMarkers(t, m1), stripCacheMarkers(t, m2[:len(m1)])
-			j1, _ := json.Marshal(prefix1)
-			j2, _ := json.Marshal(prefix2)
-			if string(j1) != string(j2) {
-				t.Fatalf("turn 1's messages are not the leading messages of turn 2 (marker aside):\n%s\n%s", j1, j2)
-			}
+			assertCachedPrefixStable(t, target, turn1, turn2)
 		})
 	}
 }
