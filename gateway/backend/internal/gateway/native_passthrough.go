@@ -150,7 +150,9 @@ func targetIsImagesOnly(target routing.Target) bool {
 // effective mode for that flavor is passthrough, otherwise the built-in
 // translation's chat-completions path (per provider — ollama speaks /api/chat, the
 // native Anthropic vendor client speaks /v1/messages, all OpenAI-compatible
-// providers speak /v1/chat/completions). It returns "" for an
+// providers speak {prefix}/chat/completions, the prefix being
+// Target.OpenAIPathPrefixOrDefault -- "/v1" unless a vendor preset configures
+// another). It returns "" for an
 // unresolved target (e.g. a resolve failure, where no upstream was called). This
 // mirrors the paths hardcoded in the provider clients (openai_compatible.go,
 // ollama.go, anthropic_messages.go) and in proxyNative, kept here in one gateway-visible place so the
@@ -189,7 +191,7 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 		// keeps the usage label consistent with endpointModeFor's passthrough answer.
 		return "/responses"
 	}
-	return "/v1/chat/completions"
+	return target.OpenAIPathPrefixOrDefault() + "/chat/completions"
 }
 
 // effectiveProviderModel is the model name actually sent to the upstream AI-server

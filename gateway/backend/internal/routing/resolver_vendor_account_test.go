@@ -499,6 +499,7 @@ var vendorTargetMayBeZero = map[string]bool{
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
+	"OpenAIPathPrefix":            true, // empty => /v1; the api.openai.com vendor target uses the default (only an OpenAI-compatible preset sets it)
 }
 
 // vendorAnthropicMessagesTargetMayBeZero is the Anthropic api-key analogue for the
@@ -518,6 +519,7 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 	"ExtraHeaders":                true, // ProxyNative sets anthropic-version itself; an API-KEY target carries no static headers
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only); the relay is verbatim
 	"Subscription":                true, // false on the API-KEY path -- its x-api-key rides in APIToken, not resolved at dispatch
+	"OpenAIPathPrefix":            true, // an Anthropic upstream speaks /v1/messages, not the OpenAI dialect; the prefix is N/A
 }
 
 // TestVendorAccountTargetCompleteness is the vendor-Target analogue of

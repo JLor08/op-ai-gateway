@@ -149,6 +149,30 @@ type Target struct {
 	// (vendorSubscription{Anthropic,OpenAI}Target); false on the api-key
 	// vendorAccountTarget and every self-hosted target.
 	Subscription bool
+	// OpenAIPathPrefix is the URL path segment OpenAICompatibleClient puts between
+	// Endpoint and the OpenAI-dialect resource ("/chat/completions", "/models"):
+	// the composed URLs are {Endpoint}{prefix}/chat/completions and {prefix}/models.
+	// EMPTY means "/v1" — the value every self-hosted target, probe target and
+	// api.openai.com vendor target has always used — so leaving it unset is
+	// byte-identical to the pre-field behaviour. A non-empty value is a path with a
+	// leading "/" and no trailing "/" (Kilo "/gateway", Gemini "/v1beta/openai").
+	// Only an OpenAI-compatible vendor-account target sets it.
+	OpenAIPathPrefix string
+}
+
+// OpenAIPathPrefixOrDefault returns the normalised OpenAI-dialect path prefix:
+// the trimmed OpenAIPathPrefix with a leading "/" and no trailing "/", or "/v1"
+// when it is blank. It is the one place the "/v1" default lives, shared by the
+// provider client and the gateway usage-label path.
+func (t Target) OpenAIPathPrefixOrDefault() string {
+	prefix := strings.TrimRight(strings.TrimSpace(t.OpenAIPathPrefix), "/")
+	if prefix == "" {
+		return "/v1"
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	return prefix
 }
 
 // MasqueradeClaudeCode is the Target.Masquerade value that makes the Anthropic
