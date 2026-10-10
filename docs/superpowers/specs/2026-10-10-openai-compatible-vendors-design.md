@@ -2,7 +2,7 @@
 
 Date: 2026-10-10
 Branch: `feat/openai-compatible-vendors` (off `main` 585384f)
-Status: design, pending user review
+Status: approved (2026-10-10). §11 resolved — **Variante 1**: Gemini is included in A via the default-`/v1` `OpenAIPathPrefix` change (§4.2a).
 Part of: "support more providers" decomposition — this is **sub-project A** (the enabler). Usage/credits display is **sub-project D** (separate spec); native Gemini dialect is **C**; the Gemini *inbound* endpoint is issue #204. Antigravity and Cursor are **excluded** (no usable/ToS-compliant third-party inference API — verified).
 
 ## 1. Goal
@@ -92,10 +92,7 @@ Out (separate work):
 - The vendor-accounts table name + the latest migration number for the `base_url` column.
 - Whether `ModelPrefix`/relabel + the per-token `vendor_access` collision checks need any adjustment for aggregator-sized catalogs (hundreds of models).
 
-## 11. Open decision — Gemini in A, or deferred to C?
-Gemini is the only in-scope provider that needs the §4.2a shared-client change (its OpenAI shim uses a `/v1beta/openai` prefix, not `/v1`). Two ways to resolve it:
+## 11. Resolved decision — Gemini in A (Variante 1)
+**Decided (2026-10-10): Variante 1.** Gemini is delivered in A via the §4.2a default-`/v1` `OpenAIPathPrefix` change to `Target` + `OpenAICompatibleClient`. This ships all four named providers (x.ai, OpenRouter, Kilo, Gemini) + Custom in A and makes "Custom" accept any path prefix. The cost — a small, default-guarded change to the shared client that the self-hosted (vLLM/ollama-openai) and existing vendor-OpenAI paths also traverse — is accepted; the no-regression test over the existing targets (§9) is load-bearing.
 
-- **(Recommended) Include Gemini in A via §4.2a.** Add the default-`/v1` `OpenAIPathPrefix` to `Target` + client. Delivers all four named providers (x.ai, OpenRouter, Kilo, Gemini) + Custom in A; makes "Custom" truly general (any prefix). Cost: a small, default-guarded change to the shared `OpenAICompatibleClient`/`Target` that the self-hosted and existing-vendor paths also use, so the no-regression test is load-bearing.
-- **(Alternative) Keep A client-untouched; Gemini → C.** A ships x.ai, OpenRouter, Kilo, Custom with **zero** change to the shared client (they all fit `{root}/v1/chat/completions`). Gemini then lands in sub-project C, either via the same path-prefix tweak or as a native `generateContent` dialect client (like `AnthropicClient`). Lower risk for A; Gemini arrives one increment later.
-
-Either way, Antigravity and Cursor stay excluded and C still exists for native-only Gemini features.
+Antigravity and Cursor stay excluded; sub-project C remains available later for native-only Gemini features (`generateContent`, Gemini-specific params).
