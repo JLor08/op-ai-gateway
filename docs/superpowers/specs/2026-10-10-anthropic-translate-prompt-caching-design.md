@@ -44,8 +44,10 @@ context is billed at cache rates.
 4. **Breakpoints:** last system block (stable prefix = tools+system) + a moving
    breakpoint on the last block of the latest turn; ≤2 in v1.
 5. **TTL:** `ephemeral` 5-min default; 1-h selectable via config.
-6. **Display:** make the `cache_write_tokens` stat tile default-visible so the new
-   writes surface.
+6. **Display:** no change. The cache-read (`cached_tokens`) tile and group column are
+   already default-visible and will populate once the flag is on; the
+   `cache_write_tokens` tile/column stay hidden by default (enable manually to inspect
+   writes). → Feature is backend-only (+ docs).
 
 ## 4. Architecture — decision up, placement down
 
@@ -145,10 +147,11 @@ writes every turn for a pure +25% surcharge).
 
 ## 9. Display
 
-Flip the `cache_write_tokens` **stat tile** to `defaultVisible: true`
-(`activityTiles.ts`), so the new cache writes are visible without enabling a column.
-(Harmless when the flag is off — the tile shows 0.) The per-row table / group columns
-stay as they are.
+**No frontend change.** The cache-read (`cached_tokens`) stat tile and group column
+are already `defaultVisible: true` and will start showing real values once the flag
+is on and traffic caches. `cache_write_tokens` stays hidden by default (tile, group,
+and per-row table) — enable it manually to inspect writes. (Rationale: the read tile
+already confirms caching is working; the write counter is a drill-down, not a default.)
 
 ## 10. Testing & verification
 
@@ -158,9 +161,10 @@ stay as they are.
   the empty-system edge; flag-off render byte-identical to today; TTL 5m/1h emitted
   correctly; native-passthrough path unchanged.
 - A prefix-stability test (two consecutive turns share a byte-identical cached prefix).
-- Frontend: the `cache_write_tokens` tile default-visibility.
-- Gates: build/vet/`go test ./...` + golangci; frontend vitest/build/lint/format:check;
-  lint-docs; SonarQube branch-findings = 0. Postgres leg only if §8 needs a migration.
+- No frontend change → no frontend test for this feature.
+- Gates: build/vet/`go test ./...` + golangci; lint-docs; SonarQube branch-findings = 0.
+  Postgres leg only if §8 needs a migration. (Frontend vitest/build/lint unaffected —
+  no frontend change — but the repo's frontend CI still runs.)
 
 ## 11. Out of scope
 
