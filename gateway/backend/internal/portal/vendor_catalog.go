@@ -66,6 +66,8 @@ func VendorCatalog(vendor, authType string) []routing.VendorAccountModel {
 	case routing.VendorAnthropic:
 		ids = anthropicModels
 	default:
+		// The OpenAI-compatible vendors intentionally seed empty: model discovery
+		// fills their rows (RefreshVendorAccountModels).
 		return []routing.VendorAccountModel{}
 	}
 	flavor, _ := vendorAPIFlavor(vendor)
@@ -77,16 +79,20 @@ func VendorCatalog(vendor, authType string) []routing.VendorAccountModel {
 }
 
 // vendorAPIFlavor is the wire flavor a vendor's models are served over: OpenAI
-// models over the OpenAI dialect, Anthropic ones over the Anthropic dialect. It is
-// shared by the static seed (VendorCatalog) and the discovered rows
-// (RefreshVendorAccountModels), so the two cannot disagree. ok is false for a
-// vendor with no flavor.
+// models over the OpenAI dialect, Anthropic ones over the Anthropic dialect, and
+// every OpenAI-compatible vendor (xai, openrouter, kilo, google, the Custom
+// endpoint) over the OpenAI dialect as well. It is shared by the static seed
+// (VendorCatalog) and the discovered rows (RefreshVendorAccountModels), so the two
+// cannot disagree. ok is false for a vendor with no flavor.
 func vendorAPIFlavor(vendor string) (flavor string, ok bool) {
 	switch vendor {
 	case routing.VendorOpenAI:
 		return routing.APIFlavorOpenAI, true
 	case routing.VendorAnthropic:
 		return routing.APIFlavorAnthropic, true
+	}
+	if routing.IsOpenAICompatibleVendor(vendor) {
+		return routing.APIFlavorOpenAI, true
 	}
 	return "", false
 }

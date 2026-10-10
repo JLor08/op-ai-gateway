@@ -425,6 +425,37 @@ func TestVendorAccountEndpointsModelPrefixAndDisplayName(t *testing.T) {
 	}
 }
 
+// An OpenAI-compatible account is created over HTTP with its base_url (the
+// preset's default when omitted) and reads it back on get and list.
+func TestVendorAccountEndpointsCreateOpenAICompatible(t *testing.T) {
+	srv, _ := newVendorAccountTestServer(t, true)
+
+	rec := vaDo(t, srv, http.MethodPost, "/api/portal/vendor-accounts", vaOwnerSecret,
+		`{"vendor":"openai_compatible","auth_type":"api_key","name":"Custom","api_key":"`+vaTestAPIKey+`","base_url":"https://llm.example.test/"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create custom = %d, want 201, body = %s", rec.Code, rec.Body.String())
+	}
+	custom := vaDecode(t, rec)
+	if custom.Vendor != "openai_compatible" || custom.BaseURL != "https://llm.example.test" {
+		t.Fatalf("custom dto = %#v, want the trimmed base_url", custom)
+	}
+
+	rec = vaDo(t, srv, http.MethodPost, "/api/portal/vendor-accounts", vaOwnerSecret,
+		`{"vendor":"xai","auth_type":"api_key","name":"Grok","api_key":"`+vaTestAPIKey+`"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create xai = %d, want 201, body = %s", rec.Code, rec.Body.String())
+	}
+	xai := vaDecode(t, rec)
+	if xai.BaseURL != "https://api.x.ai" {
+		t.Fatalf("xai base_url = %q, want the preset default", xai.BaseURL)
+	}
+
+	rec = vaDo(t, srv, http.MethodGet, "/api/portal/vendor-accounts/"+xai.ID, vaOwnerSecret, "")
+	if rec.Code != http.StatusOK || vaDecode(t, rec).BaseURL != "https://api.x.ai" {
+		t.Fatalf("get = %d %s, want the base_url back", rec.Code, rec.Body.String())
+	}
+}
+
 func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 	srv, _ := newVendorAccountTestServer(t, true)
 	created := vaCreate(t, srv, vaOwnerSecret, "Mapped")
@@ -443,6 +474,10 @@ func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 		{"bad status", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai","auth_type":"api_key","name":"x","status":"paused"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
 		{"api key on subscription", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"anthropic","auth_type":"subscription","name":"x","api_key":"sk-x"}`, http.StatusBadRequest, "vendor_account.api_key_not_allowed"},
 		{"bad model prefix", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai","auth_type":"api_key","name":"x","model_prefix":"has space"}`, http.StatusBadRequest, "vendor_account.model_prefix_invalid"},
+		{"custom without base url", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai_compatible","auth_type":"api_key","name":"x","api_key":"sk-x"}`, http.StatusBadRequest, "vendor_account.base_url_required"},
+		{"non-https base url", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"openai_compatible","auth_type":"api_key","name":"x","base_url":"http://x.test"}`, http.StatusBadRequest, "vendor_account.base_url_invalid"},
+		{"base url with credentials", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"xai","auth_type":"api_key","name":"x","base_url":"https://u:p@x.test"}`, http.StatusBadRequest, "vendor_account.base_url_invalid"},
+		{"subscription for a compat vendor", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":"xai","auth_type":"subscription","name":"x"}`, http.StatusBadRequest, "vendor_account.auth_type_invalid"},
 		{"malformed json", http.MethodPost, "/api/portal/vendor-accounts", `{"vendor":`, http.StatusBadRequest, codeRequestInvalidJSON},
 		{"patch blank name", http.MethodPatch, itemPath, `{"name":""}`, http.StatusBadRequest, "vendor_account.name_required"},
 		{"patch bad status", http.MethodPatch, itemPath, `{"status":"needs_reconnect"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
