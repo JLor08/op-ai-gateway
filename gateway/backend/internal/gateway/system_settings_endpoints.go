@@ -219,6 +219,10 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		if req.VendorAccountsEnabled != nil || req.VendorAccountRoutingMode != nil {
 			s.invalidateVendorSettingsCache()
 		}
+		// Same for the Anthropic prompt-caching flag the dispatch policy reads.
+		if req.AnthropicPromptCachingEnabled != nil {
+			s.invalidateAnthropicPromptCachingCache()
+		}
 		writeJSON(w, http.StatusOK, dto)
 	default:
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)

@@ -611,6 +611,14 @@ type Server struct {
 	// share edgeSwitch's generation-based disarm-race guard.
 	vendorEnabledCache     settingCache[bool]
 	vendorRoutingModeCache settingCache[string]
+	// anthropicPromptCachingCache is the TTL cache (settingCache, invalidatable
+	// mode) behind anthropicPromptCachingEnabledCached, so the Anthropic
+	// prompt-cache policy (applyAnthropicCachePolicy) does not issue a
+	// system_settings read on every translate dispatch. handleSystemSettings
+	// invalidates it after a PUT that carried anthropic_prompt_caching_enabled
+	// (invalidateAnthropicPromptCachingCache), so a toggle applies on the next
+	// request rather than after the TTL.
+	anthropicPromptCachingCache settingCache[bool]
 	// speculationSeenMu guards speculationSeen: the set of mapping ids whose
 	// routing.CapabilitySpeculationObserved verdict this PROCESS has already
 	// claimed, consulted by claimSpeculationObserved (inference_complete.go) on

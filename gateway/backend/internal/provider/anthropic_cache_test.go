@@ -265,3 +265,124 @@ func TestAnthropicRequestBodyCacheControlEmptySystem(t *testing.T) {
 		t.Fatalf("cache_control count = %d, want 1 (last turn only)\n%s", n, raw)
 	}
 }
+
+// stripCacheMarkers returns a deep copy of the decoded Messages turns with every
+// cache_control field removed, so two renders can be compared on content alone.
+func stripCacheMarkers(t *testing.T, turns []json.RawMessage) []any {
+	t.Helper()
+	out := make([]any, 0, len(turns))
+	for _, raw := range turns {
+		var turn map[string]any
+		if err := json.Unmarshal(raw, &turn); err != nil {
+			t.Fatalf("turn is not valid JSON: %v\n%s", err, raw)
+		}
+		for _, b := range turn["content"].([]any) {
+			delete(b.(map[string]any), cacheControlKey)
+		}
+		out = append(out, turn)
+	}
+	return out
+}
+
+// TestAnthropicCachedPrefixIsStableAcrossTurns pins the property prompt caching
+// lives on: across two consecutive turns of a growing conversation, everything the
+// first turn cached is rendered byte-for-byte the same in the second. The `system`
+// and `tools` fields must be byte-identical (not merely structurally equal, so a
+// non-deterministic key order would fail), and the first turn's messages -- minus
+// the moving cache_control marker on its last block -- must be exactly the leading
+// messages of the second. No live API is involved.
+func TestAnthropicCachedPrefixIsStableAcrossTurns(t *testing.T) {
+	tools := []inference.Tool{{
+		Name:        "shell",
+		Description: "run a shell command",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"cmd": map[string]any{"type": "string", "description": "the command"},
+				"cwd": map[string]any{"type": "string", "description": "working directory"},
+				"env": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+				"tty": map[string]any{"type": "boolean"},
+			},
+			"required": []any{"cmd"},
+		},
+	}}
+	sys := anthropicTextMsg(inference.RoleSystem, strings.Repeat("sys ", 300))
+	cache := &inference.PromptCacheDirective{Enabled: true}
+	turn1 := inference.Request{
+		Messages: []inference.Message{
+			sys,
+			anthropicTextMsg(inference.RoleUser, "q1"),
+			anthropicTextMsg(inference.RoleAssistant, "a1"),
+			anthropicTextMsg(inference.RoleUser, "q2"),
+		},
+		Tools:       tools,
+		PromptCache: cache,
+	}
+	turn2 := turn1
+	turn2.Messages = append(append([]inference.Message{}, turn1.Messages...),
+		anthropicTextMsg(inference.RoleAssistant, "a2"),
+		anthropicTextMsg(inference.RoleUser, "q3"),
+	)
+
+	targets := map[string]routing.Target{
+		"api-key":                 {ProviderModel: "claude-sonnet-5-5"},
+		"subscription masquerade": {ProviderModel: "claude-sonnet-5-5", Masquerade: routing.MasqueradeClaudeCode},
+	}
+	for name, target := range targets {
+		t.Run(name, func(t *testing.T) {
+			b1, err := anthropicRequestBody(target, turn1, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b2, err := anthropicRequestBody(target, turn2, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The same request renders to the same bytes every time (Go map
+			// iteration order must not leak into the body).
+			for i := range 20 {
+				again, err := anthropicRequestBody(target, turn1, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(again) != string(b1) {
+					t.Fatalf("render %d of the same request differs:\n%s\n%s", i, b1, again)
+				}
+			}
+
+			var f1, f2 map[string]json.RawMessage
+			if err := json.Unmarshal(b1, &f1); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(b2, &f2); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"system", "tools"} {
+				if len(f1[field]) == 0 {
+					t.Fatalf("turn 1 has no %s field: %s", field, b1)
+				}
+				if string(f1[field]) != string(f2[field]) {
+					t.Fatalf("%s (cached stable prefix) differs across turns:\n%s\n%s", field, f1[field], f2[field])
+				}
+			}
+
+			var m1, m2 []json.RawMessage
+			if err := json.Unmarshal(f1["messages"], &m1); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(f2["messages"], &m2); err != nil {
+				t.Fatal(err)
+			}
+			if len(m2) <= len(m1) {
+				t.Fatalf("turn 2 must extend turn 1: %d vs %d messages", len(m2), len(m1))
+			}
+			prefix1, prefix2 := stripCacheMarkers(t, m1), stripCacheMarkers(t, m2[:len(m1)])
+			j1, _ := json.Marshal(prefix1)
+			j2, _ := json.Marshal(prefix2)
+			if string(j1) != string(j2) {
+				t.Fatalf("turn 1's messages are not the leading messages of turn 2 (marker aside):\n%s\n%s", j1, j2)
+			}
+		})
+	}
+}
