@@ -281,8 +281,9 @@ included:
   wrong key with **400**, not 401, so a bad key there reads `unverifiable`
   ("could not verify"), never `invalid`. The one rule is deliberately not bent
   per provider: the price is that a wrong key is not caught on those two, the gain
-  that no provider's idiosyncratic status code can ever mislabel a working key as
-  rejected ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix) (d)).
+  that a non-401 answer never reads as `invalid`. A moved endpoint that begins
+  answering 401 would still show a false `invalid` on Test connection, which
+  blocks nothing, since an api key is not probed when it is saved ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix) (d)).
 
 **Fail-soft.** Validation never reduces availability: `unverifiable` neither
 blocks an import nor is ever reported as an invalid credential. A probe runs only
@@ -915,8 +916,10 @@ So x.ai serves chat at `https://api.x.ai/v1/chat/completions`, OpenRouter at
 service defaults it from the preset when it is empty (`openai_compatible` has no
 default, so empty is `400 vendor_account.base_url_required`) and otherwise accepts
 only an **https** URL with a host and no userinfo, query, fragment or space
-(`400 vendor_account.base_url_invalid`); a trailing `/` is trimmed. Beyond that the
-host is unrestricted, which is the Custom trust model of
+(`400 vendor_account.base_url_invalid`); a trailing `/` is trimmed. So the stored
+root is either the preset's default or an **owner-supplied** one: required for
+Custom, an optional override for the four named presets. Beyond the shape the host
+is unrestricted, which is the owner-supplied base-URL trust model of
 [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 It is immutable: a different root means a new account. For `openai` and `anthropic`
 a supplied `base_url` is ignored and the column stays `''`.
@@ -1712,9 +1715,11 @@ reasons are recorded deliberately, not in denial of them
   providers can still move any of it without notice. It all sits as data in
   `internal/routing/vendor_presets.go`, so a correction is an edit there, and a
   moved endpoint degrades to `unverifiable` or an unchanged catalog, never to a
-  wrong one. The **Custom** endpoint's trust model is the one deliberate
-  acceptance here: an authenticated owner supplies an https root that is not
-  otherwise restricted, so the on-prem gateway can be pointed at any https host
+  wrong one. The **owner-supplied base-URL** trust model is the one deliberate
+  acceptance here: it applies to any OpenAI-compatible account whose owner supplies
+  a root, which is required for Custom and an optional override for the four named
+  presets, and the root is not otherwise restricted beyond https, so the on-prem
+  gateway can be pointed at any https host
   (server-side request forgery is accepted, with its limits,
   [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **Single-process assumptions.** The pending-connect state (PKCE verifier/state
@@ -1893,4 +1898,4 @@ enabled vendor accounts is affected.
   breakpoints go.
 - [ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)
   — OpenAI-compatible vendors as presets over one OpenAI client: the registry, the
-  stored root, the path prefix and the Custom trust model.
+  stored root, the path prefix and the owner-supplied base-URL trust model.

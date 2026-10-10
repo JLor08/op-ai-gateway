@@ -3347,8 +3347,10 @@ bespoke branch per provider.
   listing and no key endpoint, so the honest answer is "could not verify"). The
   classification is not bent per provider: 2xx is valid, 401 invalid, everything
   else unverifiable. x.ai and Gemini answer a wrong key with 400, so there a wrong
-  key reads "could not verify", never "invalid" — fail-soft, and a key is never
-  misreported as rejected. Discovery is `GET {base}{prefix}/models` (Gemini's
+  key reads "could not verify", never "invalid" — fail-soft: a non-401 response
+  never reads as invalid. A moved endpoint that begins answering 401 would show a
+  false "invalid" on Test connection, which blocks nothing (a key is not probed
+  when it is saved). Discovery is `GET {base}{prefix}/models` (Gemini's
   leading `models/` is stripped from the ids), runs best-effort when an account is
   created with its key (bounded to 5 s, never failing the create, since these
   accounts have no static seed) and on Refresh, and its per-discovery cap rises
@@ -3360,14 +3362,16 @@ bespoke branch per provider.
   sub-project, and usage/credits display is another (the registry's usage slot is
   the seam): until then these accounts report no usage, the passive header scrape
   finding none of the headers it knows.
-- **(f) The Custom base-URL trust model.** For `openai_compatible` the owner
-  supplies the root. It must be **https** with a host and carry no userinfo, query,
-  fragment or space (the key rides on every request, so plaintext and
-  credential-in-URL are refused); the host is otherwise unrestricted. This is an
-  on-prem gateway and the URL is set by an authenticated owner for their own
-  account, so a Custom account can make the gateway call any https host the owner
-  names, internal ones included: server-side request forgery is **accepted**, with
-  its limits recorded in
+- **(f) The owner-supplied base-URL trust model.** The root is supplied by the
+  owner for `openai_compatible` (Custom), where it is required, and may be supplied
+  for any of the four named presets as an override of their pinned default root;
+  the trust model applies to every account whose owner supplies one. It must be
+  **https** with a host and carry no userinfo, query, fragment or space (the key
+  rides on every request, so plaintext and credential-in-URL are refused); the
+  host is otherwise unrestricted. This is an on-prem gateway and the URL is set by
+  an authenticated owner for their own account, so such an account can make the
+  gateway call any https host the owner names, internal ones included:
+  server-side request forgery is **accepted**, with its limits recorded in
   [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) —
   redirects are refused on validate and discovery, and there is no DNS-rebinding
   dial guard in v1.
