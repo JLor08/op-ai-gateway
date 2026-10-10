@@ -1341,13 +1341,16 @@ the TTL holds — and the `?force=1` form from its refresh button. Nothing polls
 
 ## 6. Dynamic model discovery and the model prefix
 
-The catalog an account serves is seeded at creation from a small static set, and
-that set is only a guess (§10): a ChatGPT subscription's Codex backend serves
-newer model generations than any list kept in this repository, and a vendor
-renames or retires models without notice. So the gateway asks the vendor which
-models the account's **own credential** can really use and **replaces** the
+The catalog of an OpenAI or Anthropic account is seeded at creation from a small
+static set, and that set is only a guess (§10): a ChatGPT subscription's Codex
+backend serves newer model generations than any list kept in this repository, and
+a vendor renames or retires models without notice. So the gateway asks the vendor
+which models the account's **own credential** can really use and **replaces** the
 guess with the answer. The static set stays as the create-time fallback and as
-what an account keeps whenever discovery yields nothing.
+what an account keeps whenever discovery yields nothing. The OpenAI-compatible
+vendors (§4.4) seed **nothing**: their catalog starts empty and is filled by a
+best-effort discovery at create (when the account is created with its key, §6.2)
+and by the refresh.
 
 Discovery is split like the validation probes (§3.5). One fetcher per credential kind lives
 in `internal/vendorauth` (`discover.go`, and `openai_compatible.go` for the
