@@ -212,6 +212,15 @@ const (
 	VendorOpenAI    = "openai"
 	VendorAnthropic = "anthropic"
 
+	// OpenAI-compatible hosted providers (api-key only; reached through the
+	// shared OpenAICompatibleClient against the account's own BaseURL). Their
+	// endpoints and path prefixes are data in vendor_presets.go.
+	VendorXAI              = "xai"
+	VendorOpenRouter       = "openrouter"
+	VendorKilo             = "kilo"
+	VendorGoogle           = "google"
+	VendorOpenAICompatible = "openai_compatible"
+
 	VendorAuthAPIKey       = "api_key"
 	VendorAuthSubscription = "subscription"
 
@@ -227,7 +236,7 @@ const (
 type VendorAccount struct {
 	ID          string
 	OwnerUserID string
-	Vendor      string // VendorOpenAI | VendorAnthropic
+	Vendor      string // VendorOpenAI | VendorAnthropic | an OpenAI-compatible id (see vendor_presets.go)
 	AuthType    string // VendorAuthAPIKey | VendorAuthSubscription
 	Name        string
 	Status      string // VendorAccountStatus*
