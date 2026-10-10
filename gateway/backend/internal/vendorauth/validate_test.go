@@ -155,6 +155,21 @@ func probeCases() []probeCase {
 			absent:    []string{"Authorization", "Anthropic-Beta"},
 			forbidden: StatusUnverifiable,
 		},
+		{
+			// The probe URL is composed by the caller from the provider preset;
+			// here it is the x.ai one.
+			name: "openai-compatible api key",
+			call: func(ctx context.Context, c *http.Client, cred string) CredentialCheck {
+				return ValidateOpenAICompatibleAPIKey(ctx, c, "https://api.x.ai/v1/models", cred)
+			},
+			host: "api.x.ai",
+			path: "/v1/models",
+			headers: func(cred string) map[string]string {
+				return map[string]string{"Authorization": "Bearer " + cred}
+			},
+			absent:    []string{"X-Api-Key", "Anthropic-Version", "Anthropic-Beta"},
+			forbidden: StatusUnverifiable,
+		},
 	}
 }
 
@@ -222,6 +237,49 @@ func TestValidatorsStatusMapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The probe asks exactly the URL the caller composed (host, port, any path), not
+// a vendor constant: this package knows no vendor roots for OpenAI-compatible
+// providers.
+func TestValidateOpenAICompatibleAPIKeyRequestsTheGivenURL(t *testing.T) {
+	tests := []struct {
+		name, probeURL, host, path string
+	}{
+		{"openrouter key endpoint", "https://openrouter.ai/api/v1/key", "openrouter.ai", "/api/v1/key"},
+		{"gemini models under a versioned prefix", "https://generativelanguage.googleapis.com/v1beta/openai/models", "generativelanguage.googleapis.com", "/v1beta/openai/models"},
+		{"custom endpoint with a port and a root path", "https://gw.example.test:8443/root/v1/models", "gw.example.test:8443", "/root/v1/models"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, rec := newProbeClient(t, respondWith(http.StatusOK, `{}`))
+			got := ValidateOpenAICompatibleAPIKey(context.Background(), client, tc.probeURL, probeSecret)
+			if got.Status != StatusValid {
+				t.Errorf("status = %v, want valid (detail %q)", got.Status, got.Detail)
+			}
+			reqs := rec.all()
+			if len(reqs) != 1 {
+				t.Fatalf("requests = %d, want exactly 1", len(reqs))
+			}
+			if reqs[0].Host != tc.host || reqs[0].Path != tc.path {
+				t.Errorf("asked %s%s, want %s%s", reqs[0].Host, reqs[0].Path, tc.host, tc.path)
+			}
+		})
+	}
+}
+
+func TestValidateOpenAICompatibleAPIKeyWithAnUnbuildableURLIsUnverifiable(t *testing.T) {
+	client, rec := newProbeClient(t, respondWith(http.StatusOK, `{}`))
+	got := ValidateOpenAICompatibleAPIKey(context.Background(), client, "http://[::1", probeSecret)
+	if got.Status != StatusUnverifiable {
+		t.Errorf("status = %v, want unverifiable (detail %q)", got.Status, got.Detail)
+	}
+	if strings.Contains(got.Detail, probeSecret) {
+		t.Errorf("Detail %q contains the credential", got.Detail)
+	}
+	if n := len(rec.all()); n != 0 {
+		t.Errorf("requests = %d, want none for a URL that cannot be built", n)
 	}
 }
 
