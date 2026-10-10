@@ -75,14 +75,24 @@ type VendorConnectionCheck struct {
 // bounded client. The vendorauth.Validate* functions have exactly this shape.
 type VendorCredentialValidator func(ctx context.Context, httpClient *http.Client, credential string) vendorauth.CredentialCheck
 
-// VendorCredentialValidators is the seam over the four vendorauth probes: tests
-// inject fakes so no service test reaches a vendor over the network. A nil field
-// means the real probe (see ServiceDeps.VendorValidators).
+// VendorOpenAICompatibleValidator is the api-key probe of an OpenAI-compatible
+// provider. Unlike VendorCredentialValidator it takes the probe URL: the portal
+// composes it from the provider preset and the account's base URL, because the
+// vendorauth package knows no vendor roots. vendorauth.ValidateOpenAICompatibleAPIKey
+// has exactly this shape.
+type VendorOpenAICompatibleValidator func(ctx context.Context, httpClient *http.Client, probeURL, apiKey string) vendorauth.CredentialCheck
+
+// VendorCredentialValidators is the seam over the vendorauth probes: tests inject
+// fakes so no service test reaches a vendor over the network. A nil field means
+// the real probe (see ServiceDeps.VendorValidators).
 type VendorCredentialValidators struct {
 	OpenAISubscription    VendorCredentialValidator
 	AnthropicSubscription VendorCredentialValidator
 	OpenAIAPIKey          VendorCredentialValidator
 	AnthropicAPIKey       VendorCredentialValidator
+	// OpenAICompatibleAPIKey probes the api key of every OpenAI-compatible vendor
+	// (x.ai, OpenRouter, Google, the Custom endpoint) at a preset-derived URL.
+	OpenAICompatibleAPIKey VendorOpenAICompatibleValidator
 }
 
 // withDefaults returns v with every nil probe replaced by its vendorauth function.
@@ -98,6 +108,9 @@ func (v VendorCredentialValidators) withDefaults() VendorCredentialValidators {
 	}
 	if v.AnthropicAPIKey == nil {
 		v.AnthropicAPIKey = vendorauth.ValidateAnthropicAPIKey
+	}
+	if v.OpenAICompatibleAPIKey == nil {
+		v.OpenAICompatibleAPIKey = vendorauth.ValidateOpenAICompatibleAPIKey
 	}
 	return v
 }
@@ -154,10 +167,15 @@ func (s *Service) checkSubscriptionTokenSet(ctx context.Context, vendor string, 
 	return s.validateSubscriptionToken(ctx, vendor, ts.AccessToken)
 }
 
-// validateAPIKey runs vendor's API-KEY probe.
-func (s *Service) validateAPIKey(ctx context.Context, vendor, apiKey string) vendorauth.CredentialCheck {
+// validateAPIKey runs acc's vendor's API-KEY probe. An OpenAI-compatible vendor
+// is probed per its preset (validateOpenAICompatibleAPIKey); openai and anthropic
+// keep their own fixed-URL probes.
+func (s *Service) validateAPIKey(ctx context.Context, acc routing.VendorAccount, apiKey string) vendorauth.CredentialCheck {
+	if routing.IsOpenAICompatibleVendor(acc.Vendor) {
+		return s.validateOpenAICompatibleAPIKey(ctx, acc, apiKey)
+	}
 	var probe VendorCredentialValidator
-	switch vendor {
+	switch acc.Vendor {
 	case routing.VendorOpenAI:
 		probe = s.vendorValidation.validators.OpenAIAPIKey
 	case routing.VendorAnthropic:
@@ -167,6 +185,40 @@ func (s *Service) validateAPIKey(ctx context.Context, vendor, apiKey string) ven
 		return unverifiableVendorCheck("no credential check exists for this vendor")
 	}
 	return probe(ctx, s.vendorValidation.client, apiKey)
+}
+
+// validateOpenAICompatibleAPIKey probes the api key of an OpenAI-compatible
+// account at the URL its preset prescribes (ValidateVia):
+//
+//   - "models": GET {base}{prefix}/models (x.ai, Google, Custom: listing needs a key)
+//   - "key":    GET {base}{prefix}{ValidatePath} (OpenRouter: /models is public,
+//     /key introspects the key)
+//   - "none":   no probe at all (Kilo: public listing, no key endpoint), so the
+//     answer is Unverifiable instead of a listing that calls every key valid.
+//
+// The classification (2xx valid, 401 invalid, anything else unverifiable) is the
+// validator's and is the same for every preset. A provider that answers a bad key
+// with 400 (x.ai, Gemini) therefore reads "could not verify", never "invalid".
+func (s *Service) validateOpenAICompatibleAPIKey(ctx context.Context, acc routing.VendorAccount, apiKey string) vendorauth.CredentialCheck {
+	preset, ok := routing.VendorPresetFor(acc.Vendor)
+	if !ok {
+		return unverifiableVendorCheck("no credential check exists for this vendor")
+	}
+	var probePath string
+	switch preset.ValidateVia {
+	case "none":
+		return unverifiableVendorCheck("this provider offers no offline key check")
+	case "key":
+		probePath = preset.ValidatePath
+	default: // "models"
+		probePath = "/models"
+	}
+	probe := s.vendorValidation.validators.OpenAICompatibleAPIKey
+	if probe == nil {
+		return unverifiableVendorCheck("no credential check exists for this vendor")
+	}
+	probeURL := strings.TrimRight(acc.BaseURL, "/") + preset.PathPrefix + probePath
+	return probe(ctx, s.vendorValidation.client, probeURL, apiKey)
 }
 
 // vendorIdentityValue returns raw when it is safe to store and to send back as a
@@ -318,7 +370,7 @@ func (s *Service) checkVendorAccount(ctx context.Context, acc routing.VendorAcco
 		if apiKey == "" {
 			return unverifiableVendorCheck("no API key is set"), "", nil
 		}
-		return s.validateAPIKey(ctx, acc.Vendor, apiKey), apiKey, nil
+		return s.validateAPIKey(ctx, acc, apiKey), apiKey, nil
 	case routing.VendorAuthSubscription:
 		ts, err := s.openVendorTokenSet(acc)
 		if err != nil {

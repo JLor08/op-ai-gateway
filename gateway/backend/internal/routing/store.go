@@ -212,6 +212,15 @@ const (
 	VendorOpenAI    = "openai"
 	VendorAnthropic = "anthropic"
 
+	// OpenAI-compatible hosted providers (api-key only; reached through the
+	// shared OpenAICompatibleClient against the account's own BaseURL). Their
+	// endpoints and path prefixes are data in vendor_presets.go.
+	VendorXAI              = "xai"
+	VendorOpenRouter       = "openrouter"
+	VendorKilo             = "kilo"
+	VendorGoogle           = "google"
+	VendorOpenAICompatible = "openai_compatible"
+
 	VendorAuthAPIKey       = "api_key"
 	VendorAuthSubscription = "subscription"
 
@@ -227,7 +236,7 @@ const (
 type VendorAccount struct {
 	ID          string
 	OwnerUserID string
-	Vendor      string // VendorOpenAI | VendorAnthropic
+	Vendor      string // VendorOpenAI | VendorAnthropic | an OpenAI-compatible id (see vendor_presets.go)
 	AuthType    string // VendorAuthAPIKey | VendorAuthSubscription
 	Name        string
 	Status      string // VendorAccountStatus*
@@ -241,8 +250,12 @@ type VendorAccount struct {
 	// model ids (migration 83): "" = none. The service validates it (printable
 	// ASCII, no spaces, bounded length); the store keeps it verbatim.
 	ModelPrefix string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// BaseURL is the upstream ROOT url of an OpenAI-compatible account (no /v1 or
+	// other path prefix — the client adds the preset's prefix). "" for the bespoke
+	// openai/anthropic accounts. Set at create and immutable thereafter.
+	BaseURL   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // VendorAccountModel is one model a vendor account serves: the public id a
@@ -2285,8 +2298,8 @@ type RuntimeStore interface {
 //
 // UpdateVendorAccount rewrites auth_type, name, status, api_key, oauth_tokens,
 // model_prefix and updated_at; the account's identity — id, owner_user_id,
-// vendor and created_at — is immutable, so every driver ignores a changed value
-// there. An unknown id is ErrNotFound on Update and Delete, a duplicate id is
+// vendor and created_at — and its base_url are immutable, so every driver
+// ignores a changed value there. An unknown id is ErrNotFound on Update and Delete, a duplicate id is
 // ErrConflict on Create. Deleting an account (or its owning user) cascades its
 // dependent rows.
 type VendorAccountStore interface {

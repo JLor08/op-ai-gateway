@@ -74,6 +74,7 @@ function makeAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
     name: 'Work OpenAI',
     status: 'active',
     model_prefix: '',
+    base_url: '',
     api_key_set: true,
     subscription_connected: false,
     models: [],

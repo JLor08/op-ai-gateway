@@ -870,3 +870,52 @@ func TestNewServiceDefaultsAndInjectsTheVendorOAuthEndpoints(t *testing.T) {
 		t.Fatal("the injected endpoints / http client were not used")
 	}
 }
+
+// The OpenAI-compatible vendors are api-key only, so every subscription connect
+// path fails closed for them: a created (api-key) account is refused as not a
+// subscription before anything is stored, and even an account planted in the
+// store as a subscription (the service cannot create one) is refused as an
+// unknown vendor by the OAuth begin and the device begin rather than being
+// pointed at another vendor's endpoint.
+func TestSubscriptionConnectFailsClosedForCompatVendors(t *testing.T) {
+	svc, routeStore, _ := newVendorConnectTestService(t)
+	ctx := context.Background()
+
+	for _, vendor := range openAICompatibleTestVendors {
+		t.Run(vendor, func(t *testing.T) {
+			acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(vendor, "https://gw.example.test"))
+			if _, err := svc.BeginVendorAccountConnect(ctx, ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotSubscription) {
+				t.Fatalf("begin: err = %v, want ErrVendorAccountNotSubscription", err)
+			}
+			if _, err := svc.CompleteVendorAccountConnect(ctx, ownerToken(), acc.ID, "code#state"); !errors.Is(err, ErrVendorAccountNotSubscription) {
+				t.Fatalf("complete: err = %v, want ErrVendorAccountNotSubscription", err)
+			}
+			if _, err := svc.ConnectVendorAccountImport(ctx, ownerToken(), acc.ID, ConnectVendorAccountImportRequest{AccessToken: connectTestAccess}); !errors.Is(err, ErrVendorAccountNotSubscription) {
+				t.Fatalf("import: err = %v, want ErrVendorAccountNotSubscription", err)
+			}
+			if _, _, err := svc.BeginVendorAccountDeviceConnect(ctx, ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotSubscription) {
+				t.Fatalf("device begin: err = %v, want ErrVendorAccountNotSubscription", err)
+			}
+			if _, err := svc.PollVendorAccountDeviceConnect(ctx, ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotSubscription) {
+				t.Fatalf("device poll: err = %v, want ErrVendorAccountNotSubscription", err)
+			}
+
+			planted := routing.VendorAccount{
+				ID: "va_planted_" + vendor, OwnerUserID: "usr_owner", Vendor: vendor,
+				AuthType: routing.VendorAuthSubscription, Name: "Planted", Status: routing.VendorAccountStatusActive,
+			}
+			if err := routeStore.CreateVendorAccount(ctx, planted); err != nil {
+				t.Fatalf("plant: %v", err)
+			}
+			if _, err := svc.BeginVendorAccountConnect(ctx, ownerToken(), planted.ID); !errors.Is(err, ErrVendorAccountVendorInvalid) {
+				t.Fatalf("planted begin: err = %v, want ErrVendorAccountVendorInvalid", err)
+			}
+			if _, _, err := svc.BeginVendorAccountDeviceConnect(ctx, ownerToken(), planted.ID); !errors.Is(err, ErrVendorAccountDeviceUnsupported) {
+				t.Fatalf("planted device begin: err = %v, want ErrVendorAccountDeviceUnsupported", err)
+			}
+			if pendingCount(svc) != 0 || svc.vendorDeviceConnect.count() != 0 {
+				t.Fatal("a refused connect must not store a pending entry")
+			}
+		})
+	}
+}

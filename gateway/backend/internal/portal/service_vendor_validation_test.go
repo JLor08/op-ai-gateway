@@ -19,25 +19,34 @@ import (
 	"time"
 )
 
-// The four validator kinds the fake records, one per vendorauth probe.
+// The validator kinds the fake records, one per vendorauth probe.
 const (
-	kindOpenAISubscription    = "openai-subscription"
-	kindAnthropicSubscription = "anthropic-subscription"
-	kindOpenAIAPIKey          = "openai-api-key"
-	kindAnthropicAPIKey       = "anthropic-api-key"
+	kindOpenAISubscription     = "openai-subscription"
+	kindAnthropicSubscription  = "anthropic-subscription"
+	kindOpenAIAPIKey           = "openai-api-key"
+	kindAnthropicAPIKey        = "anthropic-api-key"
+	kindOpenAICompatibleAPIKey = "openai-compatible-api-key"
 )
+
+// fakeValidatorKinds lists every kind the fake answers.
+var fakeValidatorKinds = []string{
+	kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey,
+}
 
 // fakeValidatorCall is one recorded validator invocation.
 type fakeValidatorCall struct {
 	kind       string
 	credential string
+	// probeURL is the URL the service composed; only the OpenAI-compatible kind
+	// carries one ("" for every other kind, whose URL is a vendorauth constant).
+	probeURL string
 	// timeout is the Timeout of the *http.Client the service handed over; hasClient
 	// is false when it handed over nil.
 	timeout   time.Duration
 	hasClient bool
 }
 
-// fakeVendorValidators replaces the four vendorauth probes so no service test
+// fakeVendorValidators replaces the vendorauth probes so no service test
 // reaches the network. Each kind answers its configured verdict (Unverifiable
 // until set) and every call is recorded.
 type fakeVendorValidators struct {
@@ -48,7 +57,7 @@ type fakeVendorValidators struct {
 
 func newFakeVendorValidators() *fakeVendorValidators {
 	f := &fakeVendorValidators{checks: map[string]vendorauth.CredentialCheck{}}
-	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey} {
+	for _, kind := range fakeValidatorKinds {
 		f.checks[kind] = vendorauth.CredentialCheck{Status: vendorauth.StatusUnverifiable, Detail: "fake: not configured"}
 	}
 	return f
@@ -69,7 +78,7 @@ func (f *fakeVendorValidators) set(kind string, check vendorauth.CredentialCheck
 
 // setAll gives every kind the same verdict.
 func (f *fakeVendorValidators) setAll(check vendorauth.CredentialCheck) {
-	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey} {
+	for _, kind := range fakeValidatorKinds {
 		f.set(kind, check)
 	}
 }
@@ -87,12 +96,27 @@ func (f *fakeVendorValidators) record(kind string) func(context.Context, *http.C
 	}
 }
 
+// recordURL is record for the validator that takes a caller-composed probe URL.
+func (f *fakeVendorValidators) recordURL(kind string) func(context.Context, *http.Client, string, string) vendorauth.CredentialCheck {
+	return func(_ context.Context, client *http.Client, probeURL, credential string) vendorauth.CredentialCheck {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		call := fakeValidatorCall{kind: kind, credential: credential, probeURL: probeURL, hasClient: client != nil}
+		if client != nil {
+			call.timeout = client.Timeout
+		}
+		f.calls = append(f.calls, call)
+		return f.checks[kind]
+	}
+}
+
 func (f *fakeVendorValidators) validators() VendorCredentialValidators {
 	return VendorCredentialValidators{
-		OpenAISubscription:    f.record(kindOpenAISubscription),
-		AnthropicSubscription: f.record(kindAnthropicSubscription),
-		OpenAIAPIKey:          f.record(kindOpenAIAPIKey),
-		AnthropicAPIKey:       f.record(kindAnthropicAPIKey),
+		OpenAISubscription:     f.record(kindOpenAISubscription),
+		AnthropicSubscription:  f.record(kindAnthropicSubscription),
+		OpenAIAPIKey:           f.record(kindOpenAIAPIKey),
+		AnthropicAPIKey:        f.record(kindAnthropicAPIKey),
+		OpenAICompatibleAPIKey: f.recordURL(kindOpenAICompatibleAPIKey),
 	}
 }
 
@@ -613,6 +637,134 @@ func TestTestVendorAccountConnectionAPIKey(t *testing.T) {
 	}
 }
 
+// An OpenAI-compatible api-key account is probed with GET {base}{prefix}{path}
+// where the path is the preset's: /models when the listing needs a key, the
+// key-introspection path when /models is public. The portal composes the URL (the
+// preset registry lives in routing, which vendorauth must not import); the
+// validator only asks it. The check carries the validator's verdict unchanged.
+func TestTestVendorAccountConnectionOpenAICompatibleProbeURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		vendor  string
+		baseURL string
+		wantURL string
+	}{
+		{"xai models", routing.VendorXAI, "", "https://api.x.ai/v1/models"},
+		{"openrouter key endpoint", routing.VendorOpenRouter, "", "https://openrouter.ai/api/v1/key"},
+		{"google models under the openai prefix", routing.VendorGoogle, "", "https://generativelanguage.googleapis.com/v1beta/openai/models"},
+		{"custom endpoint", routing.VendorOpenAICompatible, "https://gw.example.test/root", "https://gw.example.test/root/v1/models"},
+		{"custom endpoint typed with a trailing slash", routing.VendorOpenAICompatible, "https://gw.example.test/", "https://gw.example.test/v1/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newVendorConnectTestService(t)
+			fake := installFakeVendorValidators(svc)
+			fake.set(kindOpenAICompatibleAPIKey, validCheck("", ""))
+			acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(tc.vendor, tc.baseURL))
+
+			got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("TestVendorAccountConnection: %v", err)
+			}
+			if got.Status != "valid" || got.Detail != "credential accepted (HTTP 200)" {
+				t.Fatalf("check = %+v, want the validator's valid verdict", got)
+			}
+			call := fake.onlyCall(t)
+			if call.kind != kindOpenAICompatibleAPIKey || call.credential != vendorAccountTestKey {
+				t.Fatalf("call = %+v, want the OpenAI-compatible validator with the stored (opened) key", call)
+			}
+			if call.probeURL != tc.wantURL {
+				t.Fatalf("probe URL = %q, want %q", call.probeURL, tc.wantURL)
+			}
+			if !call.hasClient || call.timeout != 10*time.Second {
+				t.Fatalf("call = %+v, want a client with a 10s timeout", call)
+			}
+		})
+	}
+}
+
+// The classification is the validator's, not the portal's: every verdict it
+// returns reaches the check as is, for every probe-backed preset.
+func TestTestVendorAccountConnectionOpenAICompatibleMapsEveryVerdict(t *testing.T) {
+	cases := map[string]vendorauth.CredentialCheck{
+		"valid":        validCheck("", ""),
+		"invalid":      invalidCheck(),
+		"unverifiable": unverifiableCheck(),
+	}
+	for _, vendor := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorGoogle, routing.VendorOpenAICompatible} {
+		for want, verdict := range cases {
+			t.Run(vendor+"/"+want, func(t *testing.T) {
+				svc, _, _ := newVendorConnectTestService(t)
+				fake := installFakeVendorValidators(svc)
+				fake.set(kindOpenAICompatibleAPIKey, verdict)
+				acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(vendor, "https://gw.example.test"))
+
+				got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+				if err != nil {
+					t.Fatalf("TestVendorAccountConnection: %v", err)
+				}
+				if got.Status != want {
+					t.Fatalf("status = %q, want %q", got.Status, want)
+				}
+			})
+		}
+	}
+}
+
+// Kilo's models listing is public and it has no key endpoint, so there is nothing
+// to probe: the answer is "could not verify" and NO probe runs (a probe against the
+// public listing would call every key valid).
+func TestTestVendorAccountConnectionKiloHasNoOfflineCheck(t *testing.T) {
+	svc, _, _ := newVendorConnectTestService(t)
+	fake := installFakeVendorValidators(svc)
+	fake.setAll(validCheck("", ""))
+	acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorKilo, ""))
+
+	got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("TestVendorAccountConnection: %v", err)
+	}
+	if got.Status != "unverifiable" || got.Detail == "" {
+		t.Fatalf("check = %+v, want unverifiable with a detail", got)
+	}
+	if strings.Contains(got.Detail, vendorAccountTestKey) {
+		t.Fatalf("detail %q leaks the credential", got.Detail)
+	}
+	if calls := fake.recorded(); len(calls) != 0 {
+		t.Fatalf("validator calls = %+v, want none for a provider with no offline key check", calls)
+	}
+}
+
+// The OpenAI-compatible vendors never fall into the openai/anthropic probes, and
+// openai/anthropic never reach the compatible one: each vendor family has its own
+// seam.
+func TestValidateAPIKeyKeepsTheVendorFamiliesApart(t *testing.T) {
+	svc, _, _ := newVendorConnectTestService(t)
+	fake := installFakeVendorValidators(svc)
+	fake.setAll(validCheck("", ""))
+
+	for vendor, wantKind := range map[string]string{
+		routing.VendorOpenAI:           kindOpenAIAPIKey,
+		routing.VendorAnthropic:        kindAnthropicAPIKey,
+		routing.VendorXAI:              kindOpenAICompatibleAPIKey,
+		routing.VendorOpenAICompatible: kindOpenAICompatibleAPIKey,
+	} {
+		fake.reset()
+		svc.validateAPIKey(context.Background(), routing.VendorAccount{Vendor: vendor, BaseURL: "https://gw.example.test"}, "k")
+		if call := fake.onlyCall(t); call.kind != wantKind {
+			t.Errorf("%s: validator kind = %s, want %s", vendor, call.kind, wantKind)
+		}
+	}
+
+	fake.reset()
+	if got := svc.validateAPIKey(context.Background(), routing.VendorAccount{Vendor: "no-such-vendor"}, "k"); got.Status != vendorauth.StatusUnverifiable {
+		t.Errorf("unknown vendor: status = %v, want unverifiable", got.Status)
+	}
+	if calls := fake.recorded(); len(calls) != 0 {
+		t.Errorf("unknown vendor: validator calls = %+v, want none", calls)
+	}
+}
+
 func TestTestVendorAccountConnectionSubscription(t *testing.T) {
 	cases := map[string]string{
 		routing.VendorOpenAI:    kindOpenAISubscription,
@@ -889,7 +1041,7 @@ func TestTestVendorAccountConnectionRefusesWhileTheMasterFlagIsOff(t *testing.T)
 func TestNewServiceDefaultsAndInjectsTheVendorValidators(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	v := defaults.vendorValidation.validators
-	if v.OpenAISubscription == nil || v.AnthropicSubscription == nil || v.OpenAIAPIKey == nil || v.AnthropicAPIKey == nil {
+	if v.OpenAISubscription == nil || v.AnthropicSubscription == nil || v.OpenAIAPIKey == nil || v.AnthropicAPIKey == nil || v.OpenAICompatibleAPIKey == nil {
 		t.Fatalf("default validators = %+v, want every probe defaulted to its vendorauth function", v)
 	}
 	if c := defaults.vendorValidation.client; c == nil || c.Timeout != 10*time.Second {
@@ -905,7 +1057,7 @@ func TestNewServiceDefaultsAndInjectsTheVendorValidators(t *testing.T) {
 		},
 	}})
 	iv := injected.vendorValidation.validators
-	if iv.AnthropicAPIKey == nil || iv.OpenAISubscription == nil || iv.AnthropicSubscription == nil {
+	if iv.AnthropicAPIKey == nil || iv.OpenAISubscription == nil || iv.AnthropicSubscription == nil || iv.OpenAICompatibleAPIKey == nil {
 		t.Fatalf("injected validators = %+v, want the unnamed probes defaulted", iv)
 	}
 	if got := iv.OpenAIAPIKey(context.Background(), nil, "k"); got.Status != vendorauth.StatusValid || !called {

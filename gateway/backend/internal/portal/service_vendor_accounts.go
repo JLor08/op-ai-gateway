@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -79,6 +80,10 @@ type VendorAccountUsageDTO struct {
 // model id (a model's GatewayModel), while the vendor is still asked for its own
 // id (UpstreamModel).
 //
+// BaseURL is the upstream root of an OpenAI-compatible account (the preset's
+// default root, or the one the user typed); "" for openai and anthropic, whose
+// hosts are fixed. It is immutable and always on the wire.
+//
 // Usage is the rate-limit snapshot. The two read endpoints fill it -- the detail
 // view's Usage & Limits panel (GetVendorAccount) and the list
 // (ListVendorAccounts, so the dashboard's provider usage section reads every
@@ -94,6 +99,7 @@ type VendorAccountDTO struct {
 	Name                  string                  `json:"name"`
 	Status                string                  `json:"status"`
 	ModelPrefix           string                  `json:"model_prefix"`
+	BaseURL               string                  `json:"base_url"`
 	APIKeySet             bool                    `json:"api_key_set"`
 	SubscriptionConnected bool                    `json:"subscription_connected"`
 	Models                []VendorAccountModelDTO `json:"models"`
@@ -112,6 +118,9 @@ type VendorAccountListResponse struct {
 // subscription account is created unconnected (the OAuth connect flow fills its
 // token set later). An empty Status defaults to active. ModelPrefix is optional
 // ("" = none); see normalizeVendorAccountModelPrefix for the accepted shape.
+// BaseURL is the upstream root of an OpenAI-compatible account (see
+// normalizeVendorAccountBaseURL); it is ignored for openai and anthropic and,
+// being immutable, is absent from UpdateVendorAccountRequest.
 type CreateVendorAccountRequest struct {
 	Vendor      string `json:"vendor"`
 	AuthType    string `json:"auth_type"`
@@ -119,13 +128,14 @@ type CreateVendorAccountRequest struct {
 	Status      string `json:"status"`
 	APIKey      string `json:"api_key"`
 	ModelPrefix string `json:"model_prefix"`
+	BaseURL     string `json:"base_url"`
 }
 
 // UpdateVendorAccountRequest is a partial update: a nil field keeps the stored
 // value. APIKey is the write-only secret sentinel: nil keeps the sealed key,
 // "" clears it, any other value replaces it. ModelPrefix follows the same
 // pointer convention: nil keeps the stored prefix, "" clears it, any other value
-// replaces it. Vendor and auth type are immutable.
+// replaces it. Vendor, auth type and base URL are immutable.
 type UpdateVendorAccountRequest struct {
 	Name        *string `json:"name"`
 	Status      *string `json:"status"`
@@ -157,6 +167,7 @@ func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccoun
 		Name:                  acc.Name,
 		Status:                acc.Status,
 		ModelPrefix:           acc.ModelPrefix,
+		BaseURL:               acc.BaseURL,
 		APIKeySet:             acc.APIKey != "",
 		SubscriptionConnected: acc.OAuthTokens != "",
 		Models:                models,
@@ -193,7 +204,9 @@ func (s *Service) vendorAccountUsageDTO(ctx context.Context, accountID string) (
 
 func normalizeVendorAccountVendor(raw string) (string, error) {
 	switch vendor := strings.TrimSpace(raw); vendor {
-	case routing.VendorOpenAI, routing.VendorAnthropic:
+	case routing.VendorOpenAI, routing.VendorAnthropic,
+		routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo,
+		routing.VendorGoogle, routing.VendorOpenAICompatible:
 		return vendor, nil
 	default:
 		return "", ErrVendorAccountVendorInvalid
@@ -220,6 +233,33 @@ func normalizeVendorAccountStatus(raw string) (string, error) {
 	default:
 		return "", ErrVendorAccountStatusInvalid
 	}
+}
+
+// normalizeVendorAccountBaseURL validates and defaults an OpenAI-compatible
+// account's root url. For a preset vendor an empty value means "use the preset
+// default root". For VendorOpenAICompatible (Custom) a value is required. A
+// non-empty value must be an https URL with a hostname and no userinfo/query/
+// fragment (the key rides on every request, so plaintext/credential-in-URL is
+// refused; the host is otherwise unrestricted -- this is an on-prem gateway, see
+// ADR-052). net/url hides a bare trailing "?" (ForceQuery, empty RawQuery) and a
+// bare "#" (empty Fragment) from the field checks, and ":443" parses as a
+// non-empty Host with no hostname, so the raw text is also screened for "?", "#"
+// and spaces and the HOSTNAME (not Host) must be non-empty. The stored value has
+// any trailing "/" removed.
+func normalizeVendorAccountBaseURL(vendor, raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		preset, ok := routing.VendorPresetFor(vendor)
+		if !ok || preset.DefaultBaseURL == "" {
+			return "", ErrVendorAccountBaseURLRequired
+		}
+		return preset.DefaultBaseURL, nil
+	}
+	u, err := url.Parse(value)
+	if err != nil || strings.ContainsAny(value, "?# ") || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", ErrVendorAccountBaseURLInvalid
+	}
+	return strings.TrimRight(value, "/"), nil
 }
 
 // normalizeVendorAccountModelPrefix trims a requested model prefix and checks it.
@@ -368,6 +408,18 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
+	// An OpenAI-compatible vendor is api-key only (it has no subscription/OAuth
+	// flow) and carries an immutable root url. openai and anthropic keep their
+	// fixed hosts: a supplied base_url is ignored and BaseURL stays "".
+	baseURL := ""
+	if routing.IsOpenAICompatibleVendor(vendor) {
+		if authType != routing.VendorAuthAPIKey {
+			return VendorAccountDTO{}, ErrVendorAccountAuthTypeInvalid
+		}
+		if baseURL, err = normalizeVendorAccountBaseURL(vendor, req.BaseURL); err != nil {
+			return VendorAccountDTO{}, err
+		}
+	}
 	status := strings.TrimSpace(req.Status)
 	if status == "" {
 		status = routing.VendorAccountStatusActive
@@ -397,6 +449,7 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		Status:      status,
 		APIKey:      sealedKey,
 		ModelPrefix: modelPrefix,
+		BaseURL:     baseURL,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -425,7 +478,19 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		}
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, acc)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	// An OpenAI-compatible account has no static seed (its catalog is empty), so
+	// without a discovery it would serve nothing until the user pressed Refresh:
+	// ask the provider once now, best effort, so a new account is usable at once.
+	// It needs the key just stored. It never fails the create (the account exists
+	// and Refresh re-runs it) and is bounded by the connect-time discovery timeout.
+	if routing.IsOpenAICompatibleVendor(vendor) && apiKey != "" {
+		dto = s.discoverAfterConnect(ctx, principal, dto)
+	}
+	return dto, nil
 }
 
 // applyVendorAccountName applies a name change when the request carries one; an

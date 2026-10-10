@@ -28,7 +28,14 @@ import { type Fetcher, request } from './transport';
 // code-paste successes answer the credential-free VendorAccount with
 // subscription_connected=true; the device poll answers only {connected}, so the
 // caller re-reads the account (GET .../{id}).
-export type VendorAccountVendor = 'openai' | 'anthropic';
+//
+// openai and anthropic have fixed hosts and either auth type; the other five
+// vendors (xai, openrouter, kilo, google and the user-supplied openai_compatible
+// "Custom") speak the OpenAI wire format against a configurable root URL and are
+// api-key only (the backend answers vendor_account.auth_type_invalid for a
+// subscription one).
+export type VendorAccountVendor =
+  'openai' | 'anthropic' | 'xai' | 'openrouter' | 'kilo' | 'google' | 'openai_compatible';
 export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
 // user can only ever set active or disabled.
@@ -86,6 +93,11 @@ export type VendorAccount = {
   // serves is listed and requested as model_prefix + the vendor's model id.
   // Valid shape: at most 64 characters of [A-Za-z0-9._~:/@+-], no "..".
   model_prefix: string;
+  // The upstream root URL of an OpenAI-compatible account (a preset's default
+  // root, or the one the user typed); "" for openai and anthropic, whose hosts
+  // are fixed. Always on the wire. IMMUTABLE: fixed at creation and never sent
+  // on an update.
+  base_url: string;
   // The write-only secret sentinels: true once an api key (resp. a subscription
   // token set) is stored. The value itself is never returned.
   api_key_set: boolean;
@@ -103,7 +115,14 @@ export type VendorAccount = {
 // omitted/empty; api_key is only meaningful (and only accepted) for an api_key
 // account -- the backend rejects one on a subscription account with
 // vendor_account.api_key_not_allowed. model_prefix is optional (omitted = none);
-// a malformed one is a 400 vendor_account.model_prefix_invalid.
+// a malformed one is a 400 vendor_account.model_prefix_invalid. base_url is the
+// root URL of an OpenAI-compatible account (xai, openrouter, kilo, google,
+// openai_compatible): omitted = the preset's default root, required for
+// openai_compatible (400 vendor_account.base_url_required), and a non-https URL
+// or one carrying credentials, a query or a fragment is a 400
+// vendor_account.base_url_invalid. The backend ignores it for openai and
+// anthropic. It exists on create only -- UpdateVendorAccountRequest has no
+// base_url, because the root cannot be changed once the account exists.
 export type CreateVendorAccountRequest = {
   vendor: string;
   auth_type: string;
@@ -111,6 +130,7 @@ export type CreateVendorAccountRequest = {
   status?: string;
   api_key?: string;
   model_prefix?: string;
+  base_url?: string;
 };
 
 // PATCH /api/portal/vendor-accounts/{id} body -- pointer-semantics on the

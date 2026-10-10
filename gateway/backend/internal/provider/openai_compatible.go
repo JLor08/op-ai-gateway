@@ -57,7 +57,7 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: encode request", ErrInvalidResponse)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, target.OpenAIPathPrefixOrDefault()+"/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
@@ -186,11 +186,15 @@ const sdcppModelsPath = "/sdapi/v1/sd-models"
 // discovery read from it would disable every model that is merely not loaded
 // at the moment -- permanently, since reconcile never re-enables a mapping it
 // already has.
-func modelDiscoveryFor(providerType string) (path string, decode func(io.Reader) ([]string, error)) {
+//
+// pathPrefix is the target's normalised OpenAI-dialect prefix
+// (Target.OpenAIPathPrefixOrDefault); every type but stable_diffusion_cpp lists
+// at {pathPrefix}/models, while sd.cpp keeps its fixed, unprefixed path.
+func modelDiscoveryFor(providerType, pathPrefix string) (path string, decode func(io.Reader) ([]string, error)) {
 	if strings.TrimSpace(providerType) == routing.ProviderStableDiffusionCpp {
 		return sdcppModelsPath, decodeSdcppModelList
 	}
-	return "/v1/models", decodeOpenAIModelList
+	return pathPrefix + "/models", decodeOpenAIModelList
 }
 
 // decodeOpenAIModelList decodes the OpenAI {"data":[{"id":...}]} listing.
@@ -241,7 +245,7 @@ func (c *OpenAICompatibleClient) ListModels(ctx context.Context, target routing.
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
 		defer cancel()
 	}
-	discoveryPath, decode := modelDiscoveryFor(target.Provider)
+	discoveryPath, decode := modelDiscoveryFor(target.Provider, target.OpenAIPathPrefixOrDefault())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, discoveryPath), nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
@@ -659,7 +663,7 @@ func streamLineData(line string, activity func()) (string, bool) {
 // path (a request/transport error, or a non-2xx status), the response body is
 // closed inline instead, before completeStreamAttempt ever sees it.
 func (c *OpenAICompatibleClient) startStreamRequest(ctx context.Context, target routing.Target, raw []byte) (*http.Response, bool, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, "/v1/chat/completions"), bytes.NewReader(raw))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, target.OpenAIPathPrefixOrDefault()+"/chat/completions"), bytes.NewReader(raw))
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}

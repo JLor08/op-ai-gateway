@@ -28,6 +28,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     name: 'Work OpenAI',
     status: 'active',
     model_prefix: '',
+    base_url: '',
     api_key_set: true,
     subscription_connected: false,
     models: [],
@@ -382,9 +383,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     async function chooseAuthType(optionName: string) {
       fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
       fireEvent.click(await screen.findByRole('option', { name: optionName }));
-      // The menu closes with a transition; wait it out so the select's label is
-      // unambiguous again for the next query.
-      await waitFor(() => expect(screen.queryByRole('listbox')).not.toBeInTheDocument());
+      // The menu closes with a transition, and until it is gone from the DOM (it
+      // leaves the accessibility tree earlier, so a plain queryByRole misses it) it
+      // still carries the select's label: wait it out entirely, or under load the
+      // next label query finds two matches.
+      await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
     }
     const chooseSubscription = () => chooseAuthType(t.vendorAuthSubscription);
 
@@ -3772,6 +3775,416 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           await openDetail();
           expect(refreshButton()).toBeEnabled();
         });
+      });
+    });
+  });
+
+  describe(`VendorAccountsView OpenAI-compatible providers [${locale}]`, () => {
+    async function openCreate() {
+      fireEvent.click(await screen.findByRole('button', { name: t.vendorAccountCreate }));
+      await screen.findByLabelText(t.vendorAccountApiKeyLabel);
+    }
+
+    async function openDetail() {
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.vendorAccountSettingsTitle);
+    }
+
+    async function chooseVendor(label: string) {
+      fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountVendorLabel));
+      fireEvent.click(await screen.findByRole('option', { name: label }));
+      // The menu closes with a transition, and until it is gone from the DOM (it
+      // leaves the accessibility tree earlier) it still carries the select's
+      // label, so wait it out entirely or the next label query finds two matches.
+      await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+    }
+
+    const baseUrlField = () => screen.getByLabelText(t.vendorAccountBaseUrlLabel);
+    const queryBaseUrlField = () => screen.queryByLabelText(t.vendorAccountBaseUrlLabel);
+    const createButton = () => screen.getByRole('button', { name: t.vendorAccountCreate });
+    const nameField = () => screen.getByLabelText(t.vendorAccountNameLabel);
+    const keyField = () => screen.getByLabelText(t.vendorAccountApiKeyLabel);
+
+    function fillNameAndKey(name = 'Work', key = 'sk-test-123') {
+      fireEvent.change(nameField(), { target: { value: name } });
+      fireEvent.change(keyField(), { target: { value: key } });
+    }
+
+    it('lists the seven providers in order: OpenAI, Anthropic, then the compatible ones', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+
+      fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountVendorLabel));
+      const listbox = await screen.findByRole('listbox');
+      expect(
+        within(listbox)
+          .getAllByRole('option')
+          .map((o) => o.textContent),
+      ).toEqual([
+        t.vendorOpenAI,
+        t.vendorAnthropic,
+        t.vendorXAI,
+        t.vendorOpenRouter,
+        t.vendorKilo,
+        t.vendorGoogle,
+        t.vendorOpenAICompatible,
+      ]);
+    });
+
+    it('has no base-URL field for OpenAI or Anthropic, and keeps the authentication choice', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+
+      expect(queryBaseUrlField()).not.toBeInTheDocument();
+      expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toBeInTheDocument();
+
+      await chooseVendor(t.vendorAnthropic);
+      expect(queryBaseUrlField()).not.toBeInTheDocument();
+      expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toBeInTheDocument();
+    });
+
+    it('shows an optional base-URL field for a preset, with its default root as the placeholder', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorXAI);
+      expect(baseUrlField()).toHaveValue('');
+      expect(baseUrlField()).toHaveAttribute('placeholder', 'https://api.x.ai');
+      expect(baseUrlField()).not.toBeRequired();
+      expect(baseUrlField()).toHaveAttribute('aria-invalid', 'false');
+      expect(screen.getByText(t.vendorAccountBaseUrlNote)).toBeInTheDocument();
+
+      await chooseVendor(t.vendorOpenRouter);
+      expect(baseUrlField()).toHaveAttribute('placeholder', 'https://openrouter.ai/api');
+      await chooseVendor(t.vendorKilo);
+      expect(baseUrlField()).toHaveAttribute('placeholder', 'https://api.kilo.ai/api');
+      await chooseVendor(t.vendorGoogle);
+      expect(baseUrlField()).toHaveAttribute(
+        'placeholder',
+        'https://generativelanguage.googleapis.com',
+      );
+    });
+
+    it('hides the authentication select for a compatible vendor and says why', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorXAI);
+
+      expect(screen.queryByLabelText(t.vendorAccountAuthTypeLabel)).not.toBeInTheDocument();
+      expect(screen.getByText(t.vendorAccountApiKeyOnlyNote)).toBeInTheDocument();
+      // The api key stays, the subscription note never shows.
+      expect(keyField()).toBeRequired();
+      expect(screen.queryByText(t.vendorAccountSubscriptionCreateNote)).not.toBeInTheDocument();
+    });
+
+    it('forces api_key for a compatible vendor even after subscription was chosen', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+      fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+      fireEvent.click(await screen.findByRole('option', { name: t.vendorAuthSubscription }));
+      await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+      expect(document.getElementById('vendor-account-api-key')).not.toBeInTheDocument();
+
+      await chooseVendor(t.vendorOpenAICompatible);
+      // The key field is back (api_key), not the subscription note.
+      expect(keyField()).toBeInTheDocument();
+      fillNameAndKey('Custom', 'sk-custom');
+      fireEvent.change(baseUrlField(), { target: { value: 'https://llm.example.com' } });
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'openai_compatible',
+        auth_type: 'api_key',
+        name: 'Custom',
+        api_key: 'sk-custom',
+        base_url: 'https://llm.example.com',
+      });
+    });
+
+    it('does not carry a subscription choice back to a vendor that is switched to and from', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+      fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+      fireEvent.click(await screen.findByRole('option', { name: t.vendorAuthSubscription }));
+      await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+
+      await chooseVendor(t.vendorXAI);
+      await chooseVendor(t.vendorOpenAI);
+
+      expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveTextContent(
+        t.vendorAuthApiKey,
+      );
+      expect(keyField()).toBeInTheDocument();
+    });
+
+    it('omits base_url from the create body for a preset left on its default root', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorXAI);
+      fillNameAndKey('Grok', 'xai-key');
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'xai',
+        auth_type: 'api_key',
+        name: 'Grok',
+        api_key: 'xai-key',
+      });
+      expect('base_url' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
+    });
+
+    it('omits base_url when the preset field holds only whitespace', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorOpenRouter);
+      fillNameAndKey('Router', 'or-key');
+      fireEvent.change(baseUrlField(), { target: { value: '   ' } });
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect('base_url' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
+    });
+
+    it('sends an overridden preset root, trimmed, together with a model prefix', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorOpenRouter);
+      fillNameAndKey('Router', 'or-key');
+      fireEvent.change(baseUrlField(), { target: { value: '  https://proxy.example.com/or  ' } });
+      fireEvent.change(screen.getByLabelText(t.vendorAccountModelPrefixLabel), {
+        target: { value: 'or/' },
+      });
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'openrouter',
+        auth_type: 'api_key',
+        name: 'Router',
+        api_key: 'or-key',
+        model_prefix: 'or/',
+        base_url: 'https://proxy.example.com/or',
+      });
+    });
+
+    it('requires a base URL for Custom and sends it trimmed', async () => {
+      const { fakeApi, container } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorOpenAICompatible);
+      expect(baseUrlField()).toBeRequired();
+      expect(baseUrlField()).toHaveAttribute('placeholder', 'https://llm.example.com');
+      expect(screen.getByText(t.vendorAccountBaseUrlCustomNote)).toBeInTheDocument();
+      fillNameAndKey('Custom', 'sk-custom');
+
+      // Empty, or only whitespace: Create is off and not even a bypassing submit
+      // (Enter in a field) reaches the API.
+      expect(createButton()).toBeDisabled();
+      fireEvent.change(baseUrlField(), { target: { value: '   ' } });
+      expect(createButton()).toBeDisabled();
+      expect(baseUrlField()).toHaveAttribute('aria-invalid', 'false');
+      fireEvent.submit(container.querySelector('form')!);
+      expect(fakeApi.createVendorAccount).not.toHaveBeenCalled();
+
+      fireEvent.change(baseUrlField(), { target: { value: '  https://llm.example.com/v1/  ' } });
+      expect(createButton()).toBeEnabled();
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'openai_compatible',
+        auth_type: 'api_key',
+        name: 'Custom',
+        api_key: 'sk-custom',
+        base_url: 'https://llm.example.com/v1/',
+      });
+    });
+
+    it.each([
+      ['plain http', 'http://x.test'],
+      ['credentials', 'https://u:p@x.test'],
+      ['a query', 'https://x.test/?a=1'],
+      ['a fragment', 'https://x.test/#f'],
+      ['no scheme', 'x.test'],
+    ])('rejects a base URL with %s inline, without calling the API', async (_why, bad) => {
+      const { fakeApi, container } = renderView({ accounts: [] });
+      await openCreate();
+
+      await chooseVendor(t.vendorXAI);
+      fillNameAndKey('Grok', 'xai-key');
+      fireEvent.change(baseUrlField(), { target: { value: bad } });
+
+      // The hint turns into the reason, the field is flagged and Create is off.
+      expect(screen.getByText(t.errorVendorAccountBaseUrlInvalid)).toBeInTheDocument();
+      expect(screen.queryByText(t.vendorAccountBaseUrlNote)).not.toBeInTheDocument();
+      expect(baseUrlField()).toHaveAttribute('aria-invalid', 'true');
+      expect(createButton()).toBeDisabled();
+
+      fireEvent.submit(container.querySelector('form')!);
+      expect(fakeApi.createVendorAccount).not.toHaveBeenCalled();
+
+      // Correcting it brings the form back.
+      fireEvent.change(baseUrlField(), { target: { value: 'https://ok.example.com' } });
+      expect(screen.queryByText(t.errorVendorAccountBaseUrlInvalid)).not.toBeInTheDocument();
+      expect(createButton()).toBeEnabled();
+    });
+
+    it('does not carry a typed base URL into another vendor or the next create form', async () => {
+      renderView({ accounts: [] });
+      await openCreate();
+      await chooseVendor(t.vendorXAI);
+      fireEvent.change(baseUrlField(), { target: { value: 'https://proxy.example.com' } });
+
+      // Another vendor starts empty.
+      await chooseVendor(t.vendorOpenRouter);
+      expect(baseUrlField()).toHaveValue('');
+
+      // So does a re-opened form.
+      fireEvent.change(baseUrlField(), { target: { value: 'https://proxy.example.com' } });
+      fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+      await openCreate();
+      expect(queryBaseUrlField()).not.toBeInTheDocument();
+      await chooseVendor(t.vendorOpenRouter);
+      expect(baseUrlField()).toHaveValue('');
+    });
+
+    it('does not send a base URL typed for a compatible vendor once the form is back on OpenAI', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+      await chooseVendor(t.vendorXAI);
+      fireEvent.change(baseUrlField(), { target: { value: 'https://proxy.example.com' } });
+      await chooseVendor(t.vendorOpenAI);
+
+      fillNameAndKey('Work', 'sk-test-123');
+      fireEvent.click(createButton());
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+        vendor: 'openai',
+        auth_type: 'api_key',
+        name: 'Work',
+        api_key: 'sk-test-123',
+      });
+    });
+
+    it.each([
+      ['vendor_account.base_url_required', 'errorVendorAccountBaseUrlRequired'],
+      ['vendor_account.base_url_invalid', 'errorVendorAccountBaseUrlInvalid'],
+    ] as const)(
+      'shows a %s refusal as the localized toast and stays on the form',
+      async (code, key) => {
+        renderView({
+          accounts: [],
+          createVendorAccount: async () => {
+            throw new PortalApiError(400, code, 'raw server text');
+          },
+        });
+        await openCreate();
+        await chooseVendor(t.vendorOpenAICompatible);
+        fillNameAndKey('Custom', 'sk-custom');
+        fireEvent.change(baseUrlField(), { target: { value: 'https://llm.example.com' } });
+        fireEvent.click(createButton());
+
+        expect(await screen.findByText(`${code}: ${t[key]}`)).toBeInTheDocument();
+        expect(baseUrlField()).toHaveValue('https://llm.example.com');
+      },
+    );
+
+    it('labels a compatible account in the list with its provider name', async () => {
+      renderView({
+        accounts: [
+          makeVendorAccount({
+            id: 'va_x',
+            vendor: 'xai',
+            name: 'Grok work',
+            base_url: 'https://api.x.ai',
+          }),
+        ],
+      });
+
+      expect(await screen.findByText('Grok work')).toBeInTheDocument();
+      expect(screen.getByText(t.vendorXAI)).toBeInTheDocument();
+    });
+
+    describe('detail view', () => {
+      it('shows the base URL read-only for a compatible account', async () => {
+        renderView({
+          accounts: [
+            makeVendorAccount({
+              id: 'va_c',
+              vendor: 'openai_compatible',
+              name: 'Local gateway',
+              base_url: 'https://llm.example.com',
+            }),
+          ],
+        });
+        await openDetail();
+
+        const field = baseUrlField();
+        expect(field).toHaveValue('https://llm.example.com');
+        expect(field).toHaveAttribute('readonly');
+        expect(screen.getByLabelText(t.vendorAccountVendorLabel)).toHaveValue(
+          t.vendorOpenAICompatible,
+        );
+        // Typing over it changes nothing: it is immutable.
+        fireEvent.change(field, { target: { value: 'https://other.example.com' } });
+        expect(field).toHaveValue('https://llm.example.com');
+      });
+
+      it('shows the default root a preset account was stored with', async () => {
+        renderView({
+          accounts: [
+            makeVendorAccount({ id: 'va_x', vendor: 'xai', base_url: 'https://api.x.ai' }),
+          ],
+        });
+        await openDetail();
+
+        expect(baseUrlField()).toHaveValue('https://api.x.ai');
+        expect(baseUrlField()).toHaveAttribute('readonly');
+      });
+
+      it('has no base-URL field for OpenAI or Anthropic accounts', async () => {
+        renderView({ accounts: [makeVendorAccount()] });
+        await openDetail();
+        expect(queryBaseUrlField()).not.toBeInTheDocument();
+
+        cleanup();
+        renderView({
+          accounts: [makeVendorAccount({ id: 'va_a', vendor: 'anthropic', name: 'Claude' })],
+        });
+        await openDetail();
+        expect(queryBaseUrlField()).not.toBeInTheDocument();
+      });
+
+      it('never sends base_url when the account is saved', async () => {
+        const { fakeApi } = renderView({
+          accounts: [
+            makeVendorAccount({
+              id: 'va_c',
+              vendor: 'openai_compatible',
+              name: 'Local gateway',
+              base_url: 'https://llm.example.com',
+            }),
+          ],
+        });
+        await openDetail();
+
+        fireEvent.change(nameField(), { target: { value: 'Renamed' } });
+        fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+        await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.updateVendorAccount).toHaveBeenCalledWith('va_c', {
+          name: 'Renamed',
+          status: 'active',
+          model_prefix: '',
+        });
+        expect('base_url' in fakeApi.updateVendorAccount.mock.calls[0][1]).toBe(false);
       });
     });
   });
