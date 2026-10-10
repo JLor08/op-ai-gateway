@@ -284,10 +284,11 @@ func AnthropicPromptCachingEnabled(values map[string]string) bool {
 }
 
 // AnthropicPromptCachingEnabled reports whether the anthropic_prompt_caching_enabled
-// master flag is on (off by default). It is read from the settings store on every
-// call (the flag is rare to flip and cheap to read), so a toggle takes effect on
-// the very next request. A service with no settings store, or a store that cannot
-// be read, reports false: the feature is opt-in, so an unreadable flag fails closed.
+// master flag is on (off by default). It reads the settings store on every call;
+// the gateway's dispatch hot path reads it through anthropicPromptCachingEnabledCached
+// (5s TTL, invalidated on the settings PUT) instead. A service with no settings
+// store, or a store that cannot be read, reports false: the feature is opt-in, so
+// an unreadable flag fails closed.
 func (s *Service) AnthropicPromptCachingEnabled(ctx context.Context) bool {
 	if s.settings == nil {
 		return false
