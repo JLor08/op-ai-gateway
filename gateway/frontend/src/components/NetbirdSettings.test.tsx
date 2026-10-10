@@ -56,6 +56,7 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     route_affinity_session_mode: 'client_session',
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
+    anthropic_prompt_caching_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
     vendor_openai_codex_client_version: '26.930.61225',
     energy_default_price_per_kwh: 0,

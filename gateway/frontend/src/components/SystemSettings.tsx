@@ -78,6 +78,10 @@ export function SystemSettings({
   );
   const [pendingVendorRoutingMode, setPendingVendorRoutingMode] =
     useState<VendorAccountRoutingMode | null>(null);
+  // Anthropic prompt caching flag (experimental, off by default). Null = untouched.
+  const [pendingAnthropicPromptCaching, setPendingAnthropicPromptCaching] = useState<
+    boolean | null
+  >(null);
   // The Codex client_version the OpenAI model discovery sends. Null = untouched.
   const [pendingCodexClientVersion, setPendingCodexClientVersion] = useState<string | null>(null);
   // pendingEnergyPricePerKwh holds the price DISPLAY string in the currently
@@ -155,6 +159,9 @@ export function SystemSettings({
     pendingVendorAccountsEnabled ?? settings?.vendor_accounts_enabled ?? false;
   const vendorRoutingMode: VendorAccountRoutingMode =
     pendingVendorRoutingMode ?? settings?.vendor_account_routing_mode ?? 'vendor_first';
+  // Opt-in like the vendor-accounts flag: off unless the admin turns it on.
+  const anthropicPromptCaching =
+    pendingAnthropicPromptCaching ?? settings?.anthropic_prompt_caching_enabled ?? false;
   // The settings carry the EFFECTIVE client version (the built-in default when
   // none is stored). Blank is valid: it resets to that default on save.
   const codexClientVersion =
@@ -246,6 +253,7 @@ export function SystemSettings({
         route_affinity_session_mode: affinityMode,
         vision_probe_mode: visionProbeMode,
         vendor_accounts_enabled: vendorAccountsEnabled,
+        anthropic_prompt_caching_enabled: anthropicPromptCaching,
         vendor_account_routing_mode: vendorRoutingMode,
         // Only when edited: the loaded value is the EFFECTIVE one, so re-sending it
         // on every unrelated save would pin today's built-in default and stop a
@@ -284,6 +292,7 @@ export function SystemSettings({
       setPendingVisionProbeMode(null);
       setPendingVendorAccountsEnabled(null);
       setPendingVendorRoutingMode(null);
+      setPendingAnthropicPromptCaching(null);
       setPendingCodexClientVersion(null);
       setPendingEnergyPricePerKwh(null);
       setPendingPriceUnit(null);
@@ -557,6 +566,20 @@ export function SystemSettings({
                   : t.errorSystemVendorOpenAICodexClientVersionInvalid
               }
             />
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={anthropicPromptCaching}
+                    onChange={(e) => setPendingAnthropicPromptCaching(e.target.checked)}
+                  />
+                }
+                label={t.settingsAnthropicPromptCaching}
+              />
+              <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
+                {t.settingsAnthropicPromptCachingHelp}
+              </FormHelperText>
+            </Box>
           </Stack>
         </Panel>
 

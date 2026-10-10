@@ -1225,6 +1225,18 @@ describe('netbird-only transport settings i18n keys', () => {
   });
 });
 
+describe('anthropic prompt caching settings i18n keys', () => {
+  it('defines the toggle label + help in de and en', () => {
+    const keys = ['settingsAnthropicPromptCaching', 'settingsAnthropicPromptCachingHelp'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('model-groups + visibility i18n keys', () => {
   it('defines the group-management + model-visibility keys in de and en', () => {
     const keys = [

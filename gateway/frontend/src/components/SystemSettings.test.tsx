@@ -40,6 +40,7 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     route_affinity_session_mode: 'client_session',
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
+    anthropic_prompt_caching_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
     vendor_openai_codex_client_version: '26.930.61225',
     energy_default_price_per_kwh: 0,
@@ -424,6 +425,52 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() =>
         expect(
           (screen.getByLabelText(t.systemVendorAccountsEnabledLabel) as HTMLInputElement).checked,
+        ).toBe(true),
+      );
+    });
+  });
+
+  describe(`SystemSettings Anthropic prompt caching [${locale}]`, () => {
+    it('shows the toggle OFF by default, with its help text', async () => {
+      renderSystemSettings(makeSettings());
+      const toggle = (await screen.findByLabelText(
+        t.settingsAnthropicPromptCaching,
+      )) as HTMLInputElement;
+      expect(toggle.checked).toBe(false);
+      expect(screen.getByText(t.settingsAnthropicPromptCachingHelp)).toBeInTheDocument();
+    });
+
+    it('reflects the stored value', async () => {
+      renderSystemSettings(makeSettings({ anthropic_prompt_caching_enabled: true }));
+      const toggle = (await screen.findByLabelText(
+        t.settingsAnthropicPromptCaching,
+      )) as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+    });
+
+    it('sends the stored value unchanged on a save that does not touch it', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const save = await screen.findByRole('button', { name: t.save });
+      await waitFor(() => expect(save).not.toBeDisabled());
+      fireEvent.click(save);
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        anthropic_prompt_caching_enabled: false,
+      });
+    });
+
+    it('saves the enabled toggle and keeps it shown after the form resets', async () => {
+      const { updateSystemSettings, onSaved } = renderSystemSettings(makeSettings());
+      fireEvent.click(await screen.findByLabelText(t.settingsAnthropicPromptCaching));
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        anthropic_prompt_caching_enabled: true,
+      });
+      await waitFor(() => expect(onSaved).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(
+          (screen.getByLabelText(t.settingsAnthropicPromptCaching) as HTMLInputElement).checked,
         ).toBe(true),
       );
     });
