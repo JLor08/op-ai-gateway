@@ -58,6 +58,21 @@ var anthropicModelsWant = []DiscoveredModel{
 	{Slug: "claude-haiku-5", DisplayName: "Claude Haiku 5"},
 }
 
+// openAICompatibleModelsBody mixes the shapes the compatible providers send: bare
+// OpenAI-style entries, an OpenRouter entry with a human "name", and a Gemini
+// entry whose id keeps its "models/" prefix (stripping it is the portal's job).
+const openAICompatibleModelsBody = `{"object":"list","data":[
+ {"id":"grok-4","object":"model","created":1,"owned_by":"xai"},
+ {"id":"openai/gpt-5.1","name":"OpenAI: GPT-5.1","context_length":400000},
+ {"id":"models/gemini-2.5-pro","object":"model","owned_by":"google"}
+]}`
+
+var openAICompatibleModelsWant = []DiscoveredModel{
+	{Slug: "grok-4", DisplayName: "grok-4"},
+	{Slug: "openai/gpt-5.1", DisplayName: "OpenAI: GPT-5.1"},
+	{Slug: "models/gemini-2.5-pro", DisplayName: "models/gemini-2.5-pro"},
+}
+
 type discoverCase struct {
 	name string
 	call func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus)
@@ -152,6 +167,32 @@ func discoverCases() []discoverCase {
 			emptyList: `{"data":[],"has_more":false}`,
 			hostile:   `{"data":[{"id":"claude-opus-5","display_name":"Claude Opus 5","note":"` + probeSecret + `"}],"echo":"` + probeSecret + `"}`,
 		},
+		{
+			// The caller-composed URL: the portal builds {base}{prefix}/models from the
+			// provider preset, this package only asks it.
+			name: "openai compatible api key",
+			call: func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
+				return DiscoverOpenAICompatibleModels(ctx, c, "https://api.x.ai/v1/models", cred)
+			},
+			host: "api.x.ai",
+			path: "/v1/models",
+			headers: func(cred string) map[string]string {
+				return map[string]string{"Authorization": "Bearer " + cred}
+			},
+			absent:    []string{"X-Api-Key", "Anthropic-Version", "Anthropic-Beta", "Chatgpt-Account-Id", "Originator"},
+			okBody:    openAICompatibleModelsBody,
+			want:      openAICompatibleModelsWant,
+			emptyList: `{"object":"list","data":[]}`,
+			hostile:   `{"data":[{"id":"grok-4","owned_by":"` + probeSecret + `"}],"echo":"` + probeSecret + `"}`,
+		},
+	}
+}
+
+// discoverCompatibleAt adapts DiscoverOpenAICompatibleModels, which takes the
+// caller-composed models URL, to the credential-only call shape of the table tests.
+func discoverCompatibleAt(modelsURL string) func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
+	return func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
+		return DiscoverOpenAICompatibleModels(ctx, c, modelsURL, cred)
 	}
 }
 
@@ -335,6 +376,28 @@ func TestDiscoverDisplayNameFallsBackToTheSlug(t *testing.T) {
 			want: []DiscoveredModel{{Slug: "a", DisplayName: "a"}},
 		},
 		{
+			name: "openai compatible: display_name, then name, then the id",
+			call: func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
+				return DiscoverOpenAICompatibleModels(ctx, c, "https://gw.example.test/v1/models", cred)
+			},
+			body: `{"data":[{"id":"a"},{"id":"b","name":"B Name"},{"id":"c","display_name":"C Display","name":"C Name"},{"id":"d","display_name":"","name":""},{"id":"e","display_name":"","name":"E Name"}]}`,
+			want: []DiscoveredModel{
+				{Slug: "a", DisplayName: "a"},
+				{Slug: "b", DisplayName: "B Name"},
+				{Slug: "c", DisplayName: "C Display"},
+				{Slug: "d", DisplayName: "d"},
+				{Slug: "e", DisplayName: "E Name"},
+			},
+		},
+		{
+			// OpenAI's listing is always the id, whatever else an entry carries: the name
+			// fallback must not leak into it.
+			name: "openai api key ignores name",
+			call: DiscoverOpenAIAPIKeyModels,
+			body: `{"data":[{"id":"a","name":"Ignored Name"}]}`,
+			want: []DiscoveredModel{{Slug: "a", DisplayName: "a"}},
+		},
+		{
 			name: "anthropic api key without display_name",
 			call: DiscoverAnthropicAPIKeyModels,
 			body: `{"data":[{"id":"a"},{"id":"b","display_name":""},{"id":"c","display_name":"C"}]}`,
@@ -360,6 +423,7 @@ func TestDiscoverSkipsEntriesWithoutASlug(t *testing.T) {
 		"openai subscription": `{"models":[{"display_name":"No Slug","visibility":"list","supported_in_api":true},{"slug":"","visibility":"list","supported_in_api":true},{"slug":"ok","visibility":"list","supported_in_api":true}]}`,
 		"openai api key":      `{"data":[{"object":"model"},{"id":""},{"id":"ok"}]}`,
 		"anthropic api key":   `{"data":[{"display_name":"No Id"},{"id":""},{"id":"ok"}]}`,
+		"openai compatible":   `{"data":[{"name":"No Id"},{"id":""},{"id":"ok"}]}`,
 	}
 	calls := map[string]func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus){
 		"openai subscription": func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
@@ -367,6 +431,7 @@ func TestDiscoverSkipsEntriesWithoutASlug(t *testing.T) {
 		},
 		"openai api key":    DiscoverOpenAIAPIKeyModels,
 		"anthropic api key": DiscoverAnthropicAPIKeyModels,
+		"openai compatible": discoverCompatibleAt("https://gw.example.test/v1/models"),
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
@@ -387,6 +452,7 @@ func TestDiscoverOneMalformedEntryDoesNotSinkTheRest(t *testing.T) {
 		"openai subscription": `{"models":[42,"str",null,{"slug":7},{"slug":"bad","visibility":"list","supported_in_api":"yes"},{"slug":"ok","display_name":"OK","visibility":"list","supported_in_api":true}]}`,
 		"openai api key":      `{"data":[42,"str",null,{"id":7},{"id":"ok"}]}`,
 		"anthropic api key":   `{"data":[42,"str",null,{"id":7},{"id":"ok","display_name":"OK"}]}`,
+		"openai compatible":   `{"data":[42,"str",null,{"id":7},{"id":"ok","name":"OK"}]}`,
 	}
 	calls := map[string]func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus){
 		"openai subscription": func(ctx context.Context, c *http.Client, cred string) ([]DiscoveredModel, DiscoveryStatus) {
@@ -394,6 +460,7 @@ func TestDiscoverOneMalformedEntryDoesNotSinkTheRest(t *testing.T) {
 		},
 		"openai api key":    DiscoverOpenAIAPIKeyModels,
 		"anthropic api key": DiscoverAnthropicAPIKeyModels,
+		"openai compatible": discoverCompatibleAt("https://gw.example.test/v1/models"),
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
@@ -604,6 +671,53 @@ func TestDiscoverPreservesTheVendorsOrder(t *testing.T) {
 	}
 	if want := []string{"z", "a", "m"}; !reflect.DeepEqual(slugs, want) {
 		t.Errorf("slugs = %v, want %v", slugs, want)
+	}
+}
+
+// The compatible discoverer asks exactly the URL the caller composed, wherever it
+// points (a Custom endpoint has an arbitrary root and path), and never adds the
+// OpenAI/Anthropic query or headers of the fixed-URL fetchers.
+func TestDiscoverOpenAICompatibleRequestsTheGivenURL(t *testing.T) {
+	cases := []struct {
+		name, modelsURL, wantPath string
+	}{
+		{"x.ai", "https://api.x.ai/v1/models", "/v1/models"},
+		{"kilo gateway prefix", "https://api.kilo.ai/api/gateway/models", "/api/gateway/models"},
+		{"gemini openai prefix", "https://generativelanguage.googleapis.com/v1beta/openai/models", "/v1beta/openai/models"},
+		{"custom root", "https://gw.example.test/root/v1/models", "/root/v1/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, rec := newProbeClient(t, respondWith(http.StatusOK, openAICompatibleModelsBody))
+			got, status := DiscoverOpenAICompatibleModels(context.Background(), client, tc.modelsURL, probeSecret)
+			if status != DiscoveryOK || !reflect.DeepEqual(got, openAICompatibleModelsWant) {
+				t.Fatalf("got %+v / %v, want the catalog with status ok", got, status)
+			}
+			reqs := rec.all()
+			if len(reqs) != 1 {
+				t.Fatalf("requests = %d, want exactly 1", len(reqs))
+			}
+			parsed, err := url.Parse(tc.modelsURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantHost := parsed.Host
+			if reqs[0].Host != wantHost || reqs[0].Path != tc.wantPath || len(reqs[0].Query) != 0 {
+				t.Errorf("request = host %q path %q query %v, want %q %q and no query", reqs[0].Host, reqs[0].Path, reqs[0].Query, wantHost, tc.wantPath)
+			}
+			if v := reqs[0].Header.Get("Authorization"); v != "Bearer "+probeSecret {
+				t.Errorf("Authorization = %q, want the bearer key", v)
+			}
+		})
+	}
+}
+
+func TestDiscoverOpenAICompatibleWithAnUnbuildableURLIsUnverifiable(t *testing.T) {
+	client, rec := newProbeClient(t, respondWith(http.StatusOK, openAICompatibleModelsBody))
+	got, status := DiscoverOpenAICompatibleModels(context.Background(), client, "http://[::1", probeSecret)
+	assertUnverifiable(t, "unbuildable url", got, status)
+	if n := len(rec.all()); n != 0 {
+		t.Errorf("requests = %d, want none for a URL that cannot be built", n)
 	}
 }
 

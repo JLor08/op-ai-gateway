@@ -64,7 +64,13 @@ func vaNoNetworkValidators() portal.VendorCredentialValidators {
 	probe := func(context.Context, *http.Client, string) vendorauth.CredentialCheck {
 		return vendorauth.CredentialCheck{Status: vendorauth.StatusUnverifiable, Detail: "fake: no network in tests"}
 	}
-	return portal.VendorCredentialValidators{OpenAISubscription: probe, AnthropicSubscription: probe, OpenAIAPIKey: probe, AnthropicAPIKey: probe}
+	compatProbe := func(context.Context, *http.Client, string, string) vendorauth.CredentialCheck {
+		return vendorauth.CredentialCheck{Status: vendorauth.StatusUnverifiable, Detail: "fake: no network in tests"}
+	}
+	return portal.VendorCredentialValidators{
+		OpenAISubscription: probe, AnthropicSubscription: probe, OpenAIAPIKey: probe, AnthropicAPIKey: probe,
+		OpenAICompatibleAPIKey: compatProbe,
+	}
 }
 
 // vaNoNetworkDiscoverers answers Unverifiable for every model-discovery fetch and
@@ -83,7 +89,11 @@ func vaNoNetworkDiscoverers() portal.VendorModelDiscoverers {
 		AnthropicSubscription: fetch,
 		OpenAIAPIKey:          fetch,
 		AnthropicAPIKey:       fetch,
-		OpenAIUsage:           vaNoNetworkUsage,
+		// Creating an OpenAI-compatible account runs a best-effort discovery.
+		OpenAICompatibleAPIKey: func(context.Context, *http.Client, string, string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+			return nil, vendorauth.DiscoveryUnverifiable
+		},
+		OpenAIUsage: vaNoNetworkUsage,
 	}
 }
 

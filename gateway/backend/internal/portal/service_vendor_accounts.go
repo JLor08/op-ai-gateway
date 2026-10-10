@@ -478,7 +478,19 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		}
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, acc)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	// An OpenAI-compatible account has no static seed (its catalog is empty), so
+	// without a discovery it would serve nothing until the user pressed Refresh:
+	// ask the provider once now, best effort, so a new account is usable at once.
+	// It needs the key just stored. It never fails the create (the account exists
+	// and Refresh re-runs it) and is bounded by the connect-time discovery timeout.
+	if routing.IsOpenAICompatibleVendor(vendor) && apiKey != "" {
+		dto = s.discoverAfterConnect(ctx, principal, dto)
+	}
+	return dto, nil
 }
 
 // applyVendorAccountName applies a name change when the request carries one; an
