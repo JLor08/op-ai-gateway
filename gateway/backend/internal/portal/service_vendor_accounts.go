@@ -238,10 +238,14 @@ func normalizeVendorAccountStatus(raw string) (string, error) {
 // normalizeVendorAccountBaseURL validates and defaults an OpenAI-compatible
 // account's root url. For a preset vendor an empty value means "use the preset
 // default root". For VendorOpenAICompatible (Custom) a value is required. A
-// non-empty value must be an https URL with a host and no userinfo/query/fragment
-// (the key rides on every request, so plaintext/credential-in-URL is refused;
-// the host is otherwise unrestricted -- this is an on-prem gateway, see ADR-052).
-// The stored value has any trailing "/" removed.
+// non-empty value must be an https URL with a hostname and no userinfo/query/
+// fragment (the key rides on every request, so plaintext/credential-in-URL is
+// refused; the host is otherwise unrestricted -- this is an on-prem gateway, see
+// ADR-052). net/url hides a bare trailing "?" (ForceQuery, empty RawQuery) and a
+// bare "#" (empty Fragment) from the field checks, and ":443" parses as a
+// non-empty Host with no hostname, so the raw text is also screened for "?", "#"
+// and spaces and the HOSTNAME (not Host) must be non-empty. The stored value has
+// any trailing "/" removed.
 func normalizeVendorAccountBaseURL(vendor, raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -252,7 +256,7 @@ func normalizeVendorAccountBaseURL(vendor, raw string) (string, error) {
 		return preset.DefaultBaseURL, nil
 	}
 	u, err := url.Parse(value)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || strings.ContainsAny(value, "?# ") || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", ErrVendorAccountBaseURLInvalid
 	}
 	return strings.TrimRight(value, "/"), nil

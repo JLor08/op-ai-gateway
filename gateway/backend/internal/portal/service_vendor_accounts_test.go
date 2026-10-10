@@ -1628,6 +1628,14 @@ func TestCreateRejectsMalformedOrNonHTTPSBaseURL(t *testing.T) {
 		"https://x.test/?a=1",
 		"https://x.test/path#frag",
 		"https://x.test/\x7f",
+		// Go parses a bare trailing "?" as ForceQuery with an empty RawQuery, a bare
+		// "#" as an empty Fragment, and ":443" as a non-empty Host with no hostname;
+		// a space is not a valid URL character.
+		"https://x.test/?",
+		"https://x.test/v1?",
+		"https://x.test/#",
+		"https://:443/v1",
+		"https://x.test/a b",
 	} {
 		for _, vendor := range []string{routing.VendorOpenAICompatible, routing.VendorXAI} {
 			_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(vendor, baseURL))
