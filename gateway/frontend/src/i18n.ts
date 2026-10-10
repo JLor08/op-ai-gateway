@@ -2384,6 +2384,11 @@ const de = {
   vendorAccountStatusNeedsReconnect: 'Neu verbinden',
   vendorOpenAI: 'OpenAI',
   vendorAnthropic: 'Anthropic',
+  vendorXAI: 'xAI (Grok)',
+  vendorOpenRouter: 'OpenRouter',
+  vendorKilo: 'Kilo Gateway',
+  vendorGoogle: 'Google Gemini',
+  vendorOpenAICompatible: 'Benutzerdefiniert (OpenAI-kompatibel)',
   vendorAuthApiKey: 'API-Schlüssel',
   vendorAuthSubscription: 'Abonnement',
   vendorAccountApiKeyLabel: 'API-Schlüssel',
@@ -2401,6 +2406,15 @@ const de = {
   vendorAccountModelPrefixLabel: 'Modell-Präfix (optional)',
   vendorAccountModelPrefixNote:
     'Wird jeder Modell-ID vorangestellt, z. B. „chatgpt/“ → Modelle erscheinen als „chatgpt/gpt-6-luna“. Erlaubt: Buchstaben, Ziffern und . _ ~ : / @ + - (höchstens 64 Zeichen, kein „..“).',
+  // The base URL of an OpenAI-compatible account (create form; read-only on the
+  // detail) and the note that such an account is api-key only.
+  vendorAccountBaseUrlLabel: 'Basis-URL',
+  vendorAccountBaseUrlNote:
+    'Leer lassen, um die Standardadresse des Anbieters zu verwenden. Nur https, ohne Zugangsdaten, Query und Fragment. Lässt sich nach dem Anlegen nicht mehr ändern.',
+  vendorAccountBaseUrlCustomNote:
+    'Pflichtangabe: die Adresse der OpenAI-kompatiblen API ohne „/v1“, z. B. „https://llm.example.com“. Nur https, ohne Zugangsdaten, Query und Fragment. Lässt sich nach dem Anlegen nicht mehr ändern.',
+  vendorAccountApiKeyOnlyNote:
+    'Dieser Anbieter unterstützt nur die Anmeldung mit einem API-Schlüssel.',
   vendorModelsTitle: 'Modelle',
   vendorModelsIntro:
     'Die Modelle, die dieses Konto bereitstellt. Die Modell-ID ist die ID, unter der Clients das Modell am Gateway anfragen (mit Präfix).',
@@ -2565,6 +2579,10 @@ const de = {
     'Für dieses Konto läuft kein Device-Code-Login oder er ist abgelaufen. Den Device-Code neu starten.',
   errorVendorAccountModelPrefixInvalid:
     'Ungültiges Modell-Präfix: erlaubt sind höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ ~ : / @ + -, ohne „..“',
+  errorVendorAccountBaseUrlRequired:
+    'Für einen benutzerdefinierten OpenAI-kompatiblen Anbieter ist eine Basis-URL erforderlich',
+  errorVendorAccountBaseUrlInvalid:
+    'Ungültige Basis-URL: erlaubt ist nur eine https-Adresse ohne Zugangsdaten, Query und Fragment',
   errorVendorAccountRefreshFailed: 'Die Modelle konnten nicht aktualisiert werden',
   errorVendorAccountUsageRefreshFailed: 'Die Nutzung konnte nicht aktualisiert werden',
   errorSystemVendorOpenAICodexClientVersionInvalid:
@@ -5027,6 +5045,11 @@ const en: PortalMessages = {
   vendorAccountStatusNeedsReconnect: 'Reconnect',
   vendorOpenAI: 'OpenAI',
   vendorAnthropic: 'Anthropic',
+  vendorXAI: 'xAI (Grok)',
+  vendorOpenRouter: 'OpenRouter',
+  vendorKilo: 'Kilo Gateway',
+  vendorGoogle: 'Google Gemini',
+  vendorOpenAICompatible: 'Custom (OpenAI-compatible)',
   vendorAuthApiKey: 'API key',
   vendorAuthSubscription: 'Subscription',
   vendorAccountApiKeyLabel: 'API key',
@@ -5044,6 +5067,14 @@ const en: PortalMessages = {
   vendorAccountModelPrefixLabel: 'Model prefix (optional)',
   vendorAccountModelPrefixNote:
     'Put in front of every model ID, e.g. "chatgpt/" → models appear as "chatgpt/gpt-6-luna". Allowed: letters, digits and . _ ~ : / @ + - (at most 64 characters, no "..").',
+  // The base URL of an OpenAI-compatible account (create form; read-only on the
+  // detail) and the note that such an account is api-key only.
+  vendorAccountBaseUrlLabel: 'Base URL',
+  vendorAccountBaseUrlNote:
+    "Leave empty to use the provider's default address. https only, without credentials, query or fragment. Cannot be changed after the account is created.",
+  vendorAccountBaseUrlCustomNote:
+    'Required: the address of the OpenAI-compatible API without "/v1", e.g. "https://llm.example.com". https only, without credentials, query or fragment. Cannot be changed after the account is created.',
+  vendorAccountApiKeyOnlyNote: 'This provider supports API key authentication only.',
   vendorModelsTitle: 'Models',
   vendorModelsIntro:
     'The models this account provides. The model ID is the ID clients request the model by at the gateway (including the prefix).',
@@ -5202,6 +5233,10 @@ const en: PortalMessages = {
     'No device-code login is in progress for this account, or it has expired. Start the device code again.',
   errorVendorAccountModelPrefixInvalid:
     'Invalid model prefix: at most 64 characters of letters, digits and . _ ~ : / @ + -, without ".."',
+  errorVendorAccountBaseUrlRequired:
+    'A base URL is required for a custom OpenAI-compatible provider',
+  errorVendorAccountBaseUrlInvalid:
+    'Invalid base URL: only an https address without credentials, query or fragment is allowed',
   errorVendorAccountRefreshFailed: 'The models could not be refreshed',
   errorVendorAccountUsageRefreshFailed: 'The usage could not be refreshed',
   errorSystemVendorOpenAICodexClientVersionInvalid:

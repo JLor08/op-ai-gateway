@@ -61,3 +61,42 @@ export function isValidCodexClientVersion(raw: string): boolean {
   if (version === '') return true;
   return version.length <= CODEX_CLIENT_VERSION_MAX_LENGTH && CODEX_CLIENT_VERSION.test(version);
 }
+
+// ASCII control characters and the space: Go's url.Parse refuses control bytes
+// outright and the backend screens the raw text for a space, whereas the
+// browser's URL parser silently strips or encodes them.
+// eslint-disable-next-line no-control-regex
+const BASE_URL_FORBIDDEN_CHARS = /[\u0000- \u007f]/;
+
+/**
+ * Whether `raw` is an acceptable OpenAI-compatible base URL (the upstream root):
+ * blank (the preset's default root, or "required" for Custom -- the caller
+ * decides which), or an https URL with a non-empty hostname and no userinfo,
+ * query or fragment. Judged on the trimmed value, like the backend
+ * (portal.normalizeVendorAccountBaseURL).
+ *
+ * `new URL` hides a bare trailing "?" and a bare "#" (its search / hash read
+ * ""), so the raw text is screened for "?", "#" and spaces/control characters
+ * too, and the userinfo check looks at the raw authority ("https://@x.test" has
+ * an empty username to the browser but a user to Go). The hostname (not host)
+ * must be non-empty: "https://:443" parses with a port but no hostname.
+ */
+export function isValidBaseUrl(raw: string): boolean {
+  const value = raw.trim();
+  if (value === '') return true;
+  if (value.includes('?') || value.includes('#') || BASE_URL_FORBIDDEN_CHARS.test(value)) {
+    return false;
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' || url.hostname === '') return false;
+  if (url.username !== '' || url.password !== '') return false;
+  // The authority runs from "//" to the next "/" (the "?" and "#" that could end
+  // it earlier are already refused above): an "@" in it is a userinfo part.
+  const authority = value.slice(value.indexOf('//') + 2).split('/')[0];
+  return !authority.includes('@');
+}

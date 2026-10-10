@@ -129,6 +129,8 @@ describe('formatPortalError', () => {
   // server's English text, in both locales.
   it.each([
     [400, 'vendor_account.model_prefix_invalid', 'errorVendorAccountModelPrefixInvalid'],
+    [400, 'vendor_account.base_url_required', 'errorVendorAccountBaseUrlRequired'],
+    [400, 'vendor_account.base_url_invalid', 'errorVendorAccountBaseUrlInvalid'],
     [409, 'vendor_account.credential_unreadable', 'errorVendorAccountCredentialUnreadable'],
     [500, 'vendor_account.refresh_failed', 'errorVendorAccountRefreshFailed'],
     [500, 'vendor_account.usage_refresh_failed', 'errorVendorAccountUsageRefreshFailed'],
@@ -491,7 +493,8 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `connect_failed`. `credential_unreadable` is the 409 of the connection test and of
    * the models refresh for a stored credential that cannot be opened (a lost key, a
    * corrupt blob). `model_prefix_invalid` is the 400 of create and update for a
-   * malformed model prefix, `refresh_failed` the models refresh's 500 fallback and
+   * malformed model prefix, `base_url_required` / `base_url_invalid` the 400s of
+   * create for an OpenAI-compatible account's missing (Custom) or malformed base URL, `refresh_failed` the models refresh's 500 fallback and
    * `usage_refresh_failed` the usage refresh's, both mapped for the same reason as
    * `check_failed`. The five CRUD 500
    * `vendor_account.*_failed` fallbacks (list/create/get/update/delete) are left
@@ -521,6 +524,8 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'vendor_account.check_failed',
     'vendor_account.credential_unreadable',
     'vendor_account.model_prefix_invalid',
+    'vendor_account.base_url_required',
+    'vendor_account.base_url_invalid',
     'vendor_account.refresh_failed',
     'vendor_account.usage_refresh_failed',
   ] as const;
