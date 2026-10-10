@@ -3270,7 +3270,8 @@ Anthropic request builder must keep it. The token estimate is a deliberately che
 `chars / 4` that skips tool parameter schemas, so it errs low: a request just over
 the minimum may go uncached, which is today's behavior and never a regression. The
 placement assumes the subscription path's Claude-Code masquerade block stays first;
-it is left untouched and the marker goes on the last block. Because an Anthropic
+its text is left untouched and the marker goes on the last block (with no caller
+system text that is the Claude-Code block itself). Because an Anthropic
 target exists only through a vendor account, the setting is inert in a deployment
 with vendor accounts off.
 

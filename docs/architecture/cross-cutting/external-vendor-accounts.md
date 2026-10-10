@@ -687,7 +687,9 @@ With an enabled directive the builder places **at most two** breakpoints:
    (`anthropicSystemFieldCached`) with `cache_control` on its last block. On the
    plain path the joined system/developer text becomes one text block; for the
    subscription masquerade the array already exists, its first block (the
-   Claude-Code line) is left untouched and the **last** block carries the marker.
+   Claude-Code line) is left untouched and the **last** block carries the marker
+   (when there is no caller system text, that single Claude-Code block is the last
+   block and carries the marker; its text is unchanged).
    Anthropic's cache covers `tools`, then `system`, then `messages`, in that order,
    so this one marker caches **the tool list and the system prompt**, the stable
    prefix. A request with no system text and no masquerade has no system block, and
@@ -1452,9 +1454,11 @@ rows that carry an account's models (§6.7).
 
 A fourth system setting, `anthropic_prompt_caching_enabled` (bool, **off**,
 experimental), is not part of the vendor-account policy but applies to its Anthropic
-targets: it lets the translate path place prompt-cache breakpoints. Unlike the
-three above, the gateway reads it through its **own** 5 s cache, invalidated on a
-PUT that carries the key (see *Translate prompt caching* in §4.1).
+targets: it lets the translate path place prompt-cache breakpoints. Like the first
+two it is read on the hot path through a TTL cache that is invalidated on a PUT
+that carries the key, but through its **own** gateway-side cache
+(`anthropicPromptCachingEnabledCached`, 5 s), separate from the resolver's
+vendor-settings cache (see *Translate prompt caching* in §4.1).
 
 ## 8. Owner-scope RBAC
 
