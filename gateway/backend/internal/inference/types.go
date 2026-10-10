@@ -179,6 +179,16 @@ func (e *Error) Error() string {
 // against.
 const APIFlavorOpenAIResponses = "openai_responses"
 
+// PromptCacheDirective asks a provider that supports prompt caching (Anthropic
+// translate) to place cache_control breakpoints on this request. nil or
+// Enabled=false means no caching (today's behavior). Providers without caching
+// support ignore it. The gateway computes it from the flag + request shape
+// (see gateway.applyAnthropicCachePolicy); the provider only honors it.
+type PromptCacheDirective struct {
+	Enabled bool
+	TTL     string // "" / "5m" = ephemeral default; "1h" reserved (not emitted in v1)
+}
+
 type Request struct {
 	ID        string `json:"id,omitempty"`
 	APIFlavor string `json:"api_flavor"`
@@ -244,6 +254,10 @@ type Request struct {
 	// named server even if it is currently unhealthy/unreachable (still refused if the
 	// server is disabled). Ignored when ServerOverrideID is empty.
 	ServerOverrideForceUnreachable bool `json:"server_override_force_unreachable,omitempty"`
+	// PromptCache, when set and Enabled, directs the Anthropic translate builder
+	// to place cache_control breakpoints. Internal only: set by the gateway, never
+	// parsed from or serialized to a client body.
+	PromptCache *PromptCacheDirective `json:"-"`
 }
 
 func (r Request) Validate() *Error {
