@@ -65,7 +65,7 @@ flowchart TB
 | Public ACME | Edge (public-facing) TLS certificates | Optional |
 | SMTP | Invite and password/e-mail delivery | Optional |
 | OTLP endpoint | OpenTelemetry trace export | Optional |
-| External vendor clouds (OpenAI `api.openai.com`, Anthropic `api.anthropic.com`, the ChatGPT backend `chatgpt.com`) | Serving a user's own connected **vendor account** ("Anbieter") — API key or experimental subscription OAuth — and, for that account, checking its credential (a model-independent GET at token import and on the owner's explicit test) and listing the models it can use (a GET at subscription connect and on the owner's explicit model refresh) ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)) | Optional, **off by default** |
+| External vendor clouds (OpenAI `api.openai.com`, Anthropic `api.anthropic.com`, the ChatGPT backend `chatgpt.com`, x.ai `api.x.ai`, `openrouter.ai`, the Kilo Gateway `api.kilo.ai`, Google Gemini `generativelanguage.googleapis.com`, and any https base URL a user supplies for a Custom OpenAI-compatible account) | Serving a user's own connected **vendor account** ("Anbieter") — API key or experimental subscription OAuth (x.ai, OpenRouter, Kilo, Gemini and Custom are API key only) — and, for that account, checking its credential (a model-independent GET at token import and on the owner's explicit test) and listing the models it can use (a GET at subscription connect, at the creation of an OpenAI-compatible account with its key, and on the owner's explicit model refresh) ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)) | Optional, **off by default** |
 
 ## 3.3 Scope
 

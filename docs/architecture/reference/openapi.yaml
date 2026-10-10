@@ -1195,7 +1195,7 @@ paths:
                     items: { $ref: '#/components/schemas/VendorAccount' }
     post:
       tags: [portal]
-      summary: Create a vendor account (seeded with a static model set under its prefix)
+      summary: Create a vendor account (seeded with a static model set under its prefix; an OpenAI-compatible one is filled by a best-effort discovery)
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:
         required: true
@@ -1323,7 +1323,7 @@ paths:
         No request body. Asks the vendor which models the account's stored
         credential can use and, when it answers with a usable list, replaces the
         account's models with it (each served as the account's model_prefix plus
-        the vendor's id; at most 500 models, each slug and display name validated
+        the vendor's id; at most 1000 models, each slug and display name validated
         and capped). A subscription access token already past its expiry is
         renewed first through the gateway's own locked token refresh. Answers the
         credential-free account and a VendorModelsRefreshResult. Fail-soft: when
@@ -2231,10 +2231,10 @@ components:
         The credential-free view of a vendor account (portal.VendorAccountDTO).
         The sealed api key and OAuth token set are reduced to the api_key_set /
         subscription_connected booleans; no response carries a secret.
-      required: [id, vendor, auth_type, name, status, model_prefix, api_key_set, subscription_connected, models, created_at, updated_at]
+      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
-        vendor: { type: string, enum: [openai, anthropic] }
+        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, openai_compatible] }
         auth_type: { type: string, enum: [api_key, subscription] }
         name: { type: string }
         status:
@@ -2246,6 +2246,13 @@ components:
           description: >
             The account's model-id namespace, empty for none. Every model the
             account serves is requested as model_prefix + upstream_model.
+        base_url:
+          type: string
+          description: >
+            The upstream root URL of an OpenAI-compatible account (xai, openrouter,
+            kilo, google, openai_compatible), stored without /v1 or any other path
+            prefix (the gateway adds the vendor's own prefix). Always present, empty
+            for the openai and anthropic vendors. Immutable after creation.
         api_key_set: { type: boolean }
         subscription_connected: { type: boolean }
         models:
@@ -2314,7 +2321,7 @@ components:
       description: portal.CreateVendorAccountRequest.
       required: [vendor, auth_type, name]
       properties:
-        vendor: { type: string, enum: [openai, anthropic] }
+        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, openai_compatible] }
         auth_type: { type: string, enum: [api_key, subscription] }
         name: { type: string }
         status:
@@ -2331,6 +2338,18 @@ components:
           description: >
             Optional namespace for the account's model ids (trimmed; no "..").
             An invalid value is a 400 vendor_account.model_prefix_invalid.
+        base_url:
+          type: string
+          description: >
+            The upstream root URL of an OpenAI-compatible account, without /v1 or
+            any other path prefix. Optional for xai, openrouter, kilo and google
+            (empty means the vendor's default root) and required for
+            openai_compatible (400 vendor_account.base_url_required). It must be an
+            https URL with a host and no userinfo, query or fragment (400
+            vendor_account.base_url_invalid). Ignored for openai and anthropic.
+            Immutable after creation: the update request has no such field. An
+            OpenAI-compatible vendor accepts auth_type api_key only (400
+            vendor_account.auth_type_invalid otherwise).
     VendorAccountUpdateRequest:
       type: object
       description: portal.UpdateVendorAccountRequest; an absent field keeps the stored value.

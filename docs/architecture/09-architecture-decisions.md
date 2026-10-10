@@ -557,7 +557,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -613,7 +613,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -782,7 +782,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -967,7 +967,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-85-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1182,7 +1182,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-85-migrations),
+[§4](reference/data-model.md#4-migration-history-86-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1408,7 +1408,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-85-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-86-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1533,7 +1533,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-85-migrations),
+[§4](reference/data-model.md#4-migration-history-86-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -2985,7 +2985,8 @@ reverse-engineered.
 **Decision — five choices, taken together.**
 - **(a) A first-class `vendor_account` entity, a sibling of `AIServer`, not folded
   into "provider".** Code/wire/schema name `vendor_account` (type `VendorAccount`,
-  id prefix `va_`); enums `vendor ∈ {openai, anthropic}`, `auth_type ∈ {api_key,
+  id prefix `va_`); enums `vendor ∈ {openai, anthropic}` (**extended by
+  [ADR-052](#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)**: five OpenAI-compatible ids join it), `auth_type ∈ {api_key,
   subscription}`. It lives beside the untouched `internal/provider` package and
   *reuses* its clients to reach the vendor clouds — renaming `provider` would be a
   broad, unrelated refactor the repo rules forbid. The entity is stored across all
@@ -3199,7 +3200,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-85-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-86-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3290,3 +3291,109 @@ shown to matter).
 → [External Vendor Accounts, Translate prompt caching](cross-cutting/external-vendor-accounts.md#translate-prompt-caching),
 [API Surface](reference/api-surface.md#4-system-endpoints-apisystem),
 [Configuration & Environment Variables](reference/config-env.md#anthropic-prompt-caching-system-setting-no-env-var-form).
+
+## ADR-052 — OpenAI-compatible vendors are presets over one OpenAI client: a stored root URL plus a registry-derived path prefix
+**Context:** users wanted to route through more hosted providers than OpenAI and
+Anthropic — x.ai (Grok), OpenRouter, the Kilo Gateway and Google Gemini — and
+through "anything else that speaks OpenAI". All of them serve OpenAI
+`chat/completions` with a Bearer key, so the existing `OpenAICompatibleClient`
+already handles the wire. Two things were missing. A vendor's endpoint was a
+literal in the resolver (`api.openai.com`, `api.anthropic.com`) with no stored base
+URL, and the client composed the literal paths `/v1/chat/completions` and
+`/v1/models`, which fit neither Gemini's shim (`/v1beta/openai/…`) nor the Kilo
+Gateway (`/gateway/…`). The per-user vendor-account entity of
+[ADR-049](#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)
+already supplies ownership, the per-token opt-in
+([ADR-050](#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)),
+the model prefix and the flag, so the question was how to widen it without a
+bespoke branch per provider.
+
+**Decision — six choices, taken together.**
+- **(a) The preset registry is data in `internal/routing`, not in the portal.**
+  `vendor_presets.go` holds one `VendorPreset` per new vendor id (`xai`,
+  `openrouter`, `kilo`, `google`, `openai_compatible`): its default root, its path
+  prefix, how its key is validated, how a discovered model id is rewritten, and a
+  reserved, empty usage slot. It sits in `routing` because the resolver needs the
+  prefix and routing cannot import the portal; the portal reads the rest to compose
+  plain URL strings, so `vendorauth` stays capture-only and never learns a vendor
+  id or root. No new package and no new import edge, so the architecture-test
+  allowlist is unchanged.
+- **(b) `base_url` is stored as a root; the prefix rides on
+  `Target.OpenAIPathPrefix`, and empty means `/v1`.** The new immutable column
+  `vendor_accounts.base_url` (migration 86, `text not null default ''`, `''` for
+  `openai`/`anthropic`) holds the root **without** a path prefix, so
+  `https://api.x.ai`, `https://openrouter.ai/api`, `https://api.kilo.ai/api`. The
+  prefix is looked up from the registry by vendor id at resolve time and set on
+  the target; the client composes `{Endpoint}{prefix}/chat/completions` and
+  `{prefix}/models`, and the gateway's usage-label path reads the same normalised
+  value (`Target.OpenAIPathPrefixOrDefault`, the one place the default lives). An
+  unset prefix is `/v1`, which is what every self-hosted target, probe target and
+  OpenAI vendor target already used, so every existing caller composes
+  byte-identical URLs; tests pin the composed chat and models URLs for the empty
+  default and the Gemini and Kilo prefixes (the client) and for every preset (the
+  registry).
+- **(c) Translate-only and api-key-only.** The resolver builds the target with
+  `Provider = vendor_openai` (the existing client, so no dispatch wiring changes),
+  Bearer auth, `APIFlavors = [openai, anthropic]` and zero endpoint modes: no
+  Responses or Messages passthrough, which exist only for the native OpenAI and
+  Anthropic accounts. A subscription account of these vendors is refused
+  (`vendor_account.auth_type_invalid`): none of these providers has a consumer
+  subscription OAuth path, and the reverse-engineered, ToS-restricted one of
+  ADR-049 (b) is not a model for new providers.
+- **(d) Validation and discovery are per preset, with the existing uniform
+  fail-soft classification.** Test connection probes `GET {base}{prefix}/models`
+  (x.ai, Google, Custom), `GET {base}/v1/key` for OpenRouter (its `/v1/models` is
+  public, so a listing would call every key valid) and nothing for Kilo (a public
+  listing and no key endpoint, so the honest answer is "could not verify"). The
+  classification is not bent per provider: 2xx is valid, 401 invalid, everything
+  else unverifiable. x.ai and Gemini answer a wrong key with 400, so there a wrong
+  key reads "could not verify", never "invalid" — fail-soft, and a key is never
+  misreported as rejected. Discovery is `GET {base}{prefix}/models` (Gemini's
+  leading `models/` is stripped from the ids), runs best-effort when an account is
+  created with its key (bounded to 5 s, never failing the create, since these
+  accounts have no static seed) and on Refresh, and its per-discovery cap rises
+  from 500 to 1000 models for the aggregators (OpenRouter about 460, Kilo about 390
+  at the time of writing).
+- **(e) Gemini through its OpenAI shim now; the native dialect and usage are
+  deferred.** Gemini is served at `/v1beta/openai` through the shared client. The
+  native `generateContent` dialect and Gemini-only features are a later
+  sub-project, and usage/credits display is another (the registry's usage slot is
+  the seam): until then these accounts report no usage, the passive header scrape
+  finding none of the headers it knows.
+- **(f) The Custom base-URL trust model.** For `openai_compatible` the owner
+  supplies the root. It must be **https** with a host and carry no userinfo, query,
+  fragment or space (the key rides on every request, so plaintext and
+  credential-in-URL are refused); the host is otherwise unrestricted. This is an
+  on-prem gateway and the URL is set by an authenticated owner for their own
+  account, so a Custom account can make the gateway call any https host the owner
+  names, internal ones included: server-side request forgery is **accepted**, with
+  its limits recorded in
+  [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) —
+  redirects are refused on validate and discovery, and there is no DNS-rebinding
+  dial guard in v1.
+
+**Consequence:** a new OpenAI-compatible provider is one registry entry (root,
+prefix, probe, id rewrite) plus a vendor id and a UI label, not new client or
+resolver code. The shared client now has a prefix seam that the self-hosted and
+OpenAI paths also traverse, which is why the empty-means-`/v1` default and its
+no-regression test are load-bearing: a change to the default silently moves every
+OpenAI-dialect call in the gateway. The presets' roots, prefixes and probe
+endpoints are VERIFY-LIVE data (confirmed on 2026-10-10) that a provider can move,
+and a moved one degrades to "could not verify" or an unchanged catalog. `base_url`
+being immutable keeps the root and the preset's behavior from drifting apart on an
+existing account, at the price of a new account to change it. An OpenAI-compatible
+account serves translate-only, so a Responses or Messages client reaches it through
+the neutral model and loses what only the native vendors' passthrough carries.
+
+**Rejected:** a bespoke resolver and client branch per provider (four copies of
+the same wire, and every new provider a code change); a free-form `base_url` with
+no preset identity (no way to know a provider's prefix, key probe or id rewrite,
+and nothing for the later usage work to key on); a new leaf package for the
+registry (extra architecture-test allowlist edges for what is a small table the
+resolver must read, and routing cannot import the portal); storing the path prefix
+in a column (a second source of truth that can disagree with the preset, and a
+migration per provider that changes its path).
+→ [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
+[API Surface](reference/api-surface.md#vendor-accounts-anbieter),
+[Data Model](reference/data-model.md#4-migration-history-86-migrations) (migration 86),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

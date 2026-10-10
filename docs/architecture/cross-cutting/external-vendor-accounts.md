@@ -12,13 +12,21 @@ named apart from the heavily overloaded **"provider"** adapter term
 ([ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted),
 [Glossary](../12-glossary.md)).
 
-Two vendors ship: **OpenAI** and **Anthropic**. Each is reachable through either
-of two auth types — a documented, metered **API key**, or an **experimental,
-ToS-restricted subscription** path. The subscription path reuses consumer
-OAuth tokens through a third-party gateway, which is against both vendors' consumer
-Terms and is reverse-engineered throughout; it is **off by default**, behind a
-master feature flag, and every reverse-engineered constant is marked **VERIFY-LIVE**
-(§10).
+Two bespoke vendors ship: **OpenAI** and **Anthropic**. Each is reachable through
+either of two auth types — a documented, metered **API key**, or an
+**experimental, ToS-restricted subscription** path. The subscription path reuses
+consumer OAuth tokens through a third-party gateway, which is against both vendors'
+consumer Terms and is reverse-engineered throughout; it is **off by default**,
+behind a master feature flag, and every reverse-engineered constant is marked
+**VERIFY-LIVE** (§10).
+
+Five further vendors are **OpenAI-compatible hosted providers**: **x.ai** (Grok),
+**OpenRouter**, the **Kilo Gateway**, **Google Gemini** (through Google's
+OpenAI-compatible shim) and a **Custom** endpoint the user addresses themselves.
+They speak OpenAI `chat/completions` with a Bearer key, so they are **api-key
+only** presets over the one OpenAI client, driven by a data registry and a stored
+`base_url` rather than by bespoke code (§4.4,
+[ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)).
 
 The feature reuses the gateway's existing credential sealing, routing `Target`,
 dispatch and usage machinery wherever possible. The genuinely new parts are a
@@ -48,13 +56,14 @@ sharing link table plus a resolver filter extension), not a rewrite.
 |---|---|
 | `id` | `va_`-prefixed, random hex. |
 | `owner_user_id` | FK → `users(id)` `on delete cascade`. The one principal the account serves. |
-| `vendor` | `openai` \| `anthropic` (`routing.VendorOpenAI` / `VendorAnthropic`). |
+| `vendor` | `openai` \| `anthropic` (`routing.VendorOpenAI` / `VendorAnthropic`) \| `xai` \| `openrouter` \| `kilo` \| `google` \| `openai_compatible` (`routing.VendorXAI` / `VendorOpenRouter` / `VendorKilo` / `VendorGoogle` / `VendorOpenAICompatible`; the last is the Custom endpoint). The five newer ids are the OpenAI-compatible vendors (§4.4); `routing.IsOpenAICompatibleVendor` is true for exactly those. Immutable after creation. |
 | `auth_type` | `api_key` \| `subscription` (`routing.VendorAuthAPIKey` / `VendorAuthSubscription`). Immutable after creation. |
 | `name` | User-facing label. |
 | `status` | `active` \| `disabled` \| `needs_reconnect`. The last is system-managed (§3.4): a refresh rejection flips an account to it; the operator cannot set it directly. |
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
 | `model_prefix` | Optional per-account namespace for the account's model ids (migration 83; `''` = none). The service trims it and accepts at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +` (the URL-path-safe characters of a model id) with no `..`, anything else being `400 vendor_account.model_prefix_invalid`. It is **applied**, not merely stored: every model the account serves is advertised and requested as the prefix plus the vendor's own id, while the vendor is still sent the bare id (§6.5). The DTO reports it and the create/update requests accept it. |
+| `base_url` | The upstream **root** URL of an OpenAI-compatible account (migration 86; `''` for the bespoke `openai` / `anthropic` accounts, whose hosts are fixed). Stored as a root **without** `/v1` or any other path prefix: the client appends the preset's prefix and the resource (`{prefix}/chat/completions`, `{prefix}/models`; §4.4). Defaulted from the preset at create (required for `openai_compatible`), https only with no userinfo, query or fragment, and **immutable** after creation: it is absent from the update request. The DTO always carries it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
 account created but not yet connected, and an api-key account with no key set, have
@@ -66,10 +75,12 @@ client requests (`gateway_model`, the prefix plus the vendor's id) with the id
 the vendor is sent (`upstream_model`), the API flavor, and the vendor's
 human-readable `display_name` (`''` when it gave none; since migration 83). The
 catalog starts as a small **static guess** keyed by vendor **and** auth type
-(§10), written when the account is created, and is **replaced by the vendor's
-real list** once discovery has run (§6). The three tables and the
+(§10), written when the account is created (empty for the OpenAI-compatible
+vendors, which have no seed and are filled by discovery alone), and is **replaced
+by the vendor's real list** once discovery has run (§6). The three tables and the
 `usage_events.account_id` attribution column are migration 82; migration 84 later
-adds the spend-control columns to the usage snapshot (§5.2); see
+adds the spend-control columns to the usage snapshot (§5.2), and migration 86 the
+immutable `base_url` of an OpenAI-compatible account; see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
 
 The domain type is `routing.VendorAccount`, stored across all three drivers
@@ -79,6 +90,12 @@ portal view is `portal.VendorAccountDTO`, which carries **no** credential materi
 `subscription_connected` booleans ([Secrets at rest](#9-secrets-at-rest)).
 
 ## 2. The two auth types
+
+The two types below apply to the bespoke `openai` and `anthropic` vendors. **The
+five OpenAI-compatible vendors (x.ai, OpenRouter, Kilo, Google, Custom) are
+`api_key` only**: they have no OAuth, no connect flow and no subscription backend,
+and creating one with `auth_type = subscription` is refused with
+`400 vendor_account.auth_type_invalid` (§4.4).
 
 **`api_key`.** The user pastes a platform API key (`sk-…` / `sk-ant-…`). Cheap,
 documented, stable, and legal — it is the user's own metered key. The gateway
@@ -223,10 +240,11 @@ known limitation recorded in §10.
 
 A failed chat conflates two unrelated problems — a login the vendor rejects and a
 model the backend does not serve — and the seeded model ids are a best guess
-(§10). Validation separates them. Four probes in `internal/vendorauth/validate.go`
-each make **one cheap GET that names no model**, so an authentication verdict can
-never be mistaken for a wrong-model error. The URLs live in `constants.go` beside
-the OAuth constants.
+(§10). Validation separates them. Four fixed-URL probes in
+`internal/vendorauth/validate.go`, plus a fifth that takes its URL as an argument
+(the OpenAI-compatible vendors, below), each make **one cheap GET that names no
+model**, so an authentication verdict can never be mistaken for a wrong-model
+error. The fixed URLs live in `constants.go` beside the OAuth constants.
 
 | Credential | Probe | Auth headers | Provenance |
 |---|---|---|---|
@@ -234,8 +252,19 @@ the OAuth constants.
 | Anthropic **subscription** access token | `GET https://api.anthropic.com/api/oauth/profile` | `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | reverse-engineered, **VERIFY-LIVE** |
 | OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | `Authorization: Bearer` | documented public API |
 | Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models` | `x-api-key`, `anthropic-version` | documented public API |
+| x.ai, Google, Custom **`api_key`** | `GET {base}{prefix}/models` (`https://api.x.ai/v1/models`, `https://generativelanguage.googleapis.com/v1beta/openai/models`, the user's root plus `/v1/models`) | `Authorization: Bearer` | preset registry (§4.4); the listing needs a key |
+| OpenRouter **`api_key`** | `GET {base}/v1/key` (`https://openrouter.ai/api/v1/key`): its `/v1/models` is public, so a listing would call every key valid | `Authorization: Bearer` | preset registry (§4.4) |
+| Kilo **`api_key`** | **none**: its `/gateway/models` is public and it has no key endpoint, so no honest offline check exists and the answer is `unverifiable` ("this provider offers no offline key check") | — | preset registry (§4.4) |
 
-**Classification** is one rule for all four:
+The three OpenAI-compatible rows are one function,
+`vendorauth.ValidateOpenAICompatibleAPIKey(probeURL, key)`, and the URL is composed
+by the portal from the account's `base_url` and its preset: `vendorauth` knows no
+vendor ids or roots. The rows' provenance is the providers' own API, confirmed live
+on 2026-10-10 and still VERIFY-LIVE (§10). As for every api key, they are probed
+only by the explicit Test connection, never when the key is saved.
+
+**Classification** is one rule for all of them, the OpenAI-compatible probes
+included:
 
 - HTTP **2xx** → `valid`.
 - HTTP **401** → `invalid`. This is the only answer that ever counts as a bad
@@ -248,6 +277,12 @@ the OAuth constants.
   token minted by `claude setup-token` has the inference scope but not
   `user:profile`, so the profile endpoint legitimately refuses it with a 403
   although the token serves inference.
+- **Consequence for the OpenAI-compatible providers.** x.ai and Gemini answer a
+  wrong key with **400**, not 401, so a bad key there reads `unverifiable`
+  ("could not verify"), never `invalid`. The one rule is deliberately not bent
+  per provider: the price is that a wrong key is not caught on those two, the gain
+  that no provider's idiosyncratic status code can ever mislabel a working key as
+  rejected ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix) (d)).
 
 **Fail-soft.** Validation never reduces availability: `unverifiable` neither
 blocks an import nor is ever reported as an invalid credential. A probe runs only
@@ -354,6 +389,7 @@ matrix:
 | **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
+| **OpenAI-compatible api-key** (x.ai, OpenRouter, Kilo, Google, Custom) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to the provider's `{prefix}/chat/completions` on the account's own root (§4.4). **No exception**: Responses and Messages passthrough exist only for the native OpenAI and Anthropic accounts, so an inbound `openai_responses` or `anthropic_messages` request is translated like any other. |
 
 The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted/shared path — when the module flag is off, the principal has no user
@@ -379,7 +415,8 @@ target:
 
 Three provider kinds select the client at dispatch: `vendor_openai`
 (`ProviderVendorOpenAI`, the api-key OpenAI path via the existing
-OpenAI-compatible client), `vendor_anthropic` (`ProviderVendorAnthropic`, the
+OpenAI-compatible client, which the five OpenAI-compatible vendors reuse as well,
+§4.4), `vendor_anthropic` (`ProviderVendorAnthropic`, the
 native Anthropic Messages client, used for an Anthropic account whether api-key or
 subscription), and `vendor_openai_subscription`
 (`ProviderVendorOpenAISubscription`, the ChatGPT backend).
@@ -841,6 +878,75 @@ upstream rather than a missing API version. The api-key path is unchanged: its
 sealed `APIToken` rides the vendor's own API-key header. The custom `x-api-key`
 header is redacted in payload capture (a latent leak the feature closed).
 
+### 4.4 OpenAI-compatible vendors
+
+Five vendor ids reach hosted providers that speak the OpenAI chat dialect with a
+Bearer key: `xai` (x.ai, Grok), `openrouter`, `kilo` (the Kilo Gateway), `google`
+(Gemini through Google's OpenAI-compatible shim) and `openai_compatible` (Custom:
+any OpenAI-compatible endpoint the user addresses). They are ordinary per-user
+vendor accounts, so ownership, the per-token opt-in (§11), the model prefix (§6.5),
+the master flag (§7) and the owner-scope RBAC (§8) apply unchanged, but they are
+**presets over the one OpenAI client** rather than clients of their own
+([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)).
+
+**The preset registry.** `internal/routing/vendor_presets.go` is a pure-data table
+keyed by vendor id (`VendorPresetFor`, `IsOpenAICompatibleVendor`,
+`OpenAIPathPrefixFor`). It lives in `routing` because the resolver needs the path
+prefix and routing cannot import the portal; the portal reads the rest to compose
+URLs, and `vendorauth` never sees a preset: it receives plain URL strings. A preset
+carries its default root, its path prefix, how its key is validated, how a
+discovered model id is rewritten, and a reserved, empty usage slot for the later
+usage/credits work (§5.1). The values (live-confirmed 2026-10-10, VERIFY-LIVE, §10):
+
+| Vendor id | Default root (stored as `base_url`) | Path prefix | Key probe (§3.5) | Discovered id |
+|---|---|---|---|---|
+| `xai` | `https://api.x.ai` | `/v1` | `GET {base}/v1/models` | verbatim |
+| `openrouter` | `https://openrouter.ai/api` | `/v1` | `GET {base}/v1/key` | verbatim |
+| `kilo` | `https://api.kilo.ai/api` | `/gateway` | none (`unverifiable`) | verbatim |
+| `google` | `https://generativelanguage.googleapis.com` | `/v1beta/openai` | `GET {base}/v1beta/openai/models` | a leading `models/` is stripped |
+| `openai_compatible` | none: the user supplies it | `/v1` | `GET {base}/v1/models` | verbatim |
+
+So x.ai serves chat at `https://api.x.ai/v1/chat/completions`, OpenRouter at
+`https://openrouter.ai/api/v1/chat/completions`, Kilo at
+`https://api.kilo.ai/api/gateway/chat/completions` and Gemini at
+`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
+
+**The stored root.** `base_url` is the root without the prefix. At create the
+service defaults it from the preset when it is empty (`openai_compatible` has no
+default, so empty is `400 vendor_account.base_url_required`) and otherwise accepts
+only an **https** URL with a host and no userinfo, query, fragment or space
+(`400 vendor_account.base_url_invalid`); a trailing `/` is trimmed. Beyond that the
+host is unrestricted, which is the Custom trust model of
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+It is immutable: a different root means a new account. For `openai` and `anthropic`
+a supplied `base_url` is ignored and the column stays `''`.
+
+**Serving.** `vendorAccountTarget` has a branch for these vendors that builds a
+`Target` with `Provider = vendor_openai` (the existing OpenAI-compatible client, so
+no dispatch wiring changes), Bearer auth from the sealed key (`APITokenHeader`
+empty), `Endpoint` = the stored root and `OpenAIPathPrefix` = the registry's prefix.
+`Target.OpenAIPathPrefix` is the one new `Target` field: the client composes
+`{Endpoint}{prefix}/chat/completions` and `{prefix}/models`, and the gateway's
+usage-label path reads the same normalised value
+(`Target.OpenAIPathPrefixOrDefault`, the single place the `/v1` default lives).
+**Empty means `/v1`**, so every pre-existing caller (self-hosted AI servers, probe
+targets, the OpenAI vendor target) is byte-identical to before. The served flavors
+are `[openai, anthropic]` with zero endpoint modes, **translate only**: no
+Responses or Messages passthrough, which are native to OpenAI and Anthropic. An
+account with no stored root cannot arise through the API, but if one is read it
+fails closed (no target; the request falls through) rather than routing to a URL
+with no host.
+
+**Credential check and models.** Test connection is per preset (§3.5) and model
+discovery is `GET {base}{prefix}/models` (§6.1), both with the uniform fail-soft
+classification. A new account has an empty catalog until discovery fills it
+(§6.2).
+
+**Deliberately out of scope.** Usage and credits are not reported for these
+accounts yet (§5.1); the native Gemini dialect (`generateContent` and Gemini-only
+features) is a later sub-project, Gemini being served meanwhile through its OpenAI
+shim; and the subscription/OAuth path does not exist for them (§2).
+
 ## 5. Usage & limits
 
 Neither vendor exposes an absolute cap on its **rate-limit windows**, so those are
@@ -878,6 +984,13 @@ percent is clamped to `≤ 100`. The scrape knows **nothing about spend control 
 the credit state** (the response headers never carry them): it builds its snapshot
 with `SpendUsedPct = -1` and no spend strings, so the merge (§5.3) keeps whatever
 the active pull stored.
+
+**OpenAI-compatible accounts (§4.4) report no usage yet.** They are `vendor_openai`
+targets, so the scrape runs on their responses, but it looks only for the Codex
+`x-codex-*` headers, which these providers do not send: it finds none, writes
+nothing, and the account's snapshot stays empty (unknown, never a fabricated `0`).
+A real per-provider usage and credits fetch is a later sub-project; the preset
+registry has a reserved, empty usage slot for it.
 
 ### 5.2 Active pull (OpenAI subscription only)
 
@@ -1234,7 +1347,8 @@ guess with the answer. The static set stays as the create-time fallback and as
 what an account keeps whenever discovery yields nothing.
 
 Discovery is split like the validation probes (§3.5). One fetcher per credential kind lives
-in `internal/vendorauth/discover.go` and never returns an error — only a list
+in `internal/vendorauth` (`discover.go`, and `openai_compatible.go` for the
+OpenAI-compatible vendors) and never returns an error — only a list
 and a status, `ok` or `unverifiable`. The service around it
 (`portal.Service.RefreshVendorAccountModels`, `service_vendor_discovery.go`)
 opens the sealed credential, picks the fetcher, validates and caps what the
@@ -1249,13 +1363,17 @@ transaction.
 | OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | ids that look chat-capable (below); the listing has no display name, so the id doubles as one | documented public API |
 | Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models?limit=1000` with `x-api-key`, `anthropic-version` | every `data[].id` with its `display_name` | documented public API |
 | Anthropic **subscription** | the same URL with `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | as above | reverse-engineered, **VERIFY-LIVE** |
+| **OpenAI-compatible `api_key`** (x.ai, OpenRouter, Kilo, Google, Custom) | `GET {base}{prefix}/models` with `Authorization: Bearer`, the URL composed by the portal from the account's `base_url` and its preset (§4.4) and fetched by `vendorauth.DiscoverOpenAICompatibleModels(modelsURL, key)`, **not** through the provider client | every `data[].id`; display name from `display_name`, else `name` (OpenRouter sends `name`), else the id. For Google a leading `models/` is stripped from the id (and from a display name that was only the id standing in) | the providers' own endpoints, confirmed live 2026-10-10, **VERIFY-LIVE** |
 
 An OpenAI api-key listing names every model the key reaches, with no capability
 data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
 o-series families (and fine-tunes of them), minus ids that mark an embedding,
 speech, image, moderation, realtime or completion-only model. A model the rule
 does not recognize is left out — a missing model is added by a newer rule, while
-a non-chat model offered wrongly fails every request routed to it.
+a non-chat model offered wrongly fails every request routed to it. **That heuristic
+stays OpenAI-only**: the OpenAI-compatible vendors keep every listed id exactly as
+the provider sends it (an aggregator's catalog is the point), and the per-token
+vendor access and the prefix (§11, §6.5) are what scope which of them a token sees.
 
 **What "live-confirmed" covers, and what it does not.** The operator ran the
 Codex catalog request against a real subscription and got the real catalog: the
@@ -1279,6 +1397,13 @@ account keeps its static seed.
   without a credential and the connect still succeeds with the models it had.
   The import and complete responses carry the account as it then serves; the
   device poll only reports `connected`, and the portal re-reads the account.
+- **At create (OpenAI-compatible).** Creating an OpenAI-compatible account **with
+  its key** runs the same discovery once, best-effort and under the same 5-second
+  bound, because these accounts have no static seed and would otherwise serve
+  nothing until the first refresh. It never fails the create: whatever goes wrong
+  is logged without the key and the account keeps its empty catalog. An account
+  created without a key, or whose key is set or replaced later through the update
+  request, does not discover by itself; the refresh below is how it fills.
 - **On demand.** `POST /api/portal/vendor-accounts/{id}/models/refresh` — the
   "Modelle aktualisieren" button of the account's Models panel in the detail view
   — runs the same discovery and may wait for the vendor client's own 10 second
@@ -1328,7 +1453,10 @@ under a bound of its own and persists its result.
 What the vendor sends becomes model ids, header values and rendered text, so it
 is untrusted and capped before it is stored:
 
-- **At most 500 models** per discovery.
+- **At most 1000 models** per discovery (raised from 500 for the aggregators:
+  OpenRouter lists about 460 models and Kilo about 390 at the time of writing, and
+  both are growing). Entries beyond the cap are counted as dropped in
+  `refresh.detail`.
 - **Slug:** 1 to 128 bytes, from `A-Z a-z 0-9 . _ ~ : / @ + -`, starting with a
   letter or digit and containing no `..` — the URL-path-safe subset a model id
   needs to travel in `/v1/models/{id}`, JSON and logs. It is used exactly as
@@ -1550,7 +1678,8 @@ reasons are recorded deliberately, not in denial of them
   therefore seeded with only `gpt-5` and `gpt-5-mini`, so a working credential is
   never paired with a model its backend is known to refuse — the auth-versus-model
   confusion that §3.5 exists to take apart. Anthropic's OAuth Messages path and
-  its API key serve the same ids, so its set does not vary. Even the narrowed
+  its API key serve the same ids, so its set does not vary. The OpenAI-compatible
+  vendors (§4.4) seed **empty**: discovery is their only source of models. Even the narrowed
   subscription set is unverified, and an account serves nothing its rows do not
   name — which is why the real catalog is discovered rather than kept here.
   **There is no backfill:** nothing rewrites existing catalogs at upgrade or in
@@ -1573,6 +1702,21 @@ reasons are recorded deliberately, not in denial of them
   A third is **not** accepted but tracked: a PATCH that races a refresh can write
   a stale `oauth_tokens` back, and its fix is a column-subset PATCH writer in
   every store driver (§3.4; [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+- **The OpenAI-compatible presets are the providers' own endpoints, but still
+  VERIFY-LIVE data (§4.4).** Each preset's root, path prefix, key-probe endpoint and model-list
+  shape was confirmed live on 2026-10-10: x.ai at `https://api.x.ai/v1`;
+  OpenRouter at `https://openrouter.ai/api/v1` with its key endpoint `/v1/key`;
+  the Kilo Gateway at `https://api.kilo.ai/api/gateway` with a public listing and
+  no key endpoint; Gemini at `https://generativelanguage.googleapis.com/v1beta/openai`
+  with `models/`-prefixed ids and a 400 on a wrong key (as for x.ai). The
+  providers can still move any of it without notice. It all sits as data in
+  `internal/routing/vendor_presets.go`, so a correction is an edit there, and a
+  moved endpoint degrades to `unverifiable` or an unchanged catalog, never to a
+  wrong one. The **Custom** endpoint's trust model is the one deliberate
+  acceptance here: an authenticated owner supplies an https root that is not
+  otherwise restricted, so the on-prem gateway can be pointed at any https host
+  (server-side request forgery is accepted, with its limits,
+  [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **Single-process assumptions.** The pending-connect state (PKCE verifier/state
   and the device-code pending entry), the per-account refresh lock and the
   per-account model-write lock (§6.4) are all **in-process**: a gateway restart
@@ -1596,7 +1740,7 @@ owner never meant it to reach
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-85-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-86-migrations)):
 
 ```json
 { "all": false,
@@ -1731,8 +1875,9 @@ enabled vendor accounts is affected.
 - [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter) — the
   three tables and the `usage_events.account_id` column (migration 82), the
   prefix and display-name columns (migration 83), the usage snapshot's
-  spend-control columns (migration 84) and the per-token
-  `api_tokens.vendor_provider_access` column (migration 85).
+  spend-control columns (migration 84), the per-token
+  `api_tokens.vendor_provider_access` column (migration 85) and the
+  OpenAI-compatible accounts' `vendor_accounts.base_url` column (migration 86).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
   `/api/portal/vendor-accounts*` routes (the model and usage refreshes included) and
   their error codes; [token vendor access](../reference/api-surface.md#token-vendor-access)
@@ -1746,3 +1891,6 @@ enabled vendor accounts is affected.
 - [ADR-051](../09-architecture-decisions.md#adr-051--anthropic-translate-prompt-caching-is-flag-gated-decided-at-the-gateway-by-a-hybrid-auto-switch-and-placed-by-the-provider)
   — translate prompt caching: the flag, the hybrid auto-switch and where the
   breakpoints go.
+- [ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)
+  — OpenAI-compatible vendors as presets over one OpenAI client: the registry, the
+  stored root, the path prefix and the Custom trust model.

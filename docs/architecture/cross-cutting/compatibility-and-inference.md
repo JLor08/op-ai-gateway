@@ -81,7 +81,7 @@ flowchart TD
     Native3 --> ProxyMux
 
     Mux --> Ollama["OllamaClient\n/api/chat"]
-    Mux --> OAIC["OpenAICompatibleClient\n/v1/chat/completions"]
+    Mux --> OAIC["OpenAICompatibleClient\n{prefix}/chat/completions (default /v1)"]
     Mux --> Mock["Mock (dev/test)"]
     ProxyMux --> OAIC
 
@@ -946,7 +946,13 @@ is not the loop's own
 |---|---|---|---|---|---|
 | Mock | `mock.go` | echoes the request text | word-by-word chunks | canned Responses-shaped SSE | 2 fixed names |
 | Ollama | `ollama.go` | `POST /api/chat` | `POST /api/chat` (stream:true, NDJSON) | — | `GET /api/tags` |
-| OpenAI-compatible (vLLM, llama.cpp, llama-swap, LiteLLM, the server agent, stable-diffusion.cpp) | `openai_compatible.go` | `POST /v1/chat/completions` | `POST /v1/chat/completions` (stream:true, SSE) | forwards raw body to `path` | `GET /v1/models`; `GET /sdapi/v1/sd-models` for `stable_diffusion_cpp` (below) |
+| OpenAI-compatible (vLLM, llama.cpp, llama-swap, LiteLLM, the server agent, stable-diffusion.cpp, and the OpenAI-compatible vendor accounts) | `openai_compatible.go` | `POST {prefix}/chat/completions` | `POST {prefix}/chat/completions` (stream:true, SSE) | forwards raw body to `path` | `GET {prefix}/models`; `GET /sdapi/v1/sd-models` for `stable_diffusion_cpp` (below) |
+
+`{prefix}` is `Target.OpenAIPathPrefix`, and **empty means `/v1`**: every self-hosted
+and OpenAI vendor target leaves it empty and composes exactly the paths this table
+always named, while an OpenAI-compatible vendor account sets its preset's prefix
+(`/v1beta/openai` for Gemini, `/gateway` for Kilo,
+[External Vendor Accounts §4.4](external-vendor-accounts.md#44-openai-compatible-vendors)).
 
 All three also implement `Prober` (reachability probe) and, where applicable,
 `LoadedModelLister`/`ModelInfoProber`/`MemoryProber`/`ModelUnloader` for the
