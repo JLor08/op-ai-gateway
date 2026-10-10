@@ -2583,6 +2583,9 @@ const de = {
   systemVendorOpenAICodexClientVersionLabel: 'Codex-Client-Version (OpenAI)',
   systemVendorOpenAICodexClientVersionNote:
     'Version der Codex-App, mit der die Modellerkennung für OpenAI-Abonnements anfragt. Bei neuen OpenAI-Releases hochziehen, sonst fehlen neue Modelle. Leer lassen für den Standardwert.',
+  settingsAnthropicPromptCaching: 'Anthropic Prompt-Caching',
+  settingsAnthropicPromptCachingHelp:
+    'Cacht wiederholten Kontext bei Anthropic-Modellen (spart Kosten; experimentell).',
   settingsResourceProvisioningEnforceLabel: 'Ressourcengruppen-Bereitstellung erzwingen',
   settingsResourceProvisioningEnforceHelp:
     'Aus: bereitgestellte Ziele sind eine zusätzliche Freigabe (Opt-in). An: nur bereitgestellte Benutzer/Gruppen/Dienste dürfen die Server der Ressourcengruppe nutzen (Deny-by-default).',
@@ -5217,6 +5220,9 @@ const en: PortalMessages = {
   systemVendorOpenAICodexClientVersionLabel: 'Codex client version (OpenAI)',
   systemVendorOpenAICodexClientVersionNote:
     'Version of the Codex app the model discovery for OpenAI subscriptions identifies as. Raise it when OpenAI ships a new release, otherwise new models are missing. Leave empty for the default.',
+  settingsAnthropicPromptCaching: 'Anthropic prompt caching',
+  settingsAnthropicPromptCachingHelp:
+    'Caches repeated context for Anthropic models (saves cost; experimental).',
   settingsResourceProvisioningEnforceLabel: 'Enforce resource-group provisioning',
   settingsResourceProvisioningEnforceHelp:
     "Off: provisioned targets are an additional grant (opt-in). On: only provisioned users/groups/services may use the resource group's servers (deny-by-default).",

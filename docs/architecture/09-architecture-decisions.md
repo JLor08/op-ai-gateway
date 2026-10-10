@@ -3202,3 +3202,91 @@ needed for this need).
 [Data Model](reference/data-model.md#4-migration-history-85-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
+**Context:** Anthropic caches a prompt prefix only where the request carries a
+`cache_control` breakpoint. The native `/v1/messages` passthrough already relays the
+client's own markers, but the **translate** path (an OpenAI-dialect client or the
+portal chat reaching an Anthropic vendor account, api-key or subscription) renders
+the body itself and emitted none, so a long system prompt, tool list and growing
+history were billed in full on every round. Marking blindly is not free either: a
+cache write is billed at a premium over plain input, a prefix below the model's
+cacheable minimum is silently not cached, and a large one-shot that nothing re-reads
+would pay the premium for nothing. The usage store already records both cache-read
+(`cached_tokens`) and cache-write (`cache_write_tokens`) tokens, so the feature needed
+no new accounting.
+
+**Decision — six choices, taken together.**
+- **(a) A flag-gated, experimental, default-off system setting.**
+  `anthropic_prompt_caching_enabled` (bool, a plain key/value row in
+  `system_settings`, so no migration) with a System settings toggle, mirroring
+  `vendor_accounts_enabled`. Off means the translate render is byte-identical to a
+  build without the feature.
+- **(b) A hybrid auto-switch rather than "always on" or a per-request knob.** The
+  directive is set only when the flag is on **and** the target is an Anthropic
+  translate target (`routing.ProviderVendorAnthropic`, which covers api-key **and**
+  subscription) **and** the estimated prefix reaches the model's cacheable minimum
+  (512 / 1024 / 2048 / 4096 tokens by model family, unknown = 1024) **and** the
+  prefix is likely reused (the conversation already has an assistant turn, or it is
+  a portal-chat session). Caching therefore turns on only where the prefix is big
+  enough to cache and likely to be re-read; a large one-shot is never cached.
+- **(c) The decision lives at the gateway, the placement at the provider.**
+  `applyAnthropicCachePolicy` computes the verdict at both dispatch hooks and writes
+  it onto the upstream copy of the request as an internal
+  `inference.Request.PromptCache` directive (`json:"-"`, never client-visible); the
+  Anthropic client's `anthropicRequestBody` only honors it. The gateway owns the
+  inputs the policy needs (the flag, the session source, the routed target and its
+  model) and the provider stays a pure renderer, so a provider that does not support
+  caching simply ignores the field, and the neutral model grows one optional,
+  provider-agnostic hint instead of an Anthropic detail.
+- **(d) At most two breakpoints, 5-minute TTL only.** One on the **last system
+  block** (`system` is rendered as a block array; Anthropic's order of tools, then
+  system, then messages means it caches tools plus system, the stable prefix) and one
+  on the **last content block of the latest turn** (the growing tail). The marker is
+  `{"type":"ephemeral"}` with no `ttl`. **The 1-hour TTL is deferred**: it needs
+  Anthropic's extended-cache-TTL beta header on the translate request, whose current
+  string must be verified live, plus a way to expose the TTL in the setting and the
+  UI. The directive's `TTL` field is reserved for it.
+- **(e) The flag is read through a gateway-side TTL cache.** The policy runs on every
+  Anthropic translate dispatch and the settings store read is an uncached full-table
+  read, so `anthropicPromptCachingEnabledCached` caches it for 5 s and
+  `handleSystemSettings` invalidates it on a PUT that carries the key: the same
+  trade-off and value as the vendor flags' cache. An unreadable flag reports off.
+- **(f) The native passthrough is left untouched, and the Activity display does not
+  change.** The passthrough keeps forwarding the client's own `cache_control`
+  verbatim (a gateway that rewrote it would defeat a client that places its markers
+  deliberately). The cache-read tile and grouped column are already visible by
+  default and now populate; the cache-write tile and column stay hidden by default.
+
+**Consequence:** turning the flag on can only lower the bill of a conversation whose
+prefix clears the minimum and is re-sent, at the price of a write premium on the
+first round; a prefix that clears the minimum but is **not** actually re-read inside
+the 5-minute TTL (a chat left idle, a changing prefix) pays that premium for nothing.
+**Prefix stability becomes a correctness requirement of the render**: the system
+text, the tool list and order and every earlier turn must be byte-identical from
+round to round, or cache reads silently stop landing; this is pinned by a test
+(`TestAnthropicCachedPrefixIsStableAcrossTurns`) and any later change to the
+Anthropic request builder must keep it. The token estimate is a deliberately cheap
+`chars / 4` that skips tool parameter schemas, so it errs low: a request just over
+the minimum may go uncached, which is today's behavior and never a regression. The
+placement assumes the subscription path's Claude-Code masquerade block stays first;
+its text is left untouched and the marker goes on the last block (with no caller
+system text that is the Claude-Code block itself). Because an Anthropic
+target exists only through a vendor account, the setting is inert in a deployment
+with vendor accounts off.
+
+**Rejected:** always-on caching with no flag (a prefix below the minimum is a free
+no-op, but an unreused prefix over it costs the write premium, and the feature rides
+on the experimental vendor path); a flag alone with no reuse test (it would mark every
+large one-shot); placing the policy inside the provider (it would need the system-settings
+flag, which the provider has no access to, and would mix a cost-policy decision into
+what is otherwise a pure renderer); a per-request or per-token opt-in knob (more surface
+than the problem needs while the feature is experimental); reading the flag uncached
+(one extra database round-trip on the hot path of every Anthropic dispatch); marking
+the passthrough too (the client already controls its own breakpoints); shipping the
+1-hour TTL in v1 (needs the extended-TTL beta header, which has to be verified live
+first); intermediate breakpoints for very long single turns (deferred until it is
+shown to matter).
+→ [External Vendor Accounts, Translate prompt caching](cross-cutting/external-vendor-accounts.md#translate-prompt-caching),
+[API Surface](reference/api-surface.md#4-system-endpoints-apisystem),
+[Configuration & Environment Variables](reference/config-env.md#anthropic-prompt-caching-system-setting-no-env-var-form).

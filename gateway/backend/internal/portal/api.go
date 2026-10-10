@@ -29,6 +29,7 @@ type API interface {
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
 	AllowedServerIDs(context.Context, auth.Token, []string) (map[string]bool, error)
+	AnthropicPromptCachingEnabled(context.Context) bool
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error

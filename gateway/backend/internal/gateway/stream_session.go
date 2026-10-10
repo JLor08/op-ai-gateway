@@ -132,6 +132,9 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	if target.ProviderModel != "" {
 		providerReq.Model = target.ProviderModel
 	}
+	// Direct Anthropic prompt caching when the flag is on and the request is
+	// eligible (the upstream copy only; req stays the client-facing request).
+	s.applyAnthropicCachePolicy(r.Context(), target, &providerReq)
 
 	idle := s.streamIdleTimeout // 0 = disabled (unbounded; only client disconnect ends the stream)
 	ctx, cancel := context.WithCancel(r.Context())

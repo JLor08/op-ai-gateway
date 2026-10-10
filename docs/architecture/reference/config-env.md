@@ -170,6 +170,19 @@ and, for what discovery does with the version,
 The subscription path additionally requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY`
 (above) on a disk-backed store.
 
+### Anthropic prompt caching (system setting, no env-var form)
+
+One further system setting, held in `system_settings` and edited in the portal's
+System settings (no `OP_AI_GATEWAY_*` env var or config-file key), governs prompt
+caching on the **translate** path to an Anthropic vendor account:
+
+| System setting | Values | Default | Effect |
+|---|---|---|---|
+| `anthropic_prompt_caching_enabled` | `bool` | **off** (experimental) | When on, the gateway directs the Anthropic translate request builder to place `cache_control` breakpoints (the last system block and the last content block of the latest turn; 5-minute ephemeral TTL only) on a request that is likely to be reused **and** whose estimated prefix reaches the model's cacheable minimum. When off, nothing is placed and the request renders exactly as before. The native `/v1/messages` passthrough is unaffected either way (it forwards the client's own `cache_control`). An absent, blank or unparseable value reads as off. It has **no effect unless the vendor-accounts module is enabled** (`vendor_accounts_enabled`): Anthropic translate targets exist only through vendor accounts. The gateway reads it through a 5 s cache that a settings PUT invalidates, so a toggle applies on the next request. |
+
+See [External Vendor Accounts, Translate prompt caching](../cross-cutting/external-vendor-accounts.md#translate-prompt-caching)
+and [ADR-051](../09-architecture-decisions.md#adr-051--anthropic-translate-prompt-caching-is-flag-gated-decided-at-the-gateway-by-a-hybrid-auto-switch-and-placed-by-the-provider).
+
 ## Agent (`OP_AGENT_*`)
 
 Every row below also has a matching CLI flag (kebab-case, e.g. `-gateway-url`) and JSON config-file key (snake_case, e.g. `gateway_url`), all with the same precedence: flag > env > file > default. The exceptions are marked **no flag form** in the Type column and resolve env > file > default only; passing a flag the agent does not register is a startup error, so the marking is load-bearing rather than editorial, and `scripts/check-docs.sh` checks it against the flags `server-agent` actually registers — in both directions. One exception runs the other way: `OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key**, necessarily — it is what names the file to read.

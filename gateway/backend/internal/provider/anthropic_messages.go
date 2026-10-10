@@ -360,6 +360,23 @@ type anthropicBlock struct {
 	Input     json.RawMessage       `json:"input,omitempty"`
 	ToolUseID string                `json:"tool_use_id,omitempty"`
 	Content   string                `json:"content,omitempty"`
+	// CacheControl marks this block as a prompt-cache breakpoint. Set only on the
+	// last block of the last turn, and only when the request carries an enabled
+	// PromptCacheDirective; nil (omitted) otherwise.
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicCacheControl is the Messages `cache_control` breakpoint marker.
+type anthropicCacheControl struct {
+	Type string `json:"type"`          // always "ephemeral"
+	TTL  string `json:"ttl,omitempty"` // reserved for "1h"; never set in v1
+}
+
+// ephemeralCacheControl returns the breakpoint marker for a cache directive. v1
+// supports the 5-minute ephemeral default only, so the directive's TTL is not
+// emitted (a `ttl` field is left unset); "1h" is reserved for a later change.
+func ephemeralCacheControl(_ string) *anthropicCacheControl {
+	return &anthropicCacheControl{Type: "ephemeral"}
 }
 
 type anthropicImageSource struct {
@@ -386,6 +403,21 @@ func anthropicRequestBody(target routing.Target, req inference.Request, stream b
 		Stream:    stream,
 		System:    anthropicSystemField(system, target.Masquerade),
 		Messages:  messages,
+	}
+	// Prompt caching: only when the gateway directed it. The two breakpoints are the
+	// last system block and the last turn's last content block, which together
+	// cover the stable prefix (system + prior turns) and the growing conversation
+	// tail. With no directive (or Enabled=false) nothing below runs and the render
+	// is byte-identical to the non-caching one.
+	if req.PromptCache != nil && req.PromptCache.Enabled {
+		cc := ephemeralCacheControl(req.PromptCache.TTL)
+		body.System = anthropicSystemFieldCached(system, target.Masquerade, cc)
+		if n := len(body.Messages); n > 0 {
+			m := &body.Messages[n-1]
+			if c := len(m.Content); c > 0 {
+				m.Content[c-1].CacheControl = cc
+			}
+		}
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = anthropicDefaultMaxTokens
@@ -417,8 +449,9 @@ func anthropicRequestBody(target routing.Target, req inference.Request, stream b
 // form used for the Claude-Code masquerade (the API accepts `system` as either a
 // plain string or an array of typed text blocks).
 type anthropicSystemBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // anthropicSystemField builds the Messages `system` field from the joined system
@@ -442,6 +475,27 @@ func anthropicSystemField(system, masquerade string) any {
 		return nil
 	}
 	return system
+}
+
+// anthropicSystemFieldCached renders the system field as a block array with
+// cache_control on the LAST block. For the masquerade the array already exists
+// (first block = claudeCodeSystemPrompt, left untouched); for the plain path it
+// wraps the joined string as one block. Returns nil when there is no system text
+// and no masquerade (no block to mark — the caller still marks the last turn).
+func anthropicSystemFieldCached(system, masquerade string, cc *anthropicCacheControl) any {
+	field := anthropicSystemField(system, masquerade) // reuse the non-caching logic
+	switch v := field.(type) {
+	case []anthropicSystemBlock:
+		if len(v) == 0 {
+			return nil // never emit "system":[]
+		}
+		v[len(v)-1].CacheControl = cc
+		return v
+	case string:
+		return []anthropicSystemBlock{{Type: "text", Text: v, CacheControl: cc}}
+	default: // nil: empty system, no masquerade
+		return field
+	}
 }
 
 // anthropicMessages splits the neutral messages into Anthropic's top-level system

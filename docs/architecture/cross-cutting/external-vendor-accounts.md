@@ -411,7 +411,8 @@ it, both through the **native Anthropic Messages client**
   parses itself rather than importing `internal/compat` (an architecture-test
   boundary). This serves chat completions and every `openai` flavor to any
   Anthropic account, api-key or subscription (a subscription's rendered request
-  carries the masquerade block).
+  carries the masquerade block). Prompt caching on this path is opt-in and gated
+  by its own system setting (*Translate prompt caching*, below).
 - **Native passthrough, api-key and subscription.** The client also implements the
   native-proxy interface (`ProxyNative`), and the resolver selects it for exactly
   one case: an inbound `anthropic_messages` request to an Anthropic account,
@@ -616,6 +617,124 @@ sends the exact Claude-Code block as `system[0]`. If a client version puts some
 other block ahead of its own Claude-Code block, the gateway cannot tell and
 **prepends a second copy** of the block, so Anthropic would see the Claude-Code
 line twice; whether it objects is likewise unverified.
+
+#### Translate prompt caching
+
+Anthropic caches a prompt prefix only where the request marks it with a
+`cache_control` breakpoint. The **native passthrough** relays the client's own
+`cache_control` untouched (above), so a client that already marks its prompts, such
+as Claude Code, caches without any help from the gateway. The **translate** path
+renders the request itself from the neutral model and used to emit no breakpoint at
+all, so every translated call (an OpenAI-dialect client, the portal chat) paid full
+price for the same system prompt, tool list and earlier turns on every round. The
+translate path can now place the breakpoints itself, behind the
+**`anthropic_prompt_caching_enabled`** system setting: a bool, **off by default**,
+**experimental**, edited as the "Anthropic prompt caching" toggle (de: "Anthropic
+Prompt-Caching") on the System settings page. The decision and its rejected
+alternatives are [ADR-051](../09-architecture-decisions.md#adr-051--anthropic-translate-prompt-caching-is-flag-gated-decided-at-the-gateway-by-a-hybrid-auto-switch-and-placed-by-the-provider).
+
+**The decision is made at the gateway, the placement at the provider.**
+`Server.applyAnthropicCachePolicy` (`internal/gateway/anthropic_cache_policy.go`) is
+called from both dispatch hooks, the non-streaming `complete` and the streaming
+`beginStream`, after the target's `ProviderModel` is applied. It writes the verdict
+onto the **upstream** copy of the request only (the client-facing request that is
+echoed back and recorded in usage is never touched) as
+`inference.Request.PromptCache`, a `*PromptCacheDirective{Enabled, TTL}` tagged
+`json:"-"`: internal, never parsed from or serialized to a client body. The Anthropic
+client's `anthropicRequestBody` only **honors** the directive and holds no policy of
+its own. A request with no directive (or `Enabled=false`) renders byte-identically
+to one built before this feature.
+
+**The hybrid auto-switch.** The directive is set only when **all four** hold, so
+caching turns on exactly where the prefix is both big enough to be cached and likely
+to be re-sent:
+
+| # | Condition | Why |
+|---|---|---|
+| 1 | The target is an **Anthropic translate** target: `routing.ProviderVendorAnthropic`, which covers **both** the api-key and the subscription account (the subscription differs only in `Subscription`/`Masquerade`, which the builder already handles). | Only this path renders the body from the neutral request, so only it can carry a directive. A native `/v1/messages` passthrough never reaches the dispatch hooks. |
+| 2 | The conversation is **likely to be reused**: it already carries an **assistant turn** (at least the second round of an exchange), **or** it is a **portal-chat session** (`SessionSource == "chat"`, whose next message re-sends this one). | A cache write is billed at a premium over plain input, so a prefix nothing re-reads costs more cached than not. A large **one-shot** is therefore never cached. |
+| 3 | The **`anthropic_prompt_caching_enabled`** flag is on. | The master switch. |
+| 4 | The **estimated prefix** reaches the model's cacheable minimum. | Below it Anthropic ignores `cache_control` for free, so marking such a request gains nothing. |
+
+The cheap structural checks (1, 2) run first, then the flag, and the O(prompt)
+estimate last, so a non-Anthropic or one-shot request pays almost nothing.
+
+- **The flag read is cached at the gateway.** The system-settings store read is an
+  uncached full-table `SELECT` and the policy runs on every Anthropic translate
+  dispatch, so it goes through `anthropicPromptCachingEnabledCached`: a **5 s TTL**
+  cache (`anthropicPromptCachingFlagTTL`) that `handleSystemSettings`
+  **invalidates on a PUT that carries the key**, so a portal toggle applies on the
+  next request and the TTL only bounds an out-of-band change (a direct database
+  edit). The same trade-off, and the same value, as the vendor flags' cache (§7). A
+  gateway with no portal, or an unreadable setting, reports **off**: the feature is
+  opt-in, so it fails closed. (`portal.Service.AnthropicPromptCachingEnabled` itself
+  reads the store on every call; the hot path does not use it directly.)
+- **The model minimum** (`anthropicCacheMinTokens`, matched on the upstream model
+  id): **4096** tokens for the Opus 4.6 / Opus 4.5 / Haiku 4.5 families, **2048** for
+  Opus 4.7, **512** for the Opus 5 / Sonnet 5.5 / Haiku 5.5 / Fable 5 families, and
+  **1024** for everything else, including an **unknown** model (the conservative
+  default).
+- **The estimate** (`estPrefixTokens`) is a cheap `chars / 4` over the message text
+  parts, the tool-call names and arguments, and the tool names and descriptions. It
+  deliberately does **not** measure tool parameter schemas (that would need a
+  marshal per request), so it errs **low, never high**; a low estimate merely skips
+  the markers, which is today's behavior.
+
+**Placement** (`anthropicRequestBody`, `internal/provider/anthropic_messages.go`).
+With an enabled directive the builder places **at most two** breakpoints:
+
+1. **The last system block.** `system` is rendered as a **block array**
+   (`anthropicSystemFieldCached`) with `cache_control` on its last block. On the
+   plain path the joined system/developer text becomes one text block; for the
+   subscription masquerade the array already exists, its first block (the
+   Claude-Code line) is left untouched and the **last** block carries the marker
+   (when there is no caller system text, that single Claude-Code block is the last
+   block and carries the marker; its text is unchanged).
+   Anthropic's cache covers `tools`, then `system`, then `messages`, in that order,
+   so this one marker caches **the tool list and the system prompt**, the stable
+   prefix. A request with no system text and no masquerade has no system block, and
+   only the turn marker is placed.
+2. **The last content block of the latest turn** (the final message after
+   consecutive same-role turns are merged). It caches the whole conversation up to
+   it, so the next round, which re-sends that conversation and appends a turn, reads
+   everything before its new turn from the cache. The marker moves forward each
+   round.
+
+The marker is `{"type":"ephemeral"}`: the **5-minute** TTL **only** in v1. The
+directive's `TTL` field exists and is reserved for `"1h"`, but nothing emits a
+`ttl` today; the 1-hour TTL needs Anthropic's extended-cache-TTL beta header on the
+translate request and is a deferred follow-up (ADR-051).
+
+**Prefix stability is a correctness requirement.** A cache read lands only when the
+prefix is **byte-identical** from one round to the next: any change ahead of a
+breakpoint (the system text, the tool order or a tool's schema, an earlier turn)
+invalidates everything after it, and the request then pays the write premium again
+for nothing. The render is therefore deterministic (struct-ordered fields, tool
+schemas marshalled from maps in sorted key order, no per-request value such as a
+timestamp or id ahead of a marker), and
+`TestAnthropicCachedPrefixIsStableAcrossTurns` pins it: the same request renders to
+the same bytes repeatedly, and the `system` and `tools` fields and the leading
+messages of a longer follow-up are identical to the earlier round's, for both the
+api-key and the masquerade target. One known limit: Anthropic looks back a bounded
+number of content blocks from a breakpoint for an earlier cache entry, so a **single
+turn that adds a long run of blocks** can fall outside that window and miss the
+previous write; extra intermediate breakpoints for that case are a deferred
+follow-up.
+
+**Observability, and no Activity change.** The Anthropic client already parses
+`cache_read_input_tokens` and `cache_creation_input_tokens` from the response usage,
+and the gateway stores them as `usage_events.cached_tokens` (read) and
+`cache_write_tokens` (write), disjoint from the fresh `input_tokens`
+([Telemetry](telemetry-usage-observability.md)). Turning the flag on therefore
+needs no display work: the **cache-read** stat tile and the grouped-view column are
+already visible by default and now simply populate, while the **cache-write** tile
+and column stay hidden by default (a manual drill-down in the column and tile
+pickers; the per-request table's cache columns are likewise opt-in there).
+
+**Scope.** Translate only. The native passthrough is untouched, as above. The
+setting has no effect on an OpenAI account or on a self-hosted route, and because an
+Anthropic target exists only through a vendor account, it matters only in a
+deployment that has the vendor-accounts module on (§7).
 
 ### 4.2 OpenAI
 
@@ -1333,6 +1452,14 @@ NetBird/certificates `/enabled` endpoints. The exact-path route wins over the
 The same master flag gates the **model-listing owner overlay** and the dashboard
 rows that carry an account's models (§6.7).
 
+A fourth system setting, `anthropic_prompt_caching_enabled` (bool, **off**,
+experimental), is not part of the vendor-account policy but applies to its Anthropic
+targets: it lets the translate path place prompt-cache breakpoints. Like the first
+two it is read on the hot path through a TTL cache that is invalidated on a PUT
+that carries the key, but through its **own** gateway-side cache
+(`anthropicPromptCachingEnabledCached`, 5 s), separate from the resolver's
+vendor-settings cache (see *Translate prompt caching* in §4.1).
+
 ## 8. Owner-scope RBAC
 
 The HTTP handlers gate on the standard web scope (`gateway:use`), then per-object
@@ -1616,3 +1743,6 @@ enabled vendor accounts is affected.
   — the first-class-entity and experimental-subscription decisions.
 - [ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)
   — the per-token opt-in, the shared prefix helper and the collision policy.
+- [ADR-051](../09-architecture-decisions.md#adr-051--anthropic-translate-prompt-caching-is-flag-gated-decided-at-the-gateway-by-a-hybrid-auto-switch-and-placed-by-the-provider)
+  — translate prompt caching: the flag, the hybrid auto-switch and where the
+  breakpoints go.

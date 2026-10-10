@@ -1564,6 +1564,13 @@ paths:
         '200': { description: Asset bytes }
         '404': { $ref: '#/components/responses/NotFound' }
   /api/system/settings:
+    description: >
+      The request and response bodies are opaque JSON here; see api-surface.md.
+      They include the boolean flag anthropic_prompt_caching_enabled (default
+      false, experimental): when true, the gateway directs the Anthropic
+      translate request builder to place prompt-cache breakpoints on eligible
+      requests (native /v1/messages passthrough is unaffected). On the PUT an
+      omitted or null value keeps the stored one.
     get:
       tags: [system]
       summary: System-wide settings (SMTP, NetBird, certificate gates, currency, …)

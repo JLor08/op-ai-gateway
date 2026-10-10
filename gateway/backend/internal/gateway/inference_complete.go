@@ -55,6 +55,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	if target.ProviderModel != "" {
 		providerReq.Model = target.ProviderModel
 	}
+	// Direct Anthropic prompt caching when the flag is on and the request is
+	// eligible. Only the upstream copy is touched; the client-facing req (echoed in
+	// the response and recorded in usage) is unchanged.
+	s.applyAnthropicCachePolicy(r.Context(), target, &providerReq)
 	// Thread a capture sink so the provider records the upstream response headers.
 	// When capturing, it keeps the full translated request/response (bounded by
 	// captureMaxBytes). For a vendor-account target that is NOT capturing, a

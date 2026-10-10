@@ -545,6 +545,13 @@ cache_write_tokens     = cache WRITE/creation tokens (0 for OpenAI/Responses)
 input + cached + write + output == total_tokens
 ```
 
+For an Anthropic translate call these two buckets are non-zero only when the request
+carried a prompt-cache breakpoint, which the gateway places only behind the
+`anthropic_prompt_caching_enabled` system setting
+([External Vendor Accounts, Translate prompt caching](external-vendor-accounts.md#translate-prompt-caching));
+a native passthrough reports whatever the client's own `cache_control` produced.
+The Activity cache-read tile is visible by default and the cache-write tile is not.
+
 **Cross-protocol session-id signals** (`session_extract.go`): the gateway derives a
 per-request `SessionID`/`SessionSource`/`AgentID` from the endpoint-appropriate
 natural signal, in priority order — an explicit `X-OP-AI-Gateway-Session-ID`

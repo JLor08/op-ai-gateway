@@ -2443,3 +2443,117 @@ func TestUpdateSystemSettingsRejectsUnknownCertPublicIssuerMode(t *testing.T) {
 		t.Fatalf("clearing to empty (follow global) must be legal, got %v", err)
 	}
 }
+
+func TestAnthropicPromptCachingEnabledHelper(t *testing.T) {
+	cases := []struct {
+		name string
+		in   map[string]string
+		want bool
+	}{
+		{"nil -> off", nil, false},
+		{"absent -> off", map[string]string{}, false},
+		{"blank -> off", map[string]string{anthropicPromptCachingEnabledKey: ""}, false},
+		{"unparseable -> off", map[string]string{anthropicPromptCachingEnabledKey: "maybe"}, false},
+		{"explicit false", map[string]string{anthropicPromptCachingEnabledKey: "false"}, false},
+		{"explicit true", map[string]string{anthropicPromptCachingEnabledKey: "true"}, true},
+		{"padded true", map[string]string{anthropicPromptCachingEnabledKey: " true "}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AnthropicPromptCachingEnabled(tc.in); got != tc.want {
+				t.Fatalf("AnthropicPromptCachingEnabled(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The anthropic_prompt_caching_enabled flag is opt-in (off by default), both on
+// the accessor the gateway reads and on the settings view the portal shows; it
+// round-trips through UpdateSystemSettings into the store, the accessor and the
+// view, and turning it back off persists an explicit "false".
+func TestAnthropicPromptCachingSetting(t *testing.T) {
+	ctx := context.Background()
+	settings := NewMemorySystemSettings()
+	svc := NewService(ServiceDeps{SystemSettings: settings, Clock: fixedClock()})
+
+	if svc.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("AnthropicPromptCachingEnabled default = true, want false (opt-in)")
+	}
+	if view := svc.SystemSettingsView(ctx); view.AnthropicPromptCachingEnabled {
+		t.Fatal("view default AnthropicPromptCachingEnabled = true, want false")
+	}
+
+	on := true
+	got, err := svc.UpdateSystemSettings(ctx, systemToken(), UpdateSystemSettingsRequest{AnthropicPromptCachingEnabled: &on})
+	if err != nil {
+		t.Fatalf("UpdateSystemSettings(on): %v", err)
+	}
+	if !got.AnthropicPromptCachingEnabled {
+		t.Fatal("returned DTO AnthropicPromptCachingEnabled = false after enabling")
+	}
+	values, err := settings.SystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("SystemSettings: %v", err)
+	}
+	if values[anthropicPromptCachingEnabledKey] != "true" {
+		t.Fatalf("stored anthropic_prompt_caching_enabled = %q, want %q", values[anthropicPromptCachingEnabledKey], "true")
+	}
+	if !svc.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("AnthropicPromptCachingEnabled = false after enabling")
+	}
+	if view := svc.SystemSettingsView(ctx); !view.AnthropicPromptCachingEnabled {
+		t.Fatal("view AnthropicPromptCachingEnabled = false after enabling")
+	}
+
+	// A request that omits the field keeps the stored value.
+	if _, err := svc.UpdateSystemSettings(ctx, systemToken(), UpdateSystemSettingsRequest{Theme: strPtr("default")}); err != nil {
+		t.Fatalf("UpdateSystemSettings(omitted): %v", err)
+	}
+	if !svc.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("AnthropicPromptCachingEnabled = false after an omitted field, want the stored true")
+	}
+
+	off := false
+	if _, err := svc.UpdateSystemSettings(ctx, systemToken(), UpdateSystemSettingsRequest{AnthropicPromptCachingEnabled: &off}); err != nil {
+		t.Fatalf("UpdateSystemSettings(off): %v", err)
+	}
+	if svc.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("AnthropicPromptCachingEnabled = true after turning it off")
+	}
+	values, err = settings.SystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("SystemSettings: %v", err)
+	}
+	if values[anthropicPromptCachingEnabledKey] != "false" {
+		t.Fatalf("stored anthropic_prompt_caching_enabled = %q, want %q", values[anthropicPromptCachingEnabledKey], "false")
+	}
+}
+
+// A service with no settings store, or one whose reads fail, keeps the flag OFF
+// (an unreadable opt-in flag fails closed).
+func TestAnthropicPromptCachingNilStoreAndReadFailure(t *testing.T) {
+	ctx := context.Background()
+	nilStore := NewService(ServiceDeps{Clock: fixedClock()})
+	if nilStore.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("nil store: AnthropicPromptCachingEnabled = true, want false")
+	}
+	if view := nilStore.SystemSettingsView(ctx); view.AnthropicPromptCachingEnabled {
+		t.Fatal("nil store view: AnthropicPromptCachingEnabled = true, want false")
+	}
+	failing := NewService(ServiceDeps{SystemSettings: failingSettingsReadStore{NewMemorySystemSettings()}, Clock: fixedClock()})
+	if failing.AnthropicPromptCachingEnabled(ctx) {
+		t.Fatal("read failure: AnthropicPromptCachingEnabled = true, want false (fail closed)")
+	}
+}
+
+func TestUpdateSystemSettingsAnthropicPromptCachingRequiresSystemScope(t *testing.T) {
+	svc := NewService(ServiceDeps{SystemSettings: NewMemorySystemSettings(), Clock: fixedClock()})
+	on := true
+	_, err := svc.UpdateSystemSettings(context.Background(), adminToken(), UpdateSystemSettingsRequest{AnthropicPromptCachingEnabled: &on})
+	if !errors.Is(err, ErrPrincipalForbidden) {
+		t.Fatalf("UpdateSystemSettings(admin) err = %v, want ErrPrincipalForbidden", err)
+	}
+	if svc.AnthropicPromptCachingEnabled(context.Background()) {
+		t.Fatal("a forbidden update must not turn the flag on")
+	}
+}
