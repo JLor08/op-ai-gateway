@@ -84,6 +84,9 @@ const (
 	visionProbeModeKey             = "vision_probe_mode"
 	routeAffinitySessionModeKey    = "route_affinity_session_mode"
 	resourceProvisioningEnforceKey = "resource_provisioning_enforce"
+	// anthropicPromptCachingEnabledKey is the master flag for Anthropic prompt
+	// caching on the translate path (off by default).
+	anthropicPromptCachingEnabledKey = "anthropic_prompt_caching_enabled"
 )
 
 const (
@@ -262,6 +265,38 @@ func CaptureOverride(values map[string]string) bool {
 		return false
 	}
 	return v
+}
+
+// AnthropicPromptCachingEnabled interprets the persisted
+// anthropic_prompt_caching_enabled master flag: when on, the Anthropic translate
+// path places cache_control breakpoints on eligible requests. Defaults to false
+// (opt-in) when absent, blank, or unparseable.
+func AnthropicPromptCachingEnabled(values map[string]string) bool {
+	raw, ok := values[anthropicPromptCachingEnabledKey]
+	if !ok {
+		return false
+	}
+	v, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return v
+}
+
+// AnthropicPromptCachingEnabled reports whether the anthropic_prompt_caching_enabled
+// master flag is on (off by default). It is read from the settings store on every
+// call (the flag is rare to flip and cheap to read), so a toggle takes effect on
+// the very next request. A service with no settings store, or a store that cannot
+// be read, reports false: the feature is opt-in, so an unreadable flag fails closed.
+func (s *Service) AnthropicPromptCachingEnabled(ctx context.Context) bool {
+	if s.settings == nil {
+		return false
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		return false
+	}
+	return AnthropicPromptCachingEnabled(values)
 }
 
 // HealthCheckIntervalSeconds interprets the persisted
@@ -902,6 +937,10 @@ type SystemSettingsDTO struct {
 	// portal hides the menu item and every vendor-account call is refused with
 	// 409 vendor_accounts.module_disabled.
 	VendorAccountsEnabled bool `json:"vendor_accounts_enabled"`
+	// AnthropicPromptCachingEnabled is the anthropic_prompt_caching_enabled
+	// MASTER flag for prompt caching on the Anthropic translate path; default
+	// false (opt-in). While off no cache_control breakpoints are placed.
+	AnthropicPromptCachingEnabled bool `json:"anthropic_prompt_caching_enabled"`
 	// VendorAccountRoutingMode is the routing precedence between a caller's own
 	// vendor accounts and the self-hosted/shared routes: "vendor_first"
 	// (default) or "fallback_only".
@@ -1077,6 +1116,8 @@ type UpdateSystemSettingsRequest struct {
 	// ErrVendorAccountRoutingModeInvalid.
 	VendorAccountsEnabled    *bool   `json:"vendor_accounts_enabled"`
 	VendorAccountRoutingMode *string `json:"vendor_account_routing_mode"`
+	// AnthropicPromptCachingEnabled: nil = keep the stored value.
+	AnthropicPromptCachingEnabled *bool `json:"anthropic_prompt_caching_enabled"`
 	// VendorOpenAICodexClientVersion: nil = keep the stored value. Trimmed; blank
 	// resets to the built-in default; otherwise it must be a version-shaped token
 	// (digit first, [0-9A-Za-z._+-], at most 64 characters) or the write is rejected
@@ -1613,6 +1654,7 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 	if s.settings != nil {
 		if values, err := s.settings.SystemSettings(ctx); err == nil {
 			dto.VendorAccountsEnabled = VendorAccountsEnabled(values)
+			dto.AnthropicPromptCachingEnabled = AnthropicPromptCachingEnabled(values)
 			dto.VendorAccountRoutingMode = VendorAccountRoutingMode(values)
 			dto.VendorOpenAICodexClientVersion = VendorOpenAICodexClientVersion(values)
 
@@ -1800,6 +1842,9 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 	}
 	if req.VendorAccountsEnabled != nil {
 		writes = append(writes, settingWrite{vendorAccountsEnabledKey, strconv.FormatBool(*req.VendorAccountsEnabled)})
+	}
+	if req.AnthropicPromptCachingEnabled != nil {
+		writes = append(writes, settingWrite{anthropicPromptCachingEnabledKey, strconv.FormatBool(*req.AnthropicPromptCachingEnabled)})
 	}
 	if req.VendorAccountRoutingMode != nil {
 		mode := strings.TrimSpace(*req.VendorAccountRoutingMode)

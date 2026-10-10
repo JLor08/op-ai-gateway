@@ -179,6 +179,12 @@ func (_d *APIWithTracing) AllowedServerIDs(ctx context.Context, t1 auth.Token, s
 	return _d.API.AllowedServerIDs(ctx, t1, sa1)
 }
 
+func (_d *APIWithTracing) AnthropicPromptCachingEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AnthropicPromptCachingEnabled")
+	defer span.End()
+	return _d.API.AnthropicPromptCachingEnabled(ctx)
+}
+
 func (_d *APIWithTracing) AuthorizeBenchmarkScope(ctx context.Context, t1 auth.Token, s1 string, s2 string) (a1 routing.AIServer, ba1 []BenchmarkTargetView, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeBenchmarkScope")
 	defer span.End()

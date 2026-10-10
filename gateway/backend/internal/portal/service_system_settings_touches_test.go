@@ -40,6 +40,7 @@ var nonReconcileFields = []string{
 	"VendorAccountsEnabled",
 	"VendorAccountRoutingMode",
 	"VendorOpenAICodexClientVersion",
+	"AnthropicPromptCachingEnabled",
 	"EnergyDefaultPricePerKwh",
 	"EnergyDefaultPue",
 	"EnergyDefaultWhPerToken",
