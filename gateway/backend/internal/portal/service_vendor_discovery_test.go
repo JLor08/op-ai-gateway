@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
@@ -59,6 +60,19 @@ type fakeUsageCall struct {
 	hasClient bool
 }
 
+// fakeCompatUsageCall is one recorded OpenAI-compatible usage-fetcher invocation:
+// the strategy the portal picked from the preset, the URL it composed and the opened
+// api key.
+type fakeCompatUsageCall struct {
+	usageVia string
+	usageURL string
+	apiKey   string
+	// timeout is the Timeout of the *http.Client the service handed over;
+	// hasClient is false when it handed over nil.
+	timeout   time.Duration
+	hasClient bool
+}
+
 // fakeUsageResult is what the fake usage fetcher answers.
 type fakeUsageResult struct {
 	usage  vendorauth.OpenAISubscriptionUsage
@@ -80,12 +94,18 @@ type fakeVendorDiscoverers struct {
 	calls      []fakeDiscoveryCall
 	usage      fakeUsageResult
 	usageCalls []fakeUsageCall
+	// compatUsage and compatUsageCalls are the api-key (OpenRouter / Kilo) usage
+	// seam's configured answer and its recorded calls.
+	compatUsage      fakeUsageResult
+	compatUsageCalls []fakeCompatUsageCall
 }
 
 func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
 	f := &fakeVendorDiscoverers{
 		results: map[string]fakeDiscoveryResult{},
 		usage:   fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
+
+		compatUsage: fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
 	}
 	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey} {
 		f.results[kind] = fakeDiscoveryResult{status: vendorauth.DiscoveryUnverifiable}
@@ -183,6 +203,56 @@ func (f *fakeVendorDiscoverers) requireNoUsageCalls(t *testing.T, why string) {
 	}
 }
 
+// okCompatUsage makes the api-key usage fetch answer usage as a verified read.
+func (f *fakeVendorDiscoverers) okCompatUsage(usage vendorauth.OpenAISubscriptionUsage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.compatUsage = fakeUsageResult{usage: usage, status: vendorauth.DiscoveryOK}
+}
+
+// failCompatUsage makes the api-key usage fetch answer Unverifiable together with
+// usage, a payload a correct caller ignores.
+func (f *fakeVendorDiscoverers) failCompatUsage(usage vendorauth.OpenAISubscriptionUsage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.compatUsage = fakeUsageResult{usage: usage, status: vendorauth.DiscoveryUnverifiable}
+}
+
+func (f *fakeVendorDiscoverers) recordCompatUsage(usageVia, usageURL, apiKey string, client *http.Client) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := fakeCompatUsageCall{usageVia: usageVia, usageURL: usageURL, apiKey: apiKey, hasClient: client != nil}
+	if client != nil {
+		call.timeout = client.Timeout
+	}
+	f.compatUsageCalls = append(f.compatUsageCalls, call)
+	return f.compatUsage.usage, f.compatUsage.status
+}
+
+func (f *fakeVendorDiscoverers) compatUsageRecorded() []fakeCompatUsageCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeCompatUsageCall(nil), f.compatUsageCalls...)
+}
+
+// onlyCompatUsageCall fails the test unless exactly one api-key usage fetch was
+// made, and returns it.
+func (f *fakeVendorDiscoverers) onlyCompatUsageCall(t *testing.T) fakeCompatUsageCall {
+	t.Helper()
+	calls := f.compatUsageRecorded()
+	if len(calls) != 1 {
+		t.Fatalf("compatible usage fetcher calls = %+v, want exactly one", calls)
+	}
+	return calls[0]
+}
+
+func (f *fakeVendorDiscoverers) requireNoCompatUsageCalls(t *testing.T, why string) {
+	t.Helper()
+	if calls := f.compatUsageRecorded(); len(calls) != 0 {
+		t.Fatalf("compatible usage fetcher calls = %+v, want none %s", calls, why)
+	}
+}
+
 func (f *fakeVendorDiscoverers) keyed(kind string) VendorCredentialDiscoverer {
 	return func(_ context.Context, client *http.Client, credential string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 		return f.record(kind, credential, "", "", client)
@@ -209,6 +279,9 @@ func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 		OpenAIUsage: func(_ context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
 			return f.recordUsage(accessToken, accountID, client)
 		},
+		OpenAICompatibleUsage: func(_ context.Context, client *http.Client, usageVia, usageURL, apiKey string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+			return f.recordCompatUsage(usageVia, usageURL, apiKey, client)
+		},
 	}
 }
 
@@ -218,12 +291,14 @@ func (f *fakeVendorDiscoverers) recorded() []fakeDiscoveryCall {
 	return append([]fakeDiscoveryCall(nil), f.calls...)
 }
 
-// reset forgets the recorded calls (a fixture that creates an account may have made
-// the create-time discovery's call already).
+// reset forgets the recorded model-discovery and api-key usage calls (a fixture that
+// creates an account may have made the create-time discovery's calls already, usage
+// pull included).
 func (f *fakeVendorDiscoverers) reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = nil
+	f.compatUsageCalls = nil
 }
 
 // onlyCall fails the test unless exactly one discoverer call was made, and returns it.
@@ -1624,8 +1699,8 @@ func TestUpdateVendorAccountModelPrefixAuthorizationAndValidationRunBeforeRelabe
 func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	d := defaults.vendorDiscovery.discoverers
-	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAICompatibleAPIKey == nil || d.OpenAIUsage == nil {
-		t.Fatalf("defaults = %+v, want every discoverer and the usage fetcher filled with the vendorauth function", d)
+	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAICompatibleAPIKey == nil || d.OpenAIUsage == nil || d.OpenAICompatibleUsage == nil {
+		t.Fatalf("defaults = %+v, want every discoverer and both usage fetchers filled with the vendorauth function", d)
 	}
 	if c := defaults.vendorDiscovery.client; c == nil || c.Timeout != 10*time.Second {
 		t.Fatalf("default discovery client = %+v, want a 10s timeout", c)
@@ -1639,8 +1714,8 @@ func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 		},
 	}})
 	id := injected.vendorDiscovery.discoverers
-	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAICompatibleAPIKey == nil || id.OpenAIUsage == nil {
-		t.Fatalf("injected = %+v, want the un-injected discoverers and usage fetcher defaulted", id)
+	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAICompatibleAPIKey == nil || id.OpenAIUsage == nil || id.OpenAICompatibleUsage == nil {
+		t.Fatalf("injected = %+v, want the un-injected discoverers and usage fetchers defaulted", id)
 	}
 	id.OpenAIAPIKey(context.Background(), nil, "k")
 	if !openAIKeyCalled {
@@ -1677,6 +1752,78 @@ func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 	ud.OpenAIUsage(context.Background(), nil, "t", "a")
 	if !usageCalled {
 		t.Fatal("the injected usage fetcher was replaced by the default")
+	}
+
+	var compatUsageCalled bool
+	compatUsageInjected := NewService(ServiceDeps{VendorDiscoverers: VendorModelDiscoverers{
+		OpenAICompatibleUsage: func(_ context.Context, _ *http.Client, usageVia, usageURL, _ string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+			compatUsageCalled = usageVia == "openrouter_key" && usageURL == "https://gw.example.test/v1/key"
+			return unknownUsage(), vendorauth.DiscoveryUnverifiable
+		},
+	}})
+	cud := compatUsageInjected.vendorDiscovery.discoverers
+	if cud.OpenAISubscription == nil || cud.OpenAIAPIKey == nil || cud.OpenAIUsage == nil {
+		t.Fatalf("injected compatible usage = %+v, want the other fetchers defaulted", cud)
+	}
+	cud.OpenAICompatibleUsage(context.Background(), nil, "openrouter_key", "https://gw.example.test/v1/key", "k")
+	if !compatUsageCalled {
+		t.Fatal("the injected compatible usage fetcher was replaced by the default")
+	}
+}
+
+// roundTripFunc is an http.RoundTripper answering from a function, so the default
+// compatible usage fetcher can be driven end to end without a network.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func jsonResponse(r *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    r,
+	}
+}
+
+// The ONE compatible-usage seam carries the strategy: the default fetcher picks the
+// vendorauth fetch by usageVia, and an unknown strategy is all-unknown Unverifiable
+// without any request.
+func TestDefaultCompatibleUsageFetcherDispatchesOnTheStrategy(t *testing.T) {
+	ctx := context.Background()
+	var requested []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requested = append(requested, r.URL.String())
+		if got := r.Header.Get("Authorization"); got != "Bearer "+vendorAccountTestKey {
+			t.Errorf("Authorization = %q, want the bearer key", got)
+		}
+		switch r.URL.Path {
+		case "/api/v1/key":
+			return jsonResponse(r, http.StatusOK, `{"data":{"limit":100,"limit_remaining":60}}`), nil
+		case "/api/profile/balance":
+			return jsonResponse(r, http.StatusOK, `{"balance":12.5}`), nil
+		}
+		return jsonResponse(r, http.StatusNotFound, `{}`), nil
+	})}
+
+	usage, status := defaultCompatibleUsageFetcher(ctx, client, "openrouter_key", "https://or.example.test/api/v1/key", vendorAccountTestKey)
+	if status != vendorauth.DiscoveryOK || usage.SpendLimit == "" || usage.CreditStatus != "has_credits" {
+		t.Fatalf("openrouter_key = %+v / %v, want the OpenRouter key-usage fetch (a capped key)", usage, status)
+	}
+	usage, status = defaultCompatibleUsageFetcher(ctx, client, "kilo_balance", "https://kilo.example.test/api/profile/balance", vendorAccountTestKey)
+	if status != vendorauth.DiscoveryOK || usage.CreditBalance == "" {
+		t.Fatalf("kilo_balance = %+v / %v, want the Kilo balance fetch", usage, status)
+	}
+	if len(requested) != 2 {
+		t.Fatalf("requests = %v, want one per known strategy", requested)
+	}
+
+	usage, status = defaultCompatibleUsageFetcher(ctx, client, "no_such_strategy", "https://x.example.test/u", vendorAccountTestKey)
+	if status != vendorauth.DiscoveryUnverifiable || !reflect.DeepEqual(usage, unknownUsage()) {
+		t.Fatalf("unknown strategy = %+v / %v, want all-unknown Unverifiable", usage, status)
+	}
+	if len(requested) != 2 {
+		t.Fatalf("requests = %v, an unknown strategy must not reach the network", requested)
 	}
 }
 

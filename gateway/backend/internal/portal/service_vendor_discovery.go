@@ -39,9 +39,10 @@ import (
 //     the connect. Creating an OpenAI-compatible account with its key does the
 //     same (its static seed is empty), with the same bound and the same fail-soft
 //     rule.
-//   - An OpenAI subscription's refresh also pulls the account's usage snapshot
-//     (refreshVendorUsage), best effort and after the models, with the same opened
-//     and renewed token set; it never changes the refresh's outcome.
+//   - An OpenAI subscription's or an OpenRouter/Kilo api-key account's refresh also
+//     pulls the account's usage snapshot (refreshVendorUsage), best effort and after
+//     the models, with the same opened and renewed token set (a subscription) or its
+//     own opened key (api key); it never changes the refresh's outcome.
 //   - A prefix change re-labels the existing rows (relabelVendorAccountModels)
 //     without asking the vendor again.
 //   - An access token already past its expiry is renewed through the injected
@@ -130,11 +131,34 @@ type VendorOpenAISubscriptionDiscoverer func(ctx context.Context, httpClient *ht
 // (vendorauth.FetchOpenAISubscriptionUsage has exactly this shape).
 type VendorOpenAIUsageFetcher func(ctx context.Context, httpClient *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus)
 
+// VendorOpenAICompatibleUsageFetcher is the api-key usage fetch of an
+// OpenAI-compatible provider that publishes a spend or balance figure (OpenRouter's
+// per-key limit, Kilo's balance). ONE seam carries the strategy so a single field
+// dispatches: usageVia is the preset's UsageVia ("openrouter_key" | "kilo_balance"),
+// usageURL the URL the portal composed from the preset and the account's base URL
+// (the vendorauth package knows no vendor roots), and apiKey the account's opened
+// key. defaultCompatibleUsageFetcher is the real one.
+type VendorOpenAICompatibleUsageFetcher func(ctx context.Context, httpClient *http.Client, usageVia, usageURL, apiKey string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus)
+
+// defaultCompatibleUsageFetcher dispatches on the preset's usage strategy to the
+// vendorauth fetch of that provider. A strategy it does not know answers an
+// all-unknown snapshot and DiscoveryUnverifiable without asking anything.
+func defaultCompatibleUsageFetcher(ctx context.Context, httpClient *http.Client, usageVia, usageURL, apiKey string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
+	switch usageVia {
+	case "openrouter_key":
+		return vendorauth.FetchOpenRouterKeyUsage(ctx, httpClient, usageURL, apiKey)
+	case "kilo_balance":
+		return vendorauth.FetchKiloBalanceUsage(ctx, httpClient, usageURL, apiKey)
+	default:
+		return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1}, vendorauth.DiscoveryUnverifiable
+	}
+}
+
 // VendorModelDiscoverers is the seam over the vendorauth fetchers a models refresh
-// runs: the five model-list fetchers and, riding along with the OpenAI
-// subscription's refresh, its usage fetch. Tests inject fakes so no service test
-// reaches a vendor over the network. A nil field means the real fetcher (see
-// ServiceDeps.VendorDiscoverers).
+// runs: the five model-list fetchers and the two usage fetches (the OpenAI
+// subscription's, which rides along with its refresh, and the OpenRouter/Kilo
+// api-key one). Tests inject fakes so no service test reaches a vendor over the
+// network. A nil field means the real fetcher (see ServiceDeps.VendorDiscoverers).
 type VendorModelDiscoverers struct {
 	OpenAISubscription    VendorOpenAISubscriptionDiscoverer
 	AnthropicSubscription VendorCredentialDiscoverer
@@ -146,6 +170,10 @@ type VendorModelDiscoverers struct {
 	// OpenAIUsage is the usage fetch refreshVendorUsage runs for an OpenAI
 	// subscription account after its models were refreshed.
 	OpenAIUsage VendorOpenAIUsageFetcher
+	// OpenAICompatibleUsage is the usage fetch of an OpenRouter / Kilo api-key
+	// account (the preset's UsageVia picks the vendorauth function), run by the
+	// dedicated usage refresh and by the models refresh's trailing pull.
+	OpenAICompatibleUsage VendorOpenAICompatibleUsageFetcher
 }
 
 // withDefaults returns d with every nil fetcher replaced by its vendorauth function.
@@ -167,6 +195,9 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	}
 	if d.OpenAIUsage == nil {
 		d.OpenAIUsage = vendorauth.FetchOpenAISubscriptionUsage
+	}
+	if d.OpenAICompatibleUsage == nil {
+		d.OpenAICompatibleUsage = defaultCompatibleUsageFetcher
 	}
 	return d
 }
@@ -230,11 +261,12 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher Vendo
 // over-long one is cut, and at most maxDiscoveredModels rows are stored. An OpenAI
 // api-key listing is narrowed to chat-capable models first (isChatCapableOpenAIModel).
 //
-// An OpenAI subscription account also gets its usage snapshot refreshed on the way
-// (refreshVendorUsage), with the very token set the model discovery opened and
-// renewed. That is purely additive and best effort: it never changes the result or
-// the error, never marks the account needs_reconnect, and any failure leaves the
-// stored snapshot as it was.
+// An OpenAI subscription account, and an OpenRouter/Kilo api-key account, also get
+// their usage snapshot refreshed on the way (refreshVendorUsage), with the very
+// token set the model discovery opened and renewed (a subscription) or the account's
+// own opened key (an api key). That is purely additive and best effort: it never
+// changes the result or the error, never marks the account needs_reconnect, and any
+// failure leaves the stored snapshot as it was.
 //
 // STRICTLY OWNER-ONLY, system scope included: it opens the owner's sealed
 // credential and sends it to the vendor from the gateway, so it is authorized like
@@ -464,11 +496,24 @@ func (s *Service) discoverSubscriptionModels(ctx context.Context, vendor string,
 }
 
 // refreshVendorUsage is the best-effort usage pull the models refresh runs after
-// its model write: fetchVendorUsage with its status discarded, so it returns
-// nothing and cannot change a refresh's outcome. ts is the account's current token
-// set, the one the model discovery opened and, if it was expired, renewed through
-// the gateway's locked refresher: this path never opens or renews a token itself.
+// its model write, with the status discarded so it returns nothing and cannot change
+// a refresh's outcome. It dispatches by auth type: an OpenRouter/Kilo api-key account
+// opens its own key and runs fetchCompatibleVendorUsage (ts, the zero value for an
+// api_key account, is unused); every other account runs fetchVendorUsage with ts, the
+// account's current token set, the one the model discovery opened and, if it was
+// expired, renewed through the gateway's locked refresher: this path never opens or
+// renews a token itself. A key that cannot be opened or is not set is simply skipped
+// (the models refresh already reported it).
 func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) {
+	if acc.AuthType == routing.VendorAuthAPIKey {
+		if !hasActiveVendorUsagePull(acc) {
+			return
+		}
+		if apiKey, note, err := s.currentUsageAPIKey(acc); err == nil && note == "" {
+			_ = s.fetchCompatibleVendorUsage(ctx, acc, apiKey)
+		}
+		return
+	}
 	_ = s.fetchVendorUsage(ctx, acc, ts)
 }
 
@@ -482,7 +527,8 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 //
 // It runs ONLY for an OpenAI subscription account that has an access token (an
 // api_key account and every Anthropic account are skipped, the fetcher is never
-// called) and is purely ADDITIVE and BEST EFFORT: it answers a status and never an
+// called; an OpenRouter/Kilo api-key account's pull is fetchCompatibleVendorUsage)
+// and is purely ADDITIVE and BEST EFFORT: it answers a status and never an
 // error. The status is VendorUsageRefreshOK when a snapshot was stored,
 // VendorUsageRefreshUnsupported when the gate above fails, and
 // VendorUsageRefreshUnverifiable for a fetch that was not OK (a 401 included: only
@@ -497,7 +543,7 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 // context), so nothing is recorded: a pull that did not happen must not make the
 // next lazy call answer "fresh" without a snapshot for the whole TTL.
 func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) string {
-	if !hasActiveVendorUsagePull(acc) || ts.AccessToken == "" {
+	if acc.AuthType != routing.VendorAuthSubscription || !hasActiveVendorUsagePull(acc) || ts.AccessToken == "" {
 		return VendorUsageRefreshUnsupported
 	}
 	usage, status := s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
@@ -508,8 +554,48 @@ func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccoun
 		slog.Debug("vendor account usage fetch was unverifiable; the stored usage is kept", "account", acc.ID)
 		return VendorUsageRefreshUnverifiable
 	}
-	snapshot := routing.VendorAccountUsage{
-		AccountID:       acc.ID,
+	return s.storeVendorUsageSnapshot(ctx, buildVendorUsageSnapshot(acc.ID, usage, s.clock().UTC()), true)
+}
+
+// fetchCompatibleVendorUsage pulls an OpenRouter/Kilo api-key account's usage
+// snapshot (OpenRouter's per-key spend limit, Kilo's credit balance) through the
+// compatible-usage seam and stores it AS FETCHED: these accounts' pull is their only
+// usage writer (the passive header scrape writes nothing for them), and a merge
+// cannot express "now absent" -- a cap the owner removed would keep its stale limit
+// and spend. apiKey is the account's opened key (the caller opened it, see
+// currentUsageAPIKey); the URL is composed from the provider preset's UsagePath and
+// the account's base URL, since the vendorauth package knows no vendor roots.
+//
+// It runs ONLY for an api_key account whose provider preset names a usage strategy
+// (the registry decides, see vendorUsagePreset) and has a key; anything else is
+// VendorUsageRefreshUnsupported and nothing is asked. Like fetchVendorUsage it is
+// fail-soft and answers a status, never an error: an answer that is not OK
+// (Kilo's balance endpoint is undocumented, so a miss there is expected), a failed
+// write or a snapshot that could not be stored is VendorUsageRefreshUnverifiable and
+// leaves the last good snapshot exactly as it was. The attempt is recorded for the
+// lazy TTL under the same rule: only when the context was still alive.
+func (s *Service) fetchCompatibleVendorUsage(ctx context.Context, acc routing.VendorAccount, apiKey string) string {
+	preset, ok := vendorUsagePreset(acc)
+	if !ok || apiKey == "" {
+		return VendorUsageRefreshUnsupported
+	}
+	usageURL := strings.TrimRight(acc.BaseURL, "/") + preset.UsagePath
+	usage, status := s.vendorDiscovery.discoverers.OpenAICompatibleUsage(ctx, s.vendorDiscovery.client, preset.UsageVia, usageURL, apiKey)
+	if ctx.Err() == nil {
+		s.vendorUsagePulls.record(acc.ID, s.clock())
+	}
+	if status != vendorauth.DiscoveryOK {
+		slog.Debug("vendor account usage fetch was unverifiable; the stored usage is kept", "account", acc.ID)
+		return VendorUsageRefreshUnverifiable
+	}
+	return s.storeVendorUsageSnapshot(ctx, buildVendorUsageSnapshot(acc.ID, usage, s.clock().UTC()), false)
+}
+
+// buildVendorUsageSnapshot is the stored snapshot of accountID for what a usage fetch
+// reported, stamped at (the field-for-field copy both usage pulls share).
+func buildVendorUsageSnapshot(accountID string, usage vendorauth.OpenAISubscriptionUsage, at time.Time) routing.VendorAccountUsage {
+	return routing.VendorAccountUsage{
+		AccountID:       accountID,
 		FiveHourPct:     usage.FiveHourPct,
 		FiveHourResetAt: usage.FiveHourResetAt,
 		WeeklyPct:       usage.WeeklyPct,
@@ -522,20 +608,31 @@ func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccoun
 		SpendUsedPct:    usage.SpendUsedPct,
 		SpendResetAt:    usage.SpendResetAt,
 		CreditStatus:    usage.CreditStatus,
-		UpdatedAt:       s.clock().UTC(),
+		UpdatedAt:       at,
 	}
-	// An account with no stored snapshot is written as fetched: merging with the
-	// zero value would turn every unknown percent (-1) into a fabricated 0.
-	existing, found, err := s.routes.VendorAccountUsageByID(ctx, acc.ID)
-	if err != nil {
-		slog.Debug("vendor account usage read for merge failed; the stored usage is kept", "account", acc.ID, "err", err)
-		return VendorUsageRefreshUnverifiable
-	}
-	if found {
-		snapshot = routing.MergeVendorAccountUsage(existing, snapshot)
+}
+
+// storeVendorUsageSnapshot writes snapshot for its account and answers the status of
+// the pull: VendorUsageRefreshOK once stored, VendorUsageRefreshUnverifiable (logged
+// at Debug with the account id, the stored snapshot untouched) when the stored one
+// cannot be read or the write fails. With merge, the snapshot is first merged over
+// the stored one (routing.MergeVendorAccountUsage: a field it does not know keeps
+// the passive scrape's value; an account with no stored snapshot is written as
+// fetched, because merging with the zero value would turn every unknown percent (-1)
+// into a fabricated 0). Without it, the snapshot replaces the stored one as it is.
+func (s *Service) storeVendorUsageSnapshot(ctx context.Context, snapshot routing.VendorAccountUsage, merge bool) string {
+	if merge {
+		existing, found, err := s.routes.VendorAccountUsageByID(ctx, snapshot.AccountID)
+		if err != nil {
+			slog.Debug("vendor account usage read for merge failed; the stored usage is kept", "account", snapshot.AccountID, "err", err)
+			return VendorUsageRefreshUnverifiable
+		}
+		if found {
+			snapshot = routing.MergeVendorAccountUsage(existing, snapshot)
+		}
 	}
 	if err := s.routes.UpsertVendorAccountUsage(ctx, snapshot); err != nil {
-		slog.Debug("vendor account usage write failed; the stored usage is kept", "account", acc.ID, "err", err)
+		slog.Debug("vendor account usage write failed; the stored usage is kept", "account", snapshot.AccountID, "err", err)
 		return VendorUsageRefreshUnverifiable
 	}
 	return VendorUsageRefreshOK

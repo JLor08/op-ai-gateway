@@ -149,10 +149,11 @@ func TestRefreshVendorAccountUsageRefusesWhileTheMasterFlagIsOff(t *testing.T) {
 	fake.requireNoUsageCalls(t, "while the module is off")
 }
 
-// Only an OpenAI SUBSCRIPTION has an active usage pull. Any other account (an api
-// key of either vendor, an Anthropic subscription) answers "unsupported": no token
-// is opened or renewed (a sealed credential that cannot be read is no error here),
-// no fetcher runs, and the stored snapshot, if any, is still answered.
+// Only an OpenAI SUBSCRIPTION (and an OpenRouter/Kilo api key, below) has an active
+// usage pull. The native api keys of either vendor and an Anthropic subscription
+// answer "unsupported": no token is opened or renewed (a sealed credential that
+// cannot be read is no error here), no fetcher runs, and the stored snapshot, if any,
+// is still answered.
 func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -197,6 +198,7 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 				t.Fatalf("usage = %+v, want none (nothing stored)", usage)
 			}
 			fake.requireNoUsageCalls(t, "for an account that is not an OpenAI subscription")
+			fake.requireNoCompatUsageCalls(t, "for an account whose preset names no usage strategy")
 			fake.requireNoCalls(t, "for a usage refresh")
 			if got := refresher.recorded(); len(got) != 0 {
 				t.Fatalf("refresher calls = %v, want no token opened or renewed", got)
@@ -806,4 +808,487 @@ func TestDeleteVendorAccountForgetsItsUsagePull(t *testing.T) {
 	if svc.vendorUsagePulls.within(acc.ID, discoveryTestNow, VendorUsageLazyTTL) {
 		t.Fatal("the deleted account's pull time is still tracked")
 	}
+}
+
+// --- api-key accounts: OpenRouter / Kilo ----------------------------------------------------
+//
+// An api-key account of a provider whose preset names a usage strategy (OpenRouter's
+// per-key limit, Kilo's balance) is pulled through the ONE compatible-usage seam: the
+// portal composes the URL from the preset, opens the stored key and upserts what the
+// vendor reported as it is (these accounts are the single usage writer, so there is
+// nothing to merge with). The subscription path above is unchanged.
+
+// openRouterCapped is a capped OpenRouter key: 40 of 100 USD spent.
+func openRouterCapped() vendorauth.OpenAISubscriptionUsage {
+	return vendorauth.OpenAISubscriptionUsage{
+		FiveHourPct: -1, WeeklyPct: -1, SpendUnit: "USD", SpendLimit: "100", SpendUsed: "40",
+		SpendRemaining: "60", SpendUsedPct: 40, CreditStatus: "has_credits",
+	}
+}
+
+// openRouterUnlimited is the same key after its cap was removed: no limit, no spend.
+func openRouterUnlimited() vendorauth.OpenAISubscriptionUsage {
+	return vendorauth.OpenAISubscriptionUsage{FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, CreditStatus: "unlimited"}
+}
+
+// usageAccount creates an api-key account of an OpenAI-compatible vendor on its
+// preset's default root, from a clean slate. Creating the account runs the
+// create-time discovery, whose best-effort usage pull (refreshVendorUsage) already
+// asks the usage seam and records a pull; so the seam answers nothing usable while
+// the account is created, and its calls and the recorded pull are forgotten
+// afterwards. A test configures the seam's answer AFTER calling this.
+func usageAccount(t *testing.T, svc *Service, fake *fakeVendorDiscoverers, vendor string) VendorAccountDTO {
+	t.Helper()
+	fake.failCompatUsage(unknownUsage())
+	acc := compatDiscoveryAccount(t, svc, fake, vendor, "", "p-")
+	svc.vendorUsagePulls.forget(acc.ID)
+	return acc
+}
+
+func TestHasActiveVendorUsagePull(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		vendor   string
+		authType string
+		want     bool
+	}{
+		{"openrouter api key", routing.VendorOpenRouter, routing.VendorAuthAPIKey, true},
+		{"kilo api key", routing.VendorKilo, routing.VendorAuthAPIKey, true},
+		{"openai subscription", routing.VendorOpenAI, routing.VendorAuthSubscription, true},
+		{"openai api key", routing.VendorOpenAI, routing.VendorAuthAPIKey, false},
+		{"anthropic api key", routing.VendorAnthropic, routing.VendorAuthAPIKey, false},
+		{"anthropic subscription", routing.VendorAnthropic, routing.VendorAuthSubscription, false},
+		{"xai api key", routing.VendorXAI, routing.VendorAuthAPIKey, false},
+		{"google api key", routing.VendorGoogle, routing.VendorAuthAPIKey, false},
+		{"custom openai-compatible api key", routing.VendorOpenAICompatible, routing.VendorAuthAPIKey, false},
+		{"openrouter subscription (not a real kind)", routing.VendorOpenRouter, routing.VendorAuthSubscription, false},
+		{"unknown vendor api key", "no-such-vendor", routing.VendorAuthAPIKey, false},
+		{"unknown auth type", routing.VendorOpenRouter, "no-such-auth", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasActiveVendorUsagePull(routing.VendorAccount{Vendor: tc.vendor, AuthType: tc.authType}); got != tc.want {
+				t.Fatalf("hasActiveVendorUsagePull(%s, %s) = %v, want %v", tc.vendor, tc.authType, got, tc.want)
+			}
+		})
+	}
+}
+
+// An OpenRouter / Kilo api-key account is pulled: the URL is composed from the
+// preset's default root and usage path, the stored key is opened and handed over with
+// the strategy and the bounded client, the snapshot is stored as fetched and
+// answered -- and neither the model discovery nor the ChatGPT usage fetch runs.
+func TestRefreshVendorAccountUsagePullsAPIKeyAccountsThroughThePresetStrategy(t *testing.T) {
+	for _, tc := range []struct {
+		name, vendor, wantVia, wantURL string
+	}{
+		{"openrouter", routing.VendorOpenRouter, "openrouter_key", "https://openrouter.ai/api/v1/key"},
+		{"kilo", routing.VendorKilo, "kilo_balance", "https://api.kilo.ai/api/profile/balance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			acc := usageAccount(t, svc, fake, tc.vendor)
+			fake.okCompatUsage(openRouterCapped())
+			seed := storedModels(t, routeStore, acc.ID)
+			ctx := context.Background()
+
+			usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL)
+			if err != nil {
+				t.Fatalf("RefreshVendorAccountUsage: %v", err)
+			}
+			if res.Status != VendorUsageRefreshOK || res.Detail == "" {
+				t.Fatalf("result = %+v, want ok with a detail", res)
+			}
+			call := fake.onlyCompatUsageCall(t)
+			if call.usageVia != tc.wantVia || call.usageURL != tc.wantURL || call.apiKey != vendorAccountTestKey || !call.hasClient || call.timeout != 10*time.Second {
+				t.Fatalf("compatible usage call = %+v, want via %q, URL %q, the opened key and the bounded 10s client", call, tc.wantVia, tc.wantURL)
+			}
+			fake.requireNoUsageCalls(t, "for an api-key account (the ChatGPT usage fetch is subscription-only)")
+			fake.requireNoCalls(t, "for a usage refresh (the model discovery must not run)")
+			if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, seed) {
+				t.Fatalf("model rows = %+v, want them untouched %+v", got, seed)
+			}
+			want := routing.VendorAccountUsage{
+				AccountID: acc.ID, FiveHourPct: -1, WeeklyPct: -1, SpendUnit: "USD", SpendLimit: "100",
+				SpendUsed: "40", SpendRemaining: "60", SpendUsedPct: 40, CreditStatus: "has_credits", UpdatedAt: discoveryTestNow,
+			}
+			if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+				t.Fatalf("stored usage = %+v (found %v), want %+v", got, found, want)
+			}
+			if usage == nil || usage.SpendLimit != "100" || usage.SpendUsedPct != 40 || usage.CreditStatus != "has_credits" || !usage.UpdatedAt.Equal(discoveryTestNow) {
+				t.Fatalf("answered usage = %+v, want the stored snapshot", usage)
+			}
+			requireNoToken(t, "usage", usage)
+			requireNoToken(t, "result", res)
+			if !usagePullRecorded(svc, acc.ID) {
+				t.Fatal("the api-key pull was not recorded for the lazy TTL")
+			}
+
+			// A second lazy call inside the 5-minute TTL is fresh: the vendor is not asked.
+			setUsageClock(svc, discoveryTestNow.Add(time.Minute))
+			usage, res, err = svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL)
+			if err != nil || res.Status != VendorUsageRefreshFresh {
+				t.Fatalf("second lazy call = %+v, err = %v, want fresh", res, err)
+			}
+			if usage == nil || usage.SpendLimit != "100" {
+				t.Fatalf("fresh usage = %+v, want the stored snapshot", usage)
+			}
+			fake.onlyCompatUsageCall(t)
+
+			// ?force (maxAge 0) bypasses the TTL.
+			if _, res, err = svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0); err != nil || res.Status != VendorUsageRefreshOK {
+				t.Fatalf("forced call = %+v, err = %v, want ok", res, err)
+			}
+			if n := len(fake.compatUsageRecorded()); n != 2 {
+				t.Fatalf("compatible usage fetcher calls = %d, want 2 after the forced call", n)
+			}
+		})
+	}
+}
+
+// An api-key account with no stored key cannot be asked: unverifiable, saying why,
+// and the fetcher is never called. (The strategy's own account kind: the check is
+// the account's, not the vendor's.)
+func TestRefreshVendorAccountUsageAPIKeyAccountWithoutAKeyIsUnverifiable(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+	fake.okCompatUsage(openRouterCapped())
+	row := accountRow(t, svc, acc)
+	row.APIKey = ""
+	if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
+		t.Fatalf("UpdateVendorAccount: %v", err)
+	}
+
+	usage, res, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, VendorUsageLazyTTL)
+	if err != nil {
+		t.Fatalf("RefreshVendorAccountUsage: %v", err)
+	}
+	if res.Status != VendorUsageRefreshUnverifiable || !strings.Contains(res.Detail, "no API key is set") {
+		t.Fatalf("result = %+v, want unverifiable saying no API key is set", res)
+	}
+	if usage != nil {
+		t.Fatalf("usage = %+v, want none (nothing stored)", usage)
+	}
+	fake.requireNoCompatUsageCalls(t, "without a key")
+	if usagePullRecorded(svc, acc.ID) {
+		t.Fatal("a refresh that never reached the vendor was recorded as a pull")
+	}
+	if _, found := storedUsage(t, routeStore, acc.ID); found {
+		t.Fatal("a usage snapshot was stored without a key")
+	}
+}
+
+// A stored key that cannot be opened is the documented 409 error of this endpoint,
+// exactly as for a subscription's token set; nothing is fetched.
+func TestRefreshVendorAccountUsageAPIKeyUnreadableCredentialIsAnError(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := usageAccount(t, svc, fake, routing.VendorKilo)
+	fake.okCompatUsage(openRouterCapped())
+	row := accountRow(t, svc, acc)
+	row.APIKey = "garbage-without-a-prefix"
+	if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
+		t.Fatalf("UpdateVendorAccount: %v", err)
+	}
+
+	usage, _, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, 0)
+	if !errors.Is(err, ErrVendorAccountCredentialUnreadable) {
+		t.Fatalf("err = %v, want ErrVendorAccountCredentialUnreadable", err)
+	}
+	if usage != nil {
+		t.Fatalf("usage = %+v, want none on an error", usage)
+	}
+	fake.requireNoCompatUsageCalls(t, "for an unreadable credential")
+}
+
+// Kilo's balance endpoint is undocumented: a miss (the fetcher answers Unverifiable)
+// is unverifiable, never a write -- the last good snapshot is kept and answered. The
+// vendor WAS asked, so the attempt counts toward the lazy TTL; a manual refresh asks again.
+func TestRefreshVendorAccountUsageAPIKeyUnverifiableKeepsTheStoredUsage(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := usageAccount(t, svc, fake, routing.VendorKilo)
+	fake.failCompatUsage(vendorauth.OpenAISubscriptionUsage{FiveHourPct: 99, WeeklyPct: 99, CreditBalance: "junk", SpendUsedPct: -1})
+	before := routing.VendorAccountUsage{
+		AccountID: acc.ID, FiveHourPct: -1, WeeklyPct: -1, CreditBalance: "7.50", SpendUsedPct: -1,
+		CreditStatus: "has_credits", UpdatedAt: discoveryTestNow.Add(-time.Hour),
+	}
+	seedUsage(t, routeStore, before)
+	ctx := context.Background()
+
+	usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL)
+	if err != nil || res.Status != VendorUsageRefreshUnverifiable || res.Detail == "" {
+		t.Fatalf("result = %+v, err = %v, want unverifiable with a detail", res, err)
+	}
+	if usage == nil || usage.CreditBalance != "7.50" {
+		t.Fatalf("usage = %+v, want the last good snapshot answered", usage)
+	}
+	if got, _ := storedUsage(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+		t.Fatalf("stored usage = %+v, want it untouched %+v", got, before)
+	}
+	fake.onlyCompatUsageCall(t)
+
+	if _, res, _ := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL); res.Status != VendorUsageRefreshFresh {
+		t.Fatalf("lazy call after a failed attempt = %+v, want fresh (the vendor is not hammered)", res)
+	}
+	fake.onlyCompatUsageCall(t)
+	if _, res, _ := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0); res.Status != VendorUsageRefreshUnverifiable {
+		t.Fatalf("forced call = %+v, want unverifiable (the button asks again)", res)
+	}
+	if n := len(fake.compatUsageRecorded()); n != 2 {
+		t.Fatalf("compatible usage fetcher calls = %d, want 2", n)
+	}
+
+	// With no snapshot stored yet, a miss writes nothing at all.
+	other := usageAccount(t, svc, fake, routing.VendorKilo)
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), other.ID, 0); err != nil || res.Status != VendorUsageRefreshUnverifiable {
+		t.Fatalf("no-snapshot miss = %+v, err = %v, want unverifiable / nil", res, err)
+	}
+	if _, found := storedUsage(t, routeStore, other.ID); found {
+		t.Fatal("a failed pull stored a snapshot")
+	}
+}
+
+// The api-key path upserts AS FETCHED (no merge): these accounts are the single usage
+// writer, and a merge cannot express "now absent" -- a cap that was removed would keep
+// its stale limit and spend. The subscription path keeps its merge (see
+// TestRefreshVendorAccountUsageAnswersTheMergedSnapshot).
+func TestRefreshVendorAccountUsageAPIKeyUpsertsAsFetchedNotMerged(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+	ctx := context.Background()
+
+	fake.okCompatUsage(openRouterCapped())
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0); err != nil || res.Status != VendorUsageRefreshOK {
+		t.Fatalf("first pull = %+v, err = %v, want ok", res, err)
+	}
+	if got, _ := storedUsage(t, routeStore, acc.ID); got.SpendLimit != "100" || got.SpendUsedPct != 40 {
+		t.Fatalf("first snapshot = %+v, want the capped key", got)
+	}
+
+	// The owner removed the key's cap at the vendor: the next pull reports unlimited.
+	fake.okCompatUsage(openRouterUnlimited())
+	later := discoveryTestNow.Add(10 * time.Minute)
+	setUsageClock(svc, later)
+	usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0)
+	if err != nil || res.Status != VendorUsageRefreshOK {
+		t.Fatalf("second pull = %+v, err = %v, want ok", res, err)
+	}
+	want := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, CreditStatus: "unlimited", UpdatedAt: later}
+	if got, found := storedUsage(t, routeStore, acc.ID); !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored usage = %+v (found %v), want exactly the unlimited snapshot %+v (no stale limit or spend merged in)", got, found, want)
+	}
+	if usage == nil || usage.SpendLimit != "" || usage.SpendUsed != "" || usage.SpendRemaining != "" || usage.SpendUnit != "" || usage.SpendUsedPct != -1 || usage.CreditStatus != "unlimited" {
+		t.Fatalf("answered usage = %+v, want unlimited with the spend fields cleared", usage)
+	}
+}
+
+// A store that cannot take the snapshot makes the pull unverifiable, the stored row
+// as it was; a store that cannot be READ for the answer is the one real error.
+func TestRefreshVendorAccountUsageAPIKeyStoreFailures(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("snapshot write fails", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+		fake.okCompatUsage(openRouterCapped())
+		before := routing.VendorAccountUsage{AccountID: acc.ID, FiveHourPct: -1, WeeklyPct: -1, SpendUsedPct: -1, CreditStatus: "unlimited", UpdatedAt: discoveryTestNow.Add(-time.Hour)}
+		seedUsage(t, routeStore, before)
+		svc.routes = failUsageStore{Store: routeStore, writeErr: errors.New("usage table unavailable")}
+
+		usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0)
+		if err != nil || res.Status != VendorUsageRefreshUnverifiable {
+			t.Fatalf("result = %+v, err = %v, want unverifiable / nil", res, err)
+		}
+		if usage == nil || usage.CreditStatus != "unlimited" {
+			t.Fatalf("usage = %+v, want the stored snapshot", usage)
+		}
+		if got, _ := storedUsage(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+			t.Fatalf("stored usage = %+v, want it untouched %+v", got, before)
+		}
+	})
+	t.Run("snapshot read fails", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+		fake.okCompatUsage(openRouterCapped())
+		svc.routes = failUsageStore{Store: routeStore, readErr: errors.New("usage table unavailable")}
+
+		if _, _, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0); err == nil || !strings.Contains(err.Error(), "usage table unavailable") {
+			t.Fatalf("err = %v, want the store failure surfaced", err)
+		}
+	})
+}
+
+// A pull whose context ended before the vendor could answer is no recorded pull (the
+// same rule as the subscription path): the next lazy call asks the vendor instead of
+// answering "fresh" with no snapshot for the TTL.
+func TestRefreshVendorAccountUsageAPIKeyDeadContextIsNotARecordedPull(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+	fake.failCompatUsage(unknownUsage())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want unverifiable / nil", res, err)
+	}
+	if usagePullRecorded(svc, acc.ID) {
+		t.Fatal("a pull that never reached the vendor was recorded")
+	}
+
+	fake.okCompatUsage(openRouterCapped())
+	if usage, res, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshOK || usage == nil {
+		t.Fatalf("next lazy call = %+v / %+v, err = %v, want ok with usage (it must pull again)", usage, res, err)
+	}
+	if _, found := storedUsage(t, routeStore, acc.ID); !found {
+		t.Fatal("the later live pull stored nothing")
+	}
+}
+
+// The usage-capable gate is the registry's, not a vendor list: the OpenAI-compatible
+// providers whose preset names no usage strategy (x.ai, Google, a custom endpoint) and
+// the native openai/anthropic api keys stay "unsupported" and ask nothing.
+func TestRefreshVendorAccountUsageAPIKeyWithoutAStrategyIsUnsupported(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers) VendorAccountDTO
+	}{
+		{"xai", func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers) VendorAccountDTO {
+			return usageAccount(t, svc, fake, routing.VendorXAI)
+		}},
+		{"google", func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers) VendorAccountDTO {
+			return usageAccount(t, svc, fake, routing.VendorGoogle)
+		}},
+		{"custom openai-compatible", func(t *testing.T, svc *Service, fake *fakeVendorDiscoverers) VendorAccountDTO {
+			return compatDiscoveryAccount(t, svc, fake, routing.VendorOpenAICompatible, "https://gw.example.test/root", "p-")
+		}},
+		{"native openai api key", func(t *testing.T, svc *Service, _ *fakeVendorDiscoverers) VendorAccountDTO {
+			return apiKeyAccount(t, svc, routing.VendorOpenAI, "")
+		}},
+		{"native anthropic api key", func(t *testing.T, svc *Service, _ *fakeVendorDiscoverers) VendorAccountDTO {
+			return apiKeyAccount(t, svc, routing.VendorAnthropic, "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			acc := tc.make(t, svc, fake)
+			fake.okCompatUsage(openRouterCapped()) // an answer that WOULD be stored if the seam were consulted
+			fake.okUsage(usagePulled())
+
+			usage, res, err := svc.RefreshVendorAccountUsage(context.Background(), ownerToken(), acc.ID, 0)
+			if err != nil || res.Status != VendorUsageRefreshUnsupported || res.Detail == "" {
+				t.Fatalf("result = %+v, err = %v, want unsupported with a detail", res, err)
+			}
+			if strings.Contains(res.Detail, "OpenAI subscription accounts") {
+				t.Fatalf("detail = %q, must not claim only OpenAI subscriptions have a usage pull", res.Detail)
+			}
+			if usage != nil {
+				t.Fatalf("usage = %+v, want none", usage)
+			}
+			fake.requireNoCompatUsageCalls(t, "for an account whose preset names no usage strategy")
+			fake.requireNoUsageCalls(t, "for an api-key account")
+			if _, found := storedUsage(t, routeStore, acc.ID); found {
+				t.Fatal("a usage snapshot was stored for an unsupported account")
+			}
+		})
+	}
+}
+
+// Creating an OpenRouter / Kilo account with its key runs the create-time discovery,
+// whose best-effort usage pull populates the snapshot at once (as connecting an OpenAI
+// subscription does) and counts as an active pull for the lazy TTL.
+func TestCreateVendorAccountPullsAPIKeyUsageOnTheWay(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAICompatibleAPIKey, "model-a")
+	fake.okCompatUsage(openRouterCapped())
+
+	acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorOpenRouter, ""))
+
+	call := fake.onlyCompatUsageCall(t)
+	if call.usageVia != "openrouter_key" || call.usageURL != "https://openrouter.ai/api/v1/key" || call.apiKey != vendorAccountTestKey {
+		t.Fatalf("compatible usage call = %+v, want the OpenRouter key URL and the opened key", call)
+	}
+	got, found := storedUsage(t, routeStore, acc.ID)
+	if !found || got.SpendLimit != "100" || got.CreditStatus != "has_credits" {
+		t.Fatalf("stored usage = %+v (found %v), want the snapshot pulled at create time", got, found)
+	}
+	if !usagePullRecorded(svc, acc.ID) {
+		t.Fatal("the create-time pull was not recorded for the lazy TTL")
+	}
+}
+
+// The usage pull the models refresh runs on the way also covers an OpenRouter / Kilo
+// api-key account: its snapshot is populated after RefreshVendorAccountModels, the
+// pull counts toward the lazy TTL, and a vendor that fails it changes nothing about
+// the models result.
+func TestRefreshVendorAccountModelsPullsAPIKeyUsageOnTheWay(t *testing.T) {
+	t.Run("the snapshot is populated and the pull is recorded", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okSlugs(kindOpenAICompatibleAPIKey, "model-a")
+		acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+		fake.okCompatUsage(openRouterCapped())
+		ctx := context.Background()
+
+		_, res, err := svc.RefreshVendorAccountModels(ctx, ownerToken(), acc.ID)
+		if err != nil || res.Status != VendorRefreshOK {
+			t.Fatalf("models refresh = %+v, err = %v, want ok", res, err)
+		}
+		call := fake.onlyCompatUsageCall(t)
+		if call.usageVia != "openrouter_key" || call.usageURL != "https://openrouter.ai/api/v1/key" || call.apiKey != vendorAccountTestKey {
+			t.Fatalf("compatible usage call = %+v, want the OpenRouter key URL and the opened key", call)
+		}
+		fake.requireNoUsageCalls(t, "for an api-key account")
+		got, found := storedUsage(t, routeStore, acc.ID)
+		if !found || got.SpendLimit != "100" || got.SpendUsedPct != 40 || !got.UpdatedAt.Equal(discoveryTestNow) {
+			t.Fatalf("stored usage = %+v (found %v), want the pulled snapshot", got, found)
+		}
+
+		// The lazy refresh right after is fresh: the models refresh's pull was an active one.
+		if _, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, VendorUsageLazyTTL); err != nil || res.Status != VendorUsageRefreshFresh {
+			t.Fatalf("lazy usage refresh = %+v, err = %v, want fresh", res, err)
+		}
+		fake.onlyCompatUsageCall(t)
+	})
+
+	t.Run("a failing usage pull never changes the models result", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okSlugs(kindOpenAICompatibleAPIKey, "model-a", "model-b")
+		acc := usageAccount(t, svc, fake, routing.VendorKilo)
+		fake.failCompatUsage(unknownUsage())
+
+		_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+		if err != nil || res.Status != VendorRefreshOK || res.Discovered != 2 {
+			t.Fatalf("models refresh = %+v, err = %v, want ok / 2 regardless of the usage pull", res, err)
+		}
+		fake.onlyCompatUsageCall(t)
+		if _, found := storedUsage(t, routeStore, acc.ID); found {
+			t.Fatal("a failed pull stored a snapshot")
+		}
+	})
+
+	t.Run("an account with no key never reaches the usage seam", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		acc := usageAccount(t, svc, fake, routing.VendorOpenRouter)
+		fake.okCompatUsage(openRouterCapped())
+		row := accountRow(t, svc, acc)
+		row.APIKey = ""
+		if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
+			t.Fatalf("UpdateVendorAccount: %v", err)
+		}
+
+		if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshUnverifiable {
+			t.Fatalf("models refresh = %+v, err = %v, want unverifiable / nil", res, err)
+		}
+		fake.requireNoCompatUsageCalls(t, "without a key")
+	})
+
+	t.Run("providers without a usage strategy are not pulled", func(t *testing.T) {
+		for _, vendor := range []string{routing.VendorXAI, routing.VendorGoogle} {
+			svc, _, fake := newDiscoveryTestService(t)
+			fake.okSlugs(kindOpenAICompatibleAPIKey, "model-a")
+			acc := usageAccount(t, svc, fake, vendor)
+			fake.okCompatUsage(openRouterCapped())
+			if _, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil || res.Status != VendorRefreshOK {
+				t.Fatalf("%s: models refresh = %+v, err = %v, want ok", vendor, res, err)
+			}
+			fake.requireNoCompatUsageCalls(t, "for "+vendor+" (its preset names no usage strategy)")
+		}
+	})
 }
