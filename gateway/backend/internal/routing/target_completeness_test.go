@@ -25,10 +25,11 @@ var targetFromMayLeaveZero = map[string]bool{
 	// self-hosted/server_agent targets, which never masquerade, carry no static
 	// extra headers, and resolve their credential from APIToken rather than a
 	// vendor account. Each is legitimately zero here.
-	"ExtraHeaders":    true, // static upstream headers only a vendor subscription target carries
-	"Masquerade":      true, // "" (no disguise) for every self-hosted target
-	"VendorAccountID": true, // non-empty only for a vendor target (usage attribution); a self-hosted target carries none
-	"Subscription":    true, // false for every self-hosted target (OAuth-bearer trigger, subscription-only)
+	"ExtraHeaders":     true, // static upstream headers only a vendor subscription target carries
+	"Masquerade":       true, // "" (no disguise) for every self-hosted target
+	"VendorAccountID":  true, // non-empty only for a vendor target (usage attribution); a self-hosted target carries none
+	"Subscription":     true, // false for every self-hosted target (OAuth-bearer trigger, subscription-only)
+	"OpenAIPathPrefix": true, // empty => /v1; only an OpenAI-compatible vendor-account target sets it
 }
 
 // TestTargetFromPopulatesEveryField is the routing.Target analogue of

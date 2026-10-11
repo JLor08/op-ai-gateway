@@ -36,7 +36,9 @@ import (
 //   - The connect flows (token import, code paste, device code) run it best
 //     effort once the tokens are stored, so a freshly connected subscription
 //     account serves its real models at once; a failing discovery never fails
-//     the connect.
+//     the connect. Creating an OpenAI-compatible account with its key does the
+//     same (its static seed is empty), with the same bound and the same fail-soft
+//     rule.
 //   - An OpenAI subscription's refresh also pulls the account's usage snapshot
 //     (refreshVendorUsage), best effort and after the models, with the same opened
 //     and renewed token set; it never changes the refresh's outcome.
@@ -76,9 +78,11 @@ const (
 	maxDiscoveredModelIDLen     = 128
 	maxDiscoveredDisplayNameLen = 128
 	// maxDiscoveredModels caps how many models one discovery stores. The largest
-	// real listings are in the low hundreds; the cap bounds what a hostile or
-	// runaway answer can make the portal persist.
-	maxDiscoveredModels = 500
+	// real listings are the aggregators' catalogs (OpenRouter ~458 and Kilo ~390
+	// models at the time of writing, still growing), so the cap leaves them
+	// headroom over the old 500; it still bounds what a hostile or runaway answer
+	// can make the portal persist. What lies beyond it is counted as dropped.
+	maxDiscoveredModels = 1000
 )
 
 // The wire values of RefreshResult.Status.
@@ -108,6 +112,13 @@ type RefreshResult struct {
 // this shape.
 type VendorCredentialDiscoverer func(ctx context.Context, httpClient *http.Client, credential string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)
 
+// VendorOpenAICompatibleDiscoverer is the api-key model-list fetch of an
+// OpenAI-compatible provider. Unlike VendorCredentialDiscoverer it takes the models
+// URL: the portal composes it from the provider preset and the account's base URL,
+// because the vendorauth package knows no vendor roots.
+// vendorauth.DiscoverOpenAICompatibleModels has exactly this shape.
+type VendorOpenAICompatibleDiscoverer func(ctx context.Context, httpClient *http.Client, modelsURL, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)
+
 // VendorOpenAISubscriptionDiscoverer is the ChatGPT-subscription fetch, which also
 // needs the ChatGPT account id and the Codex client_version to advertise
 // (vendorauth.DiscoverOpenAISubscriptionModels has exactly this shape).
@@ -120,7 +131,7 @@ type VendorOpenAISubscriptionDiscoverer func(ctx context.Context, httpClient *ht
 type VendorOpenAIUsageFetcher func(ctx context.Context, httpClient *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus)
 
 // VendorModelDiscoverers is the seam over the vendorauth fetchers a models refresh
-// runs: the four model-list fetchers and, riding along with the OpenAI
+// runs: the five model-list fetchers and, riding along with the OpenAI
 // subscription's refresh, its usage fetch. Tests inject fakes so no service test
 // reaches a vendor over the network. A nil field means the real fetcher (see
 // ServiceDeps.VendorDiscoverers).
@@ -129,6 +140,9 @@ type VendorModelDiscoverers struct {
 	AnthropicSubscription VendorCredentialDiscoverer
 	OpenAIAPIKey          VendorCredentialDiscoverer
 	AnthropicAPIKey       VendorCredentialDiscoverer
+	// OpenAICompatibleAPIKey lists the models of every OpenAI-compatible vendor
+	// (x.ai, OpenRouter, Kilo, Google, the Custom endpoint) at a preset-derived URL.
+	OpenAICompatibleAPIKey VendorOpenAICompatibleDiscoverer
 	// OpenAIUsage is the usage fetch refreshVendorUsage runs for an OpenAI
 	// subscription account after its models were refreshed.
 	OpenAIUsage VendorOpenAIUsageFetcher
@@ -147,6 +161,9 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	}
 	if d.AnthropicAPIKey == nil {
 		d.AnthropicAPIKey = vendorauth.DiscoverAnthropicAPIKeyModels
+	}
+	if d.OpenAICompatibleAPIKey == nil {
+		d.OpenAICompatibleAPIKey = vendorauth.DiscoverOpenAICompatibleModels
 	}
 	if d.OpenAIUsage == nil {
 		d.OpenAIUsage = vendorauth.FetchOpenAISubscriptionUsage
@@ -365,12 +382,42 @@ func (s *Service) discoverAPIKeyModels(ctx context.Context, acc routing.VendorAc
 	if apiKey == "" {
 		return nil, 0, "no API key is set", nil
 	}
+	if routing.IsOpenAICompatibleVendor(acc.Vendor) {
+		models, status := s.discoverOpenAICompatibleModels(ctx, acc, apiKey)
+		return models, status, "", nil
+	}
 	fetch := s.apiKeyDiscoverer(acc.Vendor)
 	if fetch == nil {
 		return nil, 0, noVendorDiscoveryNote, nil
 	}
 	models, status := fetch(ctx, s.vendorDiscovery.client, apiKey)
 	return models, status, "", nil
+}
+
+// discoverOpenAICompatibleModels lists the models of an OpenAI-compatible account
+// at GET {base}{preset prefix}/models, the URL the portal composes from the
+// provider preset (the vendorauth fetcher knows no vendor roots). The preset's
+// StripModelsPrefix (Gemini lists "models/<id>" but serves and expects the bare
+// id) is then removed from the front of each id, and from the display name too when
+// that is only the id standing in because the provider sent no name, so the prefix
+// reaches neither a model row nor the UI.
+func (s *Service) discoverOpenAICompatibleModels(ctx context.Context, acc routing.VendorAccount, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+	preset, ok := routing.VendorPresetFor(acc.Vendor)
+	if !ok {
+		return nil, vendorauth.DiscoveryUnverifiable
+	}
+	modelsURL := strings.TrimRight(acc.BaseURL, "/") + preset.PathPrefix + "/models"
+	models, status := s.vendorDiscovery.discoverers.OpenAICompatibleAPIKey(ctx, s.vendorDiscovery.client, modelsURL, apiKey)
+	if preset.StripModelsPrefix != "" {
+		for i := range models {
+			stripped := strings.TrimPrefix(models[i].Slug, preset.StripModelsPrefix)
+			if models[i].DisplayName == models[i].Slug {
+				models[i].DisplayName = stripped
+			}
+			models[i].Slug = stripped
+		}
+	}
+	return models, status
 }
 
 // currentSubscriptionTokens opens a subscription account's sealed token set and
@@ -803,12 +850,13 @@ func (s *Service) relabelVendorAccountModels(ctx context.Context, id string) err
 	return s.routes.SetVendorAccountModels(ctx, acc.ID, relabeled)
 }
 
-// discoverAfterConnect runs a model discovery for the subscription account dto
-// that has just been connected, so it serves its real models at once rather than
-// the static seed. It is BEST EFFORT: whatever goes wrong is logged (token-free)
-// and dto is returned as it was, because the connect itself has succeeded and
-// must be reported as such. On success the refreshed view (the discovered models)
-// is returned in its place.
+// discoverAfterConnect runs a model discovery for the account dto that has just
+// been connected (a subscription account) or created with its key (an
+// OpenAI-compatible account, which has no static seed), so it serves its real
+// models at once rather than the static seed. It is BEST EFFORT: whatever goes
+// wrong is logged (token-free) and dto is returned as it was, because the connect
+// or create itself has succeeded and must be reported as such. On success the
+// refreshed view (the discovered models) is returned in its place.
 //
 // The whole discovery runs under its own short bound (vendorConnectDiscoveryTimeout,
 // shared by the token refresh, the fetch and the write), so a vendor that hangs
@@ -827,13 +875,13 @@ func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token
 		if errors.Is(err, ErrVendorAccountCredentialUnreadable) {
 			// A FIXED line, never the cause chain: the chain of a stored blob that
 			// cannot be decoded can quote part of what it could not decode.
-			slog.Warn("vendor model discovery after connect skipped: the stored credential could not be read; the account keeps its current models", "account", dto.ID)
+			slog.Warn("vendor model discovery after connect/create skipped: the stored credential could not be read; the account keeps its current models", "account", dto.ID)
 		} else {
-			slog.Warn("vendor model discovery after connect failed; the account keeps its current models", "account", dto.ID, "err", err)
+			slog.Warn("vendor model discovery after connect/create failed; the account keeps its current models", "account", dto.ID, "err", err)
 		}
 		return s.currentConnectedVendorAccount(requestCtx, dto)
 	}
-	slog.Info("vendor model discovery after connect", "account", dto.ID, "status", result.Status, "discovered", result.Discovered)
+	slog.Info("vendor model discovery after connect/create", "account", dto.ID, "status", result.Status, "discovered", result.Discovered)
 	return refreshed
 }
 

@@ -208,6 +208,62 @@ func TestOpenAICompatibleClientListModels(t *testing.T) {
 	}
 }
 
+// TestOpenAICompatibleClientUsesOpenAIPathPrefix pins the composed OpenAI-dialect
+// URLs: {Endpoint}{prefix}/chat/completions (both chat POST sites -- Complete and
+// CompleteStream) and {Endpoint}{prefix}/models (discovery). An empty prefix is
+// the historical "/v1", so every self-hosted target stays byte-identical, while
+// Kilo's "/gateway" and Gemini's "/v1beta/openai" compose correctly.
+func TestOpenAICompatibleClientUsesOpenAIPathPrefix(t *testing.T) {
+	cases := []struct {
+		name, prefix, wantChat, wantModels string
+	}{
+		{"default empty => /v1", "", "/v1/chat/completions", "/v1/models"},
+		{"gemini shim", "/v1beta/openai", "/v1beta/openai/chat/completions", "/v1beta/openai/models"},
+		{"kilo gateway", "/gateway", "/gateway/chat/completions", "/gateway/models"},
+		{"trailing slash normalised", "/v1/", "/v1/chat/completions", "/v1/models"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var chatPaths []string
+			var gotModels string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+					chatPaths = append(chatPaths, r.URL.Path)
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+				case strings.HasSuffix(r.URL.Path, "/models"):
+					gotModels = r.URL.Path
+					_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+				}
+			}))
+			defer upstream.Close()
+			client := NewOpenAICompatibleClient(http.DefaultClient)
+			target := routing.Target{Endpoint: upstream.URL, ProviderModel: "m", Timeout: 5 * time.Second, OpenAIPathPrefix: c.prefix}
+			req := inference.Request{Model: "m"}
+			_, _ = client.Complete(context.Background(), target, req)
+			_ = client.CompleteStream(context.Background(), target, req, func(inference.StreamEvent) error { return nil })
+			_, _ = client.ListModels(context.Background(), target)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(chatPaths) < 2 {
+				t.Fatalf("chat POSTs = %v, want one from Complete and one from CompleteStream", chatPaths)
+			}
+			for _, got := range chatPaths {
+				if got != c.wantChat {
+					t.Errorf("chat path = %q, want %q", got, c.wantChat)
+				}
+			}
+			if gotModels != c.wantModels {
+				t.Errorf("models path = %q, want %q", gotModels, c.wantModels)
+			}
+		})
+	}
+}
+
 func TestOpenAICompatibleClientListModelsReturnsUnavailableForNon2xx(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

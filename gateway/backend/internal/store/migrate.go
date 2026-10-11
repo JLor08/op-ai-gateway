@@ -118,6 +118,7 @@ var migrations = []migration{
 	{version: 83, name: "vendor_account_model_discovery", up: migration83Up},
 	{version: 84, name: "vendor_account_usage_spend_control", up: migration84Up},
 	{version: 85, name: "api_token_vendor_provider_access", up: migration85Up},
+	{version: 86, name: "vendor_account_base_url", up: migration86Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3972,4 +3973,12 @@ func migration84Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // vendor access). See store.DecodeVendorAccess / EncodeVendorAccess.
 func migration85Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "vendor_provider_access text not null default ''")
+}
+
+// migration86Up adds vendor_accounts.base_url: the upstream ROOT url of an
+// OpenAI-compatible account, stored without the /v1 (or /v1beta/openai) prefix
+// the gateway adds from its provider-preset registry; "" for openai/anthropic.
+// Schema only, no backfill; baselineCreateStatements stays frozen at v60.
+func migration86Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "base_url text not null default ''")
 }

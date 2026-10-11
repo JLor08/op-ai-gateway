@@ -10,6 +10,16 @@ export function vendorLabel(t: Translation, vendor: string): string {
       return t.vendorOpenAI;
     case 'anthropic':
       return t.vendorAnthropic;
+    case 'xai':
+      return t.vendorXAI;
+    case 'openrouter':
+      return t.vendorOpenRouter;
+    case 'kilo':
+      return t.vendorKilo;
+    case 'google':
+      return t.vendorGoogle;
+    case 'openai_compatible':
+      return t.vendorOpenAICompatible;
     default:
       return vendor;
   }

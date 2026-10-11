@@ -573,7 +573,9 @@ tokens/s** (#182). A request served by an external vendor account
 ([External Vendor Accounts](external-vendor-accounts.md)) has no AI server, so
 its `host` and `server_name` are empty, and what identifies it is `provider`
 (`vendor_openai`, `vendor_openai_subscription`, `vendor_anthropic`) plus
-`account_id`. No vendor reports a generation rate (no `timings` object of any
+`account_id`; an OpenAI-compatible account (x.ai, OpenRouter, Kilo, Gemini, Custom)
+appears as provider `vendor_openai` with its `account_id`, since it is served by the
+same client. No vendor reports a generation rate (no `timings` object of any
 kind), so without help such a row also stores `tokens_per_second = 0` and
 Activity renders it as never measured. Two things make it readable:
 
@@ -1373,7 +1375,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-85-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-86-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -1810,7 +1812,7 @@ llama.cpp's `/props`, Ollama's `/api/show` or stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-85-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-86-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

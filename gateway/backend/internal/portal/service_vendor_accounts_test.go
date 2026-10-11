@@ -1480,3 +1480,194 @@ func TestVendorAccountModelDTOExposesTheDisplayName(t *testing.T) {
 		}
 	}
 }
+
+// openAICompatibleTestVendors are the vendor ids the portal accepts on top of
+// openai and anthropic: the four named presets and the Custom endpoint.
+var openAICompatibleTestVendors = []string{
+	routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorOpenAICompatible,
+}
+
+func compatAccountRequest(vendor, baseURL string) CreateVendorAccountRequest {
+	return CreateVendorAccountRequest{
+		Vendor:   vendor,
+		AuthType: routing.VendorAuthAPIKey,
+		Name:     "Compat " + vendor,
+		APIKey:   vendorAccountTestKey,
+		BaseURL:  baseURL,
+	}
+}
+
+// Each OpenAI-compatible vendor is created api-key only. The stored account and
+// the DTO carry the base_url: the typed one (trimmed of a trailing slash), or the
+// preset's default root when none was typed. The static catalog stays empty --
+// discovery fills the models -- and the key is sealed like any other.
+func TestCreateVendorAccountAcceptsOpenAICompatibleVendors(t *testing.T) {
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+
+	for _, vendor := range openAICompatibleTestVendors {
+		t.Run(vendor, func(t *testing.T) {
+			typed := "https://gw.example.test/root/"
+			wantTyped := "https://gw.example.test/root"
+
+			dto := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(vendor, typed))
+			if dto.Vendor != vendor || dto.AuthType != routing.VendorAuthAPIKey || !dto.APIKeySet {
+				t.Fatalf("dto = %#v", dto)
+			}
+			if dto.BaseURL != wantTyped {
+				t.Fatalf("dto base_url = %q, want the typed one without a trailing slash %q", dto.BaseURL, wantTyped)
+			}
+			row, err := routeStore.VendorAccountByID(ctx, dto.ID)
+			if err != nil || row.BaseURL != wantTyped {
+				t.Fatalf("stored account = %#v, %v, want BaseURL %q", row, err, wantTyped)
+			}
+			if row.APIKey != "plain:"+vendorAccountTestKey {
+				t.Fatalf("stored api key = %q, want the sealed plain: envelope", row.APIKey)
+			}
+			if len(dto.Models) != 0 {
+				t.Fatalf("models = %#v, want none (discovery fills them)", dto.Models)
+			}
+			raw, _ := json.Marshal(dto)
+			if !strings.Contains(string(raw), `"base_url":"`+wantTyped+`"`) {
+				t.Fatalf("dto JSON %s missing base_url", raw)
+			}
+			got, err := svc.GetVendorAccount(ctx, ownerToken(), dto.ID)
+			if err != nil || got.BaseURL != wantTyped {
+				t.Fatalf("Get = %#v, %v, want base_url %q", got, err, wantTyped)
+			}
+
+			// An omitted base_url defaults to the preset's root, except for Custom,
+			// where it is required (TestCreateCustomRequiresBaseURL).
+			if vendor == routing.VendorOpenAICompatible {
+				return
+			}
+			preset, ok := routing.VendorPresetFor(vendor)
+			if !ok || preset.DefaultBaseURL == "" {
+				t.Fatalf("no preset default for %s", vendor)
+			}
+			def := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(vendor, "  "))
+			if def.BaseURL != preset.DefaultBaseURL {
+				t.Fatalf("defaulted base_url = %q, want %q", def.BaseURL, preset.DefaultBaseURL)
+			}
+			if row, err := routeStore.VendorAccountByID(ctx, def.ID); err != nil || row.BaseURL != preset.DefaultBaseURL {
+				t.Fatalf("stored defaulted account = %#v, %v", row, err)
+			}
+		})
+	}
+}
+
+// openai and anthropic keep their fixed hosts: a supplied base_url is ignored
+// (stays ""), and the field is still on the wire as "".
+func TestCreateVendorAccountIgnoresBaseURLForBespokeVendors(t *testing.T) {
+	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
+
+	for _, vendor := range []string{routing.VendorOpenAI, routing.VendorAnthropic} {
+		req := apiKeyAccountRequest("Bespoke")
+		req.Vendor = vendor
+		req.BaseURL = "https://evil.example.test"
+		dto := createTestVendorAccount(t, svc, ownerToken(), req)
+		if dto.BaseURL != "" {
+			t.Fatalf("%s dto base_url = %q, want empty", vendor, dto.BaseURL)
+		}
+		if row, err := routeStore.VendorAccountByID(context.Background(), dto.ID); err != nil || row.BaseURL != "" {
+			t.Fatalf("%s stored account = %#v, %v, want empty BaseURL", vendor, row, err)
+		}
+		raw, _ := json.Marshal(dto)
+		if !strings.Contains(string(raw), `"base_url":""`) {
+			t.Fatalf("dto JSON %s must carry an empty base_url, not omit it", raw)
+		}
+	}
+}
+
+// The compat vendors are api-key only: there is no subscription flow for them.
+func TestCreateVendorAccountRejectsSubscriptionForCompatVendor(t *testing.T) {
+	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
+
+	for _, vendor := range openAICompatibleTestVendors {
+		req := compatAccountRequest(vendor, "https://gw.example.test")
+		req.AuthType = routing.VendorAuthSubscription
+		req.APIKey = ""
+		if _, err := svc.CreateVendorAccount(context.Background(), ownerToken(), req); !errors.Is(err, ErrVendorAccountAuthTypeInvalid) {
+			t.Fatalf("%s subscription: err = %v, want ErrVendorAccountAuthTypeInvalid", vendor, err)
+		}
+	}
+	if rows, _ := routeStore.VendorAccounts(context.Background()); len(rows) != 0 {
+		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
+	}
+}
+
+func TestCreateCustomRequiresBaseURL(t *testing.T) {
+	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
+
+	for _, baseURL := range []string{"", "   "} {
+		_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(routing.VendorOpenAICompatible, baseURL))
+		if !errors.Is(err, ErrVendorAccountBaseURLRequired) {
+			t.Fatalf("base_url %q: err = %v, want ErrVendorAccountBaseURLRequired", baseURL, err)
+		}
+	}
+	if rows, _ := routeStore.VendorAccounts(context.Background()); len(rows) != 0 {
+		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
+	}
+}
+
+// The key rides on every request, so a base_url must be an https URL with a host
+// and no credentials, query or fragment. Validated for the presets too (a typed
+// override of a default), not only for Custom.
+func TestCreateRejectsMalformedOrNonHTTPSBaseURL(t *testing.T) {
+	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
+
+	for _, baseURL := range []string{
+		"not-a-url",
+		"http://x.test",
+		"ftp://x.test",
+		"https://",
+		"https:///v1",
+		"https://u:p@x.test",
+		"https://u@x.test",
+		"https://x.test/?a=1",
+		"https://x.test/path#frag",
+		"https://x.test/\x7f",
+		// Go parses a bare trailing "?" as ForceQuery with an empty RawQuery, a bare
+		// "#" as an empty Fragment, and ":443" as a non-empty Host with no hostname;
+		// a space is not a valid URL character.
+		"https://x.test/?",
+		"https://x.test/v1?",
+		"https://x.test/#",
+		"https://:443/v1",
+		"https://x.test/a b",
+	} {
+		for _, vendor := range []string{routing.VendorOpenAICompatible, routing.VendorXAI} {
+			_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(vendor, baseURL))
+			if !errors.Is(err, ErrVendorAccountBaseURLInvalid) {
+				t.Fatalf("%s base_url %q: err = %v, want ErrVendorAccountBaseURLInvalid", vendor, baseURL, err)
+			}
+		}
+	}
+	if rows, _ := routeStore.VendorAccounts(context.Background()); len(rows) != 0 {
+		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
+	}
+}
+
+// base_url is immutable: it is not on the update request, so an update can never
+// change it (the JSON field is simply not read).
+func TestUpdateVendorAccountCannotChangeTheBaseURL(t *testing.T) {
+	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	created := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorOpenAICompatible, "https://gw.example.test"))
+
+	var req UpdateVendorAccountRequest
+	if err := json.Unmarshal([]byte(`{"name":"Renamed","base_url":"https://other.example.test"}`), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, req)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if dto.Name != "Renamed" || dto.BaseURL != "https://gw.example.test" {
+		t.Fatalf("dto = %#v, want renamed with the original base_url", dto)
+	}
+	if row, err := routeStore.VendorAccountByID(ctx, created.ID); err != nil || row.BaseURL != "https://gw.example.test" {
+		t.Fatalf("stored account = %#v, %v, want the original BaseURL", row, err)
+	}
+}

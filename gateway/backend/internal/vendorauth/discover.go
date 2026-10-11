@@ -266,9 +266,11 @@ func parseCodexModels(body []byte) []DiscoveredModel {
 }
 
 // parseDataModels reads the OpenAI/Anthropic shape {"data":[{"id":...}]} and keeps
-// every entry that has an id. withDisplayName selects whether the entry's
-// display_name is carried (Anthropic) or the id is used for both fields (OpenAI,
-// which sends no display name).
+// every entry that has an id. withDisplayName selects whether the entry's human
+// name is carried (Anthropic and the OpenAI-compatible providers) or the id is used
+// for both fields (OpenAI's own listing, which sends no display name). The name is
+// display_name when the entry has one and otherwise name (OpenRouter sends name);
+// an entry with neither gets the id.
 func parseDataModels(body []byte, withDisplayName bool) []DiscoveredModel {
 	var env struct {
 		Data []json.RawMessage `json:"data"`
@@ -281,6 +283,7 @@ func parseDataModels(body []byte, withDisplayName bool) []DiscoveredModel {
 		var m struct {
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
+			Name        string `json:"name"`
 		}
 		_ = json.Unmarshal(raw, &m)
 		if m.ID == "" {
@@ -289,6 +292,9 @@ func parseDataModels(body []byte, withDisplayName bool) []DiscoveredModel {
 		displayName := ""
 		if withDisplayName {
 			displayName = m.DisplayName
+			if displayName == "" {
+				displayName = m.Name
+			}
 		}
 		out = append(out, newDiscoveredModel(m.ID, displayName))
 	}

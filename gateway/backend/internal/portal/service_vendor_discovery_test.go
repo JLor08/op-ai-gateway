@@ -35,6 +35,9 @@ type fakeDiscoveryCall struct {
 	credential    string
 	accountID     string
 	clientVersion string
+	// modelsURL is the URL the service composed; only the OpenAI-compatible kind
+	// carries one ("" for every other kind, whose URL is a vendorauth constant).
+	modelsURL string
 	// timeout is the Timeout of the *http.Client the service handed over;
 	// hasClient is false when it handed over nil.
 	timeout   time.Duration
@@ -84,7 +87,7 @@ func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
 		results: map[string]fakeDiscoveryResult{},
 		usage:   fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
 	}
-	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey} {
+	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey} {
 		f.results[kind] = fakeDiscoveryResult{status: vendorauth.DiscoveryUnverifiable}
 	}
 	return f
@@ -114,14 +117,20 @@ func (f *fakeVendorDiscoverers) okSlugs(kind string, slugs ...string) {
 }
 
 func (f *fakeVendorDiscoverers) record(kind, credential, accountID, clientVersion string, client *http.Client) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+	return f.recordCall(fakeDiscoveryCall{kind: kind, credential: credential, accountID: accountID, clientVersion: clientVersion}, client)
+}
+
+// recordCall stamps call with the client the service handed over, records it and
+// answers its kind's configured result.
+func (f *fakeVendorDiscoverers) recordCall(call fakeDiscoveryCall, client *http.Client) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	call := fakeDiscoveryCall{kind: kind, credential: credential, accountID: accountID, clientVersion: clientVersion, hasClient: client != nil}
+	call.hasClient = client != nil
 	if client != nil {
 		call.timeout = client.Timeout
 	}
 	f.calls = append(f.calls, call)
-	r := f.results[kind]
+	r := f.results[call.kind]
 	return append([]vendorauth.DiscoveredModel(nil), r.models...), r.status
 }
 
@@ -180,14 +189,23 @@ func (f *fakeVendorDiscoverers) keyed(kind string) VendorCredentialDiscoverer {
 	}
 }
 
+// compat is the fake of the OpenAI-compatible fetch: it records the models URL the
+// service composed.
+func (f *fakeVendorDiscoverers) compat() VendorOpenAICompatibleDiscoverer {
+	return func(_ context.Context, client *http.Client, modelsURL, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		return f.recordCall(fakeDiscoveryCall{kind: kindOpenAICompatibleAPIKey, credential: apiKey, modelsURL: modelsURL}, client)
+	}
+}
+
 func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 	return VendorModelDiscoverers{
 		OpenAISubscription: func(_ context.Context, client *http.Client, accessToken, accountID, clientVersion string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 			return f.record(kindOpenAISubscription, accessToken, accountID, clientVersion, client)
 		},
-		AnthropicSubscription: f.keyed(kindAnthropicSubscription),
-		OpenAIAPIKey:          f.keyed(kindOpenAIAPIKey),
-		AnthropicAPIKey:       f.keyed(kindAnthropicAPIKey),
+		AnthropicSubscription:  f.keyed(kindAnthropicSubscription),
+		OpenAIAPIKey:           f.keyed(kindOpenAIAPIKey),
+		AnthropicAPIKey:        f.keyed(kindAnthropicAPIKey),
+		OpenAICompatibleAPIKey: f.compat(),
 		OpenAIUsage: func(_ context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
 			return f.recordUsage(accessToken, accountID, client)
 		},
@@ -198,6 +216,14 @@ func (f *fakeVendorDiscoverers) recorded() []fakeDiscoveryCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]fakeDiscoveryCall(nil), f.calls...)
+}
+
+// reset forgets the recorded calls (a fixture that creates an account may have made
+// the create-time discovery's call already).
+func (f *fakeVendorDiscoverers) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = nil
 }
 
 // onlyCall fails the test unless exactly one discoverer call was made, and returns it.
@@ -562,6 +588,371 @@ func TestRefreshVendorAccountModelsCapsTheNumberOfModels(t *testing.T) {
 	if rows[0].UpstreamModel != "m-0000" || rows[len(rows)-1].UpstreamModel != fmt.Sprintf("m-%04d", maxDiscoveredModels-1) {
 		t.Fatalf("rows span %q..%q, want the vendor's first %d entries", rows[0].UpstreamModel, rows[len(rows)-1].UpstreamModel, maxDiscoveredModels)
 	}
+}
+
+// --- OpenAI-compatible vendors -------------------------------------------------
+
+// compatDiscoveryAccount creates an OpenAI-compatible api-key account (with the
+// create-time discovery's calls forgotten, so a test sees only its own).
+func compatDiscoveryAccount(t *testing.T, svc *Service, fake *fakeVendorDiscoverers, vendor, baseURL, prefix string) VendorAccountDTO {
+	t.Helper()
+	req := compatAccountRequest(vendor, baseURL)
+	req.ModelPrefix = prefix
+	acc := createTestVendorAccount(t, svc, ownerToken(), req)
+	fake.reset()
+	return acc
+}
+
+// An OpenAI-compatible account is asked at {base}{preset prefix}/models: the portal
+// composes the URL (the preset registry lives in routing, which vendorauth must not
+// import) and hands it to the compatible seam, with the stored (opened) key and the
+// bounded discovery client; neither the OpenAI nor the Anthropic seam is touched.
+func TestCompatDiscoveryComposesTheModelsURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		vendor  string
+		baseURL string
+		wantURL string
+	}{
+		{"xai", routing.VendorXAI, "", "https://api.x.ai/v1/models"},
+		{"openrouter", routing.VendorOpenRouter, "", "https://openrouter.ai/api/v1/models"},
+		{"kilo gateway prefix", routing.VendorKilo, "", "https://api.kilo.ai/api/gateway/models"},
+		{"google openai prefix", routing.VendorGoogle, "", "https://generativelanguage.googleapis.com/v1beta/openai/models"},
+		{"custom root", routing.VendorOpenAICompatible, "https://gw.example.test/root", "https://gw.example.test/root/v1/models"},
+		{"custom root typed with a trailing slash", routing.VendorOpenAICompatible, "https://gw.example.test/", "https://gw.example.test/v1/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.ok(kindOpenAICompatibleAPIKey, discovered("model-a", "Model A"))
+			acc := compatDiscoveryAccount(t, svc, fake, tc.vendor, tc.baseURL, "p-")
+
+			dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("RefreshVendorAccountModels: %v", err)
+			}
+			if res.Status != VendorRefreshOK || res.Discovered != 1 {
+				t.Fatalf("result = %+v, want ok / 1", res)
+			}
+			call := fake.onlyCall(t)
+			if call.kind != kindOpenAICompatibleAPIKey || call.credential != vendorAccountTestKey {
+				t.Fatalf("call = %+v, want the compatible seam with the stored (opened) key", call)
+			}
+			if call.modelsURL != tc.wantURL {
+				t.Fatalf("models URL = %q, want %q", call.modelsURL, tc.wantURL)
+			}
+			if !call.hasClient || call.timeout != 10*time.Second {
+				t.Fatalf("call = %+v, want a client with a 10s timeout", call)
+			}
+			want := []routing.VendorAccountModel{modelRow(acc.ID, "p-model-a", "model-a", routing.APIFlavorOpenAI, "Model A")}
+			if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
+				t.Fatalf("stored rows = %+v, want %+v", got, want)
+			}
+			requireNoToken(t, "refreshed account", dto)
+		})
+	}
+}
+
+// openai and anthropic keep their own fixed-URL seams: a compatible vendor never
+// reaches them and they never reach the compatible one.
+func TestCompatDiscoveryKeepsTheVendorFamiliesApart(t *testing.T) {
+	svc, _, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "gpt-5.1")
+	fake.okSlugs(kindAnthropicAPIKey, "claude-opus-5")
+	fake.okSlugs(kindOpenAICompatibleAPIKey, "grok-4")
+
+	for vendor, wantKind := range map[string]string{
+		routing.VendorOpenAI:           kindOpenAIAPIKey,
+		routing.VendorAnthropic:        kindAnthropicAPIKey,
+		routing.VendorXAI:              kindOpenAICompatibleAPIKey,
+		routing.VendorOpenAICompatible: kindOpenAICompatibleAPIKey,
+	} {
+		req := CreateVendorAccountRequest{Vendor: vendor, AuthType: routing.VendorAuthAPIKey, Name: "K " + vendor, APIKey: vendorAccountTestKey}
+		if vendor == routing.VendorOpenAICompatible {
+			req.BaseURL = "https://gw.example.test"
+		}
+		acc := createTestVendorAccount(t, svc, ownerToken(), req)
+		fake.reset()
+		if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+			t.Fatalf("%s: RefreshVendorAccountModels: %v", vendor, err)
+		}
+		if call := fake.onlyCall(t); call.kind != wantKind {
+			t.Errorf("%s: discoverer kind = %s, want %s", vendor, call.kind, wantKind)
+		}
+	}
+}
+
+// An account with no api key has nothing to ask with: nothing is sent and the rows
+// are kept.
+func TestCompatDiscoveryWithoutAKeyIsUnverifiable(t *testing.T) {
+	svc, _, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAICompatibleAPIKey, "grok-4")
+	acc := createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorXAI, AuthType: routing.VendorAuthAPIKey, Name: "No key",
+	})
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want unverifiable", res, err)
+	}
+	fake.requireNoCalls(t, "for an account without a key")
+}
+
+// Fail-soft holds for the compatible vendors too: a listing that cannot be had
+// leaves the rows exactly as they were.
+func TestCompatDiscoveryKeepsTheRowsWhenTheVendorCannotBeVerified(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := compatDiscoveryAccount(t, svc, fake, routing.VendorOpenRouter, "", "")
+	existing := []routing.VendorAccountModel{{GatewayModel: "kept", UpstreamModel: "kept", APIFlavor: routing.APIFlavorOpenAI}}
+	if err := routeStore.SetVendorAccountModels(context.Background(), acc.ID, existing); err != nil {
+		t.Fatal(err)
+	}
+	before := storedModels(t, routeStore, acc.ID)
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want unverifiable", res, err)
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+		t.Fatalf("rows changed to %+v, want %+v", got, before)
+	}
+}
+
+// Gemini lists its models as "models/<id>" but serves and expects the bare id: the
+// preset's StripModelsPrefix is removed from the front of each id before it becomes
+// a row (id, display name and all), so the prefix never reaches a gateway model, an
+// upstream request or the UI. A repeat created by the strip folds into the first
+// row and an id that is nothing but the prefix is dropped.
+func TestGeminiStripRemovesTheModelsPrefix(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.ok(kindOpenAICompatibleAPIKey,
+		discovered("models/gemini-2.5-pro", "models/gemini-2.5-pro"), // the vendor sent no name: the id stood in
+		discovered("models/gemini-2.5-flash", "Gemini 2.5 Flash"),
+		discovered("gemini-bare", "gemini-bare"),
+		discovered("gemini-2.5-pro", "gemini-2.5-pro"), // repeats the first once stripped
+		discovered("models/", "models/"),               // nothing left
+	)
+	acc := compatDiscoveryAccount(t, svc, fake, routing.VendorGoogle, "", "g/")
+
+	dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v", err)
+	}
+	if res.Status != VendorRefreshOK || res.Discovered != 3 || !strings.Contains(res.Detail, "2 unusable") {
+		t.Fatalf("result = %+v, want ok / 3 with 2 dropped", res)
+	}
+	want := []routing.VendorAccountModel{ // the store lists a set by gateway id
+		modelRow(acc.ID, "g/gemini-2.5-flash", "gemini-2.5-flash", routing.APIFlavorOpenAI, "Gemini 2.5 Flash"),
+		modelRow(acc.ID, "g/gemini-2.5-pro", "gemini-2.5-pro", routing.APIFlavorOpenAI, "gemini-2.5-pro"),
+		modelRow(acc.ID, "g/gemini-bare", "gemini-bare", routing.APIFlavorOpenAI, "gemini-bare"),
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want %+v", got, want)
+	}
+	if len(dto.Models) != len(want) {
+		t.Fatalf("dto models = %+v, want %d rows", dto.Models, len(want))
+	}
+}
+
+// Only a preset that asks for the strip gets it: another provider's "models/..." id
+// is an id like any other.
+func TestGeminiStripOnlyAppliesToThePresetThatAsksForIt(t *testing.T) {
+	for _, vendor := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorOpenAICompatible} {
+		t.Run(vendor, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.okSlugs(kindOpenAICompatibleAPIKey, "models/x")
+			baseURL := ""
+			if vendor == routing.VendorOpenAICompatible {
+				baseURL = "https://gw.example.test"
+			}
+			acc := compatDiscoveryAccount(t, svc, fake, vendor, baseURL, "")
+
+			if _, _, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID); err != nil {
+				t.Fatalf("RefreshVendorAccountModels: %v", err)
+			}
+			rows := storedModels(t, routeStore, acc.ID)
+			if len(rows) != 1 || rows[0].UpstreamModel != "models/x" || rows[0].GatewayModel != "models/x" {
+				t.Fatalf("rows = %+v, want the id kept verbatim", rows)
+			}
+		})
+	}
+}
+
+// OpenRouter (~458 models) and Kilo (~390) list more than the old 500-entry bound
+// left room for as they grow; an aggregator catalog is stored whole, up to the
+// (raised) bound, with what lies beyond it counted as dropped.
+func TestAggregatorCapStoresACatalogBeyondTheOldLimit(t *testing.T) {
+	const catalog = 600 // more than the old 500 cap, inside the new one
+	if maxDiscoveredModels < 1000 {
+		t.Fatalf("maxDiscoveredModels = %d, want at least 1000 for aggregator catalogs", maxDiscoveredModels)
+	}
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	slugs := make([]string, 0, catalog)
+	for i := 0; i < catalog; i++ {
+		slugs = append(slugs, fmt.Sprintf("vendor/model-%04d", i))
+	}
+	fake.okSlugs(kindOpenAICompatibleAPIKey, slugs...)
+	acc := compatDiscoveryAccount(t, svc, fake, routing.VendorOpenRouter, "", "or/")
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v", err)
+	}
+	if res.Status != VendorRefreshOK || res.Discovered != catalog || strings.Contains(res.Detail, "unusable") {
+		t.Fatalf("result = %+v, want all %d stored and nothing dropped", res, catalog)
+	}
+	rows := storedModels(t, routeStore, acc.ID)
+	if len(rows) != catalog {
+		t.Fatalf("stored %d rows, want %d", len(rows), catalog)
+	}
+	if last := rows[len(rows)-1]; last.UpstreamModel != fmt.Sprintf("vendor/model-%04d", catalog-1) || last.GatewayModel != "or/"+last.UpstreamModel {
+		t.Fatalf("last row = %+v, want the vendor's last entry under the prefix", last)
+	}
+}
+
+func TestAggregatorCapStillBoundsARunawayListingAndCountsWhatItDropped(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	const extra = 50
+	slugs := make([]string, 0, maxDiscoveredModels+extra)
+	for i := 0; i < maxDiscoveredModels+extra; i++ {
+		slugs = append(slugs, fmt.Sprintf("m-%04d", i))
+	}
+	fake.okSlugs(kindOpenAICompatibleAPIKey, slugs...)
+	acc := compatDiscoveryAccount(t, svc, fake, routing.VendorKilo, "", "")
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil {
+		t.Fatalf("RefreshVendorAccountModels: %v", err)
+	}
+	if res.Status != VendorRefreshOK || res.Discovered != maxDiscoveredModels || !strings.Contains(res.Detail, fmt.Sprintf("%d unusable", extra)) {
+		t.Fatalf("result = %+v, want ok capped at %d with %d reported dropped", res, maxDiscoveredModels, extra)
+	}
+	if rows := storedModels(t, routeStore, acc.ID); len(rows) != maxDiscoveredModels {
+		t.Fatalf("stored %d rows, want %d", len(rows), maxDiscoveredModels)
+	}
+}
+
+// --- best-effort discovery on create -----------------------------------------------
+
+// A freshly created OpenAI-compatible account has no seed (its static catalog is
+// empty), so the create asks the vendor once, best effort, and the account serves
+// the discovered models at once: the stored rows and the returned DTO carry them.
+func TestCompatDiscoveryOnCreateStoresTheDiscoveredModels(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.ok(kindOpenAICompatibleAPIKey, discovered("grok-4", "Grok 4"), discovered("grok-4-mini", "grok-4-mini"))
+
+	req := compatAccountRequest(routing.VendorXAI, "")
+	req.ModelPrefix = "x/"
+	dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), req)
+	if err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+
+	want := []routing.VendorAccountModel{
+		modelRow(dto.ID, "x/grok-4", "grok-4", routing.APIFlavorOpenAI, "Grok 4"),
+		modelRow(dto.ID, "x/grok-4-mini", "grok-4-mini", routing.APIFlavorOpenAI, "grok-4-mini"),
+	}
+	if got := storedModels(t, routeStore, dto.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want %+v", got, want)
+	}
+	served := make([]string, 0, len(dto.Models))
+	for _, m := range dto.Models {
+		served = append(served, m.GatewayModel)
+	}
+	if !reflect.DeepEqual(served, []string{"x/grok-4", "x/grok-4-mini"}) {
+		t.Fatalf("created account serves %v, want the discovered models", served)
+	}
+	call := fake.onlyCall(t)
+	if call.kind != kindOpenAICompatibleAPIKey || call.modelsURL != "https://api.x.ai/v1/models" || call.credential != vendorAccountTestKey {
+		t.Fatalf("call = %+v, want one compatible discovery with the new key at the composed URL", call)
+	}
+	requireNoToken(t, "created account", dto)
+}
+
+// The discovery is best effort: whatever it does, the account is created, with the
+// (empty) seed it already has, and no error. The user can press Refresh later.
+func TestCompatDiscoveryOnCreateNeverFailsTheCreate(t *testing.T) {
+	cases := map[string]fakeDiscoveryResult{
+		"unverifiable":         {status: vendorauth.DiscoveryUnverifiable},
+		"ok but empty":         {status: vendorauth.DiscoveryOK},
+		"ok but nothing valid": {models: []vendorauth.DiscoveredModel{discovered("bad slug", "x")}, status: vendorauth.DiscoveryOK},
+	}
+	for name, result := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.results[kindOpenAICompatibleAPIKey] = result
+
+			dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(routing.VendorOpenRouter, ""))
+			if err != nil {
+				t.Fatalf("CreateVendorAccount: %v, want the account created whatever the discovery says", err)
+			}
+			if _, err := routeStore.VendorAccountByID(context.Background(), dto.ID); err != nil {
+				t.Fatalf("account not stored: %v", err)
+			}
+			if rows := storedModels(t, routeStore, dto.ID); len(rows) != 0 || len(dto.Models) != 0 {
+				t.Fatalf("rows = %+v, dto models = %+v, want none", rows, dto.Models)
+			}
+			fake.onlyCall(t)
+		})
+	}
+}
+
+// A vendor that hangs adds at most the connect-time bound to the create; the account
+// is created, unseeded, without an error.
+func TestCompatDiscoveryOnCreateIsBounded(t *testing.T) {
+	svc, routeStore, _ := newDiscoveryTestService(t)
+	svc.vendorDiscovery.connectTimeout = 100 * time.Millisecond
+	svc.vendorDiscovery.discoverers.OpenAICompatibleAPIKey = func(ctx context.Context, _ *http.Client, _, _ string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		return nil, vendorauth.DiscoveryUnverifiable
+	}
+
+	start := time.Now()
+	dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(routing.VendorKilo, ""))
+	if err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("create took %v, want it bounded by the connect-time discovery timeout", elapsed)
+	}
+	if _, err := routeStore.VendorAccountByID(context.Background(), dto.ID); err != nil {
+		t.Fatalf("account not stored: %v", err)
+	}
+}
+
+// Only a compatible account WITH a key discovers on create: openai/anthropic accounts
+// keep their curated seed (and are not asked), and a key-less compatible account has
+// nothing to ask with.
+func TestCompatDiscoveryOnCreateOnlyRunsForACompatibleAccountWithAKey(t *testing.T) {
+	svc, _, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAIAPIKey, "gpt-5.1")
+	fake.okSlugs(kindAnthropicAPIKey, "claude-opus-5")
+	fake.okSlugs(kindOpenAICompatibleAPIKey, "grok-4")
+
+	createTestVendorAccount(t, svc, ownerToken(), apiKeyAccountRequest("OpenAI key"))
+	createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthAPIKey, Name: "Anthropic key", APIKey: vendorAccountTestKey,
+	})
+	createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorXAI, AuthType: routing.VendorAuthAPIKey, Name: "x.ai without a key",
+	})
+	fake.requireNoCalls(t, "when creating openai/anthropic accounts or a compatible account without a key")
+}
+
+// The discovery runs only once the account is persisted: a refused create (here a
+// Custom endpoint without a base URL) never reaches the vendor.
+func TestCompatDiscoveryOnCreateNeverRunsForARefusedCreate(t *testing.T) {
+	svc, _, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindOpenAICompatibleAPIKey, "grok-4")
+
+	_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(routing.VendorOpenAICompatible, ""))
+	if err == nil {
+		t.Fatal("CreateVendorAccount without a base URL succeeded, want an error")
+	}
+	fake.requireNoCalls(t, "for a refused create")
 }
 
 // --- fail-soft ----------------------------------------------------------------
@@ -1233,7 +1624,7 @@ func TestUpdateVendorAccountModelPrefixAuthorizationAndValidationRunBeforeRelabe
 func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	d := defaults.vendorDiscovery.discoverers
-	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAIUsage == nil {
+	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAICompatibleAPIKey == nil || d.OpenAIUsage == nil {
 		t.Fatalf("defaults = %+v, want every discoverer and the usage fetcher filled with the vendorauth function", d)
 	}
 	if c := defaults.vendorDiscovery.client; c == nil || c.Timeout != 10*time.Second {
@@ -1248,12 +1639,28 @@ func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 		},
 	}})
 	id := injected.vendorDiscovery.discoverers
-	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAIUsage == nil {
+	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAICompatibleAPIKey == nil || id.OpenAIUsage == nil {
 		t.Fatalf("injected = %+v, want the un-injected discoverers and usage fetcher defaulted", id)
 	}
 	id.OpenAIAPIKey(context.Background(), nil, "k")
 	if !openAIKeyCalled {
 		t.Fatal("the injected OpenAI api-key discoverer was replaced by the default")
+	}
+
+	var compatCalled bool
+	compatInjected := NewService(ServiceDeps{VendorDiscoverers: VendorModelDiscoverers{
+		OpenAICompatibleAPIKey: func(_ context.Context, _ *http.Client, modelsURL, _ string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+			compatCalled = modelsURL == "https://gw.example.test/v1/models"
+			return nil, vendorauth.DiscoveryUnverifiable
+		},
+	}})
+	cd := compatInjected.vendorDiscovery.discoverers
+	if cd.OpenAISubscription == nil || cd.OpenAIAPIKey == nil || cd.AnthropicAPIKey == nil {
+		t.Fatalf("injected compatible = %+v, want the other discoverers defaulted", cd)
+	}
+	cd.OpenAICompatibleAPIKey(context.Background(), nil, "https://gw.example.test/v1/models", "k")
+	if !compatCalled {
+		t.Fatal("the injected OpenAI-compatible discoverer was replaced by the default")
 	}
 
 	var usageCalled bool

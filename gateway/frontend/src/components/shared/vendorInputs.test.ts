@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  isValidBaseUrl,
   isValidCodexClientVersion,
   isValidModelPrefix,
   MODEL_PREFIX_MAX_LENGTH,
@@ -78,5 +79,42 @@ describe('isValidCodexClientVersion', () => {
   it('accepts a 64 character version and rejects 65', () => {
     expect(isValidCodexClientVersion(`1${'0'.repeat(63)}`)).toBe(true);
     expect(isValidCodexClientVersion(`1${'0'.repeat(64)}`)).toBe(false);
+  });
+});
+
+describe('isValidBaseUrl', () => {
+  it.each([
+    '',
+    '   ',
+    'https://api.x.ai',
+    'https://openrouter.ai/api',
+    'https://llm.example.com/',
+    'https://llm.internal:8443/proxy/v2',
+    'https://10.0.0.5:8443',
+    'https://[::1]:8443/api',
+    ' https://api.x.ai ',
+    'HTTPS://API.X.AI',
+  ])('accepts %j', (value) => {
+    expect(isValidBaseUrl(value)).toBe(true);
+  });
+
+  it.each([
+    ['plain http', 'http://x.test'],
+    ['no scheme', 'api.x.ai'],
+    ['not a url', 'not-a-url'],
+    ['another scheme', 'ftp://x.test'],
+    ['an empty hostname', 'https://'],
+    ['a port but no hostname', 'https://:443'],
+    ['userinfo with a password', 'https://u:p@x.test'],
+    ['userinfo with a name only', 'https://u@x.test'],
+    ['an empty userinfo', 'https://@x.test'],
+    ['a query', 'https://x.test/?a=1'],
+    ['a bare question mark', 'https://x.test/?'],
+    ['a fragment', 'https://x.test/#f'],
+    ['a bare hash', 'https://x.test/#'],
+    ['a space inside', 'https://x.test/a b'],
+    ['a newline inside', 'https://x.test/a\nb'],
+  ])('rejects a URL with %s', (_why, value) => {
+    expect(isValidBaseUrl(value)).toBe(false);
   });
 });

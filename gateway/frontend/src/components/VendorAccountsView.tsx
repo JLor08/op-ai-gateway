@@ -22,7 +22,12 @@ import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { vendorLabel } from './shared/vendorLabel';
 import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
-import { isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
+import { isValidBaseUrl, isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
+import {
+  defaultBaseUrl,
+  isOpenAICompatibleVendor,
+  OPENAI_COMPATIBLE_VENDORS,
+} from './shared/vendorPresets';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
@@ -33,7 +38,9 @@ type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 // The vendors and authentication types a user can create an account for. An
 // api_key account is created with its key; a subscription account is created
 // disconnected and connected from its detail view (VendorSubscriptionConnect).
-const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic'];
+// openai and anthropic offer both; the OpenAI-compatible vendors (x.ai,
+// OpenRouter, Kilo, Gemini and Custom) are api-key only and carry a base URL.
+const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic', ...OPENAI_COMPATIBLE_VENDORS];
 const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
 
 function authTypeLabel(t: Translation, authType: string): string {
@@ -68,6 +75,13 @@ function hasCredential(account: VendorAccount): boolean {
  * A subscription account has no key: it is created disconnected (the create
  * form then opens its detail view) and connected from the detail view's
  * "connect subscription" panel, which only ever sees `subscription_connected`.
+ *
+ * An OpenAI-compatible account (x.ai, OpenRouter, Kilo, Gemini, Custom) is
+ * api-key only -- the create form hides the authentication select for it -- and
+ * carries a base URL: an optional create-form field (blank = the preset's default
+ * root, shown as the placeholder; required for Custom) validated inline. The base
+ * URL is IMMUTABLE, so the detail view shows it read-only and a save never sends
+ * it.
  *
  * An account may carry a model prefix (an optional input on the create form and
  * the settings panel, validated inline against the shape the backend accepts):
@@ -154,6 +168,17 @@ export function VendorAccountsView({
   // The optional model prefix, as typed (create and detail); trimmed on send.
   const [modelPrefix, setModelPrefix] = useState('');
   const modelPrefixValid = isValidModelPrefix(modelPrefix);
+  // Create only: the root URL of an OpenAI-compatible account, as typed (trimmed
+  // on send; immutable once created, so the detail view never edits it).
+  const [baseUrl, setBaseUrl] = useState('');
+  const baseUrlValid = isValidBaseUrl(baseUrl);
+  const compatVendor = isOpenAICompatibleVendor(vendor);
+  // Custom has no default root, so a blank base URL cannot be created.
+  const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
+  // An OpenAI-compatible vendor is api-key only, whatever the select last said.
+  const createAuthType = compatVendor ? 'api_key' : authType;
+  const baseUrlNote =
+    vendor === 'openai_compatible' ? t.vendorAccountBaseUrlCustomNote : t.vendorAccountBaseUrlNote;
 
   function resetKeyInput() {
     setApiKey('');
@@ -165,6 +190,7 @@ export function VendorAccountsView({
     setVendor('openai');
     setAuthType('api_key');
     setModelPrefix('');
+    setBaseUrl('');
     resetKeyInput();
     setMode('create');
   }
@@ -185,18 +211,30 @@ export function VendorAccountsView({
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
-    // A malformed prefix is already flagged inline; never round-trip it for a 400.
-    if (!modelPrefixValid) return;
+    // A malformed prefix or base URL (or a missing one for Custom) is already
+    // flagged inline; never round-trip it for a 400.
+    if (!modelPrefixValid || !baseUrlValid || baseUrlMissing) return;
     setBusy(true);
     try {
       // An empty prefix is simply omitted (= none).
       const prefix = normalizeModelPrefix(modelPrefix);
       const prefixField = prefix === '' ? {} : { model_prefix: prefix };
+      // The base URL only exists for an OpenAI-compatible vendor; left blank it is
+      // omitted and the backend applies the preset's default root.
+      const base = baseUrl.trim();
+      const baseUrlField = compatVendor && base !== '' ? { base_url: base } : {};
       // A subscription account carries no key: it is created disconnected.
       const created = await api.createVendorAccount(
-        authType === 'subscription'
+        createAuthType === 'subscription'
           ? { vendor, auth_type: 'subscription', name, ...prefixField }
-          : { vendor, auth_type: 'api_key', name, api_key: apiKey, ...prefixField },
+          : {
+              vendor,
+              auth_type: 'api_key',
+              name,
+              api_key: apiKey,
+              ...prefixField,
+              ...baseUrlField,
+            },
       );
       setAccountsData((current) => [...(current ?? []), created]);
       if (created.auth_type === 'subscription') {
@@ -407,7 +445,9 @@ export function VendorAccountsView({
 
   // Create sub-view: vendor + authentication + name, and the (plain, required)
   // api key for an api_key account. A subscription account has no key field: it
-  // is created disconnected and connected from its detail view.
+  // is created disconnected and connected from its detail view. An
+  // OpenAI-compatible vendor has no authentication choice (api key only) and a
+  // base-URL field instead.
   if (mode === 'create') {
     return (
       <>
@@ -426,7 +466,14 @@ export function VendorAccountsView({
               id="vendor-account-vendor"
               label={t.vendorAccountVendorLabel}
               value={vendor}
-              onChange={(e) => setVendor(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                setVendor(next);
+                // The root URL belongs to one vendor: never carry it (or a
+                // subscription choice the new vendor cannot have) across.
+                setBaseUrl('');
+                if (isOpenAICompatibleVendor(next)) setAuthType('api_key');
+              }}
             >
               {VENDORS.map((v) => (
                 <option value={v} key={v}>
@@ -434,22 +481,28 @@ export function VendorAccountsView({
                 </option>
               ))}
             </SelectField>
-            <SelectField
-              id="vendor-account-auth-type"
-              label={t.vendorAccountAuthTypeLabel}
-              value={authType}
-              onChange={(e) => {
-                setAuthType(e.target.value);
-                // Never carry a typed key into a subscription account.
-                resetKeyInput();
-              }}
-            >
-              {AUTH_TYPES.map((a) => (
-                <option value={a} key={a}>
-                  {authTypeLabel(t, a)}
-                </option>
-              ))}
-            </SelectField>
+            {compatVendor ? (
+              <Typography color="text.secondary" variant="body2">
+                {t.vendorAccountApiKeyOnlyNote}
+              </Typography>
+            ) : (
+              <SelectField
+                id="vendor-account-auth-type"
+                label={t.vendorAccountAuthTypeLabel}
+                value={authType}
+                onChange={(e) => {
+                  setAuthType(e.target.value);
+                  // Never carry a typed key into a subscription account.
+                  resetKeyInput();
+                }}
+              >
+                {AUTH_TYPES.map((a) => (
+                  <option value={a} key={a}>
+                    {authTypeLabel(t, a)}
+                  </option>
+                ))}
+              </SelectField>
+            )}
             <Field
               id="vendor-account-name"
               label={t.vendorAccountNameLabel}
@@ -457,6 +510,19 @@ export function VendorAccountsView({
               onChange={(e) => setName(e.target.value)}
               required
             />
+            {compatVendor && (
+              <Field
+                id="vendor-account-base-url"
+                label={t.vendorAccountBaseUrlLabel}
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                autoComplete="off"
+                placeholder={defaultBaseUrl(vendor)}
+                required={vendor === 'openai_compatible'}
+                error={!baseUrlValid}
+                helperText={baseUrlValid ? baseUrlNote : t.errorVendorAccountBaseUrlInvalid}
+              />
+            )}
             <Field
               id="vendor-account-model-prefix"
               label={t.vendorAccountModelPrefixLabel}
@@ -470,7 +536,7 @@ export function VendorAccountsView({
                   : t.errorVendorAccountModelPrefixInvalid
               }
             />
-            {authType === 'subscription' ? (
+            {createAuthType === 'subscription' ? (
               <Typography color="text.secondary" variant="body2">
                 {t.vendorAccountSubscriptionCreateNote}
               </Typography>
@@ -487,7 +553,11 @@ export function VendorAccountsView({
               />
             )}
             <Box sx={{ display: 'flex', gap: 1.5 }}>
-              <Button type="submit" variant="contained" disabled={busy || !modelPrefixValid}>
+              <Button
+                type="submit"
+                variant="contained"
+                disabled={busy || !modelPrefixValid || !baseUrlValid || baseUrlMissing}
+              >
                 {t.vendorAccountCreate}
               </Button>
               <Button type="button" variant="text" color="secondary" onClick={backToList}>
@@ -551,6 +621,16 @@ export function VendorAccountsView({
               onChange={() => undefined}
               readOnly
             />
+            {/* Immutable: fixed when the account was created, never part of a save. */}
+            {isOpenAICompatibleVendor(account.vendor) && (
+              <Field
+                id="vendor-account-detail-base-url"
+                label={t.vendorAccountBaseUrlLabel}
+                value={account.base_url}
+                onChange={() => undefined}
+                readOnly
+              />
+            )}
             <Field
               id="vendor-account-detail-name"
               label={t.vendorAccountNameLabel}

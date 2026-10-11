@@ -39,7 +39,7 @@ func TestRoutingStoreVendorAccountCRUD(t *testing.T) {
 		acc := routing.VendorAccount{
 			ID: "va_one", OwnerUserID: "u_va", Vendor: routing.VendorOpenAI,
 			AuthType: routing.VendorAuthAPIKey, Name: "My OpenAI", Status: routing.VendorAccountStatusActive,
-			APIKey: "enc:seeded", OAuthTokens: "", ModelPrefix: "work/", CreatedAt: now, UpdatedAt: now,
+			APIKey: "enc:seeded", OAuthTokens: "", ModelPrefix: "work/", BaseURL: "https://api.x.ai", CreatedAt: now, UpdatedAt: now,
 		}
 		if err := s.CreateVendorAccount(ctx, acc); err != nil {
 			t.Fatalf("create: %v", err)
@@ -84,8 +84,8 @@ func TestRoutingStoreVendorAccountCRUD(t *testing.T) {
 // store contract the happy-path CRUD test above does not reach, identically on
 // every driver: an unknown id is ErrNotFound on Update and Delete, ownership
 // filtering never leaks another user's accounts, and Update rewrites only the
-// mutable columns -- the account's identity (id, owner, vendor, created_at)
-// survives an Update that tries to change it.
+// mutable columns -- the account's identity (id, owner, vendor, created_at) and
+// its immutable base_url survive an Update that tries to change them.
 func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	seedSQL := func(t *testing.T, s *SQLStore) {
@@ -112,7 +112,7 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		mine := routing.VendorAccount{
 			ID: "va_mine", OwnerUserID: "u_va_a", Vendor: routing.VendorAnthropic,
 			AuthType: routing.VendorAuthAPIKey, Name: "Mine", Status: routing.VendorAccountStatusActive,
-			APIKey: "enc:key", ModelPrefix: "mine/", CreatedAt: now, UpdatedAt: now,
+			APIKey: "enc:key", ModelPrefix: "mine/", BaseURL: "https://api.groq.com", CreatedAt: now, UpdatedAt: now,
 		}
 		theirs := routing.VendorAccount{
 			ID: "va_theirs", OwnerUserID: "u_va_b", Vendor: routing.VendorOpenAI,
@@ -149,6 +149,7 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 		upd.APIKey = ""
 		upd.OAuthTokens = "enc:new-tokens"
 		upd.ModelPrefix = "edited-"
+		upd.BaseURL = "https://rewritten.example.test" // immutable: Update must not write it
 		upd.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpdateVendorAccount(ctx, upd); err != nil {
 			t.Fatalf("update: %v", err)

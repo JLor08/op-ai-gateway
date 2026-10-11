@@ -14,15 +14,15 @@ import (
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them.
-const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, created_at, updated_at`
+const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. A duplicate id is
 // ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
 	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountColumns+`)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.CreatedAt, a.UpdatedAt)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict
@@ -34,8 +34,9 @@ func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorA
 
 // UpdateVendorAccount rewrites the mutable columns of an existing account
 // (auth_type, name, status, api_key, oauth_tokens, model_prefix, updated_at).
-// id, owner_user_id, vendor and created_at are the account's identity and are
-// never written, matching the memory driver. An unknown id is ErrNotFound.
+// id, owner_user_id, vendor and created_at are the account's identity, and
+// base_url is fixed at create; none of them is ever written, matching the
+// memory driver. An unknown id is ErrNotFound.
 func (s *SQLiteStore) UpdateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
 	result, err := s.exec(ctx, `
 		update vendor_accounts
@@ -271,7 +272,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

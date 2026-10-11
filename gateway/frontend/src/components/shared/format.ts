@@ -154,6 +154,12 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // ".." (400, on create and update; the portal validates the same shape before
   // it sends, so this is the backstop for a stale build).
   'vendor_account.model_prefix_invalid': 'errorVendorAccountModelPrefixInvalid',
+  // An OpenAI-compatible account's base URL (400, on create only -- it is
+  // immutable): missing for a Custom account, or not an https URL without
+  // credentials, query and fragment (the portal validates the same shape before
+  // it sends, so `invalid` is the backstop for a stale build).
+  'vendor_account.base_url_required': 'errorVendorAccountBaseUrlRequired',
+  'vendor_account.base_url_invalid': 'errorVendorAccountBaseUrlInvalid',
   // Subscription connect (token import, code-paste and device code): the sentinels of
   // portal/service_vendor_connect.go, wired in the same errRow table. A vendor
   // refusal of the code is a 400 (connect_rejected), never a 401 -- the portal

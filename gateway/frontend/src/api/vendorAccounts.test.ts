@@ -187,6 +187,53 @@ describe('vendorAccountsApi', () => {
     expect(JSON.parse(fetcher.mock.calls[2][1].body)).toEqual({ name: 'Renamed' });
   });
 
+  it('POSTs base_url on a create when one is given, and leaves it out when it is not', async () => {
+    const fetcher = vi.fn().mockImplementation(async () => jsonResponse({ id: 'va_1' }));
+    const api = createPortalApi(fetcher);
+
+    await api.createVendorAccount({
+      vendor: 'openai_compatible',
+      auth_type: 'api_key',
+      name: 'Local gateway',
+      api_key: 'sk-test',
+      base_url: 'https://llm.example.com',
+    });
+    // A preset left on its default root sends no base_url at all.
+    await api.createVendorAccount({
+      vendor: 'xai',
+      auth_type: 'api_key',
+      name: 'Grok',
+      api_key: 'sk-test',
+    });
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({
+      vendor: 'openai_compatible',
+      auth_type: 'api_key',
+      name: 'Local gateway',
+      api_key: 'sk-test',
+      base_url: 'https://llm.example.com',
+    });
+    const preset = JSON.parse(fetcher.mock.calls[1][1].body);
+    expect(preset).toEqual({
+      vendor: 'xai',
+      auth_type: 'api_key',
+      name: 'Grok',
+      api_key: 'sk-test',
+    });
+    expect('base_url' in preset).toBe(false);
+  });
+
+  it('returns the base_url the backend stored on the account', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ id: 'va_1', vendor: 'xai', base_url: 'https://api.x.ai' }));
+    const api = createPortalApi(fetcher);
+
+    const account = await api.vendorAccount('va_1');
+
+    expect(account.base_url).toBe('https://api.x.ai');
+  });
+
   it('POSTs .../models/refresh with the id URL-encoded and no body, and returns the account and outcome', async () => {
     const answer = {
       account: {

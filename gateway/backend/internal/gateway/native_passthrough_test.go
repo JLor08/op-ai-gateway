@@ -699,24 +699,34 @@ func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 // path of the two vendor-account provider kinds: a vendor_anthropic target is
 // served by the native Anthropic client at /v1/messages (not the chat-completions
 // default every other non-ollama provider falls through to), while vendor_openai
-// reuses the OpenAI-compatible client and so stays on /v1/chat/completions. A
+// reuses the OpenAI-compatible client and so stays on {prefix}/chat/completions
+// (the default prefix is /v1; a vendor preset may configure another). A
 // wrong value here mislabels the usage row's provider_path.
 func TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath(t *testing.T) {
 	cases := []struct {
+		name     string
 		provider string
+		prefix   string
 		want     string
 	}{
-		{routing.ProviderVendorAnthropic, "/v1/messages"},
-		{routing.ProviderVendorOpenAI, "/v1/chat/completions"},
+		{"anthropic", routing.ProviderVendorAnthropic, "", "/v1/messages"},
+		{"openai default prefix", routing.ProviderVendorOpenAI, "", "/v1/chat/completions"},
+		// An OpenAI-compatible vendor with a configured prefix is labelled with
+		// the path the provider client actually POSTs (Target.OpenAIPathPrefix).
+		{"openai gemini prefix", routing.ProviderVendorOpenAI, "/v1beta/openai", "/v1beta/openai/chat/completions"},
+		{"openai kilo prefix", routing.ProviderVendorOpenAI, "/gateway", "/gateway/chat/completions"},
+		// A vendor_anthropic target ignores the OpenAI prefix: its client speaks
+		// /v1/messages regardless.
+		{"anthropic ignores openai prefix", routing.ProviderVendorAnthropic, "/gateway", "/v1/messages"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.provider, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			// openai_chat_completions: a flavor with no passthrough mode, so the
 			// provider fallbacks decide.
-			got := upstreamPath(routing.Target{Provider: tc.provider}, "openai_chat_completions")
+			got := upstreamPath(routing.Target{Provider: tc.provider, OpenAIPathPrefix: tc.prefix}, "openai_chat_completions")
 
 			if got != tc.want {
-				t.Fatalf("upstreamPath(%s) = %q, want %q", tc.provider, got, tc.want)
+				t.Fatalf("upstreamPath(%s, prefix %q) = %q, want %q", tc.provider, tc.prefix, got, tc.want)
 			}
 		})
 	}

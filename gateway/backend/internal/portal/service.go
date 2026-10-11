@@ -147,6 +147,13 @@ var (
 	// (the URL-path-safe characters of a model id).
 	ErrVendorAccountModelPrefixInvalid = errors.New("vendor_account.model_prefix_invalid")
 
+	// ErrVendorAccountBaseURLRequired rejects a Custom OpenAI-compatible account
+	// created without a base url (the named presets default theirs).
+	// ErrVendorAccountBaseURLInvalid rejects a base url that is not an https URL
+	// with a host, or that carries userinfo, a query or a fragment.
+	ErrVendorAccountBaseURLRequired = errors.New("vendor_account.base_url_required")
+	ErrVendorAccountBaseURLInvalid  = errors.New("vendor_account.base_url_invalid")
+
 	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
 	// (system setting vendor_accounts_enabled, off by default): every
 	// vendor-account service method returns it, before doing anything, while
