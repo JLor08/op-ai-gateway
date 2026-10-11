@@ -27,9 +27,16 @@ type VendorPreset struct {
 	// StripModelsPrefix, when non-empty, is stripped from the front of each
 	// discovered model id (Gemini's "models/"); "" = keep ids verbatim.
 	StripModelsPrefix string
-	// UsageVia is reserved for sub-project D (per-provider usage/credits). Empty
-	// in sub-project A: no provider reports usage yet.
+	// UsageVia selects the per-provider usage strategy: "openrouter_key"
+	// (GET {BaseURL}{UsagePath} → key limit/usage), "kilo_balance" (best-effort
+	// balance), "" = the provider reports no usage with the stored api key.
 	UsageVia string
+	// UsagePath is the ROOT-relative URL suffix for the usage GET (composed as
+	// TrimRight(BaseURL,"/")+UsagePath), used when UsageVia != "". It is NOT under
+	// PathPrefix: OpenRouter's key endpoint is "/v1/key" and Kilo's undocumented
+	// balance is "/profile/balance" (outside its "/gateway" prefix). "" when the
+	// provider reports no usage.
+	UsagePath string
 }
 
 // vendorPresets is the registry of OpenAI-compatible providers. The keys are the
@@ -47,11 +54,15 @@ var vendorPresets = map[string]VendorPreset{
 		PathPrefix:     "/v1",
 		ValidateVia:    "key", // /v1/models is public; validate against /v1/key
 		ValidatePath:   "/key",
+		UsageVia:       "openrouter_key",
+		UsagePath:      "/v1/key",
 	},
 	VendorKilo: {
 		DefaultBaseURL: "https://api.kilo.ai/api",
 		PathPrefix:     "/gateway",
 		ValidateVia:    "none", // /gateway/models is public and there is no key endpoint
+		UsageVia:       "kilo_balance",
+		UsagePath:      "/profile/balance",
 	},
 	VendorGoogle: {
 		DefaultBaseURL:    "https://generativelanguage.googleapis.com",

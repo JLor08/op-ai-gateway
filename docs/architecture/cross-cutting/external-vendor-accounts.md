@@ -36,7 +36,8 @@ tells a rejected login from a wrong model (§3.5), a small native Anthropic
 Messages client and an OpenAI Responses translate client (`internal/provider`,
 §4), two static dispatch extensions (extra headers + a system-prompt masquerade,
 §4), a usage/limits snapshot fed by the vendor's rate-limit response headers and,
-for an OpenAI subscription, an active usage pull with its own refresh endpoint (§5),
+for an OpenAI subscription and for an OpenRouter or Kilo api key, an active usage
+pull with its own refresh endpoint (§5),
 and a discovery of each account's real model catalog from the vendor, served under
 an optional per-account prefix (§6). Which of a user's accounts each API token may
 use is the token's own, strictly opt-in decision, with an optional per-token
@@ -896,21 +897,37 @@ keyed by vendor id (`VendorPresetFor`, `IsOpenAICompatibleVendor`,
 prefix and routing cannot import the portal; the portal reads the rest to compose
 URLs, and `vendorauth` never sees a preset: it receives plain URL strings. A preset
 carries its default root, its path prefix, how its key is validated, how a
-discovered model id is rewritten, and a reserved, empty usage slot for the later
-usage/credits work (§5.1). The values (live-confirmed 2026-10-10, VERIFY-LIVE, §10):
+discovered model id is rewritten, and its usage strategy (`UsageVia` with the
+root-relative `UsagePath`, below; §5.2). The values (live-confirmed 2026-10-10,
+VERIFY-LIVE, §10; the usage endpoints, checked on 2026-10-11, are
+docs-derived or undocumented, §5.2):
 
-| Vendor id | Default root (stored as `base_url`) | Path prefix | Key probe (§3.5) | Discovered id |
-|---|---|---|---|---|
-| `xai` | `https://api.x.ai` | `/v1` | `GET {base}/v1/models` | verbatim |
-| `openrouter` | `https://openrouter.ai/api` | `/v1` | `GET {base}/v1/key` | verbatim |
-| `kilo` | `https://api.kilo.ai/api` | `/gateway` | none (`unverifiable`) | verbatim |
-| `google` | `https://generativelanguage.googleapis.com` | `/v1beta/openai` | `GET {base}/v1beta/openai/models` | a leading `models/` is stripped |
-| `openai_compatible` | none: the user supplies it | `/v1` | `GET {base}/v1/models` | verbatim |
+| Vendor id | Default root (stored as `base_url`) | Path prefix | Key probe (§3.5) | Discovered id | Usage (`UsageVia` + `UsagePath`, §5.2) |
+|---|---|---|---|---|---|
+| `xai` | `https://api.x.ai` | `/v1` | `GET {base}/v1/models` | verbatim | none |
+| `openrouter` | `https://openrouter.ai/api` | `/v1` | `GET {base}/v1/key` | verbatim | `openrouter_key`, `GET {base}/v1/key` |
+| `kilo` | `https://api.kilo.ai/api` | `/gateway` | none (`unverifiable`) | verbatim | `kilo_balance`, `GET {base}/profile/balance` (best effort) |
+| `google` | `https://generativelanguage.googleapis.com` | `/v1beta/openai` | `GET {base}/v1beta/openai/models` | a leading `models/` is stripped | none |
+| `openai_compatible` | none: the user supplies it | `/v1` | `GET {base}/v1/models` | verbatim | none |
 
 So x.ai serves chat at `https://api.x.ai/v1/chat/completions`, OpenRouter at
 `https://openrouter.ai/api/v1/chat/completions`, Kilo at
 `https://api.kilo.ai/api/gateway/chat/completions` and Gemini at
 `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
+
+**The usage strategy.** `UsageVia` names how the stored api key can be used to ask
+the provider for usage or credits (`openrouter_key`, `kilo_balance`; empty = the
+provider offers no such query with an inference key: x.ai keeps its balance behind
+a separate Management API with its own key, Gemini has no usage API at all, and
+Custom has no standard endpoint). `UsagePath` is the **root-relative** suffix of
+that request, composed as `TrimRight(base_url, "/") + UsagePath` by the portal, so
+`vendorauth` receives a finished URL and stays free of any vendor root. It is
+root-relative, and not relative to the path prefix, because Kilo's balance sits
+under the host root and **outside** its `/gateway` prefix, while OpenRouter's
+`/v1/key` is also expressible from the root and is the very URL its Test
+connection probe asks. The registry is what says which api-key accounts have an
+active usage pull (§5.2): the gate reads `UsageVia != ""`, it keeps no vendor
+list of its own.
 
 **The stored root.** `base_url` is the root without the prefix. At create the
 service defaults it from the preset when it is empty (`openai_compatible` has no
@@ -945,24 +962,29 @@ discovery is `GET {base}{prefix}/models` (§6.1), both with the uniform fail-sof
 classification. A new account has an empty catalog until discovery fills it
 (§6.2).
 
-**Deliberately out of scope.** Usage and credits are not reported for these
-accounts yet (§5.1); the native Gemini dialect (`generateContent` and Gemini-only
+**Deliberately out of scope.** Usage and credits are reported only for OpenRouter
+(its key's limit, per key) and, best effort, Kilo (a balance); x.ai, Google and
+Custom report none (§5.2), and the passive header scrape finds nothing for any of
+them (§5.1); the native Gemini dialect (`generateContent` and Gemini-only
 features) is a later sub-project, Gemini being served meanwhile through its OpenAI
 shim; and the subscription/OAuth path does not exist for them (§2).
 
 ## 5. Usage & limits
 
-Neither vendor exposes an absolute cap on its **rate-limit windows**, so those are
-shown as **percentages and reset times only**. The one absolute figure is the
-**spend-control credit allowance** of a Codex *Business* (workspace) plan, whose
-quota is a number of credits rather than a window: the panel shows it as
-"used / limit Credits" (§5.2, §5.4). Everything lives in one per-account snapshot
-(`vendor_account_usage`) that two independent, best-effort writers fill: a
-**passive header scrape** on every served request (§5.1) and, for an OpenAI
-subscription only, an **active pull** from the vendor's usage endpoint: on its own
-when the account's usage view is opened or refreshed, and as the last step of a
-models refresh or connect (§5.2). Both write through the same **merge rule**
-(§5.3), so neither can blank what the other learned.
+Neither OpenAI nor Anthropic exposes an absolute cap on its **rate-limit windows**,
+so those are shown as **percentages and reset times only**. The absolute figures
+are the **spend-control credit allowance** of a Codex *Business* (workspace) plan,
+whose quota is a number of credits rather than a window, and an **OpenRouter key's
+USD limit**: the panel shows each as "used / limit" with its unit (§5.2, §5.4). Everything
+lives in one per-account snapshot (`vendor_account_usage`) filled by best-effort
+writers: a **passive header scrape** on every served request (§5.1) and an
+**active pull** from the vendor's usage endpoint for an OpenAI subscription or for
+an OpenRouter or Kilo api key: on its own when the account's usage view is opened
+or refreshed, and as the last step of a models refresh, a connect or an
+OpenAI-compatible create (§5.2). The two writers of an OpenAI or Anthropic
+subscription write through the same **merge rule** (§5.3), so neither can blank
+what the other learned; an OpenRouter or Kilo account has the pull as its only
+writer and stores what it fetched, without a merge (§5.2).
 
 ### 5.1 Passive header scraping
 
@@ -988,20 +1010,23 @@ the credit state** (the response headers never carry them): it builds its snapsh
 with `SpendUsedPct = -1` and no spend strings, so the merge (§5.3) keeps whatever
 the active pull stored.
 
-**OpenAI-compatible accounts (§4.4) report no usage yet.** They are `vendor_openai`
+**OpenAI-compatible accounts (§4.4) are never scraped.** They are `vendor_openai`
 targets, so the scrape runs on their responses, but it looks only for the Codex
-`x-codex-*` headers, which these providers do not send: it finds none, writes
-nothing, and the account's snapshot stays empty (unknown, never a fabricated `0`).
-A real per-provider usage and credits fetch is a later sub-project; the preset
-registry has a reserved, empty usage slot for it.
+`x-codex-*` headers, which these providers do not send: it finds none and writes
+nothing. Their snapshot is therefore written by the active pull alone (§5.2) for
+OpenRouter and Kilo, and stays empty (unknown, never a fabricated `0`) for x.ai,
+Google and Custom, which have no usage query with an inference key.
 
-### 5.2 Active pull (OpenAI subscription only)
+### 5.2 Active pull (OpenAI subscription, OpenRouter and Kilo api keys)
 
 The headers arrive only with a served request, so a ChatGPT subscription that has
-not been used lately shows no windows, or old ones. For that one account kind the
-gateway can also **ask** the vendor. An OpenAI `api_key` account (a platform
-account has no subscription window to report) and every Anthropic account have no
-such endpoint; for Anthropic the header scrape stays the only source.
+not been used lately shows no windows, or old ones. For that account kind the
+gateway can also **ask** the vendor, and for an OpenRouter or Kilo `api_key`
+account, whose responses never carry usage headers at all, the pull is the only way
+to learn anything (the api-key pull, below). An OpenAI `api_key` account (a
+platform account has no subscription window to report), every Anthropic account
+and the x.ai, Google and Custom accounts have no such endpoint; for Anthropic the
+header scrape stays the only source.
 
 | Credential | Request | Provenance |
 |---|---|---|
@@ -1080,23 +1105,31 @@ and an empty answer is deliberately not "OK, nothing known", for the reason give
 for discovery (§6.3): it must not be able to wipe a stored snapshot. The response
 is capped at the same 8 MiB as a discovery fetch (§6.4).
 
-**When it runs.** There is **one pull, `fetchVendorUsage`** (the fetch, the merge
-over the stored row and the store write, all fail-soft), and it has two callers.
-Nothing else triggers it: there is no background job and no startup step (a
+**When it runs.** There are **two pulls**, one per credential kind, sharing one
+store tail: `fetchVendorUsage` for an OpenAI subscription (the fetch with its
+token set, then the merge over the stored row and the store write) and
+`fetchCompatibleVendorUsage` for an OpenRouter or Kilo api key (the fetch with the
+opened key, then the store write of the snapshot as fetched, no merge; see the
+api-key pull below). Both are fail-soft and both have the same two callers.
+Nothing else triggers them: there is no background job and no startup step (a
 background refresher is a deferred follow-up, §5.4).
 
 1. **As the last, best-effort step of `RefreshVendorAccountModels`** (§6), so it
    runs wherever that does: on the explicit `POST .../models/refresh` ("Modelle
-   aktualisieren") and, because the connect flows call the same function, at the end
-   of every OpenAI-subscription connect (§6.2).
+   aktualisieren"), at the end of every OpenAI-subscription connect and at the
+   create of an OpenAI-compatible account with its key (§6.2), both of which call
+   the same function. The create-time pull therefore only exists for an OpenRouter
+   or Kilo account created **with** a key.
 2. **On its own, through the dedicated usage refresh** (§5.5), which is what the
    usage panel calls when its account's detail view is opened and when its refresh
    button is pressed. It is the only caller that does not also run the model
    discovery.
 
-Both callers record the attempt as the account's **last active pull** (§5.5), so the
-on-view refresh does not ask the vendor again right after a models refresh or a
-connect. The passive scrape (§5.1) is **not** a pull and records nothing.
+Both callers record the attempt as the account's **last active pull** (§5.5) when
+the vendor was reached, so the on-view refresh does not ask the vendor again right
+after a models refresh or a connect. The models-refresh step itself ignores the
+lazy TTL: it pulls on every models refresh, the way the OpenAI subscription's
+always has. The passive scrape (§5.1) is **not** a pull and records nothing.
 
 As the models-refresh step the pull behaves as follows:
 
@@ -1118,15 +1151,76 @@ As the models-refresh step the pull behaves as follows:
 
 **Time budget.** The explicit models refresh makes up to **two** vendor requests,
 each bounded by the discovery client's 10 seconds (the model list, then usage), so
-it can take about 20 seconds against the server's 30 second write timeout. The
-dedicated usage refresh makes at most one (plus a token renewal when the token had
-expired). The connect flows stay inside their single 5 second budget (§6.2), which
-the usage pull **shares** with the token renewal, the model list and the model
-write: behind a slow model list the budget is spent and the pull degrades to
-`unverifiable`, leaving the snapshot as it was. That is acceptable for an advisory
-number, and the next refresh or served request fills it in.
+it can take about 20 seconds against the server's 30 second write timeout, for an
+OpenRouter or Kilo api key as for an OpenAI subscription. The dedicated usage
+refresh makes at most one (plus a token renewal when the token had expired). The
+connect flows and the OpenAI-compatible create stay inside their single 5 second
+budget (§6.2), which the usage pull **shares** with the token renewal, the model
+list and the model write: behind a slow model list the budget is spent and the
+pull degrades to `unverifiable`, leaving the snapshot as it was. That is
+acceptable for an advisory number, and the next refresh or view fills it in.
+
+#### The api-key pull: OpenRouter and Kilo
+
+An OpenRouter or Kilo `api_key` account is asked with the key the account already
+stores; no second credential is involved
+([ADR-053](../09-architecture-decisions.md#adr-053--usagecredits-for-api-key-vendor-accounts-a-per-preset-usage-strategy-over-the-existing-oauth-only-pull-path)).
+The portal composes the URL from the account's `base_url` and the preset's
+`UsagePath` (§4.4), `routing.VendorPresetFor` supplies the strategy, and the
+fetcher in `internal/vendorauth/compatible_usage.go` (one per strategy, with the
+same no-error-return, `ok` / `unverifiable` shape as the ChatGPT fetch) takes the
+finished URL and the key as a `Bearer` token. The key is never logged or returned
+and a transport error's text is dropped.
+
+| Provider | Request | Maps to | Provenance |
+|---|---|---|---|
+| OpenRouter (`openrouter_key`) | `GET {base}/v1/key` (`https://openrouter.ai/api/v1/key`) with `Authorization: Bearer`; the same URL its Test connection probe asks | a **capped** key (`data.limit` a number): `spend_unit` `USD`, `spend_limit`, `spend_remaining`, `spend_used` (limit minus remaining, never below 0), `spend_used_pct` (0..100, only for a positive limit) and `credit_status` (`has_credits` while the remaining amount is above 0, else `none`; unknown when `limit_remaining` is absent). An **unlimited** key (`data.limit` an explicit `null`): `credit_status = unlimited` and every spend field left empty, so the panel reads "Unlimited" | **REVERSE-ENGINEERED / VERIFY-LIVE**: the shape is derived from OpenRouter's documentation, no live key was available |
+| Kilo (`kilo_balance`) | `GET {base}/profile/balance` (`https://api.kilo.ai/api/profile/balance`, under the **root**, not under `/gateway`) with `Authorization: Bearer` | `credit_balance` (the balance as a plain decimal) and `credit_status` (`has_credits` while above 0, else `none`); `spend_unit` stays empty because the unit is not documented and is not asserted | **Best effort, undocumented**: the endpoint is read off Kilo's own client, which calls it with an OAuth access token, and it is **unconfirmed** that the api-key type the gateway stores is accepted at all |
+
+Three things are worth knowing about what these figures mean.
+
+- **OpenRouter reports the KEY, not the account.** `/v1/key` answers the limit and
+  usage of the one key the gateway holds, in USD. It is not an account balance
+  (that needs a management key, which the gateway never asks for), so
+  `credit_balance` stays empty. A key without a cap is shown as "Unlimited"; the
+  all-time `usage` figure the body also carries is deliberately not shown beside
+  it, since it would read as a period figure. The richer OpenRouter fields
+  (`usage_daily`, `usage_weekly`, `usage_monthly`, the free-tier counters, BYOK)
+  have no home in the snapshot and are not stored (deferred, they would need new
+  columns).
+- **Kilo degrades quietly.** A 401, 403 or 404, a redirect, a body without a
+  numeric `balance`, or a balance that is not a plausible number is
+  `unverifiable`: the panel keeps its empty-state line and nothing is raised. That
+  is the expected outcome while the key type is unconfirmed, not a fault.
+- **Money is a plain decimal string.** Amounts are rendered without exponent or
+  float noise (rounded to six places), so the panel can reformat the used amount
+  and show the limit verbatim.
+
+**Stored as fetched, not merged.** Unlike a subscription's snapshot (§5.3), an
+api-key account's usage row is **replaced** by what the pull learned. Its pull is
+the row's only writer (the scrape writes nothing for these accounts, §5.1), so
+the merge's "an unknown incoming field is no news" rule has nothing to protect,
+and it would keep showing the old limit and spend of a key whose cap the owner has
+since removed: a merge cannot express "now absent". A failed pull, on the other
+hand, writes nothing: the last good snapshot stays, as for every other pull.
+
+**What the gate and the request path do.** `hasActiveVendorUsagePull` is true for
+an OpenAI subscription and for an `api_key` account whose preset names a
+`UsageVia` (OpenRouter, Kilo); the native OpenAI and Anthropic api-key accounts are
+not in the preset registry and stay false. The dedicated refresh (§5.5) branches
+**before** the OAuth token step, which would answer "not connected" for an account
+that has no token set. An api-key account with **no key set** answers
+`unverifiable` ("no API key is set"); one whose stored key **cannot be opened**
+answers the documented `409 vendor_account.credential_unreadable`, not
+`unverifiable`, exactly as for a subscription's token set. In the trailing pull of
+a models refresh an unreadable or missing key is simply skipped, the refresh
+having already said so.
 
 ### 5.3 The merge rule
+
+This rule governs the two writers of an **OpenAI or Anthropic subscription's**
+snapshot, the scrape and the pull. An OpenRouter or Kilo api-key account's snapshot
+has a single writer and does not use it: its pull stores what it fetched (§5.2).
 
 `UpsertVendorAccountUsage` replaces the whole row, and each writer sees only part of
 the picture: the OpenAI scrape carries the credit balance only when the response
@@ -1214,8 +1308,10 @@ this account yet.") instead of vanishing, so the refresh button (below) stays
 reachable; the line is held back only while the first read of the snapshot is still
 in flight, and a failed read of the snapshot also leaves the frame with that line
 rather than a toast. An
-`api_key` account normally has no snapshot at all, since its responses carry none of
-the headers of §5.1, so it shows the empty-state line. A window the vendor did not
+`api_key` account has no snapshot from the scrape, since its responses carry none of
+the headers of §5.1: an OpenRouter or Kilo account gets one from the active pull
+(§5.2), and the others (x.ai, Google, Custom, a native OpenAI or Anthropic key)
+show the empty-state line. A window the vendor did not
 report (`-1`, never observed) has **no row at all** — it is hidden, not drawn as
 "no data" and never as a real 0 % (a real `0` is a known value and is shown). The
 rows are therefore a subset of: the five-hour window, the weekly window and one
@@ -1223,9 +1319,9 @@ credit row. The credit side is **one row, chosen by priority**:
 
 | Snapshot | Row |
 |---|---|
-| spend control known (`spend_used_pct ≥ 0`, or a non-empty `spend_limit` or `spend_used`) | "Credit-Kontingent" (English: "Credit allowance"): `<used> / <limit> Credits (<pct> %)` with a progress bar and the reset line (`spend_reset_at`); the panel's intro text switches to its spend variant |
-| else `credit_status = "unlimited"` | the same "Credit-Kontingent" label with the value "Unbegrenzt" (English: "Unlimited") |
-| else a non-empty `credit_balance` | "Guthaben" (English: "Credit balance") with the vendor's raw string |
+| spend control known (`spend_used_pct ≥ 0`, or a non-empty `spend_limit` or `spend_used`): a Business plan's credits, or an OpenRouter key's USD limit | "Credit-Kontingent" (English: "Credit allowance"): `<used> / <limit> <unit> (<pct> %)` with a progress bar and the reset line (`spend_reset_at`); the panel's intro text switches to its pulled-figures variant, which also applies to the two rows below |
+| else `credit_status = "unlimited"` (an OpenRouter key without a cap, or an unlimited plan) | the same "Credit-Kontingent" label with the value "Unbegrenzt" (English: "Unlimited") |
+| else a non-empty `credit_balance` (Kilo's balance, or a plan that reports one) | "Guthaben" (English: "Credit balance") with the vendor's raw string |
 | else `credit_status = "none"` | the same label with the value "Keine Credits" (English: "No credits") |
 | else (`has_credits`, which has nothing more to say, or unknown) | no credit row |
 
@@ -1233,7 +1329,11 @@ Display details of the spend row: the used amount is reformatted (at most one
 decimal, the portal locale's decimal separator, no digit grouping) when it is a plain
 decimal, and shown exactly as the vendor sent it otherwise; the limit is always
 shown as the vendor sent it. A unit of `credit` / `credits` (any case) or none reads
-"Credits", any other unit is shown as the vendor named it. The percent is rounded and
+"Credits", any other unit (OpenRouter's `USD`) is shown as the vendor named it. The
+at-most-one-decimal rounding is made for credits: a USD amount under a dollar
+loses its cents in the used figure (0.42 reads "0,4"), while the limit stays exact.
+Showing currency to the cent is a deferred follow-up
+([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)). The percent is rounded and
 capped at 100; the bar turns amber from 75 % and red from 90 %, and is left off
 (with the text kept) when the percent is unknown. A missing half degrades to
 "`<used>` Credits used" or "Limit: `<limit>` Credits", and an unknown percent leaves
@@ -1245,8 +1345,9 @@ its credit row, with no empty window placeholders. Under the rows the panel prin
 "Zuletzt aktualisiert: …" ("Last updated: …") from `updated_at`, which is the time of
 the last write, not a per-field freshness (§5.3).
 
-**Refreshing it from the panel.** For the one account the gateway can actively ask — a
-connected **OpenAI subscription** — the panel's frame also carries an "Aktualisieren"
+**Refreshing it from the panel.** For an account the gateway can actively ask — a
+connected **OpenAI subscription**, or an **OpenRouter or Kilo `api_key` account with
+a key stored** — the panel's frame also carries an "Aktualisieren"
 button ("Refresh") that calls the dedicated refresh with `?force=1` (§5.5), shows the
 answer inline by its `status` (an answer the gateway delivered is not an error:
 `ok` and `fresh` read as a success, "Nutzung aktualisiert"; `unverifiable` reads as a
@@ -1256,8 +1357,12 @@ the provider), and re-reads the snapshot; a call that itself failed is a toast. 
 same account also gets **one on-view-lazy refresh** (the plain call, no `force`) when
 its detail view opens, so figures that went stale while nobody looked are renewed
 without a click; it is best effort, its failure is silent and it never loops or
-polls. Every other account (an `api_key`, an Anthropic subscription) gets neither the
-button nor the call: it learns its usage only from the requests it serves.
+polls. Every other account (an x.ai, Google, Custom or native `api_key`, an Anthropic
+subscription) gets neither the button nor the call: it learns its usage only from
+the requests it serves. The frontend names the two api-key vendors itself
+(`hasActiveUsagePull`), mirroring the registry's `UsageVia`; the backend registry
+is the authority, so a drift between the two only shows or hides a button, and the
+backend still answers `unsupported` for an account it cannot ask.
 
 **On the dashboard.** The portal dashboard has a flag-gated section "Anbieter —
 Nutzung & Limits" (English "Providers — usage & limits") that shows the user's own
@@ -1277,9 +1382,10 @@ shows only what the gateway has already learned, its figures move with the serve
 requests and the active pulls (§5.5), not with the vendor's own changes.
 
 **Deferred.** API-key accounts carry no subscription window; absolute €/$ spend
-accounting is deferred. A **background refresher** — a periodic active pull that would
-keep every OpenAI-subscription account's snapshot current without anyone opening its
-view — is deliberately **not** built, and would be an opt-in, default-off follow-up. The
+accounting is deferred, and so are OpenRouter's period and free-tier figures and a
+Kilo organization's balance. A **background refresher** — a periodic active pull
+that would keep every OpenAI-subscription or OpenRouter/Kilo account's snapshot
+current without anyone opening its view — is deliberately **not** built, and would be an opt-in, default-off follow-up. The
 usage endpoint is reverse-engineered and ToS-restricted like the rest of the
 subscription path (§10), so the gateway asks it only when a person looks (§5.5:
 human-correlated and capped by the TTL), never on an idle timer: the usage is
@@ -1290,7 +1396,8 @@ connected.
 
 `POST /api/portal/vendor-accounts/{id}/usage/refresh` (no body;
 [API Surface](../reference/api-surface.md#vendor-accounts-anbieter)) pulls an OpenAI
-subscription's usage **without re-listing the models**, so the usage panel can keep
+subscription's or an OpenRouter or Kilo api key's usage **without re-listing the
+models**, so the usage panel can keep
 its figures current on its own (`RefreshVendorAccountUsage`,
 `internal/portal/service_vendor_usage_refresh.go`). It is **owner-only, system scope
 included** (it opens the owner's sealed credential and sends it to the vendor, so it
@@ -1322,22 +1429,25 @@ merged write is idempotent).
 
 | `refresh.status` | Meaning |
 |---|---|
-| `ok` | The vendor was asked, answered usably and the snapshot was stored (merged, §5.3). |
+| `ok` | The vendor was asked, answered usably and the snapshot was stored (merged, §5.3, for an OpenAI subscription; as fetched for an api-key account, §5.2). |
 | `fresh` | The lazy TTL skipped the pull; the vendor was **not** called. It says the pull was skipped, not that the data is current: the last attempt may have failed, so the stored snapshot can be older than the TTL, or `usage` can be `null`. |
-| `unverifiable` | Nothing usable could be had: no usable token, the vendor unreachable or answering with an error or an unusable body, or a snapshot that could not be stored. The stored snapshot is kept. It says nothing about the credential (only the dispatch moves an account to `needs_reconnect`, §3.4). |
-| `unsupported` | Not an OpenAI subscription: an `api_key` account of either vendor and an Anthropic subscription have no active pull, their snapshot only ever comes from the scrape. No credential is opened. |
+| `unverifiable` | Nothing usable could be had: no usable token, or no API key set, the vendor unreachable or answering with an error or an unusable body (Kilo's undocumented balance endpoint is expected to do so while the stored key type is unconfirmed), or a snapshot that could not be stored. The stored snapshot is kept. It says nothing about the credential (only the dispatch moves an account to `needs_reconnect`, §3.4). |
+| `unsupported` | Neither an OpenAI subscription nor an OpenRouter or Kilo api key: a native OpenAI or Anthropic `api_key` account, an x.ai, Google or Custom account and an Anthropic subscription have no active pull; their snapshot, when they have one, only comes from the scrape (§5.1). No credential is opened. |
 
 `refresh.detail` is a short English phrase for diagnostics; the portal keys off
 `status` only. The endpoint is **fail-soft** like the models refresh: an
 unreachable vendor is a `200` with `unverifiable`, never an error. The only errors
 are a stranger's or unknown id (`404`, no existence leak), the master flag off
 (`409`), a stored credential that cannot be opened (`409
-vendor_account.credential_unreadable`) and a store failure (`500
+vendor_account.credential_unreadable`: a subscription's token set or an api-key
+account's key; an api-key account with **no** key set is `unverifiable`, not this)
+and a store failure (`500
 vendor_account.usage_refresh_failed`).
 
 **What the portal does with it.** The usage panel (§5.4) calls the plain form once
-when an OpenAI-subscription account's detail view opens — a cheap stored read while
-the TTL holds — and the `?force=1` form from its refresh button. Nothing polls it.
+when the detail view of an account it can ask (an OpenAI subscription, an OpenRouter
+or Kilo api key) opens — a cheap stored read while the TTL holds — and the `?force=1`
+form from its refresh button. Nothing polls it.
 
 ## 6. Dynamic model discovery and the model prefix
 
@@ -1406,15 +1516,17 @@ account keeps its static seed.
 - **At create (OpenAI-compatible).** Creating an OpenAI-compatible account **with
   its key** runs the same discovery once, best-effort and under the same 5-second
   bound, because these accounts have no static seed and would otherwise serve
-  nothing until the first refresh. It never fails the create: whatever goes wrong
+  nothing until the first refresh. For OpenRouter and Kilo the trailing usage pull
+  of §5.2 rides along inside the same bound, so a new account can show its limit or
+  balance at once. It never fails the create: whatever goes wrong
   is logged without the key and the account keeps its empty catalog. An account
   created without a key, or whose key is set or replaced later through the update
   request, does not discover by itself; the refresh below is how it fills.
 - **On demand.** `POST /api/portal/vendor-accounts/{id}/models/refresh` — the
   "Modelle aktualisieren" button of the account's Models panel in the detail view
   — runs the same discovery and may wait for the vendor client's own 10 second
-  timeout, twice for an OpenAI subscription (the model list, then the usage pull
-  of §5.2; [API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
+  timeout, twice for an OpenAI subscription or an OpenRouter or Kilo api key (the
+  model list, then the usage pull of §5.2; [API Surface](../reference/api-surface.md#vendor-accounts-anbieter)).
   An `api_key` account has no connect step, so this is how it leaves the static
   seed.
 - **Never otherwise.** No request path, background job or startup step runs a
@@ -1725,6 +1837,19 @@ reasons are recorded deliberately, not in denial of them
   gateway can be pointed at any https host
   (server-side request forgery is accepted, with its limits,
   [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **The OpenRouter and Kilo usage endpoints are the least certain data in the
+  registry (§5.2).** OpenRouter's `GET {base}/v1/key` is a documented endpoint, but
+  its response shape was derived from the documentation and has not been confirmed
+  against a live key, so the parser is tolerant (a field of the wrong type is
+  skipped, a body with nothing usable is `unverifiable`) and the shape is marked
+  REVERSE-ENGINEERED / VERIFY-LIVE. It reports the **key's** limit and usage, not
+  the account's credit balance. Kilo's `GET {base}/profile/balance` is
+  **undocumented**, read off Kilo's own client (which sends an OAuth access token),
+  and it is not known whether the api-key type the gateway stores is accepted; the
+  fetch is best effort and every failure degrades to the panel's empty-state line.
+  Both sit as data in the registry (`UsageVia`, `UsagePath`), so a correction is an
+  edit of the table and its test
+  ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 - **Single-process assumptions.** The pending-connect state (PKCE verifier/state
   and the device-code pending entry), the per-account refresh lock and the
   per-account model-write lock (§6.4) are all **in-process**: a gateway restart
@@ -1902,3 +2027,6 @@ enabled vendor accounts is affected.
 - [ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)
   — OpenAI-compatible vendors as presets over one OpenAI client: the registry, the
   stored root, the path prefix and the owner-supplied base-URL trust model.
+- [ADR-053](../09-architecture-decisions.md#adr-053--usagecredits-for-api-key-vendor-accounts-a-per-preset-usage-strategy-over-the-existing-oauth-only-pull-path)
+  — usage/credits for api-key vendor accounts: the per-preset usage strategy, its
+  root-relative path and the single-writer store of the api-key pull.

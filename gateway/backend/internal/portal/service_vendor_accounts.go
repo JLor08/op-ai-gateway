@@ -41,19 +41,23 @@ type VendorAccountModelDTO struct {
 }
 
 // VendorAccountUsageDTO is the portal view of a routing.VendorAccountUsage: the
-// latest rate-limit snapshot the gateway scraped off the account's upstream
-// responses. It carries percentages and reset times only -- neither vendor
-// exposes an absolute cap, so there is deliberately no "N of M". A percentage is
-// 0..100, or -1 when that window is UNKNOWN (never observed): the portal must
-// not read -1 as a real 0 % used. A reset time is nil when the vendor sent none;
-// CreditBalance is the vendor's raw credit string ("" = none).
+// latest usage snapshot of a vendor account, scraped off its upstream responses
+// and/or pulled from the vendor (an OpenAI subscription's, an OpenRouter or Kilo
+// api key's). The rate-limit windows carry percentages and reset times only --
+// neither OpenAI nor Anthropic exposes an absolute window cap, so there is
+// deliberately no "N of M" for them. A percentage is 0..100, or -1 when that
+// window is UNKNOWN (never observed): the portal must not read -1 as a real 0 %
+// used. A reset time is nil when the vendor sent none; CreditBalance is the
+// vendor's raw credit string ("" = none; Kilo's balance).
 //
-// A Business plan's spend control and credit state (#195) ride along: SpendUnit
-// (e.g. "credit") and the vendor's raw SpendLimit / SpendUsed / SpendRemaining
-// strings (never parsed, so the exact digits survive), SpendUsedPct (0..100, or -1
-// = unknown, like the windows), SpendResetAt (nil = unknown) and CreditStatus
-// ("unlimited" | "has_credits" | "none", "" = unknown). Every one is always on the
-// wire; an account with no spend control reads "" / -1 / null.
+// The absolute amounts ride in the spend fields and CreditStatus, which a Business
+// plan's spend control (#195) and an OpenRouter key's USD limit both fill:
+// SpendUnit (e.g. "credit", "USD") and the vendor's raw SpendLimit / SpendUsed /
+// SpendRemaining strings (never parsed by the portal, so the exact digits survive),
+// SpendUsedPct (0..100, or -1 = unknown, like the windows), SpendResetAt (nil =
+// unknown) and CreditStatus ("unlimited" | "has_credits" | "none", "" = unknown;
+// an OpenRouter key without a cap is "unlimited" with the spend strings empty).
+// Every one is always on the wire; an account with none of this reads "" / -1 / null.
 type VendorAccountUsageDTO struct {
 	FiveHourPct     float64    `json:"five_hour_pct"`
 	FiveHourResetAt *time.Time `json:"five_hour_reset_at"`

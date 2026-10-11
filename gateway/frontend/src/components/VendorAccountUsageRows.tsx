@@ -104,8 +104,10 @@ function spendUnit(t: Translation, raw: string): string {
 
 /**
  * Spend control is present when the vendor reported a percentage or an amount.
- * The detail panel picks its intro sentence by it: the spend-control credits carry
- * amounts, which the "percentages only" intro would contradict.
+ * The detail panel picks its intro sentence by it (and by a pulled balance or an
+ * "unlimited" state, see isPulledSnapshot): amounts, such as the spend-control
+ * credits or an OpenRouter key's USD limit, would contradict the "percentages only"
+ * intro.
  */
 export function hasSpendControl(usage: VendorAccountUsage): boolean {
   return (
@@ -223,8 +225,9 @@ export function visibleUsageRows(usage: VendorAccountUsage | null | undefined): 
  * It carries no `Panel`, no title and no landmark: the caller supplies the frame
  * (the detail view's titled panel, a dashboard card) and is expected to show its own
  * empty state, because with no visible row this renders nothing at all. The windows
- * are PERCENTAGES ONLY (neither vendor publishes an absolute cap); only the
- * spend-control credits carry amounts. `dense` tightens the spacing and the bars for
+ * are PERCENTAGES ONLY (neither OpenAI nor Anthropic publishes an absolute cap); only
+ * the credit row carries amounts (a Business plan's credits, an OpenRouter key's USD
+ * limit, a Kilo balance). `dense` tightens the spacing and the bars for
  * a compact card; `now` is injectable so the countdowns are deterministic in tests.
  */
 export function VendorAccountUsageRows({

@@ -3,7 +3,10 @@
 
 package routing
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsOpenAICompatibleVendor(t *testing.T) {
 	compat := []string{VendorXAI, VendorOpenRouter, VendorKilo, VendorGoogle, VendorOpenAICompatible}
@@ -84,5 +87,34 @@ func TestVendorPresetValidateVia(t *testing.T) {
 	}
 	if p, _ := VendorPresetFor(VendorGoogle); p.StripModelsPrefix != "models/" {
 		t.Errorf("google StripModelsPrefix = %q, want models/", p.StripModelsPrefix)
+	}
+}
+
+func TestVendorPresetUsage(t *testing.T) {
+	cases := map[string]struct {
+		wantVia string
+		wantURL string // composed: TrimRight(DefaultBaseURL,"/") + UsagePath; "" when no usage
+	}{
+		VendorOpenRouter:       {"openrouter_key", "https://openrouter.ai/api/v1/key"},
+		VendorKilo:             {"kilo_balance", "https://api.kilo.ai/api/profile/balance"},
+		VendorXAI:              {"", ""},
+		VendorGoogle:           {"", ""},
+		VendorOpenAICompatible: {"", ""},
+	}
+	for vendor, c := range cases {
+		p, ok := VendorPresetFor(vendor)
+		if !ok {
+			t.Fatalf("VendorPresetFor(%q) ok=false", vendor)
+		}
+		if p.UsageVia != c.wantVia {
+			t.Errorf("%s UsageVia = %q, want %q", vendor, p.UsageVia, c.wantVia)
+		}
+		got := ""
+		if p.UsagePath != "" {
+			got = strings.TrimRight(p.DefaultBaseURL, "/") + p.UsagePath
+		}
+		if got != c.wantURL {
+			t.Errorf("%s usage URL = %q, want %q", vendor, got, c.wantURL)
+		}
 	}
 }

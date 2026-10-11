@@ -1369,24 +1369,28 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     post:
       tags: [portal]
-      summary: Refresh the account's usage snapshot from the vendor (OpenAI subscription only)
+      summary: Refresh the account's usage snapshot from the vendor (OpenAI subscription, OpenRouter and Kilo api keys)
       description: >
         No request body. Pulls the account's usage snapshot from the vendor
         without re-listing its models and answers the stored snapshot as it is
         after the pull, plus a VendorUsageRefreshResult. Only an OpenAI
-        subscription has an active pull; any other account answers
-        refresh.status unsupported and no credential is opened. Without a query
+        subscription and an OpenRouter or Kilo api-key account have an active
+        pull (OpenRouter asks GET {base_url}/v1/key for the key's own limit and
+        usage in USD, Kilo asks the undocumented GET {base_url}/profile/balance
+        for a credit balance, best effort); any other account answers
+        refresh.status unsupported and no credential is opened. An api-key
+        account with no key set answers unverifiable. Without a query
         it is the on-view-lazy call: when the account's last active pull (held
         in memory per account, recorded only when the vendor was actually
         reached) is younger than the server's TTL of 5 minutes the vendor is not
         asked and the answer is fresh. force=1 (the manual refresh button)
         bypasses the TTL and always asks. An expired subscription token is
-        renewed first through the gateway's own locked token refresh.
-        Fail-soft: a vendor that cannot be asked is a 200 with refresh.status
+        renewed first through the gateway's own locked token refresh; an
+        api-key account has nothing to renew. Fail-soft: a vendor that cannot be asked is a 200 with refresh.status
         unverifiable and the stored snapshot kept. Strictly owner-only (system
         scope included); a non-owner gets the same 404 as an unknown id. A
-        stored credential that cannot be opened is a 409
-        vendor_account.credential_unreadable; an uncategorized failure (a store
+        stored credential (a token set or an api key) that cannot be opened is
+        a 409 vendor_account.credential_unreadable; an uncategorized failure (a store
         error) is a 500 vendor_account.usage_refresh_failed.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       parameters:
@@ -2272,7 +2276,9 @@ components:
         otherwise); also the usage of the usage-refresh answer. The rate-limit
         windows are percentages and reset times only; a Codex Business plan's
         spend control and credit state ride along as the spend_* fields and
-        credit_status. Every field is always on the wire, with an unknown one
+        credit_status, and so does an OpenRouter key's USD limit (spend_unit
+        USD; a key without a cap reads credit_status unlimited). A Kilo
+        balance rides in credit_balance. Every field is always on the wire, with an unknown one
         reading -1 (a percent), null (a time) or "" (a string), never a
         fabricated 0. A client shows only the limits it knows (a -1 window is
         hidden, not drawn as zero).
@@ -2304,15 +2310,18 @@ components:
           type: string
           enum: [ok, fresh, unverifiable, unsupported]
           description: >
-            ok - the vendor was asked and the snapshot was stored. fresh - the
+            ok - the vendor was asked and the snapshot was stored (merged for
+            an OpenAI subscription, as fetched for an OpenRouter or Kilo api
+            key). fresh - the
             lazy TTL (the account's last active pull was younger than 5 minutes)
             skipped the pull: the vendor was not called and the stored snapshot
             is answered as it is (never with ?force=1). unverifiable - nothing
-            usable could be had (no usable token, vendor unreachable or
-            unusable answer, snapshot not storable); the stored snapshot was
-            kept; says nothing about the credential. unsupported - the account
-            has no active usage pull (only an OpenAI subscription has one); no
-            credential was opened.
+            usable could be had (no usable token or no api key set, vendor
+            unreachable or unusable answer, snapshot not storable); the stored
+            snapshot was kept; says nothing about the credential. unsupported -
+            the account has no active usage pull (only an OpenAI subscription
+            and an OpenRouter or Kilo api key have one); no credential was
+            opened.
         detail:
           type: string
           description: Short English phrase (what happened, or why nothing was pulled). Never a credential or vendor text; key off status, not this.

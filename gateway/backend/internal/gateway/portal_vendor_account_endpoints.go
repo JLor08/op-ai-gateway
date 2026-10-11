@@ -284,10 +284,11 @@ func vendorUsageForce(r *http.Request) bool {
 // lazy TTL ago the vendor is not asked and the stored snapshot is answered with
 // refresh.status "fresh". ?force=1 (the button) bypasses the TTL and always asks.
 // It is fail-soft: a vendor that cannot be asked, or an account with no usable
-// token, leaves the stored snapshot as it was and is still a 200, with
+// token or API key, leaves the stored snapshot as it was and is still a 200, with
 // refresh.status "unverifiable" and the reason in refresh.detail; an account with
-// no active pull (anything but an OpenAI subscription) is a 200 "unsupported" and
-// opens no credential. The request has no body and no credential is ever returned.
+// no active pull (anything but an OpenAI subscription or an OpenRouter/Kilo
+// api-key account) is a 200 "unsupported" and opens no credential. The request has
+// no body and no credential is ever returned.
 // Owner-only and gated by the vendor_accounts_enabled master flag (both in
 // portal.Service): any other principal gets the same 404 as an unknown id; a stored
 // credential that cannot be opened is a 409 vendor_account.credential_unreadable.

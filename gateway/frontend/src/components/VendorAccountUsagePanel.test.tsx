@@ -315,6 +315,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByText(t.vendorUsageIntroSpend)).not.toBeInTheDocument();
       });
 
+      it.each([
+        ['a credit balance (an OpenRouter or Kilo pull)', { credit_balance: '12.34' }],
+        ['an unlimited credit state', { credit_status: 'unlimited' }],
+      ] as const)(
+        'also uses the pull-based intro for a balance-only snapshot with %s',
+        (_name, credit) => {
+          renderPanel(makeUsage({ five_hour_pct: -1, weekly_pct: -1, ...credit }));
+          expect(screen.getByText(t.vendorUsageIntroSpend)).toBeInTheDocument();
+          expect(screen.queryByText(t.vendorUsageIntro)).not.toBeInTheDocument();
+        },
+      );
+
+      it.each([
+        ['no credit data', {}],
+        ['only a has_credits flag', { credit_status: 'has_credits' }],
+        ['only a none flag', { credit_status: 'none' }],
+      ] as const)(
+        'keeps the per-request intro for a window-only snapshot with %s',
+        (_name, credit) => {
+          renderPanel(makeUsage(credit));
+          expect(screen.getByText(t.vendorUsageIntro)).toBeInTheDocument();
+          expect(screen.queryByText(t.vendorUsageIntroSpend)).not.toBeInTheDocument();
+        },
+      );
+
       it('formats the used amount to one decimal in the portal locale, without a thousands separator', () => {
         renderPanel(makeBusinessUsage({ spend_used: '1500.25' }));
         expect(screen.getByText(spend.fractional)).toBeInTheDocument();
