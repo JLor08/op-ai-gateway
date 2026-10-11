@@ -52,8 +52,9 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
   subscription_connected: false,
 };
 
-// A connected OpenAI subscription: the one kind of account the gateway can actively
-// ask for its usage (the refresh button and the on-view refresh).
+// A connected OpenAI subscription: one kind of account the gateway can actively ask
+// for its usage (the refresh button and the on-view refresh); an OpenRouter or Kilo
+// api key is the other.
 const OPENAI_SUBSCRIPTION: Partial<VendorAccount> = {
   id: 'va_oai_sub',
   vendor: 'openai',
@@ -2490,6 +2491,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
           'va_sub',
         ],
+        [
+          'an x.ai api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'xai', auth_type: 'api_key' }),
+          'va_key',
+        ],
+        [
+          'a Google api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'google', auth_type: 'api_key' }),
+          'va_key',
+        ],
+        [
+          'an OpenAI-compatible api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'openai_compatible', auth_type: 'api_key' }),
+          'va_key',
+        ],
+        [
+          'an OpenRouter account whose api key is not set',
+          makeVendorAccount({
+            id: 'va_key',
+            vendor: 'openrouter',
+            auth_type: 'api_key',
+            api_key_set: false,
+          }),
+          'va_key',
+        ],
       ])('hides the button for %s, which has no active usage pull', async (_name, account) => {
         renderView({
           accounts: [account],
@@ -2501,6 +2527,57 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
         expect(usageButton()).not.toBeInTheDocument();
       });
+
+      it.each(['openrouter', 'kilo'] as const)(
+        'shows the button for a %s api-key account, which the gateway can ask for its usage',
+        async (vendor) => {
+          const account = makeVendorAccount({
+            id: 'va_key',
+            vendor,
+            auth_type: 'api_key',
+            api_key_set: true,
+          });
+          renderView({
+            accounts: [account],
+            vendorAccount: async (id: string) =>
+              makeVendorAccount({ ...account, id, usage: makeUsage() }),
+          });
+          await openDetail();
+
+          await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+          const panel = screen.getByRole('region', { name: t.vendorUsageTitle });
+          expect(
+            within(panel).getByRole('button', { name: t.vendorUsageRefreshAction }),
+          ).toBeEnabled();
+        },
+      );
+
+      it.each(['openrouter', 'kilo'] as const)(
+        'forces the refresh when the button of a %s api-key account is clicked',
+        async (vendor) => {
+          const account = makeVendorAccount({
+            id: 'va_key',
+            vendor,
+            auth_type: 'api_key',
+            api_key_set: true,
+          });
+          const { fakeApi } = renderView({
+            accounts: [account],
+            vendorAccount: async (id: string) =>
+              makeVendorAccount({ ...account, id, usage: makeUsage() }),
+            refreshUsage: async (_id, opts) =>
+              opts?.force ? makeUsageRefresh('ok') : makeUsageRefresh('fresh'),
+          });
+          await openDetail();
+          await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+
+          fireEvent.click(usageButton()!);
+
+          await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(2));
+          expect(fakeApi.refreshUsage.mock.calls[1]).toEqual(['va_key', { force: true }]);
+          expect(await screen.findByText(t.vendorUsageRefreshed)).toBeInTheDocument();
+        },
+      );
 
       it('forces the refresh when the button is clicked and shows the figures it re-reads', async () => {
         const { fakeApi } = renderView({
@@ -2638,6 +2715,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1);
       });
 
+      it.each(['openrouter', 'kilo'] as const)(
+        'fires ONE lazy refresh without force when the detail of a %s api-key account opens',
+        async (vendor) => {
+          const account = makeVendorAccount({
+            id: 'va_key',
+            vendor,
+            auth_type: 'api_key',
+            api_key_set: true,
+          });
+          const { fakeApi } = renderView({
+            accounts: [account],
+            vendorAccount: async (id: string) =>
+              makeVendorAccount({ ...account, id, usage: makeUsage() }),
+          });
+          await openDetail();
+
+          await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+          // Exactly the account id: no options, so no ?force=1 on the wire.
+          expect(fakeApi.refreshUsage.mock.calls[0]).toEqual(['va_key']);
+          await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+          // It is not a poll: nothing fires it again.
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1);
+        },
+      );
+
       it.each([
         ['an OpenAI api-key account', makeVendorAccount({ id: 'va_key' })],
         [
@@ -2651,6 +2754,27 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         [
           'an OpenAI subscription that was never connected',
           makeVendorAccount({ ...OPENAI_SUBSCRIPTION, subscription_connected: false }),
+        ],
+        [
+          'an x.ai api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'xai', auth_type: 'api_key' }),
+        ],
+        [
+          'a Google api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'google', auth_type: 'api_key' }),
+        ],
+        [
+          'an OpenAI-compatible api-key account',
+          makeVendorAccount({ id: 'va_key', vendor: 'openai_compatible', auth_type: 'api_key' }),
+        ],
+        [
+          'an OpenRouter account whose api key is not set',
+          makeVendorAccount({
+            id: 'va_key',
+            vendor: 'openrouter',
+            auth_type: 'api_key',
+            api_key_set: false,
+          }),
         ],
       ])('does not fire the lazy refresh for %s', async (_name, account) => {
         const { fakeApi } = renderView({

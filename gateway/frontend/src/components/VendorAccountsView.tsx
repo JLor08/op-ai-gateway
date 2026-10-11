@@ -99,9 +99,10 @@ function hasCredential(account: VendorAccount): boolean {
  * snapshot: an api key or a connected subscription. The panel is always there for
  * such an account (its limits, or an empty-state line) and shows only the limits
  * the vendor actually reports; it reads the snapshot from the single-account GET so
- * it can re-read it on its own. A connected OpenAI subscription -- the one account the
- * gateway can actively ask -- also gets a "Refresh" button (a forced usage refresh,
- * independent of the models refresh) and one on-view refresh when the detail opens.
+ * it can re-read it on its own. A connected OpenAI subscription and an OpenRouter
+ * or Kilo api key -- the accounts the gateway can actively ask -- also get a
+ * "Refresh" button (a forced usage refresh, independent of the models refresh) and
+ * one on-view refresh when the detail opens.
  */
 export function VendorAccountsView({
   t,

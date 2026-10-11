@@ -16,22 +16,27 @@ import {
   visibleUsageRows,
 } from './VendorAccountUsageRows';
 
+// Vendors whose stored api key the gateway can use to ask for usage/credits
+// (mirrors the routing preset's UsageVia != ""): OpenRouter and, best effort, Kilo.
+// x.ai, Google and a user-supplied OpenAI-compatible endpoint offer no such query.
+const API_KEY_USAGE_VENDORS: ReadonlySet<string> = new Set(['openrouter', 'kilo']);
+
 /**
  * Whether the gateway can ASK the vendor for this account's usage, as opposed to
- * only learning it passively from the responses it serves: today that is a
- * connected OpenAI subscription (the account whose usage endpoint the gateway
- * pulls). Every other account -- an api key, an Anthropic subscription -- has no
- * active pull (the backend answers "unsupported"), so it gets neither the refresh
- * button nor the on-view refresh.
+ * only learning it passively from the responses it serves: a connected OpenAI
+ * subscription (the account whose usage endpoint the gateway pulls) and an api-key
+ * account of a vendor with a usage/credits query (OpenRouter, Kilo) whose key is
+ * stored. Every other account -- another vendor's api key, an Anthropic
+ * subscription -- has no active pull (the backend answers "unsupported"), so it
+ * gets neither the refresh button nor the on-view refresh.
  */
 export function hasActiveUsagePull(
-  account: Pick<VendorAccount, 'vendor' | 'auth_type' | 'subscription_connected'>,
+  account: Pick<VendorAccount, 'vendor' | 'auth_type' | 'subscription_connected' | 'api_key_set'>,
 ): boolean {
-  return (
-    account.vendor === 'openai' &&
-    account.auth_type === 'subscription' &&
-    account.subscription_connected
-  );
+  if (account.auth_type === 'subscription') {
+    return account.vendor === 'openai' && account.subscription_connected;
+  }
+  return account.api_key_set && API_KEY_USAGE_VENDORS.has(account.vendor);
 }
 
 // What a usage-refresh answer reads as. ok and fresh (the server's TTL skipped the
@@ -53,6 +58,16 @@ function outcomePresentation(
     default:
       return { severity: 'info', headline: t.vendorUsageRefreshUnverifiable, unchanged: true };
   }
+}
+
+// A snapshot carrying figures the gateway pulled (the spend-control credits, or a
+// credit balance / unlimited state such as OpenRouter's and Kilo's), as opposed to
+// percentages learned from every served request. The intro sentence follows it: the
+// "refreshed with every request" wording would be wrong for these.
+function isPulledSnapshot(usage: VendorAccountUsage): boolean {
+  return (
+    hasSpendControl(usage) || usage.credit_balance !== '' || usage.credit_status === 'unlimited'
+  );
 }
 
 /**
@@ -127,7 +142,7 @@ export function VendorAccountUsagePanel({
         titleId="vendor-account-usage-heading"
         title={t.vendorUsageTitle}
         subtitle={
-          usage != null && hasSpendControl(usage) ? t.vendorUsageIntroSpend : t.vendorUsageIntro
+          usage != null && isPulledSnapshot(usage) ? t.vendorUsageIntroSpend : t.vendorUsageIntro
         }
         actions={
           onRefresh && (
@@ -252,10 +267,11 @@ export function VendorAccountUsage({
  * connected has served nothing, so it has no usage to show and renders nothing;
  * every other account (an api key, a connected subscription) gets the usage panel.
  * Only an account the gateway can actively ask (hasActiveUsagePull: a connected
- * OpenAI subscription) is handed `onRefresh`, which gives it the refresh button and
- * the one on-view refresh; the others only learn their usage from the requests they
- * serve. The panel is keyed by the account id, so another account never inherits the
- * previous one's snapshot, outcome or on-view refresh.
+ * OpenAI subscription, an OpenRouter or Kilo api key) is handed `onRefresh`, which
+ * gives it the refresh button and the one on-view refresh; the others only learn
+ * their usage from the requests they serve. The panel is keyed by the account id,
+ * so another account never inherits the previous one's snapshot, outcome or
+ * on-view refresh.
  */
 export function VendorAccountUsageSection({
   t,

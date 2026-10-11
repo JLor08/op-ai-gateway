@@ -217,8 +217,9 @@ export type VendorAccountModelsRefresh = {
 // server's recent-pull TTL skipped the call (the stored snapshot is returned, the
 // vendor was NOT called); unverifiable = the vendor could not be asked or answered
 // unusably (the stored snapshot is kept); unsupported = the account has no active
-// usage pull (only an OpenAI subscription has one). `usage` is the same snapshot
-// the single-account read carries, or null when none is stored.
+// usage pull (only a connected OpenAI subscription and an OpenRouter or Kilo api
+// key have one). `usage` is the same snapshot the single-account read carries, or
+// null when none is stored.
 export type VendorUsageRefreshStatus = 'ok' | 'fresh' | 'unverifiable' | 'unsupported';
 export type VendorUsageRefresh = {
   status: VendorUsageRefreshStatus;
@@ -285,13 +286,14 @@ export function vendorAccountsApi(fetcher: Fetcher) {
         { method: 'POST' },
       ),
     // The explicit / on-view "refresh usage": the gateway asks the vendor for the
-    // account's current limits and stores them, WITHOUT touching the models. Only an
-    // OpenAI subscription has such an active pull; any other account answers
-    // refresh.status "unsupported". Without `force` the server skips the vendor call
-    // while its last pull is younger than its TTL (5 min; status "fresh"), which is
-    // what the on-view call relies on; `{force: true}` (?force=1) bypasses the TTL
-    // for the explicit button. Fail-soft like the models refresh: a vendor that
-    // cannot be asked is a 200 with "unverifiable". Owner-only (404 for anybody
+    // account's current limits and stores them, WITHOUT touching the models. Only a
+    // connected OpenAI subscription and an OpenRouter or Kilo api key have such an
+    // active pull; any other account answers refresh.status "unsupported". Without
+    // `force` the server skips the vendor call while its last pull is younger than
+    // its TTL (5 min; status "fresh"), which is what the on-view call relies on;
+    // `{force: true}` (?force=1) bypasses the TTL for the explicit button. Fail-soft
+    // like the models refresh: a vendor that cannot be asked is a 200 with
+    // "unverifiable". Owner-only (404 for anybody
     // else's id); 409 vendor_account.credential_unreadable for a stored credential
     // that cannot be opened, 500 vendor_account.usage_refresh_failed otherwise. No
     // request body.
