@@ -54,19 +54,22 @@ export type VendorAccountModel = {
   display_name: string;
 };
 
-// The latest rate-limit snapshot the gateway scraped off an account's upstream
-// responses -- mirrors portal.VendorAccountUsageDTO. PERCENTAGES ONLY: neither
-// vendor exposes an absolute cap, so there is no "N of M". A percentage is
-// 0..100, or -1 when that window has never been observed (unknown, NOT 0 % used);
-// a reset time is null when the vendor sent none; credit_balance is the vendor's
-// raw credit string ("" = none).
+// The latest usage snapshot of a vendor account, scraped off its upstream responses
+// and/or pulled from the vendor -- mirrors portal.VendorAccountUsageDTO. The
+// rate-limit windows are PERCENTAGES ONLY: neither OpenAI nor Anthropic exposes an
+// absolute window cap, so there is no "N of M" for them. A percentage is 0..100, or
+// -1 when that window has never been observed (unknown, NOT 0 % used); a reset time
+// is null when the vendor sent none; credit_balance is the vendor's raw credit
+// string ("" = none; Kilo's balance).
 //
-// A Business plan's spend control and credit state ride along (always present on
-// the wire): spend_unit (e.g. "credit") and the vendor's raw spend_limit /
-// spend_used / spend_remaining strings (kept verbatim, never parsed), spend_used_pct
-// (0..100, or -1 = unknown, like the windows), spend_reset_at (null = unknown) and
-// credit_status ("unlimited" | "has_credits" | "none", "" = unknown). An account
-// with no spend control reads "" / -1 / null for all of them.
+// The absolute amounts ride in the spend fields and credit_status (always present
+// on the wire), which a Business plan's spend control and an OpenRouter key's USD
+// limit both fill: spend_unit (e.g. "credit", "USD") and the vendor's raw
+// spend_limit / spend_used / spend_remaining strings (kept verbatim, never parsed),
+// spend_used_pct (0..100, or -1 = unknown, like the windows), spend_reset_at (null =
+// unknown) and credit_status ("unlimited" | "has_credits" | "none", "" = unknown;
+// an OpenRouter key without a cap is "unlimited" with the spend strings empty). An
+// account with none of this reads "" / -1 / null for all of them.
 export type VendorAccountUsage = {
   five_hour_pct: number;
   five_hour_reset_at: string | null;

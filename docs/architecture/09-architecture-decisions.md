@@ -3361,7 +3361,9 @@ bespoke branch per provider.
   native `generateContent` dialect and Gemini-only features are a later
   sub-project, and usage/credits display is another (the registry's usage slot is
   the seam): until then these accounts report no usage, the passive header scrape
-  finding none of the headers it knows.
+  finding none of the headers it knows. (Taken up by
+  [ADR-053](#adr-053--usagecredits-for-api-key-vendor-accounts-a-per-preset-usage-strategy-over-the-existing-oauth-only-pull-path):
+  OpenRouter and Kilo now report usage; x.ai, Google and Custom still do not.)
 - **(f) The owner-supplied base-URL trust model.** The root is supplied by the
   owner for `openai_compatible` (Custom), where it is required, and may be supplied
   for any of the four named presets as an override of their pinned default root;
@@ -3401,3 +3403,105 @@ migration per provider that changes its path).
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Data Model](reference/data-model.md#4-migration-history-86-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
+**Context:** [ADR-052](#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)
+left usage and credits for the OpenAI-compatible vendors to a later sub-project and
+reserved an empty usage slot in the preset registry. The machinery they need already
+existed for an OpenAI subscription: the per-account snapshot, its DTO, the dedicated
+refresh endpoint with its lazy TTL and the availability-aware panel. Its pull was
+OAuth-only, though: the gate was "an OpenAI subscription", the refresh opened a
+token set, and every write merged into the row the passive header scrape also
+writes. What can be asked with the **stored inference key** differs per provider
+(checked on 2026-10-11): OpenRouter answers a per-key limit and usage at
+`GET /v1/key`; Kilo has an undocumented balance endpoint that its own client calls
+with an OAuth token; x.ai keeps balance and usage behind a separate Management API
+with its own key and a team id; Gemini has no usage or balance API at all; and a
+Custom endpoint has no standard one.
+
+**Decision — seven choices, taken together.**
+- **(a) The OAuth-only pull is extended to api-key accounts, gated by the preset's
+  `UsageVia`.** An api-key account has an active pull when its preset names a usage
+  strategy (`openrouter_key`, `kilo_balance`); the registry is the only thing that
+  says so, not a vendor-id list in the portal. The native OpenAI and Anthropic
+  api-key accounts are not in the registry and keep no pull, and x.ai, Google and
+  Custom keep their `UsageVia` empty and with it the panel's availability-aware
+  empty state. The fetch is split per credential kind and the store tail is shared;
+  the dedicated refresh branches on an api-key account **before** its OAuth-token
+  step (which would answer "not connected" for an account that has no token set).
+  The same pull also runs best-effort, never failing the call, as the last step of a
+  models refresh and so of an OpenAI-compatible create with its key, inside the
+  existing bounds. No new endpoint, DTO field or frontend type: the refresh endpoint
+  and its answer are reused as they are.
+- **(b) `UsagePath` is root-relative.** The preset gains one field, the root-relative
+  URL suffix of the usage request, composed as `TrimRight(base_url, "/") + UsagePath`
+  by the portal, so `vendorauth` receives a finished URL and stays free of any vendor
+  root (it stays capture-only). It is not relative to the path prefix because Kilo's
+  balance (`/profile/balance`) lies **outside** its `/gateway` prefix, while
+  OpenRouter's `/v1/key` is expressible from the root as well and is the very URL its
+  key probe asks (ADR-052 (d)): one rule, no per-provider special case.
+- **(c) The existing snapshot, DTO and panel are reused; there is no migration.**
+  OpenRouter's key limit maps onto the `spend_*` fields and `credit_status`, Kilo's
+  balance onto `credit_balance`, so the panel's existing credit row renders them.
+  OpenRouter's richer fields (daily, weekly and monthly usage, the free-tier counters,
+  BYOK) have no home in the snapshot and are **deferred**: showing them would need new
+  columns, a migration and a Postgres leg for what is v1 advisory data.
+- **(d) The api-key pull stores what it fetched, with no merge.** The merge rule of
+  the subscription path exists because two writers each know part of the row and a
+  partial reading must not blank what the other learned. An OpenRouter or Kilo account
+  has one writer: the scrape looks only for the Codex `x-codex-*` headers, which these
+  providers never send, so it writes nothing for them. The merge's "an unknown
+  incoming field is no news" would then only do harm, because it cannot express "now
+  absent": an owner who removes a key's cap would keep seeing the old limit and spend.
+  A failed pull still writes nothing, so the last good snapshot stays.
+- **(e) OpenRouter reports the key, not the account, and an unlimited key reads
+  "Unlimited".** `/v1/key` answers the limit and usage of the one key the gateway
+  holds, in USD; the account's credit balance needs a management key the gateway never
+  asks for, so `credit_balance` stays empty. A capped key fills the spend fields
+  (`spend_used` is limit minus remaining, consistent with the bar); a key with an
+  explicit `null` limit maps to `credit_status = unlimited` with every spend field
+  left empty, because the body's all-time `usage` total shown beside "Unlimited" would
+  read as a period figure.
+- **(f) Kilo is best effort.** The balance endpoint is undocumented and read off a
+  client that authenticates it with an OAuth token; whether the api-key type the
+  gateway stores is accepted at all is unconfirmed. Any 401, 403 or 404, a redirect or a
+  body without a plausible `balance` is `unverifiable` and leaves the panel's
+  empty-state line; nothing is raised. The unit is not asserted either: `spend_unit`
+  stays empty.
+- **(g) An unreadable key is a 409, a missing key is `unverifiable`.** An api-key
+  account whose sealed key cannot be opened answers the documented
+  `409 vendor_account.credential_unreadable`, the same state-of-the-account error a
+  subscription's token set gives, because it is fixed by re-entering the key and says
+  something the caller can act on. An account with no key set has nothing to ask with
+  and answers `unverifiable` ("no API key is set"), the fail-soft status of every
+  other pull that could not be made.
+
+**Consequence:** a provider that offers a usage query with an inference key is one
+registry entry (`UsageVia`, `UsagePath`), one `vendorauth` fetcher and one case in the
+portal's strategy dispatch, with no schema work. There is no migration, so no
+PostgreSQL leg is needed for this change. The two usage endpoints are the least certain
+data in the registry: OpenRouter's shape is derived from its documentation
+(REVERSE-ENGINEERED, VERIFY-LIVE, read by a tolerant parser) and Kilo's endpoint is
+undocumented and may not accept the stored key, so Kilo's usage may simply never appear
+([Risks §11.1](11-risks-and-technical-debt.md#111-operational-risks)). The pull that
+trails a models refresh does not consult the lazy TTL (the subscription's never did), so
+it asks the provider on every models refresh; only the dedicated on-view call is
+rate-limited. The frontend names the two api-key vendors itself, mirroring `UsageVia`;
+the backend registry is the authority, so a drift between them shows or hides a Refresh
+button and nothing else. The shared spend display rounds the used amount to one
+decimal, which suits credits and loses the cents of a USD figure: a follow-up, not
+part of this decision.
+
+**Rejected:** new DTO columns for the richer OpenRouter data (daily, weekly and
+monthly usage, free-tier counters) in v1: a migration and a Postgres leg for figures
+no one asked for, which can be added when they are; an OpenRouter-only hardcode in the
+portal (the next provider with a usage query would be a second branch, and the registry
+already is the place that says what a provider supports); the x.ai Management API
+(balance and usage there need a second credential and a team id, which an account
+that stores one inference key cannot supply, and asking for it widens what an account
+holds); merging the api-key snapshot like the subscription's (it cannot express a
+removed cap and there is no second writer to protect).
+→ [External Vendor Accounts §5.2](cross-cutting/external-vendor-accounts.md#52-active-pull-openai-subscription-openrouter-and-kilo-api-keys),
+[§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
+[API Surface](reference/api-surface.md#vendor-accounts-anbieter),
+[Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks).
