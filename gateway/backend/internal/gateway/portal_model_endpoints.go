@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"sort"
 	"time"
@@ -503,6 +504,74 @@ func (s *Server) handlePortalModelServers(w http.ResponseWriter, r *http.Request
 	}
 	s.injectRuntimeModelState(r.Context(), rows)
 	writeJSON(w, http.StatusOK, map[string]any{"data": rows})
+}
+
+// handlePortalModelImageOptions answers what image options a gateway model
+// (?name=<model>) offers: the aggregate (aggregateImageOptions: what every
+// serving sd-server can do) of the options its sd-server mappings state.
+// gateway:use, global like handlePortalModelServers, and the model name is a
+// query parameter for the same reason (it may contain '/'). Unlike model-servers
+// a missing name is a 400: an empty name would resolve to no mappings and read
+// as "no options", hiding a client bug behind a normal-looking answer.
+//
+// The two option caches are merged here, one per kind of sd-server: an external
+// stable_diffusion_cpp application's live probe cache (AppImageOptions, by
+// application id) and an agent-launched one's last status frame (RuntimeStatus,
+// by server and spec id). Visibility is decided BEFORE either is read:
+// ModelImageOptionViews returns only the mappings the token may route to, so a
+// hidden, locked or out-of-group model has no views, reads no cache and answers
+// {"data":{}} exactly like an unknown one.
+func (s *Server) handlePortalModelImageOptions(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
+	if !ok {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, apierror.Response("model.name_required", "model name is required", ""))
+		return
+	}
+	views, err := s.Portal.ModelImageOptionViews(r.Context(), token, name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apierror.Response("model.image_options_failed", "model image options failed", ""))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": aggregateImageOptions(s.cachedImageOptions(views))})
+}
+
+// cachedImageOptions collects the image options the two caches hold for views,
+// one entry per view that has any. A view with none (an application the probe
+// has not read, an agent that has not reported, a frame without options) adds
+// nothing rather than a zero value, so it can neither fail the request nor
+// narrow the aggregate. Both registries are nil-safe, so a Server without them
+// collects nothing.
+//
+// The collected options are READ-ONLY: an agent view's pointer is the one the
+// runtime registry shares with every reader of its snapshot, and aggregation
+// copies out of it.
+func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provider.SdcppImageOptions {
+	var collected []provider.SdcppImageOptions
+	statusesByServer := make(map[string]map[string]RuntimeStatusDTO)
+	for _, view := range views {
+		switch view.AppType {
+		case routing.ProviderStableDiffusionCpp:
+			if opts, ok := s.AppImageOptions.Get(view.ApplicationID); ok {
+				collected = append(collected, opts)
+			}
+		case routing.ProviderServerAgent:
+			if view.SpecID == "" {
+				continue
+			}
+			dto, ok := s.runtimeStatusesForServer(statusesByServer, view.ServerID)[view.SpecID]
+			if ok && dto.ImageOptions != nil {
+				collected = append(collected, *dto.ImageOptions)
+			}
+		}
+	}
+	return collected
 }
 
 // handlePortalModelServersEvents streams the model-servers list over SSE: a `snapshot` frame, then
