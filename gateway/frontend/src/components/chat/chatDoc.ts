@@ -166,9 +166,11 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   clip_skip: '',
 };
 
-// sd-server's batch_count ceiling for one request (its capabilities `limits`
-// report max_batch_count: 8). Enforced by the composer; the gateway passes n
-// through and sd-server clamps anyway.
+// The portal's HARD cap on images per request: a gateway-side image-STORAGE limit
+// (a generated image is kept in the chat transcript), not an sd-server limit. A
+// model's reported max batch count (GET /api/portal/model-image-options) may only
+// NARROW the composer's count below this, never raise it. Enforced by the
+// composer's count field (Chat.tsx).
 export const IMAGE_N_MAX = 8;
 
 // The size presets the composer offers. "" is "model default" (no size sent, so

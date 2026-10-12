@@ -1289,6 +1289,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(Object.keys(body.settings.image ?? {})).toEqual(['n']);
     });
 
+    it('states the size default when BOTH the width and the height are reported', async () => {
+      await openAdvancedFor({ defaults: { width: 1024, height: 768 } });
+
+      expect(screen.getByRole('combobox', { name: t.chatImageSize })).toHaveAccessibleDescription(
+        `${defaultLabel}: 1024x768`,
+      );
+    });
+
     it('states no size default unless BOTH the width and the height are reported', async () => {
       await openAdvancedFor({ defaults: { width: 1024 } });
 
@@ -1324,8 +1332,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       },
     );
 
-    it("flags a saved count above the picked model's max batch count", async () => {
+    it("flags a saved count above the picked model's max batch count, and only then", async () => {
       await openAdvancedForSaved({ max_batch_count: 4 }, { n: 8 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAttribute('aria-invalid', 'true');
+      // Back inside the ceiling the flag clears, so it is not simply always on.
+      fireEvent.change(count, { target: { value: '3' } });
+      expect(count).toHaveAttribute('aria-invalid', 'false');
+    });
+
+    it("never raises the count ceiling above the gateway's hard cap of 8", async () => {
+      // The model may only NARROW the cap: a reported 16 is still 8 (a gateway
+      // image-storage limit), in the helper, the clamp and the run body.
+      await openAdvancedFor({ max_batch_count: 16 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAccessibleDescription('1–8');
+      fireEvent.change(count, { target: { value: '20' } });
+      expect(count).toHaveValue(8);
+      const body = await sendPrompt();
+      expect(body.settings.image?.n).toBe(8);
+    });
+
+    it('keeps the count ceiling at 8 for a model whose max batch count is exactly 8', async () => {
+      await openAdvancedFor({ max_batch_count: 8 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAccessibleDescription('1–8');
+      fireEvent.change(count, { target: { value: '8' } });
+      expect(count).toHaveValue(8);
+      fireEvent.change(count, { target: { value: '9' } });
+      expect(count).toHaveValue(8);
+    });
+
+    it('flags a saved count above the hard cap even when the model reports a larger max', async () => {
+      await openAdvancedForSaved({ max_batch_count: 16 }, { n: 12 });
 
       expect(screen.getByLabelText(t.chatImageCount)).toHaveAttribute('aria-invalid', 'true');
     });

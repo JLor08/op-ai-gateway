@@ -47,12 +47,16 @@ function isReported(value: number | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
-// The most images one request may ask for: the picked model's reported max
-// batch count when it states a usable (>= 1) one, else the static sd-server
-// ceiling.
+// The most images one request may ask for. IMAGE_N_MAX is the gateway's HARD cap
+// (an image-storage limit, not a model limit), so the picked model's reported max
+// batch count may only NARROW it: a usable (>= 1) report is clamped to the cap
+// (a model reporting 16 still gets 8), and an absent or unusable one leaves the
+// cap itself.
 function imageCountMax(options: ImageModelOptions | null): number {
   const reported = options?.max_batch_count;
-  return isReported(reported) && reported >= 1 ? Math.floor(reported) : IMAGE_N_MAX;
+  return isReported(reported) && reported >= 1
+    ? Math.min(Math.floor(reported), IMAGE_N_MAX)
+    : IMAGE_N_MAX;
 }
 
 // Clamp a typed image count to [1, max]; a non-number falls back to 1. The
