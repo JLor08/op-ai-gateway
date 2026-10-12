@@ -126,47 +126,63 @@ func (c *GeminiClient) CompleteStream(ctx context.Context, target routing.Target
 		reader = io.TeeReader(httpResp.Body, rw)
 	}
 
-	activity := StreamActivityFrom(ctx)
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), geminiStreamLineMaxLen)
+	st := &geminiStreamState{}
+	if err := c.scanStream(ctx, reader, st, emit); err != nil {
+		return err
+	}
+	// A stream that ends without a finishReason chunk was cut off (a dropped
+	// connection, a proxy closing early). Reporting it as Completed would hand the
+	// client a partial answer with partial usage as if it were whole.
+	if !st.done {
+		return fmt.Errorf("%w: stream ended before a finish reason", ErrUnavailable)
+	}
+	// geminiwire.ParseStreamChunk maps finishReason per chunk: a functionCall can
+	// arrive on an earlier chunk while the terminal chunk reports STOP, which maps
+	// to "stop". Upgrade a final "stop" to "tool_calls" when any tool call was
+	// buffered, so the completion reflects the whole stream.
+	if len(st.toolCalls) > 0 && st.finish == "stop" {
+		st.finish = "tool_calls"
+	}
+	for i := range st.toolCalls {
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: &st.toolCalls[i]}); err != nil {
+			return err
+		}
+	}
+	var usagePtr *inference.Usage
+	if st.sawUsage {
+		u := st.usage
+		usagePtr = &u
+	}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usagePtr, FinishReason: st.finish})
+}
 
-	var (
-		toolCalls []inference.ToolCall
-		usage     inference.Usage
-		sawUsage  bool
-		finish    string
-		done      bool
-	)
+// geminiStreamState accumulates one streamGenerateContent response across its SSE
+// chunks: buffered tool calls, the last non-zero usage and the finish reason of
+// the chunk that ended the stream.
+type geminiStreamState struct {
+	toolCalls []inference.ToolCall
+	usage     inference.Usage
+	sawUsage  bool
+	finish    string
+	done      bool
+}
+
+// scanStream reads the upstream SSE line by line, applying each `data:` frame to
+// st until the stream ends. Comment lines (keepalives) are reported to the
+// activity hook by streamLineData. A scanner error is mapped to the canonical
+// provider error (ErrTimeout when ctx's deadline elapsed, ErrUnavailable
+// otherwise).
+func (c *GeminiClient) scanStream(ctx context.Context, r io.Reader, st *geminiStreamState, emit StreamEmit) error {
+	activity := StreamActivityFrom(ctx)
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), geminiStreamLineMaxLen)
 	for scanner.Scan() {
 		data, ok := streamLineData(strings.TrimSpace(scanner.Text()), activity)
 		if !ok {
 			continue
 		}
-		if geminiStreamIsError([]byte(data)) {
-			return fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, readUpstreamErrorSnippet(strings.NewReader(data), geminiErrorBodyLimit))
-		}
-		res, chunkDone, err := geminiwire.ParseStreamChunk([]byte(data))
-		if err != nil {
-			continue // tolerate a non-JSON frame
-		}
-		if res.Text != "" {
-			if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: res.Text}); err != nil {
-				return err
-			}
-		}
-		if res.Reasoning != "" {
-			if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Reasoning: res.Reasoning}); err != nil {
-				return err
-			}
-		}
-		toolCalls = append(toolCalls, res.ToolCalls...)
-		// usageMetadata is cumulative per chunk, so the last non-zero one is the
-		// answer's usage; a chunk without it must not reset an earlier one.
-		if res.Usage != (inference.Usage{}) {
-			usage, sawUsage = res.Usage, true
-		}
-		if chunkDone {
-			finish, done = res.FinishReason, true
+		if err := st.apply(data, emit); err != nil {
+			return err
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -175,30 +191,48 @@ func (c *GeminiClient) CompleteStream(ctx context.Context, target routing.Target
 		}
 		return fmt.Errorf("%w: read stream: %v", ErrUnavailable, err)
 	}
-	// A stream that ends without a finishReason chunk was cut off (a dropped
-	// connection, a proxy closing early). Reporting it as Completed would hand the
-	// client a partial answer with partial usage as if it were whole.
-	if !done {
-		return fmt.Errorf("%w: stream ended before a finish reason", ErrUnavailable)
+	return nil
+}
+
+// apply folds one SSE data frame into st, emitting its text and reasoning deltas
+// as they arrive. An in-stream error frame ends the stream as ErrUnavailable with
+// a bounded snippet of the frame; a frame that is not valid JSON is tolerated and
+// skipped.
+func (st *geminiStreamState) apply(data string, emit StreamEmit) error {
+	if geminiStreamIsError([]byte(data)) {
+		return fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, readUpstreamErrorSnippet(strings.NewReader(data), geminiErrorBodyLimit))
 	}
-	// geminiwire.ParseStreamChunk maps finishReason per chunk: a functionCall can
-	// arrive on an earlier chunk while the terminal chunk reports STOP, which maps
-	// to "stop". Upgrade a final "stop" to "tool_calls" when any tool call was
-	// buffered, so the completion reflects the whole stream.
-	if len(toolCalls) > 0 && finish == "stop" {
-		finish = "tool_calls"
+	res, chunkDone, err := geminiwire.ParseStreamChunk([]byte(data))
+	if err != nil {
+		return nil // tolerate a non-JSON frame
 	}
-	for i := range toolCalls {
-		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: &toolCalls[i]}); err != nil {
+	if err := emitGeminiDeltas(res, emit); err != nil {
+		return err
+	}
+	st.toolCalls = append(st.toolCalls, res.ToolCalls...)
+	// usageMetadata is cumulative per chunk, so the last non-zero one is the
+	// answer's usage; a chunk without it must not reset an earlier one.
+	if res.Usage != (inference.Usage{}) {
+		st.usage, st.sawUsage = res.Usage, true
+	}
+	if chunkDone {
+		st.finish, st.done = res.FinishReason, true
+	}
+	return nil
+}
+
+// emitGeminiDeltas emits the chunk's text and reasoning as separate text-delta
+// events, skipping whichever is empty.
+func emitGeminiDeltas(res geminiwire.Result, emit StreamEmit) error {
+	if res.Text != "" {
+		if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: res.Text}); err != nil {
 			return err
 		}
 	}
-	var usagePtr *inference.Usage
-	if sawUsage {
-		u := usage
-		usagePtr = &u
+	if res.Reasoning != "" {
+		return emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Reasoning: res.Reasoning})
 	}
-	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: usagePtr, FinishReason: finish})
+	return nil
 }
 
 // ProxyNative forwards the raw inbound generateContent body to the upstream's own
