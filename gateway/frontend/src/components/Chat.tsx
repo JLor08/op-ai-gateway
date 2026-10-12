@@ -22,10 +22,24 @@ import type { ChatContent } from './shared/chatContent';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
-import { useChatStore } from './chat/ChatStore';
+import {
+  IMAGE_LOSSY_FORMATS,
+  IMAGE_N_MAX,
+  IMAGE_OUTPUT_FORMATS,
+  IMAGE_SIZE_OPTIONS,
+  useChatStore,
+} from './chat/ChatStore';
 import { ChatSidebar } from './chat/ChatSidebar';
 
 const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
+
+// Clamp a typed image count to [1, IMAGE_N_MAX]; a non-number falls back to 1.
+// The gateway passes n through and sd-server clamps too, but keeping the field
+// honest avoids a request that silently generates a different count.
+function clampImageN(raw: number): number {
+  if (!Number.isFinite(raw)) return 1;
+  return Math.min(IMAGE_N_MAX, Math.max(1, Math.round(raw)));
+}
 
 function readSidebarCollapsed(): boolean {
   try {
@@ -179,46 +193,126 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                 bgcolor: 'var(--page)',
               }}
             >
-              <TextField
-                id="chat-system-prompt"
-                label={t.chatSystemPrompt}
-                multiline
-                minRows={3}
-                fullWidth
-                value={c.systemPrompt}
-                onChange={(event) => c.setSystemPrompt(event.target.value)}
-                disabled={c.streaming}
-              />
-              <Box
-                sx={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-                  gap: 2,
-                }}
-              >
-                <Box>
-                  <Typography component="label" id="chat-temperature-label">
-                    {t.chatTemperature}: {c.temperature.toFixed(1)}
-                  </Typography>
-                  <Slider
-                    aria-labelledby="chat-temperature-label"
-                    min={0}
-                    max={2}
-                    step={0.1}
-                    value={c.temperature}
-                    onChange={(_event, value) => c.setTemperature(value as number)}
+              {/* Text-chat controls: a system prompt, sampling temperature and a
+                token cap are all meaningless to the images endpoint, so an image
+                thread hides them and shows the image knobs below instead. */}
+              {!isImageThread && (
+                <>
+                  <TextField
+                    id="chat-system-prompt"
+                    label={t.chatSystemPrompt}
+                    multiline
+                    minRows={3}
+                    fullWidth
+                    value={c.systemPrompt}
+                    onChange={(event) => c.setSystemPrompt(event.target.value)}
                     disabled={c.streaming}
                   />
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                      gap: 2,
+                    }}
+                  >
+                    <Box>
+                      <Typography component="label" id="chat-temperature-label">
+                        {t.chatTemperature}: {c.temperature.toFixed(1)}
+                      </Typography>
+                      <Slider
+                        aria-labelledby="chat-temperature-label"
+                        min={0}
+                        max={2}
+                        step={0.1}
+                        value={c.temperature}
+                        onChange={(_event, value) => c.setTemperature(value as number)}
+                        disabled={c.streaming}
+                      />
+                    </Box>
+                    <TextField
+                      id="chat-max-tokens"
+                      label={t.chatMaxTokens}
+                      type="number"
+                      value={String(c.maxTokens)}
+                      onChange={(event) => c.setMaxTokens(Number(event.target.value))}
+                      disabled={c.streaming}
+                    />
+                  </Box>
+                </>
+              )}
+              {/* Image-generation knobs. The gateway passes these through to
+                sd-server, which honours size / n / output_format and (for a
+                lossy format) output_compression; an untouched control sends
+                nothing, leaving the upstream default. */}
+              {isImageThread && (
+                <Box
+                  sx={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                    gap: 2,
+                  }}
+                >
+                  <SearchableSelect
+                    id="chat-image-size"
+                    label={t.chatImageSize}
+                    value={c.imageSettings.size}
+                    onChange={(value) => c.setImageSettings((s) => ({ ...s, size: value }))}
+                    disabled={c.streaming}
+                    options={IMAGE_SIZE_OPTIONS.map((size) => ({
+                      value: size,
+                      label: size === '' ? t.chatImageSizeDefault : size,
+                    }))}
+                  />
+                  <TextField
+                    id="chat-image-count"
+                    label={t.chatImageCount}
+                    type="number"
+                    value={String(c.imageSettings.n)}
+                    onChange={(event) =>
+                      c.setImageSettings((s) => ({
+                        ...s,
+                        n: clampImageN(Number(event.target.value)),
+                      }))
+                    }
+                    disabled={c.streaming}
+                    helperText={`1–${IMAGE_N_MAX}`}
+                  />
+                  <SearchableSelect
+                    id="chat-image-output-format"
+                    label={t.chatImageOutputFormat}
+                    value={c.imageSettings.output_format}
+                    onChange={(value) =>
+                      c.setImageSettings((s) => ({ ...s, output_format: value }))
+                    }
+                    disabled={c.streaming}
+                    options={IMAGE_OUTPUT_FORMATS.map((format) => ({
+                      value: format,
+                      label: format === '' ? t.chatImageFormatDefault : format.toUpperCase(),
+                    }))}
+                  />
+                  {IMAGE_LOSSY_FORMATS.includes(c.imageSettings.output_format) && (
+                    <Box>
+                      <Typography component="label" id="chat-image-compression-label">
+                        {t.chatImageCompression}: {c.imageSettings.output_compression}
+                      </Typography>
+                      <Slider
+                        aria-labelledby="chat-image-compression-label"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={c.imageSettings.output_compression}
+                        onChange={(_event, value) =>
+                          c.setImageSettings((s) => ({
+                            ...s,
+                            output_compression: value as number,
+                          }))
+                        }
+                        disabled={c.streaming}
+                      />
+                    </Box>
+                  )}
                 </Box>
-                <TextField
-                  id="chat-max-tokens"
-                  label={t.chatMaxTokens}
-                  type="number"
-                  value={String(c.maxTokens)}
-                  onChange={(event) => c.setMaxTokens(Number(event.target.value))}
-                  disabled={c.streaming}
-                />
-              </Box>
+              )}
               {/* The server-override picker is hidden entirely when the caller
                 manages zero servers AND the run-as token does not lock it —
                 otherwise there would be nothing to override onto. A locked

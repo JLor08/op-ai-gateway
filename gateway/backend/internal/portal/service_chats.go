@@ -333,6 +333,42 @@ type ChatRunSettings struct {
 	// Declared LAST and omitempty on purpose: that is what keeps an existing
 	// text chat's persisted settings byte-identical.
 	Kind string `json:"kind,omitempty"`
+	// Image carries the image-generation knobs of an "image" thread. It is nil
+	// (and omitted) for a text thread, so a text chat's persisted settings stay
+	// byte-identical -- the same guarantee Kind's omitempty gives, and
+	// PrepareChatRun clears it for any non-image kind to hold that even against a
+	// raw API client. Unlike Kind it is NOT force-pinned: like the text knobs
+	// (temperature/max_tokens) a client sends the thread's CURRENT image settings
+	// on every send and they are persisted, so the composer can change size/n
+	// between sends. Only the fields the upstream honors are carried;
+	// buildImagesBody (chat_runs_images.go) forwards the set ones and the gateway
+	// passes them through unexamined.
+	Image *ChatImageSettings `json:"image,omitempty"`
+}
+
+// ChatImageSettings are the image-generation knobs a portal "image" thread
+// forwards to /v1/images/generations. Every field is optional and omitted when
+// unset, so an unset field leaves the upstream (sd-server) on its own default
+// rather than being handed an inert zero. Only the fields sd-server's OpenAI
+// generations endpoint actually reads are here -- size, n, output_format and
+// output_compression. quality/style/response_format/user are ignored upstream,
+// and the native sampler/steps/cfg knobs are delivered separately (a later
+// phase), so neither belongs on this struct. See
+// docs/architecture/cross-cutting/compatibility-and-inference.md section 3.4.
+type ChatImageSettings struct {
+	// Size is the "WxH" image size (e.g. "1024x1024"); "" leaves sd-server's own
+	// default.
+	Size string `json:"size,omitempty"`
+	// N is how many images to generate (sd-server's batch_count, upstream-capped);
+	// 0 leaves the default of one.
+	N int `json:"n,omitempty"`
+	// OutputFormat is "png", "jpeg" or "webp"; "" leaves the default ("png").
+	OutputFormat string `json:"output_format,omitempty"`
+	// OutputCompression is sd-server's 0..100 output_compression for a lossy
+	// output_format (jpeg/webp); it is ignored for png. A POINTER so an explicit
+	// 0 stays distinguishable from "unset" -- nil is omitted, so only a value the
+	// composer moved off the upstream default is forwarded.
+	OutputCompression *int `json:"output_compression,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
@@ -466,6 +502,13 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	}
 	if hadPriorMessages {
 		req.Settings.Kind = stored.Kind
+	}
+	// Image settings belong to an image thread only. Clearing them for any other
+	// kind keeps a text thread's persisted settings byte-identical even against a
+	// raw API client that submits them (ChatRunSettings is the POST body
+	// verbatim), mirroring the ServerOverrideForceUnreachable self-heal above.
+	if req.Settings.Kind != "image" {
+		req.Settings.Image = nil
 	}
 
 	settingsRaw, err := json.Marshal(req.Settings)

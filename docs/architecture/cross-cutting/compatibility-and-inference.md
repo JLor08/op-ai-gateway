@@ -1280,6 +1280,16 @@ the **thread** rather than of the model the picker currently shows
 `image` posts to `/v1/images/generations` instead, with the prompt built from
 the last user message and `response_format: "b64_json"` stated explicitly
 rather than inherited from the endpoint's tolerance of an absent value (§3.4).
+An image thread also carries a `ChatImageSettings` (`size`, `n`,
+`output_format`, `output_compression`) that the composer's settings panel edits
+in place of the text-chat controls (which the images endpoint uses none of);
+`buildImagesBody` forwards each field the user actually set, so an untouched knob
+is omitted and sd-server keeps its own default. It is persisted per thread the
+same way as `kind` — `omitempty` on the wire and in the stored blob, cleared for
+any non-image kind — so a text chat's settings stay byte-identical. Only the
+fields sd-server honors are plumbed (§3.4); its native sampler/steps/cfg knobs
+are reachable only through its own `<sd_cpp_extra_args>` channel, which the
+portal does not use.
 A run is registered before its kind is known (the reservation predates
 `PrepareChatRun`), which is why that field is mutex-guarded rather than one of
 the run's immutable identity fields.

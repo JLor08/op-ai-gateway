@@ -22,11 +22,13 @@ import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import {
   byNewest,
+  imageSetting,
   kindSetting,
   pruneEmptyAssistantTail,
   SAVE_DEBOUNCE_MS,
   type ActiveChatDoc,
   type ChatUiMessage,
+  type ImageSettings,
 } from './chatDoc';
 
 export type ChatPersistenceApi = {
@@ -75,6 +77,7 @@ export function useChatPersistence(
     systemPromptRef: RefObject<string>;
     temperatureRef: RefObject<number>;
     maxTokensRef: RefObject<number>;
+    imageSettingsRef: RefObject<ImageSettings>;
     selectedTokenIdRef: RefObject<string>;
     serverOverrideRef: RefObject<string>;
     serverOverrideForceUnreachableRef: RefObject<boolean>;
@@ -98,6 +101,9 @@ export function useChatPersistence(
     systemPrompt: string;
     temperature: number;
     maxTokens: number;
+    // The image knobs are one reactive value (the whole object): a new object
+    // identity on any knob change schedules a save, like the primitives above.
+    imageSettings: ImageSettings;
     selectedTokenId: string;
     serverOverride: string;
     serverOverrideForceUnreachable: boolean;
@@ -120,6 +126,7 @@ export function useChatPersistence(
     systemPromptRef,
     temperatureRef,
     maxTokensRef,
+    imageSettingsRef,
     selectedTokenIdRef,
     serverOverrideRef,
     serverOverrideForceUnreachableRef,
@@ -136,6 +143,7 @@ export function useChatPersistence(
     systemPrompt,
     temperature,
     maxTokens,
+    imageSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
@@ -170,6 +178,9 @@ export function useChatPersistence(
         // Omitted entirely for a text thread, mirroring the backend's
         // `omitempty` -- see kindSetting in chatDoc.ts.
         ...kindSetting(chatKindRef.current),
+        // The image knobs, likewise present only for an image thread (keyed off
+        // the kind by imageSetting): a knob this omits is erased by the next PUT.
+        ...imageSetting(chatKindRef.current, imageSettingsRef.current),
       },
       messages: pruneEmptyAssistantTail(messagesRef.current),
     }),
@@ -178,6 +189,7 @@ export function useChatPersistence(
       systemPromptRef,
       temperatureRef,
       maxTokensRef,
+      imageSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -248,6 +260,7 @@ export function useChatPersistence(
     systemPrompt,
     temperature,
     maxTokens,
+    imageSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,

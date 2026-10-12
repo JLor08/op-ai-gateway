@@ -138,6 +138,82 @@ func imageRunPrep() PrepareRunResult {
 	}
 }
 
+// With no image settings the body is exactly the three fixed fields: an image
+// thread that set no knob must send nothing extra, so sd-server stays on its own
+// defaults and the body is byte-for-byte what it was before this feature.
+func TestBuildImagesBodyWithoutSettingsIsTheThreeFixedFields(t *testing.T) {
+	raw, err := buildImagesBody(imageRunPrep())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	if len(body) != 3 || body["model"] != "sd-turbo" || body["prompt"] != "a cat" || body["response_format"] != "b64_json" {
+		t.Fatalf("want exactly model/prompt/response_format, got: %s", raw)
+	}
+}
+
+// The set image knobs are forwarded; an unset knob is omitted (sd-server keeps
+// its default) rather than sent as an inert zero.
+func TestBuildImagesBodyForwardsOnlyTheSetImageSettings(t *testing.T) {
+	compression := 80
+	prep := imageRunPrep()
+	prep.Settings.Image = &portal.ChatImageSettings{
+		Size:              "1024x1024",
+		N:                 3,
+		OutputFormat:      "webp",
+		OutputCompression: &compression,
+	}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	if body["model"] != "sd-turbo" || body["prompt"] != "a cat" || body["response_format"] != "b64_json" {
+		t.Fatalf("base fields changed: %s", raw)
+	}
+	if body["size"] != "1024x1024" {
+		t.Fatalf("size = %v, want 1024x1024: %s", body["size"], raw)
+	}
+	if n, _ := body["n"].(float64); n != 3 {
+		t.Fatalf("n = %v, want 3: %s", body["n"], raw)
+	}
+	if body["output_format"] != "webp" {
+		t.Fatalf("output_format = %v, want webp: %s", body["output_format"], raw)
+	}
+	if c, _ := body["output_compression"].(float64); c != 80 {
+		t.Fatalf("output_compression = %v, want 80: %s", body["output_compression"], raw)
+	}
+
+	// Unset knobs are omitted: an image blob carrying only a size sends only size.
+	prep.Settings.Image = &portal.ChatImageSettings{Size: "512x512"}
+	raw, err = buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = map[string]any{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	if _, ok := body["n"]; ok {
+		t.Fatalf("an unset n must be omitted, not sent: %s", raw)
+	}
+	if _, ok := body["output_format"]; ok {
+		t.Fatalf("an unset output_format must be omitted: %s", raw)
+	}
+	if _, ok := body["output_compression"]; ok {
+		t.Fatalf("an unset output_compression must be omitted: %s", raw)
+	}
+	if body["size"] != "512x512" {
+		t.Fatalf("size = %v, want 512x512: %s", body["size"], raw)
+	}
+}
+
 // runError reads a terminal run's error message the way the existing run tests
 // do: through a subscribe() snapshot rather than the mu-guarded field.
 func runError(t *testing.T, run *ChatRun) string {

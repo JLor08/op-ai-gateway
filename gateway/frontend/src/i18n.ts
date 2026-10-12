@@ -219,6 +219,16 @@ const de = {
   // multi-minute generation, so it is stated up front rather than after.
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  // The image-thread settings panel: the generation knobs shown in place of the
+  // text-chat controls. The "" options ("Standard …") send nothing and leave
+  // sd-server on its own default; output_compression only applies to a lossy
+  // Format (JPEG/WEBP), so its control appears only then.
+  chatImageSize: 'Bildgröße',
+  chatImageSizeDefault: 'Standard (Modell)',
+  chatImageCount: 'Anzahl Bilder',
+  chatImageOutputFormat: 'Format',
+  chatImageFormatDefault: 'Standard (PNG)',
+  chatImageCompression: 'Kompression',
   // The composer during an image run's wait (ADR-043 (d)): the pending label
   // and the static "nothing more is coming" sentence -- ImagePendingTurn's
   // only two announced strings (its clock is aria-hidden). Deliberately NOT
@@ -3008,6 +3018,12 @@ const en: PortalMessages = {
   chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
   chatImagePromptLabel: 'Image prompt',
   chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatImageSize: 'Image size',
+  chatImageSizeDefault: 'Default (model)',
+  chatImageCount: 'Number of images',
+  chatImageOutputFormat: 'Format',
+  chatImageFormatDefault: 'Default (PNG)',
+  chatImageCompression: 'Compression',
   chatImageRunPending: 'Waiting for image',
   chatImageNoIntermediateNews:
     'No intermediate updates – the image arrives finished or not at all.',

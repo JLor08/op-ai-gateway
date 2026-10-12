@@ -850,6 +850,48 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(body.settings.kind).toBe('image');
     });
 
+    it('shows the image-generation controls (and hides the text controls) for an image thread', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+
+      expect(screen.getByRole('combobox', { name: t.chatImageSize })).toBeInTheDocument();
+      expect(screen.getByLabelText(t.chatImageCount)).toBeInTheDocument();
+      expect(screen.getByRole('combobox', { name: t.chatImageOutputFormat })).toBeInTheDocument();
+      // The text-model controls are gone, not merely shadowed: the images
+      // endpoint uses none of them.
+      expect(screen.queryByLabelText(t.chatSystemPrompt)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatMaxTokens)).not.toBeInTheDocument();
+    });
+
+    it('shows the text controls (and no image controls) for a text thread', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+
+      expect(screen.getByLabelText(t.chatSystemPrompt)).toBeInTheDocument();
+      expect(screen.getByLabelText(t.chatMaxTokens)).toBeInTheDocument();
+      expect(screen.queryByRole('combobox', { name: t.chatImageSize })).not.toBeInTheDocument();
+    });
+
+    it('carries a changed image count into the started run settings', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+      fireEvent.change(screen.getByLabelText(t.chatImageCount), { target: { value: '4' } });
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.image?.n).toBe(4);
+    });
+
     it('disables the attach button for an image model that is not vision-capable', async () => {
       renderChat(tokens, imageModels);
       await waitForChatReady();

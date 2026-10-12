@@ -26,6 +26,20 @@ export type ChatListResponse = {
   max_content_bytes?: number;
 };
 
+// The image-generation knobs of an "image" thread, as sent on the wire and
+// persisted inside `content.settings.image`. Every field is OPTIONAL: an unset
+// knob is omitted so the upstream (sd-server) keeps its own default, and the
+// whole object is omitted for a text thread (mirroring `kind`), so a text chat's
+// persisted settings stay byte-identical. Only the fields sd-server's OpenAI
+// /v1/images/generations endpoint honors are here — size, n, output_format and
+// output_compression — see the backend's portal.ChatImageSettings.
+export type ChatImageSettings = {
+  size?: string;
+  n?: number;
+  output_format?: string;
+  output_compression?: number;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -56,6 +70,11 @@ export type ChatSettings = {
   // every save would give that property away from the client side. See
   // kindSetting() in chatDoc.ts, which is how both writers honour it.
   kind?: string;
+  // The image-generation knobs, present only on an "image" thread (omitted for a
+  // text thread so its settings stay byte-identical, exactly like `kind`). The
+  // store holds a concrete ImageSettings (chatDoc.ts) and both writers go
+  // through imageSetting() so neither can reintroduce the key for a text thread.
+  image?: ChatImageSettings;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
@@ -107,6 +126,11 @@ export type StartChatRunBody = {
     // send this value establishes the pin; afterwards the backend ignores it
     // in favour of the stored one.
     kind: string;
+    // Mirrors ChatSettings.image: the image-generation knobs an image thread
+    // sends. Absent for a text thread. The backend forwards the set fields to
+    // /v1/images/generations (buildImagesBody) and clears them for a non-image
+    // kind.
+    image?: ChatImageSettings;
   };
 };
 export type StartChatRunResponse = {
