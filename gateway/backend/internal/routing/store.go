@@ -50,6 +50,10 @@ const (
 	// api-key ProviderVendorOpenAI (api.openai.com, OpenAI-compatible client) so the
 	// two never share a client or an endpoint. EXPERIMENTAL / ToS-sensitive.
 	ProviderVendorOpenAISubscription = "vendor_openai_subscription"
+	// ProviderVendorGemini selects the native Google Gemini dialect client,
+	// which speaks generateContent directly (translate) rather than the
+	// OpenAI-compatibility shim used by VendorGoogle.
+	ProviderVendorGemini = "vendor_gemini"
 
 	ServerStatusActive      = "active"
 	ServerStatusDisabled    = "disabled"
@@ -215,10 +219,13 @@ const (
 	// OpenAI-compatible hosted providers (api-key only; reached through the
 	// shared OpenAICompatibleClient against the account's own BaseURL). Their
 	// endpoints and path prefixes are data in vendor_presets.go.
-	VendorXAI              = "xai"
-	VendorOpenRouter       = "openrouter"
-	VendorKilo             = "kilo"
-	VendorGoogle           = "google"
+	VendorXAI        = "xai"
+	VendorOpenRouter = "openrouter"
+	VendorKilo       = "kilo"
+	VendorGoogle     = "google"
+	// VendorGoogleNative is a Google account served by the native Gemini
+	// dialect. VendorGoogle ("google") remains the OpenAI-shim account.
+	VendorGoogleNative     = "google_native"
 	VendorOpenAICompatible = "openai_compatible"
 
 	VendorAuthAPIKey       = "api_key"

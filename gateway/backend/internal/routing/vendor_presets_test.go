@@ -118,3 +118,31 @@ func TestVendorPresetUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestVendorPredicateSplit(t *testing.T) {
+	if !IsPresetVendor(VendorGoogle) || !IsPresetVendor(VendorGoogleNative) {
+		t.Fatal("both google ids must be preset vendors")
+	}
+	if !IsOpenAICompatibleVendor(VendorGoogle) {
+		t.Fatal("shim google must be OpenAI-compatible")
+	}
+	if IsOpenAICompatibleVendor(VendorGoogleNative) {
+		t.Fatal("native google must NOT be OpenAI-compatible")
+	}
+	if !IsNativeGeminiVendor(VendorGoogleNative) {
+		t.Fatal("native google must be a native Gemini vendor")
+	}
+	if IsNativeGeminiVendor(VendorGoogle) || IsNativeGeminiVendor(VendorOpenAI) {
+		t.Fatal("only google_native is native Gemini")
+	}
+}
+
+func TestVendorGoogleNativePreset(t *testing.T) {
+	p, ok := VendorPresetFor(VendorGoogleNative)
+	if !ok {
+		t.Fatal("missing google_native preset")
+	}
+	if p.Dialect != "gemini" || p.DefaultBaseURL != "https://generativelanguage.googleapis.com" || p.StripModelsPrefix != "models/" {
+		t.Fatalf("preset = %+v", p)
+	}
+}

@@ -667,3 +667,39 @@ func TestOpenAICompatibleVendorEmptyBaseURLFailsClosed(t *testing.T) {
 		t.Fatalf("resolve with empty BaseURL = %v, want ErrNoModelRoute", err)
 	}
 }
+
+// TestVendorAccountTargetNativeGemini pins the native Google Gemini target: the
+// vendor_gemini provider kind against the account's own root, x-goog-api-key
+// auth (not Bearer), and translate-only (both endpoint modes zero).
+func TestVendorAccountTargetNativeGemini(t *testing.T) {
+	acc := VendorAccount{Vendor: VendorGoogleNative, AuthType: VendorAuthAPIKey, BaseURL: "https://generativelanguage.googleapis.com"}
+	tgt := vendorAccountTarget(acc, VendorAccountModel{}, "gemini-2.5-pro", "openai", "openai_chat_completions")
+	if tgt.Provider != ProviderVendorGemini {
+		t.Fatalf("provider = %q", tgt.Provider)
+	}
+	if tgt.Endpoint != "https://generativelanguage.googleapis.com" {
+		t.Fatalf("endpoint = %q", tgt.Endpoint)
+	}
+	if tgt.APITokenHeader != "x-goog-api-key" {
+		t.Fatalf("token header = %q", tgt.APITokenHeader)
+	}
+	if tgt.OpenAIPathPrefix != "" {
+		t.Fatalf("OpenAIPathPrefix = %q, want empty (the client owns the /v1beta path)", tgt.OpenAIPathPrefix)
+	}
+	if tgt.MessagesMode != "" || tgt.ResponsesMode != "" {
+		t.Fatalf("expected translate modes, got messages=%q responses=%q", tgt.MessagesMode, tgt.ResponsesMode)
+	}
+	if got := strings.Join(tgt.APIFlavors, ","); got != APIFlavorOpenAI+","+APIFlavorAnthropic {
+		t.Fatalf("APIFlavors = %q, want openai,anthropic", got)
+	}
+}
+
+// TestVendorAccountModelTargetNativeFailClosed pins that a native Gemini account
+// stored without a root URL fails closed like every other preset vendor:
+// ok == false means "no target, fall through", not an error.
+func TestVendorAccountModelTargetNativeFailClosed(t *testing.T) {
+	acc := VendorAccount{Vendor: VendorGoogleNative, AuthType: VendorAuthAPIKey, BaseURL: ""}
+	if _, ok := vendorAccountModelTarget(acc, VendorAccountModel{}, inference.Request{Model: "gemini-2.5-pro"}, "openai"); ok {
+		t.Fatal("empty BaseURL for a preset vendor must fail closed")
+	}
+}
