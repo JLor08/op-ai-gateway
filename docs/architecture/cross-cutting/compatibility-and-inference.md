@@ -947,14 +947,15 @@ is not the loop's own
 | Mock | `mock.go` | echoes the request text | word-by-word chunks | canned Responses-shaped SSE | 2 fixed names |
 | Ollama | `ollama.go` | `POST /api/chat` | `POST /api/chat` (stream:true, NDJSON) | — | `GET /api/tags` |
 | OpenAI-compatible (vLLM, llama.cpp, llama-swap, LiteLLM, the server agent, stable-diffusion.cpp, and the OpenAI-compatible vendor accounts) | `openai_compatible.go` | `POST {prefix}/chat/completions` | `POST {prefix}/chat/completions` (stream:true, SSE) | forwards raw body to `path` | `GET {prefix}/models`; `GET /sdapi/v1/sd-models` for `stable_diffusion_cpp` (below) |
+| Native Google Gemini (a `google_native` vendor account, provider kind `vendor_gemini`) | `gemini.go` | `POST /v1beta/models/{model}:generateContent` | `POST /v1beta/models/{model}:streamGenerateContent?alt=sse` (SSE, no `[DONE]`; complete on a `finishReason`) | forwards raw body to the caller-composed `path` (reserved for the inbound Gemini endpoint, #204) | none (vendor discovery lives in the portal) |
 
 `{prefix}` is `Target.OpenAIPathPrefix`, and **empty means `/v1`**: every self-hosted
 and OpenAI vendor target leaves it empty and composes exactly the paths this table
 always named, while an OpenAI-compatible vendor account sets its preset's prefix
-(`/v1beta/openai` for Gemini, `/gateway` for Kilo,
+(`/v1beta/openai` for Gemini's OpenAI shim, `/gateway` for Kilo,
 [External Vendor Accounts §4.4](external-vendor-accounts.md#44-openai-compatible-vendors)).
 
-All three also implement `Prober` (reachability probe) and, where applicable,
+The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachability probe) and, where applicable,
 `LoadedModelLister`/`ModelInfoProber`/`MemoryProber`/`ModelUnloader` for the
 routing/capacity subsystems — out of this chapter's scope; see [Routing & Model
 Selection](routing-and-model-selection.md). One `OpenAICompatibleClient`
@@ -964,6 +965,18 @@ OpenAI HTTP dialect; only Ollama gets its own client for its distinct
 `/api/chat` NDJSON shape. `stable_diffusion_cpp` cannot borrow the Ollama client
 instead: that client does not implement `NativeProxyClient`, and the images
 relay is a native passthrough.
+
+The **native Gemini client** (`GeminiClient`) is not an OpenAI-dialect client and
+shares none of that path machinery. It translates the neutral request and response
+through `internal/geminiwire` (a leaf package that imports only `inference`; both the
+Gemini wire structs and the neutral-to-Gemini converters live there so the later
+inbound endpoint can reuse them), authenticates with the `x-goog-api-key` header,
+puts the model in the URL path, never follows a redirect (a custom credential header
+would travel with it) and implements no `ModelLister` or `Prober`, since vendor
+model discovery lives in the portal. The `Multiplexer` reaches it by `target.Provider = vendor_gemini`, set by the
+resolver for a `google_native` account, which is translate-only
+([External Vendor Accounts §4.5](external-vendor-accounts.md#45-native-google-gemini),
+[ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)).
 
 **Upstream model discovery is derived from the application TYPE.**
 `ListModels` asks `provider.modelDiscoveryFor(type)` where to list and how to

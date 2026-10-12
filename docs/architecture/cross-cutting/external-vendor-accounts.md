@@ -28,13 +28,21 @@ only** presets over the one OpenAI client, driven by a data registry and a store
 `base_url` rather than by bespoke code (§4.4,
 [ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)).
 
+One more vendor reaches Google Gemini through its **own** wire instead of the
+OpenAI shim: **Google Gemini (native)**, vendor id `google_native`. It is a preset
+too (api-key only, a stored root, the same registry), but its `Dialect` selects a
+dedicated provider kind and client that speak `generateContent` and authenticate
+with `x-goog-api-key` (§4.5,
+[ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)).
+It is a separate account from the shim `google` one, so both can exist side by side.
+
 The feature reuses the gateway's existing credential sealing, routing `Target`,
 dispatch and usage machinery wherever possible. The genuinely new parts are a
 first-class account entity (§1), an OAuth subsystem — connect + token refresh —
 (`internal/vendorauth`, §3), model-independent credential validation that
 tells a rejected login from a wrong model (§3.5), a small native Anthropic
-Messages client and an OpenAI Responses translate client (`internal/provider`,
-§4), two static dispatch extensions (extra headers + a system-prompt masquerade,
+Messages client, an OpenAI Responses translate client and a native Gemini
+`generateContent` client (`internal/provider`, §4), two static dispatch extensions (extra headers + a system-prompt masquerade,
 §4), a usage/limits snapshot fed by the vendor's rate-limit response headers and,
 for an OpenAI subscription and for an OpenRouter or Kilo api key, an active usage
 pull with its own refresh endpoint (§5),
@@ -57,14 +65,14 @@ sharing link table plus a resolver filter extension), not a rewrite.
 |---|---|
 | `id` | `va_`-prefixed, random hex. |
 | `owner_user_id` | FK → `users(id)` `on delete cascade`. The one principal the account serves. |
-| `vendor` | `openai` \| `anthropic` (`routing.VendorOpenAI` / `VendorAnthropic`) \| `xai` \| `openrouter` \| `kilo` \| `google` \| `openai_compatible` (`routing.VendorXAI` / `VendorOpenRouter` / `VendorKilo` / `VendorGoogle` / `VendorOpenAICompatible`; the last is the Custom endpoint). The five newer ids are the OpenAI-compatible vendors (§4.4); `routing.IsOpenAICompatibleVendor` is true for exactly those. Immutable after creation. |
+| `vendor` | `openai` \| `anthropic` (`routing.VendorOpenAI` / `VendorAnthropic`) \| `xai` \| `openrouter` \| `kilo` \| `google` \| `google_native` \| `openai_compatible` (`routing.VendorXAI` / `VendorOpenRouter` / `VendorKilo` / `VendorGoogle` / `VendorGoogleNative` / `VendorOpenAICompatible`; the last is the Custom endpoint). The six newer ids are the **preset** vendors (`routing.IsPresetVendor`): five are the OpenAI-compatible vendors (§4.4; `routing.IsOpenAICompatibleVendor`, a preset whose `Dialect` is empty), and `google_native` is the native Gemini one (§4.5; `routing.IsNativeGeminiVendor`, `Dialect == "gemini"`), distinct from the shim `google`. Immutable after creation. |
 | `auth_type` | `api_key` \| `subscription` (`routing.VendorAuthAPIKey` / `VendorAuthSubscription`). Immutable after creation. |
 | `name` | User-facing label. |
 | `status` | `active` \| `disabled` \| `needs_reconnect`. The last is system-managed (§3.4): a refresh rejection flips an account to it; the operator cannot set it directly. |
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
 | `model_prefix` | Optional per-account namespace for the account's model ids (migration 83; `''` = none). The service trims it and accepts at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +` (the URL-path-safe characters of a model id) with no `..`, anything else being `400 vendor_account.model_prefix_invalid`. It is **applied**, not merely stored: every model the account serves is advertised and requested as the prefix plus the vendor's own id, while the vendor is still sent the bare id (§6.5). The DTO reports it and the create/update requests accept it. |
-| `base_url` | The upstream **root** URL of an OpenAI-compatible account (migration 86; `''` for the bespoke `openai` / `anthropic` accounts, whose hosts are fixed). Stored as a root **without** `/v1` or any other path prefix: the client appends the preset's prefix and the resource (`{prefix}/chat/completions`, `{prefix}/models`; §4.4). Defaulted from the preset at create (required for `openai_compatible`), https only with no userinfo, query or fragment, and **immutable** after creation: it is absent from the update request. The DTO always carries it. |
+| `base_url` | The upstream **root** URL of a preset account, OpenAI-compatible or native Gemini (migration 86; `''` for the bespoke `openai` / `anthropic` accounts, whose hosts are fixed). Stored as a root **without** `/v1` or any other path prefix: the client appends the preset's prefix and the resource (`{prefix}/chat/completions`, `{prefix}/models`; §4.4), or, for native Gemini, its own `/v1beta/models/{model}:generateContent` (§4.5). Defaulted from the preset at create (required for `openai_compatible`), https only with no userinfo, query or fragment, and **immutable** after creation: it is absent from the update request. The DTO always carries it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
 account created but not yet connected, and an api-key account with no key set, have
@@ -76,8 +84,8 @@ client requests (`gateway_model`, the prefix plus the vendor's id) with the id
 the vendor is sent (`upstream_model`), the API flavor, and the vendor's
 human-readable `display_name` (`''` when it gave none; since migration 83). The
 catalog starts as a small **static guess** keyed by vendor **and** auth type
-(§10), written when the account is created (empty for the OpenAI-compatible
-vendors, which have no seed and are filled by discovery alone), and is **replaced
+(§10), written when the account is created (empty for the preset vendors, which
+have no seed and are filled by discovery alone), and is **replaced
 by the vendor's real list** once discovery has run (§6). The three tables and the
 `usage_events.account_id` attribution column are migration 82; migration 84 later
 adds the spend-control columns to the usage snapshot (§5.2), and migration 86 the
@@ -94,9 +102,10 @@ portal view is `portal.VendorAccountDTO`, which carries **no** credential materi
 
 The two types below apply to the bespoke `openai` and `anthropic` vendors. **The
 five OpenAI-compatible vendors (x.ai, OpenRouter, Kilo, Google, Custom) are
-`api_key` only**: they have no OAuth, no connect flow and no subscription backend,
-and creating one with `auth_type = subscription` is refused with
-`400 vendor_account.auth_type_invalid` (§4.4).
+`api_key` only**, and so is native Gemini (`google_native`): they have no OAuth,
+no connect flow and no subscription backend, and creating one with
+`auth_type = subscription` is refused with `400 vendor_account.auth_type_invalid`
+(§4.4, §4.5).
 
 **`api_key`.** The user pastes a platform API key (`sk-…` / `sk-ant-…`). Cheap,
 documented, stable, and legal — it is the user's own metered key. The gateway
@@ -245,7 +254,9 @@ model the backend does not serve — and the seeded model ids are a best guess
 `internal/vendorauth/validate.go`, plus a fifth that takes its URL as an argument
 (the OpenAI-compatible vendors, below), each make **one cheap GET that names no
 model**, so an authentication verdict can never be mistaken for a wrong-model
-error. The fixed URLs live in `constants.go` beside the OAuth constants.
+error. The fixed URLs live in `constants.go` beside the OAuth constants. The
+native Gemini probe (`ValidateGeminiAPIKey`, below) takes its URL as an argument
+too, and sends the key in `x-goog-api-key` instead of a Bearer header.
 
 | Credential | Probe | Auth headers | Provenance |
 |---|---|---|---|
@@ -254,15 +265,18 @@ error. The fixed URLs live in `constants.go` beside the OAuth constants.
 | OpenAI **`api_key`** | `GET https://api.openai.com/v1/models` | `Authorization: Bearer` | documented public API |
 | Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models` | `x-api-key`, `anthropic-version` | documented public API |
 | x.ai, Google, Custom **`api_key`** | `GET {base}{prefix}/models` (`https://api.x.ai/v1/models`, `https://generativelanguage.googleapis.com/v1beta/openai/models`, the user's root plus `/v1/models`) | `Authorization: Bearer` | preset registry (§4.4); the listing needs a key |
+| Google (native) **`api_key`** | `GET {base}/v1beta/models` (`https://generativelanguage.googleapis.com/v1beta/models`) | `x-goog-api-key` | preset registry (§4.4, §4.5); the listing needs a key |
 | OpenRouter **`api_key`** | `GET {base}/v1/key` (`https://openrouter.ai/api/v1/key`): its `/v1/models` is public, so a listing would call every key valid | `Authorization: Bearer` | preset registry (§4.4) |
 | Kilo **`api_key`** | **none**: its `/gateway/models` is public and it has no key endpoint, so no honest offline check exists and the answer is `unverifiable` ("this provider offers no offline key check") | — | preset registry (§4.4) |
 
 The three OpenAI-compatible rows are one function,
-`vendorauth.ValidateOpenAICompatibleAPIKey(probeURL, key)`, and the URL is composed
-by the portal from the account's `base_url` and its preset: `vendorauth` knows no
-vendor ids or roots. The rows' provenance is the providers' own API, confirmed live
-on 2026-10-10 and still VERIFY-LIVE (§10). As for every api key, they are probed
-only by the explicit Test connection, never when the key is saved.
+`vendorauth.ValidateOpenAICompatibleAPIKey(probeURL, key)`, and the native Gemini
+row is its counterpart `vendorauth.ValidateGeminiAPIKey(probeURL, key)`; in both the
+URL is composed by the portal from the account's `base_url` and its preset:
+`vendorauth` knows no vendor ids or roots. The rows' provenance is the providers' own API, confirmed live
+on 2026-10-10 and still VERIFY-LIVE (§10); the native Gemini row was designed from
+Google's documentation and is VERIFY-LIVE in full (§10). As for every api key, they
+are probed only by the explicit Test connection, never when the key is saved.
 
 **Classification** is one rule for all of them, the OpenAI-compatible probes
 included:
@@ -278,13 +292,17 @@ included:
   token minted by `claude setup-token` has the inference scope but not
   `user:profile`, so the profile endpoint legitimately refuses it with a 403
   although the token serves inference.
-- **Consequence for the OpenAI-compatible providers.** x.ai and Gemini answer a
-  wrong key with **400**, not 401, so a bad key there reads `unverifiable`
+- **Consequence for the OpenAI-compatible providers.** x.ai and Gemini (the shim)
+  answer a wrong key with **400**, not 401, so a bad key there reads `unverifiable`
   ("could not verify"), never `invalid`. The one rule is deliberately not bent
   per provider: the price is that a wrong key is not caught on those two, the gain
   that a non-401 answer never reads as `invalid`. A moved endpoint that begins
   answering 401 would still show a false `invalid` on Test connection, which
   blocks nothing, since an api key is not probed when it is saved ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix) (d)).
+- **Native Gemini's wrong-key status is unconfirmed.** Whether the native
+  `/v1beta/models` answers a bad key with 400 (`INVALID_ARGUMENT`) like the shim or
+  with 401 is VERIFY-LIVE (§10). Under the uniform rule either is safe: a 400 reads
+  `unverifiable`, a 401 `invalid`, and nothing else is ever a verdict.
 
 **Fail-soft.** Validation never reduces availability: `unverifiable` neither
 blocks an import nor is ever reported as an invalid credential. A probe runs only
@@ -392,6 +410,7 @@ matrix:
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
 | **OpenAI-compatible api-key** (x.ai, OpenRouter, Kilo, Google, Custom) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to the provider's `{prefix}/chat/completions` on the account's own root (§4.4). **No exception**: Responses and Messages passthrough exist only for the native OpenAI and Anthropic accounts, so an inbound `openai_responses` or `anthropic_messages` request is translated like any other. |
+| **Google (native) api-key** (`google_native`) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.Provider = vendor_gemini`, `APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to Gemini's `POST {root}/v1beta/models/{model}:generateContent` (`:streamGenerateContent?alt=sse` when streaming), authenticated with `x-goog-api-key` (§4.5). **No exception**, as for the OpenAI-compatible accounts: there is no passthrough yet (the inbound Gemini endpoint is #204). |
 
 The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted/shared path — when the module flag is off, the principal has no user
@@ -415,13 +434,20 @@ target:
 | `ExtraHeaders` | A small static header set attached to the upstream request (§4.1/§4.2). |
 | `Masquerade` | `""` (none) or `claude_code` (`routing.MasqueradeClaudeCode`), which makes the Anthropic client put the required Claude-Code system block first: prepended to the rendered request on the translate path, injected into the relayed body on the passthrough path (§4.1). |
 
-Three provider kinds select the client at dispatch: `vendor_openai`
+Four provider kinds select the client at dispatch: `vendor_openai`
 (`ProviderVendorOpenAI`, the api-key OpenAI path via the existing
 OpenAI-compatible client, which the five OpenAI-compatible vendors reuse as well,
 §4.4), `vendor_anthropic` (`ProviderVendorAnthropic`, the
 native Anthropic Messages client, used for an Anthropic account whether api-key or
-subscription), and `vendor_openai_subscription`
-(`ProviderVendorOpenAISubscription`, the ChatGPT backend).
+subscription), `vendor_openai_subscription`
+(`ProviderVendorOpenAISubscription`, the ChatGPT backend) and `vendor_gemini`
+(`ProviderVendorGemini`, the native Gemini `generateContent` client of a
+`google_native` account, §4.5). The Gemini kind has two paths. The one built is
+**translate**: the neutral request is rendered into `generateContent` and the answer
+parsed back. The other, a lossless **passthrough** of Gemini's own wire (the inbound
+Gemini endpoint where a Gemini-shaped client such as Antigravity connects), is
+deferred to #204: the client already implements `NativeProxyClient` for it, and the
+translation package it will reuse is the one the translate path uses.
 
 ### 4.1 Anthropic
 
@@ -878,7 +904,10 @@ them per request, §4.1), and — for OpenAI — the per-account `chatgpt-accoun
 even when no bearer is available, so an auth failure reads as an auth error
 upstream rather than a missing API version. The api-key path is unchanged: its
 sealed `APIToken` rides the vendor's own API-key header. The custom `x-api-key`
-header is redacted in payload capture (a latent leak the feature closed).
+header (Anthropic) and `x-goog-api-key` (native Gemini, §4.5) are redacted in payload
+capture: the provider's capture sink records the **outbound** request headers, so an
+unlisted credential header would be stored in clear (a latent leak the feature
+closed).
 
 ### 4.4 OpenAI-compatible vendors
 
@@ -892,13 +921,15 @@ the master flag (§7) and the owner-scope RBAC (§8) apply unchanged, but they a
 ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)).
 
 **The preset registry.** `internal/routing/vendor_presets.go` is a pure-data table
-keyed by vendor id (`VendorPresetFor`, `IsOpenAICompatibleVendor`,
-`OpenAIPathPrefixFor`). It lives in `routing` because the resolver needs the path
+keyed by vendor id (`VendorPresetFor`, `IsPresetVendor`, `IsOpenAICompatibleVendor`,
+`IsNativeGeminiVendor`, `OpenAIPathPrefixFor`). It lives in `routing` because the resolver needs the path
 prefix and routing cannot import the portal; the portal reads the rest to compose
 URLs, and `vendorauth` never sees a preset: it receives plain URL strings. A preset
 carries its default root, its path prefix, how its key is validated, how a
 discovered model id is rewritten, and its usage strategy (`UsageVia` with the
-root-relative `UsagePath`, below; §5.2). The values (live-confirmed 2026-10-10,
+root-relative `UsagePath`, below; §5.2), and its **`Dialect`**: `""` for the
+OpenAI wire served by the shared OpenAI-compatible client, `"gemini"` for the native
+`generateContent` client (§4.5). The values (live-confirmed 2026-10-10,
 VERIFY-LIVE, §10; the usage endpoints, checked on 2026-10-11, are
 docs-derived or undocumented, §5.2):
 
@@ -908,7 +939,19 @@ docs-derived or undocumented, §5.2):
 | `openrouter` | `https://openrouter.ai/api` | `/v1` | `GET {base}/v1/key` | verbatim | `openrouter_key`, `GET {base}/v1/key` |
 | `kilo` | `https://api.kilo.ai/api` | `/gateway` | none (`unverifiable`) | verbatim | `kilo_balance`, `GET {base}/profile/balance` (best effort) |
 | `google` | `https://generativelanguage.googleapis.com` | `/v1beta/openai` | `GET {base}/v1beta/openai/models` | a leading `models/` is stripped | none |
+| `google_native` (`Dialect` `gemini`; §4.5) | `https://generativelanguage.googleapis.com` | `/v1beta` (discovery and the key probe only: the client owns its request paths) | `GET {base}/v1beta/models` with `x-goog-api-key` | a leading `models/` is stripped; only `generateContent` models are kept | none |
 | `openai_compatible` | none: the user supplies it | `/v1` | `GET {base}/v1/models` | verbatim | none |
+
+**One registry, three predicates.** The registry holds both preset families, so its
+membership test is split by what a caller means. `IsPresetVendor` is true for every
+preset account and carries the **account** semantics shared by both families: api-key
+only, a configurable immutable root, fail-closed on an empty root, a best-effort
+discovery at create and an empty static seed. `IsOpenAICompatibleVendor` is
+`IsPresetVendor` with an empty `Dialect` and selects the OpenAI-wire resolver branch
+and the OpenAI-compatible discovery and key probe. `IsNativeGeminiVendor`
+(`Dialect == "gemini"`) is tested **first** in the resolver, discovery and
+validation, so a native account never takes an OpenAI-wire branch. The two Google
+presets share a default root but are separate accounts (§4.5).
 
 So x.ai serves chat at `https://api.x.ai/v1/chat/completions`, OpenRouter at
 `https://openrouter.ai/api/v1/chat/completions`, Kilo at
@@ -963,11 +1006,115 @@ classification. A new account has an empty catalog until discovery fills it
 (§6.2).
 
 **Deliberately out of scope.** Usage and credits are reported only for OpenRouter
-(its key's limit, per key) and, best effort, Kilo (a balance); x.ai, Google and
+(its key's limit, per key) and, best effort, Kilo (a balance); x.ai, Google, Google (native) and
 Custom report none (§5.2), and the passive header scrape finds nothing for any of
-them (§5.1); the native Gemini dialect (`generateContent` and Gemini-only
-features) is a later sub-project, Gemini being served meanwhile through its OpenAI
-shim; and the subscription/OAuth path does not exist for them (§2).
+them (§5.1); Gemini-only features do not exist on the shim, which carries only what
+OpenAI's chat completions do (the native dialect, §4.5, is the separate
+`google_native` account); and the subscription/OAuth path does not exist for them
+(§2).
+
+### 4.5 Native Google Gemini
+
+The vendor id `google_native` reaches Gemini through Google's own `generateContent`
+wire rather than the OpenAI shim of §4.4
+([ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)).
+It is an ordinary per-user vendor account (ownership, the per-token opt-in §11, the
+model prefix §6.5, the master flag §7, owner-scope RBAC §8 all apply) and a preset
+of the same registry, so it is api-key only and carries an immutable stored root
+(default `https://generativelanguage.googleapis.com`, https only, an optional owner
+override under the same trust model as §4.4). It differs from the shim `google`
+account in three ways: its `Dialect` is `gemini`, its provider kind is
+`vendor_gemini`, and its client is a native one.
+
+**Selection, with no migration.** The two Google accounts are told apart by vendor
+id alone. `vendor_accounts.vendor` is free text with no check constraint, so adding
+`google_native` changes no schema: an owner may hold a shim and a native account at
+once, and rolling back is deleting the native account. Both register the same model
+names when they discover, so the name-collision rule of §11.3 applies (the first
+account by id wins at resolve time), and the advice is a distinct `model_prefix` on
+one of them (§6.5).
+
+**Serving.** `vendorAccountTarget` builds the target in an `IsNativeGeminiVendor`
+branch that comes **before** the generic OpenAI-compatible one: `Provider =
+vendor_gemini`, `Endpoint` = the stored root, `APITokenHeader = x-goog-api-key` and no
+`OpenAIPathPrefix` (the client composes its own paths, and `OpenAIPathPrefixFor`
+answers empty for a native preset). The served flavors are `[openai, anthropic]` with
+both endpoint modes zero, **translate only** (the matrix in §4). A stored account
+with no root fails closed through `IsPresetVendor`, like an OpenAI-compatible one.
+
+**The client** (`internal/provider/gemini.go`, `GeminiClient`) implements `Client`,
+`StreamingClient` and `NativeProxyClient`; like the Anthropic client it implements no
+`ModelLister` or `Prober`, because vendor discovery lives in the portal (§6).
+
+- **Paths.** `POST {root}/v1beta/models/{model}:generateContent`, and
+  `:streamGenerateContent?alt=sse` for a stream. The model is taken from the
+  target's `ProviderModel` (a leading `models/`, the listing's form, is stripped) and
+  path-escaped; the request body carries no model and no stream flag.
+- **Auth.** The sealed key is sent only as the `x-goog-api-key` header, never as the
+  `?key=` query parameter (which would put it in URLs and logs).
+- **No redirects.** On both the translate and the passthrough path the client does not
+  follow a redirect: `net/http` drops `Authorization` but not a custom credential header
+  when a redirect leaves the host, and the root is owner-supplied. A 3xx is returned as
+  the upstream's answer.
+- **Timeouts and errors.** `Complete` applies the target timeout; `CompleteStream`
+  applies none (the gateway's idle watchdog governs a stalled stream, as for every
+  client). A context deadline is `provider.timeout`, a transport failure
+  `provider.unavailable`, and a non-2xx status the usual status mapping **with a bounded
+  snippet of the upstream body**, so a 400 `INVALID_ARGUMENT` explains itself.
+- **Streaming.** Gemini's SSE carries only `data:` frames (no `[DONE]`), each a whole
+  response chunk. The stream is complete only when a chunk reports a finish reason;
+  the last (cumulative) `usageMetadata` is the answer's usage; whole function calls are
+  buffered and emitted before the terminal event; and a mid-stream `{"error":...}` frame
+  or an end of stream with no finish reason is `provider.unavailable`, so a cut-off
+  stream is never reported as a completed one.
+- **Capture.** `x-goog-api-key` is in the capture-redaction allowlist (§4.3), and the
+  usage-row path label of a `vendor_gemini` target is the fixed string
+  `/v1beta/models/*:generateContent`, because the label function takes no model.
+
+**Translation** is `internal/geminiwire`, a leaf package that imports only
+`internal/inference` (pinned by the architecture tests,
+[Architecture Tests](architecture-tests.md)). It holds the Gemini wire structs and the
+converters, outbound (`RenderRequest`, `ParseResponse`, `ParseStreamChunk`) now and
+inbound (`ParseRequest`, `RenderResponse`, `RenderStreamChunk`) reserved for #204, so
+both directions share one package. The rules, at the neutral model's expressiveness:
+
+| Neutral | Gemini |
+|---|---|
+| `system` / `developer` messages | joined with a blank line into `systemInstruction` (text only) |
+| `user` / `assistant` turns | `user` / `model` contents; consecutive same-role turns merge, empty ones drop |
+| `tool` message | a `user` turn of `functionResponse` parts (parallel results merge); a non-object result is wrapped as `{"result": text}` |
+| image data URI / http(s) URL | `inlineData` / `fileData` (an external URL is VERIFY-LIVE); other media is dropped |
+| `Tool` | `functionDeclarations[].parametersJsonSchema` (a bare object schema when there are none) |
+| `tool_choice` | `functionCallingConfig`: auto is `AUTO`, none `NONE`, required `ANY`, a named function `ANY` with `allowedFunctionNames` |
+| `temperature`, `max_tokens`, `stop` | `generationConfig` `temperature`, `maxOutputTokens`, `stopSequences` |
+| `reasoning_effort` | `thinkingConfig` with thoughts included: a `thinkingBudget` for the 2.5 family (low 1024, medium 8192, high 24576), a `thinkingLevel` for `gemini-3`, the family sniffed from the model name |
+| response `thought` parts / text parts / `functionCall` parts | reasoning / text / tool calls (arguments as compact JSON, `{}` when absent) |
+| `finishReason` | `MAX_TOKENS` is `length`; safety-class reasons (`SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `LANGUAGE`, `IMAGE_*`) are `content_filter`; anything else is `stop`, or `tool_calls` when a call is present |
+| a prompt-blocked reply (HTTP 200, no candidates, a `promptFeedback.blockReason`) | an empty answer with `content_filter`; the parser never indexes `candidates[0]` unconditionally |
+| `usageMetadata` | input = `promptTokenCount` (includes the cache), cached = `cachedContentTokenCount`, output = candidates plus `thoughtsTokenCount`, total as reported |
+
+**Function name and `thoughtSignature` via the tool-call id.** The neutral model has no
+slot for either, yet Gemini keys a `functionResponse` by function **name** and, on
+Gemini 3, rejects a function-calling turn whose `thoughtSignature` is not echoed back.
+Every dialect echoes a tool-call id verbatim, so the parser puts both into
+`ToolCall.ID` as `gcw1:` plus the base64url of a small JSON object (`n` the name, `s` the
+signature), and the renderer decodes it on the next turn to restore the model turn's
+`thoughtSignature` and the `functionResponse` name. A malformed or `null` payload does
+not decode. An id minted elsewhere (history from another provider) falls back to the
+name of an **earlier** assistant call with that id and carries no signature (what
+Gemini 3 does with a signature-less history is VERIFY-LIVE, §10). Only a function-call
+part's signature is carried.
+
+**Discovery and validation** are the portal's, through `vendorauth` (§6.1, §3.5):
+`DiscoverGeminiModels` pages `GET {base}/v1beta/models` and `ValidateGeminiAPIKey`
+probes the same URL, both with `x-goog-api-key`. The preset has no usage strategy:
+Gemini has no usage API, so a `google_native` account reports no usage (§5.2).
+
+**Scope.** Translate-only. Lossless passthrough of Gemini's own wire, the inbound
+Gemini endpoint where a Gemini-shaped client connects, is #204 and reuses
+`geminiwire` and the client's `ProxyNative`. Broad translate fidelity, meaning the
+features the neutral model cannot carry (structured output, safety settings, non-image
+media, fine thinking control), is #208.
 
 ## 5. Usage & limits
 
@@ -1025,7 +1172,7 @@ gateway can also **ask** the vendor, and for an OpenRouter or Kilo `api_key`
 account, whose responses never carry usage headers at all, the pull is the only way
 to learn anything (the api-key pull, below). An OpenAI `api_key` account (a
 platform account has no subscription window to report), every Anthropic account
-and the x.ai, Google and Custom accounts have no such endpoint; for Anthropic the
+and the x.ai, Google, Google (native) and Custom accounts have no such endpoint; for Anthropic the
 header scrape stays the only source.
 
 | Credential | Request | Provenance |
@@ -1310,7 +1457,7 @@ in flight, and a failed read of the snapshot also leaves the frame with that lin
 rather than a toast. An
 `api_key` account has no snapshot from the scrape, since its responses carry none of
 the headers of §5.1: an OpenRouter or Kilo account gets one from the active pull
-(§5.2), and the others (x.ai, Google, Custom, a native OpenAI or Anthropic key)
+(§5.2), and the others (x.ai, Google, Google (native), Custom, a native OpenAI or Anthropic key)
 show the empty-state line. A window the vendor did not
 report (`-1`, never observed) has **no row at all** — it is hidden, not drawn as
 "no data" and never as a real 0 % (a real `0` is a known value and is shown). The
@@ -1357,7 +1504,7 @@ the provider), and re-reads the snapshot; a call that itself failed is a toast. 
 same account also gets **one on-view-lazy refresh** (the plain call, no `force`) when
 its detail view opens, so figures that went stale while nobody looked are renewed
 without a click; it is best effort, its failure is silent and it never loops or
-polls. Every other account (an x.ai, Google, Custom or native `api_key`, an Anthropic
+polls. Every other account (an x.ai, Google, Google (native), Custom or native `api_key`, an Anthropic
 subscription) gets neither the button nor the call: it learns its usage only from
 the requests it serves. The frontend names the two api-key vendors itself
 (`hasActiveUsagePull`), mirroring the registry's `UsageVia`; the backend registry
@@ -1432,7 +1579,7 @@ merged write is idempotent).
 | `ok` | The vendor was asked, answered usably and the snapshot was stored (merged, §5.3, for an OpenAI subscription; as fetched for an api-key account, §5.2). |
 | `fresh` | The lazy TTL skipped the pull; the vendor was **not** called. It says the pull was skipped, not that the data is current: the last attempt may have failed, so the stored snapshot can be older than the TTL, or `usage` can be `null`. |
 | `unverifiable` | Nothing usable could be had: no usable token, or no API key set, the vendor unreachable or answering with an error or an unusable body (Kilo's undocumented balance endpoint is expected to do so while the stored key type is unconfirmed), or a snapshot that could not be stored. The stored snapshot is kept. It says nothing about the credential (only the dispatch moves an account to `needs_reconnect`, §3.4). |
-| `unsupported` | Neither an OpenAI subscription nor an OpenRouter or Kilo api key: a native OpenAI or Anthropic `api_key` account, an x.ai, Google or Custom account and an Anthropic subscription have no active pull; their snapshot, when they have one, only comes from the scrape (§5.1). No credential is opened. |
+| `unsupported` | Neither an OpenAI subscription nor an OpenRouter or Kilo api key: a native OpenAI or Anthropic `api_key` account, an x.ai, Google, Google (native) or Custom account and an Anthropic subscription have no active pull; their snapshot, when they have one, only comes from the scrape (§5.1). No credential is opened. |
 
 `refresh.detail` is a short English phrase for diagnostics; the portal keys off
 `status` only. The endpoint is **fail-soft** like the models refresh: an
@@ -1457,14 +1604,14 @@ backend serves newer model generations than any list kept in this repository, an
 a vendor renames or retires models without notice. So the gateway asks the vendor
 which models the account's **own credential** can really use and **replaces** the
 guess with the answer. The static set stays as the create-time fallback and as
-what an account keeps whenever discovery yields nothing. The OpenAI-compatible
-vendors (§4.4) seed **nothing**: their catalog starts empty and is filled by a
-best-effort discovery at create (when the account is created with its key, §6.2)
-and by the refresh.
+what an account keeps whenever discovery yields nothing. The preset vendors, the
+OpenAI-compatible ones (§4.4) and native Gemini (§4.5), seed **nothing**: their
+catalog starts empty and is filled by a best-effort discovery at create (when the
+account is created with its key, §6.2) and by the refresh.
 
 Discovery is split like the validation probes (§3.5). One fetcher per credential kind lives
-in `internal/vendorauth` (`discover.go`, and `openai_compatible.go` for the
-OpenAI-compatible vendors) and never returns an error — only a list
+in `internal/vendorauth` (`discover.go`, `openai_compatible.go` for the
+OpenAI-compatible vendors and `gemini.go` for native Gemini) and never returns an error — only a list
 and a status, `ok` or `unverifiable`. The service around it
 (`portal.Service.RefreshVendorAccountModels`, `service_vendor_discovery.go`)
 opens the sealed credential, picks the fetcher, validates and caps what the
@@ -1480,6 +1627,7 @@ transaction.
 | Anthropic **`api_key`** | `GET https://api.anthropic.com/v1/models?limit=1000` with `x-api-key`, `anthropic-version` | every `data[].id` with its `display_name` | documented public API |
 | Anthropic **subscription** | the same URL with `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, `anthropic-version` | as above | reverse-engineered, **VERIFY-LIVE** |
 | **OpenAI-compatible `api_key`** (x.ai, OpenRouter, Kilo, Google, Custom) | `GET {base}{prefix}/models` with `Authorization: Bearer`, the URL composed by the portal from the account's `base_url` and its preset (§4.4) and fetched by `vendorauth.DiscoverOpenAICompatibleModels(modelsURL, key)`, **not** through the provider client | every `data[].id`; display name from `display_name`, else `name` (OpenRouter sends `name`), else the id. For Google a leading `models/` is stripped from the id (and from a display name that was only the id standing in) | the providers' own endpoints, confirmed live 2026-10-10, **VERIFY-LIVE** |
+| **Google (native) `api_key`** (`google_native`) | `GET {base}/v1beta/models?pageSize=1000` with `x-goog-api-key`, the URL composed by the portal from the account's `base_url` and its preset (§4.5), following `nextPageToken` for at most 20 pages, fetched by `vendorauth.DiscoverGeminiModels(modelsURL, key)`, **not** through the provider client | only entries whose `supportedGenerationMethods` contain `generateContent` (the listing also carries embedding and other models); the `models/` resource prefix is stripped from the id (and from a display name that was only the id standing in). A listing still paging after the cap is `unverifiable`, never a truncated catalog | Google's documented endpoint, shape and method vocabulary **VERIFY-LIVE** (§10) |
 
 An OpenAI api-key listing names every model the key reaches, with no capability
 data, so it is narrowed by a small heuristic: the `gpt-*`, `chatgpt-*` and
@@ -1513,8 +1661,8 @@ account keeps its static seed.
   without a credential and the connect still succeeds with the models it had.
   The import and complete responses carry the account as it then serves; the
   device poll only reports `connected`, and the portal re-reads the account.
-- **At create (OpenAI-compatible).** Creating an OpenAI-compatible account **with
-  its key** runs the same discovery once, best-effort and under the same 5-second
+- **At create (preset accounts).** Creating an OpenAI-compatible or native Gemini
+  account **with its key** runs the same discovery once, best-effort and under the same 5-second
   bound, because these accounts have no static seed and would otherwise serve
   nothing until the first refresh. For OpenRouter and Kilo the trailing usage pull
   of §5.2 rides along inside the same bound, so a new account can show its limit or
@@ -1837,6 +1985,31 @@ reasons are recorded deliberately, not in denial of them
   gateway can be pointed at any https host
   (server-side request forgery is accepted, with its limits,
   [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **Native Gemini was designed from documentation, without a live key, so its wire
+  details are VERIFY-LIVE (§4.5).** The conservative choice in each case is what the
+  code does today, and a wrong guess degrades to an upstream error or an unverifiable
+  probe, not to a wrong answer:
+  - whether the native endpoint accepts an API key sent as `Authorization: Bearer`
+    (assumed not, so the key is sent as `x-goog-api-key` only, never as a Bearer
+    token);
+  - a wrong key may be answered with 400 `INVALID_ARGUMENT` or with 401
+    (`ACCESS_TOKEN_TYPE_UNSUPPORTED`), which the uniform classification turns into
+    `unverifiable` or `invalid` respectively (§3.5);
+  - the exact shape of `/v1beta/models`, its default page size and the vocabulary of
+    `supportedGenerationMethods` (the discovery filters on `generateContent`);
+  - whether every model accepts `parametersJsonSchema` for tool schemas (the fallback
+    would be the OpenAPI-subset `parameters` field), and whether an external image URL
+    is accepted as `fileData` (else it is dropped);
+  - streaming details: that `usageMetadata` is cumulative so the last one is kept,
+    that function-call parts arrive whole, the shape of a mid-stream error frame and
+    that `finishReason` is absent on partial chunks;
+  - what Gemini 3 does with a history that carries no `thoughtSignature` (a
+    cross-provider turn), a documented dummy-signature fallback versus failing, and
+    which parallel function-call parts carry signatures;
+  - per-model quirks that drive the conservative rendering: sampling parameters the
+    newer models ignore or reject, a trailing `model` turn answered with a 400, and
+    `thinkingLevel` versus `thinkingBudget` per model family (the family is sniffed
+    from the model name).
 - **The OpenRouter and Kilo usage endpoints are the least certain data in the
   registry (§5.2).** OpenRouter's `GET {base}/v1/key` is a documented endpoint, but
   its response shape was derived from the documentation and has not been confirmed
@@ -1949,7 +2122,10 @@ the reason to prefer a distinct prefix when both exist.
 ### 11.3 Name collisions
 
 Two accounts can offer the same effective name: two accounts of one vendor with no
-prefix, or an override that lands on another account's prefix. Two layers handle it:
+prefix, or an override that lands on another account's prefix. The two Google
+accounts are a concrete case: a shim `google` account and a native `google_native`
+account discover the same model names, so without a prefix on one of them they
+collide (give one a distinct `model_prefix`, §6.5). Two layers handle it:
 
 - **Rejected at save** (`all: false` only). Creating or updating a token checks the
   effective names across the selected accounts' **current** models and refuses a
@@ -2030,3 +2206,7 @@ enabled vendor accounts is affected.
 - [ADR-053](../09-architecture-decisions.md#adr-053--usagecredits-for-api-key-vendor-accounts-a-per-preset-usage-strategy-over-the-existing-oauth-only-pull-path)
   — usage/credits for api-key vendor accounts: the per-preset usage strategy, its
   root-relative path and the single-writer store of the api-key pull.
+- [ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)
+  — the native Gemini dialect: its own vendor id and provider kind, the preset
+  `Dialect` selector, the shared `geminiwire` translation package and the
+  translate-only scope.

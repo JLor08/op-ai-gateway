@@ -18,7 +18,7 @@ Two test families per module:
 
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
-   compared against a checked-in allowlist — 63 edges across 26 packages in
+   compared against a checked-in allowlist — 65 edges across 27 packages in
    `op-ai-gateway`, 24 edges across 12 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
@@ -37,6 +37,7 @@ Gateway backend (`op-ai-gateway`):
 | `store` ↛ `portal`, `gateway` | persistence sits below the service layer |
 | `portal` ↛ `gateway`, `compat` | the service layer never reaches up into HTTP or flavor translation |
 | `compat` imports only `inference` among internals | API-flavor knowledge stays contained in the translation layer |
+| `geminiwire` imports only `inference` among internals | the Gemini wire types and Gemini-to-neutral converters stay a leaf that the provider client (and the later inbound endpoint) can share; today only `provider` imports it, and a later importer is a deliberate allowlist edit ([ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)) |
 | `tracing` ↛ `portal`, `account`, `provider` | those packages' tracing decorators live inside them via the OTel global, precisely to avoid this cycle |
 | `inference`, `usage`, `apierror`, `storeerr`, `theme`, `auth` import no internal package | leaf vocabulary/utility packages |
 
