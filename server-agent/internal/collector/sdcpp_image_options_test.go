@@ -112,6 +112,10 @@ var sdcppImageOptionsCases = []struct {
 	},
 }
 
+// TestParseSdcppImageOptionsTwinTable runs sdcppImageOptionsCases against this
+// module's parseSdcppImageOptions. The gateway runs the same table (verbatim,
+// held identical by its TestSdcppImageOptionsCasesMatchTheAgentsTable) against
+// its own copy of the decode, so the two copies cannot drift apart unnoticed.
 func TestParseSdcppImageOptionsTwinTable(t *testing.T) {
 	for _, tc := range sdcppImageOptionsCases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -3476,6 +3476,12 @@ func TestProbeRuntimeChildPropsSdcppImageOptionsNilWhenNoDocumentWasRead(t *test
 				t.Errorf("%s: ImageOptions = %+v, want nil", name, rs.ImageOptions)
 			}
 		}
+		// The nil above only means something if the probe actually ran: the
+		// child was asked exactly once (the miss), and the conclusive 404 was
+		// cached so the hit did not ask again.
+		if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+			t.Errorf("child requests = %v, want %v (probed once, then answered from the cache)", got, want)
+		}
 	})
 
 	t.Run("a document with no options is a non-nil zero value", func(t *testing.T) {

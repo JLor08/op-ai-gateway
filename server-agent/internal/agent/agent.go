@@ -204,7 +204,22 @@ import (
 // operator observes, and nothing on the gateway waits on either: an older
 // agent rests on the older document until the next push or the poll, and
 // leaves such a request queued until the next release, exit or Apply.
-const Version = "0.8.1"
+//
+// 0.8.1 -> 0.8.2 is the single bump for the image-model-options branch: for
+// a "stable_diffusion_cpp" child the agent now also reports the image
+// options its /sdcpp/v1/capabilities document states -- the sampler and
+// scheduler names, the img_gen output formats, the size and batch limits and
+// the server's own defaults -- as the new sample.RuntimeSample.ImageOptions
+// field (the "image_options" key), read from the same document and cached in
+// the same entry as the image verdict. PATCH, and the rule decides it:
+// agent.Features gains NO entry. The field rides the existing
+// "capability_source_sdcpp" gate, a feature name the GATEWAY declares, not
+// one the agent does: while the gateway does not declare it the child is not
+// probed and nothing is sent, exactly as for the image verdict, and a
+// gateway that predates the field ignores the unknown key. Nothing on the
+// gateway side waits on the agent, so there is nothing for a feature flag to
+// gate. The same reasoning made 0.7.3 -> 0.7.4 (#154) a PATCH.
+const Version = "0.8.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
