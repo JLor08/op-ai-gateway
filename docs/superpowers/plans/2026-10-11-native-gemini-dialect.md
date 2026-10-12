@@ -319,7 +319,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"example.com/op-ai-gateway/backend/internal/inference"
+	"op-ai-gateway/internal/inference"
 )
 
 func fv(f float64) *float64 { return &f }
@@ -384,14 +384,15 @@ func TestRenderFunctionResponseNameFallback(t *testing.T) {
 
 func TestRenderToolsAndChoice(t *testing.T) {
 	req := inference.Request{
-		Tools: []inference.Tool{{Name: "f", Description: "d", Parameters: json.RawMessage(`{"type":"object","properties":{}}`)}},
+		Tools:      []inference.Tool{{Name: "f", Description: "d", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}},
 		ToolChoice: "required",
 	}
 	got := RenderRequest(req, "gemini-2.5-pro")
 	if len(got.Tools) != 1 || len(got.Tools[0].FunctionDeclarations) != 1 {
 		t.Fatalf("tools = %+v", got.Tools)
 	}
-	if string(got.Tools[0].FunctionDeclarations[0].ParametersJSONSchema) != `{"type":"object","properties":{}}` {
+	// json.Marshal sorts map keys, so "properties" precedes "type".
+	if string(got.Tools[0].FunctionDeclarations[0].ParametersJSONSchema) != `{"properties":{},"type":"object"}` {
 		t.Fatalf("schema = %s", got.Tools[0].FunctionDeclarations[0].ParametersJSONSchema)
 	}
 	if got.ToolConfig == nil || got.ToolConfig.FunctionCallingConfig.Mode != "ANY" {
@@ -401,7 +402,7 @@ func TestRenderToolsAndChoice(t *testing.T) {
 
 func TestRenderToolChoiceNamed(t *testing.T) {
 	req := inference.Request{
-		Tools:      []inference.Tool{{Name: "f", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		Tools:      []inference.Tool{{Name: "f", Parameters: map[string]any{"type": "object"}}},
 		ToolChoice: map[string]any{"type": "function", "function": map[string]any{"name": "f"}},
 	}
 	got := RenderRequest(req, "gemini-2.5-pro")
@@ -459,7 +460,7 @@ func TestRenderBadToolArgsBecomeEmptyObject(t *testing.T) {
 }
 ```
 
-> Confirm the exact `internal/inference` import path (`example.com/...`) and the `inference.Tool` field name for the JSON-schema parameters (`Parameters`) against `gateway/backend/go.mod` and `internal/inference/types.go` before writing — the brief's values are authoritative if they differ.
+> Verified against the source (authoritative): the module import path is `op-ai-gateway/internal/inference` (module `op-ai-gateway`, rooted at `gateway/backend`). **`inference.Tool.Parameters` is a `map[string]any`, NOT `json.RawMessage`** — so `toolSchema` marshals the map into a `json.RawMessage` for `parametersJsonSchema`. Field reference: `inference.Tool{Name, Description string; Parameters map[string]any}`; `inference.ToolCall{ID, Name, Arguments string}` (Arguments is a JSON string); `inference.Message{Role Role; Content []ContentPart; ToolCallID string; ToolCalls []ToolCall}`; `inference.ContentPart{Type ContentType; Text, ImageURL string}`; `inference.Message.Text()` joins the `ContentText` parts. Roles: `RoleSystem`/`RoleDeveloper`/`RoleUser`/`RoleAssistant`/`RoleTool`. Content types: `ContentText`/`ContentImage`/`ContentToolResult`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -477,7 +478,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"example.com/op-ai-gateway/backend/internal/inference"
+	"op-ai-gateway/internal/inference"
 )
 
 // RenderRequest converts a neutral request into a Gemini generateContent body.
@@ -657,12 +658,17 @@ func renderTools(tools []inference.Tool) []Tool {
 	return []Tool{{FunctionDeclarations: decls}}
 }
 
-func toolSchema(params json.RawMessage) json.RawMessage {
-	trimmed := strings.TrimSpace(string(params))
-	if trimmed == "" || trimmed == "null" {
+// toolSchema marshals a neutral tool's JSON-schema parameters (a map) into a
+// parametersJsonSchema value. An empty/absent map becomes a bare object schema.
+func toolSchema(params map[string]any) json.RawMessage {
+	if len(params) == 0 {
 		return json.RawMessage(`{"type":"object"}`)
 	}
-	return json.RawMessage(trimmed)
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return json.RawMessage(`{"type":"object"}`)
+	}
+	return raw
 }
 
 func renderToolConfig(choice any) *ToolConfig {
@@ -974,7 +980,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"example.com/op-ai-gateway/backend/internal/inference"
+	"op-ai-gateway/internal/inference"
 )
 
 // Result is the neutral outcome of a Gemini response or stream chunk. It is
@@ -1358,8 +1364,8 @@ import (
 	"testing"
 	"time"
 
-	"example.com/op-ai-gateway/backend/internal/inference"
-	"example.com/op-ai-gateway/backend/internal/routing"
+	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/routing"
 )
 
 func TestGeminiClientInterfaces(t *testing.T) {
@@ -1547,9 +1553,9 @@ import (
 	"net/url"
 	"strings"
 
-	"example.com/op-ai-gateway/backend/internal/geminiwire"
-	"example.com/op-ai-gateway/backend/internal/inference"
-	"example.com/op-ai-gateway/backend/internal/routing"
+	"op-ai-gateway/internal/geminiwire"
+	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/routing"
 )
 
 const (
