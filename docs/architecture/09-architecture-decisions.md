@@ -3576,11 +3576,16 @@ be written twice or buried in one client.
   encode error is the client's `json.Marshal`.
 - **(e) The function name and `thoughtSignature` ride in the neutral tool-call id.**
   Every dialect echoes a tool-call id verbatim (`tool_call_id`, `call_id`,
-  `tool_use_id`), so the parser folds the function name and the part's
-  `thoughtSignature` into `ToolCall.ID` as `gcw1:` plus the base64url of a small JSON
-  object, and the renderer decodes it on the next turn to restore the model turn's
-  `thoughtSignature` and the `functionResponse` name. The codec is reversible and
-  rejects a malformed or `null` payload. An id this package did not mint (history from
+  `tool_use_id`), so the parser folds the function name, the part's
+  `thoughtSignature`, and a per-response call index into `ToolCall.ID` as `gcw1:` plus
+  the base64url of a small JSON object (`n`/`s`/`x`), and the renderer decodes it on the
+  next turn to restore the model turn's `thoughtSignature` and the `functionResponse`
+  name. The codec is reversible and rejects a malformed or `null` payload. The `x` index
+  keeps two parallel calls to the same function with the same (or no) signature distinct
+  (a strict downstream client keys on `tool_call_id`); it is omitted when 0, ignored on
+  decode, and never sent to Gemini. The index is per response, so the first unsigned call
+  of each turn repeats across turns — accepted, since a per-response nonce would break
+  the determinism the rest of the codec relies on. An id this package did not mint (history from
   another provider) falls back to the name of an **earlier** assistant call with that id,
   and carries no signature. A non-object tool result is wrapped as `{"result": text}`.
 - **(f) Translation at the neutral model's expressiveness, with Gemini's own

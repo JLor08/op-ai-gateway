@@ -167,6 +167,38 @@ func TestGeminiCompleteStreamToolCallOnEarlierChunkUpgradesFinish(t *testing.T) 
 	}
 }
 
+// TestGeminiCompleteStreamParallelSameNameCallsDistinctIDs drives the client's
+// stream aggregator end to end: two parallel calls to the SAME function arrive on
+// separate SSE chunks, and the emitted tool-call ids must differ. This exercises
+// the offset wiring (the client passes its running tool-call count to
+// ParseStreamChunk) that a geminiwire-only test cannot reach.
+func TestGeminiCompleteStreamParallelSameNameCallsDistinctIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\"}}}]}}]}\n\n"))
+		fl.Flush()
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Bergen\"}}}]},\"finishReason\":\"STOP\"}]}\n\n"))
+		fl.Flush()
+	}))
+	defer srv.Close()
+	c := NewGeminiClient(srv.Client())
+	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro"}
+	_, events := collectGeminiStream(t, c, tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("weather?")}})
+	var ids []string
+	for _, ev := range events {
+		if ev.Type == inference.StreamEventToolCall && ev.ToolCall != nil {
+			ids = append(ids, ev.ToolCall.ID)
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("want 2 tool-call events, got %d (%v)", len(ids), ids)
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("parallel same-name calls across chunks got identical ids: %q", ids[0])
+	}
+}
+
 // Gemini reports cumulative usageMetadata on every chunk; only the last
 // non-zero one is the answer's usage.
 func TestGeminiCompleteStreamKeepsLastUsage(t *testing.T) {

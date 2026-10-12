@@ -1099,7 +1099,9 @@ slot for either, yet Gemini keys a `functionResponse` by function **name** and, 
 Gemini 3, rejects a function-calling turn whose `thoughtSignature` is not echoed back.
 Every dialect echoes a tool-call id verbatim, so the parser puts both into
 `ToolCall.ID` as `gcw1:` plus the base64url of a small JSON object (`n` the name, `s` the
-signature), and the renderer decodes it on the next turn to restore the model turn's
+signature, `x` a per-response call index — omitted when 0 — that keeps parallel same-name
+calls distinct for a strict downstream client; it is ignored on decode and never sent to
+Gemini), and the renderer decodes it on the next turn to restore the model turn's
 `thoughtSignature` and the `functionResponse` name. A malformed or `null` payload does
 not decode. An id minted elsewhere (history from another provider) falls back to the
 name of an **earlier** assistant call with that id and carries no signature (what

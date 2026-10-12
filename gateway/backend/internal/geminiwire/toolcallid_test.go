@@ -15,7 +15,7 @@ func TestToolCallIDRoundTrip(t *testing.T) {
 		{"", ""},
 	}
 	for _, c := range cases {
-		id := encodeToolCallID(c.name, c.sig)
+		id := encodeToolCallID(c.name, c.sig, 0)
 		gotName, gotSig, ok := decodeToolCallID(id)
 		if !ok {
 			t.Fatalf("decode(%q) ok=false, want true", id)
@@ -49,7 +49,7 @@ func TestDecodeToolCallIDForeign(t *testing.T) {
 // conversation histories, so the scheme is a contract.
 func TestEncodeToolCallIDFormat(t *testing.T) {
 	want := "gcw1:" + base64.RawURLEncoding.EncodeToString([]byte(`{"n":"f"}`))
-	if got := encodeToolCallID("f", ""); got != want {
+	if got := encodeToolCallID("f", "", 0); got != want {
 		t.Fatalf("format = %q, want %q", got, want)
 	}
 }

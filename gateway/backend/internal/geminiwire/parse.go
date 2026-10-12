@@ -22,7 +22,7 @@ type Result struct {
 // malformed JSON; a prompt-blocked reply (no candidates, promptFeedback set)
 // is a valid, billed result with empty text and a content_filter finish.
 func ParseResponse(raw []byte) (Result, error) {
-	res, _, err := parseGenerateContent(raw)
+	res, _, err := parseGenerateContent(raw, 0)
 	return res, err
 }
 
@@ -33,15 +33,19 @@ func ParseResponse(raw []byte) (Result, error) {
 // only the chunk that reports the finishReason maps it, and it reflects
 // tool_calls only when that same chunk carries a functionCall, so a caller
 // aggregating a stream must remember tool calls seen on earlier chunks.
-func ParseStreamChunk(raw []byte) (res Result, done bool, err error) {
-	return parseGenerateContent(raw)
+//
+// toolCallOffset is the number of tool calls the caller has already collected
+// from earlier chunks (len of its running slice). It makes each call's index
+// stream-global so parallel same-name calls split across chunks get distinct ids.
+func ParseStreamChunk(raw []byte, toolCallOffset int) (res Result, done bool, err error) {
+	return parseGenerateContent(raw, toolCallOffset)
 }
 
 // parseGenerateContent is the shared decoder behind ParseResponse and
 // ParseStreamChunk: a buffered response and a stream chunk are the same wire
 // shape. It never indexes candidates[0] unconditionally, because a
 // prompt-blocked reply has none.
-func parseGenerateContent(raw []byte) (Result, bool, error) {
+func parseGenerateContent(raw []byte, offset int) (Result, bool, error) {
 	var resp GenerateContentResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return Result{}, false, err
@@ -53,7 +57,7 @@ func parseGenerateContent(raw []byte) (Result, bool, error) {
 		cand := resp.Candidates[0]
 		finish = cand.FinishReason
 		if cand.Content != nil {
-			res.Text, res.Reasoning, res.ToolCalls = partsToNeutral(cand.Content.Parts)
+			res.Text, res.Reasoning, res.ToolCalls = partsToNeutral(cand.Content.Parts, offset)
 			hasToolCall = len(res.ToolCalls) > 0
 		}
 	} else if resp.PromptFeedback != nil && resp.PromptFeedback.BlockReason != "" {
@@ -68,13 +72,17 @@ func parseGenerateContent(raw []byte) (Result, bool, error) {
 	return res, res.FinishReason != "", nil
 }
 
-func partsToNeutral(parts []Part) (text, reasoning string, calls []inference.ToolCall) {
+// partsToNeutral converts a candidate's parts. offset is the number of tool
+// calls already collected before these parts (0 for a buffered response, the
+// running total across a stream's earlier chunks), so each call's index is
+// stream-global and parallel same-name calls get distinct neutral ids.
+func partsToNeutral(parts []Part, offset int) (text, reasoning string, calls []inference.ToolCall) {
 	var tb, rb strings.Builder
 	for _, p := range parts {
 		switch {
 		case p.FunctionCall != nil:
 			calls = append(calls, inference.ToolCall{
-				ID:        encodeToolCallID(p.FunctionCall.Name, p.ThoughtSignature),
+				ID:        encodeToolCallID(p.FunctionCall.Name, p.ThoughtSignature, offset+len(calls)),
 				Name:      p.FunctionCall.Name,
 				Arguments: compactArgs(p.FunctionCall.Args),
 			})
