@@ -241,6 +241,25 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// reaches.
 	_, preSuppress := flavorSetsFromViews(visible, idx, &overlay, token)
 	callable := callableNamesForFlavor(preSuppress, flavor, overlay.visByLower)
+	existing := existingNamesForFlavor(views, idx, overlay, flavor)
+	// Fold in the token's own vendor-account models under the token-effective
+	// prefix (vendorModelFlavorSets → routing.TokenVendorPrefix, the same source
+	// /v1/models and the resolver use, so a listed name equals a routable name).
+	// A model the resolver will dispatch for this token is reachable, so the
+	// unknown-model redirect must see it as callable and existing — otherwise it
+	// treats a routable vendor model (e.g. a bare name served under an empty
+	// prefix override) as unknown and reroutes it to the fallback. The server
+	// composition above cannot carry these: vendor-account models are not mapping
+	// views. vendorModelFlavorSets returns nil unless the vendor-accounts flag is
+	// on, the principal is a user and a routing store is wired, so this is a
+	// no-op for every token with no vendor access.
+	for name, flavors := range s.vendorModelFlavorSets(ctx, token) {
+		if _, ok := flavors[flavor]; !ok {
+			continue
+		}
+		callable[name] = struct{}{}
+		existing[name] = struct{}{}
+	}
 	capable, err := s.capableNames(ctx, callable, visible, idx, overlay, required)
 	if err != nil {
 		return emptyModelOffering()
@@ -248,7 +267,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	return ModelOffering{
 		Callable: callable,
 		Capable:  capable,
-		Existing: existingNamesForFlavor(views, idx, overlay, flavor),
+		Existing: existing,
 	}
 }
 
