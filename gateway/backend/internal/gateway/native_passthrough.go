@@ -190,6 +190,11 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 		// no chat-completions surface) -- provider.OpenAIResponsesClient's path. This
 		// keeps the usage label consistent with endpointModeFor's passthrough answer.
 		return "/responses"
+	case routing.ProviderVendorGemini:
+		// The native Gemini client POSTs to a per-model :generateContent (or
+		// :streamGenerateContent) URL; this function takes no model or stream
+		// argument, so the usage-row label is a fixed cosmetic string.
+		return "/v1beta/models/*:generateContent"
 	}
 	return target.OpenAIPathPrefixOrDefault() + "/chat/completions"
 }
