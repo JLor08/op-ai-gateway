@@ -18,6 +18,10 @@ export function vendorLabel(t: Translation, vendor: string): string {
       return t.vendorKilo;
     case 'google':
       return t.vendorGoogle;
+    // The usage row's provider kind vendor_gemini is derived to the gemini segment.
+    case 'google_native':
+    case 'gemini':
+      return t.vendorGoogleNative;
     case 'openai_compatible':
       return t.vendorOpenAICompatible;
     default:

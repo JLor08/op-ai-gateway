@@ -16,6 +16,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ['openrouter', t.vendorOpenRouter],
       ['kilo', t.vendorKilo],
       ['google', t.vendorGoogle],
+      ['google_native', t.vendorGoogleNative],
+      // The provider kind vendor_gemini, derived to its segment by vendorServerLabel.
+      ['gemini', t.vendorGoogleNative],
       ['openai_compatible', t.vendorOpenAICompatible],
     ])('labels %s with its localized name', (vendor, label) => {
       expect(vendorLabel(t, vendor)).toBe(label);
