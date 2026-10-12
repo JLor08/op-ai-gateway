@@ -1,6 +1,9 @@
 package geminiwire
 
-import "testing"
+import (
+	"encoding/base64"
+	"testing"
+)
 
 func TestToolCallIDRoundTrip(t *testing.T) {
 	cases := []struct{ name, sig string }{
@@ -8,6 +11,8 @@ func TestToolCallIDRoundTrip(t *testing.T) {
 		{"f", ""},
 		{"", "onlysig"},
 		{"name/with:odd.chars", "a+b/c=="},
+		// The empty encoding ({}) is legitimate and distinct from a JSON null payload.
+		{"", ""},
 	}
 	for _, c := range cases {
 		id := encodeToolCallID(c.name, c.sig)
@@ -23,9 +28,28 @@ func TestToolCallIDRoundTrip(t *testing.T) {
 
 func TestDecodeToolCallIDForeign(t *testing.T) {
 	// Ids from other dialects (Anthropic toolu_*, OpenAI call_*) are not ours.
-	for _, id := range []string{"", "call_123", "toolu_abc", "gcw1:not-base64!!"} {
+	for _, id := range []string{
+		"",
+		"call_123",
+		"toolu_abc",
+		"gcw1:not-base64!!",
+		// Ours by prefix, but the payload is not a valid encoding.
+		"gcw1:",
+		"gcw1:" + base64.RawURLEncoding.EncodeToString([]byte("notjson")),
+		// A JSON null payload must not decode as the legitimate empty encoding.
+		"gcw1:" + base64.RawURLEncoding.EncodeToString([]byte("null")),
+	} {
 		if _, _, ok := decodeToolCallID(id); ok {
 			t.Fatalf("decodeToolCallID(%q) ok=true, want false", id)
 		}
+	}
+}
+
+// TestEncodeToolCallIDFormat pins the wire format: minted ids persist in client
+// conversation histories, so the scheme is a contract.
+func TestEncodeToolCallIDFormat(t *testing.T) {
+	want := "gcw1:" + base64.RawURLEncoding.EncodeToString([]byte(`{"n":"f"}`))
+	if got := encodeToolCallID("f", ""); got != want {
+		t.Fatalf("format = %q, want %q", got, want)
 	}
 }

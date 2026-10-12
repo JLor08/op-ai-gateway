@@ -36,8 +36,10 @@ func decodeToolCallID(id string) (name, signature string, encoded bool) {
 	if err != nil {
 		return "", "", false
 	}
-	var p toolCallIDPayload
-	if err := json.Unmarshal(raw, &p); err != nil {
+	// Unmarshal into a pointer so a JSON null payload leaves it nil and is
+	// rejected, instead of decoding as the legitimate empty encoding ({}).
+	var p *toolCallIDPayload
+	if err := json.Unmarshal(raw, &p); err != nil || p == nil {
 		return "", "", false
 	}
 	return p.N, p.S, true
