@@ -241,6 +241,12 @@ type appHealthRunner struct {
 	probeTimeout time.Duration
 	cipher       *capture.Cipher
 	now          func() time.Time
+	// imageOptionsRegistry caches the image options each external
+	// stable_diffusion_cpp application's capability document states
+	// (probeSdcppCapabilities writes it, the portal reads it through the
+	// Server). Nil is valid and means nobody consumes them: the options probe
+	// is then not made at all.
+	imageOptionsRegistry *gateway.AppImageOptionsRegistry
 }
 
 // cycleCfg is the once-per-cycle settings snapshot read via
@@ -417,6 +423,8 @@ func (r *appHealthRunner) runOnce(ctx context.Context, state *cycleState) time.D
 	// enumeration so a transient store error can't wrongly evict live entries.
 	if enumComplete {
 		r.loaded.Retain(state.liveApps, liveServers)
+		// Same bound for the cached sd-server image options (nil-safe).
+		r.imageOptionsRegistry.Retain(state.liveApps)
 		// Bound the agent-presence + availability-dedup state to live servers so a
 		// deleted server does not leave a stale entry behind (nil-safe on presence).
 		retainAgents(r.agents, liveServers)
@@ -611,6 +619,15 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // by the same cycle's model_sync reconcile, which runs beside this pass, and
 // a pass that lost that race would otherwise wait one full interval before
 // the new model's first verdict landed.
+//
+// The same document also states the image options the loaded model offers
+// (samplers, schedulers, output formats, size limits, defaults). Whichever way
+// the verdict path ends, cacheSdcppImageOptions reads them with the same target
+// and credential into r.imageOptionsRegistry. That is a second GET of the
+// document per tick (the verdict decode is strict and the options decode
+// lenient, so they are two probes, see provider.SdcppImageOptionsProber); it
+// is skipped when the verdict probe already failed with ErrUnavailable, since
+// the server did not answer. It never changes the verdict path's outcome.
 func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.SdcppCapabilitiesProber) (unlanded bool) {
 	target := routing.Target{
 		Provider: app.Type,
@@ -621,6 +638,12 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 	token, _ := capture.OpenSecret(r.cipher, app.APIToken)
 	pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
 	v, err := prober.ProbeSdcppCapabilities(pctx, target)
+	if !errors.Is(err, provider.ErrUnavailable) {
+		// Deferred so every return below -- a verdict decode error, no verdict,
+		// a failed mapping read -- still reaches it; the options decode is
+		// lenient and may read a document the strict verdict decode refused.
+		defer r.cacheSdcppImageOptions(pctx, app, target, prober)
+	}
 	if err != nil {
 		slog.Debug("app health: sdcpp capabilities probe failed", "app_id", app.ID, "error", err)
 		return false
@@ -654,6 +677,30 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 			"app_id", app.ID, "model_stem", v.ModelStem, "image", v.Image)
 	}
 	return !matched
+}
+
+// cacheSdcppImageOptions reads the image options of one external
+// stable_diffusion_cpp application's capability document and records them in
+// r.imageOptionsRegistry. Best-effort by design: no registry, a prober that
+// cannot read options, or a failed probe each contribute nothing (a failure is
+// logged at debug level and keeps whatever an earlier tick cached, which beats
+// no options for a transient outage; deleting the application is what evicts
+// them, see Retain in runOnce). It is called with the verdict probe's own
+// target and credential-carrying context.
+func (r *appHealthRunner) cacheSdcppImageOptions(ctx context.Context, app routing.Application, target routing.Target, prober provider.SdcppCapabilitiesProber) {
+	if r.imageOptionsRegistry == nil {
+		return
+	}
+	optProber, ok := prober.(provider.SdcppImageOptionsProber)
+	if !ok {
+		return
+	}
+	opts, err := optProber.ProbeSdcppImageOptions(ctx, target)
+	if err != nil {
+		slog.Debug("app health: sdcpp image options probe failed", "app_id", app.ID, "error", err)
+		return
+	}
+	r.imageOptionsRegistry.Set(app.ID, opts)
 }
 
 // probeServer runs one probe+derive+sample pass for a SINGLE server: probe

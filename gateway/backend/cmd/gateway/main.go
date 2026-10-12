@@ -856,6 +856,10 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// appHealth is ONE shared registry for this process; the probe loop
 	// populates it and routing/model-offering consume it.
 	appHealth := gateway.NewAppHealthRegistry(usageBroker)
+	// appImageOptions is ONE shared registry too: the probe loop writes the
+	// image options of each external sd-server, the Server (ServerDeps) reads
+	// them back.
+	appImageOptions := gateway.NewAppImageOptionsRegistry()
 	// loadedModels is ONE shared registry: the app-health loop writes the
 	// gateway-poll source, the agent-telemetry handler (ServerDeps) writes the
 	// agent-report source, and the portal Service reads it. All three MUST
@@ -1007,16 +1011,17 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// the fleet cadence.
 	appHealthServerTrigger := make(chan string, 64)
 	cancelHealth := startAppHealthLoop(&appHealthRunner{
-		store:        b.Routes,
-		prober:       mux,
-		syncer:       portalService,
-		registry:     appHealth,
-		loaded:       loadedModels,
-		agents:       agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
-		groups:       groups,
-		settings:     b.SystemSettings,
-		probeTimeout: cfg.AppHealthProbeTimeout,
-		cipher:       b.Cipher,
+		store:                b.Routes,
+		prober:               mux,
+		syncer:               portalService,
+		registry:             appHealth,
+		loaded:               loadedModels,
+		imageOptionsRegistry: appImageOptions,
+		agents:               agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
+		groups:               groups,
+		settings:             b.SystemSettings,
+		probeTimeout:         cfg.AppHealthProbeTimeout,
+		cipher:               b.Cipher,
 	}, appHealthServerTrigger)
 	// NetBird sync -- two loops, both cadences read live from
 	// NetbirdPolicySettings: Loop A (peer sync) keeps each NetBird server's
@@ -1098,6 +1103,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CaptureEnabled:                  func() bool { return captureFlagsHook().Enabled },
 		CaptureOverride:                 func() bool { return captureFlagsHook().Override },
 		AppHealth:                       appHealth,
+		AppImageOptions:                 appImageOptions,
 		SelfBaseURL:                     loopbackSelfBase(),
 		InternalAuthSecret:              internalAuthSecret,
 		ChatRuns:                        gateway.NewChatRunRegistry(5),

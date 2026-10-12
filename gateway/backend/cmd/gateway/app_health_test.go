@@ -1153,15 +1153,28 @@ type sdcppFakeProber struct {
 	// the branch builds its auth context like the context-probe branch.
 	sdTargets []routing.Target
 	sdAuth    []provider.UpstreamAuth
+	// sdOptions / sdOptErr answer ProbeSdcppImageOptions per endpoint, with
+	// the same "options STILL come back beside an error" rule as sdVerdicts;
+	// sdOptTargets / sdOptAuth record every options probe asked, so a test can
+	// pin that it reuses the verdict probe's target and credential.
+	sdOptions    map[string]provider.SdcppImageOptions
+	sdOptErr     map[string]error
+	sdOptTargets []routing.Target
+	sdOptAuth    []provider.UpstreamAuth
 }
 
-var _ provider.SdcppCapabilitiesProber = (*sdcppFakeProber)(nil)
+var (
+	_ provider.SdcppCapabilitiesProber = (*sdcppFakeProber)(nil)
+	_ provider.SdcppImageOptionsProber = (*sdcppFakeProber)(nil)
+)
 
 func newSdcppFakeProber() *sdcppFakeProber {
 	return &sdcppFakeProber{
 		fakeProber: newFakeProber(),
 		sdVerdicts: map[string]provider.SdcppVerdicts{},
 		sdErr:      map[string]error{},
+		sdOptions:  map[string]provider.SdcppImageOptions{},
+		sdOptErr:   map[string]error{},
 	}
 }
 
@@ -1172,6 +1185,22 @@ func (f *sdcppFakeProber) ProbeSdcppCapabilities(ctx context.Context, target rou
 	a, _ := provider.UpstreamAuthFrom(ctx)
 	f.sdAuth = append(f.sdAuth, a)
 	return f.sdVerdicts[target.Endpoint], f.sdErr[target.Endpoint]
+}
+
+func (f *sdcppFakeProber) ProbeSdcppImageOptions(ctx context.Context, target routing.Target) (provider.SdcppImageOptions, error) {
+	f.sdMu.Lock()
+	defer f.sdMu.Unlock()
+	f.sdOptTargets = append(f.sdOptTargets, target)
+	a, _ := provider.UpstreamAuthFrom(ctx)
+	f.sdOptAuth = append(f.sdOptAuth, a)
+	return f.sdOptions[target.Endpoint], f.sdOptErr[target.Endpoint]
+}
+
+// sdcppOptionCalls returns a copy of every target ProbeSdcppImageOptions was asked.
+func (f *sdcppFakeProber) sdcppOptionCalls() []routing.Target {
+	f.sdMu.Lock()
+	defer f.sdMu.Unlock()
+	return append([]routing.Target(nil), f.sdOptTargets...)
 }
 
 // sdcppCalls returns a copy of every target ProbeSdcppCapabilities was asked.
@@ -1584,6 +1613,312 @@ func TestSdcppCapabilitiesPassE2EWritesImageVerdict(t *testing.T) {
 	defer mu.Unlock()
 	if len(paths) != 1 || paths[0] != "/sdcpp/v1/capabilities" {
 		t.Fatalf("upstream paths = %v, want exactly [/sdcpp/v1/capabilities]", paths)
+	}
+}
+
+// sdImageOptionsFixture is a full options view of the measured capability
+// document, as ProbeSdcppImageOptions would decode it.
+func sdImageOptionsFixture() provider.SdcppImageOptions {
+	return provider.SdcppImageOptions{
+		Samplers:      []string{"euler", "euler_a", "dpm++2m"},
+		Schedulers:    []string{"discrete", "karras"},
+		OutputFormats: []string{"png", "jpeg", "webp"},
+		Limits:        provider.SdcppImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 64, MaxHeight: 2048, MaxBatchCount: 4},
+		Defaults: provider.SdcppImageDefaults{
+			Sampler: "euler", Scheduler: "discrete", OutputFormat: "png",
+			Steps: 20, ClipSkip: -1, Seed: -1, Width: 512, Height: 512, CFG: 7,
+		},
+	}
+}
+
+// sdcppOptionsRunner is sdcppProbeRunner plus an image-options registry, with
+// the options document answering opts.
+func sdcppOptionsRunner(t *testing.T, opts provider.SdcppImageOptions, mappings ...routing.ModelMapping) (*appHealthRunner, *fakeHealthStore, *sdcppFakeProber, *gateway.AppImageOptionsRegistry) {
+	t.Helper()
+	runner, st, prober := sdcppProbeRunner(t, provider.SdcppVerdicts{Image: routing.CapabilityYes, ModelStem: "flux1-dev"}, mappings...)
+	prober.sdOptions["http://s1.local:8001"] = opts
+	reg := gateway.NewAppImageOptionsRegistry()
+	runner.imageOptionsRegistry = reg
+	return runner, st, prober, reg
+}
+
+// TestRunAppHealthOnceSdcppCachesImageOptions: the same pass that writes an
+// external sd-server's image verdict also caches the image options its
+// capability document states, keyed by application id, so the portal can
+// offer the knobs that model actually accepts. The verdict write is unchanged
+// beside it.
+func TestRunAppHealthOnceSdcppCachesImageOptions(t *testing.T) {
+	want := sdImageOptionsFixture()
+	runner, st, prober, reg := sdcppOptionsRunner(t, want, sdcppMapping("m1", "flux1-dev"))
+
+	runCapabilityCycle(runner)
+
+	got, ok := reg.Get("a1")
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, %v, want %+v, true", got, ok, want)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+	calls := prober.sdcppOptionCalls()
+	if len(calls) != 1 || calls[0].Provider != routing.ProviderStableDiffusionCpp || calls[0].Endpoint != "http://s1.local:8001" || calls[0].Timeout != time.Second {
+		t.Fatalf("options probe targets = %+v, want one {Provider:stable_diffusion_cpp Endpoint:http://s1.local:8001 Timeout:1s}", calls)
+	}
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsDoNotNeedAMapping: the options belong to
+// the application's endpoint, not to a mapping, so they are cached even when
+// the verdict has no active mapping to land on (the cycle that creates the
+// mapping runs beside this pass).
+func TestRunAppHealthOnceSdcppImageOptionsDoNotNeedAMapping(t *testing.T) {
+	want := sdImageOptionsFixture()
+	runner, _, _, reg := sdcppOptionsRunner(t, want)
+
+	runCapabilityCycle(runner)
+
+	if got, ok := reg.Get("a1"); !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, %v, want %+v, true", got, ok, want)
+	}
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsProbeErrorCachesNothing: a failed
+// options probe (here a 404-style ErrUnavailable beside which the fake still
+// hands options back, so only the error guard stands between them and the
+// registry) leaves the application absent, does not crash the pass, and does
+// not disturb the verdict write.
+func TestRunAppHealthOnceSdcppImageOptionsProbeErrorCachesNothing(t *testing.T) {
+	runner, st, prober, reg := sdcppOptionsRunner(t, sdImageOptionsFixture(), sdcppMapping("m1", "flux1-dev"))
+	prober.sdOptErr["http://s1.local:8001"] = fmt.Errorf("%w: status 500", provider.ErrUnavailable)
+
+	runCapabilityCycle(runner)
+
+	if got, ok := reg.Get("a1"); ok {
+		t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, true after a failed options probe, want absent", got)
+	}
+	if n := len(prober.sdcppOptionCalls()); n != 1 {
+		t.Fatalf("options probe asked %d times, want 1 (the failure must be reached, not skipped)", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsKeepLastGoodOnError: a later failed
+// probe does not erase what an earlier tick learned -- stale options beat
+// none for a transient outage. (Deleting the application is what evicts them,
+// see TestRunAppHealthOnceRetainsImageOptionsOfLiveAppsOnly.)
+func TestRunAppHealthOnceSdcppImageOptionsKeepLastGoodOnError(t *testing.T) {
+	want := sdImageOptionsFixture()
+	runner, _, prober, reg := sdcppOptionsRunner(t, want, sdcppMapping("m1", "flux1-dev"))
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time { return current }
+	state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)}
+
+	runner.runOnce(context.Background(), state)
+	prober.sdMu.Lock()
+	prober.sdOptErr["http://s1.local:8001"] = fmt.Errorf("%w: status 503", provider.ErrUnavailable)
+	prober.sdMu.Unlock()
+	current = current.Add(time.Duration(portal.MaxHealthCheckIntervalSeconds) * time.Second)
+	runner.runOnce(context.Background(), state)
+
+	if n := len(prober.sdcppOptionCalls()); n != 2 {
+		t.Fatalf("options probe asked %d times over two due cycles, want 2", n)
+	}
+	if got, ok := reg.Get("a1"); !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, %v after a failed refresh, want the earlier %+v", got, ok, want)
+	}
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsFollowTheVerdictOutcome pins when the
+// options probe is (not) asked, relative to the verdict probe it shares a
+// document with. The verdict's strict decode failing on a document it cannot
+// read (ErrInvalidResponse) must not cost the options their lenient read --
+// that is the point of the separate decode. A verdict probe that could not
+// reach the server at all (ErrUnavailable: transport failure or non-2xx) means
+// the options GET would fail the same way, so it is not asked: a down
+// sd-server must not cost a second probe timeout per tick.
+func TestRunAppHealthOnceSdcppImageOptionsFollowTheVerdictOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		verdictEr error
+		wantAsked bool
+	}{
+		{"verdict decode error still reads options", fmt.Errorf("%w: decode sdcpp capabilities: boom", provider.ErrInvalidResponse), true},
+		{"unreachable server skips options", fmt.Errorf("%w: status 404", provider.ErrUnavailable), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := sdImageOptionsFixture()
+			runner, _, prober, reg := sdcppOptionsRunner(t, want, sdcppMapping("m1", "flux1-dev"))
+			prober.sdErr["http://s1.local:8001"] = tc.verdictEr
+
+			runCapabilityCycle(runner)
+
+			asked := len(prober.sdcppOptionCalls()) > 0
+			if asked != tc.wantAsked {
+				t.Fatalf("options probe asked = %v, want %v", asked, tc.wantAsked)
+			}
+			got, ok := reg.Get("a1")
+			if ok != tc.wantAsked || (ok && !reflect.DeepEqual(got, want)) {
+				t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, %v, want cached=%v", got, ok, tc.wantAsked)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSdcppNilImageOptionsRegistryAsksNothing: with no registry
+// to hold the answer the options GET would be pure waste, so it is not made.
+// This is also what keeps every pre-existing runner (no registry) at exactly
+// the one request per tick the verdict pass always made.
+func TestRunAppHealthOnceSdcppNilImageOptionsRegistryAsksNothing(t *testing.T) {
+	runner, _, prober := sdcppProbeRunner(t, provider.SdcppVerdicts{Image: routing.CapabilityYes}, sdcppMapping("m1", "flux1-dev"))
+	prober.sdOptions["http://s1.local:8001"] = sdImageOptionsFixture()
+
+	runCapabilityCycle(runner)
+
+	if n := len(prober.sdcppOptionCalls()); n != 0 {
+		t.Fatalf("options probe asked %d times with no registry wired, want 0", n)
+	}
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsFollowTheAppCadence: the options probe
+// rides the verdict pass's schedule ("sdcpp:"+id), so a second cycle at the
+// same instant asks neither.
+func TestRunAppHealthOnceSdcppImageOptionsFollowTheAppCadence(t *testing.T) {
+	runner, _, prober, _ := sdcppOptionsRunner(t, sdImageOptionsFixture(), sdcppMapping("m1", "flux1-dev"))
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time { return current }
+	state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)}
+
+	runner.runOnce(context.Background(), state)
+	runner.runOnce(context.Background(), state)
+	if v, o := len(prober.sdcppCalls()), len(prober.sdcppOptionCalls()); v != 1 || o != 1 {
+		t.Fatalf("over two cycles at one instant the verdict probe was asked %d times and the options probe %d, want 1 and 1", v, o)
+	}
+	current = current.Add(time.Duration(portal.MaxHealthCheckIntervalSeconds) * time.Second)
+	runner.runOnce(context.Background(), state)
+	if v, o := len(prober.sdcppCalls()), len(prober.sdcppOptionCalls()); v != 2 || o != 2 {
+		t.Fatalf("after the interval elapsed the verdict probe was asked %d times and the options probe %d, want 2 and 2", v, o)
+	}
+}
+
+// TestRunAppHealthOnceSdcppImageOptionsCarryTheAppCredential: the options probe
+// is built with the same target and credential as the verdict probe.
+func TestRunAppHealthOnceSdcppImageOptionsCarryTheAppCredential(t *testing.T) {
+	shrinkRetryGap(t)
+	app := sdcppApp("a1", "s1", 8001)
+	app.APIToken = "plain:sd-tok"
+	app.APITokenHeader = "X-Api-Key"
+	st := newHealthTestStore(app)
+	prober := newSdcppFakeProber()
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		imageOptionsRegistry: gateway.NewAppImageOptionsRegistry(),
+		settings:             st, probeTimeout: time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	prober.sdMu.Lock()
+	defer prober.sdMu.Unlock()
+	if len(prober.sdOptAuth) != 1 || prober.sdOptAuth[0].Header != "X-Api-Key" || prober.sdOptAuth[0].Token != "sd-tok" {
+		t.Fatalf("options probe credentials = %+v, want one {Header:X-Api-Key Token:sd-tok}", prober.sdOptAuth)
+	}
+	if !reflect.DeepEqual(prober.sdTargets, prober.sdOptTargets) {
+		t.Fatalf("options probe targets = %+v, verdict probe targets = %+v, want identical", prober.sdOptTargets, prober.sdTargets)
+	}
+}
+
+// TestRunAppHealthOnceRetainsImageOptionsOfLiveAppsOnly: an application that no
+// longer exists loses its cached options at the end of a complete cycle, like
+// its loaded-model entries, so the registry does not grow for the life of the
+// process.
+func TestRunAppHealthOnceRetainsImageOptionsOfLiveAppsOnly(t *testing.T) {
+	runner, _, _, reg := sdcppOptionsRunner(t, sdImageOptionsFixture(), sdcppMapping("m1", "flux1-dev"))
+	reg.Set("deleted-app", sdImageOptionsFixture())
+
+	runCapabilityCycle(runner)
+
+	if _, ok := reg.Get("deleted-app"); ok {
+		t.Fatalf("options of an application that no longer exists survived a complete cycle")
+	}
+	if _, ok := reg.Get("a1"); !ok {
+		t.Fatalf("options of a live application were evicted")
+	}
+}
+
+// TestSdcppImageOptionsPassE2ECachesOptions drives the options probe through
+// the REAL production chain (providerClients' Multiplexer, its OpenAI-
+// compatible client) against an httptest sd-server serving the capability
+// document. The fake-prober tests cannot see the failure that matters here:
+// the branch type-asserts the prober to provider.SdcppImageOptionsProber and
+// skips silently when that fails.
+func TestSdcppImageOptionsPassE2ECachesOptions(t *testing.T) {
+	shrinkRetryGap(t)
+	var paths []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path != "/sdcpp/v1/capabilities" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"current_mode":"img_gen","model":{"name":"flux1-dev.safetensors","stem":"flux1-dev"},"supported_modes":["img_gen"],` +
+			`"samplers":["euler","euler_a"],"schedulers":["discrete","karras"],"output_formats_by_mode":{"img_gen":["png","jpeg"]},` +
+			`"limits":{"min_width":64,"max_width":2048,"min_height":64,"max_height":2048,"max_batch_count":4},` +
+			`"defaults_by_mode":{"img_gen":{"clip_skip":-1,"seed":-1,"width":512,"height":512,"output_format":"png",` +
+			`"sample_params":{"sample_method":"euler","sample_steps":20,"scheduler":"discrete","guidance":{"txt_cfg":7}}}}}`))
+	}))
+	defer upstream.Close()
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	store := routing.NewMemoryStore()
+	if err := store.CreateAIServer(ctx, routing.AIServer{
+		ID: "s1", Name: "S1", Domain: u.Hostname(), Provider: routing.ProviderStableDiffusionCpp,
+		Endpoint: upstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := store.CreateApplication(ctx, routing.Application{
+		ID: "a1", ServerID: "s1", Type: routing.ProviderStableDiffusionCpp, Port: port, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAIImages}, Priority: 1, Weight: 1,
+		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+
+	reg := gateway.NewAppImageOptionsRegistry()
+	(&appHealthRunner{
+		store: store, prober: providerClients(0, false, nil), registry: gateway.NewAppHealthRegistry(nil),
+		imageOptionsRegistry: reg,
+		settings:             staticSettings(nil), probeTimeout: time.Second, now: func() time.Time { return now },
+	}).runOnce(ctx, &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	want := provider.SdcppImageOptions{
+		Samplers:      []string{"euler", "euler_a"},
+		Schedulers:    []string{"discrete", "karras"},
+		OutputFormats: []string{"png", "jpeg"},
+		Limits:        provider.SdcppImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 64, MaxHeight: 2048, MaxBatchCount: 4},
+		Defaults: provider.SdcppImageDefaults{
+			Sampler: "euler", Scheduler: "discrete", OutputFormat: "png",
+			Steps: 20, ClipSkip: -1, Seed: -1, Width: 512, Height: 512, CFG: 7,
+		},
+	}
+	if got, ok := reg.Get("a1"); !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("imageOptionsRegistry.Get(a1) = %+v, %v, want %+v, true", got, ok, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 2 || paths[0] != "/sdcpp/v1/capabilities" || paths[1] != "/sdcpp/v1/capabilities" {
+		t.Fatalf("upstream paths = %v, want the capability document twice (verdict + options)", paths)
 	}
 }
 
