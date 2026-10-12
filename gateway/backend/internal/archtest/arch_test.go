@@ -102,11 +102,14 @@ var allowedDeps = map[string][]string{
 		"internal/vendorauth",
 	},
 	"internal/gateway/visionassets": {},
-	"internal/inference":            {},
-	"internal/logbuffer":            {},
-	"internal/mail":                 {},
-	"internal/netbird":              {},
-	"internal/ping":                 {},
+	"internal/geminiwire": {
+		"internal/inference",
+	},
+	"internal/inference": {},
+	"internal/logbuffer": {},
+	"internal/mail":      {},
+	"internal/netbird":   {},
+	"internal/ping":      {},
 	"internal/portal": {
 		"internal/auth",
 		"internal/capture",
@@ -292,6 +295,16 @@ func TestForbiddenEdges(t *testing.T) {
 		// into store/portal/gateway/routing/etc.
 		allowOnlyAmongInternal(t, "internal/compat", []string{"internal/inference"},
 			"internal/compat (flavor translation) must depend on nothing internal except internal/inference")
+	})
+
+	t.Run("geminiwire stays contained to inference", func(t *testing.T) {
+		// internal/geminiwire holds the Gemini wire types and the
+		// Gemini<->neutral converters shared by the outbound client and the
+		// future inbound endpoint. Like internal/compat it must stay
+		// contained: among internal packages it may depend only on
+		// internal/inference's shared types.
+		allowOnlyAmongInternal(t, "internal/geminiwire", []string{"internal/inference"},
+			"internal/geminiwire (Gemini translation) must depend on nothing internal except internal/inference")
 	})
 
 	t.Run("tracing does not import its own decorated packages", func(t *testing.T) {
