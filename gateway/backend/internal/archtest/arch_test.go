@@ -123,6 +123,7 @@ var allowedDeps = map[string][]string{
 		"internal/vendorauth",
 	},
 	"internal/provider": {
+		"internal/geminiwire",
 		"internal/inference",
 		"internal/routing",
 		"internal/tracing",

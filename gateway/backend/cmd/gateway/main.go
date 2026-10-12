@@ -1296,6 +1296,10 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// ProviderVendorAnthropic: api.anthropic.com has no chat-completions
 		// surface; the native /v1/messages client translates to and from it.
 		routing.ProviderVendorAnthropic: provider.NewAnthropicClient(appHTTPClient),
+		// ProviderVendorGemini: generativelanguage.googleapis.com serves Gemini's
+		// own generateContent wire (model in the path, x-goog-api-key); the native
+		// client translates to and from it.
+		routing.ProviderVendorGemini: provider.NewGeminiClient(appHTTPClient),
 	}, nil)
 }
 
