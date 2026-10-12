@@ -383,6 +383,100 @@ back off the capped capture buffer — that independence is the whole reason the
 counter exists, and it is documented with the usage event
 ([§8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
+**Per-model option discovery: what the portal composer may offer for an image
+model.** The relay above forwards every native knob opaquely, so nothing on the
+inference path knows which sampler names, output formats or sizes a given
+`sd-server` accepts. The portal composer (§12) learns that from one read-only
+endpoint, `GET /api/portal/model-image-options?name=<model>`
+(`handlePortalModelImageOptions`, `internal/gateway/portal_model_endpoints.go`;
+[API Surface](../reference/api-surface.md#models-servers-applications-mappings)),
+which answers what the `sd-server`(s) behind a gateway model state, so the
+composer can narrow its advanced dropdowns from the static sd-cpp superset to the
+picked model's own options and show the server's defaults. It is a portal
+endpoint beside `model-servers`, not part of the inference surface, and it
+changes nothing about how a run is sent
+([ADR-055](../09-architecture-decisions.md#adr-055--per-model-sd-server-image-options-are-read-live-on-pick-from-two-volatile-caches-and-never-stored)).
+
+- **The source is the document the `image` verdict already reads.**
+  `sd-server`'s `GET /sdcpp/v1/capabilities` states `samplers`, `schedulers`,
+  `output_formats_by_mode.img_gen`, `limits.{min_width, max_width, min_height,
+  max_height, max_batch_count}` and `defaults_by_mode.img_gen`, whose sampling
+  defaults are nested under `sample_params` (`sample_method` is the sampler,
+  `sample_steps` the step count, `scheduler`, `guidance.txt_cfg` the CFG scale)
+  while `clip_skip`, `seed`, `negative_prompt`, `width`, `height` and
+  `output_format` sit directly in it (names verified against
+  stable-diffusion.cpp's `make_capabilities_json`).
+- **Two in-memory caches, one per deployment shape, and nothing durable.**
+  An **external** `stable_diffusion_cpp` application is read by the gateway's
+  health loop: `probeSdcppCapabilities` (`cmd/gateway/app_health.go`) reads the
+  document a second time per tick (skipped when the verdict probe already found
+  the server unreachable), through `provider.ProbeSdcppImageOptions` (the
+  verdict probe's own transport, credential and 1 MiB bound), and writes the
+  decoded options to `AppImageOptionsRegistry` keyed by application id. A failed
+  read keeps the last good entry; deleting the application evicts it.
+  An **agent-launched** `server_agent` child sits behind the agent's router,
+  which the health loop cannot reach, so the agent reads the same document
+  itself and carries the decoded options on its telemetry sample as
+  `runtimes[].image_options`, cached per (pid, type, model) generation like the
+  verdict beside it and behind the same `capability_source_sdcpp` gate; the
+  gateway mirrors it into `RuntimeStatusDTO.ImageOptions` in the volatile
+  runtime-status registry (keyed by server and spec id, tagged `json:"-"` — it
+  is an in-process hand-off and never rides the runtime-status SSE frame). This
+  is the established "health loop writes, portal reads" split
+  (`AppHealthRegistry`): the portal GET **never probes upstream**, so an
+  unreachable server cannot slow or fail it.
+- **The options decode is lenient and SEPARATE from the verdict decode.**
+  `parseSdcppImageOptions` (`internal/provider/sdcpp_image_options.go`, with a
+  verbatim twin in `server-agent/internal/collector/`, pinned by one case table
+  duplicated in both modules' tests) reads what it can and leaves everything it
+  cannot at zero, which uniformly means *unknown*; only a body that is not JSON
+  at all is an error. The strict, fail-closed `parseSdcppCapabilities` that
+  answers the routing `image` verdict is untouched, so a malformed options
+  document yields partial or empty options and can **never** suppress or alter
+  the verdict the images gate depends on.
+- **Visibility is decided in the portal layer, before any cache is read.**
+  `portal.Service.ModelImageOptionViews` applies the same suppression
+  (`model_settings` visibility `hidden`/`locked` for a non-admin, fail-closed on
+  a read error) and resource-group filtering as `model-servers`, then keeps only
+  the sd-server mappings: an external `stable_diffusion_cpp` application, or a
+  `server_agent` mapping whose spec's effective type is `stable_diffusion_cpp`.
+  A model the token cannot route to has no views, touches no cache and answers
+  `{"data":{}}`, exactly like an unknown model — it neither leaks nor 404s.
+- **Aggregation answers "what every backing server can do"**
+  (`aggregateImageOptions`, `internal/gateway/model_image_options_aggregate.go`),
+  because a request may land on any server behind the model, including one
+  external and one agent-launched sd-server in a single set. `samplers`,
+  `schedulers` and `output_formats` are the **intersection** of the lists the
+  servers state, in the first stated list's order. Size limits are the
+  **tightest envelope** per axis (largest stated minimum, smallest stated
+  maximum), and `max_batch_count` the smallest positive value; a non-positive
+  limit is unknown and never becomes a bound, and an axis whose resulting
+  minimum exceeds its maximum is dropped whole, so any emitted bound pair
+  satisfies `min <= max` with no negatives. A default is emitted only when
+  every server that states it agrees; `clip_skip` and `seed` carry the
+  servers' own `-1` ("model default" / "random") faithfully.
+- **Fail-open: an absent or empty field is UNKNOWN, never "none supported".**
+  Every field of the response is `omitempty`, and a server that has not been
+  read, whose probe failed, or whose document states nothing for a field
+  contributes nothing to it. Where the aggregate ends up without a value for a
+  field, the **client falls back to the static sd-cpp superset** for that field
+  (§12). That includes the case a reader would otherwise take for a statement:
+  two backing servers whose sampler sets are **disjoint** intersect to the empty
+  set, which is omitted and read as unknown, not as "this model supports no
+  sampler". The consequence is deliberate: an option the composer offers may be
+  one a given build ignores (the gateway forwards every pick opaquely, as
+  above), whereas a fail-closed reading would leave an unread model with an
+  empty dropdown and no way to set a knob that works.
+- **Freshness and the restart warm-up gap are accepted, not hidden.** The caches
+  are volatile, so a gateway restart starts them cold. An agent-launched child's
+  options reappear on the next telemetry sample (about a second); an external
+  application's reappear on its next health tick, which can be up to the
+  application's longest probe interval away. Until then the composer shows the
+  static superset, which is the fail-open answer above. The endpoint is
+  best-effort throughout: it answers `200` whatever the caches hold, and the
+  only failure it reports is its own visibility read (`500`
+  `model.image_options_failed`).
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
@@ -1296,7 +1390,42 @@ the set ones (via `json.Marshal` of a typed struct, in sd-server's native
 block appended to the prompt — sd-server's own extension point — and strips any
 literal tag the user typed so the appended block is unambiguous. The gateway
 forwards every knob opaquely (it does not own sd-server's sampler enum or numeric
-caps); the composer offers the static sd-cpp sampler/scheduler superset.
+caps); the composer offers the static sd-cpp sampler/scheduler superset until the
+picked model's own options arrive (next paragraph).
+
+**The image controls follow the picked model.** When the effective model is an
+image model, `ChatStore` fetches `GET /api/portal/model-image-options` for it
+(`api.modelImageOptions`, exposed as `modelImageOptions`; §3.4 has the
+endpoint, its two caches and the aggregation). The state is cleared on every
+model change, so one model's options are never selectable while the next
+model's fetch is in flight; a stale response is discarded (latest pick wins) and
+a failed fetch also clears it. The advanced section then reads each field from
+the fetched options and **falls back to the static superset for any field the
+response leaves empty or absent** (`optionsOr` in `chatDoc.ts`) — an absent field
+is *unknown*, not "none", so the composer never ends up with an empty dropdown
+(§3.4, fail-open):
+
+- **Sampler, scheduler and output format** list the fetched values, else
+  `IMAGE_SAMPLERS`/`IMAGE_SCHEDULERS`/`IMAGE_OUTPUT_FORMATS`.
+- **Size presets** keep only the `WxH` presets inside the reported
+  `size_limits` (each bound optional; an unstated bound constrains nothing); the
+  empty "model default" entry always stays.
+- **The image count** is bounded by `min(8, max_batch_count)`. `IMAGE_N_MAX = 8`
+  is the portal's **hard** cap — a gateway image-storage limit, since a generated
+  image is kept in the chat transcript, not a model limit — so a model's reported
+  batch ceiling may only *narrow* it (a model reporting 16 still gets 8; an
+  absent or unusable report leaves 8).
+- **The model's defaults are shown as hints and never pre-filled** — placeholder
+  text in the free-text/numeric fields, helper text beside the dropdowns.
+  Pre-filling would turn an untouched blank-able knob into an explicitly sent
+  override and break the "blank = leave sd-server's own default" contract above;
+  a reported `0` or `-1` (`clip_skip`, `seed`) is a real default and is shown.
+- **A persisted value the narrowed list omits stays selectable**, as a synthetic
+  trailing option (the trick the model and server-override pickers use), so
+  reopening a chat whose saved sampler the current model does not list never
+  silently drops it; a saved count above the model's ceiling is kept but
+  flagged.
+
 A run is registered before its kind is known (the reservation predates
 `PrepareChatRun`), which is why that field is mutex-guarded rather than one of
 the run's immutable identity fields.

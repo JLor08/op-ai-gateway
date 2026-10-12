@@ -676,7 +676,12 @@ why).
     mapping is created by the same cycle's `model_sync` reconcile, which runs
     beside this pass, and a new model would otherwise stay without its first
     verdict, and out of the portal chat, until the interval came round. The
-    stem itself is not stored.
+    stem itself is not stored. The same tick also reads the document's image
+    options (samplers, schedulers, size limits, defaults) into a volatile
+    cache for the portal composer; that is a separate, lenient decode that can
+    never affect this verdict
+    ([API Compatibility & Inference
+    §3.4](compatibility-and-inference.md#34-openai-images-generations)).
   - An **agent-launched** child is a `server_agent` mapping behind the
     agent's router, which the health loop cannot reach — the router passes
     only `/props` through per model. Instead the agent itself reads the
