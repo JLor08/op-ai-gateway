@@ -3370,7 +3370,9 @@ bespoke branch per provider.
   leaves the shim `google` account described here unchanged.)
 - **(f) The owner-supplied base-URL trust model.** The root is supplied by the
   owner for `openai_compatible` (Custom), where it is required, and may be supplied
-  for any of the four named presets as an override of their pinned default root;
+  for any of the four named presets as an override of their pinned default root
+  (and, since [ADR-054](#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package),
+  for the native Gemini `google_native` preset);
   the trust model applies to every account whose owner supplies one. It must be
   **https** with a host and carry no userinfo, query, fragment or space (the key
   rides on every request, so plaintext and credential-in-URL are refused); the

@@ -816,6 +816,8 @@ canonicalizes header casing:
 | `Cookie` | session secret |
 | `X-OP-CSRF` | CSRF token |
 | `X-OP-Run-As-Token` | run-as token selector |
+| `x-api-key` | native Anthropic vendor-account credential (the header it travels in on the translated upstream request) |
+| `x-goog-api-key` | native Gemini vendor-account credential (the header it travels in on the translated upstream request) |
 
 Each matched header's value is replaced with the literal marker
 `[redacted]`; the header *name* is kept so the capture viewer can still show

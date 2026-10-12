@@ -89,7 +89,7 @@ have no seed and are filled by discovery alone), and is **replaced
 by the vendor's real list** once discovery has run (§6). The three tables and the
 `usage_events.account_id` attribution column are migration 82; migration 84 later
 adds the spend-control columns to the usage snapshot (§5.2), and migration 86 the
-immutable `base_url` of an OpenAI-compatible account; see
+immutable `base_url` of a preset account (OpenAI-compatible or native Gemini); see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
 
 The domain type is `routing.VendorAccount`, stored across all three drivers
@@ -251,8 +251,8 @@ known limitation recorded in §10.
 A failed chat conflates two unrelated problems — a login the vendor rejects and a
 model the backend does not serve — and the seeded model ids are a best guess
 (§10). Validation separates them. Four fixed-URL probes in
-`internal/vendorauth/validate.go`, plus a fifth that takes its URL as an argument
-(the OpenAI-compatible vendors, below), each make **one cheap GET that names no
+`internal/vendorauth/validate.go`, plus two that take their URL as an argument
+(the OpenAI-compatible vendors and native Gemini, below), each make **one cheap GET that names no
 model**, so an authentication verdict can never be mistaken for a wrong-model
 error. The fixed URLs live in `constants.go` beside the OAuth constants. The
 native Gemini probe (`ValidateGeminiAPIKey`, below) takes its URL as an argument
@@ -978,7 +978,8 @@ default, so empty is `400 vendor_account.base_url_required`) and otherwise accep
 only an **https** URL with a host and no userinfo, query, fragment or space
 (`400 vendor_account.base_url_invalid`); a trailing `/` is trimmed. So the stored
 root is either the preset's default or an **owner-supplied** one: required for
-Custom, an optional override for the four named presets. Beyond the shape the host
+Custom, an optional override for every named preset vendor (x.ai, OpenRouter, Kilo,
+Google and `google_native`). Beyond the shape the host
 is unrestricted, which is the owner-supplied base-URL trust model of
 [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 It is immutable: a different root means a new account. For `openai` and `anthropic`
@@ -1160,9 +1161,12 @@ the active pull stored.
 **OpenAI-compatible accounts (§4.4) are never scraped.** They are `vendor_openai`
 targets, so the scrape runs on their responses, but it looks only for the Codex
 `x-codex-*` headers, which these providers do not send: it finds none and writes
-nothing. Their snapshot is therefore written by the active pull alone (§5.2) for
-OpenRouter and Kilo, and stays empty (unknown, never a fabricated `0`) for x.ai,
-Google and Custom, which have no usage query with an inference key.
+nothing. A native Gemini account (§4.5) is a `vendor_gemini` target: the scrape runs
+for it too (it runs for any vendor target), but it has no recognized rate-limit
+headers for that provider kind and writes nothing, the same empty outcome. Their
+snapshot is therefore written by the active pull alone (§5.2) for OpenRouter and
+Kilo, and stays empty (unknown, never a fabricated `0`) for x.ai, Google,
+`google_native` and Custom, which have no usage query with an inference key.
 
 ### 5.2 Active pull (OpenAI subscription, OpenRouter and Kilo api keys)
 
@@ -1944,8 +1948,9 @@ reasons are recorded deliberately, not in denial of them
   therefore seeded with only `gpt-5` and `gpt-5-mini`, so a working credential is
   never paired with a model its backend is known to refuse — the auth-versus-model
   confusion that §3.5 exists to take apart. Anthropic's OAuth Messages path and
-  its API key serve the same ids, so its set does not vary. The OpenAI-compatible
-  vendors (§4.4) seed **empty**: discovery is their only source of models. Even the narrowed
+  its API key serve the same ids, so its set does not vary. The preset vendors, the
+  OpenAI-compatible ones (§4.4) and native Gemini (§4.5), seed **empty**: discovery
+  is their only source of models. Even the narrowed
   subscription set is unverified, and an account serves nothing its rows do not
   name — which is why the real catalog is discovered rather than kept here.
   **There is no backfill:** nothing rewrites existing catalogs at upgrade or in
@@ -1979,9 +1984,10 @@ reasons are recorded deliberately, not in denial of them
   `internal/routing/vendor_presets.go`, so a correction is an edit there, and a
   moved endpoint degrades to `unverifiable` or an unchanged catalog, never to a
   wrong one. The **owner-supplied base-URL** trust model is the one deliberate
-  acceptance here: it applies to any OpenAI-compatible account whose owner supplies
-  a root, which is required for Custom and an optional override for the four named
-  presets, and the root is not otherwise restricted beyond https, so the on-prem
+  acceptance here: it applies to any preset account (OpenAI-compatible or native
+  Gemini) whose owner supplies a root, which is required for Custom and an optional
+  override for the named presets (x.ai, OpenRouter, Kilo, Google and `google_native`),
+  and the root is not otherwise restricted beyond https, so the on-prem
   gateway can be pointed at any https host
   (server-side request forgery is accepted, with its limits,
   [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
@@ -2186,7 +2192,8 @@ enabled vendor accounts is affected.
   prefix and display-name columns (migration 83), the usage snapshot's
   spend-control columns (migration 84), the per-token
   `api_tokens.vendor_provider_access` column (migration 85) and the
-  OpenAI-compatible accounts' `vendor_accounts.base_url` column (migration 86).
+  preset accounts' (OpenAI-compatible and native Gemini) `vendor_accounts.base_url`
+  column (migration 86).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
   `/api/portal/vendor-accounts*` routes (the model and usage refreshes included) and
   their error codes; [token vendor access](../reference/api-surface.md#token-vendor-access)
