@@ -26,6 +26,8 @@ import {
   IMAGE_LOSSY_FORMATS,
   IMAGE_N_MAX,
   IMAGE_OUTPUT_FORMATS,
+  IMAGE_SAMPLERS,
+  IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
   useChatStore,
 } from './chat/ChatStore';
@@ -65,6 +67,9 @@ function textOf(content: ChatContent): string | undefined {
 export function Chat({ t }: Readonly<{ t: Translation }>) {
   const c = useChatStore();
   const [showSettings, setShowSettings] = useState(false);
+  // The advanced (sd-server) image knobs are collapsed by default: they are
+  // power-user controls below the common size/count/format settings.
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(readSidebarCollapsed);
 
   function toggleSidebar() {
@@ -312,6 +317,114 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     </Box>
                   )}
                 </Box>
+              )}
+              {/* Advanced (sd-server) knobs: the native sampler/steps/cfg/etc.,
+                collapsed by default. The gateway folds the SET ones into the
+                prompt's <sd_cpp_extra_args> block; a blank numeric field leaves
+                sd-server's own per-model default, and sampler/scheduler are the
+                static sd-cpp enum superset (a build that lacks one ignores it). */}
+              {isImageThread && (
+                <>
+                  <Button
+                    variant="text"
+                    size="small"
+                    onClick={() => setShowAdvanced((open) => !open)}
+                    sx={{ justifySelf: 'start' }}
+                  >
+                    {t.chatImageAdvanced}
+                  </Button>
+                  {showAdvanced && (
+                    <Box
+                      sx={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                        gap: 2,
+                      }}
+                    >
+                      <TextField
+                        id="chat-image-negative-prompt"
+                        label={t.chatImageNegativePrompt}
+                        multiline
+                        minRows={2}
+                        fullWidth
+                        value={c.imageSettings.negative_prompt}
+                        onChange={(event) =>
+                          c.setImageSettings((s) => ({ ...s, negative_prompt: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                        sx={{ gridColumn: '1 / -1' }}
+                      />
+                      <SearchableSelect
+                        id="chat-image-sampler"
+                        label={t.chatImageSampler}
+                        value={c.imageSettings.sampler}
+                        onChange={(value) => c.setImageSettings((s) => ({ ...s, sampler: value }))}
+                        disabled={c.streaming}
+                        options={IMAGE_SAMPLERS.map((sampler) => ({
+                          value: sampler,
+                          label: sampler === '' ? t.chatImageAdvancedDefault : sampler,
+                        }))}
+                      />
+                      <SearchableSelect
+                        id="chat-image-scheduler"
+                        label={t.chatImageScheduler}
+                        value={c.imageSettings.scheduler}
+                        onChange={(value) =>
+                          c.setImageSettings((s) => ({ ...s, scheduler: value }))
+                        }
+                        disabled={c.streaming}
+                        options={IMAGE_SCHEDULERS.map((scheduler) => ({
+                          value: scheduler,
+                          label: scheduler === '' ? t.chatImageAdvancedDefault : scheduler,
+                        }))}
+                      />
+                      <TextField
+                        id="chat-image-steps"
+                        label={t.chatImageSteps}
+                        type="number"
+                        value={c.imageSettings.steps}
+                        placeholder={t.chatImageAdvancedDefault}
+                        onChange={(event) =>
+                          c.setImageSettings((s) => ({ ...s, steps: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                      />
+                      <TextField
+                        id="chat-image-cfg"
+                        label={t.chatImageCFG}
+                        type="number"
+                        value={c.imageSettings.cfg}
+                        placeholder={t.chatImageAdvancedDefault}
+                        onChange={(event) =>
+                          c.setImageSettings((s) => ({ ...s, cfg: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                      />
+                      <TextField
+                        id="chat-image-seed"
+                        label={t.chatImageSeed}
+                        type="number"
+                        value={c.imageSettings.seed}
+                        placeholder={t.chatImageAdvancedDefault}
+                        onChange={(event) =>
+                          c.setImageSettings((s) => ({ ...s, seed: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                      />
+                      <TextField
+                        id="chat-image-clip-skip"
+                        label={t.chatImageClipSkip}
+                        type="number"
+                        value={c.imageSettings.clip_skip}
+                        placeholder={t.chatImageAdvancedDefault}
+                        onChange={(event) =>
+                          c.setImageSettings((s) => ({ ...s, clip_skip: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                      />
+                    </Box>
+                  )}
+                </>
               )}
               {/* The server-override picker is hidden entirely when the caller
                 manages zero servers AND the run-as token does not lock it —

@@ -229,6 +229,19 @@ const de = {
   chatImageOutputFormat: 'Format',
   chatImageFormatDefault: 'Standard (PNG)',
   chatImageCompression: 'Kompression',
+  // The advanced sd-server knobs (Phase 1b), in a collapsible section. The
+  // numeric fields are blank-able ("" = sd-server-Standard, chatImageAdvancedDefault
+  // as placeholder); sampler/scheduler are dropdowns whose "" option is the same
+  // label. CFG stays an acronym in both languages.
+  chatImageAdvanced: 'Erweitert (sd-server)',
+  chatImageAdvancedDefault: 'Standard (Modell)',
+  chatImageNegativePrompt: 'Negativ-Prompt',
+  chatImageSampler: 'Sampler',
+  chatImageScheduler: 'Scheduler',
+  chatImageSteps: 'Schritte',
+  chatImageCFG: 'CFG',
+  chatImageSeed: 'Seed',
+  chatImageClipSkip: 'Clip Skip',
   // The composer during an image run's wait (ADR-043 (d)): the pending label
   // and the static "nothing more is coming" sentence -- ImagePendingTurn's
   // only two announced strings (its clock is aria-hidden). Deliberately NOT
@@ -3024,6 +3037,15 @@ const en: PortalMessages = {
   chatImageOutputFormat: 'Format',
   chatImageFormatDefault: 'Default (PNG)',
   chatImageCompression: 'Compression',
+  chatImageAdvanced: 'Advanced (sd-server)',
+  chatImageAdvancedDefault: 'Default (model)',
+  chatImageNegativePrompt: 'Negative prompt',
+  chatImageSampler: 'Sampler',
+  chatImageScheduler: 'Scheduler',
+  chatImageSteps: 'Steps',
+  chatImageCFG: 'CFG',
+  chatImageSeed: 'Seed',
+  chatImageClipSkip: 'Clip skip',
   chatImageRunPending: 'Waiting for image',
   chatImageNoIntermediateNews:
     'No intermediate updates – the image arrives finished or not at all.',

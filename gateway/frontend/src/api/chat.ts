@@ -38,6 +38,17 @@ export type ChatImageSettings = {
   n?: number;
   output_format?: string;
   output_compression?: number;
+  // The advanced sd-server knobs (Phase 1b). The backend folds the set ones into
+  // a <sd_cpp_extra_args> block in the prompt (not top-level fields upstream);
+  // the numerics are sent as JSON numbers, omitted when the composer left them
+  // blank. See the backend's portal.ChatImageSettings.
+  negative_prompt?: string;
+  sampler?: string;
+  scheduler?: string;
+  steps?: number;
+  cfg?: number;
+  seed?: number;
+  clip_skip?: number;
 };
 
 // The per-chat settings the frontend persists inside `content`.

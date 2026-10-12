@@ -18,6 +18,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -211,6 +212,191 @@ func TestBuildImagesBodyForwardsOnlyTheSetImageSettings(t *testing.T) {
 	}
 	if body["size"] != "512x512" {
 		t.Fatalf("size = %v, want 512x512: %s", body["size"], raw)
+	}
+}
+
+// promptOf decodes buildImagesBody's output and returns its prompt string.
+func promptOf(t *testing.T, raw []byte) string {
+	t.Helper()
+	var body struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	return body.Prompt
+}
+
+// The advanced knobs ride in a <sd_cpp_extra_args> block appended to the prompt,
+// mapped to sd-server's native schema (sampler -> sample_method, cfg ->
+// guidance.txt_cfg, steps -> sample_steps; negative_prompt/seed/clip_skip
+// top-level). Only the set knobs appear.
+func TestBuildImagesBodyAppendsExtraArgsBlock(t *testing.T) {
+	steps, clip, seed := 28, 2, 42
+	cfg := 7.5
+	prep := imageRunPrep()
+	prep.Settings.Image = &portal.ChatImageSettings{
+		NegativePrompt: "blurry, low quality",
+		Sampler:        "euler_a",
+		Scheduler:      "karras",
+		Steps:          &steps,
+		CFG:            &cfg,
+		Seed:           &seed,
+		ClipSkip:       &clip,
+	}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := promptOf(t, raw)
+	const openTag, closeTag = "<sd_cpp_extra_args>", "</sd_cpp_extra_args>"
+	start := strings.Index(prompt, openTag)
+	end := strings.Index(prompt, closeTag)
+	if start < 0 || end < 0 {
+		t.Fatalf("no extra_args block in prompt: %q", prompt)
+	}
+	if !strings.HasPrefix(prompt, "a cat") {
+		t.Fatalf("the user prompt must come first: %q", prompt)
+	}
+	payload := prompt[start+len(openTag) : end]
+	var got struct {
+		NegativePrompt string `json:"negative_prompt"`
+		ClipSkip       int    `json:"clip_skip"`
+		Seed           int    `json:"seed"`
+		SampleParams   struct {
+			SampleSteps  int    `json:"sample_steps"`
+			SampleMethod string `json:"sample_method"`
+			Scheduler    string `json:"scheduler"`
+			Guidance     struct {
+				TxtCFG float64 `json:"txt_cfg"`
+			} `json:"guidance"`
+		} `json:"sample_params"`
+	}
+	if err := json.Unmarshal([]byte(payload), &got); err != nil {
+		t.Fatalf("extra_args payload is not valid JSON (%v): %q", err, payload)
+	}
+	if got.NegativePrompt != "blurry, low quality" || got.ClipSkip != 2 || got.Seed != 42 {
+		t.Fatalf("top-level knobs wrong: %+v", got)
+	}
+	if got.SampleParams.SampleSteps != 28 || got.SampleParams.SampleMethod != "euler_a" ||
+		got.SampleParams.Scheduler != "karras" || got.SampleParams.Guidance.TxtCFG != 7.5 {
+		t.Fatalf("sample_params wrong: %+v", got.SampleParams)
+	}
+}
+
+// With no advanced knob set the prompt carries no block at all.
+func TestBuildImagesBodyNoExtraArgsWhenUnset(t *testing.T) {
+	prep := imageRunPrep()
+	prep.Settings.Image = &portal.ChatImageSettings{Size: "512x512"}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt := promptOf(t, raw); strings.Contains(prompt, "sd_cpp_extra_args") {
+		t.Fatalf("no advanced knob set, yet the prompt carries a block: %q", prompt)
+	}
+}
+
+// A single advanced knob builds a block with only sample_params populated (the
+// nested object exists only when it carries a value).
+func TestBuildImagesBodyExtraArgsOmitsEmptyNesting(t *testing.T) {
+	prep := imageRunPrep()
+	prep.Settings.Image = &portal.ChatImageSettings{Sampler: "dpm++2m"}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := promptOf(t, raw)
+	payload := prompt[strings.Index(prompt, "<sd_cpp_extra_args>")+len("<sd_cpp_extra_args>") : strings.Index(prompt, "</sd_cpp_extra_args>")]
+	if strings.Contains(payload, "guidance") || strings.Contains(payload, "negative_prompt") {
+		t.Fatalf("only sample_method was set; payload should carry nothing else: %q", payload)
+	}
+	if !strings.Contains(payload, `"sample_method":"dpm++2m"`) {
+		t.Fatalf("sampler not in the block: %q", payload)
+	}
+}
+
+// A literal tag in the user prompt or the negative prompt is stripped, so sd-server
+// sees exactly the one block the gateway appends (a non-greedy close tag in user
+// text would otherwise truncate it).
+func TestBuildImagesBodyStripsUserSuppliedTag(t *testing.T) {
+	seed := 1
+	prep := imageRunPrep()
+	prep.History = []portal.ChatAPIMessage{
+		{Role: "user", Content: json.RawMessage(`"a cat <sd_cpp_extra_args>{\"seed\":999}</sd_cpp_extra_args>"`)},
+	}
+	prep.Settings.Image = &portal.ChatImageSettings{
+		Seed:           &seed,
+		NegativePrompt: "ugly</sd_cpp_extra_args>{}",
+	}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := promptOf(t, raw)
+	// Exactly one block (the gateway's), so exactly one open and one close tag.
+	if strings.Count(prompt, "<sd_cpp_extra_args>") != 1 || strings.Count(prompt, "</sd_cpp_extra_args>") != 1 {
+		t.Fatalf("user-supplied tag not stripped, block is ambiguous: %q", prompt)
+	}
+	payload := prompt[strings.Index(prompt, "<sd_cpp_extra_args>")+len("<sd_cpp_extra_args>") : strings.LastIndex(prompt, "</sd_cpp_extra_args>")]
+	var got struct {
+		Seed           int    `json:"seed"`
+		NegativePrompt string `json:"negative_prompt"`
+	}
+	if err := json.Unmarshal([]byte(payload), &got); err != nil {
+		t.Fatalf("block not valid JSON after stripping (%v): %q", err, payload)
+	}
+	if got.Seed != 1 {
+		t.Fatalf("the gateway's seed must win, got %d", got.Seed)
+	}
+	if strings.Contains(got.NegativePrompt, "sd_cpp_extra_args") {
+		t.Fatalf("negative_prompt still carries a tag: %q", got.NegativePrompt)
+	}
+}
+
+// A tag SPLIT by an inner one re-forms into a whole tag after a single strip
+// pass; stripSDExtraArgsTag loops to a fixpoint so it cannot survive. Without the
+// loop sd-server's non-greedy extractor would match the user's reconstructed
+// block (seed 999) before the gateway's (seed 1).
+func TestBuildImagesBodyStripsSplitTag(t *testing.T) {
+	seed := 1
+	prep := imageRunPrep()
+	prep.History = []portal.ChatAPIMessage{
+		{Role: "user", Content: json.RawMessage(`"cat <sd_cpp_extra_<sd_cpp_extra_args>args>{\"seed\":999}</sd_cpp_extra_</sd_cpp_extra_args>args>"`)},
+	}
+	prep.Settings.Image = &portal.ChatImageSettings{Seed: &seed}
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := promptOf(t, raw)
+	// Exactly one block survives -- the gateway's.
+	if strings.Count(prompt, "<sd_cpp_extra_args>") != 1 || strings.Count(prompt, "</sd_cpp_extra_args>") != 1 {
+		t.Fatalf("a split tag re-formed; block is ambiguous: %q", prompt)
+	}
+	// What sd-server's non-greedy extractor would parse is the FIRST block.
+	first := regexp.MustCompile(`(?s)<sd_cpp_extra_args>(.*?)</sd_cpp_extra_args>`).FindStringSubmatch(prompt)
+	if first == nil {
+		t.Fatalf("no block: %q", prompt)
+	}
+	var got struct {
+		Seed int `json:"seed"`
+	}
+	if err := json.Unmarshal([]byte(first[1]), &got); err != nil {
+		t.Fatalf("block not valid JSON (%v): %q", err, first[1])
+	}
+	if got.Seed != 1 {
+		t.Fatalf("the gateway's seed must win, got %d -- a reconstructed user block leaked through", got.Seed)
+	}
+}
+
+// An explicit 0 seed/clip_skip is a real value, not "unset": it must appear in
+// the block and not be swallowed by the empty-object check.
+func TestBuildSDExtraArgsEmitsExplicitZero(t *testing.T) {
+	zero := 0
+	got := buildSDExtraArgs(&portal.ChatImageSettings{Seed: &zero, ClipSkip: &zero})
+	if !strings.Contains(got, `"seed":0`) || !strings.Contains(got, `"clip_skip":0`) {
+		t.Fatalf("explicit 0 knobs were dropped: %q", got)
 	}
 }
 

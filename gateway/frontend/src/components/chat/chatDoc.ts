@@ -138,6 +138,18 @@ export type ImageSettings = {
   n: number; // 1..IMAGE_N_MAX
   output_format: string; // "" = default (png) | "png" | "jpeg" | "webp"
   output_compression: number; // 0..100, only sent (and shown) for a lossy format
+  // The advanced sd-server knobs (Phase 1b), reached via the <sd_cpp_extra_args>
+  // channel. negative_prompt/sampler/scheduler are "" when unset. The numerics
+  // are kept as BLANK-ABLE strings ("" = leave sd-server's own per-model default)
+  // and parsed to numbers on the wire by imageSetting(); a blank or unparseable
+  // one is omitted.
+  negative_prompt: string;
+  sampler: string; // "" = model default; one of IMAGE_SAMPLERS
+  scheduler: string; // "" = model default; one of IMAGE_SCHEDULERS
+  steps: string;
+  cfg: string;
+  seed: string;
+  clip_skip: string;
 };
 
 export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
@@ -145,6 +157,13 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   n: 1,
   output_format: '',
   output_compression: 100,
+  negative_prompt: '',
+  sampler: '',
+  scheduler: '',
+  steps: '',
+  cfg: '',
+  seed: '',
+  clip_skip: '',
 };
 
 // sd-server's batch_count ceiling for one request (its capabilities `limits`
@@ -168,6 +187,77 @@ export const IMAGE_SIZE_OPTIONS = [
 // when the sd-server build has WebP support). "" leaves the default (png).
 // output_compression (0..100) applies only to the two lossy formats.
 export const IMAGE_OUTPUT_FORMATS = ['', 'png', 'jpeg', 'webp'] as const;
+
+// sd-cpp's compiled-in sampler (sample_method_to_str) and scheduler
+// (scheduler_to_str) enums, offered as a STATIC superset for Phase 1b. "" = the
+// model's own default. The gateway forwards the pick opaquely, so a value a given
+// sd-server build does not support is simply ignored upstream; a future Phase 1b
+// would narrow these per model from /sdcpp/v1/capabilities.
+export const IMAGE_SAMPLERS = [
+  '',
+  'euler',
+  'euler_a',
+  'heun',
+  'dpm2',
+  'dpm++2s_a',
+  'dpm++2m',
+  'dpm++2mv2',
+  'ipndm',
+  'ipndm_v',
+  'lcm',
+  'ddim_trailing',
+  'tcd',
+  'res_multistep',
+  'res_2s',
+  'er_sde',
+  'euler_cfg_pp',
+  'euler_a_cfg_pp',
+  'euler_ge',
+  'dpm++2m_sde',
+  'dpm++2m_sde_bt',
+  'lms',
+] as const;
+
+export const IMAGE_SCHEDULERS = [
+  '',
+  'discrete',
+  'normal',
+  'karras',
+  'exponential',
+  'ays',
+  'gits',
+  'sgm_uniform',
+  'simple',
+  'smoothstep',
+  'kl_optimal',
+  'lcm',
+  'bong_tangent',
+  'ltx2',
+  'logit_normal',
+  'flux2',
+  'flux',
+  'beta',
+  'llada_image',
+] as const;
+
+// Parse a blank-able numeric knob string to a wire number, or undefined when
+// blank/unparseable (so imageSetting omits it and sd-server keeps its default).
+function toImageNumber(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (trimmed === '') return undefined;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function toImageInt(raw: string): number | undefined {
+  const n = toImageNumber(raw);
+  return n === undefined ? undefined : Math.trunc(n);
+}
+
+// The inverse: a persisted wire number back to the store's blank-able string.
+function imageNumToStr(n: number | undefined): string {
+  return typeof n === 'number' && Number.isFinite(n) ? String(n) : '';
+}
 export const IMAGE_LOSSY_FORMATS = ['jpeg', 'webp'];
 
 // All localStorage access is guarded: some environments (incl. the jsdom test
@@ -234,6 +324,20 @@ export function imageSetting(
   ) {
     image.output_compression = s.output_compression;
   }
+  // Advanced knobs: strings/dropdowns sent when non-empty, blank-able numerics
+  // parsed and sent only when a finite number. The gateway folds the set ones
+  // into the <sd_cpp_extra_args> block.
+  if (s.negative_prompt) image.negative_prompt = s.negative_prompt;
+  if (s.sampler) image.sampler = s.sampler;
+  if (s.scheduler) image.scheduler = s.scheduler;
+  const steps = toImageInt(s.steps);
+  if (steps !== undefined) image.steps = steps;
+  const cfg = toImageNumber(s.cfg);
+  if (cfg !== undefined) image.cfg = cfg;
+  const seed = toImageInt(s.seed);
+  if (seed !== undefined) image.seed = seed;
+  const clipSkip = toImageInt(s.clip_skip);
+  if (clipSkip !== undefined) image.clip_skip = clipSkip;
   return { image };
 }
 
@@ -251,6 +355,13 @@ export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSe
       typeof s.output_compression === 'number' && Number.isFinite(s.output_compression)
         ? s.output_compression
         : DEFAULT_IMAGE_SETTINGS.output_compression,
+    negative_prompt: typeof s.negative_prompt === 'string' ? s.negative_prompt : '',
+    sampler: typeof s.sampler === 'string' ? s.sampler : '',
+    scheduler: typeof s.scheduler === 'string' ? s.scheduler : '',
+    steps: imageNumToStr(s.steps),
+    cfg: imageNumToStr(s.cfg),
+    seed: imageNumToStr(s.seed),
+    clip_skip: imageNumToStr(s.clip_skip),
   };
 }
 
