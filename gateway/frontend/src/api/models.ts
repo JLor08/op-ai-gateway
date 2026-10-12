@@ -463,35 +463,41 @@ export type ModelOption = {
 
 // The per-model sd-server image options GET /api/portal/model-image-options
 // returns (the aggregate across the servers that offer the model; the backend's
-// ModelImageOptionsDTO). EVERY field is optional because the backend omits
-// (omitempty) whatever it does not know: an absent field means "unknown" and the
-// chat falls back to its static Phase 1b-i superset (see optionsOr in
-// chat/chatDoc.ts). The backend guarantees size_limits has min <= max and no
-// negatives, so a consumer may clamp against it without re-validating.
+// ModelImageOptionsDTO). EVERY field is optional, INCLUDING the inner fields of
+// size_limits and defaults, because the backend omits (omitempty) whatever it
+// does not know: it drops an inverted or unstated size axis, and a default unless
+// every serving server agrees on it. So a partial object (maxima without minima,
+// one default) or an absent size_limits/defaults is valid wire. An absent value
+// means "unknown", never "none" and never 0: the chat falls back to its static
+// Phase 1b-i superset (see optionsOr in chat/chatDoc.ts) and treats an unstated
+// bound as unbounded. The backend guarantees that a size axis it DOES state has
+// min <= max and no negatives, so a consumer need not re-validate one. Note that
+// clip_skip and seed legitimately carry -1 ("model default" / "random"), so a
+// default is "reported" whenever it is present, whatever its value.
 export type ImageModelOptions = {
   samplers?: string[];
   schedulers?: string[];
   output_formats?: string[];
   size_limits?: {
-    min_width: number;
-    max_width: number;
-    min_height: number;
-    max_height: number;
+    min_width?: number;
+    max_width?: number;
+    min_height?: number;
+    max_height?: number;
   };
   max_batch_count?: number;
   // The model's own defaults: what an unset ("") composer knob resolves to
   // upstream, shown as placeholders rather than sent.
   defaults?: {
-    sampler: string;
-    scheduler: string;
-    output_format: string;
-    negative_prompt: string;
-    steps: number;
-    clip_skip: number;
-    seed: number;
-    width: number;
-    height: number;
-    cfg: number;
+    sampler?: string;
+    scheduler?: string;
+    output_format?: string;
+    negative_prompt?: string;
+    steps?: number;
+    clip_skip?: number;
+    seed?: number;
+    width?: number;
+    height?: number;
+    cfg?: number;
   };
 };
 
