@@ -191,10 +191,12 @@ export const IMAGE_SIZE_OPTIONS = [
 export const IMAGE_OUTPUT_FORMATS = ['', 'png', 'jpeg', 'webp'] as const;
 
 // sd-cpp's compiled-in sampler (sample_method_to_str) and scheduler
-// (scheduler_to_str) enums, offered as a STATIC superset for Phase 1b. "" = the
-// model's own default. The gateway forwards the pick opaquely, so a value a given
-// sd-server build does not support is simply ignored upstream; a future Phase 1b
-// would narrow these per model from /sdcpp/v1/capabilities.
+// (scheduler_to_str) enums, kept as a STATIC superset. "" = the model's own
+// default. They are the fallback the composer uses when GET
+// /api/portal/model-image-options returns nothing for a field; the picked
+// model's own options narrow them when it does. The gateway forwards the pick
+// opaquely, so a value a given sd-server build does not support is simply
+// ignored upstream.
 export const IMAGE_SAMPLERS = [
   '',
   'euler',

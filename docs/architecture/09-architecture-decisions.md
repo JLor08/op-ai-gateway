@@ -3691,8 +3691,9 @@ is the wrong shape for it.
   options decode is its own struct and function (twinned in the gateway's
   `provider` and the agent's `collector`, the same drift discipline as
   `parseSdcppCapabilities`) and reads whatever it can, leaving the rest at zero =
-  unknown. The verdict decode stays strict and fail-closed exactly as ADR-042 and
-  ADR-044 need it, so **a malformed options document can yield partial or empty
+  unknown. The verdict decode stays strict and fail-closed exactly as
+  [ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
+  and ADR-044 need it, so **a malformed options document can yield partial or empty
   options but can never suppress or alter the routing `image` verdict.**
 - **(d) Visibility in the portal layer, aggregation as "what every backing server
   can do".** `portal.Service.ModelImageOptionViews` applies `model-servers`'

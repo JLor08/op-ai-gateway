@@ -1419,7 +1419,11 @@ is *unknown*, not "none", so the composer never ends up with an empty dropdown
   text in the free-text/numeric fields, helper text beside the dropdowns.
   Pre-filling would turn an untouched blank-able knob into an explicitly sent
   override and break the "blank = leave sd-server's own default" contract above;
-  a reported `0` or `-1` (`clip_skip`, `seed`) is a real default and is shown.
+  the client shows any default it receives, including `-1` for `clip_skip` and
+  `seed` ("model default" / "random"), as a real reported default. A
+  server-reported `0` for either is dropped upstream as "not stated"
+  (`agreedDefault` treats zero as unknown and the DTO fields are `omitempty`), so
+  it never reaches the client; only `-1` or a positive value does.
 - **A persisted value the narrowed list omits stays selectable**, as a synthetic
   trailing option (the trick the model and server-override pickers use), so
   reopening a chat whose saved sampler the current model does not list never
