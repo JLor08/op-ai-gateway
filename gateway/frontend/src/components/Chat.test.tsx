@@ -10,6 +10,7 @@ import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import type {
   ActiveChatRun,
+  ImageModelOptions,
   ModelOption,
   PortalServer,
   PortalToken,
@@ -126,6 +127,10 @@ function makeChatApi() {
     activeChatRuns: vi.fn(async () => ({ data: [] as ActiveChatRun[] })),
     // The server-override picker's filtered-model fetch (Task 6, step 3).
     serverModels: vi.fn(async (serverId: string) => serverModelsByServer[serverId] ?? []),
+    // The per-model sd-server image options the store fetches whenever the picked
+    // model GENERATES images: this file's fixtures know none, so every field is
+    // omitted (the dropdowns then use the static Phase 1b-i superset).
+    modelImageOptions: vi.fn(async (_name: string) => ({}) as ImageModelOptions),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.

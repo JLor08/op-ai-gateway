@@ -16,7 +16,13 @@ import {
 import { ToastProvider } from '../shared/ToastProvider';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
-import type { ActiveChatRun, ModelOption, PortalToken, ServerModelOption } from '../../api';
+import type {
+  ActiveChatRun,
+  ImageModelOptions,
+  ModelOption,
+  PortalToken,
+  ServerModelOption,
+} from '../../api';
 
 const models: ModelOption[] = [
   { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
@@ -144,6 +150,10 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     // exercises it, but the store now holds a real reference to this method so
     // the mock must provide one.
     serverModels: vi.fn(async () => [] as ServerModelOption[]),
+    // The per-model sd-server image options fetch, issued whenever the picked
+    // model GENERATES images. Defaults to "nothing known" (every field omitted);
+    // the image-options tests below override it.
+    modelImageOptions: vi.fn(async (_name: string) => ({}) as ImageModelOptions),
   };
   return { api: spies, rows, spies };
 }
@@ -182,6 +192,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="run-kind">{c.runKind ?? ''}</span>
       <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
+      {/* The fetched per-model image options ("null" until/unless one arrives). */}
+      <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
       <span data-testid="image-capacity">
         {c.imageCapacityLeft === null ? 'unknown' : String(c.imageCapacityLeft)}
       </span>
@@ -210,6 +222,13 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <button type="button" onClick={() => c.setModel(altModelId)}>
         set-model-alt
       </button>
+      {/* One "pick this model" button per reachable model, for tests that switch
+          between several (set-model-alt only ever targets one id). */}
+      {c.chatModels.map((m) => (
+        <button key={`pick-${m.id}`} type="button" onClick={() => c.setModel(m.id)}>
+          pick-{m.id}
+        </button>
+      ))}
       {c.usableTokens.map((tk) => (
         <button key={tk.id} type="button" onClick={() => c.setSelectedTokenId(tk.id)}>
           select-token-{tk.id}
@@ -2661,6 +2680,158 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       expect(screen.getByTestId('chat-kind').textContent).toBe('');
       expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
+    });
+  });
+
+  // The per-model sd-server options (samplers / size limits / ...) the composer's
+  // dropdowns narrow to. Fetched on demand when the picked model GENERATES images
+  // -- the serverOverrideModels pattern: latest-wins, a failure degrades to null
+  // (so the dropdowns fall back to the static Phase 1b-i superset).
+  describe(`ChatStoreProvider per-model image options [${locale}]`, () => {
+    const imageOptionModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+      {
+        id: 'sd-xl',
+        display_name: 'sd-xl',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+      { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+    ];
+    const turboOptions: ImageModelOptions = {
+      samplers: ['euler_a', 'lcm'],
+      max_batch_count: 4,
+      size_limits: { min_width: 64, max_width: 1024, min_height: 64, max_height: 1024 },
+    };
+    const xlOptions: ImageModelOptions = { schedulers: ['karras'] };
+
+    const optionsShown = () => screen.getByTestId('model-image-options').textContent;
+
+    it('fetches nothing while the picked model is not an image generator', async () => {
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('false');
+      expect(chatApi.spies.modelImageOptions).not.toHaveBeenCalled();
+      expect(optionsShown()).toBe('null');
+    });
+
+    it('fetches and exposes the options of a picked image model', async () => {
+      chatApi.spies.modelImageOptions.mockResolvedValue(turboOptions);
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+      expect(optionsShown()).toBe('null');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(turboOptions)));
+      expect(chatApi.spies.modelImageOptions).toHaveBeenCalledTimes(1);
+      expect(chatApi.spies.modelImageOptions).toHaveBeenCalledWith('sd-turbo');
+    });
+
+    it('refetches for another image model and clears when a text model is picked', async () => {
+      chatApi.spies.modelImageOptions.mockImplementation(async (name: string) =>
+        name === 'sd-turbo' ? turboOptions : xlOptions,
+      );
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(turboOptions)));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-xl' }));
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(xlOptions)));
+      expect(chatApi.spies.modelImageOptions).toHaveBeenLastCalledWith('sd-xl');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      await waitFor(() => expect(optionsShown()).toBe('null'));
+      // Going text must clear without another fetch.
+      expect(chatApi.spies.modelImageOptions).toHaveBeenCalledTimes(2);
+    });
+
+    it('leaves the options null when the fetch fails', async () => {
+      chatApi.spies.modelImageOptions.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+
+      await waitFor(() => expect(chatApi.spies.modelImageOptions).toHaveBeenCalledWith('sd-turbo'));
+      expect(optionsShown()).toBe('null');
+    });
+
+    it('drops options a previous model fetched when the next fetch fails', async () => {
+      chatApi.spies.modelImageOptions.mockImplementation(async (name: string) => {
+        if (name === 'sd-turbo') return turboOptions;
+        throw new Error('boom');
+      });
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(turboOptions)));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-xl' }));
+      await waitFor(() => expect(optionsShown()).toBe('null'));
+    });
+
+    it("does not keep the previous model's options while the next fetch is in flight", async () => {
+      let releaseXl: (v: ImageModelOptions) => void = () => {};
+      chatApi.spies.modelImageOptions.mockImplementation((name: string) =>
+        name === 'sd-turbo'
+          ? Promise.resolve(turboOptions)
+          : new Promise<ImageModelOptions>((resolve) => {
+              releaseXl = resolve;
+            }),
+      );
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(turboOptions)));
+
+      // sd-xl's fetch is pending: sd-turbo's limits must not linger as if they
+      // were sd-xl's.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-xl' }));
+      await waitFor(() => expect(chatApi.spies.modelImageOptions).toHaveBeenCalledWith('sd-xl'));
+      expect(optionsShown()).toBe('null');
+
+      await act(async () => {
+        releaseXl(xlOptions);
+      });
+      expect(optionsShown()).toBe(JSON.stringify(xlOptions));
+    });
+
+    it('ignores a stale response for a previously picked model (latest wins)', async () => {
+      // sd-turbo's response is held back until after sd-xl's has landed.
+      let releaseTurbo: (v: ImageModelOptions) => void = () => {};
+      chatApi.spies.modelImageOptions.mockImplementation((name: string) =>
+        name === 'sd-turbo'
+          ? new Promise<ImageModelOptions>((resolve) => {
+              releaseTurbo = resolve;
+            })
+          : Promise.resolve(xlOptions),
+      );
+      renderProvider([], { models: imageOptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-turbo' }));
+      await waitFor(() => expect(chatApi.spies.modelImageOptions).toHaveBeenCalledWith('sd-turbo'));
+      fireEvent.click(screen.getByRole('button', { name: 'pick-sd-xl' }));
+      await waitFor(() => expect(optionsShown()).toBe(JSON.stringify(xlOptions)));
+
+      await act(async () => {
+        releaseTurbo(turboOptions);
+      });
+      expect(optionsShown()).toBe(JSON.stringify(xlOptions));
     });
   });
 
