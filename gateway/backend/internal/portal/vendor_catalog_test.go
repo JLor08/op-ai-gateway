@@ -129,10 +129,11 @@ func TestVendorCatalogReturnsAFreshSlice(t *testing.T) {
 	}
 }
 
-// The OpenAI-compatible vendors speak the OpenAI dialect; the bespoke ones keep
-// theirs and an unknown vendor has none.
+// The preset vendors (the OpenAI-compatible ones and native Gemini) speak the
+// OpenAI dialect towards the gateway's clients; the bespoke ones keep theirs and an
+// unknown vendor has none.
 func TestVendorAPIFlavorKnowsCompatVendors(t *testing.T) {
-	for _, v := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorOpenAICompatible} {
+	for _, v := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorGoogleNative, routing.VendorOpenAICompatible} {
 		flavor, ok := vendorAPIFlavor(v)
 		if !ok || flavor != routing.APIFlavorOpenAI {
 			t.Errorf("vendorAPIFlavor(%q) = (%q,%v), want (openai,true)", v, flavor, ok)
@@ -146,9 +147,10 @@ func TestVendorAPIFlavorKnowsCompatVendors(t *testing.T) {
 	}
 }
 
-// The OpenAI-compatible vendors seed no static models: discovery fills them in.
+// The preset vendors (OpenAI-compatible and native Gemini) seed no static models:
+// discovery fills them in.
 func TestVendorCatalogCompatVendorsSeedNothing(t *testing.T) {
-	for _, v := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorOpenAICompatible} {
+	for _, v := range []string{routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorGoogleNative, routing.VendorOpenAICompatible} {
 		for _, authType := range vendorAuthTypes {
 			if got := VendorCatalog(v, authType); len(got) != 0 {
 				t.Errorf("VendorCatalog(%q, %q) = %+v, want empty", v, authType, got)

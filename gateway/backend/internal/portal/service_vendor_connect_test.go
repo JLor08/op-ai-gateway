@@ -871,8 +871,8 @@ func TestNewServiceDefaultsAndInjectsTheVendorOAuthEndpoints(t *testing.T) {
 	}
 }
 
-// The OpenAI-compatible vendors are api-key only, so every subscription connect
-// path fails closed for them: a created (api-key) account is refused as not a
+// The preset vendors (OpenAI-compatible and native Gemini) are api-key only, so
+// every subscription connect path fails closed for them: a created (api-key) account is refused as not a
 // subscription before anything is stored, and even an account planted in the
 // store as a subscription (the service cannot create one) is refused as an
 // unknown vendor by the OAuth begin and the device begin rather than being
@@ -881,7 +881,7 @@ func TestSubscriptionConnectFailsClosedForCompatVendors(t *testing.T) {
 	svc, routeStore, _ := newVendorConnectTestService(t)
 	ctx := context.Background()
 
-	for _, vendor := range openAICompatibleTestVendors {
+	for _, vendor := range presetTestVendors {
 		t.Run(vendor, func(t *testing.T) {
 			acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(vendor, "https://gw.example.test"))
 			if _, err := svc.BeginVendorAccountConnect(ctx, ownerToken(), acc.ID); !errors.Is(err, ErrVendorAccountNotSubscription) {

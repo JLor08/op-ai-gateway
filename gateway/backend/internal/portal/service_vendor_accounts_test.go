@@ -1481,10 +1481,11 @@ func TestVendorAccountModelDTOExposesTheDisplayName(t *testing.T) {
 	}
 }
 
-// openAICompatibleTestVendors are the vendor ids the portal accepts on top of
-// openai and anthropic: the four named presets and the Custom endpoint.
-var openAICompatibleTestVendors = []string{
-	routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorOpenAICompatible,
+// presetTestVendors are the vendor ids the portal accepts on top of openai and
+// anthropic: the named presets (Google's OpenAI shim and native Gemini, google_native,
+// among them) and the Custom endpoint.
+var presetTestVendors = []string{
+	routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo, routing.VendorGoogle, routing.VendorGoogleNative, routing.VendorOpenAICompatible,
 }
 
 func compatAccountRequest(vendor, baseURL string) CreateVendorAccountRequest {
@@ -1506,7 +1507,7 @@ func TestCreateVendorAccountAcceptsOpenAICompatibleVendors(t *testing.T) {
 	svc, routeStore := newVendorAccountTestService(t, now)
 	ctx := context.Background()
 
-	for _, vendor := range openAICompatibleTestVendors {
+	for _, vendor := range presetTestVendors {
 		t.Run(vendor, func(t *testing.T) {
 			typed := "https://gw.example.test/root/"
 			wantTyped := "https://gw.example.test/root"
@@ -1584,7 +1585,7 @@ func TestCreateVendorAccountIgnoresBaseURLForBespokeVendors(t *testing.T) {
 func TestCreateVendorAccountRejectsSubscriptionForCompatVendor(t *testing.T) {
 	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
 
-	for _, vendor := range openAICompatibleTestVendors {
+	for _, vendor := range presetTestVendors {
 		req := compatAccountRequest(vendor, "https://gw.example.test")
 		req.AuthType = routing.VendorAuthSubscription
 		req.APIKey = ""
@@ -1594,6 +1595,20 @@ func TestCreateVendorAccountRejectsSubscriptionForCompatVendor(t *testing.T) {
 	}
 	if rows, _ := routeStore.VendorAccounts(context.Background()); len(rows) != 0 {
 		t.Fatalf("rows = %#v, want none persisted after rejected creates", rows)
+	}
+}
+
+// google_native is on the vendor-id allowlist next to the OpenAI-compatible ones
+// (and the shim google stays on it); an unknown id is still refused.
+func TestNormalizeVendorAccountVendorAcceptsGoogleNative(t *testing.T) {
+	for _, vendor := range []string{routing.VendorGoogleNative, routing.VendorGoogle} {
+		got, err := normalizeVendorAccountVendor("  " + vendor + " ")
+		if err != nil || got != vendor {
+			t.Errorf("normalizeVendorAccountVendor(%q) = %q, %v, want it accepted and trimmed", vendor, got, err)
+		}
+	}
+	if _, err := normalizeVendorAccountVendor("google_native2"); !errors.Is(err, ErrVendorAccountVendorInvalid) {
+		t.Errorf("err = %v, want ErrVendorAccountVendorInvalid for an unknown id", err)
 	}
 }
 
@@ -1637,7 +1652,7 @@ func TestCreateRejectsMalformedOrNonHTTPSBaseURL(t *testing.T) {
 		"https://:443/v1",
 		"https://x.test/a b",
 	} {
-		for _, vendor := range []string{routing.VendorOpenAICompatible, routing.VendorXAI} {
+		for _, vendor := range []string{routing.VendorOpenAICompatible, routing.VendorXAI, routing.VendorGoogleNative} {
 			_, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(vendor, baseURL))
 			if !errors.Is(err, ErrVendorAccountBaseURLInvalid) {
 				t.Fatalf("%s base_url %q: err = %v, want ErrVendorAccountBaseURLInvalid", vendor, baseURL, err)

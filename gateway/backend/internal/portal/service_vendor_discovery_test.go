@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -36,8 +37,9 @@ type fakeDiscoveryCall struct {
 	credential    string
 	accountID     string
 	clientVersion string
-	// modelsURL is the URL the service composed; only the OpenAI-compatible kind
-	// carries one ("" for every other kind, whose URL is a vendorauth constant).
+	// modelsURL is the URL the service composed; only the preset kinds (the
+	// OpenAI-compatible and the native Gemini one) carry one ("" for every other
+	// kind, whose URL is a vendorauth constant).
 	modelsURL string
 	// timeout is the Timeout of the *http.Client the service handed over;
 	// hasClient is false when it handed over nil.
@@ -107,7 +109,7 @@ func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
 
 		compatUsage: fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
 	}
-	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey} {
+	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey, kindGeminiAPIKey} {
 		f.results[kind] = fakeDiscoveryResult{status: vendorauth.DiscoveryUnverifiable}
 	}
 	return f
@@ -267,6 +269,14 @@ func (f *fakeVendorDiscoverers) compat() VendorOpenAICompatibleDiscoverer {
 	}
 }
 
+// gemini is the fake of the native Gemini fetch: it records the models URL the
+// service composed, like compat.
+func (f *fakeVendorDiscoverers) gemini() VendorOpenAICompatibleDiscoverer {
+	return func(_ context.Context, client *http.Client, modelsURL, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+		return f.recordCall(fakeDiscoveryCall{kind: kindGeminiAPIKey, credential: apiKey, modelsURL: modelsURL}, client)
+	}
+}
+
 func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 	return VendorModelDiscoverers{
 		OpenAISubscription: func(_ context.Context, client *http.Client, accessToken, accountID, clientVersion string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
@@ -276,6 +286,7 @@ func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 		OpenAIAPIKey:           f.keyed(kindOpenAIAPIKey),
 		AnthropicAPIKey:        f.keyed(kindAnthropicAPIKey),
 		OpenAICompatibleAPIKey: f.compat(),
+		GeminiAPIKey:           f.gemini(),
 		OpenAIUsage: func(_ context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
 			return f.recordUsage(accessToken, accountID, client)
 		},
@@ -729,18 +740,23 @@ func TestCompatDiscoveryComposesTheModelsURL(t *testing.T) {
 }
 
 // openai and anthropic keep their own fixed-URL seams: a compatible vendor never
-// reaches them and they never reach the compatible one.
+// reaches them and they never reach the compatible one. The native Gemini account
+// (google_native) has a seam of its own, while the google OpenAI shim stays on the
+// compatible one.
 func TestCompatDiscoveryKeepsTheVendorFamiliesApart(t *testing.T) {
 	svc, _, fake := newDiscoveryTestService(t)
 	fake.okSlugs(kindOpenAIAPIKey, "gpt-5.1")
 	fake.okSlugs(kindAnthropicAPIKey, "claude-opus-5")
 	fake.okSlugs(kindOpenAICompatibleAPIKey, "grok-4")
+	fake.okSlugs(kindGeminiAPIKey, "gemini-2.5-pro")
 
 	for vendor, wantKind := range map[string]string{
 		routing.VendorOpenAI:           kindOpenAIAPIKey,
 		routing.VendorAnthropic:        kindAnthropicAPIKey,
 		routing.VendorXAI:              kindOpenAICompatibleAPIKey,
 		routing.VendorOpenAICompatible: kindOpenAICompatibleAPIKey,
+		routing.VendorGoogle:           kindOpenAICompatibleAPIKey, // the OpenAI shim stays on the compatible seam
+		routing.VendorGoogleNative:     kindGeminiAPIKey,
 	} {
 		req := CreateVendorAccountRequest{Vendor: vendor, AuthType: routing.VendorAuthAPIKey, Name: "K " + vendor, APIKey: vendorAccountTestKey}
 		if vendor == routing.VendorOpenAICompatible {
@@ -904,6 +920,146 @@ func TestAggregatorCapStillBoundsARunawayListingAndCountsWhatItDropped(t *testin
 	}
 	if rows := storedModels(t, routeStore, acc.ID); len(rows) != maxDiscoveredModels {
 		t.Fatalf("stored %d rows, want %d", len(rows), maxDiscoveredModels)
+	}
+}
+
+// A native Gemini account is asked at {base}/v1beta/models through its OWN seam (the
+// shim google account's /v1beta/openai/models stays on the compatible one): the
+// portal composes the URL from the google_native preset, hands it over with the
+// stored (opened) key and the bounded discovery client, and the rows are served
+// over the openai flavor with the "models/" prefix removed, like every preset
+// account's.
+func TestNativeGeminiDiscoveryComposesTheModelsURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		baseURL string
+		wantURL string
+	}{
+		{"preset root", "", "https://generativelanguage.googleapis.com/v1beta/models"},
+		{"typed root with a trailing slash", "https://gw.example.test/", "https://gw.example.test/v1beta/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore, fake := newDiscoveryTestService(t)
+			fake.ok(kindGeminiAPIKey,
+				discovered("models/gemini-2.5-pro", "models/gemini-2.5-pro"), // the id standing in for a name
+				discovered("gemini-2.5-flash", "Gemini 2.5 Flash"),
+			)
+			acc := compatDiscoveryAccount(t, svc, fake, routing.VendorGoogleNative, tc.baseURL, "g/")
+
+			dto, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("RefreshVendorAccountModels: %v", err)
+			}
+			if res.Status != VendorRefreshOK || res.Discovered != 2 {
+				t.Fatalf("result = %+v, want ok / 2", res)
+			}
+			call := fake.onlyCall(t)
+			if call.kind != kindGeminiAPIKey || call.credential != vendorAccountTestKey {
+				t.Fatalf("call = %+v, want the native Gemini seam with the stored (opened) key", call)
+			}
+			if call.modelsURL != tc.wantURL {
+				t.Fatalf("models URL = %q, want %q", call.modelsURL, tc.wantURL)
+			}
+			if !call.hasClient || call.timeout != 10*time.Second {
+				t.Fatalf("call = %+v, want a client with a 10s timeout", call)
+			}
+			want := []routing.VendorAccountModel{ // the store lists a set by gateway id
+				modelRow(acc.ID, "g/gemini-2.5-flash", "gemini-2.5-flash", routing.APIFlavorOpenAI, "Gemini 2.5 Flash"),
+				modelRow(acc.ID, "g/gemini-2.5-pro", "gemini-2.5-pro", routing.APIFlavorOpenAI, "gemini-2.5-pro"),
+			}
+			if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, want) {
+				t.Fatalf("stored rows = %+v, want %+v", got, want)
+			}
+			requireNoToken(t, "refreshed account", dto)
+		})
+	}
+}
+
+// Fail-soft holds for the native account too: a listing that cannot be had leaves
+// the rows exactly as they were.
+func TestNativeGeminiDiscoveryKeepsTheRowsWhenTheVendorCannotBeVerified(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	acc := compatDiscoveryAccount(t, svc, fake, routing.VendorGoogleNative, "", "")
+	existing := []routing.VendorAccountModel{{GatewayModel: "kept", UpstreamModel: "kept", APIFlavor: routing.APIFlavorOpenAI}}
+	if err := routeStore.SetVendorAccountModels(context.Background(), acc.ID, existing); err != nil {
+		t.Fatal(err)
+	}
+	before := storedModels(t, routeStore, acc.ID)
+
+	_, res, err := svc.RefreshVendorAccountModels(context.Background(), ownerToken(), acc.ID)
+	if err != nil || res.Status != VendorRefreshUnverifiable {
+		t.Fatalf("result = %+v, err = %v, want unverifiable", res, err)
+	}
+	if got := storedModels(t, routeStore, acc.ID); !reflect.DeepEqual(got, before) {
+		t.Fatalf("rows changed to %+v, want %+v", got, before)
+	}
+}
+
+// A freshly created native account has no seed either, so the create asks Gemini
+// once, best effort, and the account serves the discovered models at once.
+func TestNativeGeminiDiscoveryOnCreateStoresTheDiscoveredModels(t *testing.T) {
+	svc, routeStore, fake := newDiscoveryTestService(t)
+	fake.okSlugs(kindGeminiAPIKey, "gemini-2.5-pro")
+
+	dto, err := svc.CreateVendorAccount(context.Background(), ownerToken(), compatAccountRequest(routing.VendorGoogleNative, ""))
+	if err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	want := []routing.VendorAccountModel{modelRow(dto.ID, "gemini-2.5-pro", "gemini-2.5-pro", routing.APIFlavorOpenAI, "gemini-2.5-pro")}
+	if got := storedModels(t, routeStore, dto.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want %+v", got, want)
+	}
+	if served := gatewayModels(storedModels(t, routeStore, dto.ID)); !reflect.DeepEqual(served, []string{"gemini-2.5-pro"}) || len(dto.Models) != 1 {
+		t.Fatalf("created account serves %v / %+v, want the discovered model", served, dto.Models)
+	}
+	call := fake.onlyCall(t)
+	if call.kind != kindGeminiAPIKey || call.modelsURL != "https://generativelanguage.googleapis.com/v1beta/models" || call.credential != vendorAccountTestKey {
+		t.Fatalf("call = %+v, want one native discovery with the new key at the composed URL", call)
+	}
+	requireNoToken(t, "created account", dto)
+}
+
+// The whole native path with the real vendorauth fetcher wired in: the portal
+// composes {base}/v1beta/models, the fetcher pages it with the key in the
+// x-goog-api-key header, keeps the generateContent models only and the prefix is
+// gone from the stored rows.
+func TestNativeGeminiDiscoveryThroughTheRealFetcher(t *testing.T) {
+	var pages int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1beta/models" || r.Header.Get("x-goog-api-key") != vendorAccountTestKey || r.Header.Get("Authorization") != "" {
+			t.Errorf("request = %s, x-goog-api-key %q, Authorization %q, want GET /v1beta/models with only the Google key header",
+				r.URL.Path, r.Header.Get("x-goog-api-key"), r.Header.Get("Authorization"))
+		}
+		pages++
+		if r.URL.Query().Get("pageToken") == "" {
+			_, _ = w.Write([]byte(`{"models":[
+				{"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","supportedGenerationMethods":["generateContent"]},
+				{"name":"models/text-embedding-004","displayName":"Embedding","supportedGenerationMethods":["embedContent"]}],
+				"nextPageToken":"page-2"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"models":[
+			{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]}`))
+	}))
+	defer srv.Close()
+
+	svc, routeStore := newVendorAccountTestService(t, discoveryTestNow)
+	svc.vendorDiscovery.discoverers = VendorModelDiscoverers{}.withDefaults()
+	svc.vendorDiscovery.client = srv.Client()
+	req := compatAccountRequest(routing.VendorGoogleNative, srv.URL)
+	req.ModelPrefix = "g/"
+
+	dto := createTestVendorAccount(t, svc, ownerToken(), req)
+	if pages != 2 {
+		t.Fatalf("listing pages requested = %d, want 2 (the create discovered and followed nextPageToken)", pages)
+	}
+	want := []routing.VendorAccountModel{
+		modelRow(dto.ID, "g/gemini-2.5-flash", "gemini-2.5-flash", routing.APIFlavorOpenAI, "gemini-2.5-flash"),
+		modelRow(dto.ID, "g/gemini-2.5-pro", "gemini-2.5-pro", routing.APIFlavorOpenAI, "Gemini 2.5 Pro"),
+	}
+	if got := storedModels(t, routeStore, dto.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("stored rows = %+v, want %+v (chat models only, no models/ prefix)", got, want)
 	}
 }
 
@@ -1699,7 +1855,7 @@ func TestUpdateVendorAccountModelPrefixAuthorizationAndValidationRunBeforeRelabe
 func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	d := defaults.vendorDiscovery.discoverers
-	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAICompatibleAPIKey == nil || d.OpenAIUsage == nil || d.OpenAICompatibleUsage == nil {
+	if d.OpenAISubscription == nil || d.AnthropicSubscription == nil || d.OpenAIAPIKey == nil || d.AnthropicAPIKey == nil || d.OpenAICompatibleAPIKey == nil || d.GeminiAPIKey == nil || d.OpenAIUsage == nil || d.OpenAICompatibleUsage == nil {
 		t.Fatalf("defaults = %+v, want every discoverer and both usage fetchers filled with the vendorauth function", d)
 	}
 	if c := defaults.vendorDiscovery.client; c == nil || c.Timeout != 10*time.Second {
@@ -1714,7 +1870,7 @@ func TestNewServiceDefaultsAndInjectsTheVendorDiscoverers(t *testing.T) {
 		},
 	}})
 	id := injected.vendorDiscovery.discoverers
-	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAICompatibleAPIKey == nil || id.OpenAIUsage == nil || id.OpenAICompatibleUsage == nil {
+	if id.OpenAISubscription == nil || id.AnthropicSubscription == nil || id.AnthropicAPIKey == nil || id.OpenAICompatibleAPIKey == nil || id.GeminiAPIKey == nil || id.OpenAIUsage == nil || id.OpenAICompatibleUsage == nil {
 		t.Fatalf("injected = %+v, want the un-injected discoverers and usage fetchers defaulted", id)
 	}
 	id.OpenAIAPIKey(context.Background(), nil, "k")

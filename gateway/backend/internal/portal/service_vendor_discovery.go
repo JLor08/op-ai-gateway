@@ -36,9 +36,9 @@ import (
 //   - The connect flows (token import, code paste, device code) run it best
 //     effort once the tokens are stored, so a freshly connected subscription
 //     account serves its real models at once; a failing discovery never fails
-//     the connect. Creating an OpenAI-compatible account with its key does the
-//     same (its static seed is empty), with the same bound and the same fail-soft
-//     rule.
+//     the connect. Creating a preset account (OpenAI-compatible or native Gemini)
+//     with its key does the same (its static seed is empty), with the same bound
+//     and the same fail-soft rule.
 //   - An OpenAI subscription's or an OpenRouter/Kilo api-key account's refresh also
 //     pulls the account's usage snapshot (refreshVendorUsage), best effort and after
 //     the models, with the same opened and renewed token set (a subscription) or its
@@ -113,11 +113,12 @@ type RefreshResult struct {
 // this shape.
 type VendorCredentialDiscoverer func(ctx context.Context, httpClient *http.Client, credential string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)
 
-// VendorOpenAICompatibleDiscoverer is the api-key model-list fetch of an
-// OpenAI-compatible provider. Unlike VendorCredentialDiscoverer it takes the models
-// URL: the portal composes it from the provider preset and the account's base URL,
-// because the vendorauth package knows no vendor roots.
-// vendorauth.DiscoverOpenAICompatibleModels has exactly this shape.
+// VendorOpenAICompatibleDiscoverer is the api-key model-list fetch of a preset
+// provider (an OpenAI-compatible one, or native Gemini). Unlike
+// VendorCredentialDiscoverer it takes the models URL: the portal composes it from
+// the provider preset and the account's base URL, because the vendorauth package
+// knows no vendor roots. vendorauth.DiscoverOpenAICompatibleModels and
+// vendorauth.DiscoverGeminiModels have exactly this shape.
 type VendorOpenAICompatibleDiscoverer func(ctx context.Context, httpClient *http.Client, modelsURL, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)
 
 // VendorOpenAISubscriptionDiscoverer is the ChatGPT-subscription fetch, which also
@@ -155,7 +156,7 @@ func defaultCompatibleUsageFetcher(ctx context.Context, httpClient *http.Client,
 }
 
 // VendorModelDiscoverers is the seam over the vendorauth fetchers a models refresh
-// runs: the five model-list fetchers and the two usage fetches (the OpenAI
+// runs: the six model-list fetchers and the two usage fetches (the OpenAI
 // subscription's, which rides along with its refresh, and the OpenRouter/Kilo
 // api-key one). Tests inject fakes so no service test reaches a vendor over the
 // network. A nil field means the real fetcher (see ServiceDeps.VendorDiscoverers).
@@ -165,8 +166,12 @@ type VendorModelDiscoverers struct {
 	OpenAIAPIKey          VendorCredentialDiscoverer
 	AnthropicAPIKey       VendorCredentialDiscoverer
 	// OpenAICompatibleAPIKey lists the models of every OpenAI-compatible vendor
-	// (x.ai, OpenRouter, Kilo, Google, the Custom endpoint) at a preset-derived URL.
+	// (x.ai, OpenRouter, Kilo, Google's OpenAI shim, the Custom endpoint) at a
+	// preset-derived URL.
 	OpenAICompatibleAPIKey VendorOpenAICompatibleDiscoverer
+	// GeminiAPIKey lists the models of a native Gemini account (generateContent
+	// API, x-goog-api-key) at its preset-derived URL.
+	GeminiAPIKey VendorOpenAICompatibleDiscoverer
 	// OpenAIUsage is the usage fetch refreshVendorUsage runs for an OpenAI
 	// subscription account after its models were refreshed.
 	OpenAIUsage VendorOpenAIUsageFetcher
@@ -192,6 +197,9 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	}
 	if d.OpenAICompatibleAPIKey == nil {
 		d.OpenAICompatibleAPIKey = vendorauth.DiscoverOpenAICompatibleModels
+	}
+	if d.GeminiAPIKey == nil {
+		d.GeminiAPIKey = vendorauth.DiscoverGeminiModels
 	}
 	if d.OpenAIUsage == nil {
 		d.OpenAIUsage = vendorauth.FetchOpenAISubscriptionUsage
@@ -414,8 +422,18 @@ func (s *Service) discoverAPIKeyModels(ctx context.Context, acc routing.VendorAc
 	if apiKey == "" {
 		return nil, 0, "no API key is set", nil
 	}
-	if routing.IsOpenAICompatibleVendor(acc.Vendor) {
-		models, status := s.discoverOpenAICompatibleModels(ctx, acc, apiKey)
+	// A preset vendor lists its models at a preset-derived URL: native Gemini first
+	// (its own fetcher, x-goog-api-key and paging), then the OpenAI-compatible
+	// vendors. openai and anthropic keep their fixed-URL fetchers below.
+	var discoverPreset VendorOpenAICompatibleDiscoverer
+	switch {
+	case routing.IsNativeGeminiVendor(acc.Vendor):
+		discoverPreset = s.vendorDiscovery.discoverers.GeminiAPIKey
+	case routing.IsOpenAICompatibleVendor(acc.Vendor):
+		discoverPreset = s.vendorDiscovery.discoverers.OpenAICompatibleAPIKey
+	}
+	if discoverPreset != nil {
+		models, status := s.discoverPresetModels(ctx, acc, apiKey, discoverPreset)
 		return models, status, "", nil
 	}
 	fetch := s.apiKeyDiscoverer(acc.Vendor)
@@ -426,20 +444,21 @@ func (s *Service) discoverAPIKeyModels(ctx context.Context, acc routing.VendorAc
 	return models, status, "", nil
 }
 
-// discoverOpenAICompatibleModels lists the models of an OpenAI-compatible account
-// at GET {base}{preset prefix}/models, the URL the portal composes from the
-// provider preset (the vendorauth fetcher knows no vendor roots). The preset's
-// StripModelsPrefix (Gemini lists "models/<id>" but serves and expects the bare
-// id) is then removed from the front of each id, and from the display name too when
-// that is only the id standing in because the provider sent no name, so the prefix
-// reaches neither a model row nor the UI.
-func (s *Service) discoverOpenAICompatibleModels(ctx context.Context, acc routing.VendorAccount, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
+// discoverPresetModels lists the models of a preset account (an OpenAI-compatible
+// one or native Gemini) with discover, the vendor's fetcher, at GET {base}{preset
+// prefix}/models, the URL the portal composes from the provider preset (the
+// vendorauth fetchers know no vendor roots; any paging is the fetcher's business).
+// The preset's StripModelsPrefix (Gemini lists "models/<id>" but serves and expects
+// the bare id) is then removed from the front of each id, and from the display name
+// too when that is only the id standing in because the provider sent no name, so
+// the prefix reaches neither a model row nor the UI.
+func (s *Service) discoverPresetModels(ctx context.Context, acc routing.VendorAccount, apiKey string, discover VendorOpenAICompatibleDiscoverer) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus) {
 	preset, ok := routing.VendorPresetFor(acc.Vendor)
 	if !ok {
 		return nil, vendorauth.DiscoveryUnverifiable
 	}
 	modelsURL := strings.TrimRight(acc.BaseURL, "/") + preset.PathPrefix + "/models"
-	models, status := s.vendorDiscovery.discoverers.OpenAICompatibleAPIKey(ctx, s.vendorDiscovery.client, modelsURL, apiKey)
+	models, status := discover(ctx, s.vendorDiscovery.client, modelsURL, apiKey)
 	if preset.StripModelsPrefix != "" {
 		for i := range models {
 			stripped := strings.TrimPrefix(models[i].Slug, preset.StripModelsPrefix)
@@ -948,12 +967,12 @@ func (s *Service) relabelVendorAccountModels(ctx context.Context, id string) err
 }
 
 // discoverAfterConnect runs a model discovery for the account dto that has just
-// been connected (a subscription account) or created with its key (an
-// OpenAI-compatible account, which has no static seed), so it serves its real
-// models at once rather than the static seed. It is BEST EFFORT: whatever goes
-// wrong is logged (token-free) and dto is returned as it was, because the connect
-// or create itself has succeeded and must be reported as such. On success the
-// refreshed view (the discovered models) is returned in its place.
+// been connected (a subscription account) or created with its key (a preset
+// account, OpenAI-compatible or native Gemini, which has no static seed), so it
+// serves its real models at once rather than the static seed. It is BEST EFFORT:
+// whatever goes wrong is logged (token-free) and dto is returned as it was,
+// because the connect or create itself has succeeded and must be reported as such.
+// On success the refreshed view (the discovered models) is returned in its place.
 //
 // The whole discovery runs under its own short bound (vendorConnectDiscoveryTimeout,
 // shared by the token refresh, the fetch and the write), so a vendor that hangs
