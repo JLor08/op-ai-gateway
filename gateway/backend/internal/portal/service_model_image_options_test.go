@@ -53,10 +53,10 @@ func seedImageOptionSpec(t *testing.T, rs routing.Store, mappingID, specType, bi
 }
 
 // viewMappingIDs is the mapping ids of views, in order.
-func viewMappingIDs(views []mappingView) []string {
+func viewMappingIDs(views []ImageOptionMapping) []string {
 	ids := make([]string, 0, len(views))
 	for _, v := range views {
-		ids = append(ids, v.mapping.ID)
+		ids = append(ids, v.MappingID)
 	}
 	return ids
 }
@@ -202,9 +202,11 @@ func TestModelImageOptionViewsDropsNonSDServerMappings(t *testing.T) {
 
 // An external stable_diffusion_cpp application AND a server_agent mapping whose
 // effective runtime-spec type is stable_diffusion_cpp (explicit, or detected
-// from the binary) are both returned, as full server+app+mapping views sorted
-// by server name then mapping id, so the caller can classify external vs agent
-// from app.Type.
+// from the binary) are both returned as exported ImageOptionMappings, sorted by
+// server name then mapping id. Each carries the identity a caller outside this
+// package needs (server, application, application type, mapping); an agent
+// mapping also carries its runtime spec's id and effective type, an external
+// application none.
 func TestModelImageOptionViewsIncludesExternalAndAgentSDServer(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
@@ -217,22 +219,17 @@ func TestModelImageOptionViewsIncludesExternalAndAgentSDServer(t *testing.T) {
 	_, explicitMap := seedImageOptionOffering(t, rs, now, "srv-b-agent-explicit", routing.ProviderServerAgent, name)
 	seedImageOptionSpec(t, rs, explicitMap, string(routing.RuntimeSpecTypeStableDiffusionCpp), "/opt/bin/custom-launcher")
 
-	views, err := svc.ModelImageOptionViews(ctx, adminToken(), name)
+	got, err := svc.ModelImageOptionViews(ctx, adminToken(), name)
 	if err != nil {
 		t.Fatalf("ModelImageOptionViews: %v", err)
 	}
-	if got := viewMappingIDs(views); !slices.Equal(got, []string{"map-srv-a-agent-detected", "map-srv-b-agent-explicit", "map-srv-c-external"}) {
-		t.Fatalf("ModelImageOptionViews = %v, want the detected agent, the explicit agent and the external mapping, sorted by server", got)
+	want := []ImageOptionMapping{
+		{ServerID: "srv-a-agent-detected", ServerName: "srv-a-agent-detected", ApplicationID: "app-srv-a-agent-detected", AppType: routing.ProviderServerAgent, MappingID: "map-srv-a-agent-detected", SpecID: "spec-map-srv-a-agent-detected", SpecType: "stable_diffusion_cpp"},
+		{ServerID: "srv-b-agent-explicit", ServerName: "srv-b-agent-explicit", ApplicationID: "app-srv-b-agent-explicit", AppType: routing.ProviderServerAgent, MappingID: "map-srv-b-agent-explicit", SpecID: "spec-map-srv-b-agent-explicit", SpecType: "stable_diffusion_cpp"},
+		{ServerID: "srv-c-external", ServerName: "srv-c-external", ApplicationID: "app-srv-c-external", AppType: routing.ProviderStableDiffusionCpp, MappingID: "map-srv-c-external"},
 	}
-	// The views are the internal server+app+mapping triples, not a projection.
-	wantType := map[string]string{"srv-a-agent-detected": routing.ProviderServerAgent, "srv-b-agent-explicit": routing.ProviderServerAgent, "srv-c-external": routing.ProviderStableDiffusionCpp}
-	for _, v := range views {
-		if v.server.Name == "" || v.app.ID != "app-"+v.server.ID || v.mapping.ApplicationID != v.app.ID || v.mapping.GatewayModelName != name {
-			t.Fatalf("view = %+v, want a populated server+app+mapping triple for %q", v, name)
-		}
-		if v.app.Type != wantType[v.server.ID] {
-			t.Fatalf("view on %s has app.Type %q, want %q", v.server.ID, v.app.Type, wantType[v.server.ID])
-		}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ModelImageOptionViews =\n%+v\nwant\n%+v", got, want)
 	}
 }
 
@@ -283,5 +280,88 @@ func TestModelImageOptionViewsWithholdsAgentWhenSpecReadFails(t *testing.T) {
 	}
 	if got := viewMappingIDs(views); !slices.Equal(got, []string{"map-srv-external"}) {
 		t.Fatalf("ModelImageOptionViews = %v, want only the external mapping (agent withheld: spec unreadable)", got)
+	}
+}
+
+// countingRuntimeSpecStore counts RuntimeSpecsByApplication reads per application.
+type countingRuntimeSpecStore struct {
+	*routing.MemoryStore
+	reads map[string]int
+}
+
+func (c *countingRuntimeSpecStore) RuntimeSpecsByApplication(ctx context.Context, appID string) ([]routing.RuntimeSpec, error) {
+	if c.reads == nil {
+		c.reads = make(map[string]int)
+	}
+	c.reads[appID]++
+	return c.MemoryStore.RuntimeSpecsByApplication(ctx, appID)
+}
+
+// Runtime specs are read only for mappings the caller may see: the visibility
+// gates run BEFORE the sd-server classification, so a suppressed (hidden or
+// locked) model's agent mapping never costs a spec read. The admin call on the
+// same mapping is the positive control: it proves the counter sees a read when
+// one is made.
+func TestModelImageOptionViewsReadsNoSpecForSuppressedMapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	routes := &countingRuntimeSpecStore{MemoryStore: routing.NewMemoryStore()}
+	svc := newModelServersTestServiceWithRoutes(t, now, fakeLoadedModels{}, routes)
+	hiddenApp, hiddenMap := seedImageOptionOffering(t, routes, now, "srv-hidden-agent", routing.ProviderServerAgent, "hidden-img")
+	seedImageOptionSpec(t, routes, hiddenMap, "", "/opt/sd-server/sd-server")
+	shownApp, shownMap := seedImageOptionOffering(t, routes, now, "srv-shown-agent", routing.ProviderServerAgent, "shown-img")
+	seedImageOptionSpec(t, routes, shownMap, "", "/opt/sd-server/sd-server")
+	if err := routes.UpsertModelSetting(ctx, routing.ModelSetting{GatewayModelName: "hidden-img", Visibility: "hidden", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertModelSetting: %v", err)
+	}
+	nonAdmin := auth.Token{UserID: "usr_plain_io", Scopes: []string{"gateway:use"}}
+
+	views, err := svc.ModelImageOptionViews(ctx, nonAdmin, "hidden-img")
+	if err != nil || len(views) != 0 {
+		t.Fatalf("ModelImageOptionViews(non-admin, hidden-img) = (%v, %v), want empty and no error", viewMappingIDs(views), err)
+	}
+	if n := routes.reads[hiddenApp]; n != 0 {
+		t.Fatalf("spec reads for the suppressed mapping's application = %d, want 0 (specs are read only for visible mappings)", n)
+	}
+
+	if views, err = svc.ModelImageOptionViews(ctx, nonAdmin, "shown-img"); err != nil || len(views) != 1 {
+		t.Fatalf("ModelImageOptionViews(non-admin, shown-img) = (%v, %v), want 1 view", viewMappingIDs(views), err)
+	}
+	if n := routes.reads[shownApp]; n != 1 {
+		t.Fatalf("spec reads for a visible agent application = %d, want 1 (the counter must see a read when one is made)", n)
+	}
+	if views, err = svc.ModelImageOptionViews(ctx, adminToken(), "hidden-img"); err != nil || len(views) != 1 {
+		t.Fatalf("ModelImageOptionViews(admin, hidden-img) = (%v, %v), want 1 view (admin bypasses suppression)", viewMappingIDs(views), err)
+	}
+	if n := routes.reads[hiddenApp]; n != 1 {
+		t.Fatalf("spec reads for the hidden mapping's application after the admin call = %d, want 1", n)
+	}
+}
+
+// The same invariant for the resource-group gate: an agent mapping on a server
+// the caller is not provisioned to use costs no spec read, while the one on a
+// server the caller may use does.
+func TestModelImageOptionViewsReadsNoSpecForRestrictedServer(t *testing.T) {
+	e := newGroupTestEnv(t)
+	f := setupVisibilityFixture(e) // srvX restricted (provisioned for usr_u), srvY unrestricted
+	routes := &countingRuntimeSpecStore{MemoryStore: e.routes}
+	svc := NewService(ServiceDeps{Users: e.dir, Groups: e.dir, Routes: routes, Clock: func() time.Time { return e.now }})
+	seedImageOptionApp(t, routes, e.now, f.srvX.ID, "app_x_agent", "map_x_agent", routing.ProviderServerAgent, "img-agent", 8100)
+	seedImageOptionSpec(t, routes, "map_x_agent", "", "/opt/sd-server/sd-server")
+	seedImageOptionApp(t, routes, e.now, f.srvY.ID, "app_y_agent", "map_y_agent", routing.ProviderServerAgent, "img-agent", 8100)
+	seedImageOptionSpec(t, routes, "map_y_agent", "", "/opt/sd-server/sd-server")
+
+	views, err := svc.ModelImageOptionViews(e.ctx, token("usr_v"), "img-agent")
+	if err != nil {
+		t.Fatalf("ModelImageOptionViews(usr_v): %v", err)
+	}
+	if got := viewMappingIDs(views); !slices.Equal(got, []string{"map_y_agent"}) {
+		t.Fatalf("ModelImageOptionViews(usr_v, img-agent) = %v, want only the unrestricted server's mapping", got)
+	}
+	if n := routes.reads["app_x_agent"]; n != 0 {
+		t.Fatalf("spec reads for the restricted server's application = %d, want 0 (specs are read only for visible mappings)", n)
+	}
+	if n := routes.reads["app_y_agent"]; n != 1 {
+		t.Fatalf("spec reads for the visible server's application = %d, want 1", n)
 	}
 }

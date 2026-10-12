@@ -123,6 +123,7 @@ type API interface {
 	ManageableUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	ManageModels(context.Context, auth.Token) ModelsResponse
 	MappingBenchmarks(context.Context, auth.Token, string, int) ([]BenchmarkRunDTO, error)
+	ModelImageOptionViews(context.Context, auth.Token, string) ([]ImageOptionMapping, error)
 	ModelOfferingFor(context.Context, auth.Token, string, []string) ModelOffering
 	ModelServers(context.Context, auth.Token, string) ([]ModelServerDTO, error)
 	Models(context.Context, auth.Token) ModelsResponse
