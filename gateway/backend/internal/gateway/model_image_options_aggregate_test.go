@@ -208,6 +208,135 @@ func TestAggregateImageOptionsSizeLimitsAllUnknownIsNil(t *testing.T) {
 	}
 }
 
+func TestAggregateImageOptionsNegativeLimitsAreUnknown(t *testing.T) {
+	// A negative limit (malformed, or an "unlimited" marker) is unknown like a
+	// zero: it never becomes a bound, whichever side of min() it would have won.
+	got := aggregateImageOptions([]provider.SdcppImageOptions{
+		{Limits: provider.SdcppImageLimits{MinWidth: -1, MaxWidth: -1, MinHeight: -64, MaxHeight: -1, MaxBatchCount: -1}},
+		{Limits: provider.SdcppImageLimits{MaxWidth: 1024, MaxBatchCount: 4}},
+	})
+	if want := (&SizeLimitsDTO{MaxWidth: 1024}); !reflect.DeepEqual(got.SizeLimits, want) {
+		t.Fatalf("SizeLimits = %+v, want %+v (negative limits ignored)", got.SizeLimits, want)
+	}
+	if got.MaxBatchCount != 4 {
+		t.Fatalf("MaxBatchCount = %d, want 4 (negative ignored)", got.MaxBatchCount)
+	}
+}
+
+func TestAggregateImageOptionsOnlyNegativeLimitsAreOmitted(t *testing.T) {
+	got := aggregateImageOptions([]provider.SdcppImageOptions{
+		{Limits: provider.SdcppImageLimits{MinWidth: -1, MaxWidth: -1, MinHeight: -1, MaxHeight: -1, MaxBatchCount: -1}},
+	})
+	if got.SizeLimits != nil {
+		t.Fatalf("SizeLimits = %+v, want nil", got.SizeLimits)
+	}
+	if got.MaxBatchCount != 0 {
+		t.Fatalf("MaxBatchCount = %d, want 0", got.MaxBatchCount)
+	}
+	if js := marshalImageOptionsDTO(t, got); js != "{}" {
+		t.Fatalf("marshalled = %s, want {}", js)
+	}
+}
+
+func TestAggregateImageOptionsInvertedEnvelopeDropsTheAxis(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []provider.SdcppImageOptions
+		want *SizeLimitsDTO
+	}{
+		{
+			// Two servers whose width ranges do not overlap: [1024,2048] vs [64,512].
+			name: "disjoint servers, one axis",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 1024, MaxWidth: 2048, MinHeight: 64, MaxHeight: 2048}},
+				{Limits: provider.SdcppImageLimits{MinWidth: 64, MaxWidth: 512, MinHeight: 128, MaxHeight: 1024}},
+			},
+			want: &SizeLimitsDTO{MinHeight: 128, MaxHeight: 1024},
+		},
+		{
+			// A single malformed document: min_width above max_width.
+			name: "single malformed document, one axis",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 1024, MaxWidth: 512, MinHeight: 64, MaxHeight: 2048}},
+			},
+			want: &SizeLimitsDTO{MinHeight: 64, MaxHeight: 2048},
+		},
+		{
+			name: "height axis drops, width stays",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 2048, MaxHeight: 4096}},
+				{Limits: provider.SdcppImageLimits{MinHeight: 64, MaxHeight: 1024}},
+			},
+			want: &SizeLimitsDTO{MinWidth: 64, MaxWidth: 2048},
+		},
+		{
+			name: "every axis drops",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 1024, MaxWidth: 512, MinHeight: 1024, MaxHeight: 512}},
+			},
+			want: nil,
+		},
+		{
+			name: "every axis drops across servers",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 1024, MaxWidth: 2048, MinHeight: 1024, MaxHeight: 2048}},
+				{Limits: provider.SdcppImageLimits{MinWidth: 64, MaxWidth: 512, MinHeight: 64, MaxHeight: 512}},
+			},
+			want: nil,
+		},
+		{
+			// min == max is a single valid size, not an inversion.
+			name: "equal bounds are kept",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 512, MaxWidth: 512}},
+			},
+			want: &SizeLimitsDTO{MinWidth: 512, MaxWidth: 512},
+		},
+		{
+			// A lone bound has nothing to contradict, however large.
+			name: "a lone minimum is kept",
+			in: []provider.SdcppImageOptions{
+				{Limits: provider.SdcppImageLimits{MinWidth: 4096}},
+				{Limits: provider.SdcppImageLimits{MaxHeight: 8}},
+			},
+			want: &SizeLimitsDTO{MinWidth: 4096, MaxHeight: 8},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := aggregateImageOptions(tc.in)
+			if !reflect.DeepEqual(got.SizeLimits, tc.want) {
+				t.Fatalf("SizeLimits = %+v, want %+v", got.SizeLimits, tc.want)
+			}
+			if tc.want == nil {
+				if js := marshalImageOptionsDTO(t, got); js != "{}" {
+					t.Fatalf("marshalled = %s, want {}", js)
+				}
+			}
+		})
+	}
+}
+
+func TestAggregateImageOptionsInvertedEnvelopeKeepsTheRest(t *testing.T) {
+	// Dropping an inverted axis touches nothing else: lists, batch count and
+	// defaults still aggregate.
+	got := aggregateImageOptions([]provider.SdcppImageOptions{
+		{
+			Samplers: []string{"euler"},
+			Limits:   provider.SdcppImageLimits{MinWidth: 1024, MaxWidth: 512, MaxBatchCount: 4},
+			Defaults: provider.SdcppImageDefaults{Sampler: "euler"},
+		},
+	})
+	want := ModelImageOptionsDTO{
+		Samplers:      []string{"euler"},
+		MaxBatchCount: 4,
+		Defaults:      &ImageDefaultsDTO{Sampler: "euler"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("aggregateImageOptions = %+v, want %+v", got, want)
+	}
+}
+
 func TestAggregateImageOptionsMaxBatchCountIsTheMinimumKnown(t *testing.T) {
 	cases := []struct {
 		name string

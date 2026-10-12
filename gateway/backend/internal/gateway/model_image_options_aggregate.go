@@ -66,8 +66,11 @@ type ImageDefaultsDTO struct {
 //     nothing"). If no mapping states the field, or the stated lists share no
 //     value, the result is empty and the field is omitted.
 //   - Size limits: the tightest envelope, the largest stated minimum and the
-//     smallest stated maximum per axis.
-//   - MaxBatchCount: the smallest stated value.
+//     smallest stated maximum per axis. A limit of zero or below is unknown and
+//     ignored. An axis whose resulting minimum exceeds its maximum is dropped
+//     (both bounds), so the wire never carries min > max; if every axis drops,
+//     SizeLimits is nil.
+//   - MaxBatchCount: the smallest positive stated value.
 //   - Defaults: a field is kept only if every mapping that states it agrees.
 //
 // No mappings at all yield the zero DTO, which marshals to {}.
@@ -86,6 +89,8 @@ func aggregateImageOptions(perMapping []provider.SdcppImageOptions) ModelImageOp
 		MinHeight: tightestLimit(perMapping, func(l provider.SdcppImageLimits) int { return l.MinHeight }, larger),
 		MaxHeight: tightestLimit(perMapping, func(l provider.SdcppImageLimits) int { return l.MaxHeight }, smaller),
 	}
+	limits.MinWidth, limits.MaxWidth = dropInvertedAxis(limits.MinWidth, limits.MaxWidth)
+	limits.MinHeight, limits.MaxHeight = dropInvertedAxis(limits.MinHeight, limits.MaxHeight)
 	if limits != (SizeLimitsDTO{}) {
 		out.SizeLimits = &limits
 	}
@@ -138,15 +143,18 @@ func intersectOptionLists(perMapping []provider.SdcppImageOptions, field func(pr
 	return out
 }
 
-// tightestLimit folds the non-zero values field selects from the mappings'
-// limits with pick (min or max), so a zero (unknown) never becomes a bound. It
-// returns 0 when no mapping states the limit.
+// tightestLimit folds the positive values field selects from the mappings'
+// limits with pick (min or max). A limit of zero or below is unknown (a missing
+// field, a malformed document, or an "unlimited" marker) and never becomes a
+// bound, so it cannot reach the wire. It returns 0 when no mapping states the
+// limit. This is for limits only: a default such as ClipSkip or Seed keeps -1
+// as a real value (agreedDefault).
 func tightestLimit(perMapping []provider.SdcppImageOptions, field func(provider.SdcppImageLimits) int, pick func(a, b int) int) int {
 	tightest := 0
 	for _, m := range perMapping {
 		v := field(m.Limits)
 		switch {
-		case v == 0:
+		case v <= 0:
 		case tightest == 0:
 			tightest = v
 		default:
@@ -154,6 +162,19 @@ func tightestLimit(perMapping []provider.SdcppImageOptions, field func(provider.
 		}
 	}
 	return tightest
+}
+
+// dropInvertedAxis keeps the size contract min <= max honest: when both bounds
+// of an axis are stated and the minimum exceeds the maximum, whether because
+// two servers' ranges do not overlap or because one document is itself
+// malformed, no size fits and the axis is dropped (both bounds cleared) so the
+// client falls back to its static range. An axis with at most one bound stated
+// has nothing to contradict and is returned unchanged.
+func dropInvertedAxis(lo, hi int) (int, int) {
+	if lo > 0 && hi > 0 && lo > hi {
+		return 0, 0
+	}
+	return lo, hi
 }
 
 // agreedDefault returns the value every mapping that states the default
