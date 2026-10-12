@@ -115,10 +115,12 @@ func VendorPresetFor(vendor string) (VendorPreset, bool) {
 	return p, ok
 }
 
-// OpenAIPathPrefixFor is the Target.OpenAIPathPrefix value for an OpenAI-compatible
-// vendor; "" for every other vendor (so the Target keeps the default-/v1 behaviour).
+// OpenAIPathPrefixFor is the Target.OpenAIPathPrefix value for an
+// OpenAI-compatible (OpenAI-wire) preset vendor; "" for every other vendor,
+// including a native-dialect preset such as google_native, which the OpenAI
+// path machinery never serves (so the Target keeps the default-/v1 behaviour).
 func OpenAIPathPrefixFor(vendor string) string {
-	if p, ok := vendorPresets[vendor]; ok {
+	if p, ok := vendorPresets[vendor]; ok && p.Dialect == "" {
 		return p.PathPrefix
 	}
 	return ""

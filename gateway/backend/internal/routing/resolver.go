@@ -971,9 +971,10 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req infer
 
 // vendorAccountTarget assembles the Target for a matched vendor account + model
 // row. Split out from resolveVendorAccount so the construction is testable on its
-// own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
+// own and so the three vendor kinds (OpenAI-compatible, native Anthropic, and
+// native Gemini: vendor_gemini, x-goog-api-key auth, translate-only) read as
 // one table. The provider/endpoint/auth-header triple is the only thing the
-// account's vendor decides; everything else is the same for both, with ONE
+// account's vendor decides; everything else is the same for all of them, with ONE
 // exception per vendor keyed on the FINE request flavor (fineFlavor, not the
 // coarse apiFlavor, which folds every openai_* flavor to "openai"): an OpenAI
 // account reached over openai_responses, and an Anthropic account reached over

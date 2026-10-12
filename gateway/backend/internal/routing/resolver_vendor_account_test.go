@@ -703,3 +703,24 @@ func TestVendorAccountModelTargetNativeFailClosed(t *testing.T) {
 		t.Fatal("empty BaseURL for a preset vendor must fail closed")
 	}
 }
+
+// TestVendorAccountTargetShimGoogleUnchanged locks the shim google account from
+// the other side: it must keep resolving to the OpenAI-compatible client with
+// the "/v1beta/openai" prefix and Bearer auth, never captured by the native
+// Gemini branch.
+func TestVendorAccountTargetShimGoogleUnchanged(t *testing.T) {
+	acc := VendorAccount{Vendor: VendorGoogle, AuthType: VendorAuthAPIKey, BaseURL: "https://generativelanguage.googleapis.com"}
+	tgt := vendorAccountTarget(acc, VendorAccountModel{}, "gemini-2.5-pro", "openai", "openai_chat_completions")
+	if tgt.Provider != ProviderVendorOpenAI {
+		t.Fatalf("provider = %q, want the OpenAI-compatible shim client", tgt.Provider)
+	}
+	if tgt.OpenAIPathPrefix != "/v1beta/openai" {
+		t.Fatalf("path prefix = %q, want /v1beta/openai (the shim)", tgt.OpenAIPathPrefix)
+	}
+	if tgt.APITokenHeader != "" {
+		t.Fatalf("token header = %q, want \"\" (Bearer default)", tgt.APITokenHeader)
+	}
+	if tgt.Endpoint != acc.BaseURL {
+		t.Fatalf("endpoint = %q, want the account base URL", tgt.Endpoint)
+	}
+}

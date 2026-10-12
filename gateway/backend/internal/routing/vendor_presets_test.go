@@ -146,3 +146,16 @@ func TestVendorGoogleNativePreset(t *testing.T) {
 		t.Fatalf("preset = %+v", p)
 	}
 }
+
+// TestOpenAIPathPrefixForNativeDialectIsEmpty pins that a native-dialect preset's
+// PathPrefix ("/v1beta", used only for portal discovery/validation) is never
+// surfaced as an OpenAI path prefix, while the shim google account keeps its
+// "/v1beta/openai" prefix.
+func TestOpenAIPathPrefixForNativeDialectIsEmpty(t *testing.T) {
+	if got := OpenAIPathPrefixFor(VendorGoogleNative); got != "" {
+		t.Errorf("OpenAIPathPrefixFor(%q) = %q, want empty (native dialect has no OpenAI path)", VendorGoogleNative, got)
+	}
+	if got := OpenAIPathPrefixFor(VendorGoogle); got != "/v1beta/openai" {
+		t.Errorf("OpenAIPathPrefixFor(%q) = %q, want /v1beta/openai (the shim)", VendorGoogle, got)
+	}
+}
