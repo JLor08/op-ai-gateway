@@ -63,7 +63,9 @@ func parseGenerateContent(raw []byte) (Result, bool, error) {
 	if resp.UsageMetadata != nil {
 		res.Usage = canonicalUsage(resp.UsageMetadata)
 	}
-	return res, finish != "", nil
+	// done derives from the mapped reason, not the raw one, so the two cannot
+	// disagree (a whitespace-only raw reason maps to "" and is not done).
+	return res, res.FinishReason != "", nil
 }
 
 func partsToNeutral(parts []Part) (text, reasoning string, calls []inference.ToolCall) {

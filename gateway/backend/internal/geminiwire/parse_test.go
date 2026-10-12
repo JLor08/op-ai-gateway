@@ -161,3 +161,64 @@ func TestParseStreamChunkThoughtDeltaAndNoUsage(t *testing.T) {
 		t.Fatalf("usage without usageMetadata must be zero, got %+v", r.Usage)
 	}
 }
+
+func TestParseResponseCandidateWithoutContent(t *testing.T) {
+	// Real Gemini returns a candidate with no content on a safety stop.
+	r, err := ParseResponse([]byte(`{"candidates":[{"finishReason":"SAFETY"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Text != "" || r.Reasoning != "" || len(r.ToolCalls) != 0 || r.FinishReason != "content_filter" {
+		t.Fatalf("no-content result = %+v", r)
+	}
+}
+
+func TestParseResponseEmptyParts(t *testing.T) {
+	r, err := ParseResponse([]byte(`{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Text != "" || r.Reasoning != "" || len(r.ToolCalls) != 0 || r.FinishReason != "stop" {
+		t.Fatalf("empty-parts result = %+v", r)
+	}
+}
+
+func TestParseStreamChunkFunctionCallWithoutFinishReason(t *testing.T) {
+	// A functionCall chunk before the terminal chunk: the tool call is returned,
+	// but the chunk is not done and carries no finish reason (per-chunk mapping).
+	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[
+		{"functionCall":{"name":"f","args":{"a":1}},"thoughtSignature":"s"}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done || r.FinishReason != "" {
+		t.Fatalf("done=%v finish=%q, want false/empty", done, r.FinishReason)
+	}
+	if len(r.ToolCalls) != 1 || r.ToolCalls[0].Name != "f" || r.ToolCalls[0].Arguments != `{"a":1}` {
+		t.Fatalf("toolcalls = %+v", r.ToolCalls)
+	}
+}
+
+func TestParseResponsePromptBlockedKeepsUsage(t *testing.T) {
+	// Usage is still read when there are no candidates (a blocked prompt is billed).
+	r, err := ParseResponse([]byte(`{"promptFeedback":{"blockReason":"SAFETY"},
+		"usageMetadata":{"promptTokenCount":7,"totalTokenCount":7}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.FinishReason != "content_filter" {
+		t.Fatalf("finish = %q", r.FinishReason)
+	}
+	if r.Usage.InputTokens != 7 || r.Usage.OutputTokens != 0 || r.Usage.TotalTokens != 7 {
+		t.Fatalf("usage = %+v", r.Usage)
+	}
+}
+
+func TestParseStreamChunkWhitespaceFinishReasonIsNotDone(t *testing.T) {
+	// done and FinishReason are derived from the same mapped value, so a
+	// whitespace-only raw finishReason cannot yield done=true with an empty reason.
+	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"  "}]}`))
+	if err != nil || done || r.FinishReason != "" || r.Text != "x" {
+		t.Fatalf("chunk = %+v done=%v err=%v", r, done, err)
+	}
+}
