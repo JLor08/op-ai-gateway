@@ -127,6 +127,11 @@ type ServerDeps struct {
 	// background app-health probe loop and consumed by Phase 3 (routing + model
 	// offering). gateway.New copies it; a nil value gets a fresh registry.
 	AppHealth *AppHealthRegistry
+	// AppImageOptions caches the image-generation options each external
+	// stable-diffusion.cpp application's capability document states, populated
+	// by the same app-health probe loop. gateway.New copies it; a nil value
+	// gets a fresh registry.
+	AppImageOptions *AppImageOptionsRegistry
 	// InternalAuthSecret gates the internal trusted-loopback auth branch (see
 	// authenticateWeb in auth.go). Empty disables it (fail-closed). Will be
 	// wired in a later task.
@@ -381,6 +386,7 @@ type Server struct {
 	CaptureOverride          func() bool
 	Active                   *activeRegistry
 	AppHealth                *AppHealthRegistry
+	AppImageOptions          *AppImageOptionsRegistry
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -702,6 +708,10 @@ func New(deps ServerDeps) *Server {
 	if appHealth == nil {
 		appHealth = NewAppHealthRegistry(broker)
 	}
+	appImageOptions := deps.AppImageOptions
+	if appImageOptions == nil {
+		appImageOptions = NewAppImageOptionsRegistry()
+	}
 	resolver := deps.Resolver
 	if resolver == nil && deps.Routes != nil {
 		// The app-health registry gates routing on reachability; it satisfies
@@ -890,6 +900,7 @@ func New(deps ServerDeps) *Server {
 		CaptureOverride:             deps.CaptureOverride,
 		Active:                      active,
 		AppHealth:                   appHealth,
+		AppImageOptions:             appImageOptions,
 		capacityVRAMMarginPct:       capacityVRAMMarginPct,
 		capacityMaxConcurrency:      capacityMaxConcurrency,
 		capacitySettleSeconds:       capacitySettleSeconds,
