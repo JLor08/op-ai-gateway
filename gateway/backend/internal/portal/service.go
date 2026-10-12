@@ -4146,8 +4146,12 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 	// 3) so the per-flavor listings (/v1/models, the Anthropic list) advertise
 	// exactly what resolveVendorAccount will dispatch for them. Applied here, on
 	// the public method ModelsForFlavor consumes, rather than inside
-	// modelFlavorSetsWithPreSuppress, so the preSuppress-reading callers (the
-	// unknown-model redirect's reachability set) are left untouched.
+	// modelFlavorSetsWithPreSuppress, so the override-alias overlay's preSuppress
+	// stays the pure server/group composition. The unknown-model redirect needs
+	// the same vendor models in its reachability set, but gets them a different
+	// way — folded straight into ModelOffering.Callable/Existing in
+	// ModelOfferingFor — because treating a routable vendor model as unknown
+	// would reroute it to the fallback.
 	s.overlayVendorModels(ctx, token, sets)
 	return sets, nil
 }
