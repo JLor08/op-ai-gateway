@@ -240,6 +240,17 @@ export const IMAGE_SCHEDULERS = [
   'llada_image',
 ] as const;
 
+// The merge rule for a per-model option list (GET /api/portal/model-image-options):
+// the fetched list wins when it is non-empty, else the static superset above. The
+// endpoint omits (omitempty) a list it does not know, so absent and empty both mean
+// "unknown" and the dropdown must still offer something.
+export function optionsOr(
+  fetched: readonly string[] | undefined,
+  staticList: readonly string[],
+): readonly string[] {
+  return fetched && fetched.length > 0 ? fetched : staticList;
+}
+
 // Parse a blank-able numeric knob string to a wire number, or undefined when
 // blank/unparseable (so imageSetting omits it and sd-server keeps its default).
 function toImageNumber(raw: string): number | undefined {

@@ -60,7 +60,8 @@ import { useChatPersistence } from './useChatPersistence';
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { ChatUiMessage };
 
-// The image-settings presets the composer (Chat.tsx, OUTSIDE components/chat/)
+// The image-settings presets (and the optionsOr helper that merges a per-model
+// fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
 // renders. Re-exported through this file because the chat module's only public
 // surface is ChatStore.tsx / ChatSidebar.tsx -- Chat.tsx must not reach into
 // chatDoc.ts directly (arch.test.ts enforces this).
@@ -71,6 +72,7 @@ export {
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
+  optionsOr,
 } from './chatDoc';
 
 export type ChatStore = {

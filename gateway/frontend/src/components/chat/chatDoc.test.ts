@@ -5,11 +5,14 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_IMAGE_SETTINGS,
   DEFAULTS,
+  IMAGE_SAMPLERS,
+  IMAGE_SCHEDULERS,
   imageSetting,
   imageSettingsFrom,
   kindSetting,
   metricsOf,
   normalizeDoc,
+  optionsOr,
 } from './chatDoc';
 
 describe('metricsOf', () => {
@@ -198,5 +201,24 @@ describe('the persisted image settings mirror the backend omitempty', () => {
     // An absent numeric comes back as a blank string, never "undefined"/"NaN".
     expect(imageSettingsFrom(undefined).steps).toBe('');
     expect(imageSettingsFrom(undefined).negative_prompt).toBe('');
+  });
+});
+
+// The per-model sd-server options endpoint omits every field it does not know
+// (omitempty on the wire), so "absent" and "empty" both mean "unknown" and the
+// dropdowns fall back to the Phase 1b-i static superset.
+describe('optionsOr', () => {
+  it('uses the fetched list when it is non-empty', () => {
+    expect(optionsOr(['euler_a'], IMAGE_SAMPLERS)).toEqual(['euler_a']);
+    expect(optionsOr(['karras', 'simple'], IMAGE_SCHEDULERS)).toEqual(['karras', 'simple']);
+  });
+
+  it('falls back to the static list when the fetched list is empty', () => {
+    expect(optionsOr([], IMAGE_SAMPLERS)).toBe(IMAGE_SAMPLERS);
+  });
+
+  it('falls back to the static list when the fetched list is absent', () => {
+    expect(optionsOr(undefined, IMAGE_SAMPLERS)).toBe(IMAGE_SAMPLERS);
+    expect(optionsOr(undefined, IMAGE_SCHEDULERS)).toBe(IMAGE_SCHEDULERS);
   });
 });
