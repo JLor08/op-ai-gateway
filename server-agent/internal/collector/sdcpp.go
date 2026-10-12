@@ -63,16 +63,23 @@ func parseSdcppCapabilities(body []byte) (sdcppVerdicts, error) {
 }
 
 // ProbeSdcppVerdicts GETs baseURL+SdcppCapabilitiesPath and returns the
-// image verdict the document yields, in the same PropsVerdicts shape and
-// under the same stable/transient contract as ProbePropsVerdicts and
-// ProbeOllamaVerdicts:
+// image verdict the document yields, together with the image options it
+// states, in the same PropsVerdicts shape and under the same stable/transient
+// contract as ProbePropsVerdicts and ProbeOllamaVerdicts:
 //   - 404/401/403/405 are fixed properties of the running binary, so they
-//     are conclusive (stable, no verdict);
+//     are conclusive (stable, no verdict, no options);
 //   - no response and every other non-2xx (5xx above all) are transient;
 //   - a body that is not syntactically JSON reads as a child still
 //     mid-response, so it is transient;
-//   - a JSON body whose shape this rule cannot read is conclusive with no
-//     verdict, because the same build will answer the same way.
+//   - a JSON body whose shape the VERDICT rule cannot read is conclusive with
+//     no verdict, because the same build will answer the same way.
+//
+// The options are a second, lenient reading of the same bytes
+// (parseSdcppImageOptions), independent of the verdict: ImageOptions is set
+// for every JSON body, including one whose supported_modes the strict verdict
+// decode rejects, and a malformed options block never changes the verdict.
+// That mirrors the gateway, whose options probe likewise reads any JSON body
+// regardless of what the verdict probe makes of it.
 //
 // LiveProgress is always "": sd-server has no timings surface.
 func ProbeSdcppVerdicts(ctx context.Context, client *http.Client, baseURL string) (PropsVerdicts, bool) {
@@ -87,9 +94,10 @@ func ProbeSdcppVerdicts(ctx context.Context, client *http.Client, baseURL string
 	if !json.Valid(body) {
 		return PropsVerdicts{}, false
 	}
+	options := parseSdcppImageOptions(body)
 	v, err := parseSdcppCapabilities(body)
 	if err != nil {
-		return PropsVerdicts{}, true
+		return PropsVerdicts{ImageOptions: &options}, true
 	}
-	return PropsVerdicts{Caps: Capabilities{Image: v.image}}, true
+	return PropsVerdicts{Caps: Capabilities{Image: v.image}, ImageOptions: &options}, true
 }

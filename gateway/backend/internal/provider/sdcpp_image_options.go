@@ -136,11 +136,14 @@ type sdcppImageOptionsDoc struct {
 // and is dropped by cleanSdcppStrings). TestParseSdcppImageOptions pins this.
 //
 // This is a DUPLICATE, on purpose, of parseSdcppImageOptions in
-// server-agent/internal/collector/sdcpp.go, which reads the same document from
-// an sd-server the agent launched. The two are separate Go modules and cannot
-// share code, the same precedent as parseSdcppCapabilities in
-// sdcpp_capabilities.go. A cross-module test holds the two decodes equal.
-// Whoever changes this rule must change that copy identically.
+// server-agent/internal/collector/sdcpp_image_options.go, which reads the same
+// document from an sd-server the agent launched. The two are separate Go
+// modules and cannot share code, the same precedent as parseSdcppCapabilities
+// in sdcpp_capabilities.go. The sdcppImageOptionsCases table, duplicated
+// verbatim in both modules' sdcpp_image_options_test.go, pins both copies, and
+// TestSdcppImageOptionsCasesMatchTheAgentsTable holds the two tables
+// identical. Whoever changes this rule must change that copy, and both tables,
+// identically.
 func parseSdcppImageOptions(body []byte) SdcppImageOptions {
 	var doc sdcppImageOptionsDoc
 	_ = json.Unmarshal(body, &doc) // best-effort by design: see above

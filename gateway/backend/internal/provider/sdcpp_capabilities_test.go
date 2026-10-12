@@ -228,7 +228,14 @@ const agentSdcppCasesPath = "../../../../server-agent/internal/collector/sdcpp_t
 // from its first line through the first line that is exactly "}", or nil
 // when src declares no such table.
 func sdcppImageCasesBlock(src []byte) []byte {
-	start := bytes.Index(src, []byte("\nvar sdcppImageCases = "))
+	return sdcppVarBlock(src, "sdcppImageCases")
+}
+
+// sdcppVarBlock returns src's `var <name> = ...` declaration, from its first
+// line through the first line that is exactly "}", or nil when src declares no
+// such variable. It is the extractor behind both cross-module table pins.
+func sdcppVarBlock(src []byte, name string) []byte {
+	start := bytes.Index(src, []byte("\nvar "+name+" = "))
 	if start < 0 {
 		return nil
 	}
