@@ -163,9 +163,66 @@ type RuntimeSample struct {
 	// distinction the string fields above cannot make for themselves. See
 	// Capabilities' own doc comment below for the full reasoning, including
 	// why Verdicts is a keyed list rather than a map.
-	Capabilities *Capabilities       `json:"capabilities,omitempty"`
-	GPUs         []RuntimeGPUSample  `json:"gpus,omitempty"`
-	LastError    *RuntimeErrorSample `json:"last_error,omitempty"`
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
+	// ImageOptions is the image-generation options a stable_diffusion_cpp
+	// child's capability document states: the sampler/scheduler names and
+	// output formats the loaded model accepts, the size and batch limits, and
+	// the server's own defaults. It does not fit Capabilities' keyed verdict
+	// list (those are yes/no answers), so it is a field of its own, filled by
+	// the same probeRuntimeChildProps pass from the same document and behind
+	// the same capability_source_sdcpp gate as the image verdict. A POINTER
+	// with omitempty: nil means "nothing to say" -- every runtime that is not
+	// a stable_diffusion_cpp child, a child whose capability document could
+	// not be read (a 404, a non-JSON body, not yet probed conclusively), or a
+	// gateway that does not declare the sdcpp source -- and is byte-neutral
+	// for every pre-existing agent's telemetry shape; non-nil with zero values
+	// means "the document was read and states no options".
+	ImageOptions *RuntimeImageOptions `json:"image_options,omitempty"`
+	GPUs         []RuntimeGPUSample   `json:"gpus,omitempty"`
+	LastError    *RuntimeErrorSample  `json:"last_error,omitempty"`
+}
+
+// RuntimeImageOptions is one stable_diffusion_cpp child's image-generation
+// options, as the agent decoded them from its /sdcpp/v1/capabilities document
+// (the wire twin of collector.SdcppImageOptions). The gateway decodes it with
+// a mirror DTO in another Go module, so EVERY field below, nested ones
+// included, carries an explicit snake_case json tag: the keys are the whole
+// contract, and TestRuntimeImageOptionsWireShape pins them. Samplers,
+// Schedulers and the output formats are opaque strings, passed through as the
+// server spells them. A numeric zero (or "") means "unknown" -- the document
+// stated no such limit or default -- and an empty list means "the server named
+// none", so the lists are omitempty; the server's own ClipSkip and Seed
+// defaults are -1 ("model default" and "random") and are carried as such.
+type RuntimeImageOptions struct {
+	Samplers      []string             `json:"samplers,omitempty"`
+	Schedulers    []string             `json:"schedulers,omitempty"`
+	OutputFormats []string             `json:"output_formats,omitempty"`
+	Limits        RuntimeImageLimits   `json:"limits"`
+	Defaults      RuntimeImageDefaults `json:"defaults"`
+}
+
+// RuntimeImageLimits are the size and batch bounds the server states. 0 = unknown.
+type RuntimeImageLimits struct {
+	MinWidth      int `json:"min_width"`
+	MaxWidth      int `json:"max_width"`
+	MinHeight     int `json:"min_height"`
+	MaxHeight     int `json:"max_height"`
+	MaxBatchCount int `json:"max_batch_count"`
+}
+
+// RuntimeImageDefaults are the values the server applies when a request names
+// none. 0 (or "") = unknown.
+type RuntimeImageDefaults struct {
+	Sampler        string  `json:"sampler"`
+	Scheduler      string  `json:"scheduler"`
+	OutputFormat   string  `json:"output_format"`
+	NegativePrompt string  `json:"negative_prompt"`
+	Steps          int     `json:"steps"`
+	ClipSkip       int     `json:"clip_skip"`
+	Seed           int     `json:"seed"`
+	Width          int     `json:"width"`
+	Height         int     `json:"height"`
+	CFG            float64 `json:"cfg"`
 }
 
 // Capabilities is one managed child's auto-detected capability set (#49-2).
