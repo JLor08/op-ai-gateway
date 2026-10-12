@@ -36,9 +36,12 @@ import {
   MAX_IMAGES,
   byNewest,
   clearLegacyKeys,
+  DEFAULT_IMAGE_SETTINGS,
   deriveTitle,
   deriveTitleFromMessages,
   historyHasImage,
+  imageSetting,
+  imageSettingsFrom,
   lsGet,
   lsSet,
   nextId,
@@ -47,6 +50,7 @@ import {
   resolveTokenOverride,
   summaryOf,
   type ChatUiMessage,
+  type ImageSettings,
 } from './chatDoc';
 import { useChatRuns } from './useChatRuns';
 import { useChatPersistence } from './useChatPersistence';
@@ -55,6 +59,17 @@ import { useChatPersistence } from './useChatPersistence';
 // working unchanged after the FA-2 extraction into chatDoc.ts.
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { ChatUiMessage };
+
+// The image-settings presets the composer (Chat.tsx, OUTSIDE components/chat/)
+// renders. Re-exported through this file because the chat module's only public
+// surface is ChatStore.tsx / ChatSidebar.tsx -- Chat.tsx must not reach into
+// chatDoc.ts directly (arch.test.ts enforces this).
+export {
+  IMAGE_LOSSY_FORMATS,
+  IMAGE_N_MAX,
+  IMAGE_OUTPUT_FORMATS,
+  IMAGE_SIZE_OPTIONS,
+} from './chatDoc';
 
 export type ChatStore = {
   messages: ChatUiMessage[];
@@ -128,6 +143,12 @@ export type ChatStore = {
   // modelImageCapable — a text thread stays a text thread even if the user
   // later picks an image model.
   chatKind: string;
+  // The image-generation knobs of the active thread (size / n / output_format /
+  // output_compression), as concrete store state. The settings panel edits them
+  // when chatKind === "image"; they are omitted from the wire and persistence
+  // for a text thread (see imageSetting in chatDoc.ts).
+  imageSettings: ImageSettings;
+  setImageSettings: Dispatch<SetStateAction<ImageSettings>>;
   // The active chat's LIVE RUN's own reported kind ("" text | "image"),
   // read from useChatRuns' kindOf -- deliberately NOT chatKind above.
   // chatKind is the client's own "is this thread's first send" guess
@@ -261,6 +282,10 @@ export function ChatStoreProvider({
   const [systemPrompt, setSystemPrompt] = useState<string>(DEFAULTS.system_prompt);
   const [temperature, setTemperature] = useState<number>(DEFAULTS.temperature);
   const [maxTokens, setMaxTokens] = useState<number>(DEFAULTS.max_tokens);
+  // The active image thread's generation knobs (concrete, see ImageSettings).
+  // Seeded from the loaded document in activateChat, sent on run via
+  // currentSettings, persisted via buildDoc -- all gated on chatKind "image".
+  const [imageSettings, setImageSettings] = useState<ImageSettings>(DEFAULT_IMAGE_SETTINGS);
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
@@ -423,6 +448,7 @@ export function ChatStoreProvider({
   const systemPromptRef = useRef(systemPrompt);
   const temperatureRef = useRef(temperature);
   const maxTokensRef = useRef(maxTokens);
+  const imageSettingsRef = useRef(imageSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
   const serverOverrideForceUnreachableRef = useRef(serverOverrideForceUnreachable);
@@ -535,6 +561,7 @@ export function ChatStoreProvider({
       systemPromptRef,
       temperatureRef,
       maxTokensRef,
+      imageSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -551,6 +578,7 @@ export function ChatStoreProvider({
       systemPrompt,
       temperature,
       maxTokens,
+      imageSettings,
       selectedTokenId,
       serverOverride,
       serverOverrideForceUnreachable,
@@ -588,6 +616,7 @@ export function ChatStoreProvider({
     systemPromptRef.current = systemPrompt;
     temperatureRef.current = temperature;
     maxTokensRef.current = maxTokens;
+    imageSettingsRef.current = imageSettings;
     selectedTokenIdRef.current = selectedTokenId;
     serverOverrideRef.current = serverOverride;
     serverOverrideForceUnreachableRef.current = serverOverrideForceUnreachable;
@@ -626,6 +655,12 @@ export function ChatStoreProvider({
       // default here and is then written over the stored value by the next
       // debounced save, because the PUT full-replaces the content blob.
       setPinnedChatKind(doc.settings.kind ?? '');
+      // The image knobs, seeded like every other setting: a thread activateChat
+      // does not seed reverts to defaults and is written over the stored value
+      // by the next save (the PUT full-replaces the blob). normalizeDoc kept the
+      // persisted `image` only for an image thread, so a text thread seeds
+      // defaults harmlessly.
+      setImageSettings(imageSettingsFrom(doc.settings.image));
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually
@@ -681,6 +716,9 @@ export function ChatStoreProvider({
       // send the backend ignores it and forces the stored one, so sending the
       // thread's own kind is both correct and a no-op there.
       kind: chatKindRef.current,
+      // The image knobs, present only on an image thread (imageSetting keys off
+      // the kind). The backend forwards the set fields to the images endpoint.
+      ...imageSetting(chatKindRef.current, imageSettingsRef.current),
     }),
     [],
   );
@@ -1353,6 +1391,8 @@ export function ChatStoreProvider({
     modelVisionCapable,
     modelImageCapable,
     chatKind,
+    imageSettings,
+    setImageSettings,
     runKind,
     runElapsedMs,
     imageCapacityLeft,

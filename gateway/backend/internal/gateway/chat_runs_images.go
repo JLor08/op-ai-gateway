@@ -271,15 +271,19 @@ func upstreamErrorCode(body []byte, status string) string {
 	return "upstream status " + status
 }
 
-// buildImagesBody is the images endpoint's own request shape.
+// buildImagesBody is the images endpoint's own request shape: the three fields
+// the relay always needs, plus whatever image settings the thread carries.
 //
-// Three fields, and no more. response_format is stated EXPLICITLY although
-// validateImagesRequest also accepts its absence: it is the contract this
-// executor depends on (the relay can only consume b64_json), and an inherited
-// default states nothing. n, size, temperature and max_tokens are absent
-// because /v1/images/generations uses none of them and n is not exposed by
-// this feature at all -- sending a parameter the endpoint ignores would be an
-// enabled-but-inert control.
+// model and prompt are the run's own. response_format is stated EXPLICITLY
+// although validateImagesRequest also accepts its absence: it is the contract
+// this executor depends on (the relay can only consume b64_json), and an
+// inherited default states nothing. The remaining fields come from the thread's
+// ChatImageSettings and only the SET ones are added -- an unset knob is omitted
+// so sd-server stays on its own default rather than being handed an inert zero.
+// The gateway's /v1/images/generations handler passes every field except
+// response_format and stream through to the upstream unexamined (see
+// validateImagesRequest), so these reach sd-server as sent; it honors size, n,
+// output_format and output_compression and ignores the rest.
 //
 // A history with no user text yields an empty prompt, which is NOT rejected
 // here: validateImagesRequest owns "a prompt is required" and answers
@@ -287,11 +291,26 @@ func upstreamErrorCode(body []byte, status string) string {
 // would be free to drift from the endpoint's. The refusal reaches the run
 // through upstreamErrorCode above.
 func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
-	return json.Marshal(map[string]any{
+	body := map[string]any{
 		"model":           prep.Settings.Model,
 		"prompt":          lastUserPrompt(prep.History),
 		"response_format": "b64_json",
-	})
+	}
+	if img := prep.Settings.Image; img != nil {
+		if img.Size != "" {
+			body["size"] = img.Size
+		}
+		if img.N > 0 {
+			body["n"] = img.N
+		}
+		if img.OutputFormat != "" {
+			body["output_format"] = img.OutputFormat
+		}
+		if img.OutputCompression != nil {
+			body["output_compression"] = *img.OutputCompression
+		}
+	}
+	return json.Marshal(body)
 }
 
 // lastUserPrompt is the text of the LAST user message in the prepared history

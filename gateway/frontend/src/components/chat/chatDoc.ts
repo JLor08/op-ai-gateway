@@ -8,7 +8,14 @@
 // stateful run/persistence/CRUD logic. Behavior is unchanged; this is a pure
 // relocation.
 
-import type { Chat, ChatRunStatus, ChatSettings, ChatSummary, PortalToken } from '../../api';
+import type {
+  Chat,
+  ChatImageSettings,
+  ChatRunStatus,
+  ChatSettings,
+  ChatSummary,
+  PortalToken,
+} from '../../api';
 import type { ChatContent } from '../shared/chatContent';
 
 // The persisted status of an assistant turn (mirrors the backend transcript
@@ -121,6 +128,48 @@ export const DEFAULTS: ChatSettings = {
 // Type/size validation lives in ../shared/imageAttach.
 export const MAX_IMAGES = 5;
 
+// The image-generation knobs the composer edits, as CONCRETE store state (every
+// field defined, unlike the all-optional wire ChatImageSettings). An unset knob
+// is the sentinel that imageSetting() below omits from the wire: "" for
+// size/output_format ("leave sd-server's default"). Only the fields sd-server's
+// OpenAI /v1/images/generations endpoint honors are here.
+export type ImageSettings = {
+  size: string; // "" = the model's own default
+  n: number; // 1..IMAGE_N_MAX
+  output_format: string; // "" = default (png) | "png" | "jpeg" | "webp"
+  output_compression: number; // 0..100, only sent (and shown) for a lossy format
+};
+
+export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
+  size: '',
+  n: 1,
+  output_format: '',
+  output_compression: 100,
+};
+
+// sd-server's batch_count ceiling for one request (its capabilities `limits`
+// report max_batch_count: 8). Enforced by the composer; the gateway passes n
+// through and sd-server clamps anyway.
+export const IMAGE_N_MAX = 8;
+
+// The size presets the composer offers. "" is "model default" (no size sent, so
+// sd-server uses the loaded model's own). sd-server reads a free "WxH" string,
+// so this list is a convenience, not a hard set.
+export const IMAGE_SIZE_OPTIONS = [
+  '',
+  '512x512',
+  '768x768',
+  '1024x1024',
+  '1024x1792',
+  '1792x1024',
+] as const;
+
+// The output formats the generations endpoint accepts (png|jpeg|webp; webp only
+// when the sd-server build has WebP support). "" leaves the default (png).
+// output_compression (0..100) applies only to the two lossy formats.
+export const IMAGE_OUTPUT_FORMATS = ['', 'png', 'jpeg', 'webp'] as const;
+export const IMAGE_LOSSY_FORMATS = ['jpeg', 'webp'];
+
 // All localStorage access is guarded: some environments (incl. the jsdom test
 // build) do not expose window.localStorage, and private-mode browsers can throw.
 export function lsGet(key: string): string | null {
@@ -161,6 +210,50 @@ export function kindSetting(kind: string | undefined): { kind?: string } {
   return kind ? { kind } : {};
 }
 
+// The `image` entry of a settings object, as a SPREADABLE fragment, mirroring
+// kindSetting: present ONLY on an "image" thread, and carrying only the knobs
+// the user moved off the default — so a text thread stays byte-identical and an
+// untouched knob leaves sd-server on its own default. output_compression applies
+// only to a lossy output_format (sd-server ignores it for png, where its control
+// is hidden anyway), and like the others it is sent only when moved off the
+// upstream default. Both the document writer (buildDoc) and the state seeder
+// (normalizeDoc) go through this, so neither can give the key to a text thread
+// from the client side.
+export function imageSetting(
+  kind: string | undefined,
+  s: ImageSettings,
+): { image?: ChatImageSettings } {
+  if (kind !== 'image') return {};
+  const image: ChatImageSettings = {};
+  if (s.size) image.size = s.size;
+  if (s.n > 0) image.n = s.n;
+  if (s.output_format) image.output_format = s.output_format;
+  if (
+    IMAGE_LOSSY_FORMATS.includes(s.output_format) &&
+    s.output_compression !== DEFAULT_IMAGE_SETTINGS.output_compression
+  ) {
+    image.output_compression = s.output_compression;
+  }
+  return { image };
+}
+
+// Coerce a persisted (all-optional) ChatImageSettings into the concrete store
+// state, filling anything missing/mistyped from the defaults. The inverse of
+// imageSetting, used to seed the composer when a chat is loaded.
+export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSettings {
+  const s = image ?? {};
+  return {
+    size: typeof s.size === 'string' ? s.size : DEFAULT_IMAGE_SETTINGS.size,
+    n: typeof s.n === 'number' && Number.isFinite(s.n) ? s.n : DEFAULT_IMAGE_SETTINGS.n,
+    output_format:
+      typeof s.output_format === 'string' ? s.output_format : DEFAULT_IMAGE_SETTINGS.output_format,
+    output_compression:
+      typeof s.output_compression === 'number' && Number.isFinite(s.output_compression)
+        ? s.output_compression
+        : DEFAULT_IMAGE_SETTINGS.output_compression,
+  };
+}
+
 // Coerce an opaque `content` blob into a well-formed active-chat document,
 // applying sane defaults for anything missing/mistyped.
 export function normalizeDoc(content: unknown): ActiveChatDoc {
@@ -196,6 +289,15 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       // kinds this build knows) for exactly the same reason, and spread
       // through kindSetting so an absent/empty one stays absent.
       ...kindSetting(typeof s.kind === 'string' ? s.kind : DEFAULTS.kind),
+      // The image knobs, round-tripped for an image thread for the same reason
+      // as kind: buildDoc rebuilds `settings` from the state this seeds, and the
+      // PUT full-replaces the blob with no merge, so a knob dropped here is one
+      // the next autosave erases. imageSetting keys off the kind, so a text
+      // thread stays byte-identical (no image key).
+      ...imageSetting(
+        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
+        imageSettingsFrom(s.image),
+      ),
     },
     messages,
   };
