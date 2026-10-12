@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"op-ai-gateway/internal/provider"
 	"sync"
 	"time"
 )
@@ -41,7 +42,8 @@ type RuntimeGPUStatusDTO struct {
 
 // RuntimeStatusDTO is one agent-managed model process's live state, as
 // published to live SSE subscribers (mirrors agentRuntimeSample's json tags
-// for every field it carries).
+// for every field it carries, except ImageOptions, which is in-process only --
+// see that field).
 type RuntimeStatusDTO struct {
 	SpecID         string    `json:"spec_id"`
 	Model          string    `json:"model"`
@@ -93,6 +95,29 @@ type RuntimeStatusDTO struct {
 	GPUs       []RuntimeGPUStatusDTO `json:"gpus,omitempty"`
 	MeasuredAt time.Time             `json:"measured_at,omitzero"`
 	LastError  *RuntimeErrorDTO      `json:"last_error,omitempty"`
+	// ImageOptions is the image-generation options this stable_diffusion_cpp
+	// child's capability document states (sampler/scheduler names, output
+	// formats, size and batch limits, the server's own defaults), as the agent
+	// reported them on THIS frame (agentRuntimeSample.ImageOptions, converted).
+	// Nil for every runtime that has none to report -- not an sd-server, an
+	// agent that predates the field, or a document not yet read -- which is
+	// distinct from a non-nil zero value ("read, states no options"); each
+	// frame is a full snapshot, so a later frame without them replaces an
+	// earlier one with them.
+	//
+	// It is an IN-PROCESS hand-off, tagged `json:"-"` and so absent from the
+	// status SSE frame: the portal's model-image-options handler reads it from
+	// the registry (statusSnapshot) next to where it is published. The status
+	// frame is a full snapshot re-sent to every subscriber on each publish, and
+	// provider.SdcppImageOptions has untagged nested fields that would
+	// otherwise put Go-cased keys on a wire nobody specified. Read-only: the slices are shared with the
+	// published snapshot, so a reader that needs to change them clones first
+	// (cloneSdcppImageOptions).
+	//
+	// It is not a capability verdict and never takes the capability-row path
+	// (writeBackRuntimeCapabilities): the durable image verdict is written
+	// exactly as before, from Capabilities.
+	ImageOptions *provider.SdcppImageOptions `json:"-"`
 }
 
 // agentFeaturesRegistry records, per server, the feature-name set the
