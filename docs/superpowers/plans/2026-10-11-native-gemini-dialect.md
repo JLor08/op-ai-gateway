@@ -1345,7 +1345,7 @@ covers every preset vendor. The shim google account is unchanged."
 - Create: `gateway/backend/internal/provider/gemini.go`
 - Test: `gateway/backend/internal/provider/gemini_test.go`
 - Modify: `gateway/backend/cmd/gateway/main.go` (`providerClients` map entry)
-- Modify: `gateway/backend/cmd/gateway/main_test.go` (`TestProviderClientsWireVendorProviderKinds` row)
+- Modify: `gateway/backend/cmd/gateway/main_test.go` (new focused `TestProviderClientsWireGemini` — not a row in the anthropic-version-shaped table)
 - Modify: `gateway/backend/internal/archtest/arch_test.go` (add `internal/geminiwire` to `allowedDeps["internal/provider"]` — `gemini.go` is the first provider file to import it)
 
 **Interfaces:**
@@ -1392,7 +1392,7 @@ func TestGeminiCompletePathAuthAndParse(t *testing.T) {
 	ctx := WithUpstreamAuthHeaders(context.Background(), "x-goog-api-key", "secret-key", nil)
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro", Timeout: 5 * time.Second}
-	resp, err := c.Complete(ctx, tgt, inference.Request{Messages: []inference.Message{textMessage("hi")}})
+	resp, err := c.Complete(ctx, tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("hi")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1416,7 +1416,7 @@ func TestGeminiCompleteStripsModelsPrefixAndEscapes(t *testing.T) {
 	defer srv.Close()
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "models/gemini-2.5-pro"}
-	if _, err := c.Complete(context.Background(), tgt, inference.Request{Messages: []inference.Message{textMessage("x")}}); err != nil {
+	if _, err := c.Complete(context.Background(), tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("x")}}); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/v1beta/models/gemini-2.5-pro:generateContent" {
@@ -1432,7 +1432,7 @@ func TestGeminiComplete400SurfacesSnippet(t *testing.T) {
 	defer srv.Close()
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro"}
-	_, err := c.Complete(context.Background(), tgt, inference.Request{Messages: []inference.Message{textMessage("x")}})
+	_, err := c.Complete(context.Background(), tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("x")}})
 	if err == nil || !strings.Contains(err.Error(), "Invalid thinkingConfig") {
 		t.Fatalf("err = %v, want snippet", err)
 	}
@@ -1453,7 +1453,7 @@ func TestGeminiCompleteStreamSSE(t *testing.T) {
 	defer srv.Close()
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro"}
-	text, events := collectGeminiStream(t, c, tgt, inference.Request{Messages: []inference.Message{textMessage("hi")}})
+	text, events := collectGeminiStream(t, c, tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("hi")}})
 	if text != "Hello" {
 		t.Fatalf("text = %q", text)
 	}
@@ -1474,7 +1474,7 @@ func TestGeminiCompleteStreamEndsEarly(t *testing.T) {
 	defer srv.Close()
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro"}
-	err := c.CompleteStream(context.Background(), tgt, inference.Request{Messages: []inference.Message{textMessage("hi")}}, func(inference.StreamEvent) error { return nil })
+	err := c.CompleteStream(context.Background(), tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("hi")}}, func(inference.StreamEvent) error { return nil })
 	if err == nil {
 		t.Fatal("want ErrUnavailable on a stream that ends without finishReason")
 	}
@@ -1518,7 +1518,7 @@ func TestGeminiTranslateDoesNotFollowRedirect(t *testing.T) {
 	ctx := WithUpstreamAuthHeaders(context.Background(), "x-goog-api-key", "secret", nil)
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL, ProviderModel: "gemini-2.5-pro"}
-	_, err := c.Complete(ctx, tgt, inference.Request{Messages: []inference.Message{textMessage("hi")}})
+	_, err := c.Complete(ctx, tgt, inference.Request{Messages: []inference.Message{geminiTextMessage("hi")}})
 	if err == nil {
 		t.Fatal("want a non-2xx (the 307 relayed as the answer), not a followed redirect")
 	}
@@ -1528,7 +1528,13 @@ func TestGeminiTranslateDoesNotFollowRedirect(t *testing.T) {
 }
 ```
 
-Add a `collectGeminiStream` helper in the test file (mirror `collectStream` in `anthropic_messages_test.go`) that runs `CompleteStream`, concatenates `StreamEventTextDelta` `Text`, and returns the concatenated text plus the full event slice. Add the missing imports (`io`). Reuse the existing `textMessage` helper if the package test files already define one; otherwise add a local one.
+Add a `collectGeminiStream` helper in the test file (mirror `collectStream` in `anthropic_messages_test.go`) that runs `CompleteStream`, concatenates `StreamEventTextDelta` `Text`, and returns the concatenated text plus the full event slice. Add the missing imports (`io`). There is **no** shared `textMessage` helper in the `internal/provider` tests, and `collectStream` is typed to `*AnthropicClient` (not reusable), so define a local helper in `gemini_test.go` (the tests above already call it):
+
+```go
+func geminiTextMessage(text string) inference.Message {
+	return inference.Message{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: text}}}
+}
+```
 
 > Confirm `WithUpstreamAuthHeaders`, `textMessage`, `inference.StreamEventCompleted`/`StreamEventTextDelta`, and `StreamEvent.Usage` being a `*inference.Usage` against the existing provider tests and `internal/inference/types.go`.
 
@@ -1696,6 +1702,13 @@ func (c *GeminiClient) CompleteStream(ctx context.Context, target routing.Target
 	if !done {
 		return fmt.Errorf("%w: stream ended before a finish reason", ErrUnavailable)
 	}
+	// geminiwire.ParseStreamChunk maps finishReason per chunk: a functionCall can
+	// arrive on an earlier chunk while the terminal chunk reports STOP, which maps
+	// to "stop". Upgrade a final "stop" to "tool_calls" when any tool call was
+	// buffered, so the completion reflects the whole stream.
+	if len(toolCalls) > 0 && finish == "stop" {
+		finish = "tool_calls"
+	}
 	for _, tc := range toolCalls {
 		if err := emit(inference.StreamEvent{Type: inference.StreamEventToolCall, ToolCall: &tc}); err != nil {
 			return err
@@ -1781,7 +1794,7 @@ In `gateway/backend/cmd/gateway/main.go`, `providerClients`, add after the `Prov
 
 - [ ] **Step 5: Add the wiring test row**
 
-In `gateway/backend/cmd/gateway/main_test.go`, `TestProviderClientsWireVendorProviderKinds`, add a row asserting that `routing.ProviderVendorGemini` dispatches to a client that POSTs to a `:generateContent` path with the `x-goog-api-key` header (match the existing rows' table shape — provider kind, expected path substring, expected header).
+Add a **focused** test to `gateway/backend/cmd/gateway/main_test.go` — do NOT extend `TestProviderClientsWireVendorProviderKinds` with a row: that test's httptest handler switches on exact paths (`/v1/chat/completions`, `/v1/messages`) and captures `anthropic-version`, which does not fit Gemini's model-in-path (`/v1beta/models/<model>:generateContent`) + `x-goog-api-key`. Instead write `TestProviderClientsWireGemini` that builds the real `providerClients(0, false, nil)` multiplexer, points a `routing.Target{Provider: routing.ProviderVendorGemini, Endpoint: <httptest URL>, ProviderModel: "gemini-2.5-pro"}` at an httptest upstream returning a canned generateContent JSON, calls `mux.Complete` with `provider.WithUpstreamAuthHeaders(ctx, "x-goog-api-key", "k", nil)`, and asserts the upstream saw the `/v1beta/models/gemini-2.5-pro:generateContent` path and the `x-goog-api-key: k` header (proving the `vendor_gemini` kind is registered and routes to the native client). Confirm whether the multiplexer or `mux.Complete` is reachable from `package main`'s test — the existing test calls `providerClients(...)` and dispatches through the returned `*provider.Multiplexer`, so mirror exactly how it invokes a completion.
 
 - [ ] **Step 6: Add the `provider → geminiwire` archtest edge**
 
@@ -1831,11 +1844,11 @@ edge in the architecture test."
 **Interfaces:**
 - Consumes: `routing.VendorGoogleNative`, `IsNativeGeminiVendor`, `IsPresetVendor`, the `VendorGoogleNative` preset (Task 4).
 - Produces:
-  - `func DiscoverGeminiModels(ctx context.Context, httpClient *http.Client, baseURL, apiKey string) ([]vendorauth.Model, error)` — paged `GET {base}/v1beta/models?pageSize=1000`, `x-goog-api-key`, keep entries whose `supportedGenerationMethods` contains `generateContent`, strip `models/` from the id.
-  - `func ValidateGeminiAPIKey(ctx context.Context, httpClient *http.Client, baseURL, apiKey string) error` — `x-goog-api-key` GET to `{base}/v1beta/models`, uniform classification.
+  - `func DiscoverGeminiModels(ctx context.Context, httpClient *http.Client, modelsURL, apiKey string) ([]vendorauth.DiscoveredModel, vendorauth.DiscoveryStatus)` — mirrors `DiscoverOpenAICompatibleModels`'s shape. Paged `GET {modelsURL}?pageSize=1000` (append `&pageToken=` to follow `nextPageToken`, bounded page cap), header `x-goog-api-key`, keep entries whose `supportedGenerationMethods` contains `generateContent`, strip `models/` from the slug. Return `DiscoveryOK` with a usable non-empty list (via `discoveryResult`), else `DiscoveryUnverifiable`.
+  - `func ValidateGeminiAPIKey(ctx context.Context, httpClient *http.Client, probeURL, apiKey string) vendorauth.CredentialCheck` — mirrors `ValidateOpenAICompatibleAPIKey`; `x-goog-api-key` GET to `probeURL` (the `{base}/v1beta/models` listing) via `runProbe` (2xx → `StatusValid`; 401 → `StatusInvalid`; unreachable/other → `StatusUnverifiable`). VERIFY-LIVE: a bad native key may answer 400 or 401 — either lands as not-StatusValid, which is acceptable.
   - A `google_native` account: `CreateVendorAccount` forces `api_key`, normalizes the base URL, discovers on create; `vendorAPIFlavor` returns the right dialect.
 
-> Match `DiscoverGeminiModels`'s return type and the `Model` shape to what the existing `vendorauth` discoverers return, and the portal seam (`discoverAPIKeyModels` dispatch + any discoverer struct fields) to how the OpenAI-compatible native path is wired in `service_vendor_discovery.go`. Read those two files before writing; the exact field/type names there are authoritative.
+> Verified vendorauth types (authoritative; test is `package vendorauth` so use bare names): `DiscoveredModel{Slug, DisplayName string}` (there is NO `ID`/`Model` type — it's `Slug`); `DiscoveryStatus` with `DiscoveryOK = iota + 1` and `DiscoveryUnverifiable`; `CredentialCheck{Status CredentialStatus, Detail string, ...}` with `CredentialStatus` values `StatusValid = iota + 1`, `StatusInvalid`, `StatusUnverifiable`. Reusable internals in the package: `fetchModelList(ctx, httpClient, modelListSpec{url, headers}) ([]byte, bool)`, `discoveryResult([]DiscoveredModel) ([]DiscoveredModel, DiscoveryStatus)`, `runProbe(ctx, httpClient, probeSpec{url, headers, secret}) (CredentialCheck, []byte)`. The native listing shape is `{"models":[{"name":"models/…","displayName":…,"supportedGenerationMethods":[…]}],"nextPageToken":…}` — write a small custom parser (the shared `parseDataModels` only decodes `{"data":[…]}`). Mirror `DiscoverOpenAICompatibleModels`/`ValidateOpenAICompatibleAPIKey` in `openai_compatible.go` but send the credential via the `x-goog-api-key` header instead of `Authorization: Bearer`.
 
 - [ ] **Step 1: Write the failing vendorauth tests**
 
@@ -1870,16 +1883,16 @@ func TestDiscoverGeminiModelsPagesFiltersStrips(t *testing.T) {
 			{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]}]}`))
 	}))
 	defer srv.Close()
-	models, err := DiscoverGeminiModels(context.Background(), srv.Client(), srv.URL, "k")
-	if err != nil {
-		t.Fatal(err)
+	models, status := DiscoverGeminiModels(context.Background(), srv.Client(), srv.URL, "k")
+	if status != DiscoveryOK {
+		t.Fatalf("status = %v, want DiscoveryOK", status)
 	}
 	if pages != 2 {
 		t.Fatalf("pages = %d, want 2 (followed nextPageToken)", pages)
 	}
 	ids := map[string]bool{}
 	for _, m := range models {
-		ids[m.ID] = true // adapt .ID to the real Model field name
+		ids[m.Slug] = true
 	}
 	if !ids["gemini-2.5-pro"] || !ids["gemini-2.5-flash"] || ids["embedding-001"] {
 		t.Fatalf("models = %+v (want generateContent-only, models/ stripped)", models)
@@ -1895,8 +1908,8 @@ func TestValidateGeminiAPIKeyOK(t *testing.T) {
 		_, _ = w.Write([]byte(`{"models":[]}`))
 	}))
 	defer srv.Close()
-	if err := ValidateGeminiAPIKey(context.Background(), srv.Client(), srv.URL, "k"); err != nil {
-		t.Fatal(err)
+	if check := ValidateGeminiAPIKey(context.Background(), srv.Client(), srv.URL, "k"); check.Status != StatusValid {
+		t.Fatalf("status = %v (%s), want StatusValid", check.Status, check.Detail)
 	}
 }
 ```
@@ -1908,14 +1921,14 @@ Expected: FAIL — functions undefined.
 
 - [ ] **Step 3: Implement `DiscoverGeminiModels` + `ValidateGeminiAPIKey`**
 
-Write `gateway/backend/internal/vendorauth/gemini.go` following the existing `openai_compatible.go` structure (bounded response reads via `io.LimitReader`, the same `Model` return type, the same error-classification helper the other validators use). The native listing shape is `{"models":[{"name":"models/…","displayName":…,"supportedGenerationMethods":[…]}],"nextPageToken":…}`; request `{base}/v1beta/models?pageSize=1000`, follow `nextPageToken` with a bounded page cap (e.g. 20), keep only entries whose methods contain `generateContent`, strip a leading `models/` from the id (and from the display name when it equals the id). Use `x-goog-api-key` for both functions. Classify validation uniformly: 2xx → ok; non-2xx or transport error → the package's "unverifiable"/invalid error (VERIFY-LIVE: a bad native key may be 401 rather than 400 — still unverifiable under the uniform rule).
+Write `gateway/backend/internal/vendorauth/gemini.go` following the existing `openai_compatible.go` structure (bounded response reads; discovery returns `([]DiscoveredModel, DiscoveryStatus)` built via `discoveryResult`, validation returns `CredentialCheck` via `runProbe`; reuse `fetchModelList` for the GET). The native listing shape is `{"models":[{"name":"models/…","displayName":…,"supportedGenerationMethods":[…]}],"nextPageToken":…}`; request `{base}/v1beta/models?pageSize=1000`, follow `nextPageToken` with a bounded page cap (e.g. 20), keep only entries whose methods contain `generateContent`, strip a leading `models/` from the id (and from the display name when it equals the id). Use `x-goog-api-key` for both functions. Classify validation uniformly: 2xx → ok; non-2xx or transport error → the package's "unverifiable"/invalid error (VERIFY-LIVE: a bad native key may be 401 rather than 400 — still unverifiable under the uniform rule).
 
 - [ ] **Step 4: Wire the portal native branches**
 
 - `service_vendor_discovery.go`: add a seam field for the native api-key path (mirror the OpenAI-compatible one) and, in `discoverAPIKeyModels`, branch on `IsNativeGeminiVendor(vendor)` **before** the OpenAI-compatible branch, calling `DiscoverGeminiModels` with the account base URL (default from the preset) and key. Keep applying the preset `StripModelsPrefix` to Slug/DisplayName.
 - `service_vendor_validation.go`: branch on `IsNativeGeminiVendor` before the OpenAI-compatible branch, calling `ValidateGeminiAPIKey`.
-- `service_vendor_accounts.go`: add `routing.VendorGoogleNative` to the `normalizeVendorAccountVendor` allowed-id switch; ensure `CreateVendorAccount`'s force-api-key + base-URL-normalize + discover-on-create path keys off `IsPresetVendor` (so it covers native too — confirm whether it already calls `IsOpenAICompatibleVendor` and switch that call to `IsPresetVendor`).
-- `vendor_catalog.go`: in `vendorAPIFlavor`, return the correct result for a native vendor (it must not fall through the `IsOpenAICompatibleVendor`→openai mapping; a native Gemini account serves `[openai, anthropic]` like the other preset accounts — match `service_vendor_listing.go:vendorAccountServedFlavors`).
+- `service_vendor_accounts.go`: add `routing.VendorGoogleNative` to the `normalizeVendorAccountVendor` allowed-id switch; and change the TWO `routing.IsOpenAICompatibleVendor(vendor)` guards in `CreateVendorAccount` (the force-api_key + base-URL-normalize path, and the discover-after-connect path) to `routing.IsPresetVendor(vendor)`, so a native account is also forced api_key and discovered on create.
+- `vendor_catalog.go`: in `vendorAPIFlavor`, change the `if routing.IsOpenAICompatibleVendor(vendor)` guard to `routing.IsPresetVendor(vendor)` so a native Gemini account also maps to `APIFlavorOpenAI` (it serves `[openai, anthropic]` like the other preset accounts). After the predicate split `IsOpenAICompatibleVendor` returns false for native, which would otherwise fall through to `("", false)` and break the catalog — matching `service_vendor_listing.go:vendorAccountServedFlavors`.
 
 - [ ] **Step 5: Add/extend portal tests**
 
