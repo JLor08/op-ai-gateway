@@ -154,7 +154,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // ".." (400, on create and update; the portal validates the same shape before
   // it sends, so this is the backstop for a stale build).
   'vendor_account.model_prefix_invalid': 'errorVendorAccountModelPrefixInvalid',
-  // An OpenAI-compatible account's base URL (400, on create only -- it is
+  // A configurable-root account's base URL (400, on create only -- it is
   // immutable): missing for a Custom account, or not an https URL without
   // credentials, query and fragment (the portal validates the same shape before
   // it sends, so `invalid` is the backstop for a stale build).

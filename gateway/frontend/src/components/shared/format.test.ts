@@ -494,7 +494,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * the models refresh for a stored credential that cannot be opened (a lost key, a
    * corrupt blob). `model_prefix_invalid` is the 400 of create and update for a
    * malformed model prefix, `base_url_required` / `base_url_invalid` the 400s of
-   * create for an OpenAI-compatible account's missing (Custom) or malformed base URL, `refresh_failed` the models refresh's 500 fallback and
+   * create for a configurable-root account's missing (Custom) or malformed base URL, `refresh_failed` the models refresh's 500 fallback and
    * `usage_refresh_failed` the usage refresh's, both mapped for the same reason as
    * `check_failed`. The five CRUD 500
    * `vendor_account.*_failed` fallbacks (list/create/get/update/delete) are left

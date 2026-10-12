@@ -104,7 +104,7 @@ export type VendorAccount = {
   // serves is listed and requested as model_prefix + the vendor's model id.
   // Valid shape: at most 64 characters of [A-Za-z0-9._~:/@+-], no "..".
   model_prefix: string;
-  // The upstream root URL of an OpenAI-compatible account (a preset's default
+  // The upstream root URL of a configurable-root account (a preset's default
   // root, or the one the user typed); "" for openai and anthropic, whose hosts
   // are fixed. Always on the wire. IMMUTABLE: fixed at creation and never sent
   // on an update.
@@ -127,8 +127,8 @@ export type VendorAccount = {
 // account -- the backend rejects one on a subscription account with
 // vendor_account.api_key_not_allowed. model_prefix is optional (omitted = none);
 // a malformed one is a 400 vendor_account.model_prefix_invalid. base_url is the
-// root URL of an OpenAI-compatible account (xai, openrouter, kilo, google,
-// openai_compatible): omitted = the preset's default root, required for
+// root URL of a configurable-root account (xai, openrouter, kilo, google,
+// google_native, openai_compatible): omitted = the preset's default root, required for
 // openai_compatible (400 vendor_account.base_url_required), and a non-https URL
 // or one carrying credentials, a query or a fragment is a 400
 // vendor_account.base_url_invalid. The backend ignores it for openai and

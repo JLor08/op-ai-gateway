@@ -3903,7 +3903,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
-  describe(`VendorAccountsView OpenAI-compatible providers [${locale}]`, () => {
+  describe(`VendorAccountsView configurable-root providers [${locale}]`, () => {
     async function openCreate() {
       fireEvent.click(await screen.findByRole('button', { name: t.vendorAccountCreate }));
       await screen.findByLabelText(t.vendorAccountApiKeyLabel);
