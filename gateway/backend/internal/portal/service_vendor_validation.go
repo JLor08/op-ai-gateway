@@ -75,11 +75,12 @@ type VendorConnectionCheck struct {
 // bounded client. The vendorauth.Validate* functions have exactly this shape.
 type VendorCredentialValidator func(ctx context.Context, httpClient *http.Client, credential string) vendorauth.CredentialCheck
 
-// VendorOpenAICompatibleValidator is the api-key probe of an OpenAI-compatible
-// provider. Unlike VendorCredentialValidator it takes the probe URL: the portal
-// composes it from the provider preset and the account's base URL, because the
-// vendorauth package knows no vendor roots. vendorauth.ValidateOpenAICompatibleAPIKey
-// has exactly this shape.
+// VendorOpenAICompatibleValidator is the api-key probe of a preset provider (an
+// OpenAI-compatible one, or native Gemini). Unlike VendorCredentialValidator it
+// takes the probe URL: the portal composes it from the provider preset and the
+// account's base URL, because the vendorauth package knows no vendor roots.
+// vendorauth.ValidateOpenAICompatibleAPIKey and vendorauth.ValidateGeminiAPIKey have
+// exactly this shape.
 type VendorOpenAICompatibleValidator func(ctx context.Context, httpClient *http.Client, probeURL, apiKey string) vendorauth.CredentialCheck
 
 // VendorCredentialValidators is the seam over the vendorauth probes: tests inject
@@ -91,8 +92,12 @@ type VendorCredentialValidators struct {
 	OpenAIAPIKey          VendorCredentialValidator
 	AnthropicAPIKey       VendorCredentialValidator
 	// OpenAICompatibleAPIKey probes the api key of every OpenAI-compatible vendor
-	// (x.ai, OpenRouter, Google, the Custom endpoint) at a preset-derived URL.
+	// (x.ai, OpenRouter, Google's OpenAI shim, the Custom endpoint) at a
+	// preset-derived URL.
 	OpenAICompatibleAPIKey VendorOpenAICompatibleValidator
+	// GeminiAPIKey probes the api key of a native Gemini account (x-goog-api-key) at
+	// its preset-derived URL.
+	GeminiAPIKey VendorOpenAICompatibleValidator
 }
 
 // withDefaults returns v with every nil probe replaced by its vendorauth function.
@@ -111,6 +116,9 @@ func (v VendorCredentialValidators) withDefaults() VendorCredentialValidators {
 	}
 	if v.OpenAICompatibleAPIKey == nil {
 		v.OpenAICompatibleAPIKey = vendorauth.ValidateOpenAICompatibleAPIKey
+	}
+	if v.GeminiAPIKey == nil {
+		v.GeminiAPIKey = vendorauth.ValidateGeminiAPIKey
 	}
 	return v
 }
@@ -167,12 +175,20 @@ func (s *Service) checkSubscriptionTokenSet(ctx context.Context, vendor string, 
 	return s.validateSubscriptionToken(ctx, vendor, ts.AccessToken)
 }
 
-// validateAPIKey runs acc's vendor's API-KEY probe. An OpenAI-compatible vendor
-// is probed per its preset (validateOpenAICompatibleAPIKey); openai and anthropic
-// keep their own fixed-URL probes.
+// validateAPIKey runs acc's vendor's API-KEY probe. A preset vendor is probed per
+// its preset (validatePresetAPIKey) with its family's probe: native Gemini first
+// (x-goog-api-key), then the OpenAI-compatible vendors (Bearer); openai and
+// anthropic keep their own fixed-URL probes.
 func (s *Service) validateAPIKey(ctx context.Context, acc routing.VendorAccount, apiKey string) vendorauth.CredentialCheck {
-	if routing.IsOpenAICompatibleVendor(acc.Vendor) {
-		return s.validateOpenAICompatibleAPIKey(ctx, acc, apiKey)
+	var presetProbe VendorOpenAICompatibleValidator
+	switch {
+	case routing.IsNativeGeminiVendor(acc.Vendor):
+		presetProbe = s.vendorValidation.validators.GeminiAPIKey
+	case routing.IsOpenAICompatibleVendor(acc.Vendor):
+		presetProbe = s.vendorValidation.validators.OpenAICompatibleAPIKey
+	}
+	if presetProbe != nil {
+		return s.validatePresetAPIKey(ctx, acc, apiKey, presetProbe)
 	}
 	var probe VendorCredentialValidator
 	switch acc.Vendor {
@@ -187,10 +203,12 @@ func (s *Service) validateAPIKey(ctx context.Context, acc routing.VendorAccount,
 	return probe(ctx, s.vendorValidation.client, apiKey)
 }
 
-// validateOpenAICompatibleAPIKey probes the api key of an OpenAI-compatible
-// account at the URL its preset prescribes (ValidateVia):
+// validatePresetAPIKey probes the api key of a preset account (an OpenAI-compatible
+// one or native Gemini) with probe, the vendor family's validator, at the URL its
+// preset prescribes (ValidateVia):
 //
-//   - "models": GET {base}{prefix}/models (x.ai, Google, Custom: listing needs a key)
+//   - "models": GET {base}{prefix}/models (x.ai, Google, Gemini, Custom: listing
+//     needs a key)
 //   - "key":    GET {base}{prefix}{ValidatePath} (OpenRouter: /models is public,
 //     /key introspects the key)
 //   - "none":   no probe at all (Kilo: public listing, no key endpoint), so the
@@ -199,7 +217,7 @@ func (s *Service) validateAPIKey(ctx context.Context, acc routing.VendorAccount,
 // The classification (2xx valid, 401 invalid, anything else unverifiable) is the
 // validator's and is the same for every preset. A provider that answers a bad key
 // with 400 (x.ai, Gemini) therefore reads "could not verify", never "invalid".
-func (s *Service) validateOpenAICompatibleAPIKey(ctx context.Context, acc routing.VendorAccount, apiKey string) vendorauth.CredentialCheck {
+func (s *Service) validatePresetAPIKey(ctx context.Context, acc routing.VendorAccount, apiKey string, probe VendorOpenAICompatibleValidator) vendorauth.CredentialCheck {
 	preset, ok := routing.VendorPresetFor(acc.Vendor)
 	if !ok {
 		return unverifiableVendorCheck("no credential check exists for this vendor")
@@ -212,10 +230,6 @@ func (s *Service) validateOpenAICompatibleAPIKey(ctx context.Context, acc routin
 		probePath = preset.ValidatePath
 	default: // "models"
 		probePath = "/models"
-	}
-	probe := s.vendorValidation.validators.OpenAICompatibleAPIKey
-	if probe == nil {
-		return unverifiableVendorCheck("no credential check exists for this vendor")
 	}
 	probeURL := strings.TrimRight(acc.BaseURL, "/") + preset.PathPrefix + probePath
 	return probe(ctx, s.vendorValidation.client, probeURL, apiKey)

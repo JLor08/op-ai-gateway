@@ -39,7 +39,8 @@ type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 // api_key account is created with its key; a subscription account is created
 // disconnected and connected from its detail view (VendorSubscriptionConnect).
 // openai and anthropic offer both; the OpenAI-compatible vendors (x.ai,
-// OpenRouter, Kilo, Gemini and Custom) are api-key only and carry a base URL.
+// OpenRouter, Kilo, Gemini, native Gemini and Custom) are api-key only and carry a
+// base URL.
 const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic', ...OPENAI_COMPATIBLE_VENDORS];
 const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
 

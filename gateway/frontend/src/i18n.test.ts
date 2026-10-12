@@ -465,6 +465,7 @@ describe('OpenAI-compatible vendor i18n keys', () => {
       'vendorOpenRouter',
       'vendorKilo',
       'vendorGoogle',
+      'vendorGoogleNative',
       'vendorOpenAICompatible',
       'vendorAccountBaseUrlLabel',
       'vendorAccountBaseUrlNote',

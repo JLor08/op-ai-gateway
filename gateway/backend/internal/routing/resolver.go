@@ -935,11 +935,12 @@ func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.
 // row. The bool reports whether a target was built: it is false only for a
 // subscription account whose vendor is unknown, which FAILS CLOSED (no target)
 // rather than defaulting to either vendor's endpoint, which would misroute its
-// sealed OAuth token. An api_key account builds a target, except an
-// OpenAI-compatible one with no stored root URL, which fails closed the same way.
+// sealed OAuth token. An api_key account builds a target, except a preset-vendor
+// one (OpenAI-compatible or native Gemini) with no stored root URL, which fails
+// closed the same way.
 func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
 	if acc.AuthType != VendorAuthSubscription {
-		if IsOpenAICompatibleVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" {
+		if IsPresetVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" {
 			// A misconfigured account (no root url) must not route to a broken
 			// "/v1/chat/completions" with no host. Create-time validation
 			// normally prevents this; fail closed so the request falls through.
@@ -970,9 +971,10 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req infer
 
 // vendorAccountTarget assembles the Target for a matched vendor account + model
 // row. Split out from resolveVendorAccount so the construction is testable on its
-// own and so the two vendor kinds (OpenAI-compatible vs native Anthropic) read as
+// own and so the three vendor kinds (OpenAI-compatible, native Anthropic, and
+// native Gemini: vendor_gemini, x-goog-api-key auth, translate-only) read as
 // one table. The provider/endpoint/auth-header triple is the only thing the
-// account's vendor decides; everything else is the same for both, with ONE
+// account's vendor decides; everything else is the same for all of them, with ONE
 // exception per vendor keyed on the FINE request flavor (fineFlavor, not the
 // coarse apiFlavor, which folds every openai_* flavor to "openai"): an OpenAI
 // account reached over openai_responses, and an Anthropic account reached over
@@ -983,13 +985,23 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 	endpoint := "https://api.openai.com"
 	tokenHeader := ""
 	pathPrefix := "" // empty => /v1 (Target.OpenAIPathPrefix)
-	if acc.Vendor == VendorAnthropic {
+	switch {
+	case acc.Vendor == VendorAnthropic:
 		provider = ProviderVendorAnthropic
 		endpoint = "https://api.anthropic.com"
 		// The native Anthropic client authenticates with x-api-key, not the
 		// Authorization: Bearer default the OpenAI-compatible client uses.
 		tokenHeader = "x-api-key"
-	} else if IsOpenAICompatibleVendor(acc.Vendor) {
+	case IsNativeGeminiVendor(acc.Vendor):
+		// Native Google Gemini: the generateContent client against the
+		// account's own root URL, authenticating with x-goog-api-key (not
+		// the Bearer default). Translate-only (both endpoint modes stay zero).
+		// Checked before the generic OpenAI-compatible case.
+		provider = ProviderVendorGemini
+		endpoint = acc.BaseURL
+		tokenHeader = "x-goog-api-key"
+		// pathPrefix stays "" — the client owns /v1beta/models/...:generateContent
+	case IsOpenAICompatibleVendor(acc.Vendor):
 		// x.ai / OpenRouter / Kilo / Google Gemini shim / custom: the shared
 		// OpenAI-compatible client against the account's own root URL, Bearer
 		// auth, translate-only (both endpoint modes stay zero below).

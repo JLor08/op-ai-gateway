@@ -3363,10 +3363,16 @@ bespoke branch per provider.
   the seam): until then these accounts report no usage, the passive header scrape
   finding none of the headers it knows. (Taken up by
   [ADR-053](#adr-053--usagecredits-for-api-key-vendor-accounts-a-per-preset-usage-strategy-over-the-existing-oauth-only-pull-path):
-  OpenRouter and Kilo now report usage; x.ai, Google and Custom still do not.)
+  OpenRouter and Kilo now report usage; x.ai, Google and Custom still do not. The
+  native `generateContent` dialect is taken up by
+  [ADR-054](#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package),
+  which supersedes this deferral: it ships as a separate `google_native` account and
+  leaves the shim `google` account described here unchanged.)
 - **(f) The owner-supplied base-URL trust model.** The root is supplied by the
   owner for `openai_compatible` (Custom), where it is required, and may be supplied
-  for any of the four named presets as an override of their pinned default root;
+  for any of the four named presets as an override of their pinned default root
+  (and, since [ADR-054](#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package),
+  for the native Gemini `google_native` preset);
   the trust model applies to every account whose owner supplies one. It must be
   **https** with a host and carry no userinfo, query, fragment or space (the key
   rides on every request, so plaintext and credential-in-URL are refused); the
@@ -3505,3 +3511,139 @@ removed cap and there is no second writer to protect).
 [§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks).
+
+## ADR-054 — Native Google Gemini dialect: its own vendor id and provider kind, selected by the preset Dialect field, over a leaf translation package
+**Context:** [ADR-052](#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)
+(e) served Gemini through Google's OpenAI-compatibility shim and deferred the native
+dialect; this decision **supersedes that deferral** (the shim account itself stays).
+The shim is a lossy surface: it carries what OpenAI's chat completions
+carry, and Gemini's own `generateContent` wire is what a Gemini-shaped client and
+Gemini-only behaviour need. Three things stood in the way of a native client. The
+neutral `inference.Request` has no slot for what Gemini function calling requires
+on a later turn: the function **name** (a `functionResponse` is keyed by name, not
+by call id) and a part's opaque **`thoughtSignature`** (Gemini 3 answers a
+function-calling turn with a 400 when it is not echoed back). The credential rides
+a different header (`x-goog-api-key`, which the capture redaction did not know), and
+the model sits in the URL path rather than the body. And the same wire will also be
+needed *inbound* (a Gemini-compatible endpoint, #204), so its translation should not
+be written twice or buried in one client.
+
+**Decision — eight choices, taken together.**
+- **(a) A distinct vendor id selects the native dialect, via a `Dialect` field on
+  the preset.** A new vendor id `google_native` (`routing.VendorGoogleNative`) is a
+  separate account kind next to the shim `google`, not a toggle on it and not a
+  global switch. `VendorPreset` gains `Dialect string` (`""` = OpenAI wire, `"gemini"`
+  = native), and the one registry predicate is split in three:
+  `IsPresetVendor` (any preset account: api-key only, a configurable root, fail-closed
+  on an empty root, discovery on create, an empty static seed), `IsOpenAICompatibleVendor`
+  (a preset whose `Dialect` is empty: the OpenAI-wire branch) and `IsNativeGeminiVendor`
+  (`Dialect == "gemini"`). The preset-account behaviour follows `IsPresetVendor`; the
+  wire follows the dialect. **No migration:** `vendor_accounts.vendor` is free text
+  with no check, so an owner keeps a shim and a native account side by side, and
+  rollback is deleting the native one.
+- **(b) A fourth vendor provider kind, `vendor_gemini`.** `routing.ProviderVendorGemini`
+  joins `vendor_openai`, `vendor_openai_subscription` and `vendor_anthropic`, and a
+  native `provider.GeminiClient` (`Client`, `StreamingClient`, `NativeProxyClient`) is
+  registered for it. The resolver tests the native dialect **before** the generic
+  OpenAI-compatible case, which is load-bearing: the generic branch would otherwise set
+  the OpenAI path prefix on a target whose client composes its own
+  `/v1beta/models/{model}:generateContent` path (`OpenAIPathPrefixFor` also answers
+  empty for a native preset, as a second guard). The target is built from the account's
+  stored root with `APITokenHeader = x-goog-api-key`, `APIFlavors = [openai, anthropic]`
+  and both endpoint modes zero, the same served-flavor shape as every other api-key
+  vendor, so the listing overlay and dispatch agree.
+- **(c) `x-goog-api-key` auth, no redirects, and a redacted capture.** The client
+  sends the key only in the `x-goog-api-key` header, never the `?key=` query parameter
+  (a credential in the URL reaches logs), with the model path-escaped in the URL and
+  the streaming action (`:streamGenerateContent?alt=sse`) in the URL, not the body. It
+  uses a no-redirect HTTP client on every path: `net/http` strips `Authorization`, but
+  not a custom credential header, when it follows a redirect off the host, and the root
+  is owner-supplied (ADR-052 (f)). A non-2xx answer surfaces a bounded body snippet, so
+  a 400 `INVALID_ARGUMENT` explains itself. `x-goog-api-key` joins the gateway's
+  capture-redaction allowlist, because the provider's capture sink records the
+  **outbound** request headers and an unlisted credential header would be stored in
+  clear when payload capture is on.
+- **(d) `internal/geminiwire` is the shared, leaf translation home.** The Gemini wire
+  structs and the neutral-to-Gemini and Gemini-to-neutral converters live in their own
+  package, which imports **only** `internal/inference` (an architecture-test edge, with
+  a forbidden-edge test that pins it, like `compat`). `provider` imports it, so it
+  cannot return a `provider.Response` and returns a package-local `Result` that the
+  client copies. The outbound halves are built now (`RenderRequest`, `ParseResponse`,
+  `ParseStreamChunk`); the inbound halves (`ParseRequest`, `RenderResponse`,
+  `RenderStreamChunk`) are reserved for #204, so both directions end up in one
+  package and can be round-trip tested. `RenderRequest` is total (it returns no error:
+  malformed tool arguments become `{}`, unsupported media is dropped), so the only
+  encode error is the client's `json.Marshal`.
+- **(e) The function name and `thoughtSignature` ride in the neutral tool-call id.**
+  Every dialect echoes a tool-call id verbatim (`tool_call_id`, `call_id`,
+  `tool_use_id`), so the parser folds the function name and the part's
+  `thoughtSignature` into `ToolCall.ID` as `gcw1:` plus the base64url of a small JSON
+  object, and the renderer decodes it on the next turn to restore the model turn's
+  `thoughtSignature` and the `functionResponse` name. The codec is reversible and
+  rejects a malformed or `null` payload. An id this package did not mint (history from
+  another provider) falls back to the name of an **earlier** assistant call with that id,
+  and carries no signature. A non-object tool result is wrapped as `{"result": text}`.
+- **(f) Translation at the neutral model's expressiveness, with Gemini's own
+  conventions where they differ.** `system` and `developer` messages become
+  `systemInstruction`; consecutive same-role turns merge and empty ones drop; tools
+  become `functionDeclarations[].parametersJsonSchema` and `tool_choice` a
+  `functionCallingConfig` mode; `reasoning_effort` becomes a `thinkingConfig` (a
+  token budget for the 2.5 family, a level for 3.x, the family sniffed from the model
+  name); an image data URI becomes `inlineData`. On the way back `thought` parts are
+  the reasoning, `functionCall` parts the tool calls, a finish reason folds to the
+  OpenAI vocabulary (`STOP` is `tool_calls` when a call is present, safety-class
+  reasons are `content_filter`), and a prompt-blocked reply (HTTP 200, no candidates)
+  is an empty `content_filter` answer, never a crash on `candidates[0]`. Usage follows
+  the OpenAI convention: input includes the cached tokens and output includes the
+  reasoning tokens, so input and output stay consistent with the reported total. The
+  stream is SSE with no `[DONE]`: it is complete only when a chunk reports a finish
+  reason, the last cumulative `usageMetadata` is the answer's usage, and a mid-stream
+  error frame or an end without a finish reason is `provider.unavailable` rather than a
+  truncated success.
+- **(g) Native discovery and validation live in the portal's existing seam.** Model
+  discovery is `vendorauth.DiscoverGeminiModels`: the paged `GET {base}/v1beta/models`
+  with `x-goog-api-key`, keeping only models whose `supportedGenerationMethods` contain
+  `generateContent` and stripping the `models/` prefix; the key probe is
+  `vendorauth.ValidateGeminiAPIKey` with the uniform classification. Both receive a
+  portal-composed URL, so `vendorauth` still knows no vendor root. The preset carries no
+  usage strategy: Gemini has no usage API.
+- **(h) Translate-only for now; passthrough and broad fidelity are separate work.**
+  Both endpoint modes stay zero, so an inbound Responses or Messages request is
+  translated through the neutral model. Lossless passthrough, meaning the inbound
+  Gemini endpoint where a Gemini-shaped client connects, is deferred to #204, which
+  reuses `geminiwire` (and the client already implements `ProxyNative` for it). The
+  features the neutral model cannot carry (structured output, safety settings,
+  non-image media, fine thinking control) are not forced through translate: they are
+  either delivered losslessly by that passthrough or by the translate-fidelity extension
+  tracked as #208.
+
+**Consequence:** a Gemini account's tool-call ids are long, opaque strings on the
+OpenAI and Anthropic wires; a client must echo them verbatim, which every
+conforming one does. A shim and a native account of Google serving the same model
+names collide at resolve time (the first active account by id wins; a token with a
+non-"all" access policy refuses the duplicate at save,
+[External Vendor Accounts §11.3](cross-cutting/external-vendor-accounts.md#113-name-collisions)),
+so the advice is a distinct model prefix on one of them. The native wire's
+behaviour was designed from documentation without a live key, so several details are
+VERIFY-LIVE data that degrade conservatively
+([External Vendor Accounts §10](cross-cutting/external-vendor-accounts.md#10-tos-experimental-status-and-verify-live)):
+the thinking field names and budgets, `parametersJsonSchema` per model, whether an
+external image URL is accepted, what Gemini 3 does with a history that carries no
+signature, and the status a wrong key gets. Only a function-call part's signature is
+carried (the neutral model has no other slot). The translate path inherits the neutral
+model's ceiling: a client that needs a Gemini-only feature waits for #204 or #208.
+
+**Rejected:** a per-account `dialect` toggle on the existing `google` account (a column
+and a migration, an in-place behaviour change for every existing shim account, and no
+way to run both side by side); a global switch (the same, for the whole gateway);
+widening the neutral model with a `thoughtSignature` and name slot (every provider and
+inbound parser would change for one dialect's quirk, which is what #208 weighs on its
+own); writing the Gemini wire inside `provider` (the inbound endpoint of #204 could not
+reuse it without importing the whole provider package, and the two directions could not
+be tested against each other); the `?key=` query-parameter credential (it puts the key
+in URLs and logs); following redirects (the custom header would travel with them).
+→ [External Vendor Accounts §4.5](cross-cutting/external-vendor-accounts.md#45-native-google-gemini),
+[§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
+[API Compatibility & Inference §8](cross-cutting/compatibility-and-inference.md#8-provider-clients),
+[Building Block View](05-building-block-view.md#52-level-2--gateway-backend-components),
+[API Surface](reference/api-surface.md#vendor-accounts-anbieter).

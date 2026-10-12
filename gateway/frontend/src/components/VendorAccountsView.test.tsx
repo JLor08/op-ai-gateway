@@ -3934,7 +3934,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.change(keyField(), { target: { value: key } });
     }
 
-    it('lists the seven providers in order: OpenAI, Anthropic, then the compatible ones', async () => {
+    it('lists the eight providers in order: OpenAI, Anthropic, then the compatible ones', async () => {
       renderView({ accounts: [] });
       await openCreate();
 
@@ -3951,6 +3951,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         t.vendorOpenRouter,
         t.vendorKilo,
         t.vendorGoogle,
+        t.vendorGoogleNative,
         t.vendorOpenAICompatible,
       ]);
     });
@@ -3983,6 +3984,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await chooseVendor(t.vendorKilo);
       expect(baseUrlField()).toHaveAttribute('placeholder', 'https://api.kilo.ai/api');
       await chooseVendor(t.vendorGoogle);
+      expect(baseUrlField()).toHaveAttribute(
+        'placeholder',
+        'https://generativelanguage.googleapis.com',
+      );
+      await chooseVendor(t.vendorGoogleNative);
       expect(baseUrlField()).toHaveAttribute(
         'placeholder',
         'https://generativelanguage.googleapis.com',

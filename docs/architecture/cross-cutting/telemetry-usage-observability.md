@@ -572,10 +572,11 @@ them explicitly.
 tokens/s** (#182). A request served by an external vendor account
 ([External Vendor Accounts](external-vendor-accounts.md)) has no AI server, so
 its `host` and `server_name` are empty, and what identifies it is `provider`
-(`vendor_openai`, `vendor_openai_subscription`, `vendor_anthropic`) plus
-`account_id`; an OpenAI-compatible account (x.ai, OpenRouter, Kilo, Gemini, Custom)
+(`vendor_openai`, `vendor_openai_subscription`, `vendor_anthropic`, `vendor_gemini`) plus
+`account_id`; an OpenAI-compatible account (x.ai, OpenRouter, Kilo, Gemini through its shim, Custom)
 appears as provider `vendor_openai` with its `account_id`, since it is served by the
-same client. No vendor reports a generation rate (no `timings` object of any
+same client, whereas a native Gemini (`google_native`) account appears as
+`vendor_gemini`. No vendor reports a generation rate (no `timings` object of any
 kind), so without help such a row also stores `tokens_per_second = 0` and
 Activity renders it as never measured. Two things make it readable:
 

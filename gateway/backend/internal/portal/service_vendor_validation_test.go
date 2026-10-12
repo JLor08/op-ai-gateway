@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
@@ -26,19 +27,21 @@ const (
 	kindOpenAIAPIKey           = "openai-api-key"
 	kindAnthropicAPIKey        = "anthropic-api-key"
 	kindOpenAICompatibleAPIKey = "openai-compatible-api-key"
+	kindGeminiAPIKey           = "gemini-api-key"
 )
 
 // fakeValidatorKinds lists every kind the fake answers.
 var fakeValidatorKinds = []string{
-	kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey,
+	kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey, kindGeminiAPIKey,
 }
 
 // fakeValidatorCall is one recorded validator invocation.
 type fakeValidatorCall struct {
 	kind       string
 	credential string
-	// probeURL is the URL the service composed; only the OpenAI-compatible kind
-	// carries one ("" for every other kind, whose URL is a vendorauth constant).
+	// probeURL is the URL the service composed; only the preset kinds (the
+	// OpenAI-compatible and the native Gemini one) carry one ("" for every other
+	// kind, whose URL is a vendorauth constant).
 	probeURL string
 	// timeout is the Timeout of the *http.Client the service handed over; hasClient
 	// is false when it handed over nil.
@@ -117,6 +120,7 @@ func (f *fakeVendorValidators) validators() VendorCredentialValidators {
 		OpenAIAPIKey:           f.record(kindOpenAIAPIKey),
 		AnthropicAPIKey:        f.record(kindAnthropicAPIKey),
 		OpenAICompatibleAPIKey: f.recordURL(kindOpenAICompatibleAPIKey),
+		GeminiAPIKey:           f.recordURL(kindGeminiAPIKey),
 	}
 }
 
@@ -711,6 +715,112 @@ func TestTestVendorAccountConnectionOpenAICompatibleMapsEveryVerdict(t *testing.
 	}
 }
 
+// A native Gemini account is probed with its own validator (not the Bearer one) at
+// GET {base}/v1beta/models: the portal composes the URL from the google_native
+// preset, and the check carries the validator's verdict unchanged. The shim
+// google account keeps probing the OpenAI-compatible seam at /v1beta/openai/models.
+func TestTestVendorAccountConnectionNativeGeminiProbeURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		baseURL string
+		wantURL string
+	}{
+		{"preset root", "", "https://generativelanguage.googleapis.com/v1beta/models"},
+		{"typed root with a trailing slash", "https://gw.example.test/", "https://gw.example.test/v1beta/models"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newVendorConnectTestService(t)
+			fake := installFakeVendorValidators(svc)
+			fake.set(kindGeminiAPIKey, validCheck("", ""))
+			acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorGoogleNative, tc.baseURL))
+
+			got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("TestVendorAccountConnection: %v", err)
+			}
+			if got.Status != "valid" || got.Detail != "credential accepted (HTTP 200)" {
+				t.Fatalf("check = %+v, want the validator's valid verdict", got)
+			}
+			call := fake.onlyCall(t)
+			if call.kind != kindGeminiAPIKey || call.credential != vendorAccountTestKey {
+				t.Fatalf("call = %+v, want the native Gemini validator with the stored (opened) key", call)
+			}
+			if call.probeURL != tc.wantURL {
+				t.Fatalf("probe URL = %q, want %q", call.probeURL, tc.wantURL)
+			}
+			if !call.hasClient || call.timeout != 10*time.Second {
+				t.Fatalf("call = %+v, want a client with a 10s timeout", call)
+			}
+		})
+	}
+}
+
+// Every verdict the native validator returns reaches the check as is.
+func TestTestVendorAccountConnectionNativeGeminiMapsEveryVerdict(t *testing.T) {
+	cases := map[string]vendorauth.CredentialCheck{
+		"valid":        validCheck("", ""),
+		"invalid":      invalidCheck(),
+		"unverifiable": unverifiableCheck(),
+	}
+	for want, verdict := range cases {
+		t.Run(want, func(t *testing.T) {
+			svc, _, _ := newVendorConnectTestService(t)
+			fake := installFakeVendorValidators(svc)
+			fake.set(kindGeminiAPIKey, verdict)
+			acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorGoogleNative, ""))
+
+			got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+			if err != nil {
+				t.Fatalf("TestVendorAccountConnection: %v", err)
+			}
+			if got.Status != want {
+				t.Fatalf("status = %q, want %q", got.Status, want)
+			}
+		})
+	}
+}
+
+// With the real vendorauth probe wired in, the key reaches the native endpoint in
+// the x-goog-api-key header (not as a Bearer token): a server that answers 200 only
+// to that header reads "valid", a 401 reads "invalid", and neither detail echoes
+// the key.
+func TestTestVendorAccountConnectionNativeGeminiSendsTheGoogleHeader(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1beta/models" || r.Header.Get("Authorization") != "" {
+			t.Errorf("request = %s with Authorization %q, want GET /v1beta/models without a Bearer", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("x-goog-api-key") != vendorAccountTestKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer srv.Close()
+
+	svc, _, _ := newVendorConnectTestService(t)
+	svc.vendorValidation.validators = VendorCredentialValidators{}.withDefaults()
+	svc.vendorValidation.client = srv.Client()
+	acc := createTestVendorAccount(t, svc, ownerToken(), compatAccountRequest(routing.VendorGoogleNative, srv.URL))
+
+	got, err := svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+	if err != nil || got.Status != VendorConnectionValid {
+		t.Fatalf("check = %+v, %v, want valid for the stored key", got, err)
+	}
+
+	// The same server rejects any other key.
+	acc.ID = createTestVendorAccount(t, svc, ownerToken(), CreateVendorAccountRequest{
+		Vendor: routing.VendorGoogleNative, AuthType: routing.VendorAuthAPIKey, Name: "Wrong key", APIKey: "AIza-wrong-key", BaseURL: srv.URL,
+	}).ID
+	got, err = svc.TestVendorAccountConnection(context.Background(), ownerToken(), acc.ID)
+	if err != nil || got.Status != VendorConnectionInvalid {
+		t.Fatalf("check = %+v, %v, want invalid for a rejected key", got, err)
+	}
+	if strings.Contains(got.Detail, "AIza-wrong-key") {
+		t.Fatalf("detail %q leaks the key", got.Detail)
+	}
+}
+
 // Kilo's models listing is public and it has no key endpoint, so there is nothing
 // to probe: the answer is "could not verify" and NO probe runs (a probe against the
 // public listing would call every key valid).
@@ -737,7 +847,8 @@ func TestTestVendorAccountConnectionKiloHasNoOfflineCheck(t *testing.T) {
 
 // The OpenAI-compatible vendors never fall into the openai/anthropic probes, and
 // openai/anthropic never reach the compatible one: each vendor family has its own
-// seam.
+// seam. The native Gemini account has its own too (google_native), while the
+// google OpenAI shim stays on the compatible one.
 func TestValidateAPIKeyKeepsTheVendorFamiliesApart(t *testing.T) {
 	svc, _, _ := newVendorConnectTestService(t)
 	fake := installFakeVendorValidators(svc)
@@ -748,6 +859,8 @@ func TestValidateAPIKeyKeepsTheVendorFamiliesApart(t *testing.T) {
 		routing.VendorAnthropic:        kindAnthropicAPIKey,
 		routing.VendorXAI:              kindOpenAICompatibleAPIKey,
 		routing.VendorOpenAICompatible: kindOpenAICompatibleAPIKey,
+		routing.VendorGoogle:           kindOpenAICompatibleAPIKey, // the OpenAI shim stays on the Bearer probe
+		routing.VendorGoogleNative:     kindGeminiAPIKey,
 	} {
 		fake.reset()
 		svc.validateAPIKey(context.Background(), routing.VendorAccount{Vendor: vendor, BaseURL: "https://gw.example.test"}, "k")
@@ -1041,7 +1154,7 @@ func TestTestVendorAccountConnectionRefusesWhileTheMasterFlagIsOff(t *testing.T)
 func TestNewServiceDefaultsAndInjectsTheVendorValidators(t *testing.T) {
 	defaults := NewService(ServiceDeps{})
 	v := defaults.vendorValidation.validators
-	if v.OpenAISubscription == nil || v.AnthropicSubscription == nil || v.OpenAIAPIKey == nil || v.AnthropicAPIKey == nil || v.OpenAICompatibleAPIKey == nil {
+	if v.OpenAISubscription == nil || v.AnthropicSubscription == nil || v.OpenAIAPIKey == nil || v.AnthropicAPIKey == nil || v.OpenAICompatibleAPIKey == nil || v.GeminiAPIKey == nil {
 		t.Fatalf("default validators = %+v, want every probe defaulted to its vendorauth function", v)
 	}
 	if c := defaults.vendorValidation.client; c == nil || c.Timeout != 10*time.Second {
@@ -1057,7 +1170,7 @@ func TestNewServiceDefaultsAndInjectsTheVendorValidators(t *testing.T) {
 		},
 	}})
 	iv := injected.vendorValidation.validators
-	if iv.AnthropicAPIKey == nil || iv.OpenAISubscription == nil || iv.AnthropicSubscription == nil || iv.OpenAICompatibleAPIKey == nil {
+	if iv.AnthropicAPIKey == nil || iv.OpenAISubscription == nil || iv.AnthropicSubscription == nil || iv.OpenAICompatibleAPIKey == nil || iv.GeminiAPIKey == nil {
 		t.Fatalf("injected validators = %+v, want the unnamed probes defaulted", iv)
 	}
 	if got := iv.OpenAIAPIKey(context.Background(), nil, "k"); got.Status != vendorauth.StatusValid || !called {

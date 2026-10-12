@@ -3,11 +3,12 @@
 
 package routing
 
-// VendorPreset is the fixed, per-vendor data for an OpenAI-compatible hosted
-// provider. It lives in package routing because the resolver needs the path
-// prefix (routing cannot import portal); the portal reads the rest to validate
-// a key, discover models and (sub-project D) pull usage. vendorauth never sees
-// it — the portal composes plain URL strings from these fields.
+// VendorPreset is the fixed, per-vendor data for a preset hosted provider
+// (OpenAI-compatible, or native Gemini when Dialect is "gemini"). It lives in
+// package routing because the resolver needs the path prefix (routing cannot
+// import portal); the portal reads the rest to validate a key, discover models
+// and (sub-project D) pull usage. vendorauth never sees it — the portal
+// composes plain URL strings from these fields.
 type VendorPreset struct {
 	// DefaultBaseURL is the upstream ROOT (no /v1 or other path prefix); "" for
 	// VendorOpenAICompatible, where the user must supply BaseURL.
@@ -37,12 +38,16 @@ type VendorPreset struct {
 	// balance is "/profile/balance" (outside its "/gateway" prefix). "" when the
 	// provider reports no usage.
 	UsagePath string
+	// Dialect is the upstream wire dialect: "" = OpenAI wire (served by the
+	// shared OpenAI-compatible client), "gemini" = native generateContent.
+	Dialect string
 }
 
-// vendorPresets is the registry of OpenAI-compatible providers. The keys are the
-// VendorOpenAICompatible-family ids; openai/anthropic are NOT here (they keep
-// their bespoke resolver branch). Roots/prefixes are confirmed live (2026-10-10):
-// see ADR-052 and external-vendor-accounts.md §10.
+// vendorPresets is the registry of preset providers: the OpenAI-compatible
+// family plus the native Gemini account (Dialect "gemini"). The keys are the
+// VendorOpenAICompatible-family ids and VendorGoogleNative; openai/anthropic
+// are NOT here (they keep their bespoke resolver branch). Roots/prefixes are
+// confirmed live (2026-10-10): see ADR-052 and external-vendor-accounts.md §10.
 var vendorPresets = map[string]VendorPreset{
 	VendorXAI: {
 		DefaultBaseURL: "https://api.x.ai",
@@ -70,6 +75,13 @@ var vendorPresets = map[string]VendorPreset{
 		ValidateVia:       "models", // GET .../models needs a key (bad key -> 400 -> unverifiable)
 		StripModelsPrefix: "models/",
 	},
+	VendorGoogleNative: {
+		DefaultBaseURL:    "https://generativelanguage.googleapis.com",
+		PathPrefix:        "/v1beta", // portal discovery/validation only
+		ValidateVia:       "models",
+		StripModelsPrefix: "models/",
+		Dialect:           "gemini",
+	},
 	VendorOpenAICompatible: {
 		DefaultBaseURL: "", // user supplies the root
 		PathPrefix:     "/v1",
@@ -77,23 +89,38 @@ var vendorPresets = map[string]VendorPreset{
 	},
 }
 
-// IsOpenAICompatibleVendor reports whether vendor is one of the OpenAI-compatible
-// hosted providers (routed through OpenAICompatibleClient against its own BaseURL).
-func IsOpenAICompatibleVendor(vendor string) bool {
-	_, ok := vendorPresets[vendor]
+// IsPresetVendor reports whether v is a preset (configurable-root, api-key-only)
+// vendor account, regardless of wire dialect.
+func IsPresetVendor(v string) bool {
+	_, ok := vendorPresets[v]
 	return ok
 }
 
-// VendorPresetFor returns the preset for an OpenAI-compatible vendor.
+// IsOpenAICompatibleVendor reports whether v is served by the OpenAI-compatible
+// client (a preset vendor whose wire dialect is the OpenAI one).
+func IsOpenAICompatibleVendor(v string) bool {
+	p, ok := vendorPresets[v]
+	return ok && p.Dialect == ""
+}
+
+// IsNativeGeminiVendor reports whether v is served by the native Gemini client.
+func IsNativeGeminiVendor(v string) bool {
+	p, ok := vendorPresets[v]
+	return ok && p.Dialect == "gemini"
+}
+
+// VendorPresetFor returns the preset for a preset vendor (any dialect).
 func VendorPresetFor(vendor string) (VendorPreset, bool) {
 	p, ok := vendorPresets[vendor]
 	return p, ok
 }
 
-// OpenAIPathPrefixFor is the Target.OpenAIPathPrefix value for an OpenAI-compatible
-// vendor; "" for every other vendor (so the Target keeps the default-/v1 behaviour).
+// OpenAIPathPrefixFor is the Target.OpenAIPathPrefix value for an
+// OpenAI-compatible (OpenAI-wire) preset vendor; "" for every other vendor,
+// including a native-dialect preset such as google_native, which the OpenAI
+// path machinery never serves (so the Target keeps the default-/v1 behaviour).
 func OpenAIPathPrefixFor(vendor string) string {
-	if p, ok := vendorPresets[vendor]; ok {
+	if p, ok := vendorPresets[vendor]; ok && p.Dialect == "" {
 		return p.PathPrefix
 	}
 	return ""

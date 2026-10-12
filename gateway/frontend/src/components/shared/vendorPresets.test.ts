@@ -10,12 +10,13 @@ import {
 import { isValidBaseUrl } from './vendorInputs';
 
 describe('OPENAI_COMPATIBLE_VENDORS', () => {
-  it('lists the five OpenAI-compatible vendors, in dropdown order', () => {
+  it('lists the six OpenAI-compatible vendors, in dropdown order', () => {
     expect([...OPENAI_COMPATIBLE_VENDORS]).toEqual([
       'xai',
       'openrouter',
       'kilo',
       'google',
+      'google_native',
       'openai_compatible',
     ]);
   });
@@ -37,6 +38,7 @@ describe('defaultBaseUrl', () => {
     ['openrouter', 'https://openrouter.ai/api'],
     ['kilo', 'https://api.kilo.ai/api'],
     ['google', 'https://generativelanguage.googleapis.com'],
+    ['google_native', 'https://generativelanguage.googleapis.com'],
     ['openai_compatible', 'https://llm.example.com'],
   ])('shows %s as %s', (vendor, root) => {
     expect(defaultBaseUrl(vendor)).toBe(root);

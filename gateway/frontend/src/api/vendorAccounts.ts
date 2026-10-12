@@ -29,13 +29,21 @@ import { type Fetcher, request } from './transport';
 // subscription_connected=true; the device poll answers only {connected}, so the
 // caller re-reads the account (GET .../{id}).
 //
-// openai and anthropic have fixed hosts and either auth type; the other five
-// vendors (xai, openrouter, kilo, google and the user-supplied openai_compatible
-// "Custom") speak the OpenAI wire format against a configurable root URL and are
-// api-key only (the backend answers vendor_account.auth_type_invalid for a
-// subscription one).
+// openai and anthropic have fixed hosts and either auth type; the other six
+// vendors (xai, openrouter, kilo, google, the native-dialect google_native and
+// the user-supplied openai_compatible "Custom") are reached through a
+// configurable root URL and are api-key only (the backend answers
+// vendor_account.auth_type_invalid for a subscription one). google_native speaks
+// Google's own generateContent API rather than the OpenAI wire format the rest use.
 export type VendorAccountVendor =
-  'openai' | 'anthropic' | 'xai' | 'openrouter' | 'kilo' | 'google' | 'openai_compatible';
+  | 'openai'
+  | 'anthropic'
+  | 'xai'
+  | 'openrouter'
+  | 'kilo'
+  | 'google'
+  | 'google_native'
+  | 'openai_compatible';
 export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
 // user can only ever set active or disabled.

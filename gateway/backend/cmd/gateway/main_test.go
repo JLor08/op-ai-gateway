@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/config"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"os"
@@ -1169,6 +1170,41 @@ func TestProviderClientsWireVendorProviderKinds(t *testing.T) {
 				t.Fatalf("Complete(%q) hit %s (text %q, anthropic-version %q), want %s (%q, %q): wrong client wired in the provider map", tc.providerType, path, resp.Text, version, tc.wantPath, tc.wantText, tc.wantVersion)
 			}
 		})
+	}
+}
+
+// TestProviderClientsWireGemini pins that vendor_gemini is registered and routes
+// to the native Gemini client. It is its own test (not a row in
+// TestProviderClientsWireVendorProviderKinds) because Gemini carries the model in
+// the path and authenticates with x-goog-api-key, neither of which that table's
+// exact-path handler and anthropic-version capture can express.
+func TestProviderClientsWireGemini(t *testing.T) {
+	mux := providerClients(0, false, nil)
+
+	var mu sync.Mutex
+	var gotPath, gotKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath, gotKey = r.URL.Path, r.Header.Get("x-goog-api-key")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"gemini ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`))
+	}))
+	defer upstream.Close()
+
+	ctx := provider.WithUpstreamAuthHeaders(context.Background(), "x-goog-api-key", "k", nil)
+	resp, err := mux.Complete(ctx, routing.Target{Provider: routing.ProviderVendorGemini, Endpoint: upstream.URL, ProviderModel: "gemini-2.5-pro", Timeout: 5 * time.Second}, inference.Request{
+		Messages: []inference.Message{{Role: inference.RoleUser, Content: []inference.ContentPart{{Type: inference.ContentText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("Complete(%q) error = %v, want nil", routing.ProviderVendorGemini, err)
+	}
+
+	mu.Lock()
+	path, key := gotPath, gotKey
+	mu.Unlock()
+	if path != "/v1beta/models/gemini-2.5-pro:generateContent" || key != "k" || resp.Text != "gemini ok" {
+		t.Fatalf("Complete(%q) hit %s (x-goog-api-key %q, text %q), want /v1beta/models/gemini-2.5-pro:generateContent (%q, %q): wrong client wired in the provider map", routing.ProviderVendorGemini, path, key, resp.Text, "k", "gemini ok")
 	}
 }
 

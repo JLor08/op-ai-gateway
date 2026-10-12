@@ -77,6 +77,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).toEqual({ text: `${t.vendorAnthropic} · Claude key` });
     });
 
+    it('maps vendor_gemini to the native Google Gemini vendor', () => {
+      expect(
+        serverLabel(t, row({ provider: 'vendor_gemini', account_name: 'Gemini key' })),
+      ).toEqual({ text: `${t.vendorGoogleNative} · Gemini key` });
+    });
+
     it('falls back to the short account id plus the full id as title when the name is empty', () => {
       expect(serverLabel(t, row({ account_id: FULL_ID, account_name: '' }))).toEqual({
         text: `${t.vendorOpenAI} · va_01234567…`,

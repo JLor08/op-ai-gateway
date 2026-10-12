@@ -696,9 +696,10 @@ func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 }
 
 // TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath pins the translate
-// path of the two vendor-account provider kinds: a vendor_anthropic target is
+// path of the vendor-account provider kinds: a vendor_anthropic target is
 // served by the native Anthropic client at /v1/messages (not the chat-completions
-// default every other non-ollama provider falls through to), while vendor_openai
+// default every other non-ollama provider falls through to), a vendor_gemini
+// target by the native Gemini client's generateContent URL, while vendor_openai
 // reuses the OpenAI-compatible client and so stays on {prefix}/chat/completions
 // (the default prefix is /v1; a vendor preset may configure another). A
 // wrong value here mislabels the usage row's provider_path.
@@ -718,6 +719,10 @@ func TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath(t *testing.T) {
 		// A vendor_anthropic target ignores the OpenAI prefix: its client speaks
 		// /v1/messages regardless.
 		{"anthropic ignores openai prefix", routing.ProviderVendorAnthropic, "/gateway", "/v1/messages"},
+		// A native Gemini target is served by the generateContent client, not the
+		// chat-completions default; the label is a fixed string because
+		// upstreamPath takes no model or stream argument.
+		{"gemini native", routing.ProviderVendorGemini, "", "/v1beta/models/*:generateContent"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -3,15 +3,18 @@
 
 import type { VendorAccountVendor } from '../../api';
 
-// The vendors that speak the OpenAI wire format against a configurable root URL
-// (the backend's routing.IsOpenAICompatibleVendor), in the order the create form
-// lists them after openai and anthropic. They are api-key only and carry an
-// immutable base_url; openai and anthropic have fixed hosts.
+// The vendors reached through a configurable root URL (the backend's
+// routing.IsOpenAICompatibleVendor), in the order the create form lists them
+// after openai and anthropic. All but google_native speak the OpenAI wire format;
+// google_native speaks Google's native generateContent API but has the same
+// create-form shape. They are api-key only and carry an immutable base_url;
+// openai and anthropic have fixed hosts.
 export const OPENAI_COMPATIBLE_VENDORS = [
   'xai',
   'openrouter',
   'kilo',
   'google',
+  'google_native',
   'openai_compatible',
 ] as const satisfies readonly VendorAccountVendor[];
 
@@ -33,6 +36,7 @@ const DEFAULT_BASE_URLS: Record<OpenAICompatibleVendor, string> = {
   openrouter: 'https://openrouter.ai/api',
   kilo: 'https://api.kilo.ai/api',
   google: 'https://generativelanguage.googleapis.com',
+  google_native: 'https://generativelanguage.googleapis.com',
   openai_compatible: 'https://llm.example.com',
 };
 

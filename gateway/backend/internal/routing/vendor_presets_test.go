@@ -118,3 +118,44 @@ func TestVendorPresetUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestVendorPredicateSplit(t *testing.T) {
+	if !IsPresetVendor(VendorGoogle) || !IsPresetVendor(VendorGoogleNative) {
+		t.Fatal("both google ids must be preset vendors")
+	}
+	if !IsOpenAICompatibleVendor(VendorGoogle) {
+		t.Fatal("shim google must be OpenAI-compatible")
+	}
+	if IsOpenAICompatibleVendor(VendorGoogleNative) {
+		t.Fatal("native google must NOT be OpenAI-compatible")
+	}
+	if !IsNativeGeminiVendor(VendorGoogleNative) {
+		t.Fatal("native google must be a native Gemini vendor")
+	}
+	if IsNativeGeminiVendor(VendorGoogle) || IsNativeGeminiVendor(VendorOpenAI) {
+		t.Fatal("only google_native is native Gemini")
+	}
+}
+
+func TestVendorGoogleNativePreset(t *testing.T) {
+	p, ok := VendorPresetFor(VendorGoogleNative)
+	if !ok {
+		t.Fatal("missing google_native preset")
+	}
+	if p.Dialect != "gemini" || p.DefaultBaseURL != "https://generativelanguage.googleapis.com" || p.StripModelsPrefix != "models/" {
+		t.Fatalf("preset = %+v", p)
+	}
+}
+
+// TestOpenAIPathPrefixForNativeDialectIsEmpty pins that a native-dialect preset's
+// PathPrefix ("/v1beta", used only for portal discovery/validation) is never
+// surfaced as an OpenAI path prefix, while the shim google account keeps its
+// "/v1beta/openai" prefix.
+func TestOpenAIPathPrefixForNativeDialectIsEmpty(t *testing.T) {
+	if got := OpenAIPathPrefixFor(VendorGoogleNative); got != "" {
+		t.Errorf("OpenAIPathPrefixFor(%q) = %q, want empty (native dialect has no OpenAI path)", VendorGoogleNative, got)
+	}
+	if got := OpenAIPathPrefixFor(VendorGoogle); got != "/v1beta/openai" {
+		t.Errorf("OpenAIPathPrefixFor(%q) = %q, want /v1beta/openai (the shim)", VendorGoogle, got)
+	}
+}

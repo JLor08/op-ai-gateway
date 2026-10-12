@@ -210,7 +210,7 @@ func normalizeVendorAccountVendor(raw string) (string, error) {
 	switch vendor := strings.TrimSpace(raw); vendor {
 	case routing.VendorOpenAI, routing.VendorAnthropic,
 		routing.VendorXAI, routing.VendorOpenRouter, routing.VendorKilo,
-		routing.VendorGoogle, routing.VendorOpenAICompatible:
+		routing.VendorGoogle, routing.VendorGoogleNative, routing.VendorOpenAICompatible:
 		return vendor, nil
 	default:
 		return "", ErrVendorAccountVendorInvalid
@@ -412,11 +412,12 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	// An OpenAI-compatible vendor is api-key only (it has no subscription/OAuth
-	// flow) and carries an immutable root url. openai and anthropic keep their
-	// fixed hosts: a supplied base_url is ignored and BaseURL stays "".
+	// A preset vendor (OpenAI-compatible or native Gemini) is api-key only (it has
+	// no subscription/OAuth flow) and carries an immutable root url. openai and
+	// anthropic keep their fixed hosts: a supplied base_url is ignored and BaseURL
+	// stays "".
 	baseURL := ""
-	if routing.IsOpenAICompatibleVendor(vendor) {
+	if routing.IsPresetVendor(vendor) {
 		if authType != routing.VendorAuthAPIKey {
 			return VendorAccountDTO{}, ErrVendorAccountAuthTypeInvalid
 		}
@@ -486,12 +487,13 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	// An OpenAI-compatible account has no static seed (its catalog is empty), so
-	// without a discovery it would serve nothing until the user pressed Refresh:
-	// ask the provider once now, best effort, so a new account is usable at once.
-	// It needs the key just stored. It never fails the create (the account exists
-	// and Refresh re-runs it) and is bounded by the connect-time discovery timeout.
-	if routing.IsOpenAICompatibleVendor(vendor) && apiKey != "" {
+	// A preset account (OpenAI-compatible or native Gemini) has no static seed (its
+	// catalog is empty), so without a discovery it would serve nothing until the
+	// user pressed Refresh: ask the provider once now, best effort, so a new account
+	// is usable at once. It needs the key just stored. It never fails the create
+	// (the account exists and Refresh re-runs it) and is bounded by the connect-time
+	// discovery timeout.
+	if routing.IsPresetVendor(vendor) && apiKey != "" {
 		dto = s.discoverAfterConnect(ctx, principal, dto)
 	}
 	return dto, nil

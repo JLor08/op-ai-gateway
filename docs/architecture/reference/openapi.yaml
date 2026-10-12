@@ -1195,7 +1195,7 @@ paths:
                     items: { $ref: '#/components/schemas/VendorAccount' }
     post:
       tags: [portal]
-      summary: Create a vendor account (seeded with a static model set under its prefix; an OpenAI-compatible one is filled by a best-effort discovery)
+      summary: Create a vendor account (seeded with a static model set under its prefix; an OpenAI-compatible or google_native one is filled by a best-effort discovery)
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:
         required: true
@@ -2238,7 +2238,7 @@ components:
       required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
-        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, openai_compatible] }
+        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
         auth_type: { type: string, enum: [api_key, subscription] }
         name: { type: string }
         status:
@@ -2253,9 +2253,10 @@ components:
         base_url:
           type: string
           description: >
-            The upstream root URL of an OpenAI-compatible account (xai, openrouter,
-            kilo, google, openai_compatible), stored without /v1 or any other path
-            prefix (the gateway adds the vendor's own prefix). Always present, empty
+            The upstream root URL of an OpenAI-compatible or native Gemini account
+            (xai, openrouter, kilo, google, google_native, openai_compatible), stored
+            without /v1 or any other path prefix (the gateway adds the vendor's own
+            prefix). Always present, empty
             for the openai and anthropic vendors. Immutable after creation.
         api_key_set: { type: boolean }
         subscription_connected: { type: boolean }
@@ -2330,7 +2331,7 @@ components:
       description: portal.CreateVendorAccountRequest.
       required: [vendor, auth_type, name]
       properties:
-        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, openai_compatible] }
+        vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
         auth_type: { type: string, enum: [api_key, subscription] }
         name: { type: string }
         status:
@@ -2350,15 +2351,15 @@ components:
         base_url:
           type: string
           description: >
-            The upstream root URL of an OpenAI-compatible account, without /v1 or
-            any other path prefix. Optional for xai, openrouter, kilo and google
-            (empty means the vendor's default root) and required for
+            The upstream root URL of an OpenAI-compatible or native Gemini account,
+            without /v1 or any other path prefix. Optional for xai, openrouter, kilo,
+            google and google_native (empty means the vendor's default root) and required for
             openai_compatible (400 vendor_account.base_url_required). It must be an
             https URL with a host and no userinfo, query or fragment (400
             vendor_account.base_url_invalid). Ignored for openai and anthropic.
             Immutable after creation: the update request has no such field. An
-            OpenAI-compatible vendor accepts auth_type api_key only (400
-            vendor_account.auth_type_invalid otherwise).
+            OpenAI-compatible vendor, like google_native, accepts auth_type api_key
+            only (400 vendor_account.auth_type_invalid otherwise).
     VendorAccountUpdateRequest:
       type: object
       description: portal.UpdateVendorAccountRequest; an absent field keeps the stored value.

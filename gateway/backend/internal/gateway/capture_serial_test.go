@@ -50,6 +50,8 @@ func TestRedactCaptureHeaders(t *testing.T) {
 	h.Set("X-OP-Run-As-Token", "tok_123")
 	// The upstream credential header of a vendor Anthropic account (x-api-key).
 	h.Set("X-Api-Key", "sk-ant-secret")
+	// The upstream credential header of a native Gemini account.
+	h.Set("X-Goog-Api-Key", "goog-secret")
 	h.Set("Content-Type", "application/json")
 	h.Add("X-Custom", "a")
 	h.Add("X-Custom", "b")
@@ -58,7 +60,7 @@ func TestRedactCaptureHeaders(t *testing.T) {
 
 	// net/http canonicalizes X-OP-CSRF -> X-Op-Csrf etc.; redaction is
 	// case-insensitive and REPLACES the value with a marker while keeping the key.
-	for _, name := range []string{"Authorization", "Cookie", "X-Op-Csrf", "X-Op-Run-As-Token", "X-Api-Key"} {
+	for _, name := range []string{"Authorization", "Cookie", "X-Op-Csrf", "X-Op-Run-As-Token", "X-Api-Key", "X-Goog-Api-Key"} {
 		vs, ok := got[name]
 		if !ok {
 			t.Fatalf("sensitive header %q must be kept with a redaction marker, got dropped: %v", name, got)
