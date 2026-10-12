@@ -285,15 +285,22 @@ func upstreamErrorCode(body []byte, status string) string {
 // validateImagesRequest), so these reach sd-server as sent; it honors size, n,
 // output_format and output_compression and ignores the rest.
 //
+// The advanced sd-server knobs (negative_prompt, sampler, scheduler, steps, cfg,
+// seed, clip_skip) are NOT top-level fields: sd-server reads them only from a
+// <sd_cpp_extra_args> block in the prompt, so buildSDExtraArgs renders the set
+// ones into that block and this appends it to the prompt text. The user prompt is
+// first stripped of any literal tag (stripSDExtraArgsTag) so a thread cannot
+// smuggle its own block.
+//
 // A history with no user text yields an empty prompt, which is NOT rejected
 // here: validateImagesRequest owns "a prompt is required" and answers
 // images.prompt_required, and a second copy of that rule in the executor
 // would be free to drift from the endpoint's. The refusal reaches the run
 // through upstreamErrorCode above.
 func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
+	prompt := stripSDExtraArgsTag(lastUserPrompt(prep.History))
 	body := map[string]any{
 		"model":           prep.Settings.Model,
-		"prompt":          lastUserPrompt(prep.History),
 		"response_format": "b64_json",
 	}
 	if img := prep.Settings.Image; img != nil {
@@ -309,8 +316,98 @@ func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
 		if img.OutputCompression != nil {
 			body["output_compression"] = *img.OutputCompression
 		}
+		if extra := buildSDExtraArgs(img); extra != "" {
+			prompt += extra
+		}
 	}
+	body["prompt"] = prompt
 	return json.Marshal(body)
+}
+
+// sdExtraArgsOpen / sdExtraArgsClose delimit the block sd-server parses the
+// native knobs out of. It extracts the JSON between them with a NON-GREEDY regex,
+// so a stray closing tag in user text would truncate the block -- which is why
+// stripSDExtraArgsTag removes any the user typed.
+const (
+	sdExtraArgsOpen  = "<sd_cpp_extra_args>"
+	sdExtraArgsClose = "</sd_cpp_extra_args>"
+)
+
+// sdExtraArgs is the <sd_cpp_extra_args> JSON block, in sd-server's NATIVE schema
+// (not the sdapi aliases): negative_prompt / clip_skip / seed are top-level; the
+// sampler (sample_method), scheduler, step count and CFG (guidance.txt_cfg) live
+// under sample_params. Every field is omitempty and each nested object is built
+// only when it carries a value, so an unset knob never reaches sd-server and
+// leaves its own per-model default.
+type sdExtraArgs struct {
+	NegativePrompt string          `json:"negative_prompt,omitempty"`
+	ClipSkip       *int            `json:"clip_skip,omitempty"`
+	Seed           *int            `json:"seed,omitempty"`
+	SampleParams   *sdSampleParams `json:"sample_params,omitempty"`
+}
+
+type sdSampleParams struct {
+	SampleSteps  *int        `json:"sample_steps,omitempty"`
+	SampleMethod string      `json:"sample_method,omitempty"`
+	Scheduler    string      `json:"scheduler,omitempty"`
+	Guidance     *sdGuidance `json:"guidance,omitempty"`
+}
+
+type sdGuidance struct {
+	TxtCFG *float64 `json:"txt_cfg,omitempty"`
+}
+
+// buildSDExtraArgs renders the <sd_cpp_extra_args> block for the thread's
+// advanced knobs, or "" when none is set. The payload is produced by json.Marshal
+// of a typed struct, never string concatenation, so it is valid by construction
+// and the one free-text knob (negative_prompt) is auto-escaped (after any literal
+// tag is stripped from it, same reason as the prompt). An empty object ("{}")
+// yields "", so a thread that set no advanced knob leaves the prompt pristine.
+func buildSDExtraArgs(img *portal.ChatImageSettings) string {
+	args := sdExtraArgs{
+		NegativePrompt: stripSDExtraArgsTag(img.NegativePrompt),
+		ClipSkip:       img.ClipSkip,
+		Seed:           img.Seed,
+	}
+	if img.Steps != nil || img.CFG != nil || img.Sampler != "" || img.Scheduler != "" {
+		sp := &sdSampleParams{
+			SampleSteps:  img.Steps,
+			SampleMethod: img.Sampler,
+			Scheduler:    img.Scheduler,
+		}
+		if img.CFG != nil {
+			sp.Guidance = &sdGuidance{TxtCFG: img.CFG}
+		}
+		args.SampleParams = sp
+	}
+	raw, err := json.Marshal(args)
+	if err != nil || string(raw) == "{}" {
+		return ""
+	}
+	return sdExtraArgsOpen + string(raw) + sdExtraArgsClose
+}
+
+// stripSDExtraArgsTag removes every literal sd_cpp_extra_args open/close tag from
+// user text, so a user cannot smuggle sampler overrides -- or break the parse by
+// closing the block early -- through the prompt or the negative prompt. The block
+// buildSDExtraArgs appends is then unambiguously the only one sd-server sees.
+//
+// It loops to a FIXPOINT, which the single-pass form does not: strings.ReplaceAll
+// makes one non-overlapping pass and never re-scans its output, so a tag SPLIT by
+// an inner one -- e.g. "<sd_cpp_extra_<sd_cpp_extra_args>args>" -- RE-FORMS into a
+// whole tag after the pass that would have removed it, and sd-server's non-greedy
+// extractor would then match that surviving user block before ours. Every
+// iteration that changes anything deletes a whole tag and so shrinks the string,
+// so this terminates; at the fixpoint neither tag remains.
+func stripSDExtraArgsTag(s string) string {
+	for {
+		next := strings.ReplaceAll(s, sdExtraArgsOpen, "")
+		next = strings.ReplaceAll(next, sdExtraArgsClose, "")
+		if next == s {
+			return s
+		}
+		s = next
+	}
 }
 
 // lastUserPrompt is the text of the LAST user message in the prepared history

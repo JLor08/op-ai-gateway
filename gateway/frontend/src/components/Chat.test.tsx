@@ -892,6 +892,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(body.settings.image?.n).toBe(4);
     });
 
+    it('reveals the advanced knobs only on demand and sends them (numeric parsed) in the run', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+
+      // The advanced section is collapsed until its toggle is clicked.
+      expect(screen.queryByLabelText(t.chatImageSteps)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.chatImageAdvanced }));
+      expect(screen.getByLabelText(t.chatImageSteps)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.chatImageSteps), { target: { value: '28' } });
+      fireEvent.change(screen.getByLabelText(t.chatImageNegativePrompt), {
+        target: { value: 'blurry' },
+      });
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      // The blank-able text field is parsed to a wire number; the text knob rides as-is.
+      expect(body.settings.image).toMatchObject({ steps: 28, negative_prompt: 'blurry' });
+    });
+
     it('disables the attach button for an image model that is not vision-capable', async () => {
       renderChat(tokens, imageModels);
       await waitForChatReady();

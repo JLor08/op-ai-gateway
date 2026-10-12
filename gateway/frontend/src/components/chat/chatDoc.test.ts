@@ -88,6 +88,7 @@ describe('the persisted image settings mirror the backend omitempty', () => {
     expect(imageSetting('image', DEFAULT_IMAGE_SETTINGS)).toEqual({ image: { n: 1 } });
     expect(
       imageSetting('image', {
+        ...DEFAULT_IMAGE_SETTINGS,
         size: '1024x1024',
         n: 3,
         output_format: 'png',
@@ -150,5 +151,52 @@ describe('the persisted image settings mirror the backend omitempty', () => {
 
   it('carries no image key on the defaults a fresh chat is created with', () => {
     expect('image' in DEFAULTS).toBe(false);
+  });
+
+  it('sends the advanced knobs, parsing the blank-able numerics to wire numbers', () => {
+    const image = imageSetting('image', {
+      ...DEFAULT_IMAGE_SETTINGS,
+      negative_prompt: 'blurry',
+      sampler: 'euler_a',
+      scheduler: 'karras',
+      steps: '28',
+      cfg: '7.5',
+      seed: '0', // 0 is a real seed, not "unset"
+      clip_skip: '2',
+    }).image;
+    expect(image).toMatchObject({
+      negative_prompt: 'blurry',
+      sampler: 'euler_a',
+      scheduler: 'karras',
+      steps: 28,
+      cfg: 7.5,
+      seed: 0,
+      clip_skip: 2,
+    });
+  });
+
+  it('omits a blank or unparseable advanced numeric', () => {
+    const image =
+      imageSetting('image', {
+        ...DEFAULT_IMAGE_SETTINGS,
+        steps: '',
+        cfg: 'abc',
+        seed: '   ',
+      }).image ?? {};
+    expect('steps' in image).toBe(false);
+    expect('cfg' in image).toBe(false);
+    expect('seed' in image).toBe(false);
+  });
+
+  it('round-trips advanced knobs through imageSettingsFrom (numbers -> blank-able strings)', () => {
+    expect(imageSettingsFrom({ sampler: 'euler_a', steps: 28, cfg: 7.5, seed: 0 })).toMatchObject({
+      sampler: 'euler_a',
+      steps: '28',
+      cfg: '7.5',
+      seed: '0',
+    });
+    // An absent numeric comes back as a blank string, never "undefined"/"NaN".
+    expect(imageSettingsFrom(undefined).steps).toBe('');
+    expect(imageSettingsFrom(undefined).negative_prompt).toBe('');
   });
 });

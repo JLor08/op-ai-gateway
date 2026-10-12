@@ -369,6 +369,25 @@ type ChatImageSettings struct {
 	// 0 stays distinguishable from "unset" -- nil is omitted, so only a value the
 	// composer moved off the upstream default is forwarded.
 	OutputCompression *int `json:"output_compression,omitempty"`
+
+	// The advanced sd-server knobs (Phase 1b). Unlike the OpenAI-shaped fields
+	// above, these are NOT top-level on /v1/images/generations: sd-server reads
+	// them only from a <sd_cpp_extra_args>{…}</sd_cpp_extra_args> block embedded in
+	// the prompt (its own sanctioned extension point). buildImagesBody
+	// (chat_runs_images.go) maps the set ones into that block -- NegativePrompt,
+	// Seed and ClipSkip are top-level in the block; Steps, Sampler, Scheduler and
+	// CFG live under its nested sample_params. The numerics are POINTERS so an
+	// explicit 0 (a real seed/clip_skip) is distinguishable from "unset", like
+	// OutputCompression; a nil/empty knob is omitted so sd-server keeps its own
+	// (per-model) default. Passed opaquely -- the gateway does not own sd-server's
+	// sampler/scheduler enum set or numeric caps.
+	NegativePrompt string   `json:"negative_prompt,omitempty"`
+	Sampler        string   `json:"sampler,omitempty"`
+	Scheduler      string   `json:"scheduler,omitempty"`
+	Steps          *int     `json:"steps,omitempty"`
+	CFG            *float64 `json:"cfg,omitempty"`
+	Seed           *int     `json:"seed,omitempty"`
+	ClipSkip       *int     `json:"clip_skip,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
