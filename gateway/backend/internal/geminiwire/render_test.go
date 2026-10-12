@@ -25,7 +25,7 @@ func TestRenderSystemAndRoleMerge(t *testing.T) {
 }
 
 func TestRenderAssistantToolCallRestoresSignature(t *testing.T) {
-	id := encodeToolCallID("get_weather", "sig-xyz")
+	id := encodeToolCallID("get_weather", "sig-xyz", 0)
 	req := inference.Request{Messages: []inference.Message{
 		{Role: inference.RoleAssistant, ToolCalls: []inference.ToolCall{{ID: id, Name: "get_weather", Arguments: `{"city":"NYC"}`}}},
 		{Role: inference.RoleTool, ToolCallID: id, Content: []inference.ContentPart{{Type: inference.ContentText, Text: `{"temp":9}`}}},
@@ -135,7 +135,7 @@ func TestRenderGenerationConfigAndThinking(t *testing.T) {
 
 func TestRenderBadToolArgsBecomeEmptyObject(t *testing.T) {
 	req := inference.Request{Messages: []inference.Message{
-		{Role: inference.RoleAssistant, ToolCalls: []inference.ToolCall{{ID: encodeToolCallID("f", ""), Name: "f", Arguments: "not json"}}},
+		{Role: inference.RoleAssistant, ToolCalls: []inference.ToolCall{{ID: encodeToolCallID("f", "", 0), Name: "f", Arguments: "not json"}}},
 	}}
 	got := RenderRequest(req, "gemini-2.5-pro")
 	if string(got.Contents[0].Parts[0].FunctionCall.Args) != "{}" {
@@ -210,7 +210,7 @@ func TestRenderAssistantForeignToolCallID(t *testing.T) {
 
 	// An encoded id with an empty name falls back to tc.Name but keeps its signature.
 	got = RenderRequest(inference.Request{Messages: []inference.Message{
-		assistantCall(encodeToolCallID("", "sig-only"), "g"),
+		assistantCall(encodeToolCallID("", "sig-only", 0), "g"),
 	}}, "gemini-3-pro")
 	fc = got.Contents[0].Parts[0]
 	if fc.FunctionCall == nil || fc.FunctionCall.Name != "g" || fc.ThoughtSignature != "sig-only" {
@@ -223,12 +223,12 @@ func TestRenderAssistantTextArgsAndToolResultPassthrough(t *testing.T) {
 		Role:    inference.RoleAssistant,
 		Content: []inference.ContentPart{{Type: inference.ContentText, Text: "checking"}},
 		ToolCalls: []inference.ToolCall{{
-			ID: encodeToolCallID("f", ""), Name: "f", Arguments: ` {"city":"NYC"} `,
+			ID: encodeToolCallID("f", "", 0), Name: "f", Arguments: ` {"city":"NYC"} `,
 		}},
 	}
 	got := RenderRequest(inference.Request{Messages: []inference.Message{
 		asst,
-		toolResult(encodeToolCallID("f", ""), `{"temp":9}`),
+		toolResult(encodeToolCallID("f", "", 0), `{"temp":9}`),
 	}}, "gemini-2.5-pro")
 	parts := got.Contents[0].Parts
 	if len(parts) != 2 || parts[0].Text != "checking" || parts[1].FunctionCall == nil {

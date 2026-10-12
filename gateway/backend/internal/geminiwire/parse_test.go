@@ -77,12 +77,12 @@ func TestParseResponseDecodeError(t *testing.T) {
 }
 
 func TestParseStreamChunkDeltasAndDone(t *testing.T) {
-	r1, done1, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}`))
+	r1, done1, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}`), 0)
 	if err != nil || done1 || r1.Text != "Hel" {
 		t.Fatalf("chunk1 = %+v done=%v err=%v", r1, done1, err)
 	}
 	r2, done2, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}],
-		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}`))
+		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}`), 0)
 	if err != nil || !done2 || r2.Text != "lo" || r2.FinishReason != "stop" {
 		t.Fatalf("chunk2 = %+v done=%v err=%v", r2, done2, err)
 	}
@@ -93,7 +93,7 @@ func TestParseStreamChunkDeltasAndDone(t *testing.T) {
 
 func TestParseStreamChunkFunctionCall(t *testing.T) {
 	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[
-		{"functionCall":{"name":"f","args":{}}}]},"finishReason":"STOP"}]}`))
+		{"functionCall":{"name":"f","args":{}}}]},"finishReason":"STOP"}]}`), 0)
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
@@ -140,20 +140,20 @@ func TestParseResponseFunctionCallArgsAbsentOrNull(t *testing.T) {
 }
 
 func TestParseStreamChunkPromptBlockedIsDone(t *testing.T) {
-	r, done, err := ParseStreamChunk([]byte(`{"promptFeedback":{"blockReason":"SAFETY"}}`))
+	r, done, err := ParseStreamChunk([]byte(`{"promptFeedback":{"blockReason":"SAFETY"}}`), 0)
 	if err != nil || !done || r.FinishReason != "content_filter" {
 		t.Fatalf("blocked chunk = %+v done=%v err=%v", r, done, err)
 	}
 }
 
 func TestParseStreamChunkDecodeError(t *testing.T) {
-	if _, _, err := ParseStreamChunk([]byte("not json")); err == nil {
+	if _, _, err := ParseStreamChunk([]byte("not json"), 0); err == nil {
 		t.Fatal("want decode error")
 	}
 }
 
 func TestParseStreamChunkThoughtDeltaAndNoUsage(t *testing.T) {
-	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"hmm","thought":true}]}}]}`))
+	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"hmm","thought":true}]}}]}`), 0)
 	if err != nil || done || r.Reasoning != "hmm" || r.Text != "" {
 		t.Fatalf("thought chunk = %+v done=%v err=%v", r, done, err)
 	}
@@ -187,7 +187,7 @@ func TestParseStreamChunkFunctionCallWithoutFinishReason(t *testing.T) {
 	// A functionCall chunk before the terminal chunk: the tool call is returned,
 	// but the chunk is not done and carries no finish reason (per-chunk mapping).
 	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[
-		{"functionCall":{"name":"f","args":{"a":1}},"thoughtSignature":"s"}]}}]}`))
+		{"functionCall":{"name":"f","args":{"a":1}},"thoughtSignature":"s"}]}}]}`), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestParseResponsePromptBlockedKeepsUsage(t *testing.T) {
 func TestParseStreamChunkWhitespaceFinishReasonIsNotDone(t *testing.T) {
 	// done and FinishReason are derived from the same mapped value, so a
 	// whitespace-only raw finishReason cannot yield done=true with an empty reason.
-	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"  "}]}`))
+	r, done, err := ParseStreamChunk([]byte(`{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"  "}]}`), 0)
 	if err != nil || done || r.FinishReason != "" || r.Text != "x" {
 		t.Fatalf("chunk = %+v done=%v err=%v", r, done, err)
 	}

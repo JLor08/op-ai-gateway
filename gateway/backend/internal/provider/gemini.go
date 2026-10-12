@@ -202,7 +202,10 @@ func (st *geminiStreamState) apply(data string, emit StreamEmit) error {
 	if geminiStreamIsError([]byte(data)) {
 		return fmt.Errorf("%w: upstream stream error: %s", ErrUnavailable, readUpstreamErrorSnippet(strings.NewReader(data), geminiErrorBodyLimit))
 	}
-	res, chunkDone, err := geminiwire.ParseStreamChunk([]byte(data))
+	// len(st.toolCalls) is the number of calls collected from earlier chunks: it
+	// is this chunk's tool-call index offset, so parallel same-name calls spread
+	// across chunks still get distinct neutral ids.
+	res, chunkDone, err := geminiwire.ParseStreamChunk([]byte(data), len(st.toolCalls))
 	if err != nil {
 		return nil // tolerate a non-JSON frame
 	}
