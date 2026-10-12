@@ -16,7 +16,8 @@
 - **Credential header is `x-goog-api-key`** (raw, via `applyUpstreamAuth`). Never the `?key=` query param (it leaks into wrapped `*url.Error` text).
 - **Thinking-budget values are verbatim:** `reasoning_effort` → Gemini-2.5 `thinkingBudget` minimal/low→`1024`, medium→`8192`, high→`24576`; Gemini-3.x → `thinkingLevel` low/medium/high.
 - **No DB schema change → no Postgres leg.** `vendor_accounts.vendor` is free text.
-- **Go gates:** `go build ./...`, `go vet ./...`, `go test ./...`, and golangci-lint (`golangci-lint fmt --diff` + `golangci-lint run`) per Go module — gofumpt + gocritic are enforced and are NOT covered by `gofmt`/`go vet`.
+- **Go gates:** `go build ./...`, `go vet ./...`, `go test ./...`, and golangci-lint (`golangci-lint fmt --diff` + `golangci-lint run`) per Go module — gofumpt + gocritic are enforced and are NOT covered by `gofmt`/`go vet`. Run archtest with `-count=1` (it caches and can report stale `ok`).
+- **Import grouping:** the module path `op-ai-gateway` is dotless, so gci/gofumpt treats `op-ai-gateway/internal/...` imports as stdlib and sorts them into the SINGLE import block (one sorted group, as in `internal/provider/anthropic_messages.go`). The separate stdlib/internal import groups shown in this plan's code blocks are illustrative — run `golangci-lint fmt` and accept its single-block ordering; a merged sorted import block is correct, not a deviation.
 - **Frontend gates:** `npm run test` (vitest) and prettier `npm run format:check` (CI runs format:check, which local test/build/lint miss).
 - **Docs gate:** `check-docs` must pass. Do NOT write the branch-local working-docs directory path as a literal string in any committed file; reference this plan's spec only by the relative `../specs/...` path above.
 - **Repo-facing text (code comments, docs, commit messages) in English.** Commit bodies are substantive (the repo's squash-merge pre-fills the squash description from the commit message body).
@@ -1220,13 +1221,15 @@ func TestVendorAccountTargetNativeGemini(t *testing.T) {
 
 func TestVendorAccountModelTargetNativeFailClosed(t *testing.T) {
 	acc := VendorAccount{Vendor: VendorGoogleNative, AuthType: "api_key", BaseURL: ""}
-	if _, err := vendorAccountModelTarget(acc, VendorAccountModel{}, inference.Request{Model: "gemini-2.5-pro"}); err == nil {
+	// vendorAccountModelTarget(acc, m, req, apiFlavor) returns (Target, ok bool);
+	// ok==false means "fail closed, fall through" (not an error return).
+	if _, ok := vendorAccountModelTarget(acc, VendorAccountModel{}, inference.Request{Model: "gemini-2.5-pro"}, "openai"); ok {
 		t.Fatal("empty BaseURL for a preset vendor must fail closed")
 	}
 }
 ```
 
-> The exact signatures of `vendorAccountTarget` / `vendorAccountModelTarget` and the `Target` field names (`Provider`, `Endpoint`, `APITokenHeader`, `MessagesMode`, `ResponsesMode`) are in `resolver.go`; match the sibling tests in the same file and the task brief.
+> Verified signatures (authoritative) in `resolver.go`: `func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target` (returns a `Target`); `func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool)` (the `bool` is `ok`; `false` = fail-closed/fall-through, NOT an error). The current fail-closed guard is `if IsOpenAICompatibleVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" { return Target{}, false }` — change its predicate to `IsPresetVendor`. The native branch goes in `vendorAccountTarget` between the `acc.Vendor == VendorAnthropic` branch and the `else if IsOpenAICompatibleVendor(acc.Vendor)` branch. `Target` fields the test asserts: `Provider`, `Endpoint`, `APITokenHeader`, `MessagesMode`, `ResponsesMode` (both the latter stay zero/`""` for a translate target), `APIFlavors` (`[]string{APIFlavorOpenAI, APIFlavorAnthropic}`). `VendorPreset` already has `DefaultBaseURL, PathPrefix, ValidateVia, ValidatePath, StripModelsPrefix, UsageVia, UsagePath` — add `Dialect string`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
