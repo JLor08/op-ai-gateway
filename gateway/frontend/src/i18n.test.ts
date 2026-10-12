@@ -458,7 +458,7 @@ describe('server override i18n keys', () => {
   });
 });
 
-describe('OpenAI-compatible vendor i18n keys', () => {
+describe('configurable-root vendor i18n keys', () => {
   it('defines the provider labels, base-URL strings and base-URL errors in de and en', () => {
     const keys = [
       'vendorXAI',

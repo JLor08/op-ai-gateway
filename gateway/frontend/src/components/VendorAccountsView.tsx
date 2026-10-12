@@ -25,8 +25,8 @@ import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
 import { isValidBaseUrl, isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 import {
   defaultBaseUrl,
-  isOpenAICompatibleVendor,
-  OPENAI_COMPATIBLE_VENDORS,
+  isConfigurableRootVendor,
+  CONFIGURABLE_ROOT_VENDORS,
 } from './shared/vendorPresets';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
@@ -38,10 +38,10 @@ type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 // The vendors and authentication types a user can create an account for. An
 // api_key account is created with its key; a subscription account is created
 // disconnected and connected from its detail view (VendorSubscriptionConnect).
-// openai and anthropic offer both; the OpenAI-compatible vendors (x.ai,
+// openai and anthropic offer both; the configurable-root vendors (x.ai,
 // OpenRouter, Kilo, Gemini, native Gemini and Custom) are api-key only and carry a
 // base URL.
-const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic', ...OPENAI_COMPATIBLE_VENDORS];
+const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic', ...CONFIGURABLE_ROOT_VENDORS];
 const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
 
 function authTypeLabel(t: Translation, authType: string): string {
@@ -77,8 +77,8 @@ function hasCredential(account: VendorAccount): boolean {
  * form then opens its detail view) and connected from the detail view's
  * "connect subscription" panel, which only ever sees `subscription_connected`.
  *
- * An OpenAI-compatible account (x.ai, OpenRouter, Kilo, Gemini, Custom) is
- * api-key only -- the create form hides the authentication select for it -- and
+ * A configurable-root account (x.ai, OpenRouter, Kilo, Gemini, native Gemini,
+ * Custom) is api-key only -- the create form hides the authentication select for it -- and
  * carries a base URL: an optional create-form field (blank = the preset's default
  * root, shown as the placeholder; required for Custom) validated inline. The base
  * URL is IMMUTABLE, so the detail view shows it read-only and a save never sends
@@ -170,15 +170,15 @@ export function VendorAccountsView({
   // The optional model prefix, as typed (create and detail); trimmed on send.
   const [modelPrefix, setModelPrefix] = useState('');
   const modelPrefixValid = isValidModelPrefix(modelPrefix);
-  // Create only: the root URL of an OpenAI-compatible account, as typed (trimmed
+  // Create only: the root URL of a configurable-root account, as typed (trimmed
   // on send; immutable once created, so the detail view never edits it).
   const [baseUrl, setBaseUrl] = useState('');
   const baseUrlValid = isValidBaseUrl(baseUrl);
-  const compatVendor = isOpenAICompatibleVendor(vendor);
+  const rootVendor = isConfigurableRootVendor(vendor);
   // Custom has no default root, so a blank base URL cannot be created.
   const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
-  // An OpenAI-compatible vendor is api-key only, whatever the select last said.
-  const createAuthType = compatVendor ? 'api_key' : authType;
+  // A configurable-root vendor is api-key only, whatever the select last said.
+  const createAuthType = rootVendor ? 'api_key' : authType;
   const baseUrlNote =
     vendor === 'openai_compatible' ? t.vendorAccountBaseUrlCustomNote : t.vendorAccountBaseUrlNote;
 
@@ -221,10 +221,10 @@ export function VendorAccountsView({
       // An empty prefix is simply omitted (= none).
       const prefix = normalizeModelPrefix(modelPrefix);
       const prefixField = prefix === '' ? {} : { model_prefix: prefix };
-      // The base URL only exists for an OpenAI-compatible vendor; left blank it is
+      // The base URL only exists for a configurable-root vendor; left blank it is
       // omitted and the backend applies the preset's default root.
       const base = baseUrl.trim();
-      const baseUrlField = compatVendor && base !== '' ? { base_url: base } : {};
+      const baseUrlField = rootVendor && base !== '' ? { base_url: base } : {};
       // A subscription account carries no key: it is created disconnected.
       const created = await api.createVendorAccount(
         createAuthType === 'subscription'
@@ -447,8 +447,8 @@ export function VendorAccountsView({
 
   // Create sub-view: vendor + authentication + name, and the (plain, required)
   // api key for an api_key account. A subscription account has no key field: it
-  // is created disconnected and connected from its detail view. An
-  // OpenAI-compatible vendor has no authentication choice (api key only) and a
+  // is created disconnected and connected from its detail view. A
+  // configurable-root vendor has no authentication choice (api key only) and a
   // base-URL field instead.
   if (mode === 'create') {
     return (
@@ -474,7 +474,7 @@ export function VendorAccountsView({
                 // The root URL belongs to one vendor: never carry it (or a
                 // subscription choice the new vendor cannot have) across.
                 setBaseUrl('');
-                if (isOpenAICompatibleVendor(next)) setAuthType('api_key');
+                if (isConfigurableRootVendor(next)) setAuthType('api_key');
               }}
             >
               {VENDORS.map((v) => (
@@ -483,7 +483,7 @@ export function VendorAccountsView({
                 </option>
               ))}
             </SelectField>
-            {compatVendor ? (
+            {rootVendor ? (
               <Typography color="text.secondary" variant="body2">
                 {t.vendorAccountApiKeyOnlyNote}
               </Typography>
@@ -512,7 +512,7 @@ export function VendorAccountsView({
               onChange={(e) => setName(e.target.value)}
               required
             />
-            {compatVendor && (
+            {rootVendor && (
               <Field
                 id="vendor-account-base-url"
                 label={t.vendorAccountBaseUrlLabel}
@@ -624,7 +624,7 @@ export function VendorAccountsView({
               readOnly
             />
             {/* Immutable: fixed when the account was created, never part of a save. */}
-            {isOpenAICompatibleVendor(account.vendor) && (
+            {isConfigurableRootVendor(account.vendor) && (
               <Field
                 id="vendor-account-detail-base-url"
                 label={t.vendorAccountBaseUrlLabel}

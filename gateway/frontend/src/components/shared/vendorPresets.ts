@@ -4,12 +4,12 @@
 import type { VendorAccountVendor } from '../../api';
 
 // The vendors reached through a configurable root URL (the backend's
-// routing.IsOpenAICompatibleVendor), in the order the create form lists them
-// after openai and anthropic. All but google_native speak the OpenAI wire format;
+// routing.IsPresetVendor), in the order the create form lists them after openai
+// and anthropic. All but google_native speak the OpenAI wire format;
 // google_native speaks Google's native generateContent API but has the same
 // create-form shape. They are api-key only and carry an immutable base_url;
 // openai and anthropic have fixed hosts.
-export const OPENAI_COMPATIBLE_VENDORS = [
+export const CONFIGURABLE_ROOT_VENDORS = [
   'xai',
   'openrouter',
   'kilo',
@@ -18,11 +18,11 @@ export const OPENAI_COMPATIBLE_VENDORS = [
   'openai_compatible',
 ] as const satisfies readonly VendorAccountVendor[];
 
-export type OpenAICompatibleVendor = (typeof OPENAI_COMPATIBLE_VENDORS)[number];
+export type ConfigurableRootVendor = (typeof CONFIGURABLE_ROOT_VENDORS)[number];
 
-/** Whether `vendor` is one of the OpenAI-compatible vendors (api-key only, configurable root). */
-export function isOpenAICompatibleVendor(vendor: string): vendor is OpenAICompatibleVendor {
-  return (OPENAI_COMPATIBLE_VENDORS as readonly string[]).includes(vendor);
+/** Whether `vendor` is a configurable-root preset vendor (api-key only, configurable base URL; the backend's routing.IsPresetVendor). */
+export function isConfigurableRootVendor(vendor: string): vendor is ConfigurableRootVendor {
+  return (CONFIGURABLE_ROOT_VENDORS as readonly string[]).includes(vendor);
 }
 
 // The default root of each preset, shown as the base-URL field's PLACEHOLDER so
@@ -31,7 +31,7 @@ export function isOpenAICompatibleVendor(vendor: string): vendor is OpenAICompat
 // default when base_url is omitted, so a drift here can only mislabel a
 // placeholder, never change where a request goes. "Custom" has no default; its
 // placeholder is a mere example of the shape.
-const DEFAULT_BASE_URLS: Record<OpenAICompatibleVendor, string> = {
+const DEFAULT_BASE_URLS: Record<ConfigurableRootVendor, string> = {
   xai: 'https://api.x.ai',
   openrouter: 'https://openrouter.ai/api',
   kilo: 'https://api.kilo.ai/api',
@@ -42,5 +42,5 @@ const DEFAULT_BASE_URLS: Record<OpenAICompatibleVendor, string> = {
 
 /** The placeholder root for a vendor's base-URL field; "" for a vendor with a fixed host. */
 export function defaultBaseUrl(vendor: string): string {
-  return isOpenAICompatibleVendor(vendor) ? DEFAULT_BASE_URLS[vendor] : '';
+  return isConfigurableRootVendor(vendor) ? DEFAULT_BASE_URLS[vendor] : '';
 }

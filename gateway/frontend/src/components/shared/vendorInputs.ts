@@ -69,7 +69,7 @@ export function isValidCodexClientVersion(raw: string): boolean {
 const BASE_URL_FORBIDDEN_CHARS = /[\u0000- \u007f]/;
 
 /**
- * Whether `raw` is an acceptable OpenAI-compatible base URL (the upstream root):
+ * Whether `raw` is an acceptable vendor-account base URL (the upstream root):
  * blank (the preset's default root, or "required" for Custom -- the caller
  * decides which), or an https URL with a non-empty hostname and no userinfo,
  * query or fragment. Judged on the trimmed value, like the backend

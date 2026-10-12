@@ -4,14 +4,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   defaultBaseUrl,
-  isOpenAICompatibleVendor,
-  OPENAI_COMPATIBLE_VENDORS,
+  isConfigurableRootVendor,
+  CONFIGURABLE_ROOT_VENDORS,
 } from './vendorPresets';
 import { isValidBaseUrl } from './vendorInputs';
 
-describe('OPENAI_COMPATIBLE_VENDORS', () => {
-  it('lists the six OpenAI-compatible vendors, in dropdown order', () => {
-    expect([...OPENAI_COMPATIBLE_VENDORS]).toEqual([
+describe('CONFIGURABLE_ROOT_VENDORS', () => {
+  it('lists the six configurable-root vendors, in dropdown order', () => {
+    expect([...CONFIGURABLE_ROOT_VENDORS]).toEqual([
       'xai',
       'openrouter',
       'kilo',
@@ -22,13 +22,13 @@ describe('OPENAI_COMPATIBLE_VENDORS', () => {
   });
 });
 
-describe('isOpenAICompatibleVendor', () => {
-  it.each(OPENAI_COMPATIBLE_VENDORS)('is true for %s', (vendor) => {
-    expect(isOpenAICompatibleVendor(vendor)).toBe(true);
+describe('isConfigurableRootVendor', () => {
+  it.each(CONFIGURABLE_ROOT_VENDORS)('is true for %s', (vendor) => {
+    expect(isConfigurableRootVendor(vendor)).toBe(true);
   });
 
   it.each(['openai', 'anthropic', '', 'mystery'])('is false for %j', (vendor) => {
-    expect(isOpenAICompatibleVendor(vendor)).toBe(false);
+    expect(isConfigurableRootVendor(vendor)).toBe(false);
   });
 });
 

@@ -2407,7 +2407,7 @@ const de = {
   vendorAccountModelPrefixLabel: 'Modell-Präfix (optional)',
   vendorAccountModelPrefixNote:
     'Wird jeder Modell-ID vorangestellt, z. B. „chatgpt/“ → Modelle erscheinen als „chatgpt/gpt-6-luna“. Erlaubt: Buchstaben, Ziffern und . _ ~ : / @ + - (höchstens 64 Zeichen, kein „..“).',
-  // The base URL of an OpenAI-compatible account (create form; read-only on the
+  // The base URL of a configurable-root account (create form; read-only on the
   // detail) and the note that such an account is api-key only.
   vendorAccountBaseUrlLabel: 'Basis-URL',
   vendorAccountBaseUrlNote:
@@ -5069,7 +5069,7 @@ const en: PortalMessages = {
   vendorAccountModelPrefixLabel: 'Model prefix (optional)',
   vendorAccountModelPrefixNote:
     'Put in front of every model ID, e.g. "chatgpt/" → models appear as "chatgpt/gpt-6-luna". Allowed: letters, digits and . _ ~ : / @ + - (at most 64 characters, no "..").',
-  // The base URL of an OpenAI-compatible account (create form; read-only on the
+  // The base URL of a configurable-root account (create form; read-only on the
   // detail) and the note that such an account is api-key only.
   vendorAccountBaseUrlLabel: 'Base URL',
   vendorAccountBaseUrlNote:
