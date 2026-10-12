@@ -26,7 +26,11 @@ func RenderRequest(req inference.Request, model string) GenerateContentRequest {
 
 func renderMessages(messages []inference.Message) (system string, contents []Content) {
 	var sys []string
-	nameByID := toolNameByID(messages)
+	// names maps a tool-call id to the function name of the assistant call that
+	// issued it, built from the assistant messages seen so far. A tool result is
+	// resolved only against EARLIER calls, so a result placed before its call (or
+	// a reused foreign id) never picks up a later, unrelated function's name.
+	names := map[string]string{}
 	for _, msg := range messages {
 		switch msg.Role {
 		case inference.RoleSystem, inference.RoleDeveloper:
@@ -34,32 +38,19 @@ func renderMessages(messages []inference.Message) (system string, contents []Con
 				sys = append(sys, t)
 			}
 		case inference.RoleTool:
-			contents = appendTurn(contents, "user", []Part{functionResponsePart(msg, nameByID)})
+			contents = appendTurn(contents, "user", []Part{functionResponsePart(msg, names)})
 		case inference.RoleAssistant:
+			for _, tc := range msg.ToolCalls {
+				if tc.ID != "" && tc.Name != "" {
+					names[tc.ID] = tc.Name
+				}
+			}
 			contents = appendTurn(contents, "model", assistantParts(msg))
 		default:
 			contents = appendTurn(contents, "user", userParts(msg))
 		}
 	}
 	return strings.Join(sys, "\n\n"), contents
-}
-
-// toolNameByID maps a tool-call id to the function name declared by the
-// assistant that issued it, so a functionResponse can recover its mandatory
-// name even when the id is foreign (not minted by this package).
-func toolNameByID(messages []inference.Message) map[string]string {
-	m := map[string]string{}
-	for _, msg := range messages {
-		if msg.Role != inference.RoleAssistant {
-			continue
-		}
-		for _, tc := range msg.ToolCalls {
-			if tc.ID != "" && tc.Name != "" {
-				m[tc.ID] = tc.Name
-			}
-		}
-	}
-	return m
 }
 
 func appendTurn(turns []Content, role string, parts []Part) []Content {
@@ -98,10 +89,9 @@ func assistantParts(msg inference.Message) []Part {
 		}
 	}
 	for _, tc := range msg.ToolCalls {
-		name, sig, encoded := decodeToolCallID(tc.ID)
-		if !encoded {
-			name, sig = tc.Name, ""
-		}
+		// A foreign id decodes to ("", "", false), so it falls back to tc.Name
+		// with no signature; an encoded id restores both name and signature.
+		name, sig, _ := decodeToolCallID(tc.ID)
 		if name == "" {
 			name = tc.Name
 		}
@@ -114,10 +104,10 @@ func assistantParts(msg inference.Message) []Part {
 	return parts
 }
 
-func functionResponsePart(msg inference.Message, nameByID map[string]string) Part {
-	name, _, encoded := decodeToolCallID(msg.ToolCallID)
-	if !encoded || name == "" {
-		name = nameByID[msg.ToolCallID] // "" when foreign/absent; VERIFY-LIVE
+func functionResponsePart(msg inference.Message, names map[string]string) Part {
+	name, _, _ := decodeToolCallID(msg.ToolCallID)
+	if name == "" {
+		name = names[msg.ToolCallID] // "" when foreign with no earlier call; VERIFY-LIVE
 	}
 	return Part{FunctionResponse: &FunctionResponse{Name: name, Response: wrapToolResult(msg.Text())}}
 }
