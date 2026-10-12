@@ -1971,14 +1971,18 @@ api-key and discovered on create; the shim google path is unchanged."
 
 - [ ] **Step 1: Write the failing tests**
 
-Extend `TestRedactCaptureHeaders` (in `capture_serial_test.go`) to assert `x-goog-api-key` is redacted:
+Extend `TestRedactCaptureHeaders` (in `capture_serial_test.go`) to assert `x-goog-api-key` is redacted. **This is NOT a table test** — it builds an `http.Header`, calls `redactCaptureHeaders(h)`, and loops over a `[]string` of header names expecting each to be `"[redacted]"`. So add the header to the fixture and the name to the asserted slice:
 
 ```go
-	// among the existing header assertions:
-	{name: "x-goog-api-key", in: "secret", wantRedacted: true},
+	// alongside the other h.Set(...) lines near the top of the test:
+	// The upstream credential header of a native Gemini account.
+	h.Set("X-Goog-Api-Key", "goog-secret")
 ```
-
-(Adapt to the test's actual table shape.)
+```go
+	// add "X-Goog-Api-Key" to the []string of names checked for the [redacted] marker
+	// (net/http canonicalizes x-goog-api-key -> X-Goog-Api-Key):
+	for _, name := range []string{"Authorization", "Cookie", "X-Op-Csrf", "X-Op-Run-As-Token", "X-Api-Key", "X-Goog-Api-Key"} {
+```
 
 Add a `native_passthrough_test.go` case asserting `upstreamPath(routing.Target{Provider: routing.ProviderVendorGemini}, "openai_chat_completions")` returns the Gemini label (not `/v1/chat/completions`):
 
