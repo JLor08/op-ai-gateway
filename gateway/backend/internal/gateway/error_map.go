@@ -50,6 +50,11 @@ var sharedErrorMap = []errRow{
 	{err: portal.ErrChatBlobTypeUnsupported, status: http.StatusBadRequest, code: "images.blob_type_unsupported", msg: "image must be a base64 data URL of type png, jpeg, webp or gif"},
 	{err: portal.ErrChatBlobTooLarge, status: http.StatusBadRequest, code: "images.blob_too_large", msg: "image is too large"},
 	{err: portal.ErrChatBlobNotOwned, status: http.StatusBadRequest, code: "images.blob_not_owned", msg: "image reference does not belong to this chat"},
+	// A run refused because the stored images its history would carry exceed
+	// MaxRunHistoryBytes (portal.PrepareChatRun, before the turn is stored). The
+	// thread itself is fine and not lost: the user can remove images or start a
+	// new chat, so it is a request refusal like the rows above, not a 5xx.
+	{err: portal.ErrChatRunHistoryTooLarge, status: http.StatusBadRequest, code: "portal.chat_run_history_too_large", msg: "the images in this conversation are too large to send to the model"},
 	// The serving endpoint's not-found (GET /api/portal/chat-blobs/{id}): no
 	// such blob, someone else's, its chat gone, or a type that is not servable --
 	// one answer for all of them (no existence leak). A code of its own, not

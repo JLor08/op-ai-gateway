@@ -54,9 +54,15 @@ var (
 	// store.ErrNotFound: the serving endpoint answers with a blob-specific code.
 	// Mapped to 404.
 	ErrChatBlobNotFound = errors.New("portal.chat_blob_not_found")
+	// ErrChatRunHistoryTooLarge is returned when resolving a run's stored images
+	// would make its upstream history carry more than MaxRunHistoryBytes. The run
+	// is refused before the turn is stored. Mapped to 400.
+	ErrChatRunHistoryTooLarge = errors.New("portal.chat_run_history_too_large")
 )
 
 const (
+	// chatKindImage is the ChatRunSettings.Kind of an image-generation thread.
+	chatKindImage = "image"
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
 	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
@@ -77,6 +83,11 @@ const (
 	// config.Config.MaxChatBlobBytes's default and the portal composer's own 20
 	// MiB upload limit.
 	DefaultMaxChatBlobBytes = 20 << 20
+	// DefaultMaxRunHistoryBytes bounds the decoded image bytes one run's upstream
+	// history may carry when the service is built without a bound. It mirrors
+	// config.Config.MaxRunHistoryBytes's default. Base64 adds a third on the wire,
+	// so the default keeps the images of one request to about 43 MiB.
+	DefaultMaxRunHistoryBytes = 32 << 20
 )
 
 // ChatSummaryDTO is the list DTO: plaintext metadata only, never the content.
@@ -490,7 +501,10 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // persisted — which the caller must feed into the run executor (via
 // gateway.PrepareRunResult.Settings) instead of the raw request settings, so a
 // self-healed clear is honored rather than silently overridden by the stale
-// value the client submitted. Owner-scoped.
+// value the client submitted. For a text run the history carries its images as
+// data urls, the stored references of the older turns resolved to their bytes
+// (resolveChatBlobRefs); an image run's history is returned as stored.
+// Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -610,7 +624,7 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// kind keeps a text thread's persisted settings byte-identical even against a
 	// raw API client that submits them (ChatRunSettings is the POST body
 	// verbatim), mirroring the ServerOverrideForceUnreachable self-heal above.
-	if req.Settings.Kind != "image" {
+	if req.Settings.Kind != chatKindImage {
 		req.Settings.Image = nil
 	}
 
@@ -628,11 +642,29 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
+
+	history := buildAPIHistory(req.Settings.SystemPrompt, runMessages)
+	// The stored messages reference their images by url; the run's upstream gets
+	// the images themselves (see resolveChatBlobRefs). The turn being sent is in
+	// runMessages with its bytes inline already, so only the older references are
+	// fetched. An image run skips it: its executor reads nothing of the history but
+	// the last prompt's text, so fetching, decrypting and encoding every image of
+	// the thread would be wasted, and the run-size bound would refuse an image
+	// thread for bytes that are never sent.
+	//
+	// This is before the commit on purpose: a run refused for its history's size,
+	// or whose images cannot be read, stores nothing, so retrying it is not a
+	// duplicate turn.
+	if req.Settings.Kind != chatKindImage {
+		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
+			return nil, ChatRunSettings{}, err
+		}
+	}
 	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 
-	return buildAPIHistory(req.Settings.SystemPrompt, runMessages), req.Settings, nil
+	return history, req.Settings, nil
 }
 
 // buildAPIHistory maps stored messages to OpenAI role+content, prepending a

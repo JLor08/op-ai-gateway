@@ -504,6 +504,14 @@ type ServiceDeps struct {
 	// test/deps literal that omits it needs no special-casing) falls back to
 	// DefaultMaxChatBlobBytes (20 MiB) in NewService.
 	MaxChatBlobBytes int
+	// MaxRunHistoryBytes bounds the total bytes of stored chat images one run
+	// resolves into its upstream history (config.Config.MaxRunHistoryBytes): a
+	// run whose history would carry more is refused. Counted per occurrence, so
+	// an image referenced twice counts twice, because the request carries it
+	// twice. <= 0 (including the zero value, so a test/deps literal that omits
+	// it needs no special-casing) falls back to DefaultMaxRunHistoryBytes
+	// (32 MiB) in NewService.
+	MaxRunHistoryBytes int
 	// OnNetbirdDomainChanged, when set, is invoked (best-effort) after a NetBird
 	// account dns_domain change so the caller can trigger an immediate peer→domain
 	// sync pass. Nil = no trigger (the periodic sync loop is the backstop).
@@ -782,7 +790,10 @@ type Service struct {
 	// maxChatBlobBytes is the resolved per-blob ceiling for one chat binary
 	// payload (see ServiceDeps.MaxChatBlobBytes); always > 0 after NewService.
 	maxChatBlobBytes int
-	settingsVolatile bool
+	// maxRunHistoryBytes is the resolved bound on the stored-image bytes one run
+	// carries (see ServiceDeps.MaxRunHistoryBytes); always > 0 after NewService.
+	maxRunHistoryBytes int
+	settingsVolatile   bool
 	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
 	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
 	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
@@ -874,6 +885,10 @@ func NewService(deps ServiceDeps) *Service {
 	if maxChatBlobBytes <= 0 {
 		maxChatBlobBytes = DefaultMaxChatBlobBytes
 	}
+	maxRunHistoryBytes := deps.MaxRunHistoryBytes
+	if maxRunHistoryBytes <= 0 {
+		maxRunHistoryBytes = DefaultMaxRunHistoryBytes
+	}
 	themes := deps.Themes
 	if themes == nil {
 		themes = &theme.Registry{}
@@ -937,6 +952,7 @@ func NewService(deps ServiceDeps) *Service {
 		agentTLSSeparateDefault:     deps.AgentTLSSeparateDefault,
 		agentPresenceTimeoutDefault: agentPresenceDefault,
 		maxChatBlobBytes:            maxChatBlobBytes,
+		maxRunHistoryBytes:          maxRunHistoryBytes,
 		settingsVolatile:            deps.SettingsVolatile,
 		runtimeChanged:              deps.OnRuntimeConfigChanged,
 		clock:                       clock,

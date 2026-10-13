@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package portal
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"log"
+	"op-ai-gateway/internal/store"
+	"strings"
+)
+
+// unavailableImageText stands in, in a run's history, for an image the chat has
+// no stored bytes for (see resolveChatBlobRefs). The model is told rather than
+// left to guess, and the message keeps a part: an upstream rejects an empty one.
+const unavailableImageText = "[image unavailable]"
+
+var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailableImageText + `"}`)
+
+// resolveChatBlobRefs turns the stored-image references of a run's history into
+// the images themselves: every /api/portal/chat-blobs/{id} url becomes a
+// data:<type>;base64,<bytes> url of the blob's real bytes.
+//
+// A run's history goes to an upstream that cannot reach this gateway's urls --
+// above all a remote provider -- and the adapters drop an image whose url is not
+// a data: or http(s) one without an error, so a reference left in place would
+// silently vanish from the request and the model would answer without seeing the
+// picture. Resolution therefore happens here, where the history is built, for
+// every text run (see PrepareChatRun for why an image run skips it).
+//
+// What it relies on, and what it does not:
+//
+//   - One batched ChatBlobsByIDs for all the distinct ids, scoped to chatID, so
+//     the store returns only blobs this chat holds. An id that is another chat's,
+//     another user's, evicted or never stored is simply absent. A transcript can
+//     carry any id (create and a bare autosave store what they are given), so
+//     this scoping is what stops a grafted reference from becoming someone
+//     else's bytes. It is not the only guard: a row of another chat, or of a type
+//     that is not an allow-listed image type, is refused here too.
+//   - An absent image is replaced by unavailableImagePart and the run goes on.
+//     The alternatives are worse: leaving the reference sends an upstream a
+//     relative url it rejects, or (Anthropic) drops silently; refusing the run
+//     would strand a chat whose old image a RAM store has evicted. The stored
+//     document is not touched; only the history of this run is.
+//   - The bytes carried are bounded by maxRunHistoryBytes, counted per
+//     occurrence (the request carries an image once per occurrence). The
+//     declared sizes are checked first, so a refusal costs no decryption; the
+//     bytes actually unsealed are counted as well, because byte_len is metadata
+//     the store keeps beside the payload and an understated one must not let a
+//     larger payload through.
+//   - A store or cipher failure is returned as the failure it is, never as an
+//     absent image.
+//
+// history is not modified; a history with no reference comes back as it is, with
+// no store call.
+func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
+	var ids []string
+	occurrences := map[string]int{}
+	for _, m := range history {
+		if _, _, err := rewriteImageParts(m.Content, func(url string) (string, json.RawMessage, error) {
+			if id, ok := blobRefID(url); ok {
+				if occurrences[id] == 0 {
+					ids = append(ids, id)
+				}
+				occurrences[id]++
+			}
+			return url, nil, nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if len(ids) == 0 {
+		return history, nil
+	}
+
+	rows, err := s.chats.ChatBlobsByIDs(ctx, chatID, ids)
+	if err != nil {
+		return nil, err
+	}
+	limit := int64(s.maxRunHistoryBytes)
+	usable := make(map[string]store.ChatBlob, len(rows))
+	var declared int64
+	for _, id := range ids {
+		row, ok := rows[id]
+		if !ok || row.ChatID != chatID {
+			continue
+		}
+		if _, listed := chatBlobMediaTypes[row.ContentType]; !listed {
+			log.Printf("portal: chat blob %s has a content type that is not sendable; leaving it out of the run history", id)
+			continue
+		}
+		usable[id] = row
+		declared += int64(occurrences[id]) * row.ByteLen
+		if declared > limit {
+			return nil, ErrChatRunHistoryTooLarge
+		}
+	}
+
+	// Each distinct image is unsealed and encoded once; the url is shared by every
+	// occurrence. The encoding is the standard padded alphabet, which is what the
+	// extraction decodes and what the providers' data-url parsing expects.
+	urls := make(map[string]string, len(usable))
+	var actual int64
+	for _, id := range ids {
+		row, ok := usable[id]
+		if !ok {
+			continue
+		}
+		plain, err := s.openChatBlob(row)
+		if err != nil {
+			return nil, err
+		}
+		actual += int64(occurrences[id]) * int64(len(plain))
+		if actual > limit {
+			return nil, ErrChatRunHistoryTooLarge
+		}
+		urls[id] = "data:" + row.ContentType + ";base64," + base64.StdEncoding.EncodeToString(plain)
+	}
+
+	out := make([]ChatAPIMessage, len(history))
+	copy(out, history)
+	unavailable := 0
+	for i, m := range history {
+		content, changed, err := rewriteImageParts(m.Content, func(url string) (string, json.RawMessage, error) {
+			id, ok := blobRefID(url)
+			if !ok {
+				return url, nil, nil
+			}
+			if resolved, ok := urls[id]; ok {
+				return resolved, nil, nil
+			}
+			unavailable++
+			return url, unavailableImagePart, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			out[i].Content = content
+		}
+	}
+	if unavailable > 0 {
+		log.Printf("portal: chat %s: %d image reference(s) in the run history have no stored image for this chat and were left out", chatID, unavailable)
+	}
+	return out, nil
+}
+
+// blobRefID is the blob id of a stored-image url, and whether url is one.
+func blobRefID(url string) (string, bool) {
+	return strings.CutPrefix(url, chatBlobURLPrefix)
+}

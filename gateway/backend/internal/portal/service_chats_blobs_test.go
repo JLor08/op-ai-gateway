@@ -371,8 +371,10 @@ func TestPrepareChatRunStoresAnImageExactlyOnce(t *testing.T) {
 	if len(e.rec.ownerLookups) != 1 {
 		t.Fatalf("owner lookups = %v, want exactly one for the one resubmitted id", e.rec.ownerLookups)
 	}
-	if !strings.Contains(string(history[0].Content), url) {
-		t.Fatalf("the gateway url must pass through to the run history untouched: %s", history[0].Content)
+	// The reference is kept in the stored document (below); the run's history
+	// carries the image itself (the resolution, service_chats_resolve.go).
+	if got := historyImageURLs(history); len(got) != 1 || got[0] != dataURL("image/png", blobTestBytes(512, 3)) {
+		t.Fatalf("the run history must carry the resolved image, got %.80v", got)
 	}
 	if got := storedImageURLs(t, e.stored(t, chatID)); len(got) != 1 || got[0] != url {
 		t.Fatalf("stored urls after the edit = %v, want [%s]", got, url)

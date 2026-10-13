@@ -978,6 +978,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		NetbirdTokenRotateBeforeDaysDefault: &cfg.NetbirdTokenRotateBeforeDays,
 		AgentPresenceTimeoutDefault:         cfg.AgentPresenceTimeoutSeconds,
 		MaxChatBlobBytes:                    cfg.MaxChatBlobBytes,
+		MaxRunHistoryBytes:                  cfg.MaxRunHistoryBytes,
 		SettingsVolatile:                    b.SettingsVolatile, ACMEChallenges: acmeChallenges,
 		OnCertSettingsChanged: certReconcileTriggerFunc(certReconcileTrigger),
 		OnCertificateIssued:   agentStreams.NotifyCertUpdate,

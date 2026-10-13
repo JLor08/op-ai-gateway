@@ -127,28 +127,13 @@ func (x *blobExtraction) message(raw json.RawMessage) (json.RawMessage, bool, er
 		if !strings.EqualFold(msg[i].key, "content") {
 			continue
 		}
-		parts, ok := parseJSONArray(msg[i].val)
-		if !ok {
-			continue
-		}
-		partsChanged := false
-		for j := range parts {
-			out, c, err := x.part(parts[j])
-			if err != nil {
-				return nil, false, err
-			}
-			if c {
-				parts[j], partsChanged = out, true
-			}
-		}
-		if !partsChanged {
-			continue
-		}
-		val, err := json.Marshal(parts)
+		val, c, err := rewriteImageParts(msg[i].val, x.visit)
 		if err != nil {
 			return nil, false, err
 		}
-		msg[i].val, changed = val, true
+		if c {
+			msg[i].val, changed = val, true
+		}
 	}
 	if !changed {
 		return raw, false, nil
@@ -157,58 +142,11 @@ func (x *blobExtraction) message(raw json.RawMessage) (json.RawMessage, bool, er
 	return out, err == nil, err
 }
 
-// part rewrites one content part: an object whose image_url is an object with a
-// string url. Every other shape is not an image part and is left as it is.
-func (x *blobExtraction) part(raw json.RawMessage) (json.RawMessage, bool, error) {
-	part, ok := parseJSONObject(raw)
-	if !ok {
-		return raw, false, nil
-	}
-	changed := false
-	for i := range part {
-		if !strings.EqualFold(part[i].key, "image_url") {
-			continue
-		}
-		target, ok := parseJSONObject(part[i].val)
-		if !ok {
-			continue
-		}
-		targetChanged := false
-		for k := range target {
-			if !strings.EqualFold(target[k].key, "url") {
-				continue
-			}
-			var url string
-			if json.Unmarshal(target[k].val, &url) != nil {
-				continue
-			}
-			rewritten, err := x.url(url)
-			if err != nil {
-				return nil, false, err
-			}
-			if rewritten == url {
-				continue
-			}
-			val, err := json.Marshal(rewritten)
-			if err != nil {
-				return nil, false, err
-			}
-			target[k].val, targetChanged = val, true
-		}
-		if !targetChanged {
-			continue
-		}
-		val, err := target.marshal()
-		if err != nil {
-			return nil, false, err
-		}
-		part[i].val, changed = val, true
-	}
-	if !changed {
-		return raw, false, nil
-	}
-	out, err := part.marshal()
-	return out, err == nil, err
+// visit is url as an imageURLVisitor: an extraction only ever changes the url of
+// a part, never replaces the part.
+func (x *blobExtraction) visit(url string) (string, json.RawMessage, error) {
+	out, err := x.url(url)
+	return out, nil, err
 }
 
 // url decides what one image url becomes: the gateway url of a freshly stored
@@ -407,6 +345,101 @@ func (s *Service) openChatBlob(row store.ChatBlob) ([]byte, error) {
 		return nil, ErrChatCipherMissing
 	}
 	return s.cipher.Open(row.Blob)
+}
+
+// imageURLVisitor decides what one image part becomes. out is the url the part
+// carries afterwards (out == url leaves it as it is); a non-nil replacement
+// replaces the whole part instead; an error aborts the walk.
+type imageURLVisitor func(url string) (out string, replacement json.RawMessage, err error)
+
+// rewriteImageParts walks one message's content: when it is an array, every
+// part that is an image part -- an object whose image_url is an object with a
+// string url -- goes through visit. Every other shape is not an image part and
+// is left as it is, as is a content that is not an array (a plain string).
+//
+// It is the ONE definition of what an image url is, shared by the extraction at
+// a run commit and the resolution of a run's history, so the two cannot disagree
+// about a spelling: members are matched without regard to case (the readers of
+// this document decode into tagged structs, which encoding/json matches that
+// way), and a part that changes is rebuilt along the changed path only, members
+// in their original order, every other value byte for byte. The returned bool is
+// whether anything changed; when it is false the input comes back as it was.
+func rewriteImageParts(content json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
+	parts, ok := parseJSONArray(content)
+	if !ok {
+		return content, false, nil
+	}
+	changed := false
+	for i := range parts {
+		out, c, err := rewriteImagePart(parts[i], visit)
+		if err != nil {
+			return nil, false, err
+		}
+		if c {
+			parts[i], changed = out, true
+		}
+	}
+	if !changed {
+		return content, false, nil
+	}
+	out, err := json.Marshal(parts)
+	return out, err == nil, err
+}
+
+// rewriteImagePart is rewriteImageParts for one part.
+func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
+	part, ok := parseJSONObject(raw)
+	if !ok {
+		return raw, false, nil
+	}
+	changed := false
+	for i := range part {
+		if !strings.EqualFold(part[i].key, "image_url") {
+			continue
+		}
+		target, ok := parseJSONObject(part[i].val)
+		if !ok {
+			continue
+		}
+		targetChanged := false
+		for k := range target {
+			if !strings.EqualFold(target[k].key, "url") {
+				continue
+			}
+			var url string
+			if json.Unmarshal(target[k].val, &url) != nil {
+				continue
+			}
+			rewritten, replacement, err := visit(url)
+			if err != nil {
+				return nil, false, err
+			}
+			if replacement != nil {
+				return replacement, true, nil
+			}
+			if rewritten == url {
+				continue
+			}
+			val, err := json.Marshal(rewritten)
+			if err != nil {
+				return nil, false, err
+			}
+			target[k].val, targetChanged = val, true
+		}
+		if !targetChanged {
+			continue
+		}
+		val, err := target.marshal()
+		if err != nil {
+			return nil, false, err
+		}
+		part[i].val, changed = val, true
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := part.marshal()
+	return out, err == nil, err
 }
 
 // jsonField is one member of a JSON object, its value as raw JSON.

@@ -28,6 +28,8 @@ func TestWritePortalRunError(t *testing.T) {
 		portal.ErrChatBlobTypeUnsupported: 400,
 		portal.ErrChatBlobTooLarge:        400,
 		portal.ErrChatBlobNotOwned:        400,
+		// The run-size refusal (the stored images of a history over MaxRunHistoryBytes).
+		portal.ErrChatRunHistoryTooLarge: 400,
 	}
 	for err, want := range cases {
 		w := httptest.NewRecorder()
@@ -78,6 +80,7 @@ func TestWritePortalRunError(t *testing.T) {
 		portal.ErrChatBlobTypeUnsupported: "images.blob_type_unsupported",
 		portal.ErrChatBlobTooLarge:        "images.blob_too_large",
 		portal.ErrChatBlobNotOwned:        "images.blob_not_owned",
+		portal.ErrChatRunHistoryTooLarge:  "portal.chat_run_history_too_large",
 	}
 	for err, code := range literalCodes {
 		w := httptest.NewRecorder()
