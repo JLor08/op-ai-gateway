@@ -58,20 +58,9 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 // history is not modified; a history with no reference comes back as it is, with
 // no store call.
 func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
-	var ids []string
-	occurrences := map[string]int{}
-	for _, m := range history {
-		if _, _, err := rewriteImageParts(m.Content, func(url string) (string, json.RawMessage, error) {
-			if id, ok := blobRefID(url); ok {
-				if occurrences[id] == 0 {
-					ids = append(ids, id)
-				}
-				occurrences[id]++
-			}
-			return url, nil, nil
-		}); err != nil {
-			return nil, err
-		}
+	ids, occurrences, err := collectBlobRefIDs(history)
+	if err != nil {
+		return nil, err
 	}
 	if len(ids) == 0 {
 		return history, nil
@@ -82,6 +71,51 @@ func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, histor
 		return nil, err
 	}
 	limit := int64(s.maxRunHistoryBytes)
+	usable, err := usableChatBlobs(chatID, ids, occurrences, rows, limit)
+	if err != nil {
+		return nil, err
+	}
+	urls, err := s.blobDataURLs(ids, occurrences, usable, limit)
+	if err != nil {
+		return nil, err
+	}
+	out, unavailable, err := substituteBlobRefs(history, urls)
+	if err != nil {
+		return nil, err
+	}
+	if unavailable > 0 {
+		log.Printf("portal: chat %s: %d image reference(s) in the run history have no stored image for this chat and were left out", chatID, unavailable)
+	}
+	return out, nil
+}
+
+// collectBlobRefIDs lists the distinct blob ids the history references, in the
+// order first seen, and how many times each occurs. The history is only read.
+func collectBlobRefIDs(history []ChatAPIMessage) ([]string, map[string]int, error) {
+	var ids []string
+	occurrences := map[string]int{}
+	count := func(url string) (string, json.RawMessage, error) {
+		if id, ok := blobRefID(url); ok {
+			if occurrences[id] == 0 {
+				ids = append(ids, id)
+			}
+			occurrences[id]++
+		}
+		return url, nil, nil
+	}
+	for _, m := range history {
+		if _, _, err := rewriteImageParts(m.Content, count); err != nil {
+			return nil, nil, err
+		}
+	}
+	return ids, occurrences, nil
+}
+
+// usableChatBlobs keeps, of the rows the store returned for ids, those this run
+// may send: a row of another chat or of a type outside the allow-list is left
+// out like an absent one. It bounds the declared sizes -- byte_len per
+// occurrence -- by limit, so a refusal costs no decryption.
+func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, rows map[string]store.ChatBlob, limit int64) (map[string]store.ChatBlob, error) {
 	usable := make(map[string]store.ChatBlob, len(rows))
 	var declared int64
 	for _, id := range ids {
@@ -99,10 +133,15 @@ func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, histor
 			return nil, ErrChatRunHistoryTooLarge
 		}
 	}
+	return usable, nil
+}
 
-	// Each distinct image is unsealed and encoded once; the url is shared by every
-	// occurrence. The encoding is the standard padded alphabet, which is what the
-	// extraction decodes and what the providers' data-url parsing expects.
+// blobDataURLs unseals and encodes each usable image once; the url is shared by
+// every occurrence. The encoding is the standard padded alphabet, which is what
+// the extraction decodes and what the providers' data-url parsing expects. The
+// bytes actually unsealed are bounded by limit as well, per occurrence, because
+// the declared sizes (see usableChatBlobs) are only metadata.
+func (s *Service) blobDataURLs(ids []string, occurrences map[string]int, usable map[string]store.ChatBlob, limit int64) (map[string]string, error) {
 	urls := make(map[string]string, len(usable))
 	var actual int64
 	for _, id := range ids {
@@ -120,33 +159,38 @@ func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, histor
 		}
 		urls[id] = "data:" + row.ContentType + ";base64," + base64.StdEncoding.EncodeToString(plain)
 	}
+	return urls, nil
+}
 
+// substituteBlobRefs returns a copy of history in which every stored-image url
+// is replaced by its entry in urls, or -- when it has none -- the whole part by
+// unavailableImagePart. It also returns how many parts were replaced that way.
+// history is not modified.
+func substituteBlobRefs(history []ChatAPIMessage, urls map[string]string) ([]ChatAPIMessage, int, error) {
 	out := make([]ChatAPIMessage, len(history))
 	copy(out, history)
 	unavailable := 0
+	resolve := func(url string) (string, json.RawMessage, error) {
+		id, ok := blobRefID(url)
+		if !ok {
+			return url, nil, nil
+		}
+		if resolved, ok := urls[id]; ok {
+			return resolved, nil, nil
+		}
+		unavailable++
+		return url, unavailableImagePart, nil
+	}
 	for i, m := range history {
-		content, changed, err := rewriteImageParts(m.Content, func(url string) (string, json.RawMessage, error) {
-			id, ok := blobRefID(url)
-			if !ok {
-				return url, nil, nil
-			}
-			if resolved, ok := urls[id]; ok {
-				return resolved, nil, nil
-			}
-			unavailable++
-			return url, unavailableImagePart, nil
-		})
+		content, changed, err := rewriteImageParts(m.Content, resolve)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if changed {
 			out[i].Content = content
 		}
 	}
-	if unavailable > 0 {
-		log.Printf("portal: chat %s: %d image reference(s) in the run history have no stored image for this chat and were left out", chatID, unavailable)
-	}
-	return out, nil
+	return out, unavailable, nil
 }
 
 // blobRefID is the blob id of a stored-image url, and whether url is one.

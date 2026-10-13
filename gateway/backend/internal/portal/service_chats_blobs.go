@@ -404,49 +404,90 @@ func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessa
 		if !strings.EqualFold(part[i].key, "image_url") {
 			continue
 		}
-		target, ok := parseJSONObject(part[i].val)
-		if !ok {
-			continue
-		}
-		targetChanged := false
-		for k := range target {
-			if !strings.EqualFold(target[k].key, "url") {
-				continue
-			}
-			var url string
-			if json.Unmarshal(target[k].val, &url) != nil {
-				continue
-			}
-			rewritten, replacement, err := visit(url)
-			if err != nil {
-				return nil, false, err
-			}
-			if replacement != nil {
-				return replacement, true, nil
-			}
-			if rewritten == url {
-				continue
-			}
-			val, err := json.Marshal(rewritten)
-			if err != nil {
-				return nil, false, err
-			}
-			target[k].val, targetChanged = val, true
-		}
-		if !targetChanged {
-			continue
-		}
-		val, err := target.marshal()
+		res, err := rewriteImageTarget(part[i].val, visit)
 		if err != nil {
 			return nil, false, err
 		}
-		part[i].val, changed = val, true
+		if res.replacement != nil {
+			return res.replacement, true, nil
+		}
+		if res.changed {
+			part[i].val, changed = res.val, true
+		}
 	}
 	if !changed {
 		return raw, false, nil
 	}
 	out, err := part.marshal()
 	return out, err == nil, err
+}
+
+// memberRewrite is the outcome of visiting one member of an image part. When
+// replacement is non-nil it replaces the whole part and nothing else matters;
+// otherwise val is the member's new value when changed, and is unused when not.
+type memberRewrite struct {
+	val         json.RawMessage
+	changed     bool
+	replacement json.RawMessage
+}
+
+// rewriteImageTarget is rewriteImagePart for the value of one image_url member:
+// anything that is not an object is left as it is, and so is an object none of
+// whose url members changes.
+func rewriteImageTarget(raw json.RawMessage, visit imageURLVisitor) (memberRewrite, error) {
+	target, ok := parseJSONObject(raw)
+	if !ok {
+		return memberRewrite{}, nil
+	}
+	changed := false
+	for k := range target {
+		if !strings.EqualFold(target[k].key, "url") {
+			continue
+		}
+		res, err := rewriteImageURL(target[k].val, visit)
+		if err != nil {
+			return memberRewrite{}, err
+		}
+		if res.replacement != nil {
+			return res, nil
+		}
+		if res.changed {
+			target[k].val, changed = res.val, true
+		}
+	}
+	if !changed {
+		return memberRewrite{}, nil
+	}
+	val, err := target.marshal()
+	if err != nil {
+		return memberRewrite{}, err
+	}
+	return memberRewrite{val: val, changed: true}, nil
+}
+
+// rewriteImageURL sends the value of one url member through visit. A value that
+// is not a string is not an image url and is left as it is, as is a url the
+// visitor returns unchanged.
+func rewriteImageURL(raw json.RawMessage, visit imageURLVisitor) (memberRewrite, error) {
+	var url string
+	if json.Unmarshal(raw, &url) != nil {
+		return memberRewrite{}, nil
+	}
+	rewritten, replacement, err := visit(url)
+	if err != nil {
+		return memberRewrite{}, err
+	}
+	if replacement != nil {
+		return memberRewrite{replacement: replacement}, nil
+	}
+	if rewritten == url {
+		return memberRewrite{}, nil
+	}
+	val, err := json.Marshal(rewritten)
+	if err != nil {
+		return memberRewrite{}, err
+	}
+	return memberRewrite{val: val, changed: true}, nil
 }
 
 // jsonField is one member of a JSON object, its value as raw JSON.
