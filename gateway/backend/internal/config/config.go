@@ -107,6 +107,8 @@ type Config struct {
 	CertMeshRequireTLSDisable       bool
 	CaptureMaxBytes                 int
 	CaptureMemoryMaxBytes           int
+	MaxChatBlobBytes                int // per-blob ceiling for one chat binary payload (#124); config only, the service layer enforces it
+	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MockDelay                       time.Duration
 	MockUnreachable                 bool
 	SeedAppHealthMode               string
@@ -246,6 +248,8 @@ func Load() (Config, error) {
 		CertMeshRequireTLSDisable: l.boolean("OP_AI_GATEWAY_CERT_MESH_REQUIRE_TLS_DISABLE", false),
 		CaptureMaxBytes:           l.integer("OP_AI_GATEWAY_CAPTURE_MAX_BYTES", 1048576),
 		CaptureMemoryMaxBytes:     l.integer("OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES", 67108864),
+		MaxChatBlobBytes:          l.integer("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", 20<<20),
+		MaxRunHistoryBytes:        l.integer("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", 32<<20),
 		// Test-only artificial provider delay for the mock provider (default 0 = off,
 		// production-safe). Junk/0/negative -> 0 via integer().
 		MockDelay: time.Duration(l.integer("OP_AI_GATEWAY_MOCK_DELAY_MS", 0)) * time.Millisecond,

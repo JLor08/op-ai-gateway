@@ -359,6 +359,11 @@ func TestAnthropicImageSourceForParsesDataURIs(t *testing.T) {
 		{"no comma is dropped", "data:image/png;base64", ""},
 		{"http URL", "https://example.test/cat.jpg", `{"type":"url","url":"https://example.test/cat.jpg"}`},
 		{"file URL is dropped", "file:///etc/passwd", ""},
+		// A stored chat image is a gateway-relative url. It is dropped silently like
+		// any other unreachable one, which is why the chat run resolves it to a data
+		// url before the request is built (portal resolveChatBlobRefs): the image
+		// would otherwise just vanish from the request.
+		{"gateway chat-blob url is dropped", "/api/portal/chat-blobs/blob_0123456789abcdef0123456789abcdef", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

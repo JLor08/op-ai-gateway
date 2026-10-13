@@ -216,6 +216,18 @@ func (_d *APIWithTracing) ResolveSessionDetail(ctx context.Context, s1 string) (
 	return _d.API.ResolveSessionDetail(ctx, s1)
 }
 
+func (_d *APIWithTracing) ResolveSessionDetailNoTouch(ctx context.Context, s1 string) (u1 store.User, s2 store.Session, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "account.Service.ResolveSessionDetailNoTouch")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ResolveSessionDetailNoTouch(ctx, s1)
+}
+
 func (_d *APIWithTracing) SetPassword(ctx context.Context, s1 string, s2 string) (u1 store.User, s3 string, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "account.Service.SetPassword")
 	defer span.End()

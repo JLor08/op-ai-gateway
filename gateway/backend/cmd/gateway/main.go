@@ -977,6 +977,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		AgentTLSPort: atoiOr(effectiveAgentTLSPort(cfg), 8443), AgentTLSSeparateDefault: cfg.AgentTLSSeparate,
 		NetbirdTokenRotateBeforeDaysDefault: &cfg.NetbirdTokenRotateBeforeDays,
 		AgentPresenceTimeoutDefault:         cfg.AgentPresenceTimeoutSeconds,
+		MaxChatBlobBytes:                    cfg.MaxChatBlobBytes,
+		MaxRunHistoryBytes:                  cfg.MaxRunHistoryBytes,
 		SettingsVolatile:                    b.SettingsVolatile, ACMEChallenges: acmeChallenges,
 		OnCertSettingsChanged: certReconcileTriggerFunc(certReconcileTrigger),
 		OnCertificateIssued:   agentStreams.NotifyCertUpdate,

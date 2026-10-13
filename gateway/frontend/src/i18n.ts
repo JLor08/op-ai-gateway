@@ -213,10 +213,9 @@ const de = {
   chatImageModelUnsupported: 'Dieses Modell kann keine Bilder als Eingabe verarbeiten.',
   chatImageGeneratorNoInput:
     'Dieses Modell erzeugt Bilder und nimmt selbst keine Bilder als Eingabe entgegen.',
-  // The composer of an image thread: the prompt field's label, the hint under
-  // it, and the remaining-capacity line. The capacity is the one number in
-  // this feature that is exact and known BEFORE the user commits to a
-  // multi-minute generation, so it is stated up front rather than after.
+  // The composer of an image thread: the prompt field's label and the hint under
+  // it. (A remaining-capacity line used to follow; images now live outside the
+  // chat document, so there is no shared budget to state.)
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
   // The image-thread settings panel: the generation knobs shown in place of the
@@ -253,9 +252,6 @@ const de = {
   chatImageRunPending: 'Warte auf Bild',
   chatImageNoIntermediateNews:
     'Keine Zwischenmeldungen – das Bild erscheint fertig oder gar nicht.',
-  chatCapacityRemaining: (count: number) => `Platz für etwa noch ${count} Bild(er) in diesem Chat.`,
-  chatCapacityExhausted:
-    'Dieser Chat hat keinen Platz mehr für ein weiteres Bild. Lade die vorhandenen Bilder herunter und beginne einen neuen Chat.',
   chatRegenerate: 'Neu generieren',
   chatEdit: 'Bearbeiten',
   chatSave: 'Speichern',
@@ -1486,6 +1482,18 @@ const de = {
   errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
   errorImagesUpstreamError:
     'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Chat-Binärdatenspeicher: Bilder liegen außerhalb des Verlaufs, und ein
+  // Lauf wird abgelehnt, bevor er startet, wenn ein hochgeladenes oder
+  // bearbeitetes Bild nicht gespeichert beziehungsweise nicht gelesen werden
+  // kann. Wire-Codes siehe format.ts (errorLabelByCode).
+  errorImagesBlobTypeUnsupported:
+    'Dieses Bild hat ein nicht unterstütztes Format. Erlaubt sind PNG, JPEG, WebP und GIF.',
+  errorImagesBlobTooLarge:
+    'Dieses Bild ist zu groß. Bitte verwenden Sie ein kleineres Bild oder verringern Sie seine Auflösung.',
+  errorImagesBlobNotOwned:
+    'Ein Bild im Verlauf gehört nicht zu diesem Chat. Bitte laden Sie die Seite neu und versuchen Sie es erneut.',
+  errorChatRunHistoryTooLarge:
+    'Die Bilder in diesem Verlauf sind zu groß, um sie an das Modell zu senden. Entfernen Sie ältere Bilder aus dem Verlauf und versuchen Sie es erneut.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
@@ -3049,9 +3057,6 @@ const en: PortalMessages = {
   chatImageRunPending: 'Waiting for image',
   chatImageNoIntermediateNews:
     'No intermediate updates – the image arrives finished or not at all.',
-  chatCapacityRemaining: (count: number) => `Room for about ${count} more image(s) in this chat.`,
-  chatCapacityExhausted:
-    'This chat has no room for another image. Download the images you have and start a new chat.',
   chatRegenerate: 'Regenerate',
   chatEdit: 'Edit',
   chatSave: 'Save',
@@ -4185,6 +4190,17 @@ const en: PortalMessages = {
   errorImagesStreamUnsupported: 'Image generation does not support streaming.',
   errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
   errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
+  // Chat binary payload store: images live outside the transcript, and a run
+  // is refused before it starts when an uploaded or edited image cannot be
+  // stored or read. Wire codes: see format.ts (errorLabelByCode).
+  errorImagesBlobTypeUnsupported:
+    'This image is in an unsupported format. Allowed formats are PNG, JPEG, WebP and GIF.',
+  errorImagesBlobTooLarge:
+    'This image is too large. Please use a smaller image or reduce its resolution.',
+  errorImagesBlobNotOwned:
+    'An image in the history does not belong to this chat. Please reload the page and try again.',
+  errorChatRunHistoryTooLarge:
+    'The images in this conversation are too large to send to the model. Remove some older images from the conversation and try again.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).

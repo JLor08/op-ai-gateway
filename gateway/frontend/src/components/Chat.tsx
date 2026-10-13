@@ -47,8 +47,8 @@ function isReported(value: number | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
-// The most images one request may ask for. IMAGE_N_MAX is the gateway's HARD cap
-// (an image-storage limit, not a model limit), so the picked model's reported max
+// The most images one request may ask for. IMAGE_N_MAX is the portal's HARD cap
+// (not a model limit), so the picked model's reported max
 // batch count may only NARROW it: a usable (>= 1) report is clamped to the cap
 // (a model reporting 16 still gets 8), and an absent or unusable one leaves the
 // cap itself.
@@ -778,23 +778,6 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   </IconButton>
                 </span>
               </Tooltip>
-              {/* The remaining capacity of an image thread. Rendered only when
-                the gateway actually served the cap (imageCapacityLeft null =
-                unknown): a number the portal made up would be worse than
-                none. This is the one figure in the image flow that is exact
-                and known BEFORE the user commits to a multi-minute wait. */}
-              {isImageThread && c.imageCapacityLeft !== null && (
-                <Typography
-                  data-testid="chat-capacity"
-                  variant="body2"
-                  color={c.imageCapacityLeft <= 0 ? 'error' : undefined}
-                  sx={c.imageCapacityLeft > 0 ? { color: 'var(--muted)' } : undefined}
-                >
-                  {c.imageCapacityLeft <= 0
-                    ? t.chatCapacityExhausted
-                    : t.chatCapacityRemaining(c.imageCapacityLeft)}
-                </Typography>
-              )}
             </Stack>
             <Tooltip
               title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}

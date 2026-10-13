@@ -557,7 +557,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -613,7 +613,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -782,7 +782,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -967,7 +967,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-86-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1182,7 +1182,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-86-migrations),
+[§4](reference/data-model.md#4-migration-history-87-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1408,7 +1408,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-86-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-87-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1533,7 +1533,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-86-migrations),
+[§4](reference/data-model.md#4-migration-history-87-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -1858,7 +1858,10 @@ remains the only authority ([Routing & Model Selection
 §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
 
 **(c) The image is stored INLINE in the sealed transcript, and the 4 MiB
-whole-document ceiling is accepted for v1 rather than worked around.** It is
+whole-document ceiling is accepted for v1 rather than worked around.** (Amended
+by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url): the payload
+now lives in its own sealed store and this ceiling no longer binds it, see the
+amendment at the end of (c).) It is
 persisted as an OpenAI-style `image_url` content part carrying a `data:` URL —
 the identical shape an uploaded vision image already has, so history
 construction feeds it back as a vision input on the next turn for free and the
@@ -1882,14 +1885,39 @@ recorded in
 **Rejected: a separate blob store for v1.** It is the right end state and it is
 a schema change across three drivers, an owner-scoped serving endpoint, a
 delete cascade and a re-litigated sealing decision — none of which this feature
-needs in order to work. Filed as #124. — **Rejected: a server-side re-encode to
+needs in order to work. Filed as #124, and **resolved** by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url),
+which built exactly that store. — **Rejected: a server-side re-encode to
 fit the cap.** The client already downscales its **own uploads**; re-encoding
 what the *model produced* is a different act, because it silently degrades the
 artifact the user asked for. Upstream bytes are stored as-is, with a real
 binary download so the user can keep the original.
 
+**Amended by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (the payloads leave the transcript).** The shape
+this decision chose stands: an image is still an OpenAI-style `image_url` part,
+it still replays as a vision input for free, it still inherits the transcript's
+sealing (now through the same cipher on its own row), and "stored as-is, with a
+real binary download" still holds. Four statements above no longer describe the
+code. (i) "Stored INLINE" and the 4 MiB ceiling "accepted for v1": a generated
+(and an uploaded) image is extracted at the run commit into the owner-scoped
+`chat_blobs` store and the part carries `/api/portal/chat-blobs/{id}`. (ii) The
+cap as a budget every image shares "for the thread's life": it is still
+`portal.MaxChatContentBytes` and still checked on the sealed document, but it
+bounds the **text** only, so a busy image thread no longer runs out and a legacy
+inline thread migrates on its next run. (iii) "Rejected: a separate blob store
+for v1" and "Lifting the ceiling is issue #124": both are resolved, and the
+inline-image entry in
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) is
+retired (what is accepted now is recorded there in its place). (iv) "The image
+rides inside the sealed blob": true only of a chat that has not run since the
+change. What stays is the loudness: a failed
+terminal commit still ends the run as an error (its causes are now a too-large
+*text* document or a payload the store refuses, no longer an image that outgrew
+the shared budget), and the terminal event still carries only what was stored.
+
 **(d) The composer leads with the one number that is EXACT, and shows no
-progress at all.** Four independent composer designs all spent their effort on
+progress at all.** (Superseded in part by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (g): the
+remaining-capacity line and the Send refusal described here are removed; the
+wait elements and the absent character counter stand.) Four independent composer designs all spent their effort on
 the single quantity nobody can bound — progress — and all four withheld the one
 that is exact and knowable *before the user commits*: the remaining transcript
 budget. So the composer states the room left in this chat, computed from the
@@ -1911,6 +1939,23 @@ the listing the chat view already fetches, and it is deliberately **not**
 `omitempty`: a missing field and a zero are the same thing on the wire, and the
 portal reads zero as *capacity unknown* (no line, no refusal), so an accidental
 zero disables the feature instead of inventing a number.
+
+**Amended by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (g) (the capacity estimate is removed).** The
+argument above was sound while an image consumed the shared budget the composer
+could measure. Once the payloads live in `chat_blobs` it is not: a stored image
+is a ~60-character reference, so the client's estimate (the largest `image_url`
+URL as the per-image cost, divided into the served cap) would report millions of
+images left, and the cap no longer binds images at all. The composer therefore
+**states no remaining room, and `send()` no longer refuses an image turn on
+capacity**; the estimate (`imageCostBytes`, `imagesLeft`, the document-size
+helper), its strings and its tests are deleted rather than retuned. What
+survives of this paragraph: `ChatListResponse.max_content_bytes` is **still
+served**, still not `omitempty` and still `portal.MaxChatContentBytes`, but it is
+informational and **no portal code consumes it**; "served, never duplicated" is
+the rule if anything ever shows it again. A text document that overflows the cap
+is still the server's `400 portal.chat_too_large`, and the new bounds that
+replace the shared budget (`MaxChatBlobBytes`, `MaxRunHistoryBytes`) are
+server-side and not estimated in the client.
 
 **During the wait, three elements, each backed by a value that exists:**
 liveness from the run's own server-reported status; an elapsed clock from the
@@ -3200,7 +3245,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-86-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-87-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3407,7 +3452,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-86-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-87-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -3712,7 +3757,7 @@ is the wrong shape for it.
   to nothing. Reported defaults are shown as placeholder/helper text and **never
   pre-filled**, because a pre-filled knob would be sent as an explicit override and
   break "blank = leave sd-server's own default". The portal's count `n` keeps its
-  hard cap of 8 (a gateway image-storage limit), which a model's
+  hard cap of 8 (a portal-side per-request limit, not a model limit), which a model's
   `max_batch_count` may only narrow.
 
 **Why ADR-039's table is NOT extended.** `model_mapping_capabilities` holds
@@ -3754,3 +3799,193 @@ override).
 [§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings),
 [Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).
+
+## ADR-056 — Chat binary payloads live in an owner-scoped, sealed `chat_blobs` store and the transcript references them by gateway URL
+**Context:** [ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
+(c) stored a generated image **inline** in the chat's one sealed transcript and
+accepted that the whole-document ceiling (`portal.MaxChatContentBytes`, 4 MiB)
+is then a budget every image in the thread shares for its life, so a busy thread
+held roughly eight to twelve images and then could not take another turn. It
+named a store of the payloads' own as "the right end state" and filed it as
+issue #124. An *uploaded* vision image shared the same budget. The cap exists to
+bound the **text** document and stays; what exhausted it was the binary
+payloads, and taking them out of the document is the whole point. That also
+removes the only limit on stored and in-flight image bytes, so the decision
+includes the bounds that replace it.
+
+**Decision — seven choices, taken together.**
+- **(a) A generic, owner-scoped binary store, `chat_blobs`, sealed with the
+  same cipher as the transcript.** One row per payload: `id` (`blob_` + 32 hex),
+  `chat_id` → `chats(id)` `on delete cascade`, `key_version`, `blob` (the
+  **decoded bytes** sealed with the capture cipher, `KeyVersion` 1, or plain
+  with `KeyVersion` 0 on the volatile RAM path), `content_type`, `byte_len`
+  (`bigint`, [ADR-005](#adr-005--postgresql-needs-wide-column-types)) and
+  `created_at` (migration 87, additive, the frozen baseline untouched). **The
+  owner is derived through `chat_id → chats.user_id`**; there is deliberately no
+  denormalised `user_id`, which could disagree with the chat's owner and would
+  duplicate a cascade that already reaches the blobs transitively through
+  `chats`. **Delete is the cascade and nothing else**: retention is the chat's
+  lifetime, with no prune and no dedup (every payload gets a random id).
+  **No gzip**: images are already compressed, and a second pass would cost CPU
+  for nothing. Sealing with the existing cipher adds **no new decryptable
+  secret**, so the at-rest guarantee
+  ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)) is exactly what
+  it was for an inline image. The store is **payload-type-agnostic** (bytes plus a
+  content type), and **images are the only consumer in v1**: the type
+  restriction lives in one allow-list in the service layer. The store and the
+  serving path are ready for another payload type (audio, PDF, a file), which
+  would need a deliberate allow-list entry, a part shape the extract and
+  resolve walk understands, and a renderer — but no new storage layer; none of
+  that exists yet. The memory driver keeps a parallel map that is dropped
+  with its chat on both `DeleteChat` and the FIFO `evict()`, and whose bytes
+  **count against the 64 MiB memory budget** — otherwise the RAM path would be
+  unbounded, which is the very problem this decision exists to fix on the other
+  drivers.
+- **(b) The transcript references a payload by a gateway URL in the part that
+  already carried it — `image_url` is reused, not replaced.** An image part's
+  `url` is `/api/portal/chat-blobs/{id}` instead of a `data:` URL. The renderer
+  (`<img src={url}>`) and the wire format are unchanged, history construction
+  still treats it as an `image_url` part. The store and the serving endpoint are
+  payload-type-agnostic, but only `image_url` parts are extracted and resolved
+  today (the walk, `rewriteImageParts`, knows no other part shape). **Old inline `data:`
+  parts keep rendering and keep running** (additive, no forced migration): a
+  legacy chat converts lazily, on its next run, and one that is never run again
+  stays inline and works.
+- **(c) Payloads are extracted at the two run-commit paths, not on create and
+  not on a bare autosave.** `extractChatBlobs` runs in `PrepareChatRun` (an
+  *uploaded* image, an `edited_history` image, a legacy inline one) and in
+  `writeAssistant` (a *generated* image), after the chat row exists and
+  **before** the 4 MiB cap check — so a legacy 3.9 MiB thread, whose images
+  leave the document, can take its next turn. It moves each inline `data:` image
+  into a `ChatBlob`, rewrites the part's URL, and persists the rewritten
+  document **and** its new blobs in one store transaction
+  (`SaveChatWithBlobs`), so a refused or failed turn leaves no orphan. It
+  deliberately does **not** run on `CreateChat` (the chat row a blob's foreign
+  key points at does not exist yet, and a created chat is bounded by the old cap
+  anyway) or on the bare autosave `PUT` (the composer only persists a new large
+  payload by sending it through a run; a title or text edit carries
+  already-stored URLs), which also avoids re-extracting and orphaning on every
+  save. It is **idempotent** (a URL that is already a gateway URL is left
+  alone). A gateway URL in *request-supplied* content (`edited_history`, the new
+  turn) must reference a blob **this chat holds**, else `images.blob_not_owned`
+  — a client cannot graft another chat's or user's id into its own transcript;
+  that check starts at `verifyFrom`, the first message the request supplied, so
+  the images the chat itself stored are not re-verified on every turn and every
+  periodic checkpoint. **Base64 is standard-padded only**: a `data:` URL in
+  another alphabet, unpadded or with a parameter such as `charset` is refused
+  rather than guessed at, so what is stored is what was uploaded, byte for
+  byte, and what is resolved later is re-encoded identically. **Adoption needs
+  no new client code**: the existing post-run canonical refetch
+  (`adoptCanonicalTranscript`) delivers the rewritten URLs, and `activateChat`
+  covers create; the run's SSE `done` still carries the pre-rewrite `data:`
+  part, which the refetch then swaps.
+- **(d) The gateway resolves references back to bytes in one place,
+  `PrepareChatRun`, chat-scoped and remote-safe.** An upstream cannot reach a
+  gateway URL, and the Anthropic adapter's image-source conversion returns nil
+  for a URL that is neither `data:` nor `http(s)`, so a reference left in the
+  request would make the image **silently vanish** and the model answer
+  without seeing it. So for a **non-image** run `PrepareChatRun` replaces every
+  `/chat-blobs/` URL in the history it returns with a `data:` URL of the real
+  bytes, through **one** batched `ChatBlobsByIDs(chatID, ids)` — scoped to the
+  chat in the query itself, so a grafted foreign id is simply absent and can
+  never resolve to someone else's bytes. A reference with no stored bytes
+  (a foreign or never-stored id) becomes a
+  `[image unavailable]` text part: the model is told, the run goes on, and the
+  stored document is untouched. The image kind skips resolution entirely (its
+  executor reads only the last prompt's text). The resolution sits in
+  `PrepareChatRun` because it has the context, the owner and the store, while
+  `buildAPIHistory` is pure and `buildChatCompletionsBody` has no store handle.
+  It runs before the commit, so a refused run stores nothing and a retry is not
+  a duplicate turn.
+- **(e) The serving endpoint is hardened, because the content type is
+  attacker-influenced on a same-origin, cookie-authenticated, navigable URL.**
+  `GET /api/portal/chat-blobs/{id}` takes the standard portal auth (the
+  browser's `<img>` sends the session cookie), and authorises on the **blob**, never on a transcript that mentions it (a
+  transcript can carry any id — create and a bare autosave do not validate the
+  URLs they store): the blob's chat must belong to the authenticated user, decided
+  with two metadata-only lookups before any bytes are read or decrypted. Every
+  way of not being the owner of a servable blob — missing, someone else's,
+  chat deleted, evicted, an unlisted type — is the same `404
+  portal.chat_blob_not_found`, with no existence leak; a store or cipher failure
+  is `500 portal.chat_blob_failed`, never a 404 (which would turn a broken key
+  into an empty image). The stored type is checked against an **allow-list**
+  (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) at store time
+  (`images.blob_type_unsupported`, so `text/html` and `image/svg+xml` never get
+  in) **and again at read time**, and nothing else is ever echoed as
+  `Content-Type`. The response carries `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
+  and `Cache-Control: private, no-store` — the id is immutable, but the bytes are
+  decrypted and private, and a long-lived `immutable` entry would park them in
+  the browser's disk cache. The cookie leg of the auth is the **passive** session
+  check (`ResolveSessionDetailNoTouch`, so an `<img>` load does not extend the
+  idle window): a thread of N images opens N of these in parallel, and a
+  `TouchSession` write per request would stampede the connection pool; it is
+  sound because the chat load that issued them already refreshed the session, and
+  a passive fetch must not be able to keep a session alive on its own. The
+  route is not an inference endpoint, and the ownership check applies whatever
+  the credential.
+- **(f) Replacement bounds, both configurable, both refusing rather than
+  trimming.** `MaxChatBlobBytes` (`OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`, default
+  20 MiB, the composer's own upload limit) caps one decoded payload, enforced at
+  extract (`images.blob_too_large`). `MaxRunHistoryBytes`
+  (`OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES`, default 32 MiB decoded) caps the image
+  bytes one run's upstream history carries, counted per occurrence, so a long
+  vision thread cannot assemble a request of hundreds of megabytes; a run over
+  it is refused `400 portal.chat_run_history_too_large` before its turn is
+  stored (the declared sizes are checked first so a refusal decrypts nothing,
+  then the bytes actually unsealed). Neither of the two **text** limits moves:
+  the 4 MiB document cap and the 5 MiB request cap (one upload still rides
+  inline in the run body) stay as they were. Per-chat growth is bounded only by
+  the chat's lifetime; a soft per-chat ceiling is deferred
+  ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **(g) The frontend stops estimating.** The image capacity estimate is removed
+  (a ~60-character URL would make "images left" a nonsense figure, and the cap no
+  longer binds images), so the composer states no remaining room and `send()` no
+  longer refuses on it; the text overflow stays the server's `400
+  portal.chat_too_large`. `max_content_bytes` is still served on the chat
+  listing and is now informational. Saving a stored image fetches the serving
+  endpoint (a `data:` URL, from an old chat, is still decoded in place), and the
+  four new run-start codes have labels.
+
+**Consequence:** a thread is no longer limited by image count, the sealed
+transcript is small (so the keepalive and the autosave stay cheap), and "no
+4 MiB limit" means "not that shared one", not "unbounded": one payload is
+bounded, one run's resolved history is bounded, one request body is bounded. Two
+costs are accepted on purpose. **Blobs are retained for the chat's lifetime and
+an edit or regenerate that drops a message leaves its image behind** — no prune,
+no reference counting — the price of cascade-only deletion. **A RAM-store chat
+that is evicted takes its images with it** (the chat and its blobs are dropped
+together), so an already-open tab's image URLs then answer 404 and a run on that
+chat is refused as chat-not-found; `[image unavailable]` arises only for a
+foreign or missing id in a chat that still exists. The failure of a
+*generated* image's extraction at the assistant commit (it is too large or of an
+unlisted type) ends the run as `gateway.chat_run_commit_failed`
+([ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
+(c)); the three `images.blob_*` codes and the history bound are answered by the
+run-start `POST`. An id in a transcript is a claim, never a grant: authorisation
+is at read (serve) and at resolve (chat-scoped), so neither create nor autosave
+validates the URLs it stores.
+
+**Rejected:** an image-specific table or endpoint (a `content_type` column and
+an allow-list make the generic store free, and audio or a document would
+otherwise need a second layer); a denormalised `user_id` (above); extraction on
+`CreateChat` or on the autosave `PUT` (the FK ordering, and a re-extract plus
+orphan on every save); resolution in `buildAPIHistory` or
+`buildChatCompletionsBody` (pure, and no store handle); leaving gateway URLs in
+the upstream request (a remote provider cannot fetch them and the Anthropic
+adapter drops them without an error); trimming the oldest images to fit
+`MaxRunHistoryBytes` (the model would answer a different conversation than the
+user sees, silently — a refusal is a clear, retryable answer); a new content
+part type instead of reusing `image_url` (a second wire format and a renderer
+fork for nothing); a long `immutable` cache lifetime (above); gzip of the
+payload (above); content-hash dedup, a dedicated upload endpoint, a forced
+one-time migration of old chats and a soft per-chat ceiling (all deferred, none
+needed for correctness).
+→ [Data Model](reference/data-model.md#portal-chat) (migration 87),
+[HTTP API Surface](reference/api-surface.md#tokens-chats-usage),
+[Security, Authentication & Authorization
+§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest),
+[API Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

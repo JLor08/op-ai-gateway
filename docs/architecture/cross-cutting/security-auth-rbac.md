@@ -81,6 +81,12 @@ outstanding session at once) or if the row simply cannot be found (already
 logged out, expired-and-swept, etc.). Any invalid session clears the cookie
 and returns `401 auth.session_invalid`.
 
+**A passive read does not slide the idle window.** `ResolveSessionDetail`
+touches `LastSeenAt` on every resolution. The one deliberate exception is
+`ResolveSessionDetailNoTouch`, used only for the chat-image `<img>` fetches a
+browser fans out in bulk (`requireWebScopeNoTouch`): the same validation, no
+write, so such a fetch extends nothing ([§13.1](#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url)).
+
 **CSRF**: `authenticateWeb` accepts a session cookie for any method, but for
 every *unsafe* method (anything but `GET`/`HEAD`) it additionally requires the
 `X-OP-CSRF: 1` header (`csrfOK`), else `403 auth.csrf_required`. Because the
@@ -776,7 +782,8 @@ corrupt raw value.
 
 **Two independent keys, deliberately not shared.**
 `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` seals payload captures, chat
-transcripts, the SMTP password, the NetBird admin token, and TOTP secrets.
+transcripts, chat binary payloads (the stored images, §13.1), the SMTP
+password, the NetBird admin token, and TOTP secrets.
 `OP_AI_GATEWAY_CERT_ENCRYPTION_KEY` seals every certificate private key (leaf
 keys, the ACME account key, the internal CA key — see
 [Certificates & TLS](certificates-tls.md)) and *only* those — there is
@@ -800,6 +807,69 @@ in [§3](#3-portal-sessions-and-csrf)/[§4](#4-bearer-api-tokens): they are
 one-way hashed (`SHA-256` for token/session secrets, bcrypt for passwords),
 never sealed for later retrieval, because the gateway never needs to read
 them back — only to compare a freshly hashed presented value.
+
+### 13.1 Chat binary payloads: a sealed store, ownership on read, a hardened serving URL
+
+A portal chat's images (generated and uploaded) are **not** inside the sealed
+transcript: each is a row of `chat_blobs`, and the transcript's `image_url.url`
+is the gateway path `/api/portal/chat-blobs/{id}`
+([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url),
+[Data Model](../reference/data-model.md#portal-chat)).
+
+- **Sealed with the same key, no new secret.** The decoded bytes are sealed with
+  the capture cipher exactly as the transcript is (`nonce‖AES-256-GCM`,
+  `KeyVersion` 1, no gzip), or held plain with `KeyVersion` 0 on the volatile
+  RAM store, which never reaches disk. The persistent chat store is selected only
+  when the cipher is configured (otherwise chats and their images live in the
+  volatile RAM store), so the at-rest guarantee for an image is the one it had
+  inline. The
+  `content_type` and `byte_len` columns are plaintext metadata so ownership and
+  type checks never decrypt.
+- **Ownership is derived and checked on read.** A blob has no owner column: its
+  owner is its chat's owner (`chat_id → chats.user_id`), so it cannot disagree
+  with the chat and the delete cascade from users reaches it through `chats`.
+  `GET /api/portal/chat-blobs/{id}` decides authorization on the **blob**, with
+  two metadata-only lookups before any bytes are read or decrypted, never on a
+  transcript that mentions it: a transcript can carry any id (create and a bare
+  autosave store the URLs they are given), so a chat that merely references
+  another user's id grants nothing. A missing, foreign, deleted, evicted or
+  non-servable blob is one answer, `404 portal.chat_blob_not_found`, with no
+  existence leak; a store or cipher failure is `500 portal.chat_blob_failed`,
+  never a 404. The same rule holds on the write and resolve paths: a gateway
+  URL in request-supplied content must reference a blob **the chat holds**
+  (`images.blob_not_owned`), and the resolution that feeds a run's upstream is
+  scoped to the chat inside the query, so a grafted foreign id never resolves
+  to bytes ([API Compatibility & Inference
+  §12](compatibility-and-inference.md#12-in-portal-chat-playground)).
+- **The content type is attacker-influenced, so it is allow-listed twice.** It
+  originates in a client's `data:` URL and becomes the `Content-Type` of a
+  same-origin, cookie-authenticated, navigable URL, which is the classic
+  stored-XSS shape. Only `image/png`, `image/jpeg`, `image/webp` and `image/gif`
+  are accepted at store time (anything else, `text/html` and `image/svg+xml`
+  included, is `400 images.blob_type_unsupported`, and a non-standard base64
+  form is refused too), and the type is checked **again at read time**, exactly
+  as stored, so a row that somehow differs is never served. The type returned is
+  therefore always one of those four strings.
+- **The response is locked down.** `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
+  (an `<img>` renders it; a navigation to it cannot execute anything) and
+  `Cache-Control: private, no-store`: the id is immutable, but the bytes are
+  decrypted and private, so they are not parked in a browser's disk cache.
+- **Standard portal auth, with a passive cookie check, deliberately.** The
+  route is guarded like any portal read (`requireWebScopeNoTouch` →
+  `authenticateWebSession`): the internal loopback principal first, else the
+  session cookie, else a bearer token, with scope `gateway:use` (`401` without a
+  valid credential, `403 auth.insufficient_scope` without the scope). The
+  per-blob ownership check above applies whatever the principal, so a loopback
+  or foreign principal simply owns no blob and gets the `404`. The cookie leg
+  uses `ResolveSessionDetailNoTouch`: the same validation as §3 (known secret,
+  absolute and idle expiry, active user), but no `TouchSession` write, so an
+  `<img>` load does not extend the idle window. A chat of N images opens N of
+  these in parallel and a write each would stampede the connection pool;
+  skipping it is sound because the chat load that issued them already refreshed
+  the session, and a passive fetch must not be able to keep a session alive on
+  its own. Everything interactive keeps the touching variant. The route is
+  **not** an inference endpoint, and `GET` only (`405` otherwise).
 
 ## 14. Capture redaction of sensitive headers
 
@@ -868,6 +938,15 @@ body gets `413` before JSON decoding is even attempted.
 `portal.MaxChatRequestBytes` (5 MiB: the 4 MiB content cap plus the JSON
 envelope) and answer the same `413 request.body_too_large` over it; the
 service then enforces the content cap itself (`400 portal.chat_too_large`).
+
+**Two server-side bounds replaced the old shared image budget.** With images
+out of the 4 MiB document, `MaxChatBlobBytes`
+(`OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`, default 20 MiB) caps one stored payload
+(`400 images.blob_too_large`) and `MaxRunHistoryBytes`
+(`OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES`, default 32 MiB decoded, counted per
+occurrence) caps the stored-image bytes one run's upstream request carries
+(`400 portal.chat_run_history_too_large`, before the turn is stored). The text
+document cap and the 5 MiB request cap are unchanged.
 
 **Inference bodies are intentionally uncapped.** `/v1/chat/completions`,
 `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` and

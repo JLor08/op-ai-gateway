@@ -520,6 +520,52 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/chat-blobs/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: 'Blob id, "blob_" + 32 hex digits, as it appears in an image_url.url of a stored chat transcript.' }
+    get:
+      tags: [portal]
+      summary: Raw bytes of one stored chat image (owner-scoped, hardened)
+      description: >
+        Serves a chat binary payload (an image) referenced from a transcript by
+        image_url.url "/api/portal/chat-blobs/{id}" (ADR-056). Standard portal
+        auth (session cookie, else bearer or internal loopback, scope
+        gateway:use); the browser's <img> uses the cookie, through the passive
+        variant of the session check (the session is validated but its idle
+        window is not extended). Ownership applies whatever the credential.
+        Authorization is on the blob's own chat: it must belong to
+        the session's user, otherwise 404 portal.chat_blob_not_found, which is
+        also the answer for a missing, deleted, evicted or non-servable blob (no
+        existence leak). The response Content-Type is always one of the
+        allow-listed image/png, image/jpeg, image/webp, image/gif, and the
+        response carries X-Content-Type-Options nosniff, a Content-Security-Policy
+        of default-src 'none', Content-Disposition inline and Cache-Control
+        private, no-store. 500 portal.chat_blob_failed when the store or the
+        cipher fails.
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The decrypted image bytes.
+          headers:
+            X-Content-Type-Options: { schema: { type: string, enum: [nosniff] } }
+            Content-Security-Policy: { schema: { type: string, enum: ["default-src 'none'"] } }
+            Content-Disposition: { schema: { type: string, enum: [inline] } }
+            Cache-Control: { schema: { type: string, enum: ['private, no-store'] } }
+          content:
+            image/png: { schema: { type: string, format: binary } }
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+            image/gif: { schema: { type: string, format: binary } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than GET (Allow: GET).' }
+        '500':
+          description: >
+            The Error envelope with code portal.chat_blob_failed (store or
+            cipher failure; never reported as a 404).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/usage:
     get:
       tags: [portal]

@@ -166,8 +166,9 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   clip_skip: '',
 };
 
-// The portal's HARD cap on images per request: a gateway-side image-STORAGE limit
-// (a generated image is kept in the chat transcript), not an sd-server limit. A
+// The portal's HARD cap on images per request: a portal-side limit (it dates from
+// when every generated image counted against the transcript's cap; the images now
+// live in chat_blobs and the cap was left as it was), not an sd-server limit. A
 // model's reported max batch count (GET /api/portal/model-image-options) may only
 // NARROW the composer's count below this, never raise it. Enforced by the
 // composer's count field (Chat.tsx).

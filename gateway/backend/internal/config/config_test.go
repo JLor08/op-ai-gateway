@@ -351,6 +351,64 @@ func TestLoadCaptureMemoryMaxBytesFallsBackOnJunk(t *testing.T) {
 	}
 }
 
+func TestLoadMaxChatBlobBytesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", "")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxChatBlobBytes != 20<<20 {
+		t.Fatalf("MaxChatBlobBytes = %d, want %d (20 MiB)", cfg.MaxChatBlobBytes, 20<<20)
+	}
+}
+
+func TestLoadMaxChatBlobBytesOverride(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", "1048576")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxChatBlobBytes != 1048576 {
+		t.Fatalf("MaxChatBlobBytes = %d, want 1048576", cfg.MaxChatBlobBytes)
+	}
+}
+
+func TestLoadMaxChatBlobBytesFallsBackOnJunk(t *testing.T) {
+	for _, v := range []string{"garbage", "0", "-5"} {
+		t.Setenv("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", v)
+		if got := mustLoad(t).MaxChatBlobBytes; got != 20<<20 {
+			t.Fatalf("value %q: MaxChatBlobBytes = %d, want %d", v, got, 20<<20)
+		}
+	}
+}
+
+func TestLoadMaxRunHistoryBytesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", "")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxRunHistoryBytes != 32<<20 {
+		t.Fatalf("MaxRunHistoryBytes = %d, want %d (32 MiB)", cfg.MaxRunHistoryBytes, 32<<20)
+	}
+}
+
+func TestLoadMaxRunHistoryBytesOverride(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", "8388608")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxRunHistoryBytes != 8388608 {
+		t.Fatalf("MaxRunHistoryBytes = %d, want 8388608", cfg.MaxRunHistoryBytes)
+	}
+}
+
+func TestLoadMaxRunHistoryBytesFallsBackOnJunk(t *testing.T) {
+	for _, v := range []string{"garbage", "0", "-5"} {
+		t.Setenv("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", v)
+		if got := mustLoad(t).MaxRunHistoryBytes; got != 32<<20 {
+			t.Fatalf("value %q: MaxRunHistoryBytes = %d, want %d", v, got, 32<<20)
+		}
+	}
+}
+
 func TestLoadLogLevelDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_LOG_LEVEL", "")
 	if got := mustLoad(t).LogLevel; got != "info" {

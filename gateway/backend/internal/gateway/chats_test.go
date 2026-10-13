@@ -294,11 +294,13 @@ func TestPortalChatsTitleTooLongRejected(t *testing.T) {
 	}
 }
 
-// The chat list carries the pre-seal content cap so the portal composer can
-// state the remaining capacity instead of hardcoding its own copy of
-// MaxChatContentBytes (which would drift from the Go constant silently). A
-// zero here would make the portal treat the capacity as unknown, and nothing
-// else in the suite would notice.
+// The chat list still carries the pre-seal content cap. It is informational
+// now: it used to feed the composer's remaining-image-capacity line, which is
+// gone since chat images moved out of the document into chat_blobs, and the
+// portal no longer consumes the field. It stays on the wire (not omitempty, so
+// an accidental zero is distinguishable from an absent field) and this pins it
+// to MaxChatContentBytes, so a client that does show the text-document cap
+// never has to hardcode a copy that would drift from the Go constant silently.
 func TestPortalChatsListCarriesMaxContentBytes(t *testing.T) {
 	srv, dir := newChatTestServer(t)
 	seedLoginUser(t, dir, "usr_cap", "cap@example.test", "password-1", "user")

@@ -29,7 +29,6 @@ import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
 import type { ChatContent } from '../shared/chatContent';
 import { prepareImageDataUrl, ImageAttachError } from '../shared/imageAttach';
-import { imagesLeft } from '../shared/chatCapacity';
 import { offeredFlavors } from '../shared/offeredFlavors';
 import {
   ACTIVE_ID_KEY,
@@ -194,11 +193,6 @@ export type ChatStore = {
   // WHOLE transcript on every token delta of any live run, not just the row
   // in flight.
   runElapsedMs: number | undefined;
-  // How many more generated images this chat is expected to hold before it
-  // hits the backend's content cap, or null when that is unknown (a text
-  // thread, or a gateway that serves no max_content_bytes). null means
-  // "unknown" and must never be read as zero.
-  imageCapacityLeft: number | null;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -330,12 +324,6 @@ export function ChatStoreProvider({
   // the backend's omitempty) but the state is always a string, so nothing
   // downstream has to handle undefined.
   const [pinnedChatKind, setPinnedChatKind] = useState<string>('');
-  // The backend's per-chat content cap, as SERVED on the chat listing
-  // (ChatListResponse.max_content_bytes = portal.MaxChatContentBytes). 0 = not
-  // served (an older gateway) = capacity unknown. Never hardcoded here: a
-  // second copy of the Go constant would drift from it silently, and the
-  // failure mode is a capacity line stating the wrong number.
-  const [maxContentBytes, setMaxContentBytes] = useState(0);
 
   // The chat list + which one is active.
   const [chats, setChats] = useState<ChatSummary[]>([]);
@@ -449,14 +437,6 @@ export function ChatStoreProvider({
   // pin yet, so the composer shows what the next send would establish.
   const chatKind = messages.length > 0 ? pinnedChatKind : prospectiveKind;
 
-  // Remaining room for generated images, computed only for an image thread:
-  // measuring the transcript means serialising it, and a text thread neither
-  // shows the number nor is gated on it. null = unknown (see the store type).
-  const imageCapacityLeft = useMemo(
-    () => (chatKind === 'image' ? imagesLeft(messages, maxContentBytes) : null),
-    [chatKind, messages, maxContentBytes],
-  );
-
   // Refs mirror the latest state so the stable callbacks below (send / edit /
   // regenerate / save) can read current values without being re-created every
   // render.
@@ -511,9 +491,6 @@ export function ChatStoreProvider({
   // every thread pinned during the current session.
   const chatKindRef = useRef<string>(chatKind);
   chatKindRef.current = chatKind;
-  // Likewise the remaining image capacity, for send()'s refusal.
-  const imageCapacityLeftRef = useRef<number | null>(imageCapacityLeft);
-  imageCapacityLeftRef.current = imageCapacityLeft;
 
   // The run/SSE engine (FA-2): owns the per-chat run subscriptions + transcript
   // buffers behind a narrow interface. See useChatRuns.ts.
@@ -764,11 +741,6 @@ export function ChatStoreProvider({
         const list = await apiRef.current.chats();
         if (cancelled) return;
         const data = Array.isArray(list?.data) ? list.data : [];
-        // The served content cap (portal.MaxChatContentBytes). Absent on a
-        // gateway older than the field -> stays 0 -> capacity unknown, which
-        // shows no number and refuses no send. Guessing one instead would be
-        // the very drift this is served to avoid.
-        if (typeof list?.max_content_bytes === 'number') setMaxContentBytes(list.max_content_bytes);
         // Fetch the still-running server runs (Task 3.4) and REGISTER their
         // metadata into the run engine WITHOUT opening an EventSource yet.
         // Registering first keeps the opened chat's interrupted-detection
@@ -1127,18 +1099,6 @@ export function ChatStoreProvider({
       showErrorRef.current(tRef.current.chatImageModelUnsupported);
       return;
     }
-    // Refuse an image send whose result this chat provably cannot store,
-    // BEFORE anything is mutated or sent. An image generation costs minutes of
-    // upstream CPU and produces a multi-megabyte artifact; the remaining
-    // capacity is the one number in this feature that is exact and known
-    // BEFORE the user commits. Spending the wait to then fail the save (the
-    // run "completes" and the turn is dropped) is the failure this prevents.
-    // A null capacity is UNKNOWN, not zero -- it must refuse nothing.
-    const capacityLeft = imageCapacityLeftRef.current;
-    if (chatKindRef.current === 'image' && capacityLeft !== null && capacityLeft <= 0) {
-      showErrorRef.current(tRef.current.chatCapacityExhausted);
-      return;
-    }
     // This send pins the thread's kind server-side when the thread is still
     // empty (PrepareChatRun accepts the client's kind only on a genuine first
     // send). Record the same pin here, in the same batch as the optimistic
@@ -1443,7 +1403,6 @@ export function ChatStoreProvider({
     setImageSettings,
     runKind,
     runElapsedMs,
-    imageCapacityLeft,
     chats,
     activeChatId,
     chatsLoading,

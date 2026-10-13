@@ -1304,6 +1304,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/tokens/", s.handlePortalTokenItem)
 	s.mux.HandleFunc("/api/portal/chats", s.handlePortalChats)
 	s.mux.HandleFunc("/api/portal/chats/", s.handlePortalChatItem)
+	s.mux.HandleFunc(chatBlobRoutePrefix, s.handlePortalChatBlob)
 	s.mux.HandleFunc("/api/portal/usage", s.handlePortalUsage)
 	s.mux.HandleFunc("/api/portal/usage/stats", s.handlePortalUsageStats)
 	s.mux.HandleFunc("/api/portal/usage/groups", s.handlePortalUsageGroups)

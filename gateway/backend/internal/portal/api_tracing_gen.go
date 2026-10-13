@@ -327,6 +327,18 @@ func (_d *APIWithTracing) CertificatesView(ctx context.Context) (ca1 []Certifica
 	return _d.API.CertificatesView(ctx)
 }
 
+func (_d *APIWithTracing) ChatBlobBytes(ctx context.Context, t1 auth.Token, s1 string) (ba1 []byte, s2 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ChatBlobBytes")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ChatBlobBytes(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) CheckpointAssistant(ctx context.Context, t1 auth.Token, s1 string, a1 AssistantTurn) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CheckpointAssistant")
 	defer span.End()

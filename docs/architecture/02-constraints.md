@@ -37,11 +37,16 @@ several architectural decisions exist specifically to satisfy them.
   answer text, and it is user-initiated rather than an operator setting: a
   thread the user chose to keep, sealed as one opaque blob by the same capture
   encryption key
-  ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)). A
-  portal-generated image rides **inside** that blob as a content part, under
-  the transcript's own 4 MiB whole-document cap, so it inherits that sealing
-  rather than escaping it —
-  [ADR-043](09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (c).
+  ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)). The
+  transcript's text is under its own 4 MiB whole-document cap. A chat's binary
+  payloads — a portal-generated or uploaded image — are **not** in that
+  document: each lives in its own row of the owner-scoped `chat_blobs` store,
+  sealed with the **same** capture key (so it inherits that sealing rather than
+  escaping it) and referenced from the transcript by a gateway URL, which only
+  the owner's session can read —
+  [ADR-056](09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
+  (it resolves the inline storage of
+  [ADR-043](09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (c)).
 - **Browser vs. program auth are separate and both supported.** Browsers use a
   server-side session cookie plus an `X-OP-CSRF` header on state-changing
   requests; programs use bearer API tokens. Inference endpoints accept three

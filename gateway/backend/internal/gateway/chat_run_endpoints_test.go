@@ -24,6 +24,12 @@ func TestWritePortalRunError(t *testing.T) {
 		ErrTooManyRuns:         429,
 		portal.ErrChatNotFound: 404,
 		portal.ErrChatTooLarge: 400,
+		// The inline-image refusals of a run start (extraction into chat_blobs).
+		portal.ErrChatBlobTypeUnsupported: 400,
+		portal.ErrChatBlobTooLarge:        400,
+		portal.ErrChatBlobNotOwned:        400,
+		// The run-size refusal (the stored images of a history over MaxRunHistoryBytes).
+		portal.ErrChatRunHistoryTooLarge: 400,
 	}
 	for err, want := range cases {
 		w := httptest.NewRecorder()
@@ -69,6 +75,12 @@ func TestWritePortalRunError(t *testing.T) {
 	literalCodes := map[error]string{
 		portal.ErrChatTooLarge: "portal.chat_too_large",
 		ErrTooManyRuns:         "portal.chat_run_limit",
+		// The wire codes of the inline-image refusals: the portal's labels (a
+		// later task) key off exactly these strings.
+		portal.ErrChatBlobTypeUnsupported: "images.blob_type_unsupported",
+		portal.ErrChatBlobTooLarge:        "images.blob_too_large",
+		portal.ErrChatBlobNotOwned:        "images.blob_not_owned",
+		portal.ErrChatRunHistoryTooLarge:  "portal.chat_run_history_too_large",
 	}
 	for err, code := range literalCodes {
 		w := httptest.NewRecorder()
@@ -180,6 +192,43 @@ func TestStartRunCreatesRunAndConflicts(t *testing.T) {
 	if conflict.Error.Code != "portal.chat_run_active" {
 		t.Fatalf("conflict code = %q, want %q (body = %s)",
 			conflict.Error.Code, "portal.chat_run_active", w2.Body.String())
+	}
+}
+
+// TestStartRunRefusesBadInlineImages is the wire pin for the three image
+// refusals at a run start: each is a 400 with its own exact code, the turn is
+// not stored, and -- the part that matters to the next send -- the run slot the
+// start had reserved is released, so the chat is not left stuck at 409.
+func TestStartRunRefusesBadInlineImages(t *testing.T) {
+	srv, owner, chatID := newRunTestServer(t)
+
+	inline := func(url string) string {
+		return `{"user_message":[{"type":"image_url","image_url":{"url":"` + url + `"}}],"settings":{"model":"qwen-coder"}}`
+	}
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, body, code string }{
+		{"html", inline("data:text/html;base64,PGI+"), "images.blob_type_unsupported"},
+		{"unknown blob", inline("/api/portal/chat-blobs/blob_" + strings.Repeat("0", 32)), "images.blob_not_owned"},
+	} {
+		w := startRunViaHandler(srv, chatID, tc.body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d body %s, want 400", tc.name, w.Code, w.Body.String())
+		}
+		requireErrorCode(t, w.Body.String(), tc.code)
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Content) != string(before.Content) {
+		t.Fatalf("a refused start changed the transcript:\n before %s\n after  %s", before.Content, after.Content)
+	}
+	// The slot is free: a good start on the same chat goes through.
+	if w := startRunViaHandler(srv, chatID, inline("data:image/png;base64,AAEC")); w.Code != http.StatusCreated {
+		t.Fatalf("a valid image start after the refusals: got %d body %s, want 201", w.Code, w.Body.String())
 	}
 }
 

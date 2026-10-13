@@ -27,6 +27,7 @@ type API interface {
 	ResetTOTP(context.Context, string) error
 	ResolveSession(context.Context, string) (store.User, error)
 	ResolveSessionDetail(context.Context, string) (store.User, store.Session, error)
+	ResolveSessionDetailNoTouch(context.Context, string) (store.User, store.Session, error)
 	SetPassword(context.Context, string, string) (store.User, string, error)
 	SetPendingTOTP(context.Context, string) (string, string, error)
 	UpdateOwnProfile(context.Context, string, UserUpdate) (store.User, error)

@@ -89,8 +89,8 @@ regardless. See [Persistence](../../docs/architecture/cross-cutting/persistence.
   nginx's 1 MiB default, except `/api/portal/chats`: it carries whole chat
   documents and allows 5 MiB, the gateway's own chat request cap. A custom
   reverse proxy in front **must** allow at least that on `/api/portal/chats`
-  too, or saving a chat with a few generated images is refused with an HTML
-  413.
+  too, or saving a large chat document (or sending a large image upload, which
+  rides inline in the run-start body) is refused with an HTML 413.
 - `OP_AI_GATEWAY_SESSION_COOKIE_SECURE=false` (in `.env.example`) is required for
   the plain-HTTP Compose stack; set it `true` once TLS terminates in front.
 - Set `OP_AI_GATEWAY_PUBLIC_URL` to include the `/portal` segment so invite links

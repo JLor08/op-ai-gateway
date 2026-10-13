@@ -290,8 +290,32 @@ type ChatStore interface {
 	CreateChat(ctx context.Context, chat store.Chat) error
 	UpdateChat(ctx context.Context, chat store.Chat) error
 	ChatByID(ctx context.Context, id string) (store.ChatRow, error)
+	// ChatOwner returns the user_id of a chat, or store.ErrNotFound, without
+	// reading the sealed document. Ownership checks that do not need the
+	// content (the chat-image serving path, once per image) use it instead of
+	// ChatByID.
+	ChatOwner(ctx context.Context, chatID string) (userID string, err error)
 	ChatsByUser(ctx context.Context, userID string) ([]store.ChatSummary, error)
 	DeleteChat(ctx context.Context, id string) error
+
+	// Binary payloads (inline images) live in their own chat_blobs rows, owned
+	// by a chat and deleted with it, so the sealed document stays small.
+	// PutChatBlob is deliberately not part of this interface: it is store
+	// internal, used only inside SaveChatWithBlobs.
+
+	// SaveChatWithBlobs writes the chat document and its new blobs as one
+	// atomic step: either all of it persists or none of it does.
+	SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error
+	// ChatBlobByID returns one blob row, or store.ErrNotFound. It does not
+	// check which chat the caller may read from: resolve ownership first
+	// (ChatBlobOwner, or ChatBlobsByIDs, which scopes by chat itself).
+	ChatBlobByID(ctx context.Context, id string) (store.ChatBlob, error)
+	// ChatBlobOwner returns the id of the chat a blob belongs to, or
+	// store.ErrNotFound, without loading the payload.
+	ChatBlobOwner(ctx context.Context, id string) (chatID string, err error)
+	// ChatBlobsByIDs returns the named blobs that belong to chatID, keyed by
+	// blob id. An id that is missing or owned by another chat is left out.
+	ChatBlobsByIDs(ctx context.Context, chatID string, ids []string) (map[string]store.ChatBlob, error)
 }
 
 // CaptureReader reads a persisted capture blob for the detail endpoint (read
@@ -473,6 +497,21 @@ type ServiceDeps struct {
 	// value, so a test/deps literal that omits it needs no special-casing) falls
 	// back to DefaultAgentPresenceTimeoutSeconds (15) in NewService.
 	AgentPresenceTimeoutDefault int
+	// MaxChatBlobBytes is the per-blob ceiling for one chat binary payload (an
+	// inline chat image stored in chat_blobs), config.Config.MaxChatBlobBytes.
+	// The store is a plain byte store; this service applies the ceiling when it
+	// extracts images at a run commit. <= 0 (including the zero value, so a
+	// test/deps literal that omits it needs no special-casing) falls back to
+	// DefaultMaxChatBlobBytes (20 MiB) in NewService.
+	MaxChatBlobBytes int
+	// MaxRunHistoryBytes bounds the total bytes of stored chat images one run
+	// resolves into its upstream history (config.Config.MaxRunHistoryBytes): a
+	// run whose history would carry more is refused. Counted per occurrence, so
+	// an image referenced twice counts twice, because the request carries it
+	// twice. <= 0 (including the zero value, so a test/deps literal that omits
+	// it needs no special-casing) falls back to DefaultMaxRunHistoryBytes
+	// (32 MiB) in NewService.
+	MaxRunHistoryBytes int
 	// OnNetbirdDomainChanged, when set, is invoked (best-effort) after a NetBird
 	// account dns_domain change so the caller can trigger an immediate peer→domain
 	// sync pass. Nil = no trigger (the periodic sync loop is the backstop).
@@ -748,7 +787,13 @@ type Service struct {
 	// agentPresenceTimeoutDefault is the resolved (env-fallback) default used by
 	// AgentPresenceTimeoutSeconds when the KV is unset/invalid.
 	agentPresenceTimeoutDefault int
-	settingsVolatile            bool
+	// maxChatBlobBytes is the resolved per-blob ceiling for one chat binary
+	// payload (see ServiceDeps.MaxChatBlobBytes); always > 0 after NewService.
+	maxChatBlobBytes int
+	// maxRunHistoryBytes is the resolved bound on the stored-image bytes one run
+	// carries (see ServiceDeps.MaxRunHistoryBytes); always > 0 after NewService.
+	maxRunHistoryBytes int
+	settingsVolatile   bool
 	// runtimeChanged is the best-effort agent-runtime-spec-write hook (see
 	// ServiceDeps.OnRuntimeConfigChanged / SetRuntimeConfigChangedHook).
 	// nil-safe: called only through notifyRuntimeChanged (service_runtime.go).
@@ -836,6 +881,14 @@ func NewService(deps ServiceDeps) *Service {
 	if agentPresenceDefault <= 0 {
 		agentPresenceDefault = DefaultAgentPresenceTimeoutSeconds
 	}
+	maxChatBlobBytes := deps.MaxChatBlobBytes
+	if maxChatBlobBytes <= 0 {
+		maxChatBlobBytes = DefaultMaxChatBlobBytes
+	}
+	maxRunHistoryBytes := deps.MaxRunHistoryBytes
+	if maxRunHistoryBytes <= 0 {
+		maxRunHistoryBytes = DefaultMaxRunHistoryBytes
+	}
 	themes := deps.Themes
 	if themes == nil {
 		themes = &theme.Registry{}
@@ -898,6 +951,8 @@ func NewService(deps ServiceDeps) *Service {
 		agentTLSPort:                deps.AgentTLSPort,
 		agentTLSSeparateDefault:     deps.AgentTLSSeparateDefault,
 		agentPresenceTimeoutDefault: agentPresenceDefault,
+		maxChatBlobBytes:            maxChatBlobBytes,
+		maxRunHistoryBytes:          maxRunHistoryBytes,
 		settingsVolatile:            deps.SettingsVolatile,
 		runtimeChanged:              deps.OnRuntimeConfigChanged,
 		clock:                       clock,

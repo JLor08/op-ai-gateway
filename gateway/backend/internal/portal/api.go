@@ -44,6 +44,7 @@ type API interface {
 	CertificateCABundlePEM(context.Context) (string, error)
 	CertificateCAView(context.Context) (CertificateCADTO, error)
 	CertificatesView(context.Context) ([]CertificateDTO, error)
+	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
 	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)

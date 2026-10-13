@@ -43,6 +43,24 @@ var sharedErrorMap = []errRow{
 	{err: portal.ErrPathSuffixInvalid, status: http.StatusBadRequest, code: "application.path_suffix_invalid", msg: "path suffix must be a path, not a URL"},
 	{err: portal.ErrChatNotFound, status: http.StatusNotFound, code: "portal.chat_not_found", msg: "chat not found"},
 	{err: portal.ErrChatTooLarge, status: http.StatusBadRequest, code: "portal.chat_too_large", msg: "chat content is too large"},
+	// The three refusals of an inline chat image at a run commit (the extraction
+	// into chat_blobs, portal.PrepareChatRun/CommitAssistant). Only the run start
+	// can return them to a client; a commit that fails with one ends the run with
+	// the generic commit-failure code instead (see commitFailureCode).
+	{err: portal.ErrChatBlobTypeUnsupported, status: http.StatusBadRequest, code: "images.blob_type_unsupported", msg: "image must be a base64 data URL of type png, jpeg, webp or gif"},
+	{err: portal.ErrChatBlobTooLarge, status: http.StatusBadRequest, code: "images.blob_too_large", msg: "image is too large"},
+	{err: portal.ErrChatBlobNotOwned, status: http.StatusBadRequest, code: "images.blob_not_owned", msg: "image reference does not belong to this chat"},
+	// A run refused because the stored images its history would carry exceed
+	// MaxRunHistoryBytes (portal.PrepareChatRun, before the turn is stored). The
+	// thread itself is fine and not lost: the user can remove images or start a
+	// new chat, so it is a request refusal like the rows above, not a 5xx.
+	{err: portal.ErrChatRunHistoryTooLarge, status: http.StatusBadRequest, code: "portal.chat_run_history_too_large", msg: "the images in this conversation are too large to send to the model"},
+	// The serving endpoint's not-found (GET /api/portal/chat-blobs/{id}): no
+	// such blob, someone else's, its chat gone, or a type that is not servable --
+	// one answer for all of them (no existence leak). A code of its own, not
+	// portal.chat_not_found, so a client can tell a missing image from a missing
+	// chat.
+	{err: portal.ErrChatBlobNotFound, status: http.StatusNotFound, code: "portal.chat_blob_not_found", msg: "image not found"},
 	// ErrRunAlreadyActive: writePortalRunError (run start) and
 	// writePortalChatError (PUT /chats/{id}, task 9) both refuse an
 	// already-active run identically -- 409 portal.chat_run_active -- so this

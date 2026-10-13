@@ -27,6 +27,25 @@ type Chat struct {
 	UpdatedAt  time.Time
 }
 
+// ChatBlob is one binary payload (an inline image today) that belongs to a chat
+// and lives in its own chat_blobs row instead of inside the chat document, so
+// the document stays small. Blob is opaque to the store: like Chat.Blob it is
+// either nonce||AEAD(bytes) (KeyVersion > 0, sealed) or the plain bytes
+// (KeyVersion == 0, the RAM-fallback path) -- sealing/opening, the content-type
+// allow-list and the per-blob size cap are the service layer's job, this store
+// is a dumb byte store. ContentType and ByteLen are plaintext metadata about
+// the payload as it was before sealing, so the list/serve path never has to
+// decrypt just to answer "what is this and how big".
+type ChatBlob struct {
+	ID          string
+	ChatID      string
+	KeyVersion  int
+	Blob        []byte
+	ContentType string
+	ByteLen     int64
+	CreatedAt   time.Time
+}
+
 // ChatRow is the read DTO returned by ChatByID: the full row including Blob +
 // KeyVersion so the service can Open the sealed payload.
 type ChatRow struct {
@@ -69,7 +88,14 @@ func (s *SQLiteStore) CreateChat(ctx context.Context, chat Chat) error {
 // UpdateChat overwrites the mutable columns (title/blob/key_version/updated_at)
 // of an existing chat. A missing row returns ErrNotFound (RowsAffected == 0).
 func (s *SQLiteStore) UpdateChat(ctx context.Context, chat Chat) error {
-	res, err := s.exec(ctx, `
+	return s.updateChatRow(ctx, s.db, chat)
+}
+
+// updateChatRow is UpdateChat's statement and error mapping against an explicit
+// execer, shared with SaveChatWithBlobs so the in-transaction update cannot
+// drift from the standalone one.
+func (s *SQLiteStore) updateChatRow(ctx context.Context, ex execer, chat Chat) error {
+	res, err := s.execOn(ctx, ex, `
 		update chats set title = ?, key_version = ?, blob = ?, updated_at = ? where id = ?`,
 		chat.Title, chat.KeyVersion, chat.Blob, chat.UpdatedAt, chat.ID,
 	)
@@ -82,6 +108,57 @@ func (s *SQLiteStore) UpdateChat(ctx context.Context, chat Chat) error {
 	}
 	if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// SaveChatWithBlobs writes a chat and its newly-extracted chat_blobs as ONE
+// atomic unit: either the chat update and every blob persist, or none of them
+// does. It is the primitive a run-commit uses to persist a chat document that
+// now references images together with those images' bytes, so a crash or error
+// between the two writes can never leave a document pointing at blobs that do
+// not exist (or blobs no document references).
+//
+// The chat side is UpdateChat (title / key_version / blob / updated_at of an
+// existing chat; owner and created_at are not touched) and each blob is a
+// PutChatBlob insert; the error mapping is theirs: a chat that does not exist is
+// ErrNotFound, a blob id already taken -- by another row or by an earlier blob
+// of the same batch -- is ErrConflict. A blob whose ChatID is not chat.ID is
+// refused before anything is written (a save only ever attaches blobs to the
+// chat it saves). The context bounds the whole transaction.
+//
+// Atomicity is the transaction: the UPDATE and every INSERT run on one *sql.Tx
+// and only the final Commit makes them visible; any failure returns before
+// Commit and the deferred Rollback discards the lot. The blobs deliberately do
+// NOT go through PutChatBlob / s.exec, which run on the pool and would commit
+// one by one. The UPDATE runs first, so a missing chat is ErrNotFound without
+// uploading a single blob byte and the error precedence (missing chat, then
+// taken id) matches the in-RAM store's. An empty blobs is just UpdateChat -- a
+// single statement is already atomic.
+func (s *SQLiteStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob) error {
+	if len(blobs) == 0 {
+		return s.UpdateChat(ctx, chat)
+	}
+	for _, blob := range blobs {
+		if blob.ChatID != chat.ID {
+			return fmt.Errorf("save chat with blobs: blob %q belongs to chat %q, not %q", blob.ID, blob.ChatID, chat.ID)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save chat with blobs: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.updateChatRow(ctx, tx, chat); err != nil {
+		return err
+	}
+	for _, blob := range blobs {
+		if err := s.insertChatBlob(ctx, tx, blob); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save chat with blobs: %w", err)
 	}
 	return nil
 }
@@ -99,6 +176,22 @@ func (s *SQLiteStore) ChatByID(ctx context.Context, id string) (ChatRow, error) 
 		return ChatRow{}, fmt.Errorf("scan chat: %w", err)
 	}
 	return chat, nil
+}
+
+// ChatOwner returns the user_id of chat chatID, or ErrNotFound. It selects that
+// one column and never the sealed document: the chat-image serving path asks it
+// once per <img>, and a chat of many images would otherwise read the whole
+// transcript blob again for each one just to compare two strings.
+func (s *SQLiteStore) ChatOwner(ctx context.Context, chatID string) (string, error) {
+	var userID string
+	err := s.queryRow(ctx, `select user_id from chats where id = ?`, chatID).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("scan chat owner: %w", err)
+	}
+	return userID, nil
 }
 
 // ChatsByUser lists the owner's chats as summaries (no blob), most-recently

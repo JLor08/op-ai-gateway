@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Typography } from '@mui/material';
 import { ChatMessage } from './ChatMessage';
@@ -21,6 +21,9 @@ const nativeCreateElement = document.createElement.bind(document);
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  // The stored-image download tests stub fetch (and, like the data: URL ones,
+  // URL); neither may leak into the next test.
+  vi.unstubAllGlobals();
 });
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
@@ -438,7 +441,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // not crash (downloadBinary runs inside this onClick, with no error
     // boundary above it) and, since this whole feature exists to stop a
     // failure from being silent, the user must be told.
-    it('tells the user when a generated image fails to download instead of failing silently', () => {
+    it('tells the user when a generated image fails to download instead of failing silently', async () => {
       vi.stubGlobal('URL', {
         ...URL,
         createObjectURL: vi.fn(() => 'blob:stub'),
@@ -459,7 +462,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(() =>
         fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage })),
       ).not.toThrow();
-      const alert = screen.getByText(t.chatImageDownloadError);
+      // The download is async now (a stored image is fetched first), so the
+      // failure message lands a microtask after the click.
+      const alert = await screen.findByText(t.chatImageDownloadError);
       expect(alert).toBeInTheDocument();
       // ...and it READS as a failure. This was hardcoded to the brand teal
       // (var(--brand-accent)) -- the portal's accent colour -- while every
@@ -475,6 +480,170 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(window.getComputedStyle(alert).color).toBe(
         window.getComputedStyle(screen.getByTestId('error-reference')).color,
       );
+    });
+
+    // downloadBinary resolves false for every failure it knows of, but a browser
+    // API can still throw while the file is being built (here: no object URL can
+    // be created for the decoded blob). That used to escape ImageTurn's click
+    // handler as an unhandled promise rejection with nothing shown; it has to
+    // surface as the same inline error, and not reject.
+    it('tells the user, without an unhandled rejection, when building the file throws', async () => {
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => {
+            throw new Error('object url quota exceeded');
+          }),
+          revokeObjectURL: vi.fn(),
+        });
+
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            promptText="a cat"
+            content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+          />,
+        );
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        expect(await screen.findByText(t.chatImageDownloadError)).toBeInTheDocument();
+        // Let any rejection that escaped the handler reach the process hook.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
+    // Stored images (binary payload store) are short gateway urls, not data:
+    // URLs. Save has to fetch the bytes from the owner-scoped endpoint, and the
+    // saved file's extension is whatever that response's Content-Type says --
+    // the url itself says nothing about the media type.
+    describe('a stored image served from the gateway', () => {
+      const BLOB_URL = '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10';
+
+      function renderStoredImage(turnId = 'msg_a1b2') {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId={turnId}
+            promptText="a cat"
+            content={[{ type: 'image_url', image_url: { url: BLOB_URL } }]}
+          />,
+        );
+      }
+
+      it("fetches the image with credentials and names the file from the response's Content-Type", async () => {
+        let anchor: HTMLAnchorElement | undefined;
+        const clicked: string[] = [];
+        vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+          const el = nativeCreateElement(tag, options as ElementCreationOptions);
+          if (tag === 'a') {
+            const anchorEl = el as HTMLAnchorElement;
+            anchor = anchorEl;
+            // jsdom cannot navigate to the blob: URL the download builds.
+            anchorEl.click = () => clicked.push(anchorEl.download);
+          }
+          return el;
+        });
+        const blobs: Blob[] = [];
+        const createObjectURL = vi.fn((b: Blob) => {
+          blobs.push(b);
+          return 'blob:stub';
+        });
+        const revokeObjectURL = vi.fn();
+        vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+        const fetchMock = vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          blob: async () => new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/jpeg' }),
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderStoredImage();
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        await waitFor(() => expect(clicked).toHaveLength(1));
+        expect(fetchMock).toHaveBeenCalledWith(BLOB_URL, { credentials: 'same-origin' });
+        // Extension from the served media type (jpeg -> jpg), turn id in the
+        // name exactly as for a data: URL.
+        expect(anchor?.download).toBe('generated-image-msg_a1b2-1.jpg');
+        expect(blobs[0].type).toBe('image/jpeg');
+        expect(blobs[0].size).toBe(4);
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:stub');
+        expect(screen.queryByText(t.chatImageDownloadError)).not.toBeInTheDocument();
+      });
+
+      it('tells the user when the stored image cannot be fetched', async () => {
+        const createObjectURL = vi.fn(() => 'blob:stub');
+        vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => ({ ok: false, status: 404, blob: async () => new Blob([]) })),
+        );
+
+        renderStoredImage();
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        expect(await screen.findByText(t.chatImageDownloadError)).toBeInTheDocument();
+        expect(createObjectURL).not.toHaveBeenCalled();
+      });
+
+      it('tells the user, without throwing, when the request itself fails', async () => {
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:stub'),
+          revokeObjectURL: vi.fn(),
+        });
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => {
+            throw new TypeError('Failed to fetch');
+          }),
+        );
+
+        renderStoredImage();
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        expect(await screen.findByText(t.chatImageDownloadError)).toBeInTheDocument();
+      });
+
+      it('clears an earlier failure message once a later save succeeds', async () => {
+        vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+          const el = nativeCreateElement(tag, options as ElementCreationOptions);
+          if (tag === 'a') (el as HTMLAnchorElement).click = () => {};
+          return el;
+        });
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:stub'),
+          revokeObjectURL: vi.fn(),
+        });
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce({ ok: false, status: 404, blob: async () => new Blob([]) })
+          .mockResolvedValueOnce({
+            ok: true,
+            status: 200,
+            blob: async () => new Blob([new Uint8Array([1])], { type: 'image/png' }),
+          });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderStoredImage();
+        const save = screen.getByRole('button', { name: t.chatDownloadImage });
+        fireEvent.click(save);
+        expect(await screen.findByText(t.chatImageDownloadError)).toBeInTheDocument();
+
+        fireEvent.click(save);
+        await waitFor(() =>
+          expect(screen.queryByText(t.chatImageDownloadError)).not.toBeInTheDocument(),
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
     });
   });
 }

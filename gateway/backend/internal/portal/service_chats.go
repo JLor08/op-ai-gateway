@@ -34,17 +34,41 @@ var (
 	// KeyVersion > 0 when a live cipher existed at write time). Mapped to 500,
 	// never to ErrChatNotFound (it must not look like "chat missing").
 	ErrChatCipherMissing = errors.New("portal.chat_cipher_missing")
+	// ErrChatBlobTypeUnsupported is returned when an inline image in a run's
+	// content is not a base64 data url of an allow-listed image type (png, jpeg,
+	// webp, gif). Mapped to 400.
+	ErrChatBlobTypeUnsupported = errors.New("images.blob_type_unsupported")
+	// ErrChatBlobTooLarge is returned when one inline image decodes to more than
+	// the per-blob ceiling (config MaxChatBlobBytes). Mapped to 400.
+	ErrChatBlobTooLarge = errors.New("images.blob_too_large")
+	// ErrChatBlobNotOwned is returned when a content part already references a
+	// /api/portal/chat-blobs/{id} url whose blob this chat does not hold --
+	// another user's, another chat's, or none at all, indistinguishably. Mapped
+	// to 400.
+	ErrChatBlobNotOwned = errors.New("images.blob_not_owned")
+	// ErrChatBlobNotFound is returned when a stored chat image cannot be served
+	// to the caller: there is no such blob, it was evicted or its chat deleted,
+	// it belongs to another user's chat, or its stored type is not a servable
+	// image type -- all indistinguishably (owner-scoped, no existence leak).
+	// Deliberately its own sentinel rather than ErrChatNotFound or
+	// store.ErrNotFound: the serving endpoint answers with a blob-specific code.
+	// Mapped to 404.
+	ErrChatBlobNotFound = errors.New("portal.chat_blob_not_found")
+	// ErrChatRunHistoryTooLarge is returned when resolving a run's stored images
+	// would make its upstream history carry more than MaxRunHistoryBytes. The run
+	// is refused before the turn is stored. Mapped to 400.
+	ErrChatRunHistoryTooLarge = errors.New("portal.chat_run_history_too_large")
 )
 
 const (
+	// chatKindImage is the ChatRunSettings.Kind of an image-generation thread.
+	chatKindImage = "image"
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
-	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
-	// Exported because the portal composer has to state the remaining capacity
-	// of an image thread BEFORE the user commits to a multi-minute generation,
-	// and it is served to the client on ChatListResponse rather than
-	// duplicated there -- a second copy in the frontend would drift from this
-	// one with nothing to catch it.
+	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB. It
+	// bounds the chat's TEXT document: images no longer count, they live in
+	// chat_blobs (extracted before this check). Exported so it can be served on
+	// ChatListResponse, informationally, rather than duplicated by a client.
 	MaxChatContentBytes = 4 << 20
 	// MaxChatRequestBytes caps a chat request BODY -- create, save and run
 	// start -- at the content cap plus room for the JSON envelope around it
@@ -52,6 +76,16 @@ const (
 	// limit, the bundled nginx configs allow exactly this much on
 	// /api/portal/chats, and a test pins that they never fall below it.
 	MaxChatRequestBytes = MaxChatContentBytes + 1<<20
+	// DefaultMaxChatBlobBytes is the per-blob ceiling (decoded bytes) for one
+	// stored chat image when the service is built without one. It mirrors
+	// config.Config.MaxChatBlobBytes's default and the portal composer's own 20
+	// MiB upload limit.
+	DefaultMaxChatBlobBytes = 20 << 20
+	// DefaultMaxRunHistoryBytes bounds the decoded image bytes one run's upstream
+	// history may carry when the service is built without a bound. It mirrors
+	// config.Config.MaxRunHistoryBytes's default. Base64 adds a third on the wire,
+	// so the default keeps the images of one request to about 43 MiB.
+	DefaultMaxRunHistoryBytes = 32 << 20
 )
 
 // ChatSummaryDTO is the list DTO: plaintext metadata only, never the content.
@@ -74,15 +108,16 @@ type ChatDTO struct {
 }
 
 // ChatListResponse wraps the summary list under a data key (mirrors the other
-// portal list endpoints) plus the limits a client needs to stay inside it.
+// portal list endpoints) plus the text-document limit.
 //
-// MaxContentBytes is MaxChatContentBytes: the client cannot otherwise know it
-// (no other DTO carries it), and a client that hardcoded its own copy would
-// drift from this one silently -- the failure mode being a composer that
-// confidently states the wrong remaining capacity. It is NOT omitempty: a
-// missing field and a zero are the same thing on the wire, and the portal
-// reads zero as "capacity unknown" (no capacity line, no refusal), so an
-// accidental zero would disable the feature rather than break loudly.
+// MaxContentBytes is MaxChatContentBytes, the cap on the chat's TEXT document.
+// It is informational: it used to feed the composer's remaining-image-capacity
+// line, which is gone now that images live in chat_blobs rather than inside the
+// document, and the portal frontend no longer consumes it. It is still served
+// so a client that wants to show the text cap need not hardcode a copy that
+// would drift from this one silently. It is NOT omitempty: a missing field and a
+// zero are the same thing on the wire, so an accidental zero would otherwise be
+// indistinguishable from "not sent".
 type ChatListResponse struct {
 	Data            []ChatSummaryDTO `json:"data"`
 	MaxContentBytes int              `json:"max_content_bytes"`
@@ -189,24 +224,62 @@ func (s *Service) SaveChat(ctx context.Context, owner auth.Token, id string, req
 			return ChatDTO{}, err
 		}
 	}
-	keyVersion, blob, err := s.sealChat(content)
+	updated, err := s.sealedChatUpdate(row, title, content)
 	if err != nil {
 		return ChatDTO{}, err
 	}
-	now := s.clock().UTC()
-	updated := store.Chat{
+	if err := s.chats.UpdateChat(ctx, updated); err != nil {
+		return ChatDTO{}, err
+	}
+	return ChatDTO{ID: row.ID, Title: title, CreatedAt: row.CreatedAt, UpdatedAt: updated.UpdatedAt, Content: content}, nil
+}
+
+// sealedChatUpdate is row's chat in its next state: title and content replaced
+// (the content sealed, and capped at MaxChatContentBytes by sealChat), a fresh
+// updated_at, owner and created_at as they were. SaveChat writes it with
+// UpdateChat; the two run commits write it together with the blobs they
+// extracted (commitChatRun).
+func (s *Service) sealedChatUpdate(row store.ChatRow, title string, content json.RawMessage) (store.Chat, error) {
+	keyVersion, blob, err := s.sealChat(content)
+	if err != nil {
+		return store.Chat{}, err
+	}
+	return store.Chat{
 		ID:         row.ID,
 		UserID:     row.UserID,
 		Title:      title,
 		KeyVersion: keyVersion,
 		Blob:       blob,
 		CreatedAt:  row.CreatedAt,
-		UpdatedAt:  now,
+		UpdatedAt:  s.clock().UTC(),
+	}, nil
+}
+
+// commitChatRun persists doc as row's chat together with the blobs
+// extractChatBlobs took out of it, in ONE atomic store step: either the
+// document and every blob it now references persist, or none does. It is the
+// write both run commits end in (PrepareChatRun, writeAssistant).
+//
+// The document is sealed here, after the extraction, so the MaxChatContentBytes
+// cap measures the rewritten document -- a few hundred bytes per image -- not
+// the bytes it used to carry.
+//
+// A chat deleted while the run was committing surfaces as store.ErrNotFound
+// (the missing-row update, or the foreign key of a blob insert), which is the
+// error the run executor's commitFailureIsChatGone recognises, so such a run
+// ends cleanly rather than as a 500. A volatile memory store can accept the
+// save and evict the chat straight away to stay within its budget; nothing here
+// assumes the chat is still held afterwards.
+func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title string, doc chatDoc, blobs []store.ChatBlob) error {
+	content, err := doc.marshal()
+	if err != nil {
+		return err
 	}
-	if err := s.chats.UpdateChat(ctx, updated); err != nil {
-		return ChatDTO{}, err
+	updated, err := s.sealedChatUpdate(row, title, content)
+	if err != nil {
+		return err
 	}
-	return ChatDTO{ID: row.ID, Title: title, CreatedAt: row.CreatedAt, UpdatedAt: now, Content: content}, nil
+	return s.chats.SaveChatWithBlobs(ctx, updated, blobs)
 }
 
 // DeleteChat removes an owned chat. A foreign or missing chat is 404 (no leak).
@@ -427,7 +500,10 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // persisted — which the caller must feed into the run executor (via
 // gateway.PrepareRunResult.Settings) instead of the raw request settings, so a
 // self-healed clear is honored rather than silently overridden by the stale
-// value the client submitted. Owner-scoped.
+// value the client submitted. For a text run the history carries its images as
+// data urls, the stored references of the older turns resolved to their bytes
+// (resolveChatBlobRefs); an image run's history is returned as stored.
+// Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -463,8 +539,14 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// message count.
 	hadPriorMessages := len(doc.Messages) > 0
 
+	// firstUnvetted is the index of the first message this request supplied: the
+	// whole history for an edit/regenerate, only the new turn for an append. The
+	// messages before it are what the chat itself stored, and extractChatBlobs
+	// does not re-verify their blob references (see its doc).
+	firstUnvetted := len(doc.Messages)
 	if req.EditedHistory != nil {
 		doc.Messages = req.EditedHistory
+		firstUnvetted = 0
 	} else if req.UserMessage != nil {
 		userMsg, err := json.Marshal(map[string]any{
 			"id":      "msg_" + compactRandomHex(8),
@@ -475,6 +557,21 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 			return nil, ChatRunSettings{}, err
 		}
 		doc.Messages = append(doc.Messages, userMsg)
+	}
+
+	// Move the inline images of the assembled messages -- the new turn's upload,
+	// an edited history's, and a legacy chat's not yet migrated ones -- into
+	// chat_blobs, and rewrite their urls in the document that is sealed below.
+	// This is BEFORE the seal so the 4 MiB cap measures the rewritten document.
+	//
+	// runMessages is what the run itself is handed. It stays the PRE-rewrite
+	// messages: the bytes the user just sent are in hand and go to the model as
+	// they are, with no round trip through the store. extractChatBlobs rewrites a
+	// copy of the slice, so runMessages is not touched by it.
+	runMessages := doc.Messages
+	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, firstUnvetted)
+	if err != nil {
+		return nil, ChatRunSettings{}, err
 	}
 
 	// Self-heal the chat's per-run server override against the OWNER's
@@ -491,8 +588,8 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// cleared (never rejects/fails the run); blank stays blank, with no
 	// AuthorizeServerManage call (validateServerOverride's own early return).
 	// The cleared settings are PERSISTED below via the SAME content-save path
-	// this function already uses (doc.Settings feeds newContent feeds
-	// SaveChat), so a stale override is healed exactly once rather than
+	// this function already uses (doc.Settings feeds the document commitChatRun
+	// seals and saves), so a stale override is healed exactly once rather than
 	// re-discovered — and re-ignored — on every future run. This is a
 	// courtesy write, NOT the security boundary: every routed request is
 	// re-authorized again at request time by the gateway's
@@ -526,7 +623,7 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// kind keeps a text thread's persisted settings byte-identical even against a
 	// raw API client that submits them (ChatRunSettings is the POST body
 	// verbatim), mirroring the ServerOverrideForceUnreachable self-heal above.
-	if req.Settings.Kind != "image" {
+	if req.Settings.Kind != chatKindImage {
 		req.Settings.Image = nil
 	}
 
@@ -540,15 +637,33 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if title == "" {
 		title = deriveChatTitle(doc.Messages)
 	}
-	newContent, err := doc.marshal()
+	title, err = normalizeChatTitle(title)
 	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
-	if _, err := s.SaveChat(ctx, owner, chatID, UpdateChatRequest{Title: &title, Content: &newContent}); err != nil {
+
+	history := buildAPIHistory(req.Settings.SystemPrompt, runMessages)
+	// The stored messages reference their images by url; the run's upstream gets
+	// the images themselves (see resolveChatBlobRefs). The turn being sent is in
+	// runMessages with its bytes inline already, so only the older references are
+	// fetched. An image run skips it: its executor reads nothing of the history but
+	// the last prompt's text, so fetching, decrypting and encoding every image of
+	// the thread would be wasted, and the run-size bound would refuse an image
+	// thread for bytes that are never sent.
+	//
+	// This is before the commit on purpose: a run refused for its history's size,
+	// or whose images cannot be read, stores nothing, so retrying it is not a
+	// duplicate turn.
+	if req.Settings.Kind != chatKindImage {
+		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
+			return nil, ChatRunSettings{}, err
+		}
+	}
+	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 
-	return buildAPIHistory(req.Settings.SystemPrompt, doc.Messages), req.Settings, nil
+	return history, req.Settings, nil
 }
 
 // buildAPIHistory maps stored messages to OpenAI role+content, prepending a
@@ -721,10 +836,16 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 	}
 	doc.Messages = append(doc.Messages, raw)
 
-	newContent, err := doc.marshal()
+	// A generated image arrives as an inline data: part of the turn just built.
+	// Store it in chat_blobs and rewrite its url before the document is sealed,
+	// exactly as PrepareChatRun does for an upload (and so, too, before the 4 MiB
+	// cap: a generated image no longer has to fit in the document). Only the turn
+	// built here is unvetted; the messages before it were stored -- and their
+	// references verified -- by an earlier commit, so a checkpoint, which runs
+	// every few seconds, does no ownership lookups for them.
+	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, len(doc.Messages)-1)
 	if err != nil {
 		return err
 	}
-	_, err = s.SaveChat(ctx, owner, chatID, UpdateChatRequest{Content: &newContent})
-	return err
+	return s.commitChatRun(ctx, row, row.Title, doc, blobs)
 }
