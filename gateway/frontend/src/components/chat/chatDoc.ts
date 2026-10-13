@@ -166,9 +166,11 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   clip_skip: '',
 };
 
-// sd-server's batch_count ceiling for one request (its capabilities `limits`
-// report max_batch_count: 8). Enforced by the composer; the gateway passes n
-// through and sd-server clamps anyway.
+// The portal's HARD cap on images per request: a gateway-side image-STORAGE limit
+// (a generated image is kept in the chat transcript), not an sd-server limit. A
+// model's reported max batch count (GET /api/portal/model-image-options) may only
+// NARROW the composer's count below this, never raise it. Enforced by the
+// composer's count field (Chat.tsx).
 export const IMAGE_N_MAX = 8;
 
 // The size presets the composer offers. "" is "model default" (no size sent, so
@@ -189,10 +191,12 @@ export const IMAGE_SIZE_OPTIONS = [
 export const IMAGE_OUTPUT_FORMATS = ['', 'png', 'jpeg', 'webp'] as const;
 
 // sd-cpp's compiled-in sampler (sample_method_to_str) and scheduler
-// (scheduler_to_str) enums, offered as a STATIC superset for Phase 1b. "" = the
-// model's own default. The gateway forwards the pick opaquely, so a value a given
-// sd-server build does not support is simply ignored upstream; a future Phase 1b
-// would narrow these per model from /sdcpp/v1/capabilities.
+// (scheduler_to_str) enums, kept as a STATIC superset. "" = the model's own
+// default. They are the fallback the composer uses when GET
+// /api/portal/model-image-options returns nothing for a field; the picked
+// model's own options narrow them when it does. The gateway forwards the pick
+// opaquely, so a value a given sd-server build does not support is simply
+// ignored upstream.
 export const IMAGE_SAMPLERS = [
   '',
   'euler',
@@ -239,6 +243,17 @@ export const IMAGE_SCHEDULERS = [
   'beta',
   'llada_image',
 ] as const;
+
+// The merge rule for a per-model option list (GET /api/portal/model-image-options):
+// the fetched list wins when it is non-empty, else the static superset above. The
+// endpoint omits (omitempty) a list it does not know, so absent and empty both mean
+// "unknown" and the dropdown must still offer something.
+export function optionsOr(
+  fetched: readonly string[] | undefined,
+  staticList: readonly string[],
+): readonly string[] {
+  return fetched && fetched.length > 0 ? fetched : staticList;
+}
 
 // Parse a blank-able numeric knob string to a wire number, or undefined when
 // blank/unparseable (so imageSetting omits it and sd-server keeps its default).

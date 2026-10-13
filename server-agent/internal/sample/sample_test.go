@@ -6,6 +6,7 @@ package sample
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -819,5 +820,97 @@ func TestSampleRuntimeConfigAppliedETagIsOmittedWhenEmpty(t *testing.T) {
 	}
 	if !bytes.Contains(raw, []byte(`"runtime_config_applied_etag":"e1"`)) {
 		t.Fatalf("raw JSON missing runtime_config_applied_etag:\"e1\": %s", raw)
+	}
+}
+
+// TestRuntimeImageOptionsWireShape pins the JSON keys of RuntimeSample's
+// image_options, field by field, including the nested limits and defaults. The
+// gateway decodes this document with a mirror DTO in another Go module, so the
+// KEYS are the whole contract: a renamed Go field must not silently rename a
+// key, and this test fails if any of them moves.
+func TestRuntimeImageOptionsWireShape(t *testing.T) {
+	s := Sample{Runtimes: []RuntimeSample{{
+		SpecID: "rspec_sd",
+		ImageOptions: &RuntimeImageOptions{
+			Samplers:      []string{"euler", "heun"},
+			Schedulers:    []string{"karras"},
+			OutputFormats: []string{"png", "jpeg"},
+			Limits:        RuntimeImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 32, MaxHeight: 1024, MaxBatchCount: 8},
+			Defaults: RuntimeImageDefaults{
+				Sampler: "euler", Scheduler: "karras", OutputFormat: "png", NegativePrompt: "blurry",
+				Steps: 20, ClipSkip: -1, Seed: -1, Width: 512, Height: 768,
+				CFG: 7.5,
+			},
+		},
+	}}}
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var probe struct {
+		Runtimes []struct {
+			ImageOptions any `json:"image_options"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	var want any
+	if err := json.Unmarshal([]byte(`{
+		"samplers": ["euler", "heun"],
+		"schedulers": ["karras"],
+		"output_formats": ["png", "jpeg"],
+		"limits": {"min_width": 64, "max_width": 2048, "min_height": 32, "max_height": 1024, "max_batch_count": 8},
+		"defaults": {
+			"sampler": "euler", "scheduler": "karras", "output_format": "png", "negative_prompt": "blurry",
+			"steps": 20, "clip_skip": -1, "seed": -1, "width": 512, "height": 768, "cfg": 7.5
+		}
+	}`), &want); err != nil {
+		t.Fatalf("unmarshal want: %v", err)
+	}
+	if len(probe.Runtimes) != 1 || !reflect.DeepEqual(probe.Runtimes[0].ImageOptions, want) {
+		t.Fatalf("runtimes[0].image_options = %#v, want %#v (the gateway's mirror DTO matches these keys exactly)", probe.Runtimes[0].ImageOptions, want)
+	}
+}
+
+// TestRuntimeImageOptionsOmittedWhenNilAndKeepsItsObjectsWhenZero pins the two
+// ends of the pointer: nil omits the key entirely (every runtime that is not a
+// stable_diffusion_cpp child, and an agent predating the field, stays
+// byte-neutral), while a non-nil zero value still marshals its limits and
+// defaults objects with every key, so "the document was read and states no
+// options" is distinguishable from "no document was read".
+func TestRuntimeImageOptionsOmittedWhenNilAndKeepsItsObjectsWhenZero(t *testing.T) {
+	s := Sample{Runtimes: []RuntimeSample{
+		{SpecID: "rspec_none"},
+		{SpecID: "rspec_zero", ImageOptions: &RuntimeImageOptions{}},
+	}}
+	raw, err := json.Marshal(&s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var probe struct {
+		Runtimes []map[string]json.RawMessage `json:"runtimes"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		t.Fatalf("unmarshal probe: %v", err)
+	}
+	if len(probe.Runtimes) != 2 {
+		t.Fatalf("probe runtimes len = %d, want 2", len(probe.Runtimes))
+	}
+	if v, ok := probe.Runtimes[0]["image_options"]; ok {
+		t.Errorf("runtimes[0] carries image_options %s, want the key omitted", v)
+	}
+	zero, ok := probe.Runtimes[1]["image_options"]
+	if !ok {
+		t.Fatalf("runtimes[1] has no image_options key, want a present (zero) object")
+	}
+	var got map[string]map[string]any
+	if err := json.Unmarshal(zero, &got); err != nil {
+		// samplers/schedulers/output_formats are omitted when empty, so every
+		// remaining member is an object.
+		t.Fatalf("unmarshal zero image_options %s: %v", zero, err)
+	}
+	if len(got) != 2 || len(got["limits"]) != 5 || len(got["defaults"]) != 10 {
+		t.Errorf("zero image_options = %s, want exactly limits (5 keys) and defaults (10 keys)", zero)
 	}
 }

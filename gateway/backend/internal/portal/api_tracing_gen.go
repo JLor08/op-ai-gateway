@@ -1187,6 +1187,18 @@ func (_d *APIWithTracing) MeshTLSPendingServers(ctx context.Context) (ca1 []Cert
 	return _d.API.MeshTLSPendingServers(ctx)
 }
 
+func (_d *APIWithTracing) ModelImageOptionViews(ctx context.Context, t1 auth.Token, s1 string) (ia1 []ImageOptionMapping, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ModelImageOptionViews")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ModelImageOptionViews(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) ModelOfferingFor(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (m1 ModelOffering) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ModelOfferingFor")
 	defer span.End()

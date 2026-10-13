@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 )
 
@@ -113,4 +114,128 @@ func TestProbeSdcppVerdicts(t *testing.T) {
 			t.Fatal("stable = true for a closed port, want false")
 		}
 	})
+}
+
+// sdcppFullOptionsDoc is the shape stable-diffusion.cpp's capability document
+// has when a model is loaded (the same document the gateway's own tests use):
+// the sampling defaults sit under defaults_by_mode.img_gen.sample_params, the
+// CFG scale under that block's guidance.txt_cfg, and clip_skip, seed,
+// negative_prompt, width, height and output_format directly in
+// defaults_by_mode.img_gen.
+const sdcppFullOptionsDoc = `{
+  "model": {"name": "flux1-dev.safetensors", "stem": "flux1-dev"},
+  "current_mode": "img_gen",
+  "supported_modes": ["img_gen"],
+  "limits": {"min_width": 64, "max_width": 2048, "min_height": 64, "max_height": 2048, "max_batch_count": 8},
+  "samplers": ["euler", "euler_a", "heun"],
+  "schedulers": ["discrete", "karras"],
+  "output_formats": ["png", "jpeg", "webp"],
+  "output_formats_by_mode": {"img_gen": ["png", "jpeg"]},
+  "defaults_by_mode": {
+    "img_gen": {
+      "prompt": "",
+      "negative_prompt": "blurry",
+      "clip_skip": -1,
+      "width": 512,
+      "height": 768,
+      "seed": -1,
+      "batch_count": 1,
+      "output_format": "png",
+      "sample_params": {
+        "sample_method": "euler",
+        "scheduler": "karras",
+        "sample_steps": 20,
+        "guidance": {"txt_cfg": 7.5, "img_cfg": 1.0}
+      }
+    }
+  }
+}`
+
+// TestProbeSdcppVerdictsCarriesImageOptions pins that the SAME GET that yields
+// the image verdict also yields the image options, and that the two decodes
+// are independent: a malformed options document never degrades the verdict,
+// and an unreadable supported_modes never costs the options their readable
+// fields. The options ride PropsVerdicts.ImageOptions, a pointer, so that
+// "the document was read" (non-nil, possibly all zero) stays distinct from
+// "no document was read" (nil).
+func TestProbeSdcppVerdictsCarriesImageOptions(t *testing.T) {
+	serve := func(status int, body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/sdcpp/v1/capabilities" {
+				t.Errorf("request path = %q, want /sdcpp/v1/capabilities", r.URL.Path)
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+	}
+	fullWant := &SdcppImageOptions{
+		Samplers:      []string{"euler", "euler_a", "heun"},
+		Schedulers:    []string{"discrete", "karras"},
+		OutputFormats: []string{"png", "jpeg"},
+		Limits:        SdcppImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 64, MaxHeight: 2048, MaxBatchCount: 8},
+		Defaults: SdcppImageDefaults{
+			Sampler: "euler", Scheduler: "karras", OutputFormat: "png", NegativePrompt: "blurry",
+			Steps: 20, ClipSkip: -1, Seed: -1, Width: 512, Height: 768,
+			CFG: 7.5,
+		},
+	}
+	cases := []struct {
+		name        string
+		status      int
+		body        string
+		wantImage   string
+		wantOptions *SdcppImageOptions
+		wantStable  bool
+	}{
+		{"a full document yields the verdict and every option", 200, sdcppFullOptionsDoc, "yes", fullWant, true},
+		{
+			"malformed option fields leave the verdict untouched and keep the readable options",
+			200,
+			`{"supported_modes":["img_gen"],"samplers":7,"limits":"wide","defaults_by_mode":["x"],"output_formats_by_mode":3,"schedulers":["karras"]}`,
+			"yes",
+			&SdcppImageOptions{Schedulers: []string{"karras"}},
+			true,
+		},
+		{
+			"an all-malformed options document is a read document with zero options, and the verdict stands",
+			200,
+			`{"supported_modes":["img_gen"],"samplers":7,"limits":"wide","defaults_by_mode":["x"],"output_formats_by_mode":3}`,
+			"yes",
+			&SdcppImageOptions{},
+			true,
+		},
+		{
+			"an exhaustive list without img_gen is a no, and the options still come through",
+			200,
+			`{"supported_modes":["vid_gen"],"samplers":["euler"]}`,
+			"no",
+			&SdcppImageOptions{Samplers: []string{"euler"}},
+			true,
+		},
+		{
+			"a supported_modes of the wrong type is no verdict, but the options decode independently",
+			200,
+			`{"supported_modes":"img_gen","samplers":["euler"]}`,
+			"",
+			&SdcppImageOptions{Samplers: []string{"euler"}},
+			true,
+		},
+		{"a document with no options is a read, zero value", 200, `{"supported_modes":["img_gen"]}`, "yes", &SdcppImageOptions{}, true},
+		{"not JSON is transient and carries no options", 200, `{"supported_modes":[`, "", nil, false},
+		{"404 is conclusive and carries no options", 404, ``, "", nil, true},
+		{"503 is transient and carries no options", 503, sdcppFullOptionsDoc, "", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := serve(tc.status, tc.body)
+			defer srv.Close()
+			got, stable := ProbeSdcppVerdicts(context.Background(), srv.Client(), srv.URL)
+			if stable != tc.wantStable || got.Caps.Image != tc.wantImage {
+				t.Fatalf("got image=%q stable=%v, want image=%q stable=%v", got.Caps.Image, stable, tc.wantImage, tc.wantStable)
+			}
+			if !reflect.DeepEqual(got.ImageOptions, tc.wantOptions) {
+				t.Fatalf("ImageOptions = %+v, want %+v", got.ImageOptions, tc.wantOptions)
+			}
+		})
+	}
 }

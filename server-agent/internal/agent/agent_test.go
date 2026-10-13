@@ -3385,6 +3385,167 @@ func TestProbeRuntimeChildPropsSdcppReadsItsCapabilityDocument(t *testing.T) {
 	}
 }
 
+// sdcppOptionsDoc is a capability document with a model loaded: the image
+// verdict plus every image option the agent reports.
+const sdcppOptionsDoc = `{
+  "model": {"name": "flux1-dev.safetensors", "stem": "flux1-dev"},
+  "supported_modes": ["img_gen"],
+  "limits": {"min_width": 64, "max_width": 2048, "min_height": 64, "max_height": 2048, "max_batch_count": 8},
+  "samplers": ["euler", "euler_a", "heun"],
+  "schedulers": ["discrete", "karras"],
+  "output_formats_by_mode": {"img_gen": ["png", "jpeg"]},
+  "defaults_by_mode": {
+    "img_gen": {
+      "negative_prompt": "blurry", "clip_skip": -1, "width": 512, "height": 768, "seed": -1,
+      "output_format": "png",
+      "sample_params": {"sample_method": "euler", "scheduler": "karras", "sample_steps": 20, "guidance": {"txt_cfg": 7.5}}
+    }
+  }
+}`
+
+// sdcppOptionsWant is the sample.RuntimeImageOptions sdcppOptionsDoc yields.
+func sdcppOptionsWant() *sample.RuntimeImageOptions {
+	return &sample.RuntimeImageOptions{
+		Samplers:      []string{"euler", "euler_a", "heun"},
+		Schedulers:    []string{"discrete", "karras"},
+		OutputFormats: []string{"png", "jpeg"},
+		Limits:        sample.RuntimeImageLimits{MinWidth: 64, MaxWidth: 2048, MinHeight: 64, MaxHeight: 2048, MaxBatchCount: 8},
+		Defaults: sample.RuntimeImageDefaults{
+			Sampler: "euler", Scheduler: "karras", OutputFormat: "png", NegativePrompt: "blurry",
+			Steps: 20, ClipSkip: -1, Seed: -1, Width: 512, Height: 768,
+			CFG: 7.5,
+		},
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppReportsImageOptions pins that the image
+// options the collector decodes from the capability document ride the sample
+// on BOTH paths of probeRuntimeChildProps: the cache miss that probes the
+// child, and the cache hit that answers from the cached verdicts without
+// asking the child again. They come from the same document as the image
+// verdict and are cached with it, so the child is asked exactly once.
+func TestProbeRuntimeChildPropsSdcppReportsImageOptions(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppOptionsDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_sdcpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := child.status(t, "stable_diffusion_cpp", 7060)
+
+	var miss sample.RuntimeSample
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &miss)
+	if !reflect.DeepEqual(miss.ImageOptions, sdcppOptionsWant()) {
+		t.Fatalf("ImageOptions (cache miss) = %+v, want %+v", miss.ImageOptions, sdcppOptionsWant())
+	}
+	if want := sdcppImage("yes"); miss.Capabilities == nil || !reflect.DeepEqual(*miss.Capabilities, *want) {
+		t.Errorf("Capabilities (cache miss) = %+v, want %+v (the options must not disturb the verdict)", miss.Capabilities, want)
+	}
+
+	var hit sample.RuntimeSample
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &hit)
+	if !reflect.DeepEqual(hit.ImageOptions, sdcppOptionsWant()) {
+		t.Fatalf("ImageOptions (cache hit) = %+v, want %+v", hit.ImageOptions, sdcppOptionsWant())
+	}
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("child requests = %v, want %v (the options are cached with the verdict, not re-read)", got, want)
+	}
+
+	// Mutating one cycle's sample must not reach the cached entry or the next
+	// cycle's sample.
+	hit.ImageOptions.Samplers[0] = "mutated"
+	var again sample.RuntimeSample
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &again)
+	if !reflect.DeepEqual(again.ImageOptions, sdcppOptionsWant()) {
+		t.Errorf("ImageOptions after a sibling sample was mutated = %+v, want %+v", again.ImageOptions, sdcppOptionsWant())
+	}
+}
+
+// TestProbeRuntimeChildPropsSdcppImageOptionsNilWhenNoDocumentWasRead pins
+// the nil/non-nil distinction the pointer exists for: a conclusive 404 (no
+// document) reports no options, while a document that states none reports a
+// non-nil zero value ("read, nothing stated").
+func TestProbeRuntimeChildPropsSdcppImageOptionsNilWhenNoDocumentWasRead(t *testing.T) {
+	features := &fakeGatewayFeatures{names: []string{"capability_source_sdcpp"}}
+
+	t.Run("a 404 is conclusive and carries no options", func(t *testing.T) {
+		child := newProbeChild(t, nil)
+		a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+		st, base := child.status(t, "stable_diffusion_cpp", 7070)
+		for _, name := range []string{"miss", "hit"} {
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if rs.ImageOptions != nil {
+				t.Errorf("%s: ImageOptions = %+v, want nil", name, rs.ImageOptions)
+			}
+		}
+		// The nil above only means something if the probe actually ran: the
+		// child was asked exactly once (the miss), and the conclusive 404 was
+		// cached so the hit did not ask again.
+		if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+			t.Errorf("child requests = %v, want %v (probed once, then answered from the cache)", got, want)
+		}
+	})
+
+	t.Run("a document with no options is a non-nil zero value", func(t *testing.T) {
+		child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+		a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+		st, base := child.status(t, "stable_diffusion_cpp", 7071)
+		for _, name := range []string{"miss", "hit"} {
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if !reflect.DeepEqual(rs.ImageOptions, &sample.RuntimeImageOptions{}) {
+				t.Errorf("%s: ImageOptions = %+v, want a non-nil zero value", name, rs.ImageOptions)
+			}
+		}
+	})
+}
+
+// TestProbeRuntimeChildPropsSdcppImageOptionsRideTheGate pins that the options
+// share the capability_source_sdcpp gate with the verdict, on both paths:
+// while the gateway does not declare the source nothing is probed and no
+// options are sent, and a cached entry stops sending its options when the
+// gateway stops declaring the source (a rollback), then resumes them, without
+// asking the child again, once it declares it again.
+func TestProbeRuntimeChildPropsSdcppImageOptionsRideTheGate(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppOptionsDoc})
+	features := &fakeGatewayFeatures{names: []string{"runtime_manager"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	clk := newFakeClock()
+	a.now = clk.now
+	st, base := child.status(t, "stable_diffusion_cpp", 7080)
+	probe := func() sample.RuntimeSample {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		return rs
+	}
+
+	if rs := probe(); rs.ImageOptions != nil {
+		t.Fatalf("ImageOptions with the source undeclared (cache miss) = %+v, want nil", rs.ImageOptions)
+	}
+	if got := child.requests(); len(got) != 0 {
+		t.Fatalf("child requests = %v, want none while the gateway does not declare the source", got)
+	}
+
+	features.set([]string{"capability_source_sdcpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	if rs := probe(); !reflect.DeepEqual(rs.ImageOptions, sdcppOptionsWant()) {
+		t.Fatalf("ImageOptions once declared = %+v, want %+v", rs.ImageOptions, sdcppOptionsWant())
+	}
+
+	features.set([]string{"runtime_manager"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	if rs := probe(); rs.ImageOptions != nil {
+		t.Fatalf("ImageOptions after the downgrade (cache hit) = %+v, want nil", rs.ImageOptions)
+	}
+
+	features.set([]string{"capability_source_sdcpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	if rs := probe(); !reflect.DeepEqual(rs.ImageOptions, sdcppOptionsWant()) {
+		t.Fatalf("ImageOptions after the source is declared again = %+v, want %+v", rs.ImageOptions, sdcppOptionsWant())
+	}
+	if got, want := child.requests(), map[string]int{sdcppCapabilitiesRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("child requests = %v, want %v (the kept entry answers; the child is not asked again)", got, want)
+	}
+}
+
 // TestProbeRuntimeChildPropsSdcppWaitsForTheGatewayFeature pins the gate:
 // while the gateway does not declare capability_source_sdcpp, a
 // stable_diffusion_cpp child is asked NOTHING, the sample carries no
@@ -3566,6 +3727,9 @@ func TestProbeRuntimeChildPropsOtherTypesIgnoreTheSdcppFeature(t *testing.T) {
 			if rs.Capabilities == nil || rs.Capabilities.Source != tc.wantSource {
 				t.Errorf("Capabilities = %+v, want source %q", rs.Capabilities, tc.wantSource)
 			}
+			if rs.ImageOptions != nil {
+				t.Errorf("ImageOptions = %+v, want nil (only a stable_diffusion_cpp child reports image options)", rs.ImageOptions)
+			}
 
 			var hit sample.RuntimeSample
 			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &hit)
@@ -3574,6 +3738,9 @@ func TestProbeRuntimeChildPropsOtherTypesIgnoreTheSdcppFeature(t *testing.T) {
 			}
 			if hit.Capabilities == nil || hit.Capabilities.Source != tc.wantSource {
 				t.Errorf("Capabilities (cache hit) = %+v, want source %q", hit.Capabilities, tc.wantSource)
+			}
+			if hit.ImageOptions != nil {
+				t.Errorf("ImageOptions (cache hit) = %+v, want nil", hit.ImageOptions)
 			}
 			if n := features.fetches(); n != 0 {
 				t.Errorf("gateway feature fetches = %d, want 0 (only a stable_diffusion_cpp child consults the gateway's feature set)", n)

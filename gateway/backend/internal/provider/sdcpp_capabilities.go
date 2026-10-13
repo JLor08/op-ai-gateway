@@ -66,10 +66,24 @@ func (c *OpenAICompatibleClient) ProbeSdcppCapabilities(ctx context.Context, tar
 	return fetchSdcppCapabilities(ctx, c.http, target)
 }
 
-// fetchSdcppCapabilities is the GET behind ProbeSdcppCapabilities, modelled on
-// fetchLoadedModels: it honours target.Timeout, attaches the per-application
-// upstream credential, and bounds the body at 1 MiB.
+// fetchSdcppCapabilities is the GET behind ProbeSdcppCapabilities: the shared
+// document fetch, decoded by the STRICT verdict parser.
 func fetchSdcppCapabilities(ctx context.Context, httpClient *http.Client, target routing.Target) (SdcppVerdicts, error) {
+	body, err := fetchSdcppDoc(ctx, httpClient, target)
+	if err != nil {
+		return SdcppVerdicts{}, err
+	}
+	return parseSdcppCapabilities(body)
+}
+
+// fetchSdcppDoc GETs stable-diffusion.cpp's capability document and returns its
+// raw body. It is the one fetch behind both ProbeSdcppCapabilities (strict
+// verdict decode) and ProbeSdcppImageOptions (lenient options decode), so the
+// two read the same request and differ only in how they decode. Modelled on
+// fetchLoadedModels: it honours target.Timeout, attaches the per-application
+// upstream credential, and bounds the body at 1 MiB. A transport failure or a
+// non-2xx status is an ErrUnavailable; decoding is the caller's.
+func fetchSdcppDoc(ctx context.Context, httpClient *http.Client, target routing.Target) ([]byte, error) {
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
@@ -77,28 +91,30 @@ func fetchSdcppCapabilities(ctx context.Context, httpClient *http.Client, target
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, sdcppCapabilitiesPath), nil)
 	if err != nil {
-		return SdcppVerdicts{}, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
 	}
 	applyUpstreamAuth(ctx, req)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return SdcppVerdicts{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return SdcppVerdicts{}, unavailableStatus(resp.StatusCode)
+		return nil, unavailableStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return SdcppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	return parseSdcppCapabilities(body)
+	return body, nil
 }
 
 // sdcppCapabilitiesDoc is the part of the capability document this code reads.
 // Only supported_modes and model.stem answer a question the gateway has; the
 // document's limits, samplers, features, output_formats and the rest are
-// deliberately not decoded.
+// deliberately not decoded HERE: the image options are read by the separate,
+// lenient sdcppImageOptionsDoc (sdcpp_image_options.go), so this strict verdict
+// decode stays as narrow as the verdict it answers.
 //
 // SupportedModes is a POINTER so that an absent (or null) list stays
 // distinguishable from an empty one: absent is no answer, while an empty list

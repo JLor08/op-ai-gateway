@@ -277,10 +277,12 @@ func TestFeaturesDeclareRuntimeEnsure(t *testing.T) {
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
 	// followed. 0.8.0 was MINOR because agent.Features gained
-	// runtime_ensure; 0.8.1 is PATCH because it gains nothing (see the
-	// Version constant's own block). runtime_ensure's Since stays 0.8.0: a
-	// Since records the version a feature shipped in.
-	if Version != "0.8.1" {
-		t.Fatalf("Version = %q, want 0.8.1 (agent.Features gains no entry, so the bump from 0.8.0 is PATCH)", Version)
+	// runtime_ensure; 0.8.1 and 0.8.2 are PATCH because they gain nothing
+	// (see the Version constant's own block; 0.8.2 adds the image_options
+	// telemetry field, gated on the gateway-declared capability_source_sdcpp,
+	// which is not an agent.Features entry). runtime_ensure's Since stays
+	// 0.8.0: a Since records the version a feature shipped in.
+	if Version != "0.8.2" {
+		t.Fatalf("Version = %q, want 0.8.2 (agent.Features gains no entry, so the bump from 0.8.1 is PATCH)", Version)
 	}
 }

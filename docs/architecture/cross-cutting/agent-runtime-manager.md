@@ -3450,7 +3450,13 @@ mirror). Three different cadences share the one collect cycle:
     Its `LiveProgressSupport` is always `""` too, because `sd-server` has no
     timings surface of its own ([Agent-Managed Model Runtime
     §3.4](#a-worked-sd-server-launch-under-stable_diffusion_cpp)). **This
-    branch alone is gated**, below.
+    branch alone is gated**, below. The same read also yields the child's
+    image options (samplers, schedulers, size limits, defaults), decoded
+    leniently and separately from the verdict, cached in the same entry and
+    carried on the sample as `image_options` behind the same gate; the gateway
+    holds them only in memory for the portal composer
+    ([API Compatibility & Inference
+    §3.4](compatibility-and-inference.md#34-openai-images-generations)).
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.

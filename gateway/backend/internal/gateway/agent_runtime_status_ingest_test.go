@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"op-ai-gateway/internal/logbuffer"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"strings"
@@ -2503,4 +2504,188 @@ func TestAgentRuntimeCapabilitiesSampleDecode(t *testing.T) {
 			t.Errorf("Verdicts = %+v, want empty", caps.Verdicts)
 		}
 	})
+}
+
+// --- per-model sd-server image options: the telemetry ingest half --------
+
+// imageOptionsWireJSON is the agent's sample.RuntimeSample.ImageOptions as it
+// appears on the wire, written out as a LITERAL so the keys under test are the
+// ones the agent ships and not whatever this package's own mirror happens to
+// call them. Every field carries a value no other field shares (the two -1
+// defaults aside, which are pinned on their own below), so a key that is
+// renamed -- or two that are swapped -- lands a different value in the
+// decoded result and fails the comparison.
+//
+// There is no cross-module test of the gateway's mirror: the agent's
+// TestRuntimeImageOptionsWireShape pins the agent's tags and the collector
+// twin table pins the decode, but only THIS literal pins the gateway's tags.
+const imageOptionsWireJSON = `{` +
+	`"samplers":["euler","dpm++2m"],"schedulers":["karras","discrete"],"output_formats":["png","jpeg"],` +
+	`"limits":{"min_width":64,"max_width":2048,"min_height":128,"max_height":1536,"max_batch_count":4},` +
+	`"defaults":{"sampler":"euler","scheduler":"karras","output_format":"png","negative_prompt":"blurry",` +
+	`"steps":20,"clip_skip":2,"seed":1234,"width":512,"height":768,"cfg":7.5}}`
+
+// imageOptionsWant is what imageOptionsWireJSON must decode to.
+func imageOptionsWant() *provider.SdcppImageOptions {
+	return &provider.SdcppImageOptions{
+		Samplers:      []string{"euler", "dpm++2m"},
+		Schedulers:    []string{"karras", "discrete"},
+		OutputFormats: []string{"png", "jpeg"},
+		Limits: provider.SdcppImageLimits{
+			MinWidth: 64, MaxWidth: 2048, MinHeight: 128, MaxHeight: 1536, MaxBatchCount: 4,
+		},
+		Defaults: provider.SdcppImageDefaults{
+			Sampler: "euler", Scheduler: "karras", OutputFormat: "png", NegativePrompt: "blurry",
+			Steps: 20, ClipSkip: 2, Seed: 1234, Width: 512, Height: 768, CFG: 7.5,
+		},
+	}
+}
+
+// imageOptionsBody is a telemetry body for one runtime entry whose
+// image_options is the given JSON, embedded verbatim ("" omits the key). It
+// declares runtime_model_probe and carries the sdcpp image verdict, because
+// that is the shape a real agent-launched sd-server reports and the verdict
+// write is the thing these options must not disturb.
+func imageOptionsBody(specID, optionsJSON string) string {
+	field := ""
+	if optionsJSON != "" {
+		field = `,"image_options":` + optionsJSON
+	}
+	return `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+		`"runtimes":[{"spec_id":"` + specID + `","state":"running",` +
+		`"capabilities":{"verdicts":[{"name":"image","verdict":"yes"}],"source":"sdcpp_capabilities"}` +
+		field + `}]}`
+}
+
+// TestAgentRuntimeImageOptionsWireShape pins the GATEWAY's decode of the
+// agent's image_options: a telemetry literal carrying the agent's exact
+// snake_case keys, decoded through agentRuntimeSample and mapped by
+// runtimeStatusDTOsFromSamples, must land every value in the matching
+// provider.SdcppImageOptions field. A renamed json tag on the mirror makes the
+// value vanish (it decodes to zero) and this fail.
+func TestAgentRuntimeImageOptionsWireShape(t *testing.T) {
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_wire","state":"running","image_options":` +
+		imageOptionsWireJSON + `}]}`
+	req, _ := ingestReq(t, body)
+	dtos := runtimeStatusDTOsFromSamples(req.Runtimes, time.Now())
+	if len(dtos) != 1 {
+		t.Fatalf("dtos = %+v, want 1", dtos)
+	}
+	if got, want := dtos[0].ImageOptions, imageOptionsWant(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ImageOptions = %+v, want %+v", got, want)
+	}
+}
+
+// TestAgentRuntimeImageOptionsDecodeShapes covers the three states of the wire
+// field the doc on sample.RuntimeSample.ImageOptions distinguishes: absent (an
+// older agent, or a child with no sdcpp document) and null are both "nothing
+// known" -> nil; an empty object is "the document was read and states no
+// options" -> a non-nil zero value, which must not be flattened into nil. The
+// server's own -1 defaults for clip_skip and seed are carried as -1, never
+// mapped to the "unknown" zero.
+func TestAgentRuntimeImageOptionsDecodeShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want *provider.SdcppImageOptions
+	}{
+		{"key absent", ``, nil},
+		{"explicit null", `null`, nil},
+		{"empty object", `{}`, &provider.SdcppImageOptions{}},
+		{
+			"the -1 defaults are carried", `{"defaults":{"clip_skip":-1,"seed":-1}}`,
+			&provider.SdcppImageOptions{Defaults: provider.SdcppImageDefaults{ClipSkip: -1, Seed: -1}},
+		},
+		{
+			"a partial document keeps what it has", `{"samplers":["euler"],"limits":{"max_width":1024}}`,
+			&provider.SdcppImageOptions{Samplers: []string{"euler"}, Limits: provider.SdcppImageLimits{MaxWidth: 1024}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			field := ""
+			if tc.json != "" {
+				field = `,"image_options":` + tc.json
+			}
+			req, _ := ingestReq(t, `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_shape","state":"running"`+field+`}]}`)
+			dtos := runtimeStatusDTOsFromSamples(req.Runtimes, time.Now())
+			if len(dtos) != 1 {
+				t.Fatalf("dtos = %+v, want 1", dtos)
+			}
+			if got := dtos[0].ImageOptions; !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("ImageOptions = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIngestTelemetrySamplePublishesImageOptions proves an ingested sample's
+// image_options reaches the runtime-status registry on the entry for its
+// spec, readable from the snapshot keyed by server + spec -- and that the
+// capability-row write the same sample drives is exactly what it was: the
+// options are not a verdict, so the image row is still the ONLY row written.
+func TestIngestTelemetrySamplePublishesImageOptions(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_imgopts", false)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, imageOptionsBody("rspec_imgopts", imageOptionsWireJSON))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	snap := srv.RuntimeStatus.statusSnapshot("mock-host-qwen")
+	if len(snap) != 1 || snap[0].SpecID != "rspec_imgopts" {
+		t.Fatalf("snapshot = %+v, want exactly the rspec_imgopts entry", snap)
+	}
+	if got, want := snap[0].ImageOptions, imageOptionsWant(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("published ImageOptions = %+v, want %+v", got, want)
+	}
+
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityImage {
+		t.Fatalf("the capability write carried %+v, want exactly the image row -- image options are not a capability verdict", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_imgopts", routing.CapabilityImage, routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
+}
+
+// TestIngestTelemetrySampleWithoutImageOptionsLeavesThemNil is the other half:
+// a sample with no image_options (every runtime that is not an sd-server, and
+// every older agent) publishes a nil ImageOptions, and a later sample without
+// them REPLACES an earlier one that had them -- each frame is a full snapshot,
+// so stale options never outlive the frame that carried them.
+func TestIngestTelemetrySampleWithoutImageOptionsLeavesThemNil(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_noimgopts", false)
+
+	for i, optionsJSON := range []string{"", imageOptionsWireJSON, ""} {
+		req, raw := ingestReq(t, imageOptionsBody("rspec_noimgopts", optionsJSON))
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest %d: %v", i, err)
+		}
+		snap := srv.RuntimeStatus.statusSnapshot("mock-host-qwen")
+		if len(snap) != 1 {
+			t.Fatalf("sample %d: snapshot = %+v, want one entry", i, snap)
+		}
+		if want := optionsJSON != ""; (snap[0].ImageOptions != nil) != want {
+			t.Fatalf("sample %d: ImageOptions = %+v, want non-nil=%v", i, snap[0].ImageOptions, want)
+		}
+	}
+}
+
+// TestRuntimeStatusDTOImageOptionsStayOffTheSSEFrame pins that the options ride
+// the registry IN PROCESS only. The status stream the portal subscribes to
+// re-sends every entry on each publish; the options are read by a handler
+// next to the registry, and their provider type has untagged nested fields
+// that would put Go-cased keys on a wire nobody specified.
+func TestRuntimeStatusDTOImageOptionsStayOffTheSSEFrame(t *testing.T) {
+	b, err := json.Marshal(RuntimeStatusDTO{SpecID: "s", ImageOptions: imageOptionsWant()})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "image_options") || strings.Contains(string(b), "euler") {
+		t.Fatalf("status frame JSON carries the image options: %s", b)
+	}
 }

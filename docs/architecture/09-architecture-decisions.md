@@ -3652,3 +3652,105 @@ in URLs and logs); following redirects (the custom header would travel with them
 [API Compatibility & Inference §8](cross-cutting/compatibility-and-inference.md#8-provider-clients),
 [Building Block View](05-building-block-view.md#52-level-2--gateway-backend-components),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter).
+
+## ADR-055 — Per-model sd-server image options are read live on pick from two volatile caches and never stored
+**Context:** the portal image composer
+([ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread))
+first offered sd-server's native knobs from a static sd-cpp sampler/scheduler
+superset, because the gateway forwards every pick opaquely and owns none of that
+vocabulary. The real answer is per model: each `sd-server` states its own
+samplers, schedulers, output formats, size and batch limits and defaults in
+`GET /sdcpp/v1/capabilities`, the document the `image` verdict is already read
+from ([ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)
+(e)). Two things made the obvious designs wrong. An `sd-server` is served two ways
+at once — an **external** `stable_diffusion_cpp` application the gateway can
+reach, and an **agent-launched** child behind the agent's router, which the
+gateway's health loop cannot reach — so a gateway-side probe alone covers half the
+fleet. And the existing home for "what the document said",
+`model_mapping_capabilities`
+([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)),
+is the wrong shape for it.
+
+**Decision — five choices, taken together.**
+- **(a) One read-only endpoint, read live when the composer picks an image
+  model.** `GET /api/portal/model-image-options?name=<model>` answers the options
+  the model's backing `sd-server`(s) state; the composer fetches it on pick and
+  clears it on every model change. Image options are near-static per model, so
+  there is no SSE variant. The run path is untouched: this decision replaces the
+  dropdown *vocabulary* and adds default hints, nothing about how a run is sent.
+- **(b) Cache, don't store — two volatile caches, one per deployment shape, written
+  by background probes.** The health loop reads an external application's document
+  into `AppImageOptionsRegistry` (keyed by application id); the agent reads an
+  agent-launched child's document itself and reports it on its telemetry sample,
+  which the gateway holds as `RuntimeStatusDTO.ImageOptions` in the volatile
+  runtime-status registry (keyed by server and spec id, never put on the status
+  SSE frame). The portal GET only reads them, the existing "health loop writes,
+  portal reads" split, so it never probes upstream and an unreachable server can
+  neither slow nor fail it. **Nothing is persisted**, and no migration is added.
+- **(c) A lenient decode, kept SEPARATE from the strict verdict decode.** The
+  options decode is its own struct and function (twinned in the gateway's
+  `provider` and the agent's `collector`, the same drift discipline as
+  `parseSdcppCapabilities`) and reads whatever it can, leaving the rest at zero =
+  unknown. The verdict decode stays strict and fail-closed exactly as
+  [ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)
+  and ADR-044 need it, so **a malformed options document can yield partial or empty
+  options but can never suppress or alter the routing `image` verdict.**
+- **(d) Visibility in the portal layer, aggregation as "what every backing server
+  can do".** `portal.Service.ModelImageOptionViews` applies `model-servers`'
+  suppression and resource-group filtering and keeps only sd-server mappings, so a
+  model the token cannot route to reads no cache and answers an empty object.
+  `aggregateImageOptions` then **intersects** the three lists, takes the
+  **tightest envelope** of the size limits (and the smallest `max_batch_count`),
+  and keeps a default only where every server that states it agrees. A request can
+  land on any server behind the model, so only what all of them accept may be
+  offered; a mixed external plus agent-launched set unifies into one answer. Any
+  emitted size bound satisfies `min <= max` with no negatives (an inverted axis is
+  dropped whole); `clip_skip` and `seed` may legitimately be `-1`.
+- **(e) Fail-open, and defaults are hints.** An empty or absent field means
+  **unknown, not "none supported"**: the composer falls back to the static
+  superset for that field, including when disjoint backing-server sets intersect
+  to nothing. Reported defaults are shown as placeholder/helper text and **never
+  pre-filled**, because a pre-filled knob would be sent as an explicit override and
+  break "blank = leave sd-server's own default". The portal's count `n` keeps its
+  hard cap of 8 (a gateway image-storage limit), which a model's
+  `max_batch_count` may only narrow.
+
+**Why ADR-039's table is NOT extended.** `model_mapping_capabilities` holds
+exactly one kind of fact: a `yes`/`no` verdict with a rank, a source and a
+`checked_at`, where absence means unknown and an operator's `manual` row outranks
+every probe. Image options are an open vocabulary of names, integers, ranges and
+defaults with no yes/no reading, no rank to arbitrate and no operator override;
+`ValidateCapabilityRow` would refuse them, and `routing.CapabilityRow` has four
+fields and no room for them. Making them rows would also mean a schema, a
+migration and conformance on both drivers for a best-effort UX hint whose worst
+failure is the dropdown showing the static superset it showed before this
+feature. The verdict table is also the input to a fail-closed gate; mixing
+lenient data into it would put the routing path one parsing bug away from an
+option list.
+
+**Consequence:** a gateway restart empties both caches. An agent-launched child's
+options return on the next telemetry sample (about a second); an external
+application's return on its next health tick, up to that application's longest
+probe interval, and until then the composer shows the static superset. That
+warm-up gap is accepted and documented rather than closed with persistence. An
+agent whose gateway does not declare `capability_source_sdcpp` reports no options,
+which reads as unknown. Because options are fail-open, the composer may offer a
+value one backing build ignores, which is the pre-existing behaviour of the static
+list. Two copies of the lenient decode must be kept identical by hand, pinned by a
+case table duplicated in both modules' tests.
+
+**Rejected:** extending `model_mapping_capabilities` or adding an options table
+(above); probing the `sd-server` synchronously from the portal GET (it puts an
+upstream round trip and its failure modes on a user's click, and cannot reach an
+agent-launched child at all, which only the agent can read); reading only the
+external path and leaving agent-launched children on the static superset (half the
+fleet, and the same model would behave differently by deployment shape); a union
+of the backing servers' lists (it would offer values some servers refuse, so the
+same request would succeed or be ignored depending on routing); fail-closed
+semantics for an empty field (an unread model would get an empty dropdown); and
+pre-filling the reported defaults (turns every untouched knob into a sent
+override).
+→ [API Compatibility & Inference §3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[API Surface](reference/api-surface.md#models-servers-applications-mappings),
+[Agent-Managed Model Runtime](cross-cutting/agent-runtime-manager.md).

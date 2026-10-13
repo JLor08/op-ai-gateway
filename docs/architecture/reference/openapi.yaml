@@ -636,6 +636,44 @@ paths:
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/SSE' }
+  /api/portal/model-image-options:
+    get:
+      tags: [portal]
+      summary: Image options the sd-server(s) behind a gateway model state (scope gateway:use)
+      description: >
+        What the portal image composer may offer for one gateway model: the
+        sampler/scheduler/output-format values, size envelope, batch ceiling
+        and defaults its backing stable-diffusion.cpp sd-servers state,
+        aggregated across them (lists intersected, size limits the tightest
+        envelope, a default only where the servers that state it agree).
+        Served from two volatile in-memory caches (the health loop's read of
+        external applications, the agent telemetry sample for agent-launched
+        children) with no upstream probe on the request, so it can be empty
+        right after a gateway restart. A model the caller cannot route to, an
+        unknown model and a model with nothing cached all answer 200 with an
+        empty `data` object. An empty or absent field means UNKNOWN, never
+        "none supported": the client falls back to its static superset. A
+        missing or empty `name` is 400 `model.name_required`; a failed
+        visibility read is 500 `model.image_options_failed`. See
+        api-surface.md and compatibility-and-inference.md section 3.4.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: The gateway model name (a query parameter because it may contain `/`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The aggregated options, possibly an empty object.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/ModelImageOptions' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/model-group-servers:
     get:
       tags: [portal]
@@ -2207,6 +2245,68 @@ components:
                   exit_code: { type: integer }
                   failures: { type: integer }
                   stderr_tail: { type: string }
+    ModelImageOptions:
+      type: object
+      description: >
+        The image options one gateway model offers (gateway.ModelImageOptionsDTO),
+        the aggregate of what every sd-server backing the model states. EVERY
+        field is omitted when unknown or not agreed, and an empty object is a
+        normal answer. Absent or empty means UNKNOWN (fail-open), never
+        "none supported": a client falls back to its static sd-cpp superset
+        for that field, which also covers backing servers whose supported sets
+        are disjoint (the intersection is empty and is omitted). Defaults are
+        hints for placeholders, not values to pre-fill.
+      properties:
+        samplers:
+          type: array
+          items: { type: string }
+          description: Intersection of the sampler names every stating sd-server accepts, in the first stated list's order.
+        schedulers:
+          type: array
+          items: { type: string }
+          description: Intersection of the scheduler names every stating sd-server accepts.
+        output_formats:
+          type: array
+          items: { type: string }
+          description: Intersection of the output formats img_gen can encode (output_formats_by_mode.img_gen).
+        size_limits:
+          type: object
+          description: >
+            The tightest size envelope across the servers (largest stated
+            minimum, smallest stated maximum, per axis). A bound is omitted
+            when unstated. Any emitted min/max pair on one axis satisfies
+            min <= max (an inverted axis is dropped whole), and no bound is
+            negative or zero.
+          properties:
+            min_width: { type: integer, minimum: 1 }
+            max_width: { type: integer, minimum: 1 }
+            min_height: { type: integer, minimum: 1 }
+            max_height: { type: integer, minimum: 1 }
+        max_batch_count:
+          type: integer
+          minimum: 1
+          description: >
+            Smallest positive batch ceiling the servers state. A client's own
+            hard cap of 8 images per request still applies; this value may only
+            narrow it.
+        defaults:
+          type: object
+          description: >
+            Defaults every server that states one agrees on; a field the
+            servers disagree on, or none states, is omitted (zero and empty
+            are "not stated", not values). clip_skip and seed carry the
+            servers' own -1 faithfully ("model default" / "random").
+          properties:
+            sampler: { type: string }
+            scheduler: { type: string }
+            output_format: { type: string }
+            negative_prompt: { type: string }
+            steps: { type: integer }
+            clip_skip: { type: integer, description: '-1 = the model default.' }
+            seed: { type: integer, description: '-1 = random.' }
+            width: { type: integer }
+            height: { type: integer }
+            cfg: { type: number, description: 'Classifier-free guidance scale (guidance.txt_cfg).' }
     VendorAccountModel:
       type: object
       description: >

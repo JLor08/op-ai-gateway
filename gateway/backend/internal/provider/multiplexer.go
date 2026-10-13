@@ -345,6 +345,39 @@ func (m *Multiplexer) dispatchProbeSdcppCapabilities(ctx context.Context, target
 	return SdcppVerdicts{}, ErrUnavailable
 }
 
+var _ SdcppImageOptionsProber = (*Multiplexer)(nil)
+
+// ProbeSdcppImageOptions routes the stable-diffusion.cpp image-options probe to
+// the provider's client, exactly like ProbeSdcppCapabilities: a provider whose
+// client does not implement SdcppImageOptionsProber yields
+// (SdcppImageOptions{}, ErrUnavailable), because a zero value with a nil error
+// would read as a successful probe that found no options.
+func (m *Multiplexer) ProbeSdcppImageOptions(ctx context.Context, target routing.Target) (SdcppImageOptions, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProbeSdcppImageOptions")
+	defer span.End()
+	res, err := m.dispatchProbeSdcppImageOptions(ctx, target)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchProbeSdcppImageOptions(ctx context.Context, target routing.Target) (SdcppImageOptions, error) {
+	if m == nil {
+		return SdcppImageOptions{}, ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if p, ok := client.(SdcppImageOptionsProber); ok {
+			return p.ProbeSdcppImageOptions(ctx, target)
+		}
+	}
+	if p, ok := m.fallback.(SdcppImageOptionsProber); ok {
+		return p.ProbeSdcppImageOptions(ctx, target)
+	}
+	return SdcppImageOptions{}, ErrUnavailable
+}
+
 var _ RuntimeEnsurer = (*Multiplexer)(nil)
 
 // EnsureRuntimeModel routes the agent router's ensure call to the provider's

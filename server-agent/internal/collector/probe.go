@@ -264,6 +264,16 @@ type PropsVerdicts struct {
 	LiveProgress string
 	// Caps is the capability verdict set from the same document (#49-2).
 	Caps Capabilities
+	// ImageOptions is the image-generation options a stable-diffusion.cpp
+	// capability document states (samplers, schedulers, output formats, size
+	// and batch limits, the server's own defaults). Only ProbeSdcppVerdicts
+	// sets it; the /props and /api/show probes never do. A POINTER, so that
+	// nil ("no document was read": a 404, a non-JSON body, any other
+	// probe) stays distinct from non-nil-but-zero ("the document was read and
+	// states no options"). It is derived from the same bytes as Caps but by a
+	// separate lenient decode, so a malformed options block never degrades
+	// the verdict beside it.
+	ImageOptions *SdcppImageOptions
 }
 
 // ProbePropsVerdicts GETs baseURL+LiveProgressProbePath and returns every

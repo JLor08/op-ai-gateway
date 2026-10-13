@@ -204,7 +204,22 @@ import (
 // operator observes, and nothing on the gateway waits on either: an older
 // agent rests on the older document until the next push or the poll, and
 // leaves such a request queued until the next release, exit or Apply.
-const Version = "0.8.1"
+//
+// 0.8.1 -> 0.8.2 is the single bump for the image-model-options branch: for
+// a "stable_diffusion_cpp" child the agent now also reports the image
+// options its /sdcpp/v1/capabilities document states -- the sampler and
+// scheduler names, the img_gen output formats, the size and batch limits and
+// the server's own defaults -- as the new sample.RuntimeSample.ImageOptions
+// field (the "image_options" key), read from the same document and cached in
+// the same entry as the image verdict. PATCH, and the rule decides it:
+// agent.Features gains NO entry. The field rides the existing
+// "capability_source_sdcpp" gate, a feature name the GATEWAY declares, not
+// one the agent does: while the gateway does not declare it the child is not
+// probed and nothing is sent, exactly as for the image verdict, and a
+// gateway that predates the field ignores the unknown key. Nothing on the
+// gateway side waits on the agent, so there is nothing for a feature flag to
+// gate. The same reasoning made 0.7.3 -> 0.7.4 (#154) a PATCH.
+const Version = "0.8.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1657,11 +1672,19 @@ func (a *Agent) clock() time.Time {
 // there is no second copy of it to drift, here or in the other module.
 //
 // This never overwrites an already-cached value with a fabricated one:
-// rs.LiveProgressSupport and rs.Capabilities are only ever set from a
-// verdict set the probe (or a prior cache write) actually produced, and an
-// uncached probe, a stable_diffusion_cpp child the gate skips, or a cached
-// sdcpp_capabilities entry the gate withholds leaves rs.LiveProgressSupport
-// at its zero value ("") and rs.Capabilities at its zero value (nil).
+// rs.LiveProgressSupport, rs.Capabilities and rs.ImageOptions are only ever
+// set from a verdict set the probe (or a prior cache write) actually
+// produced, and an uncached probe, a stable_diffusion_cpp child the gate
+// skips, or a cached sdcpp_capabilities entry the gate withholds leaves
+// rs.LiveProgressSupport at its zero value (""), and rs.Capabilities and
+// rs.ImageOptions at theirs (nil).
+//
+// rs.ImageOptions is the stable-diffusion.cpp image options, read from the
+// same capability document as the image verdict (collector.PropsVerdicts.
+// ImageOptions), cached in the same entry, and therefore behind the same
+// capability_source_sdcpp gate on both paths: the cache hit and the cache
+// miss both set it after the gate checks above, never before them. No other
+// probe sets the collector field, so it stays nil for every other type.
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
 	if entry, ok := a.runtimeCapabilityCache[st.SpecID]; ok && entry.pid == st.PID &&
 		entry.specType == st.Type && entry.model == st.Model {
@@ -1677,6 +1700,7 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 		}
 		rs.LiveProgressSupport = entry.verdicts.LiveProgress
 		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps, entry.source)
+		rs.ImageOptions = imageOptionsSample(entry.verdicts.ImageOptions)
 		return
 	}
 	if st.Type == "stable_diffusion_cpp" && !a.gatewayDeclares(ctx, gatewayFeatureCapabilitySourceSdcpp) {
@@ -1724,6 +1748,47 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	}
 	rs.LiveProgressSupport = verdicts.LiveProgress
 	rs.Capabilities = capabilitiesSample(verdicts.Caps, source)
+	rs.ImageOptions = imageOptionsSample(verdicts.ImageOptions)
+}
+
+// imageOptionsSample converts the collector's decoded image options into
+// RuntimeSample.ImageOptions' wire pointer type: nil stays nil (no document
+// was read, or the probe is not the stable-diffusion.cpp one, the only one
+// that sets collector.PropsVerdicts.ImageOptions), and a non-nil value becomes
+// a non-nil wire value, zero or not. The lists are copied, so a sample never
+// aliases the cached verdicts it was built from; the sample is rebuilt from
+// the cache on every cycle.
+//
+// It does NOT fold into capabilitiesSample: the options are not keyed
+// yes/no verdicts, so they have no place in Capabilities.Verdicts.
+func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOptions {
+	if o == nil {
+		return nil
+	}
+	return &sample.RuntimeImageOptions{
+		Samplers:      slices.Clone(o.Samplers),
+		Schedulers:    slices.Clone(o.Schedulers),
+		OutputFormats: slices.Clone(o.OutputFormats),
+		Limits: sample.RuntimeImageLimits{
+			MinWidth:      o.Limits.MinWidth,
+			MaxWidth:      o.Limits.MaxWidth,
+			MinHeight:     o.Limits.MinHeight,
+			MaxHeight:     o.Limits.MaxHeight,
+			MaxBatchCount: o.Limits.MaxBatchCount,
+		},
+		Defaults: sample.RuntimeImageDefaults{
+			Sampler:        o.Defaults.Sampler,
+			Scheduler:      o.Defaults.Scheduler,
+			OutputFormat:   o.Defaults.OutputFormat,
+			NegativePrompt: o.Defaults.NegativePrompt,
+			Steps:          o.Defaults.Steps,
+			ClipSkip:       o.Defaults.ClipSkip,
+			Seed:           o.Defaults.Seed,
+			Width:          o.Defaults.Width,
+			Height:         o.Defaults.Height,
+			CFG:            o.Defaults.CFG,
+		},
+	}
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"slices"
@@ -403,8 +404,97 @@ type agentRuntimeSample struct {
 	// persists these AND LiveProgressSupport above as one set of
 	// model_mapping_capabilities rows.
 	Capabilities *agentRuntimeCapabilitiesSample `json:"capabilities,omitempty"`
-	GPUs         []agentRuntimeGPUSample         `json:"gpus,omitempty"`
-	LastError    *agentRuntimeError              `json:"last_error,omitempty"`
+	// ImageOptions is the image-generation options a stable_diffusion_cpp
+	// child's capability document states (the sampler/scheduler names and
+	// output formats it accepts, its size and batch limits, its own
+	// defaults), from the SAME probe pass as Capabilities above. A POINTER,
+	// mirroring the agent's own sample.RuntimeSample.ImageOptions
+	// *RuntimeImageOptions byte-for-byte on the wire: nil means the agent has
+	// nothing to say for this child -- an agent that predates the field, a
+	// child that is not an sd-server, or one whose document has not been read
+	// -- and is distinct from a non-nil all-zero value ("the document was
+	// read and states no options"). Unlike Capabilities it is NOT a verdict
+	// and has no write-back: it is carried through runtimeStatusDTOsFromSamples
+	// onto RuntimeStatusDTO.ImageOptions and lives only in the volatile
+	// runtimeStatusRegistry, so it never reaches the capability-row path.
+	ImageOptions *agentRuntimeImageOptions `json:"image_options,omitempty"`
+	GPUs         []agentRuntimeGPUSample   `json:"gpus,omitempty"`
+	LastError    *agentRuntimeError        `json:"last_error,omitempty"`
+}
+
+// agentRuntimeImageOptions mirrors the agent's sample.RuntimeImageOptions (the
+// wire form of one sd-server's image options) key-for-key, nested objects
+// included. The two live in different Go modules, so the keys ARE the contract:
+// nothing but TestAgentRuntimeImageOptionsWireShape pins this side of it. The
+// lists are omitempty on the agent's side and decode to nil here when absent;
+// limits and defaults are always present on the wire, and a numeric zero (or
+// "") in either means "unknown". toProvider maps it onto the internal
+// provider.SdcppImageOptions the rest of the gateway speaks.
+type agentRuntimeImageOptions struct {
+	Samplers      []string                  `json:"samplers,omitempty"`
+	Schedulers    []string                  `json:"schedulers,omitempty"`
+	OutputFormats []string                  `json:"output_formats,omitempty"`
+	Limits        agentRuntimeImageLimits   `json:"limits"`
+	Defaults      agentRuntimeImageDefaults `json:"defaults"`
+}
+
+// agentRuntimeImageLimits mirrors the agent's sample.RuntimeImageLimits.
+type agentRuntimeImageLimits struct {
+	MinWidth      int `json:"min_width"`
+	MaxWidth      int `json:"max_width"`
+	MinHeight     int `json:"min_height"`
+	MaxHeight     int `json:"max_height"`
+	MaxBatchCount int `json:"max_batch_count"`
+}
+
+// agentRuntimeImageDefaults mirrors the agent's sample.RuntimeImageDefaults.
+type agentRuntimeImageDefaults struct {
+	Sampler        string  `json:"sampler"`
+	Scheduler      string  `json:"scheduler"`
+	OutputFormat   string  `json:"output_format"`
+	NegativePrompt string  `json:"negative_prompt"`
+	Steps          int     `json:"steps"`
+	ClipSkip       int     `json:"clip_skip"`
+	Seed           int     `json:"seed"`
+	Width          int     `json:"width"`
+	Height         int     `json:"height"`
+	CFG            float64 `json:"cfg"`
+}
+
+// toProvider converts the decoded wire value to the gateway's internal
+// provider.SdcppImageOptions, field by field. Nil-safe: a nil receiver (no
+// image_options on the wire) is a nil result, never a zero value -- the two
+// mean different things (see agentRuntimeSample.ImageOptions). The lists are
+// handed over as decoded: the wire value is not retained, so nothing aliases
+// the registry's copy.
+func (o *agentRuntimeImageOptions) toProvider() *provider.SdcppImageOptions {
+	if o == nil {
+		return nil
+	}
+	return &provider.SdcppImageOptions{
+		Samplers:      o.Samplers,
+		Schedulers:    o.Schedulers,
+		OutputFormats: o.OutputFormats,
+		Limits: provider.SdcppImageLimits{
+			MinWidth:      o.Limits.MinWidth,
+			MaxWidth:      o.Limits.MaxWidth,
+			MinHeight:     o.Limits.MinHeight,
+			MaxHeight:     o.Limits.MaxHeight,
+			MaxBatchCount: o.Limits.MaxBatchCount,
+		},
+		Defaults: provider.SdcppImageDefaults{
+			Sampler:        o.Defaults.Sampler,
+			Scheduler:      o.Defaults.Scheduler,
+			OutputFormat:   o.Defaults.OutputFormat,
+			NegativePrompt: o.Defaults.NegativePrompt,
+			Steps:          o.Defaults.Steps,
+			ClipSkip:       o.Defaults.ClipSkip,
+			Seed:           o.Defaults.Seed,
+			Width:          o.Defaults.Width,
+			Height:         o.Defaults.Height,
+			CFG:            o.Defaults.CFG,
+		},
+	}
 }
 
 // maxAppliedConfigETag bounds the acknowledged runtime-config ETag on ingest.
@@ -489,6 +579,7 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			MetricsProbe:        rt.MetricsProbe,
 			ContextProbe:        rt.ContextProbe,
 			LiveProgressSupport: rt.LiveProgressSupport,
+			ImageOptions:        rt.ImageOptions.toProvider(),
 		}
 		// A measured 0 is UNKNOWN, not a real zero -- the same `<= 0` rule
 		// writeBackRuntimeVRAM applies to this very array on the store side.

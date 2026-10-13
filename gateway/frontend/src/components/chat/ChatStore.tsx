@@ -17,6 +17,7 @@ import type {
   ActiveChatRun,
   Chat,
   ChatSummary,
+  ImageModelOptions,
   ModelOption,
   PortalApi,
   PortalServer,
@@ -60,7 +61,8 @@ import { useChatPersistence } from './useChatPersistence';
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { ChatUiMessage };
 
-// The image-settings presets the composer (Chat.tsx, OUTSIDE components/chat/)
+// The image-settings presets (and the optionsOr helper that merges a per-model
+// fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
 // renders. Re-exported through this file because the chat module's only public
 // surface is ChatStore.tsx / ChatSidebar.tsx -- Chat.tsx must not reach into
 // chatDoc.ts directly (arch.test.ts enforces this).
@@ -71,6 +73,7 @@ export {
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
+  optionsOr,
 } from './chatDoc';
 
 export type ChatStore = {
@@ -138,6 +141,14 @@ export type ChatStore = {
   // thread, and the attach button, which an image run has no use for) — never
   // what an existing thread DOES: that is chatKind's job.
   modelImageCapable: boolean;
+  // The per-model sd-server image options (samplers / schedulers / output
+  // formats / size limits / batch ceiling / defaults) of the effective model,
+  // fetched on demand while that model GENERATES images (api.modelImageOptions).
+  // null whenever there is nothing to narrow by: not an image model, the fetch
+  // is in flight, or it failed. Every field of a fetched value is optional too
+  // ("unknown"), so the composer's dropdowns merge it over their static
+  // Phase 1b-i superset (optionsOr) rather than trusting it to be complete.
+  modelImageOptions: ImageModelOptions | null;
   // The THREAD's kind: "" (text) or "image". Pinned by the backend at the
   // thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
@@ -252,6 +263,7 @@ export function ChatStoreProvider({
     | 'chats'
     | 'createChat'
     | 'deleteChat'
+    | 'modelImageOptions'
     | 'saveChat'
     | 'saveChatKeepalive'
     | 'serverModels'
@@ -300,6 +312,9 @@ export function ChatStoreProvider({
   // api.serverModels), used to narrow the chat's model dropdown once a server
   // override is picked. Empty while no override is set.
   const [serverOverrideModels, setServerOverrideModels] = useState<ServerModelOption[]>([]);
+  // The effective image model's per-model sd-server options (see api.modelImageOptions),
+  // used to narrow the composer's image dropdowns. null while there is none.
+  const [modelImageOptions, setModelImageOptions] = useState<ImageModelOptions | null>(null);
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -922,6 +937,36 @@ export function ChatStoreProvider({
     };
   }, [effectiveServerOverride]);
 
+  // Load the effective IMAGE model's per-model sd-server options so the
+  // composer's image dropdowns can narrow to what that model actually supports.
+  // Same shape as the serverOverrideModels effect above: latest-wins guard so a
+  // slow/stale response for a previously-picked model can't clobber a newer
+  // pick, a non-image (or no) model clears without a fetch, and a failure
+  // clears too -- null makes the dropdowns fall back to the static superset.
+  // Unlike that effect it also clears on every model change (see below).
+  // Keyed on the picked model, not the thread's kind: an existing text thread
+  // that picks an image model still fetches, which is harmless because the
+  // composer only renders these controls for an image thread.
+  useEffect(() => {
+    // Cleared up front, not only on the non-image branch: these options belong
+    // to ONE model, so the previous model's must not stay exposed (and
+    // selectable) while the next model's fetch is in flight.
+    setModelImageOptions(null);
+    if (!modelImageCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelImageOptions(effectiveModel)
+      .then((options) => {
+        if (!cancelled) setModelImageOptions(options);
+      })
+      .catch(() => {
+        if (!cancelled) setModelImageOptions(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelImageCapable, effectiveModel]);
+
   // The run/SSE engine's subscribe/finishRun/adoptCanonicalTranscript/
   // ensureAssistant/writeAssistant/updateChatMessages/markRunning now live in
   // useChatRuns.ts (FA-2); `runs` above exposes the narrow interface this
@@ -1392,6 +1437,7 @@ export function ChatStoreProvider({
     modelAvailable,
     modelVisionCapable,
     modelImageCapable,
+    modelImageOptions,
     chatKind,
     imageSettings,
     setImageSettings,

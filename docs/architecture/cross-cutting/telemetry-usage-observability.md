@@ -272,7 +272,17 @@ evidence is not stamped on a failed write:
   Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)
   for the exact rules), `gpus[]` of `{index, vram_measured_mb}` (omitted when
   nothing was measured this cycle, and explicitly sorted by index because it is
-  built from a Go map), and `last_error` of `{message, at, exit_code, failures,
+  built from a Go map), `image_options` of `{samplers, schedulers,
+  output_formats, limits, defaults}` (a `stable_diffusion_cpp` child's own
+  image options, read from the same `/sdcpp/v1/capabilities` document as its
+  `image` verdict and riding the same `capability_source_sdcpp` gate; a nil
+  pointer, so the key is omitted, for every other runtime and for a document
+  not yet read, while a non-nil value with zero fields means the document was
+  read and states no options; `limits` and `defaults` are always present when
+  it is, a numeric zero or `""` meaning *unknown*; the gateway keeps it only
+  in the volatile runtime-status registry — see [API Compatibility &
+  Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)),
+  and `last_error` of `{message, at, exit_code, failures,
   stderr_tail}`. When a runtime driver is active it **also overrides
   `loaded_models`** to
   contain only specs in state `running` — `starting` deliberately does not count,
@@ -1662,6 +1672,22 @@ also compared mechanically: the gateway's
 `TestSdcppImageCasesMatchTheAgentsTable` reads the agent's test file and
 fails when the two declarations differ by a byte, or when either is missing.
 A change to one parser and its own table therefore cannot pass both suites.
+
+**A second twin reads the same document for the image options.** The agent's
+`parseSdcppImageOptions` (`server-agent/internal/collector/sdcpp_image_options.go`)
+and the gateway's (`internal/provider/sdcpp_image_options.go`, which reads an
+external application's copy of the document) are the same kind of deliberate
+duplicate, each doc comment naming the other. Unlike `parseSdcppCapabilities`
+this one is **lenient**: it reads what it can and leaves everything else at
+zero (*unknown*), so a malformed options block can never suppress or alter the
+`image` verdict above. The `sdcppImageOptionsCases` table, duplicated verbatim
+in both modules' tests, pins both copies, and the gateway's
+`TestSdcppImageOptionsCasesMatchTheAgentsTable` reads the agent's test file and
+fails when the two declarations differ by a byte, or when either is missing.
+The result rides the sample as `runtimes[].image_options` (§8.3.2); the
+gateway only mirrors it into the volatile runtime-status registry for the
+portal composer ([API Compatibility & Inference
+§3.4](compatibility-and-inference.md#34-openai-images-generations)).
 
 **The probe NAMES itself, and its name ranks with the other probes.** The
 agent reports `capabilities.source` on the wire — `llama_cpp_props`,

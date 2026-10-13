@@ -17,10 +17,11 @@ import {
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import AddPhotoAlternateIcon from '@mui/icons-material/AddPhotoAlternate';
+import type { ImageModelOptions } from '../api';
 import type { Translation } from './shared/types';
 import type { ChatContent } from './shared/chatContent';
 import { PageTitle } from './shared/PageTitle';
-import { SearchableSelect } from './shared/SearchableSelect';
+import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
 import {
   IMAGE_LOSSY_FORMATS,
@@ -29,18 +30,84 @@ import {
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
+  optionsOr,
   useChatStore,
 } from './chat/ChatStore';
 import { ChatSidebar } from './chat/ChatSidebar';
 
 const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
 
-// Clamp a typed image count to [1, IMAGE_N_MAX]; a non-number falls back to 1.
-// The gateway passes n through and sd-server clamps too, but keeping the field
+// A bound or default the model actually reported. The options endpoint omits
+// (omitempty) whatever it does not know, so `undefined` is the ONLY "not
+// reported" signal: 0 and -1 are real values (clip_skip and seed report -1, a
+// width/height/steps default can be 0) and must never be read as "unset". It
+// also keeps an absent bound out of Math.min/Math.max (NaN) and out of a <=/>=
+// comparison (silently false).
+function isReported(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+// The most images one request may ask for. IMAGE_N_MAX is the gateway's HARD cap
+// (an image-storage limit, not a model limit), so the picked model's reported max
+// batch count may only NARROW it: a usable (>= 1) report is clamped to the cap
+// (a model reporting 16 still gets 8), and an absent or unusable one leaves the
+// cap itself.
+function imageCountMax(options: ImageModelOptions | null): number {
+  const reported = options?.max_batch_count;
+  return isReported(reported) && reported >= 1
+    ? Math.min(Math.floor(reported), IMAGE_N_MAX)
+    : IMAGE_N_MAX;
+}
+
+// Clamp a typed image count to [1, max]; a non-number falls back to 1. The
+// gateway passes n through and sd-server clamps too, but keeping the field
 // honest avoids a request that silently generates a different count.
-function clampImageN(raw: number): number {
+function clampImageN(raw: number, max: number): number {
   if (!Number.isFinite(raw)) return 1;
-  return Math.min(IMAGE_N_MAX, Math.max(1, Math.round(raw)));
+  return Math.min(max, Math.max(1, Math.round(raw)));
+}
+
+// Whether `value` lies inside [min, max], where either bound may be unstated
+// (undefined = unbounded on that side).
+function withinBounds(value: number, min: number | undefined, max: number | undefined): boolean {
+  return (!isReported(min) || value >= min) && (!isReported(max) || value <= max);
+}
+
+const SIZE_PRESET = /^(\d+)x(\d+)$/;
+
+// Whether a "WxH" size preset fits the model's size envelope. An absent envelope
+// or an unstated bound constrains nothing; "" (the model default) and anything
+// that is not a WxH string always stay.
+function sizePresetFits(preset: string, limits: ImageModelOptions['size_limits']): boolean {
+  const match = SIZE_PRESET.exec(preset);
+  if (!limits || !match) return true;
+  return (
+    withinBounds(Number(match[1]), limits.min_width, limits.max_width) &&
+    withinBounds(Number(match[2]), limits.min_height, limits.max_height)
+  );
+}
+
+// The dropdown entries of one image knob: the given values with the "" default
+// entry always first, and the thread's PERSISTED value appended as a trailing
+// entry when the (narrowed) list omits it, so a saved pick the current model does
+// not offer stays visible and selectable instead of rendering blank -- the same
+// trick as the locked server-override option below.
+function imageChoices(
+  values: readonly string[],
+  current: string,
+  labelOf: (value: string) => string,
+): SearchableOption[] {
+  const entries = values.includes('') ? [...values] : ['', ...values];
+  if (current !== '' && !entries.includes(current)) entries.push(current);
+  return entries.map((value) => ({ value, label: labelOf(value) }));
+}
+
+// "<prefix>: <value>" for a default the model reported, else undefined. Reported
+// means present: a number's 0 / -1 count, but an empty string says nothing.
+function defaultHint(prefix: string, value: string | number | undefined): string | undefined {
+  const known =
+    typeof value === 'number' ? Number.isFinite(value) : value !== undefined && value !== '';
+  return known ? `${prefix}: ${value}` : undefined;
 }
 
 function readSidebarCollapsed(): boolean {
@@ -129,6 +196,22 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   } else if (c.effectiveServerOverride !== '') {
     modelHelperText = t.serverOverrideFilteredHint;
   }
+
+  // The advanced image controls follow the PICKED model: each dropdown offers
+  // what that model reports (store: modelImageOptions, null until fetched or when
+  // the model reports nothing) and falls back to the static sd-cpp superset
+  // otherwise. The model's reported defaults are shown as hints only, never
+  // written into the knobs: a blank knob must stay blank so the run omits it and
+  // sd-server keeps its own default.
+  const imageOptions = c.modelImageOptions;
+  const imageDefaults = imageOptions?.defaults;
+  const imageCountCeiling = imageCountMax(imageOptions);
+  const defaultLabel = t.chatImageAdvancedDefault;
+  const hintOr = (value: number | undefined) => defaultHint(defaultLabel, value) ?? defaultLabel;
+  const sizeDefaultHint =
+    isReported(imageDefaults?.width) && isReported(imageDefaults?.height)
+      ? defaultHint(defaultLabel, `${imageDefaults.width}x${imageDefaults.height}`)
+      : undefined;
 
   return (
     <>
@@ -263,10 +346,14 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     value={c.imageSettings.size}
                     onChange={(value) => c.setImageSettings((s) => ({ ...s, size: value }))}
                     disabled={c.streaming}
-                    options={IMAGE_SIZE_OPTIONS.map((size) => ({
-                      value: size,
-                      label: size === '' ? t.chatImageSizeDefault : size,
-                    }))}
+                    helperText={sizeDefaultHint}
+                    options={imageChoices(
+                      IMAGE_SIZE_OPTIONS.filter((size) =>
+                        sizePresetFits(size, imageOptions?.size_limits),
+                      ),
+                      c.imageSettings.size,
+                      (size) => (size === '' ? t.chatImageSizeDefault : size),
+                    )}
                   />
                   <TextField
                     id="chat-image-count"
@@ -276,11 +363,15 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     onChange={(event) =>
                       c.setImageSettings((s) => ({
                         ...s,
-                        n: clampImageN(Number(event.target.value)),
+                        n: clampImageN(Number(event.target.value), imageCountCeiling),
                       }))
                     }
                     disabled={c.streaming}
-                    helperText={`1–${IMAGE_N_MAX}`}
+                    // A saved count above THIS model's ceiling is kept as typed but
+                    // flagged, since the run would otherwise ask for more than the
+                    // model offers.
+                    error={c.imageSettings.n > imageCountCeiling}
+                    helperText={`1–${imageCountCeiling}`}
                   />
                   <SearchableSelect
                     id="chat-image-output-format"
@@ -290,10 +381,15 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       c.setImageSettings((s) => ({ ...s, output_format: value }))
                     }
                     disabled={c.streaming}
-                    options={IMAGE_OUTPUT_FORMATS.map((format) => ({
-                      value: format,
-                      label: format === '' ? t.chatImageFormatDefault : format.toUpperCase(),
-                    }))}
+                    helperText={defaultHint(
+                      defaultLabel,
+                      imageDefaults?.output_format?.toUpperCase(),
+                    )}
+                    options={imageChoices(
+                      optionsOr(imageOptions?.output_formats, IMAGE_OUTPUT_FORMATS),
+                      c.imageSettings.output_format,
+                      (format) => (format === '' ? t.chatImageFormatDefault : format.toUpperCase()),
+                    )}
                   />
                   {IMAGE_LOSSY_FORMATS.includes(c.imageSettings.output_format) && (
                     <Box>
@@ -321,8 +417,10 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               {/* Advanced (sd-server) knobs: the native sampler/steps/cfg/etc.,
                 collapsed by default. The gateway folds the SET ones into the
                 prompt's <sd_cpp_extra_args> block; a blank numeric field leaves
-                sd-server's own per-model default, and sampler/scheduler are the
-                static sd-cpp enum superset (a build that lacks one ignores it). */}
+                sd-server's own per-model default. Sampler/scheduler (and the size,
+                format and count above) narrow to the picked model's reported
+                options, else the static sd-cpp enum superset (a build that lacks
+                one ignores it); the model's reported defaults show as hints. */}
               {isImageThread && (
                 <>
                   <Button
@@ -352,6 +450,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                           c.setImageSettings((s) => ({ ...s, negative_prompt: event.target.value }))
                         }
                         disabled={c.streaming}
+                        placeholder={defaultHint(defaultLabel, imageDefaults?.negative_prompt)}
                         sx={{ gridColumn: '1 / -1' }}
                       />
                       <SearchableSelect
@@ -360,10 +459,12 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         value={c.imageSettings.sampler}
                         onChange={(value) => c.setImageSettings((s) => ({ ...s, sampler: value }))}
                         disabled={c.streaming}
-                        options={IMAGE_SAMPLERS.map((sampler) => ({
-                          value: sampler,
-                          label: sampler === '' ? t.chatImageAdvancedDefault : sampler,
-                        }))}
+                        helperText={defaultHint(defaultLabel, imageDefaults?.sampler)}
+                        options={imageChoices(
+                          optionsOr(imageOptions?.samplers, IMAGE_SAMPLERS),
+                          c.imageSettings.sampler,
+                          (sampler) => (sampler === '' ? defaultLabel : sampler),
+                        )}
                       />
                       <SearchableSelect
                         id="chat-image-scheduler"
@@ -373,17 +474,19 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                           c.setImageSettings((s) => ({ ...s, scheduler: value }))
                         }
                         disabled={c.streaming}
-                        options={IMAGE_SCHEDULERS.map((scheduler) => ({
-                          value: scheduler,
-                          label: scheduler === '' ? t.chatImageAdvancedDefault : scheduler,
-                        }))}
+                        helperText={defaultHint(defaultLabel, imageDefaults?.scheduler)}
+                        options={imageChoices(
+                          optionsOr(imageOptions?.schedulers, IMAGE_SCHEDULERS),
+                          c.imageSettings.scheduler,
+                          (scheduler) => (scheduler === '' ? defaultLabel : scheduler),
+                        )}
                       />
                       <TextField
                         id="chat-image-steps"
                         label={t.chatImageSteps}
                         type="number"
                         value={c.imageSettings.steps}
-                        placeholder={t.chatImageAdvancedDefault}
+                        placeholder={hintOr(imageDefaults?.steps)}
                         onChange={(event) =>
                           c.setImageSettings((s) => ({ ...s, steps: event.target.value }))
                         }
@@ -394,7 +497,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         label={t.chatImageCFG}
                         type="number"
                         value={c.imageSettings.cfg}
-                        placeholder={t.chatImageAdvancedDefault}
+                        placeholder={hintOr(imageDefaults?.cfg)}
                         onChange={(event) =>
                           c.setImageSettings((s) => ({ ...s, cfg: event.target.value }))
                         }
@@ -405,7 +508,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         label={t.chatImageSeed}
                         type="number"
                         value={c.imageSettings.seed}
-                        placeholder={t.chatImageAdvancedDefault}
+                        placeholder={hintOr(imageDefaults?.seed)}
                         onChange={(event) =>
                           c.setImageSettings((s) => ({ ...s, seed: event.target.value }))
                         }
@@ -416,7 +519,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         label={t.chatImageClipSkip}
                         type="number"
                         value={c.imageSettings.clip_skip}
-                        placeholder={t.chatImageAdvancedDefault}
+                        placeholder={hintOr(imageDefaults?.clip_skip)}
                         onChange={(event) =>
                           c.setImageSettings((s) => ({ ...s, clip_skip: event.target.value }))
                         }

@@ -31,6 +31,30 @@ describe('portal api', () => {
     expect(dashboard.metrics.requests_24h).toBe(2);
   });
 
+  it("fetches a model's image options by name and unwraps data", async () => {
+    const options = {
+      samplers: ['euler_a'],
+      size_limits: { min_width: 64, max_width: 2048, min_height: 64, max_height: 2048 },
+      max_batch_count: 8,
+    };
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: options }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    // A gateway model name may hold '/', so it travels URL-encoded in ?name=.
+    const result = await api.modelImageOptions('org/sd turbo');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/model-image-options?name=org%2Fsd%20turbo', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(result).toEqual(options);
+  });
+
   it('sends the CSRF header on mutating requests', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(

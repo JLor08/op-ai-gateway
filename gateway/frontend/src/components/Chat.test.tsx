@@ -5,11 +5,18 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Chat } from './Chat';
-import { ChatStoreProvider } from './chat/ChatStore';
+import {
+  ChatStoreProvider,
+  IMAGE_OUTPUT_FORMATS,
+  IMAGE_SAMPLERS,
+  IMAGE_SCHEDULERS,
+  IMAGE_SIZE_OPTIONS,
+} from './chat/ChatStore';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import type {
   ActiveChatRun,
+  ImageModelOptions,
   ModelOption,
   PortalServer,
   PortalToken,
@@ -126,6 +133,10 @@ function makeChatApi() {
     activeChatRuns: vi.fn(async () => ({ data: [] as ActiveChatRun[] })),
     // The server-override picker's filtered-model fetch (Task 6, step 3).
     serverModels: vi.fn(async (serverId: string) => serverModelsByServer[serverId] ?? []),
+    // The per-model sd-server image options the store fetches whenever the picked
+    // model GENERATES images: this file's fixtures know none, so every field is
+    // omitted (the dropdowns then use the static Phase 1b-i superset).
+    modelImageOptions: vi.fn(async (_name: string) => ({}) as ImageModelOptions),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -1041,6 +1052,360 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
       expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`Chat: the advanced image controls follow the picked model's options [${locale}]`, () => {
+    const imageModels: ModelOption[] = [
+      {
+        id: 'sd-turbo',
+        display_name: 'sd-turbo',
+        flavors: ['openai'],
+        loading_on_count: 0,
+        image: true,
+      },
+    ];
+
+    // Lets the store's fetch of the picked model's options land: the effect
+    // fires on the model pick, the (already resolved) mock settles in a
+    // microtask, and only then do the dropdowns re-derive their options.
+    async function settleModelOptions() {
+      await waitFor(() => expect(chatApi.spies.modelImageOptions).toHaveBeenCalledWith('sd-turbo'));
+      await act(async () => {});
+    }
+
+    // Opens the settings + advanced panels of a NEW image thread whose picked
+    // model reports `options`.
+    async function openAdvancedFor(options: ImageModelOptions) {
+      chatApi.spies.modelImageOptions.mockResolvedValue(options);
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'sd-turbo');
+      await settleModelOptions();
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+      fireEvent.click(screen.getByRole('button', { name: t.chatImageAdvanced }));
+    }
+
+    // The same, for a SAVED image thread whose persisted knobs are `image`.
+    async function openAdvancedForSaved(
+      options: ImageModelOptions,
+      image: Record<string, unknown>,
+    ) {
+      chatApi.rows.push({
+        id: 'c_image_opts',
+        title: '',
+        created_at: '2026-07-21T12:00:00Z',
+        updated_at: '2026-07-21T12:00:00Z',
+        content: { settings: { model: 'sd-turbo', kind: 'image', image }, messages: [] },
+      });
+      chatApi.spies.modelImageOptions.mockResolvedValue(options);
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await settleModelOptions();
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+      fireEvent.click(screen.getByRole('button', { name: t.chatImageAdvanced }));
+    }
+
+    // The option labels a combobox offers, in order (opened and closed again so
+    // the next one can be read).
+    async function offeredOptions(comboLabel: string): Promise<string[]> {
+      const combo = screen.getByRole('combobox', { name: comboLabel });
+      fireEvent.mouseDown(combo);
+      const listbox = await screen.findByRole('listbox');
+      const names = within(listbox)
+        .getAllByRole('option')
+        .map((option) => option.textContent ?? '');
+      fireEvent.keyDown(combo, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('listbox')).not.toBeInTheDocument());
+      return names;
+    }
+
+    async function sendPrompt() {
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      return chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+    }
+
+    const formatLabel = (format: string) =>
+      format === '' ? t.chatImageFormatDefault : format.toUpperCase();
+    const defaultLabel = t.chatImageAdvancedDefault;
+
+    it("offers only the model's sampler (plus the default entry) when it reports one", async () => {
+      await openAdvancedFor({ samplers: ['euler_a'] });
+
+      expect(await offeredOptions(t.chatImageSampler)).toEqual([defaultLabel, 'euler_a']);
+    });
+
+    it("offers only the model's schedulers and output formats too", async () => {
+      await openAdvancedFor({ schedulers: ['karras', 'simple'], output_formats: ['png', 'webp'] });
+
+      expect(await offeredOptions(t.chatImageScheduler)).toEqual([
+        defaultLabel,
+        'karras',
+        'simple',
+      ]);
+      expect(await offeredOptions(t.chatImageOutputFormat)).toEqual([
+        t.chatImageFormatDefault,
+        'PNG',
+        'WEBP',
+      ]);
+    });
+
+    it.each([
+      ['reports no lists at all', {}],
+      ['reports empty lists', { samplers: [], schedulers: [], output_formats: [] }],
+    ] as [string, ImageModelOptions][])(
+      'offers the full static superset when the model %s',
+      async (_name, options) => {
+        await openAdvancedFor(options);
+
+        expect(await offeredOptions(t.chatImageSampler)).toEqual(
+          IMAGE_SAMPLERS.map((value) => (value === '' ? defaultLabel : value)),
+        );
+        expect(await offeredOptions(t.chatImageScheduler)).toEqual(
+          IMAGE_SCHEDULERS.map((value) => (value === '' ? defaultLabel : value)),
+        );
+        expect(await offeredOptions(t.chatImageOutputFormat)).toEqual(
+          IMAGE_OUTPUT_FORMATS.map(formatLabel),
+        );
+        expect(await offeredOptions(t.chatImageSize)).toEqual(
+          IMAGE_SIZE_OPTIONS.map((value) => (value === '' ? t.chatImageSizeDefault : value)),
+        );
+      },
+    );
+
+    it('keeps a saved sampler the narrowed list omits selected, as a trailing option', async () => {
+      await openAdvancedForSaved({ samplers: ['euler_a', 'lcm'] }, { sampler: 'dpm++2m' });
+
+      const combo = screen.getByRole('combobox', { name: t.chatImageSampler }) as HTMLInputElement;
+      // Not blank and not snapped to the default entry: the saved pick survives.
+      expect(combo.value).toBe('dpm++2m');
+      expect(await offeredOptions(t.chatImageSampler)).toEqual([
+        defaultLabel,
+        'euler_a',
+        'lcm',
+        'dpm++2m',
+      ]);
+    });
+
+    it('keeps a saved scheduler, output format and size the narrowed lists omit selected', async () => {
+      await openAdvancedForSaved(
+        {
+          schedulers: ['karras'],
+          output_formats: ['png'],
+          size_limits: { min_width: 512, max_width: 512, min_height: 512, max_height: 512 },
+        },
+        { scheduler: 'beta', output_format: 'jpeg', size: '768x768' },
+      );
+
+      const valueOf = (label: string) =>
+        (screen.getByRole('combobox', { name: label }) as HTMLInputElement).value;
+      expect(valueOf(t.chatImageScheduler)).toBe('beta');
+      expect(valueOf(t.chatImageOutputFormat)).toBe('JPEG');
+      expect(valueOf(t.chatImageSize)).toBe('768x768');
+      expect((await offeredOptions(t.chatImageScheduler)).slice(-1)).toEqual(['beta']);
+      expect((await offeredOptions(t.chatImageOutputFormat)).slice(-1)).toEqual(['JPEG']);
+      expect((await offeredOptions(t.chatImageSize)).slice(-1)).toEqual(['768x768']);
+    });
+
+    it("shows the model's reported defaults as hints and sends none of them untouched", async () => {
+      await openAdvancedFor({
+        samplers: ['euler_a', 'lcm'],
+        schedulers: ['karras', 'simple'],
+        output_formats: ['png', 'webp'],
+        defaults: {
+          sampler: 'euler_a',
+          scheduler: 'karras',
+          output_format: 'webp',
+          negative_prompt: 'blurry, low quality',
+          steps: 20,
+          cfg: 7.5,
+          seed: 42,
+          clip_skip: 2,
+          width: 1024,
+          height: 768,
+        },
+      });
+
+      const describedBy = (label: string) =>
+        screen.getByRole('combobox', { name: label }) as HTMLInputElement;
+      expect(describedBy(t.chatImageSampler)).toHaveAccessibleDescription(
+        `${defaultLabel}: euler_a`,
+      );
+      expect(describedBy(t.chatImageScheduler)).toHaveAccessibleDescription(
+        `${defaultLabel}: karras`,
+      );
+      expect(describedBy(t.chatImageOutputFormat)).toHaveAccessibleDescription(
+        `${defaultLabel}: WEBP`,
+      );
+      expect(describedBy(t.chatImageSize)).toHaveAccessibleDescription(`${defaultLabel}: 1024x768`);
+      const placeholderOf = (label: string) => screen.getByLabelText(label);
+      expect(placeholderOf(t.chatImageSteps)).toHaveAttribute('placeholder', `${defaultLabel}: 20`);
+      expect(placeholderOf(t.chatImageCFG)).toHaveAttribute('placeholder', `${defaultLabel}: 7.5`);
+      expect(placeholderOf(t.chatImageSeed)).toHaveAttribute('placeholder', `${defaultLabel}: 42`);
+      expect(placeholderOf(t.chatImageClipSkip)).toHaveAttribute(
+        'placeholder',
+        `${defaultLabel}: 2`,
+      );
+      expect(placeholderOf(t.chatImageNegativePrompt)).toHaveAttribute(
+        'placeholder',
+        `${defaultLabel}: blurry, low quality`,
+      );
+
+      // A hint only: every field still reads as unset ...
+      expect(describedBy(t.chatImageSampler).value).toBe(defaultLabel);
+      expect(describedBy(t.chatImageScheduler).value).toBe(defaultLabel);
+      expect(describedBy(t.chatImageOutputFormat).value).toBe(t.chatImageFormatDefault);
+      expect(describedBy(t.chatImageSize).value).toBe(t.chatImageSizeDefault);
+      for (const label of [
+        t.chatImageSteps,
+        t.chatImageCFG,
+        t.chatImageSeed,
+        t.chatImageClipSkip,
+        t.chatImageNegativePrompt,
+      ]) {
+        expect(placeholderOf(label)).toHaveValue(label === t.chatImageNegativePrompt ? '' : null);
+      }
+
+      // ... and so the run body carries none of them (blank = sd-server's own default).
+      const body = await sendPrompt();
+      expect(Object.keys(body.settings.image ?? {})).toEqual(['n']);
+    });
+
+    it('shows a reported default of -1 or 0 as a hint rather than treating it as unset', async () => {
+      await openAdvancedFor({ defaults: { clip_skip: -1, seed: -1, steps: 0 } });
+
+      const hint = (label: string) => screen.getByLabelText(label).getAttribute('placeholder');
+      expect(hint(t.chatImageClipSkip)).toBe(`${defaultLabel}: -1`);
+      expect(hint(t.chatImageSeed)).toBe(`${defaultLabel}: -1`);
+      expect(hint(t.chatImageSteps)).toBe(`${defaultLabel}: 0`);
+      // An unreported default keeps the plain placeholder.
+      expect(hint(t.chatImageCFG)).toBe(defaultLabel);
+      // Still only a hint: nothing is sent.
+      const body = await sendPrompt();
+      expect(Object.keys(body.settings.image ?? {})).toEqual(['n']);
+    });
+
+    it('states the size default when BOTH the width and the height are reported', async () => {
+      await openAdvancedFor({ defaults: { width: 1024, height: 768 } });
+
+      expect(screen.getByRole('combobox', { name: t.chatImageSize })).toHaveAccessibleDescription(
+        `${defaultLabel}: 1024x768`,
+      );
+    });
+
+    it('states no size default unless BOTH the width and the height are reported', async () => {
+      await openAdvancedFor({ defaults: { width: 1024 } });
+
+      expect(
+        screen.getByRole('combobox', { name: t.chatImageSize }),
+      ).not.toHaveAccessibleDescription(/1024/);
+    });
+
+    it("caps the image count at the model's max batch count", async () => {
+      await openAdvancedFor({ max_batch_count: 4 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAccessibleDescription('1–4');
+      fireEvent.change(count, { target: { value: '9' } });
+      expect(count).toHaveValue(4);
+      const body = await sendPrompt();
+      expect(body.settings.image?.n).toBe(4);
+    });
+
+    it.each([
+      ['no max batch count', {}],
+      ['a half-stated size envelope and no max batch count', { size_limits: { max_width: 1024 } }],
+      ['a non-positive max batch count', { max_batch_count: 0 }],
+    ] as [string, ImageModelOptions][])(
+      'falls back to the static count ceiling with %s',
+      async (_name, options) => {
+        await openAdvancedFor(options);
+
+        const count = screen.getByLabelText(t.chatImageCount);
+        expect(count).toHaveAccessibleDescription('1–8');
+        fireEvent.change(count, { target: { value: '20' } });
+        expect(count).toHaveValue(8);
+      },
+    );
+
+    it("flags a saved count above the picked model's max batch count, and only then", async () => {
+      await openAdvancedForSaved({ max_batch_count: 4 }, { n: 8 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAttribute('aria-invalid', 'true');
+      // Back inside the ceiling the flag clears, so it is not simply always on.
+      fireEvent.change(count, { target: { value: '3' } });
+      expect(count).toHaveAttribute('aria-invalid', 'false');
+    });
+
+    it("never raises the count ceiling above the gateway's hard cap of 8", async () => {
+      // The model may only NARROW the cap: a reported 16 is still 8 (a gateway
+      // image-storage limit), in the helper, the clamp and the run body.
+      await openAdvancedFor({ max_batch_count: 16 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAccessibleDescription('1–8');
+      fireEvent.change(count, { target: { value: '20' } });
+      expect(count).toHaveValue(8);
+      const body = await sendPrompt();
+      expect(body.settings.image?.n).toBe(8);
+    });
+
+    it('keeps the count ceiling at 8 for a model whose max batch count is exactly 8', async () => {
+      await openAdvancedFor({ max_batch_count: 8 });
+
+      const count = screen.getByLabelText(t.chatImageCount);
+      expect(count).toHaveAccessibleDescription('1–8');
+      fireEvent.change(count, { target: { value: '8' } });
+      expect(count).toHaveValue(8);
+      fireEvent.change(count, { target: { value: '9' } });
+      expect(count).toHaveValue(8);
+    });
+
+    it('flags a saved count above the hard cap even when the model reports a larger max', async () => {
+      await openAdvancedForSaved({ max_batch_count: 16 }, { n: 12 });
+
+      expect(screen.getByLabelText(t.chatImageCount)).toHaveAttribute('aria-invalid', 'true');
+    });
+
+    it('offers only the size presets inside the size envelope', async () => {
+      await openAdvancedFor({
+        size_limits: { min_width: 600, max_width: 1024, min_height: 600, max_height: 1024 },
+      });
+
+      expect(await offeredOptions(t.chatImageSize)).toEqual([
+        t.chatImageSizeDefault,
+        '768x768',
+        '1024x1024',
+      ]);
+    });
+
+    it('applies only the stated side of a half-stated size envelope', async () => {
+      // Maxima without minima: the missing side is unbounded, not NaN (which
+      // would make every comparison false and empty the list).
+      await openAdvancedFor({ size_limits: { max_width: 1024, max_height: 1024 } });
+
+      expect(await offeredOptions(t.chatImageSize)).toEqual([
+        t.chatImageSizeDefault,
+        '512x512',
+        '768x768',
+        '1024x1024',
+      ]);
+    });
+
+    it('applies a lone minimum height and leaves every other bound open', async () => {
+      await openAdvancedFor({ size_limits: { min_height: 1024 } });
+
+      expect(await offeredOptions(t.chatImageSize)).toEqual([
+        t.chatImageSizeDefault,
+        '1024x1024',
+        '1024x1792',
+        '1792x1024',
+      ]);
     });
   });
 
