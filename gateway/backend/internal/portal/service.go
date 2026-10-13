@@ -292,6 +292,25 @@ type ChatStore interface {
 	ChatByID(ctx context.Context, id string) (store.ChatRow, error)
 	ChatsByUser(ctx context.Context, userID string) ([]store.ChatSummary, error)
 	DeleteChat(ctx context.Context, id string) error
+
+	// Binary payloads (inline images) live in their own chat_blobs rows, owned
+	// by a chat and deleted with it, so the sealed document stays small.
+	// PutChatBlob is deliberately not part of this interface: it is store
+	// internal, used only inside SaveChatWithBlobs.
+
+	// SaveChatWithBlobs writes the chat document and its new blobs as one
+	// atomic step: either all of it persists or none of it does.
+	SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error
+	// ChatBlobByID returns one blob row, or store.ErrNotFound. It does not
+	// check which chat the caller may read from: resolve ownership first
+	// (ChatBlobOwner, or ChatBlobsByIDs, which scopes by chat itself).
+	ChatBlobByID(ctx context.Context, id string) (store.ChatBlob, error)
+	// ChatBlobOwner returns the id of the chat a blob belongs to, or
+	// store.ErrNotFound, without loading the payload.
+	ChatBlobOwner(ctx context.Context, id string) (chatID string, err error)
+	// ChatBlobsByIDs returns the named blobs that belong to chatID, keyed by
+	// blob id. An id that is missing or owned by another chat is left out.
+	ChatBlobsByIDs(ctx context.Context, chatID string, ids []string) (map[string]store.ChatBlob, error)
 }
 
 // CaptureReader reads a persisted capture blob for the detail endpoint (read
