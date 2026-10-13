@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -47,6 +49,14 @@ import (
 // NormalizeAPIFlavor no longer folds openai_images into openai, an application
 // must opt into the images flavor explicitly to be an image candidate at all.
 func newImageRunTestServer(t *testing.T, upstreamURL string) (*Server, *portal.MemoryDirectory, auth.Token, string) {
+	t.Helper()
+	return newImageRunTestServerWithChats(t, upstreamURL, store.NewMemoryChatStore(0))
+}
+
+// newImageRunTestServerWithChats is newImageRunTestServer over a chat store the
+// test holds, for the tests that look at the chat_blobs rows a committed image
+// leaves behind -- the transcript itself only carries a reference to them.
+func newImageRunTestServerWithChats(t *testing.T, upstreamURL string, chats portal.ChatStore) (*Server, *portal.MemoryDirectory, auth.Token, string) {
 	t.Helper()
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
@@ -95,7 +105,7 @@ func newImageRunTestServer(t *testing.T, upstreamURL string) (*Server, *portal.M
 	svc := portal.NewService(portal.ServiceDeps{
 		Users: directory, Tokens: directory, Usage: recorder, Routes: routeStore,
 		Clock: func() time.Time { return now }, ModelLister: provider.NewMock(),
-		Chats: store.NewMemoryChatStore(0), Cipher: cipher,
+		Chats: chats, Cipher: cipher,
 	})
 	srv := New(ServerDeps{
 		Tokens:             tokens,
@@ -121,6 +131,64 @@ func newImageRunTestServer(t *testing.T, upstreamURL string) (*Server, *portal.M
 		t.Fatalf("CreateChat: %v", err)
 	}
 	return srv, directory, owner, created.ID
+}
+
+// storedImageBlob is a chat_blobs row a transcript's image part points at, with
+// its payload opened (the rows are sealed at rest).
+type storedImageBlob struct {
+	store.ChatBlob
+	plain []byte
+}
+
+// storedImageBlobs resolves every /api/portal/chat-blobs/{id} image url of a
+// stored transcript, in order, against the chat store the run committed to. A
+// committed image turn holds those references rather than the bytes.
+func storedImageBlobs(t *testing.T, chats portal.ChatStore, content json.RawMessage) []storedImageBlob {
+	t.Helper()
+	cipher, err := capture.New(testCaptureKey)
+	if err != nil {
+		t.Fatalf("capture.New: %v", err)
+	}
+	var doc struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(content, &doc); err != nil {
+		t.Fatalf("transcript is not JSON: %v", err)
+	}
+	var out []storedImageBlob
+	for _, m := range doc.Messages {
+		var parts []struct {
+			ImageURL *struct {
+				URL string `json:"url"`
+			} `json:"image_url"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue
+		}
+		for _, p := range parts {
+			if p.ImageURL == nil {
+				continue
+			}
+			id, ok := strings.CutPrefix(p.ImageURL.URL, "/api/portal/chat-blobs/")
+			if !ok {
+				t.Fatalf("image url %.80q is not a chat-blobs reference", p.ImageURL.URL)
+			}
+			row, err := chats.ChatBlobByID(context.Background(), id)
+			if err != nil {
+				t.Fatalf("ChatBlobByID(%s): %v", id, err)
+			}
+			plain := row.Blob
+			if row.KeyVersion > 0 {
+				if plain, err = cipher.Open(row.Blob); err != nil {
+					t.Fatalf("open blob %s: %v", id, err)
+				}
+			}
+			out = append(out, storedImageBlob{ChatBlob: row, plain: plain})
+		}
+	}
+	return out
 }
 
 // imageRunPrep is the prepared run every image test below starts from: the
@@ -479,10 +547,15 @@ func stalledImagesUpstream(t *testing.T, firstChunk string) (*httptest.Server, f
 // An image run ends with a committed assistant turn holding one image_url part
 // per upstream data[] item, with the MIME taken from output_format rather than
 // assumed.
+//
+// The turn is stored as image_url parts that REFERENCE chat_blobs rows (the
+// commit moves the bytes out of the document -- see portal.extractChatBlobs),
+// so the media type and each item's own bytes are asserted on the rows.
 func TestImageRunCommitsAnImagePartPerDataItem(t *testing.T) {
 	upstream, _ := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="},{"b64_json":"BB=="}]}`)
 
-	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	chats := store.NewMemoryChatStore(0)
+	srv, _, owner, chatID := newImageRunTestServerWithChats(t, upstream.URL, chats)
 	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -502,13 +575,25 @@ func TestImageRunCommitsAnImagePartPerDataItem(t *testing.T) {
 	if n := strings.Count(string(got.Content), `"type":"image_url"`); n != 2 {
 		t.Fatalf("image_url parts = %d, want 2: %s", n, got.Content)
 	}
+	// The transcript holds references, not the bytes.
+	if strings.Contains(string(got.Content), "data:") {
+		t.Fatalf("the committed turn must reference chat_blobs, not carry the image inline: %s", got.Content)
+	}
+	blobs := storedImageBlobs(t, chats, got.Content)
+	if len(blobs) != 2 {
+		t.Fatalf("image parts reference %d stored blobs, want 2: %s", len(blobs), got.Content)
+	}
 	// The MIME is REPORTED, not assumed. Hardcoding image/png would be a
 	// fabricated measurement of the same class as a fake progress bar.
-	if strings.Count(string(got.Content), `data:image/png;base64,`) != 2 {
-		t.Fatalf("data URLs must carry the upstream output_format: %s", got.Content)
+	for i, blob := range blobs {
+		if blob.ContentType != "image/png" {
+			t.Fatalf("blob %d content type = %q, must carry the upstream output_format as image/png", i, blob.ContentType)
+		}
 	}
-	if !strings.Contains(string(got.Content), `data:image/png;base64,AA==`) || !strings.Contains(string(got.Content), `data:image/png;base64,BB==`) {
-		t.Fatalf("each part must carry its OWN item's base64, not data[0]'s twice: %s", got.Content)
+	// "AA==" and "BB==" decode to different bytes: each part must be its OWN
+	// item's image, not data[0]'s twice.
+	if !bytes.Equal(blobs[0].plain, []byte{0x00}) || !bytes.Equal(blobs[1].plain, []byte{0x04}) {
+		t.Fatalf("each part must carry its OWN item's bytes, not data[0]'s twice: %x, %x", blobs[0].plain, blobs[1].plain)
 	}
 	if !strings.Contains(string(got.Content), `"status":"complete"`) {
 		t.Fatalf("the turn must be committed complete, not left pending: %s", got.Content)
@@ -611,7 +696,8 @@ func TestImageRunSendsThePinnedImagesBody(t *testing.T) {
 func TestImageRunEmitsARevisedPromptAsATextPart(t *testing.T) {
 	upstream, _ := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"webp","data":[{"b64_json":"AA==","revised_prompt":"a tabby cat, studio light"}]}`)
 
-	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	chats := store.NewMemoryChatStore(0)
+	srv, _, owner, chatID := newImageRunTestServerWithChats(t, upstream.URL, chats)
 	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -629,9 +715,14 @@ func TestImageRunEmitsARevisedPromptAsATextPart(t *testing.T) {
 		t.Fatalf("revised_prompt must be an ordinary text part: %s", got.Content)
 	}
 	// The media type still comes from output_format -- including when it is
-	// not png.
-	if !strings.Contains(string(got.Content), `{"type":"image_url","image_url":{"url":"data:image/webp;base64,AA=="}}`) {
-		t.Fatalf("data URL must carry output_format webp: %s", got.Content)
+	// not png. The transcript holds a reference; the type lives on the stored
+	// blob.
+	if !strings.Contains(string(got.Content), `{"type":"image_url","image_url":{"url":"/api/portal/chat-blobs/blob_`) {
+		t.Fatalf("the image part must reference chat_blobs, keeping the {type, image_url} shape: %s", got.Content)
+	}
+	blobs := storedImageBlobs(t, chats, got.Content)
+	if len(blobs) != 1 || blobs[0].ContentType != "image/webp" || !bytes.Equal(blobs[0].plain, []byte{0x00}) {
+		t.Fatalf("stored blob must carry output_format webp and the decoded bytes: %+v", blobs)
 	}
 }
 
@@ -1118,7 +1209,8 @@ func TestImageRunUserCancelStaysACancel(t *testing.T) {
 //
 // So the assertion is two-sided on purpose: Content must still be empty (this
 // is not a regression that started stuffing the text buffer) AND ContentParts
-// must carry exactly what the transcript now holds.
+// must carry exactly what the turn committed -- the image the transcript now
+// holds by reference, so the browser can render it from the event itself.
 func TestImageRunDoneEventCarriesTheCommittedImageParts(t *testing.T) {
 	// The whole body is written as the first chunk and the handler then stalls,
 	// so the run is reliably still `running` when we subscribe and the `done`
@@ -1127,7 +1219,8 @@ func TestImageRunDoneEventCarriesTheCommittedImageParts(t *testing.T) {
 	upstream, release := stalledImagesUpstream(t, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
 	defer release()
 
-	srv, _, owner, chatID := newImageRunTestServer(t, upstream.URL)
+	chats := store.NewMemoryChatStore(0)
+	srv, _, owner, chatID := newImageRunTestServerWithChats(t, upstream.URL, chats)
 	run, err := srv.startChatRun(owner, chatID, imageRunPrep())
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
@@ -1158,12 +1251,16 @@ func TestImageRunDoneEventCarriesTheCommittedImageParts(t *testing.T) {
 		t.Fatalf("done.ContentParts = %s, want the committed image part", done.ContentParts)
 	}
 	// ...and what it carries is what was STORED, not a second rendering of it.
+	// The transcript now holds that image BY REFERENCE (the commit moved the
+	// bytes into chat_blobs), so "the same image" is read off the blob the
+	// transcript points at: it must hold exactly the bytes the event carries.
 	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(stored.Content), string(done.ContentParts)) {
-		t.Fatalf("done.ContentParts = %s is not what the transcript holds: %s", done.ContentParts, stored.Content)
+	blobs := storedImageBlobs(t, chats, stored.Content)
+	if len(blobs) != 1 || blobs[0].ContentType != "image/png" || !bytes.Equal(blobs[0].plain, []byte{0x00}) {
+		t.Fatalf("done.ContentParts = %s is not what the transcript holds: %s -> %+v", done.ContentParts, stored.Content, blobs)
 	}
 }
 
@@ -1189,6 +1286,66 @@ func TestImageRunTerminalSnapshotCarriesTheCommittedImageParts(t *testing.T) {
 	}
 	if !strings.Contains(string(snap.ContentParts), `data:image/png;base64,AA==`) {
 		t.Fatalf("terminal snapshot ContentParts = %s, want the committed image part", snap.ContentParts)
+	}
+}
+
+// deletingChatStore deletes the chat the instant a run commit tries to save it:
+// DELETE /chats/{id} landing between the run's read of the chat and its write.
+// Armed after the chat exists, so only the commit under test meets the race.
+type deletingChatStore struct {
+	portal.ChatStore
+	armed   atomic.Bool
+	deleted atomic.Bool
+}
+
+func (s *deletingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+	if s.armed.Load() {
+		_ = s.ChatStore.DeleteChat(ctx, chat.ID)
+		s.deleted.Store(true)
+	}
+	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+}
+
+// A generated image is stored by the commit through SaveChatWithBlobs, which
+// can now meet a chat that was deleted mid-run on the blob insert / chat update
+// itself. That has to come back as the same "the chat is gone" the executor
+// already tells apart from a failed write: a run that was ending "canceled" (by
+// that very DELETE) stays canceled, one that was about to report "completed"
+// is turned into the generic commit error because its image was never saved --
+// and neither is a 500, and the image is never offered as stored.
+func TestImageRunBlobCommitOnADeletedChatIsTheChatGonePath(t *testing.T) {
+	for _, tc := range []struct{ status, wantStatus, wantErr string }{
+		{"canceled", "canceled", ""},
+		{"completed", "error", chatRunCommitFailedMessage},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			upstream, _ := imagesUpstream(t, http.StatusOK, `{"created":1,"output_format":"png","data":[{"b64_json":"AA=="}]}`)
+			chats := &deletingChatStore{ChatStore: store.NewMemoryChatStore(0)}
+			srv, _, owner, chatID := newImageRunTestServerWithChats(t, upstream.URL, chats)
+			chats.armed.Store(true)
+
+			run, err := srv.ChatRuns.add(owner.UserID, chatID, func() {})
+			if err != nil {
+				t.Fatalf("add: %v", err)
+			}
+			parts := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`)
+			srv.finishRunWithParts(context.Background(), owner, run, tc.status, "", parts)
+
+			if !chats.deleted.Load() {
+				t.Fatal("the commit never reached SaveChatWithBlobs, so the race was not exercised")
+			}
+			if got := run.statusValue(); got != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", got, tc.wantStatus)
+			}
+			if got := runError(t, run); got != tc.wantErr {
+				t.Fatalf("error = %q, want %q", got, tc.wantErr)
+			}
+			snap, _, unsub := run.subscribe()
+			unsub()
+			if len(snap.ContentParts) != 0 {
+				t.Fatalf("ContentParts = %s, want none: the image was not stored", snap.ContentParts)
+			}
+		})
 	}
 }
 

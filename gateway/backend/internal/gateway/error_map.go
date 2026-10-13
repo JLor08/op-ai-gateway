@@ -43,6 +43,13 @@ var sharedErrorMap = []errRow{
 	{err: portal.ErrPathSuffixInvalid, status: http.StatusBadRequest, code: "application.path_suffix_invalid", msg: "path suffix must be a path, not a URL"},
 	{err: portal.ErrChatNotFound, status: http.StatusNotFound, code: "portal.chat_not_found", msg: "chat not found"},
 	{err: portal.ErrChatTooLarge, status: http.StatusBadRequest, code: "portal.chat_too_large", msg: "chat content is too large"},
+	// The three refusals of an inline chat image at a run commit (the extraction
+	// into chat_blobs, portal.PrepareChatRun/CommitAssistant). Only the run start
+	// can return them to a client; a commit that fails with one ends the run with
+	// the generic commit-failure code instead (see commitFailureCode).
+	{err: portal.ErrChatBlobTypeUnsupported, status: http.StatusBadRequest, code: "images.blob_type_unsupported", msg: "image must be a base64 data URL of type png, jpeg, webp or gif"},
+	{err: portal.ErrChatBlobTooLarge, status: http.StatusBadRequest, code: "images.blob_too_large", msg: "image is too large"},
+	{err: portal.ErrChatBlobNotOwned, status: http.StatusBadRequest, code: "images.blob_not_owned", msg: "image reference does not belong to this chat"},
 	// ErrRunAlreadyActive: writePortalRunError (run start) and
 	// writePortalChatError (PUT /chats/{id}, task 9) both refuse an
 	// already-active run identically -- 409 portal.chat_run_active -- so this

@@ -1311,9 +1311,11 @@ func TestExecuteRunFallsBackToTheStatusLineForANonEnvelopeBody(t *testing.T) {
 // the write and then hangs (a lost connection with no keepalive, a lock it
 // never gets) rather than one that errors.
 //
-// It blocks in UpdateChat, not ChatByID, so only the WRITE half is affected:
+// It blocks in the writes, not ChatByID, so only the WRITE half is affected:
 // reads keep working, which is what makes the run's own path up to the commit
-// realistic.
+// realistic. There are two write entry points and both wedge: UpdateChat (the
+// plain autosave) and SaveChatWithBlobs, which is what every run commit --
+// the checkpoints and the terminal write -- ends in.
 type wedgedChatStore struct {
 	portal.ChatStore
 	armed   atomic.Bool
@@ -1327,6 +1329,15 @@ func (s *wedgedChatStore) UpdateChat(ctx context.Context, chat store.Chat) error
 		return ctx.Err()
 	}
 	return s.ChatStore.UpdateChat(ctx, chat)
+}
+
+func (s *wedgedChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+	if s.armed.Load() {
+		s.blocked.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
 }
 
 // A terminal commit that never returns used to strand the run FOREVER:

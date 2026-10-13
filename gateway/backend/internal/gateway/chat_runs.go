@@ -162,8 +162,11 @@ type runEvent struct {
 	// STRICTLY WHAT WAS COMMITTED: finishRunWithParts clears it when
 	// CommitAssistant fails, so a turn the store refused (portal.chat_too_large
 	// above all) is not rendered as though it had been saved. json.RawMessage,
-	// not a decoded shape: this is the identical blob the transcript holds and
-	// this layer has no business re-encoding it.
+	// not a decoded shape: this is the blob the turn was committed with and this
+	// layer has no business re-encoding it. The image bytes it carries inline
+	// are the ones CommitAssistant moved into chat_blobs: the stored transcript
+	// holds the same image by reference (a /api/portal/chat-blobs/ url), which
+	// the post-`done` canonical refetch delivers.
 	ContentParts json.RawMessage `json:"content_parts,omitempty"`
 }
 
