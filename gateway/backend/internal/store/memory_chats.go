@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -83,6 +84,16 @@ func (m *MemoryChatStore) UpdateChat(ctx context.Context, chat Chat) error {
 	if !ok {
 		return ErrNotFound
 	}
+	m.overwriteChat(rec, chat)
+	m.evict()
+	return nil
+}
+
+// overwriteChat applies chat's mutable fields (title/blob/key_version/
+// updated_at) to the held record rec and re-counts its blob bytes. It does NOT
+// evict: UpdateChat evicts right after, SaveChatWithBlobs only once the whole
+// save is applied. Callers must hold m.mu and pass rec = m.records[chat.ID].
+func (m *MemoryChatStore) overwriteChat(rec, chat Chat) {
 	m.bytes -= len(rec.Blob)
 	rec.Title = chat.Title
 	rec.KeyVersion = chat.KeyVersion
@@ -90,6 +101,55 @@ func (m *MemoryChatStore) UpdateChat(ctx context.Context, chat Chat) error {
 	rec.UpdatedAt = chat.UpdatedAt
 	m.records[chat.ID] = rec
 	m.bytes += len(rec.Blob)
+}
+
+// SaveChatWithBlobs writes a chat and its newly-extracted chat_blobs as one
+// all-or-nothing unit, mirroring SQLStore.SaveChatWithBlobs: the chat side is
+// UpdateChat, each blob is a PutChatBlob, and the errors are theirs (a chat that
+// is not held is ErrNotFound, a blob id already taken -- by a held blob or by an
+// earlier blob of the same batch -- is ErrConflict). A blob whose ChatID is not
+// chat.ID is refused too, exactly as the SQL driver does, so the two never
+// disagree about what a save may attach.
+//
+// It is atomic by staging: m.mu is taken ONCE and every refusal is decided in a
+// first pass that mutates nothing, so a refused save leaves the chat, the blobs,
+// the indexes and the byte budget exactly as they were. Only a save that cannot
+// fail any more is applied -- chat fields, blobs and their byte count -- and
+// eviction then runs ONCE, after the whole save. It must not loop PutChatBlob:
+// that takes the lock per blob and evicts after each one, so with the chat being
+// saved as the oldest entry a mid-save eviction would drop that very chat (and
+// the blobs already stored for it) and fail the rest of the batch with
+// ErrNotFound. Applied as one step, the budget is judged against the finished
+// state. The final eviction can still drop the saved chat if it is the oldest
+// entry and the finished state is over budget -- as UpdateChat can evict the
+// chat it just grew -- but then it goes together with all of its blobs, never
+// half-saved. Like Chat.Blob, the blob byte slices are held, not copied.
+func (m *MemoryChatStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[chat.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	// Stage: decide every refusal before touching any state.
+	batch := make(map[string]struct{}, len(blobs))
+	for _, blob := range blobs {
+		if blob.ChatID != chat.ID {
+			return fmt.Errorf("save chat with blobs: blob %q belongs to chat %q, not %q", blob.ID, blob.ChatID, chat.ID)
+		}
+		if _, taken := m.blobs[blob.ID]; taken {
+			return ErrConflict
+		}
+		if _, repeated := batch[blob.ID]; repeated {
+			return ErrConflict
+		}
+		batch[blob.ID] = struct{}{}
+	}
+	// Apply: nothing below can fail.
+	m.overwriteChat(rec, chat)
+	for _, blob := range blobs {
+		m.storeChatBlob(blob)
+	}
 	m.evict()
 	return nil
 }
@@ -201,11 +261,19 @@ func (m *MemoryChatStore) PutChatBlob(ctx context.Context, blob ChatBlob) error 
 	if _, taken := m.blobs[blob.ID]; taken {
 		return ErrConflict
 	}
+	m.storeChatBlob(blob)
+	m.evict()
+	return nil
+}
+
+// storeChatBlob records blob in the blob map and its chat's index and adds its
+// payload bytes to the budget. It does NOT evict and does not re-check the chat
+// or the id: PutChatBlob and SaveChatWithBlobs have already decided the put is
+// valid, and each evicts when it chooses. Callers must hold m.mu.
+func (m *MemoryChatStore) storeChatBlob(blob ChatBlob) {
 	m.blobs[blob.ID] = blob
 	m.chatBlobIDs[blob.ChatID] = append(m.chatBlobIDs[blob.ChatID], blob.ID)
 	m.bytes += len(blob.Blob)
-	m.evict()
-	return nil
 }
 
 // ChatBlobByID returns the full entry (payload included) for a blob id, or

@@ -218,3 +218,41 @@ func TestChatBlobsByIDsEmptyIDsDoesNoQuery(t *testing.T) {
 		}
 	})
 }
+
+// TestSaveChatWithBlobsCancelledContextPersistsNothing pins that a context that
+// is already cancelled fails the save before anything is written: the
+// transaction never opens, so neither the chat update nor a blob can persist. It
+// is SQL-only on purpose -- the in-RAM store has no I/O to cancel and, like every
+// other MemoryChatStore method, does not consult its context.
+func TestSaveChatWithBlobsCancelledContextPersistsNothing(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+		seedChatForBlobs(ctx, t, s, "u_cancel", "c_cancel", now)
+		before, err := s.ChatByID(ctx, "c_cancel")
+		if err != nil {
+			t.Fatalf("ChatByID: %v", err)
+		}
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		updated := Chat{ID: "c_cancel", Title: "must not stick", KeyVersion: 5, Blob: []byte("nope"), UpdatedAt: now.Add(time.Hour)}
+		err = s.SaveChatWithBlobs(cancelled, updated, []ChatBlob{
+			{ID: "blob_cancel", ChatID: "c_cancel", KeyVersion: 5, Blob: []byte("x"), ContentType: "image/png", ByteLen: 1, CreatedAt: now},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SaveChatWithBlobs(cancelled ctx) = %v, want context.Canceled", err)
+		}
+
+		after, err := s.ChatByID(ctx, "c_cancel")
+		if err != nil {
+			t.Fatalf("ChatByID: %v", err)
+		}
+		if after.Title != before.Title || after.KeyVersion != before.KeyVersion || !bytes.Equal(after.Blob, before.Blob) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Fatalf("chat after a cancelled save = %#v, want the unchanged %#v", after, before)
+		}
+		if _, err := s.ChatBlobByID(ctx, "blob_cancel"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("ChatBlobByID(blob_cancel) = %v, want ErrNotFound", err)
+		}
+	})
+}

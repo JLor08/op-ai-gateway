@@ -67,7 +67,20 @@ func (s *SQLiteStore) Close() error {
 }
 
 func (s *SQLStore) exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
-	return s.db.ExecContext(ctx, s.dl.rebind(q), sanitizeArgs(args)...)
+	return s.execOn(ctx, s.db, q, args...)
+}
+
+// execer is the one method of *sql.DB and *sql.Tx a write helper needs, so the
+// same statement text and error mapping can serve both the standalone write
+// (the pool) and the same write inside a transaction (the *sql.Tx).
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// execOn is exec against an explicit execer: the pool, or an open transaction
+// when several writes must commit or roll back together.
+func (s *SQLStore) execOn(ctx context.Context, ex execer, q string, args ...any) (sql.Result, error) {
+	return ex.ExecContext(ctx, s.dl.rebind(q), sanitizeArgs(args)...)
 }
 
 func (s *SQLStore) query(ctx context.Context, q string, args ...any) (*sql.Rows, error) {

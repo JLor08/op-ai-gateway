@@ -18,7 +18,15 @@ import (
 // not exist is ErrNotFound (the foreign-key violation), a blob id already
 // taken is ErrConflict.
 func (s *SQLStore) PutChatBlob(ctx context.Context, blob ChatBlob) error {
-	_, err := s.exec(ctx, `
+	return s.insertChatBlob(ctx, s.db, blob)
+}
+
+// insertChatBlob is PutChatBlob's insert and error mapping against an explicit
+// execer, so SaveChatWithBlobs can run the very same statement inside its
+// transaction instead of through the pool (which would commit each blob on its
+// own and defeat the all-or-nothing save).
+func (s *SQLStore) insertChatBlob(ctx context.Context, ex execer, blob ChatBlob) error {
+	_, err := s.execOn(ctx, ex, `
 		insert into chat_blobs (id, chat_id, key_version, blob, content_type, byte_len, created_at)
 		values (?, ?, ?, ?, ?, ?, ?)`,
 		blob.ID, blob.ChatID, blob.KeyVersion, blob.Blob, blob.ContentType, blob.ByteLen, blob.CreatedAt,
