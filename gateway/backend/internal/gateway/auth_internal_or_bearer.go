@@ -13,10 +13,10 @@ import (
 // trusted-loopback header pair, else from a bearer token. It is authenticateWeb
 // MINUS the session-cookie leg, and that omission is the point.
 //
-// Used by /v1/images/generations, which the portal-chat run executor reaches
-// over the loopback pair (chat_runs.go sets internalAuthHeaderName +
-// internalUserHeaderName and no bearer) while no browser ever calls it
-// directly. Swapping the endpoint to requireWebAnyScope would have been one
+// Used by /v1/images/generations and /v1/images/edits, which the portal-chat
+// run executor reaches over the loopback pair (chat_runs.go sets
+// internalAuthHeaderName + internalUserHeaderName and no bearer) while no
+// browser ever calls them directly. Swapping the endpoint to requireWebAnyScope would have been one
 // line and would ALSO have admitted the browser session cookie, making the
 // endpoint reachable from a logged-in page -- a browser leg this feature
 // never wanted and docs/architecture/02-constraints.md's auth-legs bullet

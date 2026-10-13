@@ -106,8 +106,9 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 // candidacy deliberately gates that app type on its own coarser, app-level
 // flavors only (the spec is the per-model authority, knowable only post-resolve).
 // Its two callers are tryProxyNative (the coding-agent endpoints) and
-// relayImages. The text translate dispatch does not call it: it applies only
-// the narrower targetIsImagesOnly below.
+// resolveImagesTarget (the generations and the edits relays). The text
+// translate dispatch does not call it: it applies only the narrower
+// targetIsImagesOnly below.
 func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 	coarse := routing.NormalizeAPIFlavor(apiFlavor)
 	for _, f := range target.APIFlavors {
@@ -472,7 +473,23 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// The payload capture keeps recording the CLIENT's bytes, so the debug line
 	// below is where an operator debugging a 400 learns that the gateway added
 	// a key at all.
-	upstreamBody := rewriteModelField(rel.raw, rel.target.ProviderModel)
+	//
+	// Both edits are JSON edits. A relay that carries a distinct upstream body or
+	// a non-JSON content type (the multipart image edit; see nativeRelay) is
+	// handed to the upstream exactly as its caller built it: rewriteModelField
+	// reads a JSON object, and the caller that chose a multipart body has already
+	// decided what the upstream sees as the model.
+	relayContentType := rel.contentType
+	if relayContentType == "" {
+		relayContentType = jsonContentType
+	}
+	upstreamBody := rel.raw
+	if rel.upstreamBody != nil {
+		upstreamBody = rel.upstreamBody
+	}
+	if relayContentType == jsonContentType {
+		upstreamBody = rewriteModelField(upstreamBody, rel.target.ProviderModel)
+	}
 
 	// The operator's opt-in, applied as a SECOND, separate edit rather than
 	// folded into the rewrite above. rewriteModelField returns the client's own
@@ -501,7 +518,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// Same construction as internal/provider's own guard,
 	// `wantsLiveProgress(target) && !c.liveProgress.rejects(target.RouteID)`.
 	injectedLiveTimings := false
-	if wantsResponsesLiveTimings(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream) && !liveProgressRejectedFor(s.Provider, rel.target) {
+	if relayContentType == jsonContentType && wantsResponsesLiveTimings(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream) && !liveProgressRejectedFor(s.Provider, rel.target) {
 		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
 	}
 
@@ -550,7 +567,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// merged with the target's own (anthropicPassthroughHeaderOverrides is nil
 	// everywhere else, which leaves the call exactly as upstreamAuthCtx builds it).
 	ctx = s.upstreamAuthCtxWithHeaders(ctx, rel.target, anthropicPassthroughHeaderOverrides(rel.target, r.Header))
-	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, jsonContentType)
+	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, relayContentType)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
 		code := completionErrorCode(err)
@@ -695,11 +712,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native
 // passthrough relay its caller has already decided on: which principal, which
-// resolved destination, which client bytes, and which endpoint identity. The two
-// call sites (tryProxyNative above and relayImages in images_handler.go) each
-// hold all six as locals by the time they call, so this groups values that
-// already travel together rather than unrelated ones bundled to shorten a
-// signature.
+// resolved destination, which client bytes, and which endpoint identity. Its
+// callers (tryProxyNative above, relayImages in images_handler.go and
+// relayImageEdit in images_edit_handler.go) each hold the first six as locals
+// by the time they call, so this groups values that already travel together
+// rather than unrelated ones bundled to shorten a signature.
 //
 // pfReq is the PREFLIGHT request (inferencePreflight's own pf.Req), deliberately
 // named apart from the session-enriched inference.Request proxyNative builds
@@ -715,13 +732,27 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 // comment for why the coarse flavor stopped being able to carry that inference
 // once a second, non-translate native endpoint — images — shared "openai" with
 // responses).
+//
+// contentType and upstreamBody describe the request the UPSTREAM is sent, for the
+// one caller whose body is not JSON (the multipart image edit). Both are
+// optional and both default to "what every other relay does": an empty
+// contentType means application/json, and a nil upstreamBody means "relay raw
+// (JSON: with its model rewritten to the mapped name)". raw is always the
+// CLIENT's bytes -- it is what the payload capture and the session extractor
+// read -- so a caller that must send something else (a multipart form rebuilt
+// with the mapped model name) supplies it as upstreamBody rather than replacing
+// raw, which keeps the capture a record of what the client sent. contentType
+// belongs to whichever of the two is relayed: the client's own for a verbatim
+// relay, the new body's (with its new boundary) for a rebuilt one.
 type nativeRelay struct {
-	token    auth.Token
-	target   routing.Target
-	path     string
-	raw      []byte
-	pfReq    inference.Request
-	endpoint sessionEndpoint
+	token        auth.Token
+	target       routing.Target
+	path         string
+	raw          []byte
+	pfReq        inference.Request
+	endpoint     sessionEndpoint
+	contentType  string
+	upstreamBody []byte
 }
 
 // nativeExchange is the request-scoped state proxyNative COMPUTES once and then

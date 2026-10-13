@@ -445,8 +445,8 @@ type Server struct {
 	// (auth.go); its two callers are authenticateWeb (auth.go, for
 	// /v1/chat/completions and every Portal/Admin/System route) and
 	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
-	// /v1/images/generations only), which differ in what they fall back to and
-	// in nothing else. internalAuthSecret empty disables the branch entirely
+	// /v1/images/generations and /v1/images/edits only), which differ in what
+	// they fall back to and in nothing else. internalAuthSecret empty disables the branch entirely
 	// (fail-closed) for both, because the check is the same code.
 	internalAuthSecret string
 	users              userLookup
@@ -1280,6 +1280,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/responses", s.handleOpenAIResponses)
 	s.mux.HandleFunc("/openai/v1/images/generations", s.handleOpenAIImages)
 	s.mux.HandleFunc("/v1/images/generations", s.handleOpenAIImages)
+	s.mux.HandleFunc("/openai/v1/images/edits", s.handleOpenAIImagesEdit)
+	s.mux.HandleFunc("/v1/images/edits", s.handleOpenAIImagesEdit)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/api/v0/models", s.handleLMStudioModels)
@@ -2137,7 +2139,7 @@ func readRawJSONLimit(w http.ResponseWriter, r *http.Request, limit int64) ([]by
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, apierror.Response("request.body_too_large", "request body too large", ""))
+			writeBodyTooLarge(w)
 			return nil, false
 		}
 		message := "request body must contain exactly one JSON value"
@@ -2153,10 +2155,16 @@ func readRawJSONLimit(w http.ResponseWriter, r *http.Request, limit int64) ([]by
 func writeJSONDecodeError(w http.ResponseWriter, err error) {
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		writeJSON(w, http.StatusRequestEntityTooLarge, apierror.Response("request.body_too_large", "request body too large", ""))
+		writeBodyTooLarge(w)
 		return
 	}
 	writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+}
+
+// writeBodyTooLarge answers a request body past its endpoint's cap: 413 with the
+// one code every capped body reader uses.
+func writeBodyTooLarge(w http.ResponseWriter) {
+	writeJSON(w, http.StatusRequestEntityTooLarge, apierror.Response("request.body_too_large", "request body too large", ""))
 }
 
 func writeRequestError(w http.ResponseWriter, err error) {

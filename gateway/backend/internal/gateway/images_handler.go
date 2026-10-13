@@ -491,27 +491,30 @@ func (s *Server) recordImagesRoutingFailure(w http.ResponseWriter, r *http.Reque
 	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
 }
 
-// relayImages resolves the routing target for an already-gated images request
-// and relays it via proxyNative. It follows tryProxyNative's resolve-then-relay
-// shape, minus the translate fallback: images has none, so unlike
-// tryProxyNative -- which returns false on an ordinary routing failure and lets
-// the caller's translate path re-resolve and record the error -- EVERY resolve
-// failure here is terminal and recorded directly, not just an admission-queue
-// rejection. req is pf.Req from the caller's inferencePreflight call, already
-// carrying RequiredCapabilities = [routing.CapabilityImage].
-func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
-	start := time.Now()
-	target, err := s.resolveTarget(r.Context(), &token, req)
+// resolveImagesTarget is the resolve-and-gate step both images relays share
+// (relayImages here, relayImageEdit in images_edit_handler.go): it resolves the
+// routing target for an already-gated images request and applies the
+// effective-served conjunct to it. On a refusal it has already written the
+// client's response and recorded the usage row, and answers ok == false. Shared
+// rather than copied so that the two endpoints cannot drift on what an agent
+// child whose spec excludes images does -- ADR-044 (b) is one rule, and an edit
+// is an images request exactly as a generation is.
+//
+// token is a pointer for the reason tryProxyNative's is: resolveTarget refreshes
+// the caller's last-used-model snapshot through it, and the relay that follows
+// must carry that refreshed token.
+func (s *Server) resolveImagesTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, req inference.Request, raw []byte, start time.Time) (routing.Target, bool) {
+	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
-		s.recordImagesRoutingFailure(w, r, token, req, raw, start, err)
-		return
+		s.recordImagesRoutingFailure(w, r, *token, req, raw, start, err)
+		return routing.Target{}, false
 	}
 	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈
 	// APIFlavors AND the endpoint is not disabled. For a server_agent mapping
 	// the resolved runtime spec -- not the application -- is the authority for
 	// its model's flavors (targetFrom), and candidacy deliberately gated that
 	// app type on its coarser app-level flavors only. tryProxyNative enforces
-	// this for the coding-agent endpoints; relayImages reaches proxyNative
+	// this for the coding-agent endpoints; the images relays reach proxyNative
 	// directly, so without this an agent-managed child whose spec lists only
 	// text would still serve an image request.
 	if !targetServesFlavor(target, req.APIFlavor) {
@@ -527,7 +530,24 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 		slog.Debug("images request rejected: resolved target's effective flavors exclude images",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordImagesRoutingFailure(w, r, token, req, raw, start, routing.ErrNoModelRoute)
+		s.recordImagesRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
+		return routing.Target{}, false
+	}
+	return target, true
+}
+
+// relayImages relays an already-gated generations request via proxyNative. It
+// follows tryProxyNative's resolve-then-relay shape, minus the translate
+// fallback: images has none, so unlike tryProxyNative -- which returns false on
+// an ordinary routing failure and lets the caller's translate path re-resolve
+// and record the error -- EVERY resolve failure here is terminal and recorded
+// directly (resolveImagesTarget), not just an admission-queue rejection. req is
+// pf.Req from the caller's inferencePreflight call, already carrying
+// RequiredCapabilities = [routing.CapabilityImage].
+func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
+	start := time.Now()
+	target, ok := s.resolveImagesTarget(w, r, &token, req, raw, start)
+	if !ok {
 		return
 	}
 	s.proxyNative(w, r, nativeRelay{
