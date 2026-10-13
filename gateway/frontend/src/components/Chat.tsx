@@ -47,8 +47,8 @@ function isReported(value: number | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
-// The most images one request may ask for. IMAGE_N_MAX is the gateway's HARD cap
-// (an image-storage limit, not a model limit), so the picked model's reported max
+// The most images one request may ask for. IMAGE_N_MAX is the portal's HARD cap
+// (not a model limit), so the picked model's reported max
 // batch count may only NARROW it: a usable (>= 1) report is clamped to the cap
 // (a model reporting 16 still gets 8), and an absent or unusable one leaves the
 // cap itself.

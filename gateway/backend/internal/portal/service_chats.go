@@ -65,12 +65,10 @@ const (
 	chatKindImage = "image"
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
-	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB.
-	// Exported because the portal composer has to state the remaining capacity
-	// of an image thread BEFORE the user commits to a multi-minute generation,
-	// and it is served to the client on ChatListResponse rather than
-	// duplicated there -- a second copy in the frontend would drift from this
-	// one with nothing to catch it.
+	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB. It
+	// bounds the chat's TEXT document: images no longer count, they live in
+	// chat_blobs (extracted before this check). Exported so it can be served on
+	// ChatListResponse, informationally, rather than duplicated by a client.
 	MaxChatContentBytes = 4 << 20
 	// MaxChatRequestBytes caps a chat request BODY -- create, save and run
 	// start -- at the content cap plus room for the JSON envelope around it
@@ -110,15 +108,16 @@ type ChatDTO struct {
 }
 
 // ChatListResponse wraps the summary list under a data key (mirrors the other
-// portal list endpoints) plus the limits a client needs to stay inside it.
+// portal list endpoints) plus the text-document limit.
 //
-// MaxContentBytes is MaxChatContentBytes: the client cannot otherwise know it
-// (no other DTO carries it), and a client that hardcoded its own copy would
-// drift from this one silently -- the failure mode being a composer that
-// confidently states the wrong remaining capacity. It is NOT omitempty: a
-// missing field and a zero are the same thing on the wire, and the portal
-// reads zero as "capacity unknown" (no capacity line, no refusal), so an
-// accidental zero would disable the feature rather than break loudly.
+// MaxContentBytes is MaxChatContentBytes, the cap on the chat's TEXT document.
+// It is informational: it used to feed the composer's remaining-image-capacity
+// line, which is gone now that images live in chat_blobs rather than inside the
+// document, and the portal frontend no longer consumes it. It is still served
+// so a client that wants to show the text cap need not hardcode a copy that
+// would drift from this one silently. It is NOT omitempty: a missing field and a
+// zero are the same thing on the wire, so an accidental zero would otherwise be
+// indistinguishable from "not sent".
 type ChatListResponse struct {
 	Data            []ChatSummaryDTO `json:"data"`
 	MaxContentBytes int              `json:"max_content_bytes"`

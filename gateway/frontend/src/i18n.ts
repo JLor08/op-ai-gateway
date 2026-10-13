@@ -213,10 +213,9 @@ const de = {
   chatImageModelUnsupported: 'Dieses Modell kann keine Bilder als Eingabe verarbeiten.',
   chatImageGeneratorNoInput:
     'Dieses Modell erzeugt Bilder und nimmt selbst keine Bilder als Eingabe entgegen.',
-  // The composer of an image thread: the prompt field's label, the hint under
-  // it, and the remaining-capacity line. The capacity is the one number in
-  // this feature that is exact and known BEFORE the user commits to a
-  // multi-minute generation, so it is stated up front rather than after.
+  // The composer of an image thread: the prompt field's label and the hint under
+  // it. (A remaining-capacity line used to follow; images now live outside the
+  // chat document, so there is no shared budget to state.)
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
   // The image-thread settings panel: the generation knobs shown in place of the

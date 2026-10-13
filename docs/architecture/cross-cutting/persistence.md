@@ -81,8 +81,8 @@ type dialect interface {
 
 - `rebind` rewrites the store's native `?`-style placeholders to Postgres's
   `$1, $2, …` form; SQLite accepts `?` natively and rebinds to a no-op.
-- `blobType()` / `timestampType()` parameterize the two BLOB columns
-  (`captures.blob`, `chats.blob`) and every timestamp column across the
+- `blobType()` / `timestampType()` parameterize the three BLOB columns
+  (`captures.blob`, `chats.blob`, `chat_blobs.blob`) and every timestamp column across the
   schema so the same `CREATE TABLE` text produces `blob`/`timestamp` on
   SQLite and `bytea`/`timestamptz` on Postgres.
 - `isUniqueViolation` / `isForeignKeyViolation` classify a driver error into
@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 86 migrations in order, same as
+- **Only-pending.** A fresh install runs all 87 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -309,7 +309,11 @@ is set — CI/dev without a Postgres instance simply skips them rather than
 failing. Coverage spans user/session/token CRUD and FK cascades, the full
 server/application/model-mapping graph, NetBird columns, energy config,
 telemetry/availability samples, benchmarks, usage record/query/stats/groups,
-captures/chats, system settings and UI preferences — plus two dedicated
+captures/chats (including `chat_blobs`: the same behaviour on the memory,
+SQLite and PostgreSQL drivers for put/get, the owner lookup, the batched
+chat-scoped read, the atomic chat-plus-blobs write, and the cascade or
+eviction that drops a chat's payloads with it), system settings and UI
+preferences — plus two dedicated
 regression tests, `TestMigration4UpgradesInt4ToBigint` and
 `TestMigration43WidensRealToDoublePrecision`, that specifically assert the
 narrow-type rule above survives an *upgrade* path (not just a fresh

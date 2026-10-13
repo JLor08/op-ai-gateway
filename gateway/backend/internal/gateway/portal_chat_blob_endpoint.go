@@ -40,8 +40,8 @@ const chatBlobRoutePrefix = "/api/portal/chat-blobs/"
 // passive one (requireWebScopeNoTouch): the same validation, without the
 // per-request TouchSession write that would stampede the connection pool.
 //
-// Doc parity (docs task): reference/api-surface.md and openapi.yaml gain this
-// route; cross-cutting/security-auth-rbac.md gains the ownership + hardening.
+// Documented in reference/api-surface.md, reference/openapi.yaml and
+// cross-cutting/security-auth-rbac.md (§13.1); the decision is ADR-056.
 func (s *Server) handlePortalChatBlob(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return

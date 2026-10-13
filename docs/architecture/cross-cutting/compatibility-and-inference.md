@@ -1283,6 +1283,15 @@ size limit. The chat documents are bounded, not uncapped: the gateway reads
 them at the chat request cap and the service enforces the content cap —
 unrelated to the inference size policy documented here.
 
+A stored chat image is **not** part of that document: it lives in `chat_blobs`
+and the document carries only its URL ([§12](#12-in-portal-chat-playground),
+"Images live outside the transcript"). Two further bounds apply to images in
+place of the old shared 4 MiB budget — `OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`
+(default 20 MiB, one decoded payload) and `OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES`
+(default 32 MiB decoded, the stored-image bytes one run's upstream request
+carries). A single uploaded image still rides inline in the run-start body, so
+the 5 MiB request cap above still bounds one upload.
+
 ## 11. Multimodal images
 
 **This section is about images as INPUT.** Image *generation* — a model that
@@ -1322,6 +1331,13 @@ the first HEIC upload and stays out of the eagerly loaded portal bundle. Every a
 downscaled (longest edge ≤ 1568px, canvas re-encode) to keep a chat transcript
 under the browser's `localStorage` quota; a 20 MB cap applies to the original
 file before conversion.
+
+**Where an attached image goes once sent.** In the in-portal chat the image is
+stored outside the transcript (`chat_blobs`, [§12](#12-in-portal-chat-playground))
+and the transcript keeps a gateway URL, but the **upstream request is
+unchanged**: `PrepareChatRun` resolves every stored reference back to a
+`data:<mime>;base64,...` part before the history reaches this section's
+adapters, so every wire shape above is what a provider still receives.
 
 ## 12. In-portal chat playground
 
@@ -1411,9 +1427,10 @@ is *unknown*, not "none", so the composer never ends up with an empty dropdown
   `size_limits` (each bound optional; an unstated bound constrains nothing); the
   empty "model default" entry always stays.
 - **The image count** is bounded by `min(8, max_batch_count)`. `IMAGE_N_MAX = 8`
-  is the portal's **hard** cap — a gateway image-storage limit, since a generated
-  image is kept in the chat transcript, not a model limit — so a model's reported
-  batch ceiling may only *narrow* it (a model reporting 16 still gets 8; an
+  is the portal's **hard** per-request cap — a portal-side limit, not a model
+  limit (it dates from when every generated image counted against the
+  transcript's 4 MiB cap; the images now live in `chat_blobs` and the cap was
+  left as it was) — so a model's reported batch ceiling may only *narrow* it (a model reporting 16 still gets 8; an
   absent or unusable report leaves 8).
 - **The model's defaults are shown as hints and never pre-filled** — placeholder
   text in the free-text/numeric fields, helper text beside the dropdowns.
@@ -1573,6 +1590,20 @@ that condition is load-bearing — a DELETE landing after the stream ended but
 before the commit ran would otherwise let a **successful** run keep reporting
 success with nothing stored.
 
+**What `portal.chat_too_large` means changed with the image store
+([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)).** The paragraph above
+is written from the time an inline image routinely approached
+`portal.MaxChatContentBytes`. An image no longer counts against it: it is moved
+into `chat_blobs` *before* the cap is checked, so the code now means a too-large
+**text** document, and a thread of many images does not reach it. A *generated*
+image the store refuses at the commit (one decoded payload over
+`MaxChatBlobBytes`, or a media type outside the allow-list) is not one of the
+verbatim codes — it degrades to `gateway.chat_run_commit_failed` like any other
+store failure — whereas the same refusals on a run-start `POST` are answered by
+their own `400` codes (`images.blob_type_unsupported`, `images.blob_too_large`,
+`images.blob_not_owned`, and `portal.chat_run_history_too_large`; see "Images
+live outside the transcript" below).
+
 **A non-200 on the loopback hop surfaces the upstream error code.** The
 executor turned any non-200 into `"upstream status " + resp.Status` without
 reading the body at all, discarding every code either endpoint was built to
@@ -1625,20 +1656,70 @@ image already has (§11), so history construction feeds a generated image back
 as a vision input on the next turn with no extra code, and the transcript
 renderer already understood it.
 
+**Images live outside the transcript ([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)).**
+The `data:` parts above exist only until the commit: both an uploaded and a
+generated image are moved into the owner-scoped `chat_blobs` store
+(`extractChatBlobs`), and the part that is sealed into the chat document carries
+`/api/portal/chat-blobs/{id}` instead, so the document stays small and the
+4 MiB cap bounds the text only. The extraction runs at exactly the **two run
+commits** — `PrepareChatRun` (an upload, an `edited_history` image, an old
+inline image not yet migrated) and `writeAssistant` (a generated image) — never
+on `POST /api/portal/chats` (the chat row a blob's foreign key points at does
+not exist yet) and never on the bare autosave `PUT` (it carries only what a run
+already stored). It happens **before** the cap check, so an old, nearly full
+inline thread can take its next turn, and the rewritten document and its new
+blobs are written in one store transaction (`SaveChatWithBlobs`), so a refused
+turn leaves nothing behind. It accepts only a standard-padded base64 `data:`
+URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif`, within
+`MaxChatBlobBytes` (else `400 images.blob_type_unsupported` /
+`images.blob_too_large`); a `/chat-blobs/` URL arriving in request-supplied
+content must reference a blob **this chat holds** (`400 images.blob_not_owned`),
+verified only from the first message the request supplied (`verifyFrom`), so the
+images the chat itself stored are not re-verified on every turn and checkpoint.
+Old chats keep their inline `data:` parts, which still render and still run, and
+migrate on their next run. Serving and ownership are
+[Security, Authentication & Authorization
+§13.1](security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url).
+
+**A run's upstream history carries the bytes, never the URLs.** An upstream
+cannot reach a gateway URL, and an adapter drops an image it cannot read without
+an error (the Anthropic image-source conversion returns nil for a URL that is
+neither `data:` nor `http(s)`), so a reference left in the request would make
+the image silently vanish. `PrepareChatRun` therefore resolves the history it
+returns (`resolveChatBlobRefs`) for every **non-image** run: all
+`/chat-blobs/` URLs become `data:<type>;base64,...` URLs of the real bytes
+through **one** batched, **chat-scoped** `ChatBlobsByIDs` call, so a foreign id
+grafted into the transcript is simply absent and never resolves to another
+user's bytes, and a real remote provider receives real bytes exactly as before.
+A reference with no stored bytes (foreign, evicted from the RAM store, never
+stored) is replaced by a `[image unavailable]` text part: the model is told, the
+run continues, and the stored document is untouched. The bytes one run carries
+are bounded by `MaxRunHistoryBytes`, counted per occurrence; a run over it is
+refused `400 portal.chat_run_history_too_large` **before** its turn is stored
+(declared sizes are checked first, so a refusal decrypts nothing), so a retry is
+not a duplicate turn. The turn being sent keeps the bytes it was uploaded with
+and needs no round trip, and an image run skips the step (its executor reads
+only the last prompt's text, so decrypting the thread's images would be wasted
+and the bound would refuse a thread for bytes never sent).
+
 **The run's terminal event carries what was committed, and only that.** The
 SSE `snapshot`/`done` events carry a `content_parts` field alongside `content`.
 `content` is the run's streamed **text** buffer, and an image run never writes
 a byte into it, so without `content_parts` the terminal event of a perfectly
 successful image run carries **no content at all** — the browser sets the
 bubble to `""`, its own empty-tail prune (correctly, by its own rule) deletes
-the turn, and only the post-`done` refetch of the whole multi-megabyte
-document puts it back. That made a best-effort optimisation the single thing
+the turn, and only the post-`done` refetch of the whole document (multi-megabyte
+while images were inline; small now that they are not) puts it back. That made a best-effort optimisation the single thing
 standing between the user and a blank thread, and a failed refetch followed by
 the portal's ordinary debounced save then wrote the pruned transcript over the
 server's good one. The field is set **only when `CommitAssistant` succeeded**,
 so the event can never claim a turn the store refused; it rides on
 `snapshot` as well as `done`, because a late subscriber inside the eviction
 grace is served the terminal state as a snapshot and never sees a `done`.
+The parts it carries are the ones as they were **produced** — the `data:`
+URL, not the gateway URL the commit rewrote them to — so the bubble renders from
+bytes it already has, and the post-`done` canonical refetch then swaps in the
+stored form.
 
 **And the portal never PUTs a transcript it cannot vouch for.** The
 post-terminal canonical refetch marks the chat *unproven* before its request
@@ -1680,16 +1761,21 @@ previous title (and the active-title ref) on **every** failure code, not only
 leaves exactly the same lie on screen, and "which codes revert" is a
 distinction nothing downstream could act on.
 
-**`GET /api/portal/chats` carries `max_content_bytes`.** The composer has to
-state an image thread's remaining capacity *before* the user commits to a
-multi-minute generation, and `portal.MaxChatContentBytes` is a Go constant that
-no DTO previously carried. It is **served, not duplicated**: a second `4 MiB`
-literal in TypeScript would drift from the Go one with nothing to catch it, and
-the failure mode is a capacity line that confidently states the wrong number.
-It is deliberately not `omitempty` — a missing field and a zero are the same
-thing on the wire, and the portal reads zero as *capacity unknown* (no capacity
-line, no refusal), so a gateway too old to send it degrades instead of
-inventing a number.
+**`GET /api/portal/chats` still carries `max_content_bytes`, but it is
+informational.** It is `portal.MaxChatContentBytes`, the 4 MiB cap on the chat's
+**text** document, served rather than duplicated so a client never needs a second
+literal that could drift, and deliberately not `omitempty` (a missing field and a
+zero are the same thing on the wire). It used to feed the composer's
+remaining-image-capacity line and the Send refusal behind it
+([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
+(d)); with the images out of the document that estimate would have divided into
+~47-character references, so it is removed, and **no portal code consumes the
+field any more**. A text document that overflows the cap is still the server's
+`400 portal.chat_too_large`, and the bounds that now limit images
+(`MaxChatBlobBytes`, `MaxRunHistoryBytes`) are enforced server-side with their
+own codes, not estimated in the client. Saving a stored image fetches the
+serving endpoint with the session cookie and names the file from the response's
+`Content-Type` (a `data:` URL from an old chat is still decoded in place).
 
 ## 13. Errors
 
