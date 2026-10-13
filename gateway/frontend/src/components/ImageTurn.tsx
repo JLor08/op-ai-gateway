@@ -4,7 +4,7 @@
 import { useState } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
-import { downloadBinary, extensionFor } from './shared/downloadBinary';
+import { downloadBinary } from './shared/downloadBinary';
 import type { Translation } from './shared/types';
 
 // A download name is built from the TURN's own id plus the image's position
@@ -35,8 +35,9 @@ function downloadNameFor(turnId: string, index: number, extension: string): stri
 // asked me to make"), each image here renders at its own natural size,
 // capped only so it never overflows the chat bubble.
 //
-// The download handler lives here, next to the data URL it downloads, rather
-// than arriving from ChatMessage as an onDownload prop -- an inline arrow
+// The download handler lives here, next to the image url it downloads (a
+// /api/portal/chat-blobs/{id} gateway url, or a data URL in an old chat),
+// rather than arriving from ChatMessage as an onDownload prop -- an inline arrow
 // built in the parent's render would give every message a new callback
 // identity on every render and defeat ChatMessage's shallow-compare memo.
 export function ImageTurn({
@@ -55,8 +56,10 @@ export function ImageTurn({
   // transcript, or a regenerated turn whose prompt message was edited away).
   const alt = prompt || t.chatGeneratedImage;
   // Tracks which image (by index) most recently failed to download -- a
-  // truncated/corrupted persisted data URL decodes to nothing. downloadBinary
-  // never throws for this, but it also must not fail silently: the whole
+  // truncated/corrupted persisted data URL decodes to nothing, a gateway url
+  // whose fetch fails (network, 404 for a purged blob) saves nothing.
+  // downloadBinary never throws or rejects for this, but it also must not fail
+  // silently: the whole
   // point of this feature is that a failed download is visible, so an
   // inline message is shown next to that image's own button rather than a
   // global toast (which couldn't say which of several images failed, and
@@ -106,8 +109,14 @@ export function ImageTurn({
               size="small"
               aria-label={t.chatDownloadImage}
               onClick={() => {
-                const ok = downloadBinary(downloadNameFor(turnId, index, extensionFor(url)), url);
-                setFailedIndex(ok ? null : index);
+                // The name is a function of the extension because a stored
+                // image's media type is only known once its bytes have been
+                // fetched; a legacy data: URL gets its extension from its own
+                // prefix through the same call. downloadBinary never rejects.
+                void downloadBinary(
+                  (extension) => downloadNameFor(turnId, index, extension),
+                  url,
+                ).then((ok) => setFailedIndex(ok ? null : index));
               }}
               sx={{ alignSelf: 'flex-end' }}
             >
