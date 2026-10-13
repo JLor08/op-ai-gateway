@@ -268,6 +268,22 @@ var (
 // (nothing re-derives "mtp" either, which is why it needs that permanence).
 // Reserving it would break a shipped control.
 //
+// routing.CapabilityImageEdit is on NEITHER list either, and for the opposite
+// reason from "mtp"'s permanence: this is a DENY list, and the pair
+// (image_edit, no) is the operator's opt-out from the derived capability
+// (routing.ImpliedImageEdit -- image:yes and no such row). It is the whole
+// mechanism by which an operator removes edit from a model that generates
+// images, so reserving it would forbid the one row the design needs. The
+// (image, no) entry above is exactly why the opt-out is a SEPARATE image_edit
+// row instead of a "no" on image itself: that pair is reserved, and a "no" on
+// image would take generation away as well. (image_edit, yes) stays writable
+// too, though inert -- the gate derives yes from image -- since refusing it
+// would say something the gate does not. Nothing here needs a change for the
+// capability to work: the name vocabulary is open (routing.ValidateCapabilityRow,
+// normalizeCapabilityVerdicts), which TestManualImageEditNoIsAWritableOptOutAndResettable
+// pins. The agent side is the mirror image: reservedAgentCapabilityNames DOES
+// list the name, because no agent has any business writing it.
+//
 // This is the portal's own rule, not a shared one. The gateway's agent-ingest
 // boundary refuses these NAMES outright from a reported verdict
 // (reservedAgentCapabilityNames), and there a name is the right key because the
@@ -301,6 +317,7 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// sd-server child that has never run, so nothing has read its document
 	// yet, or one whose agent predates the source and so never reports it.
 	routing.CapabilityImage: {routing.CapabilityNo: true},
+	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
 // reservedManualVerdict reports whether stating verdict for capability is

@@ -1191,6 +1191,18 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 //     missing here: the gateway writes this row at most once per mapping per
 //     PROCESS LIFETIME (claimSpeculationObserved), so it never rewrites what
 //     it wrote, and an agent's false verdict stands until a restart.
+//   - "image_edit" is DERIVED at the gateway, not detected by anyone
+//     (routing.ImpliedImageEdit: an image:yes verdict and no operator
+//     image_edit:no row). The only row the name ever carries is the
+//     OPERATOR's opt-out, written from the mapping form at manual rank, so
+//     there is no legitimate agent writer for it in either direction -- which
+//     is the opposite of "image", the name this list deliberately leaves OFF
+//     because the sd-server capability probe really does write it (ADR-042).
+//     The harm is the "no": an agent's rank-1 image_edit:no on a mapping that
+//     generates images silently disables edit for it, and when the operator
+//     resets the opt-out (deleting the row is how "unknown" is stored) the
+//     next sample writes it back. A "yes" is inert to the gate but would
+//     still show the operator an unvetted row as an attested capability.
 //
 // Write-once-at-rank-1 is what "mtp" and "speculation_observed" above SHARE,
 // not what tells them apart -- do not restore an older wording claiming it
@@ -1220,10 +1232,11 @@ func (s *Server) writeBackOneRuntimeCapabilities(ctx context.Context, serverID s
 // protects only against a publisher string reaching an HONEST agent's Extra
 // list. A buggy or hostile agent puts the name straight into the verdicts it
 // sends, where no agent-side filter is in the path at all. This boundary is.
-// It carries no entry for the third name and needs none, for the same reason
-// stated from the other side: "speculation_observed" appears in neither
-// document either agent detector reads, so an honest agent has no path to
-// it, and a dishonest one was never going to consult a filter.
+// It carries no entry for the last two names and needs none, for the same
+// reason stated from the other side: "speculation_observed" and "image_edit"
+// appear in neither document either agent detector reads, so an honest agent
+// has no path to them, and a dishonest one was never going to consult a
+// filter.
 //
 // The day a real MTP detector exists it reports through a field this
 // codebase defined, the way live-progress support does, or this list changes
@@ -1233,6 +1246,7 @@ var reservedAgentCapabilityNames = map[string]bool{
 	routing.CapabilityMTP:                 true,
 	routing.CapabilityLiveProgress:        true,
 	routing.CapabilitySpeculationObserved: true,
+	routing.CapabilityImageEdit:           true,
 }
 
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined

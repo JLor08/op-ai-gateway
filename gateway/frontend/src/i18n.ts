@@ -613,6 +613,13 @@ const de = {
   mappingImageCapable: 'Bilderzeugung',
   mappingImageCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Automatisch erkannt wird das in drei Fällen: bei einer stable-diffusion.cpp-Anwendung, die das Gateway direkt erreicht (mit dem nächsten Health-Check, rund 30 s), bei einem stable-diffusion.cpp-Modell, das der Server-Agent startet (Agent 0.7.4 oder neuer), sobald es einmal gelaufen ist, und bei einem Ollama-Modell, das der Server-Agent startet, sobald Ollama für dieses Modell die Fähigkeit „image“ meldet (dann nur als Ja). Eine Startkonfiguration, die noch nie gelaufen ist, hat noch kein Ergebnis, und eine Bildanfrage startet sie nicht: dort „Angeheftet (nie beenden)“ ankreuzen, sie einmal starten oder dies auf Ja setzen. Überall sonst setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
+  // Bildbearbeitung ist KEIN erkanntes Merkmal, sondern vom Gateway aus der
+  // Bilderzeugung abgeleitet (Bilderzeugung = Ja und kein „Nein“ hier). Darum
+  // gibt es nur zwei Auswahlen: Unbekannt (= abgeleitet) und Nein (die
+  // Ausnahme des Betreibers); ein „Ja“ würde nichts ändern.
+  mappingImageEdit: 'Bildbearbeitung',
+  mappingImageEditUnknownHint:
+    'Unbekannt = aus der Bilderzeugung abgeleitet: Ein Modell, das Bilder erzeugt, nimmt auch Bildbearbeitungen an (/v1/images/edits). Setze „Nein“ für eine Zuordnung, die keine Bildbearbeitung bedienen soll, zum Beispiel einen Upstream ohne /v1/images/edits. Die Bilderzeugung bleibt davon unberührt. Ein „Ja“ gibt es nicht, weil das Gateway es bereits ableitet.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1290,6 +1297,15 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
+  // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
+  // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
+  // capabilityChips in ModelServersSection.tsx.
+  capabilityImageEditOptOut: 'Bildbearbeitung gesperrt',
+  // Ergänzt modelServerCapabilitiesTooltip unten NUR für diesen Chip
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx).
+  capabilityImageEditOptOutTooltip:
+    'Ein Betreiber hat diese Zuordnung von der Bildbearbeitung ausgenommen. Die Bilderzeugung ist davon nicht berührt: Sie folgt ihrem eigenen Chip. Die Ausnahme lässt sich im Zuordnungsformular unter „Bildbearbeitung“ auf Unbekannt zurücksetzen.',
   // "Beobachtet", nicht "Unterstützt": Diese Zeile entsteht ausschließlich
   // aus echtem Traffic (llama.cpp hat mindestens einmal gedraftete Tokens
   // gemeldet), niemals aus einer Fähigkeits-Erklärung von Build oder
@@ -3402,6 +3418,13 @@ const en: PortalMessages = {
   mappingImageCapable: 'Image generation',
   mappingImageCapableUnknownHint:
     'Unknown: whether this mapping generates images is not on file. It is detected automatically in three cases: for a stable-diffusion.cpp application the gateway reaches directly (on the next health tick, about 30 s), for a stable-diffusion.cpp model the server agent launches (agent 0.7.4 or newer), once it has run, and for an Ollama model the server agent launches, once Ollama declares its "image" capability for that model (then only ever as Yes). A launch spec that has never run has no verdict yet, and an image request does not start it: tick "Pinned (never stop)" on it, start it once, or set this to Yes. Anywhere else, set it to Yes to enable image generation for this model.',
+  // Image editing is NOT a detected trait: the gateway derives it from image
+  // generation (image generation is Yes and this control is not No). So there
+  // are only two choices -- Unknown (= derived) and No (the operator's
+  // exception); a Yes would change nothing.
+  mappingImageEdit: 'Image editing',
+  mappingImageEditUnknownHint:
+    'Unknown = derived from image generation: a model that generates images also accepts image edits (/v1/images/edits). Set it to No for a mapping that should not serve image edits, for example an upstream without /v1/images/edits. Image generation is unaffected. There is no Yes, because the gateway already derives it.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -4022,6 +4045,15 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  // The chip for the operator's EXCEPTION (image editing = No), not for a
+  // capability: image editing is derived from image generation, so it has
+  // something to show in this one direction only. See capabilityChips in
+  // ModelServersSection.tsx.
+  capabilityImageEditOptOut: 'Image editing disabled',
+  // Appended to modelServerCapabilitiesTooltip below for this one chip only
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx).
+  capabilityImageEditOptOutTooltip:
+    'An operator excluded this mapping from image editing. Image generation is not affected: it follows its own chip. The exception can be reset to Unknown under "Image editing" in the mapping form.',
   // "Observed", not "supported": this row exists only because real traffic
   // produced it (llama.cpp reported at least one completion with drafted
   // tokens), never because a build or a model declared the trait -- see the

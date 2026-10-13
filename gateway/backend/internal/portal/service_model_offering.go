@@ -66,15 +66,17 @@ import (
 //
 // Capable is Callable narrowed to the names that carry EVERY capability the
 // request requires, and it answers only the redirect's CANDIDATE question. A
-// request that requires a capability (today only /v1/images/generations, which
-// requires "image") is refused by the capability gate for a model without it,
+// request that requires a capability (today /v1/images/generations, which
+// requires "image", and /v1/images/edits, which requires the derived
+// "image_edit") is refused by the capability gate for a model without it,
 // so a LastUsedModel or fallback outside Capable would turn a legible "unknown
 // model" into a 404 model_not_capable about a model the client never named.
 // The flavor cannot answer this: Callable for openai_images holds every name
 // the images relay would admit, verdict or not. Capable is judged by the
-// listing's own image fold (imageFlagsByName, groupCapabilityFlags), the rule
-// behind ModelDTO.Image, so a name is a candidate exactly when the portal
-// lists it as generating images. With no required capability Capable is
+// listing's own image folds (imageFlagsByName, imageEditFlagsByName,
+// groupCapabilityFlags), the rules behind ModelDTO.Image and ModelDTO.ImageEdit,
+// so a name is a candidate exactly when the portal lists it as generating
+// images (or as editable, for an edit). With no required capability Capable is
 // Callable itself. A required capability that has no fold makes Capable empty:
 // nothing is known to carry it, so nothing is a candidate. The requested-name
 // question never asks Capable: a callable name without the capability is the
@@ -274,19 +276,28 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // capableNames narrows callable to the names that carry every capability in
 // required (ModelOffering.Capable). It folds over the same token-filtered views
 // the listing folds over for this token (Models() reads visibleMappingViews),
-// with the listing's own rules: imageFlagsByName for a model name, and
-// groupCapabilityFlags over the group overlay for a group name. idx is the
-// caller's runtime-spec index and must cover views; capableNames makes no spec
-// read of its own. "image" is the only capability a request requires today
-// and the only one with a fold here; any other makes the result empty
-// (fail-closed). An error is a failed capability read, which the caller turns
-// into the all-or-nothing empty offering.
+// with the listing's own rules: for a model name, the listing's own fold for
+// that capability (imageFlagsByName for "image", imageEditFlagsByName for
+// "image_edit"), and groupCapabilityFlags over the group overlay for a group
+// name -- so Capable and the listing's ModelDTO flags are one rule, not two.
+// idx is the caller's runtime-spec index and must cover views; capableNames
+// makes no spec read of its own.
+//
+// "image" and "image_edit" are the capabilities a request requires today and
+// the only ones with a fold here; any other makes the result empty
+// (fail-closed), alone or beside one that has a fold. "image_edit" is DERIVED
+// (routing.ImpliedImageEdit), which is why it is handled here at all: with no
+// fold for it, an edit request for an unknown model found Capable empty and
+// the preflight redirect, which needs a capable candidate, was dead for edits
+// -- a bare 404 instead of the redirect. A request requiring more than one
+// folded capability gets the intersection. An error is a failed capability
+// read, which the caller turns into the all-or-nothing empty offering.
 func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
 	if len(required) == 0 {
 		return callable, nil
 	}
 	for _, capability := range required {
-		if capability != routing.CapabilityImage {
+		if capability != routing.CapabilityImage && capability != routing.CapabilityImageEdit {
 			return map[string]struct{}{}, nil
 		}
 	}
@@ -298,16 +309,32 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 	if err != nil {
 		return nil, err
 	}
-	flags := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
 	// The group fold reads only the overlay's members, which no flavor rule
 	// changes; the served rule is the one the listing's Image fold uses.
 	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views, idx, routing.MappingServesAPIFlavor))
-	for name, flag := range groupCapabilityFlags(entries, flags) {
-		flags[name] = flag
+	folds := make([]map[string]bool, len(required))
+	for i, capability := range required {
+		var flags map[string]bool
+		if capability == routing.CapabilityImageEdit {
+			flags = imageEditFlagsByName(views, capsByMapping, idx)
+		} else {
+			flags = imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+		}
+		for name, flag := range groupCapabilityFlags(entries, flags) {
+			flags[name] = flag
+		}
+		folds[i] = flags
 	}
 	out := make(map[string]struct{})
 	for name := range callable {
-		if flags[name] {
+		capable := true
+		for _, flags := range folds {
+			if !flags[name] {
+				capable = false
+				break
+			}
+		}
+		if capable {
 			out[name] = struct{}{}
 		}
 	}

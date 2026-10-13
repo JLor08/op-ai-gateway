@@ -1048,6 +1048,85 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText(t.capabilityImage)).not.toBeInTheDocument();
     });
 
+    // image_edit is DERIVED by the gateway from the image verdict, so the only
+    // row it ever carries that matters is the operator's opt-out (`no`). That
+    // opt-out is a NEGATIVE, which this column otherwise renders as no chip --
+    // but here its absence would hide the one decision an operator needs to see
+    // (why an image model offers no edit), so the opt-out gets a translated chip
+    // of its own. It is neutral (`standby`), not the `active` of a determined
+    // capability: it states that something is switched OFF.
+    it('renders an image_edit opt-out as a translated chip beside the image chip, never as a raw name', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [capRow('image', 'yes'), capRow('image_edit', 'no', 'manual')],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityImage)).toHaveAttribute('data-status', 'active');
+      const optOut = within(cell).getByText(t.capabilityImageEditOptOut);
+      expect(optOut).toHaveAttribute('data-status', 'standby');
+      expect(within(cell).queryByText('image_edit')).not.toBeInTheDocument();
+      // Generation first, then the opt-out: the opt-out qualifies the image
+      // chip next to it.
+      const labels = within(cell)
+        .getAllByText((_, el) => el?.hasAttribute('data-status') === true)
+        .map((el) => el.textContent);
+      expect(labels).toEqual([t.capabilityImage, t.capabilityImageEditOptOut]);
+
+      // Its own tooltip says what it does and does NOT do, with its provenance.
+      fireEvent.mouseOver(optOut);
+      const tooltip = await screen.findByRole('tooltip');
+      expect(tooltip).toHaveTextContent(t.capabilityImageEditOptOutTooltip);
+      expect(tooltip).toHaveTextContent(t.modelServerCapabilitiesSource('manual'));
+    });
+
+    // A stored `image_edit: yes` is inert -- the gate derives yes from image --
+    // so there is nothing to show, and it must not fall into the verbatim
+    // open-vocabulary bucket and read as an unvetted raw "image_edit" chip.
+    it('renders no chip for an inert image_edit yes, and not the raw name either', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, capabilities: [capRow('image', 'yes'), capRow('image_edit', 'yes')] }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText('image_edit')).not.toBeInTheDocument();
+      expect(within(cell).queryByText(t.capabilityImageEditOptOut)).not.toBeInTheDocument();
+      const labels = within(cell)
+        .getAllByText((_, el) => el?.hasAttribute('data-status') === true)
+        .map((el) => el.textContent);
+      expect(labels).toEqual([t.capabilityImage]);
+    });
+
+    it('renders no opt-out chip when the image_edit row is absent', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('image', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText(t.capabilityImageEditOptOut)).not.toBeInTheDocument();
+    });
+
     // "mtp"/"live_progress" are rows in this SAME capabilities array now (they
     // share the model_mapping_capabilities table with vision/video/audio/
     // tools), but this table already has its OWN dedicated "MTP"/
