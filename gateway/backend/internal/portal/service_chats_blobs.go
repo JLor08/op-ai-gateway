@@ -9,6 +9,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/store"
 	"slices"
@@ -322,6 +324,88 @@ func (s *Service) sealChatBlob(raw []byte) (int, []byte) {
 		return capture.KeyVersion, s.cipher.Seal(raw)
 	}
 	return 0, raw
+}
+
+// ChatBlobBytes returns the bytes and media type of the stored chat image id for
+// owner, or ErrChatBlobNotFound.
+//
+// This is the ONE place the serving endpoint's authorization is decided, and it
+// is decided on the blob, not on any transcript that mentions it: the owner of
+// a blob is the owner of the chat the blob BELONGS to (chat_blobs.chat_id ->
+// chats.user_id). A transcript can carry a url to anyone's blob -- create and a
+// bare autosave store the urls they are given and are not validated, by design;
+// the check is here, at read -- so a chat that merely references an id grants
+// nothing, and the caller's own chat is not consulted at all.
+//
+// The order is deliberate: the owner is resolved from the cheap lookups first
+// (ChatBlobOwner, then ChatByID), and the payload is loaded only for the
+// verified owner, so another user's request neither reads nor decrypts their
+// bytes. Every way of not being the owner -- no such blob, a foreign chat, a
+// chat that is gone, a blob evicted between the lookups, a store that disagrees
+// with itself about which chat a blob belongs to -- is the same
+// ErrChatBlobNotFound; a store or cipher failure is returned as the failure it
+// is (never as not-found, which would turn a broken key into an empty image).
+//
+// The media type is checked against the allow-list again here, exactly (the
+// store keeps the canonical lower-case spelling, so a row that differs is not
+// something this code wrote), rather than trusted because the store-time check
+// should have kept anything else out: an unlisted type (text/html,
+// image/svg+xml, a type with parameters, ...) is never served, whatever the row
+// says, and the type returned is therefore always one of the allow-listed
+// strings.
+//
+// The returned slice may alias the store's own memory on the plain (RAM) path;
+// the caller must write it, not modify it.
+func (s *Service) ChatBlobBytes(ctx context.Context, owner auth.Token, id string) ([]byte, string, error) {
+	chatID, err := s.chats.ChatBlobOwner(ctx, id)
+	if err != nil {
+		return nil, "", notFoundAsBlob(err)
+	}
+	chat, err := s.chats.ChatByID(ctx, chatID)
+	if err != nil {
+		return nil, "", notFoundAsBlob(err)
+	}
+	if chat.UserID != owner.UserID {
+		return nil, "", ErrChatBlobNotFound
+	}
+	row, err := s.chats.ChatBlobByID(ctx, id)
+	if err != nil {
+		return nil, "", notFoundAsBlob(err)
+	}
+	if row.ChatID != chat.ID {
+		return nil, "", ErrChatBlobNotFound
+	}
+	if _, listed := chatBlobMediaTypes[row.ContentType]; !listed {
+		log.Printf("portal: chat blob %s has a content type that is not servable; refusing to serve it", id)
+		return nil, "", ErrChatBlobNotFound
+	}
+	plain, err := s.openChatBlob(row)
+	if err != nil {
+		return nil, "", err
+	}
+	return plain, row.ContentType, nil
+}
+
+// notFoundAsBlob turns the store's not-found into the blob sentinel and leaves
+// every other error alone.
+func notFoundAsBlob(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrChatBlobNotFound
+	}
+	return err
+}
+
+// openChatBlob reverses sealChatBlob: KeyVersion > 0 was sealed with the
+// capture cipher (nonce||AEAD) and needs it; KeyVersion 0 is the plain RAM
+// fallback.
+func (s *Service) openChatBlob(row store.ChatBlob) ([]byte, error) {
+	if row.KeyVersion == 0 {
+		return row.Blob, nil
+	}
+	if s.cipher == nil {
+		return nil, ErrChatCipherMissing
+	}
+	return s.cipher.Open(row.Blob)
 }
 
 // jsonField is one member of a JSON object, its value as raw JSON.

@@ -196,6 +196,27 @@ func (s *Service) Login(ctx context.Context, email string, password string) (sto
 // ResolveSessionDetail validates a session secret and returns the active user
 // AND the session record (needed for the session's ElevatedUntil).
 func (s *Service) ResolveSessionDetail(ctx context.Context, secret string) (store.User, store.Session, error) {
+	return s.resolveSession(ctx, secret, true)
+}
+
+// ResolveSessionDetailNoTouch is ResolveSessionDetail without the TouchSession
+// write: the same validation (known secret, absolute and idle expiry, active
+// user), but the session's last-seen time is left as it was.
+//
+// It exists for reads that a browser fans out by the dozen from one page -- the
+// <img> GETs of a chat that holds many images -- where one write per request
+// would stampede the store's connection pool for no benefit. Skipping the touch
+// is correct there because the page that issued them (the chat load) already
+// refreshed the session, and a passive fetch must not be able to keep a session
+// alive by itself: it extends nothing. Everything interactive keeps using
+// ResolveSessionDetail.
+func (s *Service) ResolveSessionDetailNoTouch(ctx context.Context, secret string) (store.User, store.Session, error) {
+	return s.resolveSession(ctx, secret, false)
+}
+
+// resolveSession is the shared body of ResolveSessionDetail (touch=true) and
+// ResolveSessionDetailNoTouch (touch=false).
+func (s *Service) resolveSession(ctx context.Context, secret string, touch bool) (store.User, store.Session, error) {
 	if secret == "" {
 		return store.User{}, store.Session{}, ErrSessionInvalid
 	}
@@ -213,8 +234,10 @@ func (s *Service) ResolveSessionDetail(ctx context.Context, secret string) (stor
 		_ = s.sessions.DeleteSession(ctx, session.ID)
 		return store.User{}, store.Session{}, ErrSessionInvalid
 	}
-	if err := s.sessions.TouchSession(ctx, session.ID, now); err != nil {
-		return store.User{}, store.Session{}, ErrSessionInvalid
+	if touch {
+		if err := s.sessions.TouchSession(ctx, session.ID, now); err != nil {
+			return store.User{}, store.Session{}, ErrSessionInvalid
+		}
 	}
 	return user, session, nil
 }

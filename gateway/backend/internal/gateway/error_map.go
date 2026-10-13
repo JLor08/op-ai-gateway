@@ -50,6 +50,12 @@ var sharedErrorMap = []errRow{
 	{err: portal.ErrChatBlobTypeUnsupported, status: http.StatusBadRequest, code: "images.blob_type_unsupported", msg: "image must be a base64 data URL of type png, jpeg, webp or gif"},
 	{err: portal.ErrChatBlobTooLarge, status: http.StatusBadRequest, code: "images.blob_too_large", msg: "image is too large"},
 	{err: portal.ErrChatBlobNotOwned, status: http.StatusBadRequest, code: "images.blob_not_owned", msg: "image reference does not belong to this chat"},
+	// The serving endpoint's not-found (GET /api/portal/chat-blobs/{id}): no
+	// such blob, someone else's, its chat gone, or a type that is not servable --
+	// one answer for all of them (no existence leak). A code of its own, not
+	// portal.chat_not_found, so a client can tell a missing image from a missing
+	// chat.
+	{err: portal.ErrChatBlobNotFound, status: http.StatusNotFound, code: "portal.chat_blob_not_found", msg: "image not found"},
 	// ErrRunAlreadyActive: writePortalRunError (run start) and
 	// writePortalChatError (PUT /chats/{id}, task 9) both refuse an
 	// already-active run identically -- 409 portal.chat_run_active -- so this

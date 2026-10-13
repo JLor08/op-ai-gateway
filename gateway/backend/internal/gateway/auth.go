@@ -131,8 +131,17 @@ func (s *Server) loopbackPrincipal(r *http.Request) (auth.Token, bool) {
 // loopback header (before cookie/bearer): only the gateway calling its own
 // endpoints sets it, guarded by a per-process secret. Otherwise it resolves the
 // principal from the session cookie when present, else from a bearer token.
-// Cookie auth on state-changing methods requires the CSRF header.
+// Cookie auth on state-changing methods requires the CSRF header. A cookie
+// session is refreshed (TouchSession) on every resolve, which keeps its idle
+// window sliding.
 func (s *Server) authenticateWeb(w http.ResponseWriter, r *http.Request) (auth.Token, bool) {
+	return s.authenticateWebSession(w, r, true)
+}
+
+// authenticateWebSession is the body of authenticateWeb (touch=true) and of the
+// no-touch variant behind requireWebScopeNoTouch (touch=false): touch says
+// whether a cookie session is refreshed.
+func (s *Server) authenticateWebSession(w http.ResponseWriter, r *http.Request, touch bool) (auth.Token, bool) {
 	// Internal trusted-loopback principal injection: only the gateway calling
 	// its own endpoints sets these headers, guarded by a per-process secret.
 	// Returns a bare session principal (ID==""), exactly as the browser cookie
@@ -145,7 +154,11 @@ func (s *Server) authenticateWeb(w http.ResponseWriter, r *http.Request) (auth.T
 	}
 	if s.Account != nil {
 		if cookie, err := r.Cookie(sessionCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
-			user, session, err := s.Account.ResolveSessionDetail(r.Context(), cookie.Value)
+			resolve := s.Account.ResolveSessionDetail
+			if !touch {
+				resolve = s.Account.ResolveSessionDetailNoTouch
+			}
+			user, session, err := resolve(r.Context(), cookie.Value)
 			if err != nil {
 				s.clearSessionCookie(w)
 				writeJSON(w, http.StatusUnauthorized, apierror.Response(codeAuthSessionInvalid, msgAuthSessionInvalid, ""))
@@ -162,7 +175,22 @@ func (s *Server) authenticateWeb(w http.ResponseWriter, r *http.Request) (auth.T
 }
 
 func (s *Server) requireWebScope(w http.ResponseWriter, r *http.Request, scope string) (auth.Token, bool) {
-	token, ok := s.authenticateWeb(w, r)
+	return s.requireWebScopeSession(w, r, scope, true)
+}
+
+// requireWebScopeNoTouch is requireWebScope without refreshing a cookie
+// session: the same validation, principal, service-token and scope checks, but
+// no TouchSession write, so N parallel requests cost N reads and no write. Only
+// a read a browser fans out in bulk (the chat-image <img> GETs) may use it --
+// see account.Service.ResolveSessionDetailNoTouch for why that is sound.
+func (s *Server) requireWebScopeNoTouch(w http.ResponseWriter, r *http.Request, scope string) (auth.Token, bool) {
+	return s.requireWebScopeSession(w, r, scope, false)
+}
+
+// requireWebScopeSession is the body of requireWebScope and
+// requireWebScopeNoTouch; touch says whether a cookie session is refreshed.
+func (s *Server) requireWebScopeSession(w http.ResponseWriter, r *http.Request, scope string, touch bool) (auth.Token, bool) {
+	token, ok := s.authenticateWebSession(w, r, touch)
 	if !ok {
 		return auth.Token{}, false
 	}

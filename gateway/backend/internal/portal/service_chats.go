@@ -46,6 +46,14 @@ var (
 	// another user's, another chat's, or none at all, indistinguishably. Mapped
 	// to 400.
 	ErrChatBlobNotOwned = errors.New("images.blob_not_owned")
+	// ErrChatBlobNotFound is returned when a stored chat image cannot be served
+	// to the caller: there is no such blob, it was evicted or its chat deleted,
+	// it belongs to another user's chat, or its stored type is not a servable
+	// image type -- all indistinguishably (owner-scoped, no existence leak).
+	// Deliberately its own sentinel rather than ErrChatNotFound or
+	// store.ErrNotFound: the serving endpoint answers with a blob-specific code.
+	// Mapped to 404.
+	ErrChatBlobNotFound = errors.New("portal.chat_blob_not_found")
 )
 
 const (
