@@ -18,9 +18,11 @@ to `/sdapi/v1/img2img`). The capability is **derived** (auto-on wherever
 
 > This spec was verified against the code by six adversarial readers; the
 > mechanism details below reflect their corrections (notably: the two
-> reserved-capability lists, the agent model-name rewrite, the refine budget, the
-> single-sourced derivation, and the `capableNames` redirect). Exact line anchors
-> are approximate and will be pinned in the implementation plan.
+> reserved-capability lists, the agent model-name rewrite, the
+> single-sourced derivation, and the `capableNames` redirect). **It was then
+> rebased after #124 (the `chat_blobs` store, PR #217) shipped — Part 6's
+> refine-budget and capacity workarounds are now obsolete (see Part 6).** Exact
+> line anchors are approximate and will be pinned in the implementation plan.
 
 ## Grounding (verified facts that shape the design)
 
@@ -37,10 +39,12 @@ to `/sdapi/v1/img2img`). The capability is **derived** (auto-on wherever
 3. **The portal needs no multipart on the browser hop.** The chat already sends
    attachments as data-URL `image_url` parts over JSON to
    `POST /api/portal/chats/{id}/runs`; the **server executor**
-   (`chat_runs_images.go`) makes the inference call. The source rides as a
-   data-URL part; the multipart body is built **server-side** for the loopback
-   call. Multipart exists only on the gateway→sd-server hop and the public
-   bearer endpoint.
+   (`chat_runs_images.go`) makes the inference call. The browser hands the source
+   in as a data-URL `image_url` part; **post-#124 the server stores it as a
+   `chat_blobs` payload and the transcript carries a `/chat-blobs/{id}` reference**,
+   which the executor resolves back to bytes when it builds the **server-side**
+   multipart body for the loopback call. Multipart exists only on the
+   gateway→sd-server hop and the public bearer endpoint.
 4. **A vision-attach affordance exists to mirror** (`ModelOption.vision` → a
    store boolean → a ref → the attach enable/tooltip → the `send()` guard → the
    clear-on-switch effect), but it keys on the **thread kind + picked model**,
@@ -274,32 +278,40 @@ toggle, no "edit" button.
   the image-run deadline (no new unbounded `kind`); one terminal commit via
   `finishRunWithParts`, no streaming executor reuse.
 
-## Part 6 — Masks, iterative refine, capacity
+## Part 6 — Masks and iterative refine (simplified by #124)
 
-- **Mask upload (v1).** A second composer slot tagged as a mask. `ChatContentPart`
-  is `text|image_url` today, so a mask needs a dedicated convention (a tagged part
-  or a separate state slot) that survives `editUserMessage` and replay. An
+> **#124 (the `chat_blobs` store) has since SHIPPED (PR #217, now on `main`).**
+> Chat images (generated and uploaded) now live OUT of the transcript as
+> `/api/portal/chat-blobs/{id}` references — bounded by a per-blob cap
+> (`MaxChatBlobBytes`, 20 MiB) and a per-run history bound (`MaxRunHistoryBytes`),
+> with a server-side resolution of a gateway url back to bytes for inference. That
+> dissolves the refine-budget and capacity workarounds this section originally
+> needed; the simplifications below replace them. The plan will build on #124.
+
+- **Mask upload (v1).** A second composer slot tagged as a mask. A mask is stored
+  the same way every chat image now is — a `chat_blobs` payload referenced by a
+  gateway url — but it needs a mask **tag/convention** on the content part
+  (distinct from the source image) that survives `editUserMessage` and replay. An
   in-browser mask-**drawing** canvas is deferred (frontend-only, same backend).
-- **Iterative refine — reference, do not re-embed.** Re-embedding a generated
-  image as a new `image_url` part **blows the 4 MiB transcript cap on the first
-  refine** (prompt + out1 + embedded copy + out2 ≈ 4.5 MB > 4.19 MB). So refine
-  uses a **reference-shaped** content part pointing at the already-stored image in
-  the transcript (no copy, no re-encode — which also respects ADR-043(c)'s
-  "don't re-encode the model's output"). The reference part needs handling in
-  `editUserMessage`/replay (which currently drop non-`image_url` parts) and in the
-  executor (resolve the reference to the stored bytes before building multipart).
-  This is more work than re-embed but is the only option that fits the budget
-  **and** the no-degrade rule.
-- **Uploaded sources — normalize.** A user-uploaded source goes through **one
-  canvas re-encode to a bounded size** (the current `imageAttach.ts` pipeline is a
-  near-no-op below 1568 px, so large sources must be actively bounded): this fixes
-  the 4 MiB/5 MiB budget and EXIF orientation. Re-encoding a user upload (not model
-  output) does not hit ADR-043(c).
-- **Capacity accounting.** `imageCostBytes`/`imagesLeft` (`chatCapacity.ts`
-  ~:53-78) are role-blind and would mistake a user source for the per-output cost,
-  skewing the "N more images" line and the `send()` refusal. Make the per-output
-  cost count only non-user images, and add a `pendingBytes` term for the unsent
-  composer source (which is in `images[]`, not yet in `messages`).
+- **Iterative refine — just reference the stored image.** Post-#124 a generated
+  image is ALREADY a `/api/portal/chat-blobs/{id}` reference in the transcript, so
+  a "refine this image" action simply makes that existing reference the edit
+  turn's source. **No copy, no re-embed, no reference-part-type to invent, no
+  budget problem** — the earlier "re-embed blows the 4 MiB cap" and the
+  reference-shaped-part design are moot. The server executor resolves the source
+  chat-blob url to bytes (the same `chat_blobs` resolution #124 added for the
+  inference history) when it builds the multipart `/v1/images/edits` call.
+- **Uploaded sources — no special budget handling.** A user-uploaded source is
+  stored as a `chat_blob` by #124's extract-on-run-commit (bounded by
+  `MaxChatBlobBytes`), not inline in the transcript, so the old budget-driven
+  "re-encode to a bounded size" is no longer needed. EXIF-orientation
+  normalization is optional (a UX nicety, not a budget requirement) — decide in
+  the plan. The executor resolves the uploaded source's chat-blob url to bytes
+  for the edit call, the same as refine.
+- **Capacity accounting — nothing to do.** #124 REMOVED the image-count capacity
+  estimate (`imageCostBytes`/`imagesLeft`/`chatCapacity.ts` are gone); images no
+  longer count against the transcript budget. The role-awareness workaround this
+  section originally specified is obsolete.
 
 ## Part 7 — Cross-cutting: size, capture, billing, response
 
@@ -374,8 +386,10 @@ toggle, no "edit" button.
 - A **text-only agent spec**: the served-flavor conjunct refuses the edit.
 - A **mask**: converted alpha→luminance, dimensions enforced; a **no-mask** edit
   to an external server is relayed verbatim (not needlessly rebuilt).
-- **Capacity**: a user source doesn't corrupt the estimate or wrongly trip
-  `send()`; a **refine** commits within the 4 MiB budget (reference, not copy).
+- **Refine/source via #124 reference**: a generated-image **refine** uses the
+  existing `/chat-blobs/{id}` reference as the source (no copy/re-embed), and the
+  executor resolves it (and an uploaded source's chat-blob) to bytes for the edit
+  call. (No capacity-estimate test — #124 removed that estimate.)
 - **Capture** of a binary multipart request stores no corrupted/truncated binary.
 - **Usage** records the `/v1/images/edits` path, not generations.
 - Every **JSON endpoint** is byte-for-byte unchanged after the `ProxyNative`
@@ -396,12 +410,14 @@ toggle, no "edit" button.
 - **C — Upstream reconciliations:** strength knob (Go + frontend + persistence +
   i18n) + gateway mask-polarity conversion/dimension check + the mask-rebuild path.
 - **D — Portal img2img:** the `attachMode` predicate through the composer, the
-  `image_edit` flag fold, the server-side multipart from the data-URL source,
-  capacity role-awareness, the ADR-043 amendment.
-- **E — Masks in the portal:** the mask slot + part convention (editUserMessage/
-  replay) + the mask part end to end.
-- **F — Iterative refine:** the reference-shaped part + its executor resolution +
-  edit/replay handling.
+  `image_edit` flag fold, the server-side multipart built from the source
+  **chat-blob reference resolved to bytes** (#124), the ADR-043 amendment. (No
+  capacity work — #124 removed the estimate.)
+- **E — Masks in the portal:** the mask slot + its tag/convention
+  (editUserMessage/replay) + the mask chat-blob end to end.
+- **F — Iterative refine:** a "refine this image" action that makes the existing
+  `/chat-blobs/{id}` reference the edit source + the executor resolving it to
+  bytes + edit/replay handling. (Much smaller post-#124 — no new part type.)
 - Docs + ADRs land with the parts they describe.
 
 ## Out of scope / deferred
