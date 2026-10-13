@@ -15,15 +15,12 @@ export type ChatSummary = {
 
 export type Chat = ChatSummary & { content: unknown };
 
-// The chat listing plus the limits a client needs to stay inside them.
+// The chat listing. The wire body also carries the backend's pre-seal content
+// cap (max_content_bytes), which this client deliberately does not read: images
+// are stored out of the transcript, so the document size no longer says how many
+// more fit, and text overflow is the server's 400 portal.chat_too_large.
 export type ChatListResponse = {
   data: ChatSummary[];
-  // The backend's pre-seal content cap (portal.MaxChatContentBytes). Served
-  // rather than duplicated here: a hardcoded copy would drift from the Go
-  // constant with nothing to catch it. OPTIONAL because a gateway older than
-  // this field simply omits it — the portal then treats the capacity as
-  // unknown (states no number, refuses no send) instead of guessing one.
-  max_content_bytes?: number;
 };
 
 // The image-generation knobs of an "image" thread, as sent on the wire and

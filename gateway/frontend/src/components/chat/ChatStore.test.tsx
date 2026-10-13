@@ -87,9 +87,10 @@ type ChatRow = {
   updated_at: string;
   content: unknown;
 };
-// maxContentBytes is the cap the real listing serves (portal.MaxChatContentBytes
-// on ChatListResponse); a test shrinks it to drive the composer's capacity
-// refusal without building a multi-megabyte fixture.
+// maxContentBytes is the cap the real listing still serves
+// (portal.MaxChatContentBytes on ChatListResponse). The store ignores it -- images
+// live out of the transcript -- and a test shrinks it to prove no send is refused
+// on its account.
 function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
   let seq = 0;
   const rows: ChatRow[] = [...seed];
@@ -194,9 +195,6 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
       {/* The fetched per-model image options ("null" until/unless one arrives). */}
       <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
-      <span data-testid="image-capacity">
-        {c.imageCapacityLeft === null ? 'unknown' : String(c.imageCapacityLeft)}
-      </span>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
       <span data-testid="override-model">{c.overrideModel}</span>
       <span data-testid="override-locks">{String(c.overrideLocksModel)}</span>
@@ -2312,7 +2310,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
-  describe(`ChatStoreProvider image-thread kind and capacity [${locale}]`, () => {
+  describe(`ChatStoreProvider image-thread kind [${locale}]`, () => {
     // An image GENERATOR that does not also read images. `vision` is
     // deliberately absent so modelVisionCapable derives false -- that is the
     // combination these tests need (it is what makes the regenerate guard's
@@ -2333,9 +2331,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     const generatedImage = [
       { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,AAAA' } },
     ];
-    // A generated image big enough that a shrunken cap provably cannot hold a
-    // second one (the capacity estimate is the largest image the thread has
-    // actually produced -- see shared/chatCapacity.ts).
+    // A generated image far larger than the deliberately shrunken cap the
+    // no-refusal test serves: were the store still estimating image capacity
+    // from the document size, this thread would provably have no room left.
     const bigImage = [
       {
         type: 'image_url' as const,
@@ -2605,7 +2603,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       expect(screen.getByTestId('model-image-capable').textContent).toBe('true');
       expect(screen.getByTestId('chat-kind').textContent).toBe('');
-      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
 
       fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'more' } });
       fireEvent.click(screen.getByRole('button', { name: 'send' }));
@@ -2617,70 +2614,49 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).toBe('');
     });
 
-    it('refuses to send when the transcript has no room for another image', async () => {
-      // A thread already within one image of the served cap: the remaining
-      // capacity is exact and known NOW, so spending minutes of upstream CPU
-      // on an artifact we can already prove we cannot store is pure waste.
+    it('does not refuse an image send on the size of the transcript', async () => {
+      // Generated images are stored out of the transcript (as
+      // /api/portal/chat-blobs/{id} urls), so the document size says nothing
+      // about how many more images fit and the old image-count estimate (and
+      // its send() refusal) is gone. The listing still serves a cap this thread
+      // already exceeds; the send must go through anyway. Text overflow stays
+      // the server's 400 portal.chat_too_large.
       chatApi = makeChatApi(imageThread(bigImage), 300_000);
       renderProvider([], { models: imageModels });
       await waitForReady();
       expect(screen.getByTestId('chat-kind').textContent).toBe('image');
-      await waitFor(() => expect(screen.getByTestId('image-capacity').textContent).toBe('0'));
-
-      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
-      fireEvent.click(screen.getByRole('button', { name: 'send' }));
-
-      expect(await screen.findByText(t.chatCapacityExhausted)).toBeTruthy();
-      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
-      // The composer is left untouched -- nothing was sent, nothing dropped.
-      expect(screen.getByTestId('count').textContent).toBe('2');
-    });
-
-    it('sends normally while the transcript still has room for another image', async () => {
-      // Negative control for the refusal above: same thread, the real cap.
-      chatApi = makeChatApi(imageThread(bigImage));
-      renderProvider([], { models: imageModels });
-      await waitForReady();
-      await waitFor(() =>
-        expect(screen.getByTestId('image-capacity').textContent).not.toBe('unknown'),
-      );
-      expect(Number(screen.getByTestId('image-capacity').textContent)).toBeGreaterThan(0);
 
       fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
       fireEvent.click(screen.getByRole('button', { name: 'send' }));
 
       await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-      expect(screen.queryByText(t.chatCapacityExhausted)).toBeNull();
     });
 
-    it('reports an unknown capacity (and refuses nothing) when the server serves no cap', async () => {
-      chatApi = makeChatApi(imageThread(bigImage), 0);
-      renderProvider([], { models: imageModels });
-      await waitForReady();
+    // The backend's run-start refusals for the chat binary payload store. Each
+    // 400 reaches the toast through formatPortalError, which must show the
+    // localized label (after the code), never the raw English the server sent.
+    it.each([
+      ['images.blob_type_unsupported', 'errorImagesBlobTypeUnsupported'],
+      ['images.blob_too_large', 'errorImagesBlobTooLarge'],
+      ['images.blob_not_owned', 'errorImagesBlobNotOwned'],
+      ['portal.chat_run_history_too_large', 'errorChatRunHistoryTooLarge'],
+    ] as const)(
+      'localizes the %s run-start refusal instead of showing the raw server text',
+      async (code, labelKey) => {
+        chatApi = makeChatApi(imageThread(generatedImage));
+        chatApi.spies.startChatRun.mockRejectedValue(
+          new PortalApiError(400, code, 'raw english from the server'),
+        );
+        renderProvider([], { models: imageModels });
+        await waitForReady();
 
-      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
-      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
-      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
 
-      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-    });
-
-    it('leaves a text thread without a capacity number at all', async () => {
-      chatApi = makeChatApi([
-        {
-          id: 'c1',
-          title: 'C1',
-          created_at: T,
-          updated_at: T,
-          content: { settings: { model: models[0].id }, messages: [] },
-        },
-      ]);
-      renderProvider();
-      await waitForReady();
-
-      expect(screen.getByTestId('chat-kind').textContent).toBe('');
-      expect(screen.getByTestId('image-capacity').textContent).toBe('unknown');
-    });
+        expect(await screen.findByText(`${code}: ${t[labelKey]}`)).toBeTruthy();
+        expect(screen.queryByText(/raw english from the server/)).toBeNull();
+      },
+    );
   });
 
   // The per-model sd-server options (samplers / size limits / ...) the composer's

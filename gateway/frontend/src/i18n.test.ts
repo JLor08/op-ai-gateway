@@ -989,13 +989,28 @@ describe('capacity-benchmark i18n keys', () => {
   });
 });
 
-describe('image-thread composer i18n keys', () => {
+describe('chat binary payload store error labels', () => {
   const keys = [
-    'chatImagePromptLabel',
-    'chatImageOnlyHint',
-    'chatCapacityExhausted',
-    'chatImageGeneratorNoInput',
+    'errorImagesBlobTypeUnsupported',
+    'errorImagesBlobTooLarge',
+    'errorImagesBlobNotOwned',
+    'errorChatRunHistoryTooLarge',
   ] as const;
+
+  it('defines a user-facing label for each new run-start refusal in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+      // The two locales must be genuinely translated, not one copied over.
+      expect(messages.de[k]).not.toBe(messages.en[k]);
+    }
+  });
+});
+
+describe('image-thread composer i18n keys', () => {
+  const keys = ['chatImagePromptLabel', 'chatImageOnlyHint', 'chatImageGeneratorNoInput'] as const;
 
   it('defines the composer keys in de and en', () => {
     for (const k of keys) {
@@ -1006,11 +1021,15 @@ describe('image-thread composer i18n keys', () => {
     }
   });
 
-  it('interpolates the remaining-capacity count', () => {
-    expect(messages.de.chatCapacityRemaining(3)).toContain('3');
-    expect(messages.en.chatCapacityRemaining(3)).toContain('3');
-    expect(messages.en.chatCapacityRemaining(3)).not.toContain('{count}');
-    expect(messages.de.chatCapacityRemaining(3)).not.toContain('{count}');
+  it('carries no image-count capacity strings (images live out of the transcript)', () => {
+    // The "room for N more images" line and the "no room for another image"
+    // refusal were removed with the capacity estimate: a stored image is now a
+    // short /api/portal/chat-blobs/{id} url, so the document size no longer
+    // bounds how many fit.
+    for (const locale of [messages.de, messages.en]) {
+      expect(locale).not.toHaveProperty('chatCapacityRemaining');
+      expect(locale).not.toHaveProperty('chatCapacityExhausted');
+    }
   });
 
   it('keeps the image-INPUT refusal distinct from the image-GENERATOR one', () => {

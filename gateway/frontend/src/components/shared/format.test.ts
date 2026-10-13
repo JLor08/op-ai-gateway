@@ -2,7 +2,13 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { errorLabelByCode, formatDate, formatMetric, formatPortalError } from './format';
+import {
+  errorLabelByCode,
+  formatChatRunErrorCode,
+  formatDate,
+  formatMetric,
+  formatPortalError,
+} from './format';
 import { PortalApiError } from '../../api';
 import { messages } from '../../i18n';
 describe('formatDate', () => {
@@ -351,6 +357,11 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `imageRunFormatUnknownMessage`, `imageRunResponseUnreadableMessage`,
    * `chatRunCommitFailedMessage`).
    *
+   * `portal.chat_run_history_too_large` is `portal.ErrChatRunHistoryTooLarge`
+   * (service_chats.go, row in error_map.go): the run's image history, resolved
+   * from the chat-blob store for inference, exceeded its bound. A 400 at run
+   * start, so it reaches the toast through `formatPortalError`.
+   *
    * `portal.chat_not_found` rides in this group because it shares the
    * `portal.chat_` prefix the both-directions assertion below filters on. It
    * is NOT a run-lifecycle code and predates this feature: it is
@@ -364,6 +375,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'portal.chat_not_found',
     'portal.chat_run_active',
     'portal.chat_run_limit',
+    'portal.chat_run_history_too_large',
     'mapping.capability_reserved',
     'gateway.chat_run_timeout',
     'gateway.chat_run_image_dispatch_failed',
@@ -401,14 +413,22 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * just from a direct API client (validateImagesRequest's two refusals,
    * plus the run's own relay of a non-2xx upstream body via
    * `upstreamErrorCode` / `imagesUpstreamErrorCode`, all in
-   * `internal/gateway/images_handler.go`). Pinned as literals for the same
-   * reason as the group above.
+   * `internal/gateway/images_handler.go`), plus the three
+   * `images.blob_*` refusals of the chat binary payload store. Pinned as
+   * literals for the same reason as the group above.
    */
   const imagesWireCodes = [
     'images.prompt_required',
     'images.stream_unsupported',
     'images.response_format_unsupported',
     'images.upstream_error',
+    // The chat binary payload store's own refusals (portal.ErrChatBlob*,
+    // service_chats.go; rows in error_map.go): a run-start 400 when an
+    // uploaded or edited image is not png/jpeg/webp/gif, exceeds the per-image
+    // cap, or an edited_history entry names an image this chat does not own.
+    'images.blob_type_unsupported',
+    'images.blob_too_large',
+    'images.blob_not_owned',
   ] as const;
 
   it('carries every images.* refusal code reachable from a chat run, by its exact wire string', () => {
@@ -425,6 +445,37 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         .sort(),
     ).toEqual(imagesWireCodes.slice().sort());
   });
+
+  /**
+   * The four refusals the chat binary payload store added to a chat run's
+   * start. Each is a 400 the server words in English ("image is too large");
+   * the portal must show its own localized label for it in BOTH locales --
+   * after the code, as every other portal error does -- and never the raw
+   * server text.
+   */
+  const blobStoreWireCodes = [
+    'images.blob_type_unsupported',
+    'images.blob_too_large',
+    'images.blob_not_owned',
+    'portal.chat_run_history_too_large',
+  ] as const;
+
+  it.each([
+    ['de', messages.de],
+    ['en', messages.en],
+  ] as const)(
+    'renders a localized label, not the raw server text, for each payload-store refusal (%s)',
+    (_locale, t) => {
+      for (const code of blobStoreWireCodes) {
+        const out = formatPortalError(new PortalApiError(400, code, 'raw server text'), t);
+        expect(out, code).not.toContain('raw server text');
+        expect(out, code).toBe(`${code}: ${t[errorLabelByCode[code]!]}`);
+        // A run-terminal error carries only the code: it must map too, and
+        // degrade to the label rather than the bare code.
+        expect(formatChatRunErrorCode(code, t), code).toBe(t[errorLabelByCode[code]!]);
+      }
+    },
+  );
 
   /**
    * Fix round, finding 1: keeping a non-200's body (Deliverable 2) made

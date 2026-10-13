@@ -80,10 +80,9 @@ function makeChatApi() {
   const rows: ChatRow[] = [];
   const stamp = () => new Date(Date.UTC(2026, 6, 17, 12, seq)).toISOString();
   const api = {
-    // max_content_bytes mirrors the real listing (portal.MaxChatContentBytes,
-    // served on ChatListResponse): the composer's capacity line and the
-    // capacity refusal are driven by it, and a mock that omitted it would
-    // leave the portal in its "capacity unknown" state.
+    // The real listing still serves max_content_bytes (portal.MaxChatContentBytes);
+    // the composer must IGNORE it now that images live out of the transcript, so
+    // the mock keeps serving it to prove the capacity line stays gone.
     chats: vi.fn(async () => ({
       data: rows.map(({ content: _content, ...rest }) => rest),
       max_content_bytes: 4 * 1024 * 1024,
@@ -226,43 +225,6 @@ function seedGeneratedImageChat() {
       ],
     },
   });
-}
-
-// Seeds a pinned image thread that already holds an image large enough that a
-// deliberately shrunken content cap cannot hold another one -- the state in
-// which the composer must say the chat is FULL rather than quote a number.
-function seedFullImageChat() {
-  const stamp = '2026-07-20T12:00:00Z';
-  chatApi.rows.push({
-    id: 'c_image_full',
-    title: '',
-    created_at: stamp,
-    updated_at: stamp,
-    content: {
-      settings: { model: 'sd-turbo', kind: 'image' },
-      messages: [
-        { id: 'm_prompt', role: 'user', content: 'a cat on a bicycle' },
-        {
-          id: 'm_image',
-          role: 'assistant',
-          content: [
-            {
-              type: 'image_url',
-              image_url: { url: `data:image/png;base64,${'A'.repeat(200_000)}` },
-            },
-          ],
-        },
-      ],
-    },
-  });
-}
-
-// Serves a different content cap than the default 4 MiB from the chat listing.
-function serveContentCap(maxContentBytes: number) {
-  chatApi.spies.chats.mockImplementation(async () => ({
-    data: chatApi.rows.map(({ content: _content, ...rest }) => rest),
-    max_content_bytes: maxContentBytes,
-  }));
 }
 
 function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
@@ -1003,35 +965,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(banner).toHaveTextContent(t.chatImageGeneratorNoInput);
     });
 
-    it('states how many more images fit, rather than that the chat is full', async () => {
+    it('shows no image-count capacity line in an image thread', async () => {
+      // Generated images are stored out of the transcript (as
+      // /api/portal/chat-blobs/{id} urls), so "room for N more images" is no
+      // longer derivable from the document size: the composer states no number
+      // and refuses no send on one. The listing still serves max_content_bytes,
+      // so this fails if the portal keeps reading it for an image estimate.
       renderChat(tokens, imageModels);
       await waitForChatReady();
       await pickOption(t.chatModel, imageModels[0].display_name);
 
-      // The one number in this feature that is exact and known BEFORE the user
-      // commits to a multi-minute wait -- so the assertion is on the STRING,
-      // not merely on the element existing. A brand-new thread against the
-      // served 4 MiB cap has no image yet to measure, so the per-image cost is
-      // chatCapacity.ts's fallback estimate (1.5 MB), which leaves room for 2.
-      // If that constant is retuned this expectation moves with it, which is
-      // correct: the number the user is shown is a deliberate output.
-      const line = screen.getByTestId('chat-capacity');
-      expect(line).toHaveTextContent(t.chatCapacityRemaining(2));
-      expect(line).not.toHaveTextContent(t.chatCapacityExhausted);
-    });
-
-    it('says the chat is full when it can no longer hold an image', async () => {
-      // The other branch of the same line. Without a case that renders it, the
-      // whole ternary could be replaced by a bare "this chat is full" and a
-      // brand-new empty thread would say so permanently.
-      seedFullImageChat();
-      serveContentCap(300_000);
-      renderChat(tokens, imageModels);
-      await waitForChatReady();
-
-      const line = screen.getByTestId('chat-capacity');
-      expect(line).toHaveTextContent(t.chatCapacityExhausted);
-      expect(line).not.toHaveTextContent(t.chatCapacityRemaining(0));
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
     });
 
     it('shows no capacity line for a text thread', async () => {
@@ -1039,18 +984,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitForChatReady();
       await pickOption(t.chatModel, models[0].display_name);
 
-      expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
-    });
-
-    it('shows no capacity line when the server served no cap', async () => {
-      // A gateway older than the served max_content_bytes: the portal must say
-      // nothing rather than state a number it made up.
-      serveContentCap(0);
-      renderChat(tokens, imageModels);
-      await waitForChatReady();
-      await pickOption(t.chatModel, imageModels[0].display_name);
-
-      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
       expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
     });
   });

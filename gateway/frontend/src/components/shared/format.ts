@@ -242,6 +242,18 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'images.stream_unsupported': 'errorImagesStreamUnsupported',
   'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',
   'images.upstream_error': 'errorImagesUpstreamError',
+  // Chat binary payload store (#124): refusals at run start. The first three
+  // are rows in error_map.go for portal.ErrChatBlobTypeUnsupported /
+  // ErrChatBlobTooLarge / ErrChatBlobNotOwned (an uploaded or edited image is
+  // not png/jpeg/webp/gif, exceeds the per-image cap, or an edited_history
+  // entry names an image this chat does not own); the last is
+  // portal.ErrChatRunHistoryTooLarge (the run's resolved image history exceeds
+  // its bound). All four are 400s, so they reach the toast through
+  // formatPortalError, not as raw English.
+  'images.blob_type_unsupported': 'errorImagesBlobTypeUnsupported',
+  'images.blob_too_large': 'errorImagesBlobTooLarge',
+  'images.blob_not_owned': 'errorImagesBlobNotOwned',
+  'portal.chat_run_history_too_large': 'errorChatRunHistoryTooLarge',
   // Task 8 fix round, finding 1: keeping the non-200 body (above) made the
   // TEXT path's own upstream codes reach the chat toast for the first time
   // too -- completionErrorResponse/completionErrorCode's nine codes
