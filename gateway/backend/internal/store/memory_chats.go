@@ -165,6 +165,19 @@ func (m *MemoryChatStore) ChatByID(ctx context.Context, id string) (ChatRow, err
 	return ChatRow(rec), nil
 }
 
+// ChatOwner returns the user_id of chat chatID, or ErrNotFound: ChatByID's
+// ownership answer without copying the record (the SQL driver's counterpart
+// reads that one column and not the sealed document).
+func (m *MemoryChatStore) ChatOwner(ctx context.Context, chatID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[chatID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return rec.UserID, nil
+}
+
 // ChatsByUser returns userID's chats as summaries (no blob), most-recently
 // updated first (ties broken by ID descending for determinism).
 func (m *MemoryChatStore) ChatsByUser(ctx context.Context, userID string) ([]ChatSummary, error) {

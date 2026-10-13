@@ -178,6 +178,22 @@ func (s *SQLiteStore) ChatByID(ctx context.Context, id string) (ChatRow, error) 
 	return chat, nil
 }
 
+// ChatOwner returns the user_id of chat chatID, or ErrNotFound. It selects that
+// one column and never the sealed document: the chat-image serving path asks it
+// once per <img>, and a chat of many images would otherwise read the whole
+// transcript blob again for each one just to compare two strings.
+func (s *SQLiteStore) ChatOwner(ctx context.Context, chatID string) (string, error) {
+	var userID string
+	err := s.queryRow(ctx, `select user_id from chats where id = ?`, chatID).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("scan chat owner: %w", err)
+	}
+	return userID, nil
+}
+
 // ChatsByUser lists the owner's chats as summaries (no blob), most-recently
 // updated first.
 func (s *SQLiteStore) ChatsByUser(ctx context.Context, userID string) ([]ChatSummary, error) {

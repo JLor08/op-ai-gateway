@@ -290,6 +290,11 @@ type ChatStore interface {
 	CreateChat(ctx context.Context, chat store.Chat) error
 	UpdateChat(ctx context.Context, chat store.Chat) error
 	ChatByID(ctx context.Context, id string) (store.ChatRow, error)
+	// ChatOwner returns the user_id of a chat, or store.ErrNotFound, without
+	// reading the sealed document. Ownership checks that do not need the
+	// content (the chat-image serving path, once per image) use it instead of
+	// ChatByID.
+	ChatOwner(ctx context.Context, chatID string) (userID string, err error)
 	ChatsByUser(ctx context.Context, userID string) ([]store.ChatSummary, error)
 	DeleteChat(ctx context.Context, id string) error
 

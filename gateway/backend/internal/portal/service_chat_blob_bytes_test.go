@@ -15,17 +15,20 @@ import (
 	"time"
 )
 
-// payloadCountingStore counts the payload loads (ChatBlobByID) the service asks
-// for, and lets a test make the other lookups misreport: it is how the tests
-// below pin that a foreign caller's request never loads the bytes, and that a
-// disagreeing store is not trusted.
+// payloadCountingStore counts the lookups the service makes (payload loads via
+// ChatBlobByID, owner reads via ChatOwner, and full-transcript reads via
+// ChatByID) and lets a test make them misreport: it is how the tests below pin
+// that a foreign caller's request never loads the bytes, that a disagreeing
+// store is not trusted, and that the serving path never reads a transcript.
 type payloadCountingStore struct {
 	ChatStore
-	payloadLoads int
+	payloadLoads  int
+	chatOwnerHits int
+	chatByIDHits  int
 	// byIDRow, when set, replaces the row ChatBlobByID returns.
 	byIDRow *store.ChatBlob
-	// chatByIDErr, when set, is what ChatByID answers.
-	chatByIDErr error
+	// chatOwnerErr, when set, is what ChatOwner answers.
+	chatOwnerErr error
 }
 
 func (p *payloadCountingStore) ChatBlobByID(ctx context.Context, id string) (store.ChatBlob, error) {
@@ -36,10 +39,16 @@ func (p *payloadCountingStore) ChatBlobByID(ctx context.Context, id string) (sto
 	return p.ChatStore.ChatBlobByID(ctx, id)
 }
 
-func (p *payloadCountingStore) ChatByID(ctx context.Context, id string) (store.ChatRow, error) {
-	if p.chatByIDErr != nil {
-		return store.ChatRow{}, p.chatByIDErr
+func (p *payloadCountingStore) ChatOwner(ctx context.Context, chatID string) (string, error) {
+	p.chatOwnerHits++
+	if p.chatOwnerErr != nil {
+		return "", p.chatOwnerErr
 	}
+	return p.ChatStore.ChatOwner(ctx, chatID)
+}
+
+func (p *payloadCountingStore) ChatByID(ctx context.Context, id string) (store.ChatRow, error) {
+	p.chatByIDHits++
 	return p.ChatStore.ChatByID(ctx, id)
 }
 
@@ -71,6 +80,36 @@ func TestChatBlobBytesServesTheOwnersImage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The serving path is one image per <img> and a chat can hold dozens, so its
+// ownership read must be the owner-only lookup, never ChatByID (which reads the
+// whole sealed transcript): for the owner, for a foreign caller and for a missing
+// id alike, ChatByID is never called, and a served image costs exactly one owner
+// lookup and one payload load.
+func TestChatBlobBytesReadsTheOwnerOnlyNeverTheTranscript(t *testing.T) {
+	e := newBlobTestEnv(t, true, 0)
+	id := e.sendImage(t, e.emptyChat(t), blobTestBytes(512, 6))
+	ctx := context.Background()
+
+	counting := &payloadCountingStore{ChatStore: e.mem}
+	svc := NewService(ServiceDeps{Chats: counting, Cipher: e.cipher})
+
+	if _, _, err := svc.ChatBlobBytes(ctx, e.owner, id); err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	if counting.chatOwnerHits != 1 || counting.payloadLoads != 1 {
+		t.Fatalf("a served image cost %d owner lookups and %d payload loads, want 1 and 1", counting.chatOwnerHits, counting.payloadLoads)
+	}
+	if _, _, err := svc.ChatBlobBytes(ctx, chatToken("usr_b"), id); !errors.Is(err, ErrChatBlobNotFound) {
+		t.Fatalf("foreign caller: %v", err)
+	}
+	if _, _, err := svc.ChatBlobBytes(ctx, e.owner, "blob_00000000000000000000000000000000"); !errors.Is(err, ErrChatBlobNotFound) {
+		t.Fatalf("missing id: %v", err)
+	}
+	if counting.chatByIDHits != 0 {
+		t.Fatalf("the serving path called ChatByID %d times, want 0 (it reads the whole sealed transcript)", counting.chatByIDHits)
 	}
 }
 
@@ -143,7 +182,7 @@ func TestChatBlobBytesMissingIsNotFound(t *testing.T) {
 
 	// The chat row is gone but the blob row is still there (an orphan the
 	// store's cascade should make impossible): fail closed, no bytes.
-	orphan := &payloadCountingStore{ChatStore: e.mem, chatByIDErr: store.ErrNotFound}
+	orphan := &payloadCountingStore{ChatStore: e.mem, chatOwnerErr: store.ErrNotFound}
 	orphanSvc := NewService(ServiceDeps{Chats: orphan, Cipher: e.cipher})
 	if _, _, err := orphanSvc.ChatBlobBytes(ctx, e.owner, id); !errors.Is(err, ErrChatBlobNotFound) {
 		t.Fatalf("blob whose chat row is gone: err = %v, want ErrChatBlobNotFound", err)

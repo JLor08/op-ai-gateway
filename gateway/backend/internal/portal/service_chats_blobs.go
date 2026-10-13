@@ -337,10 +337,11 @@ func (s *Service) sealChatBlob(raw []byte) (int, []byte) {
 // the check is here, at read -- so a chat that merely references an id grants
 // nothing, and the caller's own chat is not consulted at all.
 //
-// The order is deliberate: the owner is resolved from the cheap lookups first
-// (ChatBlobOwner, then ChatByID), and the payload is loaded only for the
-// verified owner, so another user's request neither reads nor decrypts their
-// bytes. Every way of not being the owner -- no such blob, a foreign chat, a
+// The order is deliberate: the owner is resolved from the cheap, metadata-only
+// lookups first (ChatBlobOwner, then ChatOwner -- never ChatByID, which reads
+// the chat's whole sealed transcript, and a chat of many images asks this once
+// per image), and the payload is loaded only for the verified owner, so another
+// user's request neither reads nor decrypts their bytes. Every way of not being the owner -- no such blob, a foreign chat, a
 // chat that is gone, a blob evicted between the lookups, a store that disagrees
 // with itself about which chat a blob belongs to -- is the same
 // ErrChatBlobNotFound; a store or cipher failure is returned as the failure it
@@ -361,18 +362,18 @@ func (s *Service) ChatBlobBytes(ctx context.Context, owner auth.Token, id string
 	if err != nil {
 		return nil, "", notFoundAsBlob(err)
 	}
-	chat, err := s.chats.ChatByID(ctx, chatID)
+	chatOwner, err := s.chats.ChatOwner(ctx, chatID)
 	if err != nil {
 		return nil, "", notFoundAsBlob(err)
 	}
-	if chat.UserID != owner.UserID {
+	if chatOwner != owner.UserID {
 		return nil, "", ErrChatBlobNotFound
 	}
 	row, err := s.chats.ChatBlobByID(ctx, id)
 	if err != nil {
 		return nil, "", notFoundAsBlob(err)
 	}
-	if row.ChatID != chat.ID {
+	if row.ChatID != chatID {
 		return nil, "", ErrChatBlobNotFound
 	}
 	if _, listed := chatBlobMediaTypes[row.ContentType]; !listed {
