@@ -27,6 +27,25 @@ type Chat struct {
 	UpdatedAt  time.Time
 }
 
+// ChatBlob is one binary payload (an inline image today) that belongs to a chat
+// and lives in its own chat_blobs row instead of inside the chat document, so
+// the document stays small. Blob is opaque to the store: like Chat.Blob it is
+// either nonce||AEAD(bytes) (KeyVersion > 0, sealed) or the plain bytes
+// (KeyVersion == 0, the RAM-fallback path) -- sealing/opening, the content-type
+// allow-list and the per-blob size cap are the service layer's job, this store
+// is a dumb byte store. ContentType and ByteLen are plaintext metadata about
+// the payload as it was before sealing, so the list/serve path never has to
+// decrypt just to answer "what is this and how big".
+type ChatBlob struct {
+	ID          string
+	ChatID      string
+	KeyVersion  int
+	Blob        []byte
+	ContentType string
+	ByteLen     int64
+	CreatedAt   time.Time
+}
+
 // ChatRow is the read DTO returned by ChatByID: the full row including Blob +
 // KeyVersion so the service can Open the sealed payload.
 type ChatRow struct {

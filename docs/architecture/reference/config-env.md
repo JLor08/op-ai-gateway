@@ -124,6 +124,7 @@ All backend variables are read through `internal/config/config.go`'s `Load()` (e
 | `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY` | string | Key sealing captured request/response payloads (and the SMTP password, the NetBird admin token, and a **vendor account**'s API key + OAuth token set) at rest on a disk-backed store. **Required for the vendor-account subscription path**: an OAuth token set is a decryptable secret, so on a disk-backed store with no key a connect/import rejects the write (`capture.ErrKeyRequired` → `vendor_account.connect_key_required`); a memory/volatile store needs no key. See [External Vendor Accounts §9](../cross-cutting/external-vendor-accounts.md#9-secrets-at-rest) | `` |
 | `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` | int | Max captured payload size on a disk-backed store | `1048576` (1 MiB) |
 | `OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES` | int | Max total bytes held by the in-memory capture/chat store (memory driver) | `67108864` (64 MiB) |
+| `OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES` | int | Per-blob size ceiling for one chat binary payload (an inline chat image) stored in `chat_blobs`. The store itself is a plain byte store; the portal service layer is what applies the ceiling. Junk, `0` or a negative value uses the default | `20971520` (20 MiB) |
 
 ### Test / development seams
 
