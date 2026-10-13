@@ -119,6 +119,7 @@ var migrations = []migration{
 	{version: 84, name: "vendor_account_usage_spend_control", up: migration84Up},
 	{version: 85, name: "api_token_vendor_provider_access", up: migration85Up},
 	{version: 86, name: "vendor_account_base_url", up: migration86Up},
+	{version: 87, name: "chat_blobs", up: migration87Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -3981,4 +3982,39 @@ func migration85Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // Schema only, no backfill; baselineCreateStatements stays frozen at v60.
 func migration86Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "base_url text not null default ''")
+}
+
+// migration87Up creates chat_blobs: the store for the binary payloads of a chat
+// (generated images) that used to ride inside the sealed chats.blob transcript.
+// One row per payload, owned by a chat: chat_id cascades from chats, so deleting
+// a chat (or, transitively, its user) leaves no orphaned payloads. The blob
+// column holds the payload sealed under key_version, exactly as chats.blob does
+// (Cipher.Seal; key_version 0 is the unsealed RAM-fallback mode). content_type
+// and byte_len are plaintext metadata about the payload.
+//
+// Wide Go values need wide Postgres columns: byte_len is 'bigint' (integer is
+// int4 on postgres; ADR-005), blob uses dl.blobType() and created_at uses
+// dl.timestampType(), the same substitutions the chats baseline makes.
+// baselineCreateStatements is NOT touched (frozen as of v60), so the table
+// lives only here -- the same discipline migration61Up and migration82Up follow.
+// Both statements are if-not-exists so the step is replayable on both dialects.
+func migration87Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	stmts := []string{
+		`create table if not exists chat_blobs (
+			id text primary key,
+			chat_id text not null references chats(id) on delete cascade,
+			key_version integer not null,
+			blob ` + dl.blobType() + ` not null,
+			content_type text not null,
+			byte_len bigint not null,
+			created_at ` + dl.timestampType() + ` not null
+		)`,
+		`create index if not exists idx_chat_blobs_chat on chat_blobs(chat_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

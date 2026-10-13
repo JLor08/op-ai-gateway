@@ -24,12 +24,12 @@ func TestSQLiteMigrateIsIdempotent(t *testing.T) {
 		t.Fatalf("second Migrate returned %v", err)
 	}
 
-	for _, table := range []string{"users", "api_tokens", "usage_events", "captures", "chats", "ai_servers", "server_telemetry", "route_affinity", "server_owners", "agent_tokens", "system_settings", "user_ui_preferences"} {
+	for _, table := range []string{"users", "api_tokens", "usage_events", "captures", "chats", "ai_servers", "server_telemetry", "route_affinity", "server_owners", "agent_tokens", "system_settings", "user_ui_preferences", "chat_blobs"} {
 		if !sqliteTableExists(t, st.db, table) {
 			t.Fatalf("table %s does not exist", table)
 		}
 	}
-	for _, index := range []string{"idx_route_affinity_lookup", "idx_server_owners_user", "idx_agent_tokens_secret_hash", "idx_captures_created"} {
+	for _, index := range []string{"idx_route_affinity_lookup", "idx_server_owners_user", "idx_agent_tokens_secret_hash", "idx_captures_created", "idx_chat_blobs_chat"} {
 		if !sqliteIndexExists(t, st.db, index) {
 			t.Fatalf("index %s does not exist", index)
 		}
