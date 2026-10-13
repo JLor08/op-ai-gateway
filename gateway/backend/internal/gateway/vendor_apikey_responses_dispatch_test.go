@@ -133,7 +133,7 @@ func TestOpenAIAPIKeyResponsesDispatchIsLosslessPassthrough(t *testing.T) {
 	// real OpenAI-compatible client the Multiplexer registers for vendor_openai.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
 	upstreamBody := rewriteModelField([]byte(apiKeyResponsesBody), target.ProviderModel)
-	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), upstreamBody)
+	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), upstreamBody, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}

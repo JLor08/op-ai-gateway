@@ -106,7 +106,7 @@ func TestUpstreamAuthReachesUpstream(t *testing.T) {
 
 	t.Run("proxy_native_bearer", func(t *testing.T) {
 		reset()
-		resp, err := client.ProxyNative(bearerCtx, target, "/v1/responses", []byte(`{"model":"up"}`))
+		resp, err := client.ProxyNative(bearerCtx, target, "/v1/responses", []byte(`{"model":"up"}`), "application/json")
 		if err != nil {
 			t.Fatalf("ProxyNative returned %v", err)
 		}

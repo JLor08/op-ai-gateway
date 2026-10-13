@@ -433,8 +433,8 @@ var _ NativeProxyClient = (*OpenAICompatibleClient)(nil)
 
 // ProxyNative forwards the raw client body to the upstream's own endpoint path
 // (native passthrough for Codex /v1/responses and Claude Code /v1/messages).
-func (c *OpenAICompatibleClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
-	return doNativeProxy(ctx, c.http, target, path, body)
+func (c *OpenAICompatibleClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
+	return doNativeProxy(ctx, c.http, target, path, body, contentType)
 }
 
 var _ StreamingClient = (*OpenAICompatibleClient)(nil)

@@ -472,7 +472,7 @@ func TestOpenAISubscriptionDispatchAttachesBearerAccountIDAndHeaders(t *testing.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
 	path := upstreamPath(target, "openai_responses")
 	upstreamBody := rewriteModelField([]byte(openAIResponsesBody), target.ProviderModel)
-	resp, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody)
+	resp, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestOpenAISubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
 	target := openAISubscriptionTarget("acc_sub_oai", stub.srv.URL)
 
 	ctx := s.upstreamAuthCtx(context.Background(), target)
-	if _, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody)); err != nil {
+	if _, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody), "application/json"); err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
 

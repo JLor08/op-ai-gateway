@@ -134,7 +134,7 @@ func proxyNativeCapture(t *testing.T, target func(endpoint string) routing.Targe
 	defer upstream.Close()
 	ctx := WithUpstreamAuth(context.Background(), "", "sk-ant-oat-test")
 
-	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, target(upstream.URL), "/v1/messages", []byte(body))
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, target(upstream.URL), "/v1/messages", []byte(body), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}
@@ -329,7 +329,7 @@ func TestAnthropicClientProxyNativeMasqueradeKeepsTransportContract(t *testing.T
 	defer upstream.Close()
 	ctx := WithUpstreamAuthHeaders(context.Background(), "", "sk-ant-oat-test", map[string]string{"anthropic-beta": "oauth-2025-04-20"})
 
-	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, masqueradeTarget(upstream.URL+"/"), "/v1/messages", []byte(anthropicNativeBody))
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, masqueradeTarget(upstream.URL+"/"), "/v1/messages", []byte(anthropicNativeBody), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}
@@ -389,7 +389,7 @@ func TestAnthropicClientProxyNativeMasqueradeDoesNotFollowRedirects(t *testing.T
 	defer upstream.Close()
 	ctx := WithUpstreamAuth(context.Background(), "", "sk-ant-oat-secret")
 
-	resp, err := NewAnthropicClient(&http.Client{}).ProxyNative(ctx, masqueradeTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	resp, err := NewAnthropicClient(&http.Client{}).ProxyNative(ctx, masqueradeTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v, want the 307 handed back as a response", err)
 	}

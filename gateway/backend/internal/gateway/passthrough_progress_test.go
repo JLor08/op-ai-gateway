@@ -89,7 +89,7 @@ func (*progressObservingProxyProvider) CompleteStream(_ context.Context, _ routi
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{}})
 }
 
-func (p *progressObservingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, _ string, body []byte) (*provider.ProxyResponse, error) {
+func (p *progressObservingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, _ string, body []byte, _ string) (*provider.ProxyResponse, error) {
 	p.gotBody = append([]byte(nil), body...)
 	return &provider.ProxyResponse{
 		StatusCode: 200,

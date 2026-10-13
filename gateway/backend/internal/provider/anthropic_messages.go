@@ -97,11 +97,11 @@ var (
 // from a request that follows a redirect off the host, so following one could
 // carry the credential elsewhere. api.anthropic.com does not redirect; a 3xx is
 // returned to the caller as the upstream's answer.
-func (c *AnthropicClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+func (c *AnthropicClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
 	if target.Masquerade == routing.MasqueradeClaudeCode {
 		body = injectClaudeCodeSystemBlock(body)
 	}
-	return doNativeProxyWithDefaults(ctx, withoutRedirects(c.http), target, path, body, map[string]string{anthropicVersionHeader: anthropicAPIVersion})
+	return doNativeProxyWithDefaults(ctx, withoutRedirects(c.http), target, path, body, contentType, map[string]string{anthropicVersionHeader: anthropicAPIVersion})
 }
 
 // injectClaudeCodeSystemBlock returns body with the Claude-Code system block

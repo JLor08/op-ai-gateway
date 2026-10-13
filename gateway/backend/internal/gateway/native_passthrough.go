@@ -537,7 +537,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// merged with the target's own (anthropicPassthroughHeaderOverrides is nil
 	// everywhere else, which leaves the call exactly as upstreamAuthCtx builds it).
 	ctx = s.upstreamAuthCtxWithHeaders(ctx, rel.target, anthropicPassthroughHeaderOverrides(rel.target, r.Header))
-	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody)
+	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, jsonContentType)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
 		code := completionErrorCode(err)

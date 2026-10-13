@@ -96,10 +96,10 @@ var _ NativeProxyClient = (*Multiplexer)(nil)
 // ProxyNative routes native passthrough to the provider's client (like
 // CompleteStream, it does NOT cross-route to the fallback on a capability
 // mismatch — the passthrough must reach the provider routing resolved to).
-func (m *Multiplexer) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+func (m *Multiplexer) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
 	ctx, span := tracing.Start(ctx, "provider.ProxyNative")
 	defer span.End()
-	res, err := m.dispatchProxyNative(ctx, target, path, body)
+	res, err := m.dispatchProxyNative(ctx, target, path, body, contentType)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -152,7 +152,7 @@ func (m *Multiplexer) RecordLiveProgressRejection(target routing.Target) {
 	}
 }
 
-func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
+func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
 	if m == nil {
 		return nil, ErrUnavailable
 	}
@@ -164,7 +164,7 @@ func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Ta
 	if !ok {
 		return nil, fmt.Errorf("%w: native passthrough not supported for provider %q", ErrUnavailable, target.Provider)
 	}
-	return proxy.ProxyNative(ctx, target, path, body)
+	return proxy.ProxyNative(ctx, target, path, body, contentType)
 }
 
 func (m *Multiplexer) ListModels(ctx context.Context, target routing.Target) ([]string, error) {

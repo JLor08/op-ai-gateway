@@ -1873,6 +1873,8 @@ type recordingProxyProvider struct {
 	gotPath    string
 	gotBody    []byte
 	gotModel   string
+	// gotContentType is the content type the gateway handed ProxyNative.
+	gotContentType string
 	// onProxy, when set, runs at the head of ProxyNative — i.e. while the
 	// request is still in flight — so a test can inspect live state such as the
 	// active-request registry.
@@ -1890,7 +1892,7 @@ func (p *recordingProxyProvider) CompleteStream(ctx context.Context, _ routing.T
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}})
 }
 
-func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, path string, body []byte) (*provider.ProxyResponse, error) {
+func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, path string, body []byte, contentType string) (*provider.ProxyResponse, error) {
 	// Runs while the request is registered as in-flight (proxyNative adds it to
 	// the active registry before dispatching here), so a test can observe the
 	// live row from inside the call.
@@ -1899,6 +1901,7 @@ func (p *recordingProxyProvider) ProxyNative(_ context.Context, _ routing.Target
 	}
 	p.proxyCalls++
 	p.gotPath = path
+	p.gotContentType = contentType
 	p.gotBody = append([]byte(nil), body...)
 	var probe struct {
 		Model string `json:"model"`

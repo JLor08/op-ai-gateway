@@ -902,7 +902,7 @@ func TestAnthropicClientProxyNativeForwardsRawBodyVersionAndAuth(t *testing.T) {
 	ctx := WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-native")
 	// An api-key target (no Masquerade) is relayed verbatim; the subscription
 	// masquerade injection is pinned in anthropic_masquerade_test.go.
-	resp, err := client.ProxyNative(ctx, anthropicTarget(upstream.URL+"/"), "/v1/messages", []byte(anthropicNativeBody))
+	resp, err := client.ProxyNative(ctx, anthropicTarget(upstream.URL+"/"), "/v1/messages", []byte(anthropicNativeBody), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}
@@ -967,7 +967,7 @@ func TestAnthropicClientProxyNativeAlwaysSendsAnthropicVersion(t *testing.T) {
 			upstream := httptest.NewServer(capture.handler(writeAnthropicOK))
 			defer upstream.Close()
 
-			resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(tc.ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+			resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(tc.ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`), "application/json")
 			if err != nil {
 				t.Fatalf("ProxyNative returned %v", err)
 			}
@@ -987,7 +987,7 @@ func TestAnthropicClientProxyNativeForwardsTargetExtraHeaders(t *testing.T) {
 	defer upstream.Close()
 	ctx := WithUpstreamAuthHeaders(context.Background(), "x-api-key", "sk-ant-x", map[string]string{"anthropic-beta": "prompt-caching-2024-07-31"})
 
-	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}
@@ -1009,7 +1009,7 @@ func TestAnthropicClientProxyNativeRelaysUpstreamErrorStatusVerbatim(t *testing.
 	}))
 	defer upstream.Close()
 
-	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	resp, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v, want the 429 relayed as a response", err)
 	}
@@ -1030,7 +1030,7 @@ func TestAnthropicClientProxyNativeMapsTransportFailureToUnavailable(t *testing.
 	endpoint := upstream.URL
 	upstream.Close() // nothing listens any more
 
-	_, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(endpoint), "/v1/messages", []byte(`{}`))
+	_, err := NewAnthropicClient(http.DefaultClient).ProxyNative(context.Background(), anthropicTarget(endpoint), "/v1/messages", []byte(`{}`), "application/json")
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
 	}
@@ -1057,7 +1057,7 @@ func TestAnthropicClientProxyNativeDoesNotFollowRedirects(t *testing.T) {
 	httpClient := &http.Client{}
 	ctx := WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-secret")
 
-	resp, err := NewAnthropicClient(httpClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`))
+	resp, err := NewAnthropicClient(httpClient).ProxyNative(ctx, anthropicTarget(upstream.URL), "/v1/messages", []byte(`{"model":"m"}`), "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v, want the 307 handed back as a response", err)
 	}
