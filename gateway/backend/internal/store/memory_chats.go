@@ -25,12 +25,21 @@ const defaultChatMemoryMaxBytes = 67108864
 // single blob larger than the whole budget is kept as the SOLE entry rather
 // than evicted away to empty. The budget counts blob bytes only, NOT process
 // RSS. Chats are owner-scoped: ChatsByUser filters by userID.
+//
+// The chat_blobs surface (PutChatBlob, ChatBlobByID, ChatBlobOwner,
+// ChatBlobsByIDs) lives in the same store and under the same budget: an entry is
+// a chat TOGETHER with its chat_blobs, the payload bytes of both count toward
+// maxBytes, and DeleteChat or eviction of a chat drops its blobs with it (the
+// in-RAM equivalent of the SQL chat_blobs.chat_id ON DELETE CASCADE).
 type MemoryChatStore struct {
 	mu       sync.Mutex
 	maxBytes int
 	bytes    int
 	order    []string // insertion order, oldest first
 	records  map[string]Chat
+
+	blobs       map[string]ChatBlob // chat_blobs by blob id
+	chatBlobIDs map[string][]string // chat id -> ids of its blobs, in put order
 }
 
 // NewMemoryChatStore constructs a MemoryChatStore with the given byte budget.
@@ -40,8 +49,10 @@ func NewMemoryChatStore(maxBytes int) *MemoryChatStore {
 		maxBytes = defaultChatMemoryMaxBytes
 	}
 	return &MemoryChatStore{
-		maxBytes: maxBytes,
-		records:  make(map[string]Chat),
+		maxBytes:    maxBytes,
+		records:     make(map[string]Chat),
+		blobs:       make(map[string]ChatBlob),
+		chatBlobIDs: make(map[string][]string),
 	}
 }
 
@@ -120,8 +131,9 @@ func (m *MemoryChatStore) ChatsByUser(ctx context.Context, userID string) ([]Cha
 	return out, nil
 }
 
-// DeleteChat removes id's blob and subtracts its bytes from the budget. Returns
-// ErrNotFound if it is not (or no longer, e.g. already evicted) held.
+// DeleteChat removes id's blob and its chat_blobs and subtracts all their bytes
+// from the budget. Returns ErrNotFound if it is not (or no longer, e.g. already
+// evicted) held.
 func (m *MemoryChatStore) DeleteChat(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -131,6 +143,7 @@ func (m *MemoryChatStore) DeleteChat(ctx context.Context, id string) error {
 	}
 	delete(m.records, id)
 	m.bytes -= len(rec.Blob)
+	m.dropChatBlobs(id)
 	for i, oid := range m.order {
 		if oid == id {
 			m.order = append(m.order[:i], m.order[i+1:]...)
@@ -141,14 +154,100 @@ func (m *MemoryChatStore) DeleteChat(ctx context.Context, id string) error {
 }
 
 // evict drops the oldest entries (by insertion order) until the byte budget is
-// satisfied. len(m.order) > 1 guarantees the most-recently touched entry is
-// never evicted away to empty — a single oversized blob is kept as the sole
-// entry. Callers must hold m.mu.
+// satisfied. An entry is a chat together with its chat_blobs: evicting it
+// subtracts the transcript AND every blob's bytes. len(m.order) > 1 guarantees
+// the most-recently touched entry is never evicted away to empty — a single
+// oversized blob is kept as the sole entry. Callers must hold m.mu.
 func (m *MemoryChatStore) evict() {
 	for m.bytes > m.maxBytes && len(m.order) > 1 {
 		oldest := m.order[0]
 		m.order = m.order[1:]
 		m.bytes -= len(m.records[oldest].Blob)
 		delete(m.records, oldest)
+		m.dropChatBlobs(oldest)
 	}
+}
+
+// dropChatBlobs removes every chat_blobs entry of chatID and subtracts their
+// payload bytes from the budget. It is the cascade DeleteChat and evict share,
+// so a chat's blobs can never outlive it as uncounted RAM. A chat without blobs
+// is a no-op. Callers must hold m.mu.
+func (m *MemoryChatStore) dropChatBlobs(chatID string) {
+	for _, id := range m.chatBlobIDs[chatID] {
+		m.bytes -= len(m.blobs[id].Blob)
+		delete(m.blobs, id)
+	}
+	delete(m.chatBlobIDs, chatID)
+}
+
+// PutChatBlob stores one chat_blobs entry, mirroring SQLStore.PutChatBlob: it
+// is a dumb byte store (the service layer seals, allow-lists the content type
+// and caps the size before calling), a blob whose chat is not held is
+// ErrNotFound (the in-RAM foreign-key violation) and an id already taken is
+// ErrConflict. A refused put never touches the budget. Like Chat.Blob, the byte
+// slice is held, not copied: the caller must not mutate it after the call.
+//
+// len(blob.Blob) is added to the byte budget (ByteLen is metadata and is not
+// consulted) and eviction re-runs, so enough blobs push the oldest chats out.
+// The chat the blob belongs to is not exempt: if it is the oldest entry and the
+// store is over budget it is evicted together with the blob it just received,
+// exactly as UpdateChat can evict the chat it just grew.
+func (m *MemoryChatStore) PutChatBlob(ctx context.Context, blob ChatBlob) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.records[blob.ChatID]; !ok {
+		return ErrNotFound
+	}
+	if _, taken := m.blobs[blob.ID]; taken {
+		return ErrConflict
+	}
+	m.blobs[blob.ID] = blob
+	m.chatBlobIDs[blob.ChatID] = append(m.chatBlobIDs[blob.ChatID], blob.ID)
+	m.bytes += len(blob.Blob)
+	m.evict()
+	return nil
+}
+
+// ChatBlobByID returns the full entry (payload included) for a blob id, or
+// ErrNotFound. Like the SQL driver it does NOT check which chat the caller may
+// read from: a caller that serves a blob to a user resolves ownership first
+// (ChatBlobOwner, or ChatBlobsByIDs which scopes by chat itself).
+func (m *MemoryChatStore) ChatBlobByID(ctx context.Context, id string) (ChatBlob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	blob, ok := m.blobs[id]
+	if !ok {
+		return ChatBlob{}, ErrNotFound
+	}
+	return blob, nil
+}
+
+// ChatBlobOwner returns the id of the chat a blob belongs to, or ErrNotFound.
+func (m *MemoryChatStore) ChatBlobOwner(ctx context.Context, id string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	blob, ok := m.blobs[id]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return blob.ChatID, nil
+}
+
+// ChatBlobsByIDs returns the named blobs of ONE chat keyed by blob id, with the
+// SQL driver's ownership-by-construction: an id that exists but belongs to
+// another chat is simply absent from the result, exactly like an id that does
+// not exist at all. An empty (or nil) ids returns an empty, non-nil map.
+func (m *MemoryChatStore) ChatBlobsByIDs(ctx context.Context, chatID string, ids []string) (map[string]ChatBlob, error) {
+	out := make(map[string]ChatBlob, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		if blob, ok := m.blobs[id]; ok && blob.ChatID == chatID {
+			out[id] = blob
+		}
+	}
+	return out, nil
 }
