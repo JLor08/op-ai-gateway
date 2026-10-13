@@ -1493,7 +1493,7 @@ const de = {
   errorImagesBlobNotOwned:
     'Ein Bild im Verlauf gehört nicht zu diesem Chat. Bitte laden Sie die Seite neu und versuchen Sie es erneut.',
   errorChatRunHistoryTooLarge:
-    'Die Bilder in diesem Verlauf sind zu groß, um sie an das Modell zu senden. Starten Sie einen neuen Chat und versuchen Sie es erneut.',
+    'Die Bilder in diesem Verlauf sind zu groß, um sie an das Modell zu senden. Entfernen Sie ältere Bilder aus dem Verlauf und versuchen Sie es erneut.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
@@ -4200,7 +4200,7 @@ const en: PortalMessages = {
   errorImagesBlobNotOwned:
     'An image in the history does not belong to this chat. Please reload the page and try again.',
   errorChatRunHistoryTooLarge:
-    'The images in this conversation are too large to send to the model. Start a new chat and try again.',
+    'The images in this conversation are too large to send to the model. Remove some older images from the conversation and try again.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).

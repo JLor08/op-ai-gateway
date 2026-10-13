@@ -482,6 +482,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
     });
 
+    // downloadBinary resolves false for every failure it knows of, but a browser
+    // API can still throw while the file is being built (here: no object URL can
+    // be created for the decoded blob). That used to escape ImageTurn's click
+    // handler as an unhandled promise rejection with nothing shown; it has to
+    // surface as the same inline error, and not reject.
+    it('tells the user, without an unhandled rejection, when building the file throws', async () => {
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => {
+            throw new Error('object url quota exceeded');
+          }),
+          revokeObjectURL: vi.fn(),
+        });
+
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            promptText="a cat"
+            content={[{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }]}
+          />,
+        );
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadImage }));
+
+        expect(await screen.findByText(t.chatImageDownloadError)).toBeInTheDocument();
+        // Let any rejection that escaped the handler reach the process hook.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    });
+
     // Stored images (binary payload store) are short gateway urls, not data:
     // URLs. Save has to fetch the bytes from the owner-scoped endpoint, and the
     // saved file's extension is whatever that response's Content-Type says --

@@ -59,6 +59,17 @@ describe('extensionFor', () => {
     expect(extensionFor('application/octet-stream')).toBe('bin');
     expect(extensionFor('text/html; charset=utf-8')).toBe('bin');
   });
+
+  // The subtype of a served Content-Type is server input and ends up in a file
+  // name, so only the formats the gateway stores map to an extension. Echoing
+  // the subtype back would let "image/bat" save as "x.bat".
+  it.each(['image/bat', 'image/svg+xml', 'image/x-icon', 'image/constructor', 'image/__proto__'])(
+    'falls back to bin for the image subtype outside the allow-list: %s',
+    (type) => {
+      expect(extensionFor(type)).toBe('bin');
+      expect(extensionFor(`data:${type};base64,AAAA`)).toBe('bin');
+    },
+  );
 });
 
 describe('downloadBinary', () => {
@@ -272,16 +283,18 @@ describe('downloadBinary from a gateway url', () => {
     expect(anchor?.download).toBe('already-named.webp');
   });
 
-  it('also fetches an absolute http(s) url', async () => {
-    const fetchMock = vi.fn(async () => okResponse([1], 'image/gif'));
-    vi.stubGlobal('fetch', fetchMock);
+  // The extension is allow-listed, not echoed from the served subtype: a
+  // hostile Content-Type must not choose the saved file's extension.
+  it('saves a response whose image subtype is not allow-listed as .bin, not .bat', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => okResponse([1], 'image/bat')),
+    );
 
-    const ok = await downloadBinary((ext) => `cat.${ext}`, 'https://gw.example/chat-blobs/x');
+    const ok = await downloadBinary((ext) => `cat.${ext}`, GATEWAY_URL);
 
     expect(ok).toBe(true);
-    expect(fetchMock).toHaveBeenCalledWith('https://gw.example/chat-blobs/x', {
-      credentials: 'same-origin',
-    });
+    expect(anchor?.download).toBe('cat.bin');
   });
 
   // The failure modes are all reported as `false`, never thrown: this runs
@@ -331,18 +344,35 @@ describe('downloadBinary from a gateway url', () => {
     expect(clicks).toBe(0);
   });
 
-  // Only a gateway path or an http(s) url is fetched. Anything else (a
-  // scripting scheme, a protocol-relative host) never reaches the network.
-  it.each(['javascript:alert(1)', '//evil.example/x.png', 'blob:foo', 'chat-blobs/x', ''])(
-    'does not fetch %j',
-    async (url) => {
-      const fetchMock = vi.fn();
-      vi.stubGlobal('fetch', fetchMock);
+  // Only a rooted path under the chat-blobs endpoint is fetched, so the
+  // session cookie can only ever reach this origin's own endpoint. Everything
+  // else never reaches the network: a scripting scheme, a blob: url, a bare
+  // word, an absolute url (cross-origin, and same-host too -- the only
+  // producer emits a path), the protocol-relative "//host" and its backslash /
+  // tab spellings ("/\host" and "/<tab>/host" resolve cross-origin once the
+  // URL parser has normalised them), and a rooted path to some other endpoint.
+  it.each([
+    'javascript:alert(1)',
+    '//evil.example/x.png',
+    '/\\evil.example/x.png',
+    '/\t/evil.example/x.png',
+    '/\n/evil.example/x.png',
+    'https://evil.example/x.png',
+    'https://evil.example/api/portal/chat-blobs/6f1c2a52',
+    'http://gw.example/api/portal/chat-blobs/6f1c2a52',
+    '/api/portal/other/6f1c2a52',
+    '/api/portal/chat-blobs',
+    ' /api/portal/chat-blobs/6f1c2a52',
+    'blob:foo',
+    'chat-blobs/x',
+    '',
+  ])('does not fetch %j', async (url) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
 
-      await expect(downloadBinary((ext) => `cat.${ext}`, url)).resolves.toBe(false);
+    await expect(downloadBinary((ext) => `cat.${ext}`, url)).resolves.toBe(false);
 
-      expect(fetchMock).not.toHaveBeenCalled();
-      expect(createObjectURL).not.toHaveBeenCalled();
-    },
-  );
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
 });

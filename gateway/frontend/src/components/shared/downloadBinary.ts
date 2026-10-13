@@ -13,10 +13,11 @@
 //    the binary payload store existed, and what an old transcript still holds.
 //    Decoded in place; the media type is the URL's own prefix. Nothing here
 //    assumes PNG.
-//  - A gateway url (/api/portal/chat-blobs/{id}, or any other http(s) / rooted
-//    path): what a stored image is now. The bytes live behind an owner-scoped
-//    endpoint, so they are fetched (with the session cookie) and the media
-//    type is whatever the response's Content-Type says.
+//  - A gateway url (/api/portal/chat-blobs/{id}): what a stored image is now.
+//    The bytes live behind an owner-scoped endpoint, so they are fetched (with
+//    the session cookie) and the media type is whatever the response's
+//    Content-Type says. The url comes out of a persisted transcript, so only a
+//    rooted path under that endpoint is ever fetched (see isFetchableUrl).
 //
 // The file name is a string, or a function of the extension: a gateway url has
 // no media type until its response arrives, so a caller cannot build the final
@@ -39,13 +40,26 @@ export async function downloadBinary(name: DownloadName, url: string): Promise<b
   return false;
 }
 
-// A url worth a network round trip: a gateway path ("/api/portal/...") or an
-// absolute http(s) url. Deliberately not "anything that isn't a data: URL": a
-// scripting scheme, a blob: url, a bare word, and a protocol-relative
-// "//host/x" (which a "/"-prefix test alone would let through to another
-// host) must come back as a plain false, not as a fetch.
+// The only path a stored image is served from. The sole producer of a
+// non-data: url here is the chat-blobs serving endpoint (a rooted path, never
+// an absolute url), so nothing else is worth fetching with the session cookie
+// attached.
+const CHAT_BLOBS_PATH = '/api/portal/chat-blobs/';
+
+// A url worth a network round trip: a rooted path under the chat-blobs
+// endpoint, i.e. a url that can only ever resolve against THIS origin.
+//
+// The prefix is a literal, which is what makes the string test sufficient
+// where a bare "starts with /" test is not: "/\evil/x" and "/<tab>/evil/x" both
+// pass a "/"-then-not-"/" check, yet the URL parser (the one fetch uses) reads
+// each as the protocol-relative "//evil/x" -- another host, with the session
+// cookie. Here the characters after the leading "/" are fixed ("api/..."), so
+// no authority can be introduced; the tabs and newlines the parser strips from
+// the rest of a url only change the path or query. A scripting scheme, a blob:
+// url, a bare word, "//host/x", "/\host/x" and any absolute (cross-origin)
+// url all come back as a plain false, never a fetch.
 function isFetchableUrl(url: string): boolean {
-  return /^https?:\/\//i.test(url) || /^\/(?!\/)/.test(url);
+  return url.startsWith(CHAT_BLOBS_PATH);
 }
 
 function resolveName(name: DownloadName, mediaType: string): string {
@@ -106,13 +120,24 @@ function saveBlob(blob: Blob, filename: string): void {
   }
 }
 
+// The extensions a download may be saved under, by image subtype. An allow-list
+// on purpose: the subtype of a fetched response's Content-Type is server input,
+// and echoing it into the file name would let a hostile "image/bat" save as
+// "x.bat". A Map rather than an object literal so a subtype named like an
+// Object.prototype member ("constructor") is not a hit.
+const EXTENSION_BY_SUBTYPE = new Map([
+  ['png', 'png'],
+  ['jpeg', 'jpg'],
+  ['webp', 'webp'],
+  ['gif', 'gif'],
+]);
+
 // extensionFor maps a media type to a file extension for the download name. It
 // accepts a bare media type (a response's Content-Type: parameters and letter
-// case are ignored) or a data: URL, whose prefix is one. A bare fallback
-// rather than a lookup table: the only producer today is sd-server via
-// output_format, and inventing entries for types nothing emits would be dead
-// code.
+// case are ignored) or a data: URL, whose prefix is one. Only the image
+// formats the gateway stores and serves map to their own extension (jpeg
+// becomes the conventional jpg); anything else is `bin`.
 export function extensionFor(mediaTypeOrDataUrl: string): string {
   const match = /^(?:data:)?image\/([a-z0-9+.-]+)/i.exec(mediaTypeOrDataUrl);
-  return match ? match[1].toLowerCase().replace('jpeg', 'jpg') : 'bin';
+  return (match && EXTENSION_BY_SUBTYPE.get(match[1].toLowerCase())) || 'bin';
 }

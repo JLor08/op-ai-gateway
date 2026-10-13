@@ -83,6 +83,14 @@ func TestMemoryChatBlobPutGetRoundTrip(t *testing.T) {
 	}
 	mustPutBlob(ctx, t, m, want)
 
+	// The budget counts the SEALED payload (len(Blob)), never the ByteLen
+	// metadata: want's ByteLen (5e9, the plaintext size a real blob would
+	// report) differs from its 6 stored bytes on purpose, so counting ByteLen
+	// instead would blow the budget by orders of magnitude and fail here.
+	if wantBytes := 2 + len(want.Blob); m.bytes != wantBytes {
+		t.Fatalf("bytes = %d after the put, want %d (the chat's 2 + len(Blob), not ByteLen)", m.bytes, wantBytes)
+	}
+
 	got, err := m.ChatBlobByID(ctx, "blob_rt")
 	if err != nil {
 		t.Fatalf("ChatBlobByID: %v", err)

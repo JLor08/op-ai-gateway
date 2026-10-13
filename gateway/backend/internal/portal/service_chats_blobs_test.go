@@ -736,6 +736,45 @@ func TestCommitAssistantExtractsGeneratedImages(t *testing.T) {
 	}
 }
 
+// The image pipeline (gateway/chat_runs_images.go) names a generated image
+// "image/" + the upstream's output_format, and the run commit refuses any type
+// outside chatBlobMediaTypes -- so a format the allow-list lacks is a generated
+// image lost at commit. The two sets live in different packages and nothing
+// links them, so this pins the formats the pipeline emits today (sd-server's
+// png, jpeg and webp): narrowing the allow-list below them, or this set
+// drifting from the pipeline's, fails here rather than in a user's chat.
+func TestChatBlobAllowListCoversTheGeneratedImageFormats(t *testing.T) {
+	ctx := context.Background()
+	for _, mediaType := range []string{"image/png", "image/jpeg", "image/webp"} {
+		t.Run(mediaType, func(t *testing.T) {
+			if _, listed := chatBlobMediaTypes[mediaType]; !listed {
+				t.Fatalf("%s is not in chatBlobMediaTypes: a generated image of that format would be refused at commit", mediaType)
+			}
+			e := newBlobTestEnv(t, false, 0)
+			chatID := e.emptyChat(t)
+			if _, err := e.send(chatID, json.RawMessage(`"a cat"`)); err != nil {
+				t.Fatal(err)
+			}
+			raw := blobTestBytes(64, 5)
+			parts := json.RawMessage(fmt.Sprintf(`[{"type":"image_url","image_url":{"url":%q}}]`, dataURL(mediaType, raw)))
+			if err := e.svc.CommitAssistant(ctx, e.owner, chatID, AssistantTurn{ContentParts: parts}, "complete"); err != nil {
+				t.Fatalf("CommitAssistant refused a generated %s image: %v", mediaType, err)
+			}
+			urls := storedImageURLs(t, e.stored(t, chatID))
+			if len(urls) != 1 || !strings.HasPrefix(urls[0], gatewayBlobPrefix) {
+				t.Fatalf("stored urls = %v", urls)
+			}
+			row, err := e.mem.ChatBlobByID(ctx, strings.TrimPrefix(urls[0], gatewayBlobPrefix))
+			if err != nil {
+				t.Fatalf("ChatBlobByID: %v", err)
+			}
+			if row.ContentType != mediaType || !bytes.Equal(row.Blob, raw) {
+				t.Fatalf("blob row = type %s, %d bytes: not the generated image", row.ContentType, len(row.Blob))
+			}
+		})
+	}
+}
+
 // The allow-list and the cap apply to a generated image exactly as to an
 // uploaded one, and a refusal leaves the transcript as it was.
 func TestCommitAssistantRefusesBadGeneratedImages(t *testing.T) {

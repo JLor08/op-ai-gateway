@@ -58,7 +58,7 @@ export function ImageTurn({
   // Tracks which image (by index) most recently failed to download -- a
   // truncated/corrupted persisted data URL decodes to nothing, a gateway url
   // whose fetch fails (network, 404 for a purged blob) saves nothing.
-  // downloadBinary never throws or rejects for this, but it also must not fail
+  // downloadBinary reports these as `false`, but it also must not fail
   // silently: the whole
   // point of this feature is that a failed download is visible, so an
   // inline message is shown next to that image's own button rather than a
@@ -112,11 +112,14 @@ export function ImageTurn({
                 // The name is a function of the extension because a stored
                 // image's media type is only known once its bytes have been
                 // fetched; a legacy data: URL gets its extension from its own
-                // prefix through the same call. downloadBinary never rejects.
-                void downloadBinary(
-                  (extension) => downloadNameFor(turnId, index, extension),
-                  url,
-                ).then((ok) => setFailedIndex(ok ? null : index));
+                // prefix through the same call. downloadBinary resolves false
+                // for every failure it knows of; the catch is for the one it
+                // does not (a browser API throwing while the file is built), so
+                // that surfaces as the same inline error instead of an
+                // unhandled rejection.
+                void downloadBinary((extension) => downloadNameFor(turnId, index, extension), url)
+                  .then((ok) => setFailedIndex(ok ? null : index))
+                  .catch(() => setFailedIndex(index));
               }}
               sx={{ alignSelf: 'flex-end' }}
             >

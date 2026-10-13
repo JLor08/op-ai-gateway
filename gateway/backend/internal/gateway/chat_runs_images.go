@@ -147,6 +147,12 @@ const (
 // backstop -- and a run whose commit is refused for exceeding THAT cap is
 // exactly the silent-success failure mode finishRunWithParts now surfaces
 // loudly (see commitFailureCode in chat_runs.go).
+//
+// Every subtype this accepts becomes "image/<subtype>" in a data: URL that the
+// run commit then stores as a chat blob, and the commit refuses a media type
+// outside the portal's chatBlobMediaTypes allow-list (service_chats_blobs.go).
+// The two sets MUST stay in sync: a format the pipeline can emit that the
+// allow-list lacks is a generated image lost at commit with a generic error.
 var imageSubtypePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9+.-]{0,31}$`)
 
 // executeImageRun is executeRun's image branch: one buffered request to the
@@ -439,6 +445,10 @@ func lastUserPrompt(history []portal.ChatAPIMessage) string {
 // The two failures are checked in this order on purpose: "produced nothing"
 // is the more fundamental fact, and a response with no image at all should
 // not be reported as one whose media type could not be named.
+//
+// The media type named here (image/<output_format>) must be one the portal's
+// chatBlobMediaTypes allow-list accepts, or the commit refuses the image: see
+// imageSubtypePattern.
 func imagePartsFrom(resp imagesResponse) (json.RawMessage, error) {
 	produced := 0
 	for _, item := range resp.Data {

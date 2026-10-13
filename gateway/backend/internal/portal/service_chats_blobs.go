@@ -32,6 +32,13 @@ const (
 // becomes the Content-Type of a same-origin, cookie-authenticated URL, so
 // nothing outside this set is ever stored -- in particular never text/html or
 // image/svg+xml. Extend it deliberately, per consumer.
+//
+// It must stay in sync with the image pipeline's output formats: a generated
+// image is committed as "image/" + the upstream's output_format (see
+// imagePartsFrom / imageSubtypePattern in gateway/chat_runs_images.go), and the
+// commit refuses a type missing from this set, losing the image. Every format
+// the pipeline can emit has to be listed here; TestChatBlobAllowListCoversTheGeneratedImageFormats
+// pins the ones it emits today (png, jpeg, webp).
 var chatBlobMediaTypes = map[string]struct{}{
 	"image/png":  {},
 	"image/jpeg": {},
