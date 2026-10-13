@@ -34,7 +34,7 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 //
 //   - One batched ChatBlobsByIDs for all the distinct ids, scoped to chatID, so
 //     the store returns only blobs this chat holds. An id that is another chat's,
-//     another user's, evicted or never stored is simply absent. A transcript can
+//     another user's or never stored is simply absent. A transcript can
 //     carry any id (create and a bare autosave store what they are given), so
 //     this scoping is what stops a grafted reference from becoming someone
 //     else's bytes. It is not the only guard: a row of another chat, or of a type
@@ -42,7 +42,9 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 //   - An absent image is replaced by unavailableImagePart and the run goes on.
 //     The alternatives are worse: leaving the reference sends an upstream a
 //     relative url it rejects, or (Anthropic) drops silently; refusing the run
-//     would strand a chat whose old image a RAM store has evicted. The stored
+//     would strand a chat whose transcript carries one foreign or missing id
+//     (a chat evicted from the RAM store is gone with its blobs and never gets
+//     here: the run is refused at the chat lookup). The stored
 //     document is not touched; only the history of this run is.
 //   - The bytes carried are bounded by maxRunHistoryBytes, counted per
 //     occurrence (the request carries an image once per occurrence). The

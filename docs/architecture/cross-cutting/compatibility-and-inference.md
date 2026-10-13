@@ -1691,8 +1691,7 @@ returns (`resolveChatBlobRefs`) for every **non-image** run: all
 through **one** batched, **chat-scoped** `ChatBlobsByIDs` call, so a foreign id
 grafted into the transcript is simply absent and never resolves to another
 user's bytes, and a real remote provider receives real bytes exactly as before.
-A reference with no stored bytes (foreign, evicted from the RAM store, never
-stored) is replaced by a `[image unavailable]` text part: the model is told, the
+A reference with no stored bytes (a foreign or never-stored id) is replaced by a `[image unavailable]` text part: the model is told, the
 run continues, and the stored document is untouched. The bytes one run carries
 are bounded by `MaxRunHistoryBytes`, counted per occurrence; a run over it is
 refused `400 portal.chat_run_history_too_large` **before** its turn is stored
@@ -1769,7 +1768,7 @@ zero are the same thing on the wire). It used to feed the composer's
 remaining-image-capacity line and the Send refusal behind it
 ([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
 (d)); with the images out of the document that estimate would have divided into
-~47-character references, so it is removed, and **no portal code consumes the
+~60-character references, so it is removed, and **no portal code consumes the
 field any more**. A text document that overflows the cap is still the server's
 `400 portal.chat_too_large`, and the bounds that now limit images
 (`MaxChatBlobBytes`, `MaxRunHistoryBytes`) are enforced server-side with their

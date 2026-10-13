@@ -1276,8 +1276,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     it("never raises the count ceiling above the gateway's hard cap of 8", async () => {
-      // The model may only NARROW the cap: a reported 16 is still 8 (a gateway
-      // image-storage limit), in the helper, the clamp and the run body.
+      // The model may only NARROW the cap: a reported 16 is still 8 (the portal's
+      // own per-request limit), in the helper, the clamp and the run body.
       await openAdvancedFor({ max_batch_count: 16 });
 
       const count = screen.getByLabelText(t.chatImageCount);

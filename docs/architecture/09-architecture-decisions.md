@@ -1897,17 +1897,18 @@ this decision chose stands: an image is still an OpenAI-style `image_url` part,
 it still replays as a vision input for free, it still inherits the transcript's
 sealing (now through the same cipher on its own row), and "stored as-is, with a
 real binary download" still holds. Four statements above no longer describe the
-code. "Stored INLINE" and the 4 MiB ceiling "accepted for v1": a generated (and
-an uploaded) image is extracted at the run commit into the owner-scoped
-`chat_blobs` store and the part carries `/api/portal/chat-blobs/{id}`, so the
-cap, still `portal.MaxChatContentBytes` and still checked on the sealed document,
-bounds the **text** and no longer every image "for the thread's life" — a busy
-image thread no longer runs out, and a legacy inline thread migrates on its next
-run. "Rejected: a separate blob store for v1" and "Lifting the ceiling is issue
-#124" are resolved, and the inline-image entry in
+code. (i) "Stored INLINE" and the 4 MiB ceiling "accepted for v1": a generated
+(and an uploaded) image is extracted at the run commit into the owner-scoped
+`chat_blobs` store and the part carries `/api/portal/chat-blobs/{id}`. (ii) The
+cap as a budget every image shares "for the thread's life": it is still
+`portal.MaxChatContentBytes` and still checked on the sealed document, but it
+bounds the **text** only, so a busy image thread no longer runs out and a legacy
+inline thread migrates on its next run. (iii) "Rejected: a separate blob store
+for v1" and "Lifting the ceiling is issue #124": both are resolved, and the
+inline-image entry in
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) is
-retired (what is accepted now is recorded there in its place). And "the image
-rides inside the sealed blob" is true only of a chat that has not run since the
+retired (what is accepted now is recorded there in its place). (iv) "The image
+rides inside the sealed blob": true only of a chat that has not run since the
 change. What stays is the loudness: a failed
 terminal commit still ends the run as an error (its causes are now a too-large
 *text* document or a payload the store refuses, no longer an image that outgrew
@@ -1942,7 +1943,7 @@ zero disables the feature instead of inventing a number.
 **Amended by [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (g) (the capacity estimate is removed).** The
 argument above was sound while an image consumed the shared budget the composer
 could measure. Once the payloads live in `chat_blobs` it is not: a stored image
-is a ~47-character reference, so the client's estimate (the largest `image_url`
+is a ~60-character reference, so the client's estimate (the largest `image_url`
 URL as the per-image cost, divided into the served cap) would report millions of
 images left, and the cap no longer binds images at all. The composer therefore
 **states no remaining room, and `send()` no longer refuses an image turn on
@@ -3756,7 +3757,7 @@ is the wrong shape for it.
   to nothing. Reported defaults are shown as placeholder/helper text and **never
   pre-filled**, because a pre-filled knob would be sent as an explicit override and
   break "blank = leave sd-server's own default". The portal's count `n` keeps its
-  hard cap of 8 (a gateway image-storage limit), which a model's
+  hard cap of 8 (a portal-side per-request limit, not a model limit), which a model's
   `max_batch_count` may only narrow.
 
 **Why ADR-039's table is NOT extended.** `model_mapping_capabilities` holds
@@ -3831,9 +3832,11 @@ includes the bounds that replace it.
   ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)) is exactly what
   it was for an inline image. The store is **payload-type-agnostic** (bytes plus a
   content type), and **images are the only consumer in v1**: the type
-  restriction lives in one allow-list in the service layer, so a future audio,
-  PDF or file payload needs a deliberate allow-list entry and a renderer, not a
-  new storage layer. The memory driver keeps a parallel map that is dropped
+  restriction lives in one allow-list in the service layer. The store and the
+  serving path are ready for another payload type (audio, PDF, a file), which
+  would need a deliberate allow-list entry, a part shape the extract and
+  resolve walk understands, and a renderer — but no new storage layer; none of
+  that exists yet. The memory driver keeps a parallel map that is dropped
   with its chat on both `DeleteChat` and the FIFO `evict()`, and whose bytes
   **count against the 64 MiB memory budget** — otherwise the RAM path would be
   unbounded, which is the very problem this decision exists to fix on the other
@@ -3842,8 +3845,9 @@ includes the bounds that replace it.
   already carried it — `image_url` is reused, not replaced.** An image part's
   `url` is `/api/portal/chat-blobs/{id}` instead of a `data:` URL. The renderer
   (`<img src={url}>`) and the wire format are unchanged, history construction
-  still treats it as an `image_url` part, and the mechanism is generic: a
-  gateway URL in any part that can carry a `data:` one. **Old inline `data:`
+  still treats it as an `image_url` part. The store and the serving endpoint are
+  payload-type-agnostic, but only `image_url` parts are extracted and resolved
+  today (the walk, `rewriteImageParts`, knows no other part shape). **Old inline `data:`
   parts keep rendering and keep running** (additive, no forced migration): a
   legacy chat converts lazily, on its next run, and one that is never run again
   stays inline and works.
@@ -3885,7 +3889,7 @@ includes the bounds that replace it.
   bytes, through **one** batched `ChatBlobsByIDs(chatID, ids)` — scoped to the
   chat in the query itself, so a grafted foreign id is simply absent and can
   never resolve to someone else's bytes. A reference with no stored bytes
-  (foreign, evicted from the RAM store, never stored) becomes a
+  (a foreign or never-stored id) becomes a
   `[image unavailable]` text part: the model is told, the run goes on, and the
   stored document is untouched. The image kind skips resolution entirely (its
   executor reads only the last prompt's text). The resolution sits in
@@ -3895,10 +3899,10 @@ includes the bounds that replace it.
   a duplicate turn.
 - **(e) The serving endpoint is hardened, because the content type is
   attacker-influenced on a same-origin, cookie-authenticated, navigable URL.**
-  `GET /api/portal/chat-blobs/{id}` takes the portal **session**, and
-  authorises on the **blob**, never on a transcript that mentions it (a
+  `GET /api/portal/chat-blobs/{id}` takes the standard portal auth (the
+  browser's `<img>` sends the session cookie), and authorises on the **blob**, never on a transcript that mentions it (a
   transcript can carry any id — create and a bare autosave do not validate the
-  URLs they store): the blob's chat must belong to the session's user, decided
+  URLs they store): the blob's chat must belong to the authenticated user, decided
   with two metadata-only lookups before any bytes are read or decrypted. Every
   way of not being the owner of a servable blob — missing, someone else's,
   chat deleted, evicted, an unlisted type — is the same `404
@@ -3912,12 +3916,14 @@ includes the bounds that replace it.
   `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
   and `Cache-Control: private, no-store` — the id is immutable, but the bytes are
   decrypted and private, and a long-lived `immutable` entry would park them in
-  the browser's disk cache. The session check is the **passive** one
-  (`ResolveSessionDetailNoTouch`): a thread of N images opens N of these in
-  parallel, and a `TouchSession` write per request would stampede the connection
-  pool; it is sound because the chat load that issued them already refreshed the
-  session, and a passive fetch must not be able to keep a session alive on its
-  own.
+  the browser's disk cache. The cookie leg of the auth is the **passive** session
+  check (`ResolveSessionDetailNoTouch`, so an `<img>` load does not extend the
+  idle window): a thread of N images opens N of these in parallel, and a
+  `TouchSession` write per request would stampede the connection pool; it is
+  sound because the chat load that issued them already refreshed the session, and
+  a passive fetch must not be able to keep a session alive on its own. The
+  route is not an inference endpoint, and the ownership check applies whatever
+  the credential.
 - **(f) Replacement bounds, both configurable, both refusing rather than
   trimming.** `MaxChatBlobBytes` (`OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`, default
   20 MiB, the composer's own upload limit) caps one decoded payload, enforced at
@@ -3933,7 +3939,7 @@ includes the bounds that replace it.
   the chat's lifetime; a soft per-chat ceiling is deferred
   ([§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **(g) The frontend stops estimating.** The image capacity estimate is removed
-  (a ~47-character URL would make "images left" a nonsense figure, and the cap no
+  (a ~60-character URL would make "images left" a nonsense figure, and the cap no
   longer binds images), so the composer states no remaining room and `send()` no
   longer refuses on it; the text overflow stays the server's `400
   portal.chat_too_large`. `max_content_bytes` is still served on the chat
@@ -3948,8 +3954,10 @@ bounded, one run's resolved history is bounded, one request body is bounded. Two
 costs are accepted on purpose. **Blobs are retained for the chat's lifetime and
 an edit or regenerate that drops a message leaves its image behind** — no prune,
 no reference counting — the price of cascade-only deletion. **A RAM-store chat
-that is evicted takes its images with it**, and a surviving transcript's URLs
-then answer 404 and resolve to `[image unavailable]`. The failure of a
+that is evicted takes its images with it** (the chat and its blobs are dropped
+together), so an already-open tab's image URLs then answer 404 and a run on that
+chat is refused as chat-not-found; `[image unavailable]` arises only for a
+foreign or missing id in a chat that still exists. The failure of a
 *generated* image's extraction at the assistant commit (it is too large or of an
 unlisted type) ends the run as `gateway.chat_run_commit_failed`
 ([ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)

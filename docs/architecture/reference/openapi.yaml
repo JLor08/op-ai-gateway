@@ -528,10 +528,12 @@ paths:
       summary: Raw bytes of one stored chat image (owner-scoped, hardened)
       description: >
         Serves a chat binary payload (an image) referenced from a transcript by
-        image_url.url "/api/portal/chat-blobs/{id}" (ADR-056). Called by the
-        browser's <img> with the session cookie, through the passive variant
-        of the portal session check (the session is validated but its idle
-        window is not extended). Authorization is on the blob's own chat: it must belong to
+        image_url.url "/api/portal/chat-blobs/{id}" (ADR-056). Standard portal
+        auth (session cookie, else bearer or internal loopback, scope
+        gateway:use); the browser's <img> uses the cookie, through the passive
+        variant of the session check (the session is validated but its idle
+        window is not extended). Ownership applies whatever the credential.
+        Authorization is on the blob's own chat: it must belong to
         the session's user, otherwise 404 portal.chat_blob_not_found, which is
         also the answer for a missing, deleted, evicted or non-servable blob (no
         existence leak). The response Content-Type is always one of the

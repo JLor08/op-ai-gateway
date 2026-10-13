@@ -855,15 +855,21 @@ is the gateway path `/api/portal/chat-blobs/{id}`
   (an `<img>` renders it; a navigation to it cannot execute anything) and
   `Cache-Control: private, no-store`: the id is immutable, but the bytes are
   decrypted and private, so they are not parked in a browser's disk cache.
-- **The session check is passive, deliberately.** The route uses
-  `ResolveSessionDetailNoTouch`: the same validation as §3 (known secret,
-  absolute and idle expiry, active user, `gateway:use`), but no `TouchSession`
-  write. A chat of N images opens N of these in parallel and a write each would
-  stampede the connection pool; skipping it is sound because the chat load that
-  issued them already refreshed the session, and a passive fetch must not be
-  able to keep a session alive on its own. Everything interactive keeps the
-  touching variant. The route is **not** an inference endpoint: no bearer or
-  loopback ladder, and `GET` only (`405` otherwise).
+- **Standard portal auth, with a passive cookie check, deliberately.** The
+  route is guarded like any portal read (`requireWebScopeNoTouch` →
+  `authenticateWebSession`): the internal loopback principal first, else the
+  session cookie, else a bearer token, with scope `gateway:use` (`401` without a
+  valid credential, `403 auth.insufficient_scope` without the scope). The
+  per-blob ownership check above applies whatever the principal, so a loopback
+  or foreign principal simply owns no blob and gets the `404`. The cookie leg
+  uses `ResolveSessionDetailNoTouch`: the same validation as §3 (known secret,
+  absolute and idle expiry, active user), but no `TouchSession` write, so an
+  `<img>` load does not extend the idle window. A chat of N images opens N of
+  these in parallel and a write each would stampede the connection pool;
+  skipping it is sound because the chat load that issued them already refreshed
+  the session, and a passive fetch must not be able to keep a session alive on
+  its own. Everything interactive keeps the touching variant. The route is
+  **not** an inference endpoint, and `GET` only (`405` otherwise).
 
 ## 14. Capture redaction of sensitive headers
 
