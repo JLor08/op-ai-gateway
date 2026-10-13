@@ -533,7 +533,7 @@ func (s *Server) relayImages(w http.ResponseWriter, r *http.Request, token auth.
 	s.proxyNative(w, r, nativeRelay{
 		token:    token,
 		target:   target,
-		path:     upstreamPath(target, req.APIFlavor),
+		path:     upstreamPath(target, req.APIFlavor, endpointImages),
 		raw:      raw,
 		pfReq:    req,
 		endpoint: endpointImages,
@@ -598,7 +598,7 @@ func (s *Server) relayImagesUpstreamError(w http.ResponseWriter, r *http.Request
 	// relayImagesUpstreamError is images-only, so ex.req.APIFlavor is always
 	// apiFlavorImages. A non-2xx upstream response is still a non-token
 	// request -- BillingQuantity stays 0, nothing was produced.
-	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitImage, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
 }
 
 // needsImagesErrorRelay reports whether a native-passthrough response must go

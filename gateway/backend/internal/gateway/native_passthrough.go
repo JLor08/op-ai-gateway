@@ -158,6 +158,15 @@ func targetIsImagesOnly(target routing.Target) bool {
 // ollama.go, anthropic_messages.go) and in proxyNative, kept here in one gateway-visible place so the
 // persisted usage row + the live ActiveRequest agree on the value.
 //
+// endpoint is the client endpoint the request arrived on, and it matters for
+// exactly one flavor: openai_images covers two endpoints, generations and edits,
+// so for that flavor the endpoint -- not the flavor -- picks the upstream path
+// (endpointImagesEdit -> /v1/images/edits, anything else -> generations). For
+// every other flavor it is ignored, which is why the translate handlers (which
+// can never serve images, and do not know which of the three text endpoints they
+// were reached from) pass endpointChat as a placeholder that cannot change the
+// answer.
+//
 // KNOWN LIMIT (cosmetic, diagnostic field only): a translate handler derives the
 // value from its own (re-)resolved target. If, on the same request, routing flips
 // to a passthrough-mode application between tryProxyNative's resolve and the
@@ -165,7 +174,7 @@ func targetIsImagesOnly(target routing.Target) bool {
 // applications for one model with different endpoint modes), this reports the
 // native path while the provider actually called the translate path. Not
 // client-reachable in practice and only mislabels one column.
-func upstreamPath(target routing.Target, apiFlavor string) string {
+func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpoint) string {
 	if target.Provider == "" {
 		return ""
 	}
@@ -174,6 +183,9 @@ func upstreamPath(target routing.Target, apiFlavor string) string {
 	// mode lookup and the provider fallbacks below apply -- both of which
 	// are chat/responses/messages concerns that do not exist for images.
 	if apiFlavor == apiFlavorImages {
+		if endpoint == endpointImagesEdit {
+			return "/v1/images/edits"
+		}
 		return "/v1/images/generations"
 	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
@@ -398,6 +410,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		req:        req,
 		target:     rel.target,
 		raw:        rel.raw,
+		endpoint:   rel.endpoint,
 		serverName: serverName,
 		start:      start,
 		id:         id,
@@ -412,7 +425,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// passthrough flavor, so the images unit must come from the CALLER's
 		// own endpoint identity here too, not only in images_handler.go's own
 		// two call sites.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor), nil)
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, "provider.unavailable", "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, http.StatusBadGateway, rel.pfReq.APIFlavor), nil)
 		return
 	}
 
@@ -547,7 +560,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// Same reasoning as the provider.unavailable branch above: this is a
 		// pre-response failure (nothing came back from sd-server at all), and
 		// it is still a non-token images request when pfReq.APIFlavor says so.
-		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor), nil)
+		s.recordUsage(start, rel.token, req, rel.target, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), body, httpStatus, rel.pfReq.APIFlavor), nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -668,7 +681,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
 
 	usg := scanner.usage()
-	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor)}
+	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}
 	// The images measure, for an images request that finished cleanly and for
 	// nothing else -- see setImagesBillingQuantity (images_handler.go) for why
 	// the count comes off the RESPONSE and why a counted zero is logged rather
@@ -716,9 +729,12 @@ type nativeRelay struct {
 // above, which is what the caller handed in. req is the session-enriched
 // inference.Request (its Model/RequestedModel/APIFlavor/Stream are copied
 // verbatim from the relay's pfReq, so either answers the same flavor and model),
-// serverName the resolved server's display name, and start/id/capturing the
-// per-request bookkeeping that every recordUsage + buildCaptureInput pair on
-// this path needs.
+// endpoint the client endpoint the relay was built for (nativeRelay.endpoint,
+// which req cannot carry: a flavor does not identify an endpoint, and
+// recordUsage needs it to record the right ProviderPath), serverName the
+// resolved server's display name, and start/id/capturing the per-request
+// bookkeeping that every recordUsage + buildCaptureInput pair on this path
+// needs.
 //
 // It exists so a helper that finishes a request on its own —
 // relayImagesUpstreamError, which writes the client's response AND records its
@@ -729,6 +745,7 @@ type nativeExchange struct {
 	req        inference.Request
 	target     routing.Target
 	raw        []byte
+	endpoint   sessionEndpoint
 	serverName string
 	start      time.Time
 	id         string

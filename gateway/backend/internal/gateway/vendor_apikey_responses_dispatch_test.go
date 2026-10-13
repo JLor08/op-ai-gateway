@@ -133,7 +133,7 @@ func TestOpenAIAPIKeyResponsesDispatchIsLosslessPassthrough(t *testing.T) {
 	// real OpenAI-compatible client the Multiplexer registers for vendor_openai.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
 	upstreamBody := rewriteModelField([]byte(apiKeyResponsesBody), target.ProviderModel)
-	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), upstreamBody, "application/json")
+	resp, err := provider.NewOpenAICompatibleClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses", endpointResponses), upstreamBody, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow(t *t
 	srv.proxyNative(rec, req, nativeRelay{
 		token:    auth.Token{ID: "tok_rate", UserID: "usr_va_a", Active: true},
 		target:   target,
-		path:     upstreamPath(target, "openai_responses"),
+		path:     upstreamPath(target, "openai_responses", endpointResponses),
 		raw:      []byte(apiKeyResponsesBody),
 		pfReq:    inference.Request{Model: target.Model, RequestedModel: target.Model, APIFlavor: "openai_responses", Stream: true},
 		endpoint: endpointResponses,

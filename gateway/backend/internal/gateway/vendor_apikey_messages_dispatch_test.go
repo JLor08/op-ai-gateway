@@ -147,7 +147,7 @@ func TestAnthropicAPIKeyMessagesDispatchIsLosslessPassthrough(t *testing.T) {
 	// real Anthropic client the Multiplexer registers for vendor_anthropic.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
 	upstreamBody := rewriteModelField([]byte(apiKeyMessagesBody), target.ProviderModel)
-	resp, err := provider.NewAnthropicClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "anthropic_messages"), upstreamBody, "application/json")
+	resp, err := provider.NewAnthropicClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "anthropic_messages", endpointMessages), upstreamBody, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}

@@ -49,7 +49,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// server, so the running-connections view can label it with the server name
 	// (mirrors completeStream, which registers after Resolve). A resolve failure
 	// above never reaches a server, so it is intentionally not tracked as active.
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
+	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
 	defer s.Active.Remove(id)
 	providerReq := req
 	if target.ProviderModel != "" {
@@ -655,6 +655,16 @@ type usageMeta struct {
 	// usage.ValidateBillingXOR for the contract.
 	BillingUnit     string
 	BillingQuantity float64
+	// Endpoint is the client endpoint this request arrived on. recordUsage reads
+	// it for exactly one thing: the row's ProviderPath, which it recomputes from
+	// the target and the request's FLAVOR rather than taking the path the relay
+	// actually called -- and the flavor cannot tell endpoints that share it apart
+	// (openai_images covers both /v1/images/generations and /v1/images/edits). Only
+	// an images call site needs to set it, and it must: left at its zero value
+	// (endpointChat) it records the generations path, which is wrong for an edit.
+	// Every other call site leaves it zero, which changes nothing for them --
+	// upstreamPath ignores the endpoint for every non-images flavor.
+	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation
 	// window" -- every non-stream call site, native passthrough, and a tool-only
@@ -722,7 +732,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		HTTPStatus:       meta.HTTPStatus,
 		ContentType:      meta.ContentType,
 		ReqPath:          meta.ReqPath,
-		ProviderPath:     upstreamPath(target, req.APIFlavor),
+		ProviderPath:     upstreamPath(target, req.APIFlavor, meta.Endpoint),
 		ProviderModel:    effectiveProviderModel(target, req.Model),
 		Stream:           req.Stream,
 		TokenName:        token.Name,

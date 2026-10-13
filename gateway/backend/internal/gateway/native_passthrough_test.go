@@ -688,10 +688,40 @@ func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
 func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) {
 	target := routing.Target{Provider: routing.ProviderOllama}
 
-	got := upstreamPath(target, apiFlavorImages)
+	got := upstreamPath(target, apiFlavorImages, endpointImages)
 
 	if got != "/v1/images/generations" {
 		t.Fatalf("upstreamPath(images) = %q, want /v1/images/generations", got)
+	}
+}
+
+// TestUpstreamPathImagesEditEndpointReturnsTheEditsPath pins the endpoint axis
+// of upstreamPath's images branch. generations and edits share ONE api flavor
+// (openai_images), so the flavor alone cannot tell them apart -- the endpoint is
+// the only discriminator, and an edit must reach the upstream's
+// /v1/images/edits, never /v1/images/generations. ProviderOllama again, for the
+// same reason as the test above: it is the provider whose own fallback would
+// answer if the images branch did not run.
+func TestUpstreamPathImagesEditEndpointReturnsTheEditsPath(t *testing.T) {
+	target := routing.Target{Provider: routing.ProviderOllama}
+	cases := []struct {
+		name      string
+		apiFlavor string
+		endpoint  sessionEndpoint
+		want      string
+	}{
+		{"generations endpoint", apiFlavorImages, endpointImages, "/v1/images/generations"},
+		{"edits endpoint", apiFlavorImages, endpointImagesEdit, "/v1/images/edits"},
+		// The edit endpoint only discriminates WITHIN the images flavor: a
+		// non-images flavor that somehow carried it keeps its provider-derived path.
+		{"edits endpoint does not hijack a non-images flavor", "openai_chat_completions", endpointImagesEdit, "/api/chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamPath(target, tc.apiFlavor, tc.endpoint); got != tc.want {
+				t.Fatalf("upstreamPath(%q, endpoint %d) = %q, want %q", tc.apiFlavor, tc.endpoint, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -728,7 +758,7 @@ func TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// openai_chat_completions: a flavor with no passthrough mode, so the
 			// provider fallbacks decide.
-			got := upstreamPath(routing.Target{Provider: tc.provider, OpenAIPathPrefix: tc.prefix}, "openai_chat_completions")
+			got := upstreamPath(routing.Target{Provider: tc.provider, OpenAIPathPrefix: tc.prefix}, "openai_chat_completions", endpointChat)
 
 			if got != tc.want {
 				t.Fatalf("upstreamPath(%s, prefix %q) = %q, want %q", tc.provider, tc.prefix, got, tc.want)

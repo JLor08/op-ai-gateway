@@ -146,7 +146,7 @@ func (h *betaPassthroughHarness) relay(t *testing.T, target routing.Target, apiF
 	h.srv.proxyNative(rec, req, nativeRelay{
 		token:    auth.Token{ID: "tok_beta", UserID: "usr_va_a", Active: true},
 		target:   target,
-		path:     upstreamPath(target, apiFlavor),
+		path:     upstreamPath(target, apiFlavor, endpoint),
 		raw:      []byte(raw),
 		pfReq:    inference.Request{Model: target.Model, RequestedModel: target.Model, APIFlavor: apiFlavor, Stream: true},
 		endpoint: endpoint,

@@ -24,10 +24,11 @@ const maxSessionIDLen = 200
 type sessionEndpoint int
 
 const (
-	endpointChat      sessionEndpoint = iota // /v1/chat/completions (generic OpenAI)
-	endpointResponses                        // /v1/responses (Codex)
-	endpointMessages                         // /v1/messages (Claude Code / Anthropic)
-	endpointImages                           // /v1/images/generations (OpenAI images)
+	endpointChat       sessionEndpoint = iota // /v1/chat/completions (generic OpenAI)
+	endpointResponses                         // /v1/responses (Codex)
+	endpointMessages                          // /v1/messages (Claude Code / Anthropic)
+	endpointImages                            // /v1/images/generations (OpenAI images)
+	endpointImagesEdit                        // /v1/images/edits (OpenAI image edit, multipart)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -80,9 +81,10 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 			info.ClientSession, info.Source = capSession(v), "claude-code"
 			return info
 		}
-	case endpointImages:
-		// /v1/images/generations has no per-endpoint header signal; see the
-		// fuller comment on sessionFromBody's identical case below.
+	case endpointImages, endpointImagesEdit:
+		// /v1/images/generations and /v1/images/edits have no per-endpoint
+		// header signal; see the fuller comment on sessionFromBody's identical
+		// case below.
 	}
 
 	// 3. Per-endpoint body fallback (only reached when headers were empty).
@@ -127,11 +129,13 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		if v := strings.TrimSpace(b.Metadata.UserID); v != "" {
 			return v, "anthropic"
 		}
-	case endpointImages:
+	case endpointImages, endpointImagesEdit:
 		// /v1/images/generations carries no session signal: OpenAI's images
 		// request has no prompt_cache_key, no user and no metadata field, and
 		// image requests deliberately do not take an affinity pin at all (the
-		// affinity key is coarse -- see the write guards in resolver.go). Stated
+		// affinity key is coarse -- see the write guards in resolver.go). The
+		// edits request is no different, and its body is multipart, which this
+		// function's JSON decoding could not read a field out of anyway. Stated
 		// as a case rather than left to the switch's absent default, so a reader
 		// can tell "considered, and there is none" from "nobody thought about it".
 	}
