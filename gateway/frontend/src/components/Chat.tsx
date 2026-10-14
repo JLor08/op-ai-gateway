@@ -24,6 +24,7 @@ import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
 import {
+  IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
   IMAGE_N_MAX,
   IMAGE_OUTPUT_FORMATS,
@@ -801,7 +802,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     </Box>
                     <input
                       type="file"
-                      accept="image/*"
+                      // An edit's source is png or jpeg (all the edit route of
+                      // sd-server reads); a text model reads any image.
+                      accept={c.attachMode === 'edit' ? IMAGE_EDIT_SOURCE_ACCEPT : 'image/*'}
                       // An edit has one source image; a text model reads several.
                       multiple={c.attachMode !== 'edit'}
                       hidden

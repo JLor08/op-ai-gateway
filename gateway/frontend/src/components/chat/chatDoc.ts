@@ -155,6 +155,14 @@ export function attachModeOf(
   return model.vision && !model.image ? 'vision' : 'none';
 }
 
+// The formats the edit route of sd-server reads a source image in. The composer
+// takes no other one for an edit (the picker's `accept`, and handleFiles, which an
+// `accept` cannot bind), so a webp or gif source is refused where the user can
+// still act on it instead of coming back from the upstream as a generic error.
+// Lower case: compared against a file's reported MIME type.
+export const IMAGE_EDIT_SOURCE_TYPES: readonly string[] = ['image/png', 'image/jpeg'];
+export const IMAGE_EDIT_SOURCE_ACCEPT = IMAGE_EDIT_SOURCE_TYPES.join(',');
+
 // The image-generation knobs the composer edits, as CONCRETE store state (every
 // field defined, unlike the all-optional wire ChatImageSettings). An unset knob
 // is the sentinel that imageSetting() below omits from the wire: "" for
@@ -583,6 +591,16 @@ export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
     }
   }
   return false;
+}
+
+// The prompt text of the LAST user message of a replayed history ('' when there is
+// none). What an image edit is asked to do is this text, and the endpoint refuses an
+// edit without it (images.prompt_required) only after the turn was stored.
+export function lastUserText(messages: ChatUiMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === 'user') return textOf(messages[i].content);
+  }
+  return '';
 }
 
 let idSeq = 0;

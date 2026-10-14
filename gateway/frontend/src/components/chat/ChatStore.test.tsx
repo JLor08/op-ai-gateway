@@ -244,6 +244,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           <button type="button" onClick={() => c.handlersFor(m.id).onEdit('edited text')}>
             edit-{m.id}
           </button>
+          <button type="button" onClick={() => c.handlersFor(m.id).onEdit('  ')}>
+            edit-blank-{m.id}
+          </button>
         </span>
       ))}
       {c.chats.map((ch) => (
@@ -2570,6 +2573,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
 
       expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    // The prompt rule of the composer (an edit needs one) holds on the replay
+    // paths too: an edit that blanks the prompt of an edit turn, or a regenerate of
+    // an edit turn that was stored without one (the old composer allowed that),
+    // would be truncated, started and then answered images.prompt_required.
+    it('refuses to blank the prompt of an edit turn, before touching the transcript', async () => {
+      chatApi = makeChatApi(seed(editModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'edit-blank-u1' }));
+
+      expect(await screen.findByText(t.chatImageEditPromptRequired)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('refuses to regenerate an edit turn that was stored without a prompt', async () => {
+      const promptless = {
+        id: 'u1',
+        role: 'user',
+        content: [
+          { type: 'text', text: '' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+        ],
+      };
+      chatApi = makeChatApi(seed(editModel, [promptless, resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatImageEditPromptRequired)).toBeTruthy();
       expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
       expect(screen.getByTestId('count').textContent).toBe('2');
     });

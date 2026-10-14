@@ -1290,6 +1290,146 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // Two defects of the edit turn's send path that Task D left (its review's
+  // minors): an image-only edit was stored and then failed mid-run with
+  // images.prompt_required, and a webp/gif source passed the picker only to be
+  // refused by the edit route of sd-server (png and jpeg) as a generic upstream
+  // error. Both are now refused where the user can still act on them -- in the
+  // composer, before anything is sent or stored.
+  describe(`Chat: an edit turn needs a prompt and a png/jpeg source [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const visionModel: ModelOption = {
+      id: 'vision-model',
+      display_name: 'vision-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+
+    function attachFile(name: string, type: string) {
+      fireEvent.change(screen.getByLabelText(t.chatAttachImage), {
+        target: { files: [new File(['x'], name, { type })] },
+      });
+    }
+
+    describe('the prompt', () => {
+      it('is required for an edit: an image-only turn is refused before it is sent or stored', async () => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+        attachFile('source.png', 'image/png');
+        await screen.findByAltText(t.chatAttachedImage);
+
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditPromptRequired);
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        // Nothing was stored, nothing was lost: no user bubble appeared (the only
+        // thumbnail is still the composer's), and the attachment is still there to
+        // be sent once the prompt is written.
+        expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+        expect(screen.queryByRole('article')).not.toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+          target: { value: 'make it blue' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      });
+
+      it('must have a word in it: whitespace alone does not count', async () => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+        attachFile('source.png', 'image/png');
+        await screen.findByAltText(t.chatAttachedImage);
+        fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+          target: { value: '   \n ' },
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditPromptRequired);
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      });
+
+      it('stays optional for a text model reading an image: only an EDIT needs one', async () => {
+        renderChat(tokens, [visionModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, visionModel.display_name);
+        attachFile('photo.png', 'image/png');
+        await screen.findByAltText(t.chatAttachedImage);
+
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.chatImageEditPromptRequired)).not.toBeInTheDocument();
+      });
+    });
+
+    describe('the source format', () => {
+      it('is png or jpeg in the picker of an edit, and any image for a text model', async () => {
+        renderChat(tokens, [editModel, visionModel]);
+        await waitForChatReady();
+
+        await pickOption(t.chatModel, visionModel.display_name);
+        expect(screen.getByLabelText(t.chatAttachImage)).toHaveAttribute('accept', 'image/*');
+
+        await pickOption(t.chatModel, editModel.display_name);
+        expect(screen.getByLabelText(t.chatAttachImage)).toHaveAttribute(
+          'accept',
+          'image/png,image/jpeg',
+        );
+      });
+
+      it.each([
+        ['webp', 'image/webp'],
+        ['gif', 'image/gif'],
+      ])('refuses a %s source for an edit, however it got past the picker', async (ext, type) => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+
+        attachFile(`source.${ext}`, type);
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditSourceType);
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+      });
+
+      it.each([
+        ['png', 'image/png'],
+        ['jpg', 'image/jpeg'],
+      ])('takes a %s source for an edit', async (ext, type) => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+
+        attachFile(`source.${ext}`, type);
+
+        expect(await screen.findByAltText(t.chatAttachedImage)).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('still takes a webp image for a text model that reads images', async () => {
+        renderChat(tokens, [visionModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, visionModel.display_name);
+
+        attachFile('photo.webp', 'image/webp');
+
+        expect(await screen.findByAltText(t.chatAttachedImage)).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+    });
+  });
+
   describe(`Chat: the advanced image controls follow the picked model's options [${locale}]`, () => {
     const imageModels: ModelOption[] = [
       {

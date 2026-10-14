@@ -38,12 +38,14 @@ import {
   byNewest,
   clearLegacyKeys,
   DEFAULT_IMAGE_SETTINGS,
+  IMAGE_EDIT_SOURCE_TYPES,
   deriveTitle,
   deriveTitleFromMessages,
   historyHasImage,
   imageSetting,
   imageSettingsFrom,
   lastUserHasImage,
+  lastUserText,
   lsGet,
   lsSet,
   nextId,
@@ -69,6 +71,7 @@ export type { AttachMode, ChatUiMessage };
 // surface is ChatStore.tsx / ChatSidebar.tsx -- Chat.tsx must not reach into
 // chatDoc.ts directly (arch.test.ts enforces this).
 export {
+  IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
   IMAGE_N_MAX,
   IMAGE_OUTPUT_FORMATS,
@@ -1016,14 +1019,25 @@ export function ChatStoreProvider({
       // control. Refused here, before any state is touched, rather than started
       // and answered by the endpoint's own refusal after the transcript was
       // truncated.
+      //
+      // An edit also needs its prompt, the same rule the composer holds at send():
+      // a replay whose last user message has an image but no text (an edit that
+      // blanks the prompt, or a turn the old composer stored without one) would be
+      // truncated, started, and then refused by the endpoint's images.prompt_required.
       if (chatKindRef.current === 'image') {
-        if (lastUserHasImage(history) && attachModeRef.current !== 'edit') {
-          showErrorRef.current(
-            modelImageCapableRef.current
-              ? tRef.current.chatImageGeneratorNoInput
-              : tRef.current.chatImageModelUnsupported,
-          );
-          return;
+        if (lastUserHasImage(history)) {
+          if (attachModeRef.current !== 'edit') {
+            showErrorRef.current(
+              modelImageCapableRef.current
+                ? tRef.current.chatImageGeneratorNoInput
+                : tRef.current.chatImageModelUnsupported,
+            );
+            return;
+          }
+          if (lastUserText(history).trim() === '') {
+            showErrorRef.current(tRef.current.chatImageEditPromptRequired);
+            return;
+          }
         }
       } else if (!modelVisionCapableRef.current && historyHasImage(history)) {
         showErrorRef.current(tRef.current.chatImageModelUnsupported);
@@ -1157,6 +1171,13 @@ export function ChatStoreProvider({
       // dropped: the user removes the extras and sends.)
       if (mode === 'edit' && images.length > 1) {
         showErrorRef.current(tRef.current.chatImageEditSingleSource);
+        return;
+      }
+      // An edit is the prompt applied to the image: without the prompt the endpoint
+      // answers images.prompt_required, but only after the turn was stored. Refused
+      // here instead, with the composer left as it is (the image stays attached).
+      if (mode === 'edit' && !text) {
+        showErrorRef.current(tRef.current.chatImageEditPromptRequired);
         return;
       }
     }
@@ -1405,6 +1426,13 @@ export function ChatStoreProvider({
       if (count >= limit) {
         lastError = limit === 1 ? t.chatImageEditSingleSource : t.chatImageErrorCount;
         break;
+      }
+      // The edit route of sd-server reads png and jpeg only. The picker offers just
+      // those, but `accept` is a hint a file dialog's "all files" (or a drop) does
+      // not honor, so the type is checked here too.
+      if (attachMode === 'edit' && !IMAGE_EDIT_SOURCE_TYPES.includes(file.type.toLowerCase())) {
+        lastError = t.chatImageEditSourceType;
+        continue;
       }
       try {
         const url = await prepareImageDataUrl(file);

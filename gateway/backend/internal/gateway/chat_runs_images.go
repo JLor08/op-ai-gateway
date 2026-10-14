@@ -355,15 +355,25 @@ func upstreamErrorCode(body []byte, status string) string {
 // would be free to drift from the endpoint's. The refusal reaches the run
 // through upstreamErrorCode above.
 func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
-	return json.Marshal(imageRequestFields(prep))
+	return json.Marshal(imageRequestFields(prep, false))
 }
+
+// imageEditOutputFormats are the output formats sd-server's edit route can
+// produce. Its generations route also writes webp; the edit route does not.
+var imageEditOutputFormats = map[string]struct{}{"png": {}, "jpeg": {}}
 
 // imageRequestFields are the request fields buildImagesBody's doc comment
 // describes, as a map: json.Marshal of it is the generations body, and an edit
 // (buildImageEditBody) sends the very same fields as form values, so the two
 // requests cannot disagree about what the thread's settings mean. The values are
 // strings and integers only.
-func imageRequestFields(prep PrepareRunResult) map[string]any {
+//
+// The one difference is the output format of an EDIT (edit true): a format the edit
+// route cannot produce (webp) is left out, with the compression that belongs to
+// it, so the upstream answers in its own default instead of refusing the whole edit
+// -- which the user would see as a generic upstream error. The thread's setting
+// itself is not touched; its generations keep honoring it.
+func imageRequestFields(prep PrepareRunResult, edit bool) map[string]any {
 	prompt := stripSDExtraArgsTag(lastUserPrompt(prep.History))
 	body := map[string]any{
 		"model":           prep.Settings.Model,
@@ -376,10 +386,12 @@ func imageRequestFields(prep PrepareRunResult) map[string]any {
 		if img.N > 0 {
 			body["n"] = img.N
 		}
-		if img.OutputFormat != "" {
+		_, formatOK := imageEditOutputFormats[strings.ToLower(img.OutputFormat)]
+		dropFormat := edit && img.OutputFormat != "" && !formatOK
+		if img.OutputFormat != "" && !dropFormat {
 			body["output_format"] = img.OutputFormat
 		}
-		if img.OutputCompression != nil {
+		if img.OutputCompression != nil && !dropFormat {
 			body["output_compression"] = *img.OutputCompression
 		}
 		if extra := buildSDExtraArgs(img); extra != "" {
@@ -471,15 +483,14 @@ var imageEditFilenames = map[string]string{
 //
 // The thread's size, count, output_format and output_compression travel as set,
 // exactly as on a generation: the executor does not second-guess what an upstream
-// accepts (the same stance the sampler and scheduler knobs take). The edit route's
-// output formats are narrower than a generation's -- png and jpeg -- so a thread
-// set to webp has that refused upstream, which reaches the run as
-// images.upstream_error; narrowing the composer's format list for an edit turn is
-// the remedy if that proves a real complaint.
+// accepts (the same stance the sampler and scheduler knobs take) -- with the one
+// exception imageRequestFields documents: the edit route's output formats are
+// narrower than a generation's (png and jpeg), and a format it cannot produce is
+// left out rather than sent to be refused.
 func buildImageEditBody(prep PrepareRunResult, sources []imageEditSource) ([]byte, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	fields := imageRequestFields(prep)
+	fields := imageRequestFields(prep, true)
 	for _, name := range slices.Sorted(maps.Keys(fields)) {
 		if err := mw.WriteField(name, fmt.Sprint(fields[name])); err != nil {
 			return nil, "", err

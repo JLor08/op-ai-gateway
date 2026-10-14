@@ -226,6 +226,13 @@ const de = {
     'Dieses Modell erzeugt und bearbeitet Bilder. Beschreiben Sie ein Bild, oder hängen Sie ein Bild an, um es zu bearbeiten.',
   chatAttachImageEdit: 'Bild zum Bearbeiten anhängen',
   chatImageEditSingleSource: 'Eine Bildbearbeitung nimmt genau ein Ausgangsbild.',
+  // Two more refusals of the edit turn, both raised BEFORE anything is sent or
+  // stored: an edit without a prompt (the endpoint answers images.prompt_required
+  // only after the turn was stored), and a source in a format the edit route of
+  // sd-server cannot read (png and jpeg only).
+  chatImageEditPromptRequired:
+    'Beschreiben Sie, wie das Bild bearbeitet werden soll, bevor Sie senden.',
+  chatImageEditSourceType: 'Eine Bildbearbeitung nimmt ein PNG- oder JPEG-Bild.',
   // The image-thread settings panel: the generation knobs shown in place of the
   // text-chat controls. The "" options ("Standard …") send nothing and leave
   // sd-server on its own default; output_compression only applies to a lossy
@@ -3083,6 +3090,8 @@ const en: PortalMessages = {
     'This model generates and edits images. Describe an image, or attach one to edit it.',
   chatAttachImageEdit: 'Attach an image to edit',
   chatImageEditSingleSource: 'An image edit takes exactly one source image.',
+  chatImageEditPromptRequired: 'Describe how the image should be edited before sending.',
+  chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
   chatImageSize: 'Image size',
   chatImageSizeDefault: 'Default (model)',
   chatImageCount: 'Number of images',
