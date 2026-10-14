@@ -185,6 +185,37 @@ func TestOpenAIModelsCarryContextLengthWhenKnown(t *testing.T) {
 				t.Fatalf("ctx-unknown owned_by = %s, want \"op-ai-gateway\"", got)
 			}
 
+			// Both entries carry the same capabilities object /api/v1/models
+			// carries, always present. This fixture seeds no capability verdicts,
+			// so vision/image/image_edit fold to false; trained_for_tool_use is the
+			// constant true. The true-value folding is pinned in the shared
+			// modelCapabilities path by TestLMStudioV1ModelsFromDTOs.
+			for id, entry := range map[string]openAIModelEntry{"ctx-known": known, "ctx-unknown": unknown} {
+				raw, ok := entry["capabilities"]
+				if !ok {
+					t.Fatalf("%s must carry a capabilities object; entry = %v", id, entry)
+				}
+				var caps map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &caps); err != nil {
+					t.Fatalf("%s capabilities: %v", id, err)
+				}
+				capKeys := make([]string, 0, len(caps))
+				for capKey := range caps {
+					capKeys = append(capKeys, capKey)
+				}
+				if !sameStrings(capKeys, []string{"image", "image_edit", "trained_for_tool_use", "vision"}) {
+					t.Fatalf("%s capabilities keys = %q, want exactly vision, image, image_edit, trained_for_tool_use", id, capKeys)
+				}
+				if got := string(caps["trained_for_tool_use"]); got != "true" {
+					t.Fatalf("%s trained_for_tool_use = %s, want true", id, got)
+				}
+				for _, capKey := range []string{"vision", "image", "image_edit"} {
+					if got := string(caps[capKey]); got != "false" {
+						t.Fatalf("%s %s = %s, want false (fixture seeds no capability verdicts)", id, capKey, got)
+					}
+				}
+			}
+
 			requireListingIDsAreModelsForFlavor(t, srv, "dev-secret", path)
 		})
 	}

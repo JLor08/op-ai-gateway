@@ -1329,9 +1329,9 @@ client lacks it answers `provider.unavailable`
 
 | Endpoint | Shape | Filtering |
 |---|---|---|
-| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway","context_length"?}]}` — `context_length` is omitted when the window is unknown | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai` (`openAIModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "openai")` lists |
+| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway","capabilities":{"vision","image","image_edit","trained_for_tool_use"},"context_length"?}]}` — `context_length` is omitted when the window is unknown; `capabilities` is always present | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai` (`openAIModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "openai")` lists |
 | `GET /anthropic/v1/models` | Anthropic `{"data":[{"id","type":"model","display_name","created_at"}]}` | `Portal.ModelsForFlavor(token, "anthropic")` |
-| `GET /api/v1/models`, `/openai/api/v1/models` | LM Studio v2 `{"models":[{"type":"llm","key","display_name","max_context_length","loaded_instances":[{"config":{"context_length"}}],"capabilities":{"vision","trained_for_tool_use"}}]}` — `max_context_length` is always present | the same `openAIModelDTOs` rows as `/v1/models`, so it lists exactly the same names |
+| `GET /api/v1/models`, `/openai/api/v1/models` | LM Studio v2 `{"models":[{"type":"llm","key","display_name","max_context_length","loaded_instances":[{"config":{"context_length"}}],"capabilities":{"vision","image","image_edit","trained_for_tool_use"}}]}` — `max_context_length` is always present | the same `openAIModelDTOs` rows as `/v1/models`, so it lists exactly the same names |
 
 `ModelsForFlavor` (`internal/portal/service.go`) returns the sorted gateway
 model names that have at least one **active** mapping that passes the served
@@ -1364,11 +1364,17 @@ window is to set the mapping's `context_size`, by the `/props` probe or by hand.
 `/api/v1/models` is reported to be decoded strictly by its clients (issue
 #171), so `models` and every `loaded_instances` encode as `[]`, never `null`. `loaded_instances` holds one
 `{"config":{"context_length":N}}` while the model is loaded on some offering
-server and is empty otherwise; `capabilities.vision` is the portal's
-fail-closed vision fold; `capabilities.trained_for_tool_use` is the constant
-`true`, because the gateway tracks no per-model tool support — the one place it
-drops tools is a native `ollama` application, whose client sends no `tools` to
-`/api/chat` (tracked as issue #219, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+server and is empty otherwise. `capabilities` carries `vision`, `image` and
+`image_edit` — the portal's fail-closed folds for accepting image input,
+generating images and editing images — plus `trained_for_tool_use`, the
+constant `true`, because the gateway tracks no per-model tool support (the one
+place it drops tools is a native `ollama` application, whose client sends no
+`tools` to `/api/chat`, tracked as issue #219). The same `capabilities` object
+is carried on `/v1/models` too, built by one shared helper so the two listings
+stay identical (issue #222); `vision` and `trained_for_tool_use` are the keys an
+LM Studio client / opencode read, while `image` and `image_edit` are gateway
+extensions beyond those two keys
+([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
 (h)). The v2 listing is registered under `/api/v1/models` and
 `/openai/api/v1/models` only, never under `/anthropic/`, whose prefix has no OpenAI
 chat-completions route a discovered model could be used with. Both are bearer-only

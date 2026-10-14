@@ -2408,6 +2408,13 @@ retired, see (h)). Only the listing's `image` flag already read the spec
 listing. Everything else below stands; the sentences it changes point to
 (h).)**
 
+**(Amended — full model capabilities, issue #222: the `capabilities` object is
+extended from `{vision, trained_for_tool_use}` to `{vision, image, image_edit,
+trained_for_tool_use}` and is now carried on `/v1/models` too; both listings
+build it from one shared `modelCapabilities` helper, so they stay identical.
+`vision` and `trained_for_tool_use` are the keys an LM Studio client / opencode
+read; `image` and `image_edit` are gateway extensions beyond those two keys.)**
+
 **Decision (a): one rule, in `internal/routing`, read by dispatch and by every
 listing.** `routing/served_flavors.go` is store-free and sits beside
 `EffectiveRuntimeSpecType`. `EffectiveFields` returns a mapping's effective
@@ -2656,7 +2663,8 @@ model has no `context_size`, so it lists without `context_length` and with
 did a `ModelsForFlavor` read, and `Models()` does more than the ids-only list:
 on top of the visible views, group overlay and runtime-spec read both share, it
 adds a batch capability read (`MappingCapabilitiesForMappings`, for the
-`vision`, `image` and `image_edit` flags the OpenAI listing does not emit), a
+`vision`, `image` and `image_edit` flags — which, since issue #222, the OpenAI
+listing now also emits in its `capabilities` object), a
 second `model_settings` read (for each row's `Visibility`), and the per-view
 loaded-state, offered-on, context and group assembly. That is the work the
 portal chat picker and `/api/v1/models` already do per request, now also paid
