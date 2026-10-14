@@ -661,3 +661,41 @@ func TestAuthorizeRunAsTokenCarriesVendorAccess(t *testing.T) {
 		t.Fatalf("run-as VendorAccess = %#v, want %#v", runAs.VendorAccess, want)
 	}
 }
+
+// TestAuthorizeRunAsTokenCarriesClaudeModelAliases pins that the run-as
+// principal (the token a portal chat request runs under) carries the token's
+// opt-in claude_model_aliases flag (#225), exactly as a bearer lookup of the
+// same token would. AuthorizeRunAsToken assembles the auth.Token field by field
+// from the record, so a dropped field reads as false -- the plausible "off"
+// value -- and portal chat under a flag-enabled token would resolve without
+// aliases. Both polarities are asserted so neither a dropped field nor a
+// hard-coded true can pass.
+func TestAuthorizeRunAsTokenCarriesClaudeModelAliases(t *testing.T) {
+	ctx := context.Background()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	now := time.Now().UTC()
+	_ = dir.CreateUser(ctx, store.User{ID: "usr_1", Email: "u1@example.test", DisplayName: "U1", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	for _, rec := range []store.TokenRecord{
+		{ID: "tok_cma_on", UserID: "usr_1", Name: "on", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now, ClaudeModelAliases: true},
+		{ID: "tok_cma_off", UserID: "usr_1", Name: "off", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := dir.CreatePlainToken(ctx, rec, "secret-"+rec.ID); err != nil {
+			t.Fatalf("create token %s: %v", rec.ID, err)
+		}
+	}
+	svc := NewService(ServiceDeps{Users: dir, Tokens: dir})
+	principal := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
+
+	for _, tc := range []struct {
+		id   string
+		want bool
+	}{{"tok_cma_on", true}, {"tok_cma_off", false}} {
+		runAs, err := svc.AuthorizeRunAsToken(ctx, principal, tc.id)
+		if err != nil {
+			t.Fatalf("AuthorizeRunAsToken(%s): %v", tc.id, err)
+		}
+		if runAs.ClaudeModelAliases != tc.want {
+			t.Fatalf("run-as ClaudeModelAliases for %s = %v, want %v", tc.id, runAs.ClaudeModelAliases, tc.want)
+		}
+	}
+}
