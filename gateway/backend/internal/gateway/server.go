@@ -1519,10 +1519,21 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ids := s.Portal.ModelsForFlavor(r.Context(), token, routing.APIFlavorOpenAI)
-	data := make([]map[string]string, 0, len(ids))
-	for _, id := range ids {
-		data = append(data, map[string]string{"id": id, "object": "model", "owned_by": "op-ai-gateway"})
+	// The rows are the portal's Models() narrowed to the openai flavor, which
+	// openAIModelDTOs documents as exactly the names ModelsForFlavor lists (a
+	// test pins it); unlike that ids-only list they carry each model's context
+	// window.
+	models := openAIModelDTOs(s.Portal.Models(r.Context(), token).Data)
+	data := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		item := map[string]any{"id": m.ID, "object": "model", "owned_by": "op-ai-gateway"}
+		// context_length is the usable window in tokens that OpenAI-style
+		// clients (opencode among them) read; it is left out, not zero, when no
+		// mapping of the model knows it.
+		if m.ContextSize > 0 {
+			item["context_length"] = m.ContextSize
+		}
+		data = append(data, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
