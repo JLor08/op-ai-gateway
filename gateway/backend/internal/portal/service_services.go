@@ -152,6 +152,10 @@ type ServiceTokenDTO struct {
 	UnknownModelRedirect        bool   `json:"unknown_model_redirect,omitempty"`
 	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
 	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
+	// ClaudeModelAliases opts the token into the Claude-compatible model aliases,
+	// identical in meaning to TokenDTO's — see there. Settable on create only: a
+	// service token has no field-level update.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 // CreateServiceTokenRequest is CreateServiceToken's body (§6.3): scopes are
@@ -171,6 +175,9 @@ type CreateServiceTokenRequest struct {
 	UnknownModelRedirect        bool   `json:"unknown_model_redirect"`
 	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked"`
 	UnknownModelFallback        string `json:"unknown_model_fallback"`
+	// ClaudeModelAliases opts the new token into the Claude-compatible model
+	// aliases (see TokenDTO). Off when omitted.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -760,6 +767,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		UnknownModelRedirect:        redirect,
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
+		ClaudeModelAliases:          req.ClaudeModelAliases,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateServiceTokenResponse{}, err
@@ -1067,6 +1075,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		UnknownModelRedirect:        record.UnknownModelRedirect,
 		UnknownModelRedirectBlocked: record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:        record.UnknownModelFallback,
+		ClaudeModelAliases:          record.ClaudeModelAliases,
 	}
 }
 

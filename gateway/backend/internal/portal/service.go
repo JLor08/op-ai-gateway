@@ -1109,6 +1109,11 @@ type TokenDTO struct {
 	// VendorAccess is the token's vendor-account (Anbieter) access policy; nil is
 	// the strict default (no vendor-account models).
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases opts the token into the Claude-compatible model aliases:
+	// eligible local models and groups are additionally exposed under stable
+	// anthropic-local-<hash> ids. Plain opt-in flag, off by default; always
+	// emitted so a client reading a token and writing it back preserves it.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1169,6 +1174,9 @@ type CreateTokenRequest struct {
 	// field omitted) is the strict default: no vendor-account access. Validated
 	// by validateVendorAccess.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases opts the token into the Claude-compatible model aliases
+	// (see TokenDTO). Off when omitted.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 type CreateTokenResponse struct {
@@ -1206,6 +1214,8 @@ type UpdateTokenRequest struct {
 	// VendorAccess: nil = keep the stored policy; a non-nil value REPLACES it
 	// wholesale (an empty one resets to the strict default) after validation.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases: nil = keep the stored flag, a non-nil value replaces it.
+	ClaudeModelAliases *bool `json:"claude_model_aliases,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1671,6 +1681,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
 		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
+		ClaudeModelAliases:          req.ClaudeModelAliases,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1759,6 +1770,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.Secret != nil {
 		record.Secret = *req.Secret
+	}
+	if req.ClaudeModelAliases != nil {
+		record.ClaudeModelAliases = *req.ClaudeModelAliases
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -4729,6 +4743,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
+		ClaudeModelAliases:             record.ClaudeModelAliases,
 	}
 }
 
