@@ -977,7 +977,7 @@ func completionErrorResponse(err error) apierror.Body {
 		message = "the requested model is not capable of this endpoint"
 	}
 	if errors.Is(err, errImageEditUnavailable) {
-		message = "image edit is not available on this model's server: its agent does not declare the " + multipartProxyFeature + " feature, so update the agent"
+		message = "image edit is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
 	}
 	if errors.Is(err, errImageEditTooLarge) {
 		message = fmt.Sprintf("the image edit is too large for this model's server: its request limit is %d MiB, counted after the mask and model are prepared", agentRouterMaxBodyBytes>>20)
