@@ -242,12 +242,19 @@ paths:
       tags: [inference]
       summary: OpenAI-shaped model listing
       description: >
-        Bearer-only. Discovery is unfiltered by a service token's own
-        allowlist but IS filtered by resource-group provisioning visibility.
-        Alias: /openai/v1/models.
+        Bearer-only (scope `gateway:use` or `llm:invoke`). Discovery is
+        unfiltered by a service token's own allowlist but IS filtered by
+        resource-group provisioning visibility. Each entry carries the
+        model's usable context window as `context_length` when it is known;
+        the field is omitted, never 0, when no mapping reports one. Alias:
+        /openai/v1/models.
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The models offered under the `openai` flavor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenAIModelList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /openai/v1/models:
     get:
@@ -255,26 +262,53 @@ paths:
       summary: Alias of /v1/models
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The models offered under the `openai` flavor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenAIModelList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /anthropic/v1/models:
     get:
       tags: [inference]
       summary: Anthropic-shaped model listing
-      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      description: Bearer-only, scope `gateway:use`.
+      security: [{ bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-  /api/v0/models:
+  /api/v1/models:
     get:
       tags: [inference]
-      summary: LM Studio-shaped model listing (emulated metadata only)
+      summary: LM Studio v2-shaped model listing (emulated metadata only)
       description: >
-        For LM-Studio-aware clients such as opencode; actual chat still goes
-        over /v1/chat/completions.
-      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+        The native listing LM Studio's own clients read each model's context
+        window from; actual chat still goes over /v1/chat/completions.
+        Bearer-only (scope `gateway:use` or `llm:invoke`), and it lists
+        exactly the names /v1/models lists. Unlike /v1/models,
+        `max_context_length` is always present (0 when the window is
+        unknown). Alias: /openai/api/v1/models (there is no /anthropic/
+        variant). LM Studio's earlier /api/v0/models is not served and
+        answers 404.
+      security: [{ bearerAuth: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The models offered under the `openai` flavor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LMStudioModelList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/api/v1/models:
+    get:
+      tags: [inference]
+      summary: Alias of /api/v1/models
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The models offered under the `openai` flavor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LMStudioModelList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── 2. Auth ───────────────────────────────────────────────────────────────
@@ -2304,6 +2338,77 @@ components:
               description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
             message: { type: string }
             request_id: { type: string }
+    OpenAIModelList:
+      type: object
+      description: The OpenAI-shaped model listing of /v1/models.
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, owned_by]
+            properties:
+              id: { type: string, description: The gateway model name. }
+              object: { type: string, const: model }
+              owned_by: { type: string, const: op-ai-gateway }
+              context_length:
+                type: integer
+                minimum: 1
+                description: >
+                  The model's usable context window in tokens: the minimum
+                  known across its offering mappings. Omitted, never 0, when no
+                  mapping reports one.
+    LMStudioModelList:
+      type: object
+      description: >
+        The LM Studio v2-shaped model listing of /api/v1/models. Clients decode
+        it strictly: `models` and every `loaded_instances` are arrays, never
+        null.
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [type, key, display_name, max_context_length, loaded_instances, capabilities]
+            properties:
+              type: { type: string, const: llm }
+              key: { type: string, description: The gateway model name (the same ids as /v1/models). }
+              display_name: { type: string }
+              max_context_length:
+                type: integer
+                minimum: 0
+                description: >
+                  The model's usable context window in tokens: the minimum
+                  known across its offering mappings. Always present; 0 when
+                  unknown.
+              loaded_instances:
+                type: array
+                description: One entry while the model is loaded on an offering server, else empty.
+                items:
+                  type: object
+                  required: [config]
+                  properties:
+                    config:
+                      type: object
+                      required: [context_length]
+                      properties:
+                        context_length: { type: integer, minimum: 0 }
+              capabilities:
+                type: object
+                required: [vision, trained_for_tool_use]
+                properties:
+                  vision:
+                    type: boolean
+                    description: True only when every offering mapping accepts images (fail-closed).
+                  trained_for_tool_use:
+                    type: boolean
+                    const: true
+                    description: >
+                      Always true: the gateway tracks no per-model tool support
+                      (ADR-045 (h)).
     TokenVendorAccess:
       type: object
       description: >

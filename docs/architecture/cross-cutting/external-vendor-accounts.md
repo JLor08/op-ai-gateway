@@ -1813,7 +1813,7 @@ which applies to self-hosted models.
 
 | Surface | Vendor models of the caller's own accounts |
 |---|---|
-| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v0/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). |
+| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
 | Portal chat picker and a regular user's **Models** page | Listed. |
 | **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
@@ -2106,8 +2106,9 @@ The effective public name of a vendor model, for a given token, is
 
 - **Listing.** `ownVendorAccountModels` (§6.7) skips a denied account and
   re-labels each remaining account's rows to `prefix + upstream_model`, so
-  `/v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v0/models` and
-  every consumer of that one source advertise exactly the token's names.
+  `/v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`,
+  `/openai/api/v1/models` and every consumer of that one source advertise
+  exactly the token's names.
 - **Routing.** `resolveVendorAccount` (§4) skips a denied account and matches the
   request model against `prefix + upstream_model`. **The resolver reverse-maps the
   token's public name back to the raw vendor slug**: the target keeps the public
