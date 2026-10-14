@@ -6,6 +6,7 @@ package agent
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -273,16 +274,44 @@ func TestFeaturesDeclareRuntimeEnsure(t *testing.T) {
 	if !found {
 		t.Fatal("Features does not declare runtime_ensure")
 	}
+}
+
+// TestFeaturesDeclareMultipartProxy pins the multipart-edit capability: the
+// gateway relays POST /v1/images/edits (a multipart/form-data body) to an
+// agent-launched child only when this agent declares this exact name -- a
+// router without the multipart branch json-unmarshals the body, finds no
+// model, and answers 404 runtime.model_not_managed, which cannot be told apart
+// from an unknown model -- so a rename here silently refuses every edit to an
+// agent target. The gateway spells the same string in its own constant
+// (multipartProxyFeature, gateway/backend/internal/gateway/agent_features.go);
+// this module cannot import it.
+func TestFeaturesDeclareMultipartProxy(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "multipart_proxy" {
+			found = true
+			if f.Since != "0.9.0" {
+				t.Fatalf("multipart_proxy Since = %q, want 0.9.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare multipart_proxy")
+	}
+	if !slices.Contains(FeatureNames(), "multipart_proxy") {
+		t.Fatal("FeatureNames() does not carry multipart_proxy, so it never reaches the gateway in capabilities.features")
+	}
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
 	// followed. 0.8.0 was MINOR because agent.Features gained
-	// runtime_ensure; 0.8.1 and 0.8.2 are PATCH because they gain nothing
-	// (see the Version constant's own block; 0.8.2 adds the image_options
-	// telemetry field, gated on the gateway-declared capability_source_sdcpp,
-	// which is not an agent.Features entry). runtime_ensure's Since stays
-	// 0.8.0: a Since records the version a feature shipped in.
-	if Version != "0.8.2" {
-		t.Fatalf("Version = %q, want 0.8.2 (agent.Features gains no entry, so the bump from 0.8.1 is PATCH)", Version)
+	// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
+	// (0.8.2 added the image_options telemetry field, gated on the
+	// gateway-declared capability_source_sdcpp, which is not an agent.Features
+	// entry); 0.9.0 is MINOR because agent.Features gained multipart_proxy.
+	// A Since records the version a feature shipped in, so runtime_ensure's
+	// stays 0.8.0.
+	if Version != "0.9.0" {
+		t.Fatalf("Version = %q, want 0.9.0 (agent.Features gains multipart_proxy, so the bump from 0.8.2 is MINOR)", Version)
 	}
 }

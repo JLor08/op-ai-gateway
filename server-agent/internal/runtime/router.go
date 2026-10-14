@@ -33,11 +33,16 @@
 //     caller sends anyway is read and discarded, never forwarded. No
 //     heartbeats: a failure is a genuine HTTP status from the sentinel table
 //     below.
-//   - everything else -- the model-routed reverse proxy.
+//   - everything else -- the model-routed reverse proxy. The model comes from
+//     the JSON body or, when the request is multipart/form-data (an image
+//     edit, "multipart_proxy" in the agent's feature registry), from the
+//     form's "model" part, read the way the gateway reads it
+//     (peekMultipartModel). A multipart request is always a plain relay.
 //
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
 // buffered (bounded by maxBodyBytes) because `model`/`stream` must be read
-// out of the JSON before the router knows where to send it. Responses are
+// out of the JSON (or the multipart form) before the router knows where to
+// send it. Responses are
 // NEVER buffered -- httputil.ReverseProxy with FlushInterval:-1 for the
 // plain path, and a hand-rolled splice-with-heartbeat loop for the streaming
 // path, both flush after every write so SSE tokens (and any other streamed
@@ -102,6 +107,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -116,6 +123,12 @@ import (
 // discarded read of an ensure request's body. A request body beyond this is
 // rejected with 413 before any admission decision is even attempted.
 const maxBodyBytes = 32 << 20
+
+// maxMultipartModelBytes bounds the read of the one multipart part the router
+// reads, the form's "model" field. It is the gateway's own bound on a text field
+// of an image edit (maxImageEditFieldBytes), so the two parsers agree on which
+// model fields are too large to be a model name at all.
+const maxMultipartModelBytes = 1 << 20
 
 // heartbeatInterval is the cadence of `: keepalive` SSE comment lines during
 // a streaming request's silent window (cold start or time-to-first-token).
@@ -567,8 +580,16 @@ type modelStreamPeek struct {
 // serveProxy is the model-routed reverse proxy: every request that is not
 // one of the fixed control routes above -- the four GET-only ones (health,
 // running, models, and the /upstream/{model}/props probe) and POST
-// /ensure/{model}. It buffers the body (bounded), extracts model/stream, and
-// hands off to the plain or streaming path.
+// /ensure/{model}. It buffers the body (bounded), extracts the model (and, for
+// JSON, stream), and hands off to the plain or streaming path.
+//
+// The body is read as a multipart form when the request's Content-Type is
+// multipart/form-data (an image edit) and as JSON otherwise; see
+// peekMultipartModel. The Content-Type decides the shape, and a request that
+// declares the multipart one is never read as JSON, whatever its bytes look like.
+// A multipart request is always relayed by servePlainProxy: it has no stream
+// notion (the gateway refuses an edit that asks to stream), so a form field that
+// happens to be named stream is not read at all.
 func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -577,9 +598,28 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A media type that fails to parse for a reason other than its parameters
+	// comes back empty, so it falls through to the JSON default exactly as it
+	// always has. One that names multipart/form-data but carries a bad
+	// parameter (mime.ErrInvalidMediaParameter) still comes back as
+	// multipart/form-data, and is refused below rather than read as JSON.
+	mediaType, params, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == "multipart/form-data" {
+		var model string
+		if mtErr == nil {
+			model = peekMultipartModel(body, params["boundary"])
+		}
+		if model == "" {
+			writeModelNotNamed(w)
+			return
+		}
+		rt.servePlainProxy(w, r, model, body)
+		return
+	}
+
 	var peek modelStreamPeek
 	if err := json.Unmarshal(body, &peek); err != nil || peek.Model == "" {
-		writeError(w, http.StatusNotFound, codeModelNotManaged, "request body does not name a managed model")
+		writeModelNotNamed(w)
 		return
 	}
 
@@ -588,6 +628,72 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rt.servePlainProxy(w, r, peek.Model, body)
+}
+
+// writeModelNotNamed answers a proxied request whose body does not name a
+// model to route on: 404 runtime.model_not_managed, for a JSON body and a
+// multipart one alike, before anything is started.
+func writeModelNotNamed(w http.ResponseWriter) {
+	writeError(w, http.StatusNotFound, codeModelNotManaged, "request body does not name a managed model")
+}
+
+// peekMultipartModel returns the value of the "model" field of a multipart/
+// form-data body, or "" when there is none the router will route on: no
+// boundary, a malformed body, no model part, an empty model, a model over
+// maxMultipartModelBytes, or more than one model part.
+//
+// SECURITY: this reads the form the way the gateway does and must keep doing
+// so. The gateway peeks the model out of the same bytes (parseImageEditForm,
+// gateway/backend/internal/gateway/images_edit_handler.go), decides routing and
+// the operator's model allowlist on it, and then this router starts a process
+// on its own reading. Were the two to read different models out of one body, an
+// allowlisted name in the one and an arbitrary managed name in the other would
+// bypass the allowlist. So the model is, exactly as there: a part of
+// mime/multipart.NewReader over the buffered body whose FormName() is "model" --
+// FormName() is "" unless the part's disposition is form-data, so a
+// `Content-Disposition: attachment; name="model"` part is not the model, nor is
+// anything in the preamble or the epilogue, which the Reader skips. It is NOT a
+// scan for the text name="model": do not replace this with one, and do not
+// loosen what FormName() decides.
+//
+// Like the gateway it walks the WHOLE body even once the model is in hand, so a
+// repeated model part (two answers to "which model": the gateway refuses it, and
+// the router must not pick one of them) and a part the Reader cannot get to (a
+// header block it cannot parse, a body that ends inside one; the gateway answers
+// "malformed multipart body") are caught here too, instead of routing a body the
+// gateway would not have forwarded. Only the model part is read into memory,
+// bounded; every other part is skipped by the Reader, so its content is not
+// validated here -- the gateway reads the prompt and image parts and refuses a
+// body whose own are damaged, and the router relays what the gateway forwarded.
+// What the router must and does agree on is the model.
+func peekMultipartModel(body []byte, boundary string) string {
+	if boundary == "" {
+		return ""
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	var model string
+	seen := false
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return model
+		}
+		if err != nil {
+			return ""
+		}
+		if part.FormName() != "model" {
+			continue
+		}
+		if seen {
+			return ""
+		}
+		seen = true
+		value, err := io.ReadAll(io.LimitReader(part, maxMultipartModelBytes+1))
+		if err != nil || len(value) > maxMultipartModelBytes {
+			return ""
+		}
+		model = string(value)
+	}
 }
 
 // servePlainProxy handles a non-streaming request: EnsureRunning, map any

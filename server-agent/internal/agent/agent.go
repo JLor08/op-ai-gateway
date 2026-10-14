@@ -219,7 +219,22 @@ import (
 // gateway that predates the field ignores the unknown key. Nothing on the
 // gateway side waits on the agent, so there is nothing for a feature flag to
 // gate. The same reasoning made 0.7.3 -> 0.7.4 (#154) a PATCH.
-const Version = "0.8.2"
+//
+// 0.8.2 -> 0.9.0 is the single bump for the image-edit branch (#69): the
+// runtime router serves a multipart/form-data request -- the gateway's POST
+// /v1/images/edits -- by reading the model out of the form's "model" part
+// (mime/multipart, the parser the gateway peeks the same form with) instead of
+// out of a JSON document, starting that model's child, and relaying the
+// client's multipart body to it unchanged under the client's own Content-Type.
+// A multipart request is always a plain, non-streaming relay, and a body with
+// no usable model part, or a malformed one, is refused with the same 404
+// runtime.model_not_managed as a JSON body that names no managed model, before
+// any child starts. MINOR, and the rule decides it: agent.Features gains
+// "multipart_proxy", the name the gateway checks before it relays an edit to an
+// agent-launched child, because a router without the branch cannot be told apart
+// by trying (it answers 404 runtime.model_not_managed, as for an unmanaged
+// model). The same reasoning made 0.7.4 -> 0.8.0 (runtime_ensure) a MINOR.
+const Version = "0.9.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
