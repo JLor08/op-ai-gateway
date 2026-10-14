@@ -121,6 +121,28 @@ func TestProxyNativeForwardsContentType(t *testing.T) {
 	}
 }
 
+// An empty content type is sent as JSON, not as a blank Content-Type header. No
+// caller passes one today (the gateway's proxyNative defaults it first); this pins
+// the guard for the one that will.
+func TestDoNativeProxyDefaultsAnEmptyContentTypeToJSON(t *testing.T) {
+	var got []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Values("Content-Type")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	resp, err := doNativeProxy(context.Background(), upstream.Client(), routing.Target{Endpoint: upstream.URL}, "/v1/responses", []byte(`{}`), "")
+	if err != nil {
+		t.Fatalf("doNativeProxy: %v", err)
+	}
+	resp.Body.Close()
+
+	if len(got) != 1 || got[0] != jsonContentType {
+		t.Fatalf("upstream Content-Type = %q, want exactly [%q]", got, jsonContentType)
+	}
+}
+
 func TestMultiplexerProxyNativeUnsupportedProvider(t *testing.T) {
 	// A provider client without the NativeProxyClient capability yields a clear
 	// error rather than cross-routing to the fallback.

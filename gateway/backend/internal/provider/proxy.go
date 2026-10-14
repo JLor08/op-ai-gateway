@@ -27,7 +27,8 @@ type ProxyResponse struct {
 // upstream response with its Body still open, so the gateway can stream it back to
 // the client byte-for-byte without translating through inference.Request.
 //
-// contentType is the body's media type, sent upstream verbatim as Content-Type.
+// contentType is the body's media type, sent upstream verbatim as Content-Type
+// (an empty one is sent as application/json).
 // Every JSON endpoint passes "application/json"; a multipart body (the image-edit
 // upload) passes its own "multipart/form-data; boundary=..." so the boundary the
 // parts were framed with survives the hop.
@@ -54,10 +55,18 @@ func doNativeProxy(ctx context.Context, httpClient *http.Client, target routing.
 // applied, so a ctx-carried ExtraHeaders entry of the same name still wins — the
 // same precedence the Anthropic translate path has — while a ctx that carries
 // nothing still sends them. A nil/empty set is exactly doNativeProxy.
+//
+// An empty contentType is sent as application/json rather than as an empty
+// Content-Type header: every caller reaches this through the gateway's proxyNative,
+// which already defaults it, so this is no behaviour change today -- it keeps a
+// future caller that forgets from sending an upstream a blank media type.
 func doNativeProxyWithDefaults(ctx context.Context, httpClient *http.Client, target routing.Target, path string, body []byte, contentType string, defaults map[string]string) (*ProxyResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+	}
+	if contentType == "" {
+		contentType = jsonContentType
 	}
 	httpReq.Header.Set(contentTypeHeader, contentType)
 	for name, value := range defaults {

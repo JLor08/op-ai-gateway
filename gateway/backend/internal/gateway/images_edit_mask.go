@@ -33,7 +33,18 @@ const (
 	// a few hundred KB on the wire and tens of GB as pixels. The cap is read off
 	// the header, before any pixel is allocated. 16 Mpixels (4096 x 4096) is the
 	// largest image sd-server itself generates (its capabilities document limits
-	// the edge to 4096), and decodes to about 64 MiB.
+	// the edge to 4096).
+	//
+	// What one conversion of a mask at the cap allocates, measured at 4096 x 4096
+	// (convertImageEditMask end to end): about 81 MiB in total for an 8-bit RGBA
+	// mask (64 MiB of decoded pixels and the 16 MiB luminance plane they are
+	// converted into), and about 273 MiB for a 16-bit RGBA one -- 128 MiB of
+	// decoded pixels and the same 16 MiB plane live at once, and another ~128 MiB
+	// of short-lived garbage, one boxed color.Color per pixel, because
+	// alphaMaskToLuminance has no fast path for NRGBA64. An all-transparent 16-bit
+	// mask of that size is about 180 KiB on the wire. The cap bounds ONE
+	// conversion, not how many run at once: that worst case is per concurrent
+	// request.
 	maxImageEditMaskPixels = 1 << 24
 
 	// imageEditMaskFilename names the converted mask's file part: sd-server reads
