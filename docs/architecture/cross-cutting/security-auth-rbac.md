@@ -24,8 +24,8 @@ cookie: they are reachable by the gateway's own background executor over
 loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
 `internal/gateway/auth_internal_or_bearer.go`). Every remaining inference
 endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
-`/v0/models`, `/openai/v1/models`, `/anthropic/v1/models` model-listing
-endpoints) is **bearer-only**: no session cookie and no loopback pair is
+`/v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models` and
+`/openai/api/v1/models` model-listing endpoints) is **bearer-only**: no session cookie and no loopback pair is
 accepted there at all.
 
 ## 2. Local password authentication

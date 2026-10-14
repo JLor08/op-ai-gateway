@@ -1528,9 +1528,9 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		item := map[string]any{"id": m.ID, "object": "model", "owned_by": "op-ai-gateway"}
-		// context_length is the usable window in tokens that OpenAI-style
-		// clients (opencode among them) read; it is left out, not zero, when no
-		// mapping of the model knows it.
+		// context_length is the usable window in tokens, the standard location
+		// clients read a model's context from (no released opencode reads it
+		// yet); it is left out, not zero, when no mapping of the model knows it.
 		if m.ContextSize > 0 {
 			item["context_length"] = m.ContextSize
 		}
@@ -1540,11 +1540,12 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // lmStudioV1ModelsFromDTOs maps portal model rows into the item shape of LM
-// Studio's native v2 GET /api/v1/models listing, which is where a current
-// opencode (and any LM Studio client) learns each model's context window. Chat
-// still flows over the OpenAI-compatible /v1/chat/completions path; only the
-// metadata is emulated. It maps every row it is given; handleLMStudioV1Models
-// passes only the rows openAIModelDTOs keeps.
+// Studio's native v2 GET /api/v1/models listing, which is where an LM Studio
+// client (a current opencode, per issue #171's reading of its source) learns
+// each model's context window. Chat still flows over the OpenAI-compatible
+// /v1/chat/completions path; only the metadata is emulated. It maps every row
+// it is given; handleLMStudioV1Models passes only the rows openAIModelDTOs
+// keeps.
 //
 // max_context_length is ALWAYS present, even at 0 (an unknown window): LM
 // Studio's v2 contract requires it and a client keeps its own default for 0.
@@ -1594,11 +1595,11 @@ func openAIModelDTOs(models []portal.ModelDTO) []portal.ModelDTO {
 }
 
 // handleLMStudioV1Models serves LM Studio's native v2 model listing
-// (GET /api/v1/models, also under /openai/api/v1/models), the endpoint a current
-// opencode reads each model's context window from. Like /v1/models it is
-// bearer-only and reachable to a service token (llm:invoke) as well as a normal
-// gateway:use token: discovery is not invocation. It lists exactly the names
-// /v1/models lists.
+// (GET /api/v1/models, also under /openai/api/v1/models), the endpoint an LM
+// Studio client (a current opencode, per issue #171) reads each model's context
+// window from. Like /v1/models it is bearer-only and reachable to a service
+// token (llm:invoke) as well as a normal gateway:use token: discovery is not
+// invocation. It lists exactly the names /v1/models lists.
 func (s *Server) handleLMStudioV1Models(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return

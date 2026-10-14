@@ -2593,11 +2593,12 @@ carries the context window (model context-size discovery, issue #171).** This
 ADR kept an LM Studio-shaped `GET /api/v0/models` that reported each model's
 `max_context_length`, on the belief, repeated in four places (the compatibility
 doc, the API surface table, the OpenAPI spec and the handler's comments), that
-opencode auto-detects a model's context window from it. It does not: no
-current opencode reads v0. opencode's LM Studio provider discovers from LM
+opencode auto-detects a model's context window from it. Per issue #171's
+reading of opencode's source (not verified against opencode here) it does not:
+no current opencode reads v0, and its LM Studio provider discovers from LM
 Studio's native v2 listing, `GET /api/v1/models`, which the gateway answered
 with 404, and a config-file `openai-compatible` provider discovers nothing.
-The v0 listing's only consumer was `scripts/gen-opencode-config.sh`. The
+The v0 listing's only in-repo consumer was `scripts/gen-opencode-config.sh`. The
 decisions, which leave (a) to (g) as they are:
 
 1. **`/api/v0/models` is retired, not deprecated.** The route,
@@ -2610,14 +2611,15 @@ decisions, which leave (a) to (g) as they are:
    one entry per `openAIModelDTOs` row, so the ids are `/v1/models`' ids, groups
    and offered aliases included. `max_context_length` is **always** present,
    `0` when unknown: v2 requires the key, and listing a model with `0` keeps it
-   visible (a client that discovers replaces its model list, so omitting the
-   key would hide the model) while the client keeps its own default for `0`.
+   visible (a client that discovers is understood to replace its model list, so
+   omitting the key would hide the model) while the client keeps its own
+   default for `0`.
    `loaded_instances` is `[{"config":{"context_length":N}}]` for a loaded model
    and `[]` otherwise; `models` and every `loaded_instances` encode as `[]`,
-   never `null`, because a client decodes the response strictly and one `null`
-   fails the whole listing. The pair is registered under `/api/v1/models` and
-   `/openai/api/v1/models` and **not** under `/anthropic/`, which has no chat
-   route a discovered model could be used with. Its auth is `requireAnyScope`,
+   never `null`, because opencode is reported to decode the response strictly,
+   so one `null` would fail the whole listing. The pair is registered under `/api/v1/models` and
+   `/openai/api/v1/models` and **not** under `/anthropic/`, which has no OpenAI
+   chat-completions route a discovered model could be used with. Its auth is `requireAnyScope`,
    bearer-only, exactly `/v1/models`' (so a service token's `llm:invoke`
    discovers; v0's `requireScope("gateway:use")` refused it): discovery is not
    invocation, and the allowlist restricts the second only.
@@ -2629,8 +2631,9 @@ decisions, which leave (a) to (g) as they are:
    is **omitted** when it is `0`, unlike `max_context_length`: a client that
    reads `context_length ?? fallback` would be blocked by a `0`. The two
    endpoints therefore keep different contracts, deliberately. No released
-   opencode reads this field yet; it is the standard place other
-   OpenAI-compatible tools read, and `scripts/gen-opencode-config.sh` reads it
+   opencode is known to read this field yet; it is the place a generic
+   OpenAI-compatible client reads a model's window, and
+   `scripts/gen-opencode-config.sh` reads it
    (same `limit.context` / `limit.output = min(floor(context/4), 8192)` output,
    models without a context skipped).
 4. **The tools policy: `capabilities.trained_for_tool_use` is the constant
