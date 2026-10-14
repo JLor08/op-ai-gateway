@@ -1724,8 +1724,16 @@ source is impossible to send three ways: the slot refuses it, an effect drops a
 mask whose source goes, and `userTurnContent` never emits one). The user turn is
 built in one place, `userTurnContent(text, images, mask, mode)`, which appends the
 `purpose: "mask"` part only for an edit with exactly one source; the bubble shows
-the mask apart, as its own thumbnail. **Refine** is a per-image control on a
-generated result (`ImageTurn`'s `onRefine`, offered on assistant turns and only
+the mask apart, as its own thumbnail. The mask is sized to the source the composer
+holds (`prepareMaskDataUrl`), not clamped to the 1568 px cap: an uploaded source is
+downscaled to that cap, but a refined one is sent by reference at its stored size
+(1792 × 1024 is a size the composer offers), and the gateway refuses a mask that is
+not exactly the first source's size (`images.mask_invalid`). A mask already of the
+source's size goes as it is; the same picture at another size (the same shape, within
+1 %) is drawn at the source's size, PNG with its alpha; a mask of another shape, or a
+source that cannot be read, falls back to the cap and the gateway's refusal — a mask
+is never stretched onto a source it was not drawn for. **Refine** is a per-image
+control on a generated result (`ImageTurn`'s `onRefine`, offered on assistant turns and only
 where `attachMode` is `'edit'`): it **seeds the composer** — it never sends — with
 that image's own `/api/portal/chat-blobs/{id}` reference, replacing whatever was
 attached (an edit has one source) and any mask (one drawn for the old source would

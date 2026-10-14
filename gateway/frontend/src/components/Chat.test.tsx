@@ -271,6 +271,31 @@ const tokens: PortalToken[] = [plainToken, overrideToken];
 // rejects with ImageAttachError reason "decode". Reset per test in beforeEach.
 let imageDecodeFails = false;
 
+// What the stubbed decoder reports as an image's pixel size: 32x24 unless a test says
+// otherwise (<= the 1568 cap, so nothing is ever re-encoded). A test that needs a
+// bigger image either registers it here by its exact src (a chat-blob reference, which
+// holds no bytes to read) or makes it out of bytes that SAY their size: fakeImageFile
+// builds such a file, and the stubbed canvas (stubCanvas) encodes the size of what it
+// draws the same way, so a data url read back through the decoder gives the size the
+// pipeline really produced. Reset per test in beforeEach.
+let imageSizes = new Map<string, [number, number]>();
+const fakeImageBytes = (width: number, height: number) => `fake-image ${width}x${height}`;
+function fakeImageFile(width: number, height: number, name = 'image.png') {
+  return new File([fakeImageBytes(width, height)], name, { type: 'image/png' });
+}
+function decodedSize(src: string): [number, number] {
+  const registered = imageSizes.get(src);
+  if (registered) return registered;
+  const payload = /^data:[^;,]+;base64,(.*)$/.exec(src)?.[1];
+  let said: RegExpExecArray | null = null;
+  try {
+    said = payload ? /^fake-image (\d+)x(\d+)$/.exec(atob(payload)) : null;
+  } catch {
+    // not base64 at all: a seeded placeholder, which is the default size
+  }
+  return said ? [Number(said[1]), Number(said[2])] : [32, 24];
+}
+
 function installStubs() {
   const store = new Map<string, string>();
   const storage = {
@@ -293,14 +318,13 @@ function installStubs() {
     onerror: (() => void) | null = null;
     naturalWidth = 0;
     naturalHeight = 0;
-    set src(_value: string) {
+    set src(value: string) {
       queueMicrotask(() => {
         if (imageDecodeFails) {
           this.onerror?.();
           return;
         }
-        this.naturalWidth = 32;
-        this.naturalHeight = 24;
+        [this.naturalWidth, this.naturalHeight] = decodedSize(value);
         this.onload?.();
       });
     }
@@ -320,6 +344,7 @@ async function pickOption(comboLabel: string, optionText: string) {
 
 beforeEach(() => {
   imageDecodeFails = false;
+  imageSizes = new Map();
   FakeEventSource.instances = [];
   serverModelsByServer = {};
   installStubs();
@@ -2011,6 +2036,170 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           screen.getAllByAltText(t.chatAttachedImage).map((img) => img.getAttribute('src')),
         ).toContain(newerRef),
       );
+    });
+  });
+
+  // The gateway refuses a mask that is not EXACTLY the size of the edit's source
+  // (images.mask_invalid), so the portal sizes the mask to the source it actually
+  // sends. The two sources differ: an uploaded image is downscaled to a 1568 px
+  // longest edge on the way in, but a refined one is the stored image BY REFERENCE, at
+  // its natural size -- 1792x1024 when the composer's own size menu made it -- so a
+  // mask clamped to the same 1568 px would never fit it, with no way out for the user.
+  describe(`Chat: an edit's mask is sized to its source, not clamped to 1568 px [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const resultRef = '/api/portal/chat-blobs/blob_result';
+    let drawImage: ReturnType<typeof vi.fn>;
+    let toDataURL: ReturnType<typeof vi.spyOn>;
+    let getContext: ReturnType<typeof vi.spyOn>;
+
+    // jsdom has no canvas raster: a stubbed one that records the draw and encodes the
+    // size it was given (see fakeImageBytes), so the url that comes out reads back to
+    // the pixel size of the canvas it was drawn on.
+    beforeEach(() => {
+      drawImage = vi.fn();
+      getContext = vi
+        .spyOn(HTMLCanvasElement.prototype, 'getContext')
+        .mockReturnValue({ drawImage } as unknown as CanvasRenderingContext2D);
+      toDataURL = vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(function (
+        this: HTMLCanvasElement,
+      ) {
+        return `data:image/png;base64,${btoa(fakeImageBytes(this.width, this.height))}`;
+      } as unknown as HTMLCanvasElement['toDataURL']);
+    });
+    afterEach(() => {
+      getContext.mockRestore();
+      toDataURL.mockRestore();
+    });
+
+    function seedGeneration() {
+      chatApi.rows.push({
+        id: 'c_refine',
+        title: 'Lighthouse',
+        created_at: '2026-07-19T12:00:00Z',
+        updated_at: '2026-07-19T12:00:00Z',
+        content: {
+          settings: { model: editModel.id, kind: 'image' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'a lighthouse' },
+            {
+              id: 'a1',
+              role: 'assistant',
+              content: [{ type: 'image_url', image_url: { url: resultRef } }],
+              status: 'complete',
+            },
+          ],
+        },
+      });
+    }
+    // The generation was made at 1792x1024 (an offered size) and is refined as stored.
+    async function refineLargeImage() {
+      imageSizes.set(resultRef, [1792, 1024]);
+      seedGeneration();
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+      fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+      await screen.findByAltText(t.chatAttachedImage);
+    }
+    async function uploadSource(width: number, height: number) {
+      renderChat(tokens, [editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+      fireEvent.change(screen.getByLabelText(t.chatAttachImage), {
+        target: { files: [fakeImageFile(width, height, 'source.png')] },
+      });
+      await screen.findByAltText(t.chatAttachedImage);
+    }
+    async function attachMask(width: number, height: number) {
+      fireEvent.change(screen.getByLabelText(t.chatAttachMask), {
+        target: { files: [fakeImageFile(width, height, 'mask.png')] },
+      });
+      await screen.findByAltText(t.chatAttachedMask);
+    }
+    async function sendEdit(prompt = 'fill the sky') {
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: prompt },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      return (chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody).user_message as {
+        image_url?: { url: string };
+        purpose?: string;
+      }[];
+    }
+    const sizeOf = (url: string | undefined) => decodedSize(url ?? '');
+
+    describe('a refined image', () => {
+      it('gets a mask drawn at its own 1792x1024, not the 1568x896 the source upload would be clamped to', async () => {
+        await refineLargeImage();
+
+        await attachMask(3584, 2048); // the same picture at twice the size
+        const parts = await sendEdit();
+
+        expect(parts).toHaveLength(3);
+        expect(parts[1].image_url?.url).toBe(resultRef);
+        expect(parts[2].purpose).toBe('mask');
+        expect(sizeOf(parts[2].image_url?.url)).toEqual([1792, 1024]);
+        expect(drawImage).toHaveBeenCalledWith(expect.anything(), 0, 0, 1792, 1024);
+        expect(toDataURL).toHaveBeenCalledWith('image/png');
+      });
+
+      it('keeps a mask that is already its size exactly as it was: no clamp, no re-encode', async () => {
+        await refineLargeImage();
+
+        await attachMask(1792, 1024);
+        const parts = await sendEdit();
+
+        expect(sizeOf(parts[2].image_url?.url)).toEqual([1792, 1024]);
+        expect(parts[2].image_url?.url).toBe(
+          `data:image/png;base64,${btoa(fakeImageBytes(1792, 1024))}`,
+        );
+        expect(drawImage).not.toHaveBeenCalled();
+      });
+
+      it('is sent without a mask exactly as before: the stored reference alone, nothing drawn', async () => {
+        await refineLargeImage();
+
+        const parts = await sendEdit('make the sky purple');
+
+        expect(parts).toStrictEqual([
+          { type: 'text', text: 'make the sky purple' },
+          { type: 'image_url', image_url: { url: resultRef } },
+        ]);
+        expect(drawImage).not.toHaveBeenCalled();
+        expect(toDataURL).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('an uploaded image', () => {
+      it('keeps its mask the size of the downscaled source it is sent with', async () => {
+        await uploadSource(4000, 3000); // downscaled to the 1568 px cap: 1568x1176
+
+        await attachMask(4000, 3000);
+        const parts = await sendEdit();
+
+        expect(sizeOf(parts[1].image_url?.url)).toEqual([1568, 1176]);
+        expect(sizeOf(parts[2].image_url?.url)).toEqual([1568, 1176]);
+        expect(parts[2].purpose).toBe('mask');
+      });
+
+      it('is sent without a mask exactly as before: the downscaled source alone', async () => {
+        await uploadSource(4000, 3000);
+
+        const parts = await sendEdit('make it blue');
+
+        expect(parts).toHaveLength(2);
+        expect(parts[1]).toStrictEqual({
+          type: 'image_url',
+          image_url: { url: `data:image/png;base64,${btoa(fakeImageBytes(1568, 1176))}` },
+        });
+      });
     });
   });
 

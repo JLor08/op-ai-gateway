@@ -28,7 +28,12 @@ import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
 import { imageUrlsOf, type ChatContent } from '../shared/chatContent';
-import { prepareImageDataUrl, ImageAttachError, isHeicFile } from '../shared/imageAttach';
+import {
+  prepareImageDataUrl,
+  prepareMaskDataUrl,
+  ImageAttachError,
+  isHeicFile,
+} from '../shared/imageAttach';
 import { offeredFlavors } from '../shared/offeredFlavors';
 import {
   ACTIVE_ID_KEY,
@@ -1556,13 +1561,16 @@ export function ChatStoreProvider({
 
   const removeMask = useCallback(() => setMask(null), []);
 
-  // The mask slot of an edit: ONE PNG, and only beside a source image. It goes
-  // through the same preparation as the source (size cap, decode check, the 1568 px
-  // longest-edge downscale), which is what keeps the two the same size when the
-  // source is downscaled -- the same function of the same pixel size gives the same
-  // result -- and a PNG stays a PNG, alpha included. The gateway checks the rest
-  // (the mask's size against the source's, a transparent region to edit) and says
-  // so with images.mask_invalid.
+  // The mask slot of an edit: ONE PNG, and only beside a source image. It is sized to
+  // the source as it is actually sent (prepareMaskDataUrl: size cap, decode check, the
+  // source's own pixel size), NOT clamped to the 1568 px longest edge an uploaded
+  // source is downscaled to. The two sources differ: an upload is downscaled to that
+  // cap, but a refined image is sent by reference at its stored, natural size
+  // (1792x1024 is a size the composer offers), and the gateway refuses a mask that is
+  // not exactly the first source's size -- a clamped mask would never fit a refined
+  // image, and the user has no way to make one that does. A PNG stays a PNG, alpha
+  // included. The gateway checks the rest (a transparent region to edit, and the size
+  // of a mask that was not of the source's shape) and says so with images.mask_invalid.
   async function handleMaskFile(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
     if (attachMode !== 'edit' || images.length === 0) {
@@ -1578,7 +1586,7 @@ export function ChatStoreProvider({
       return;
     }
     try {
-      setMask(await prepareImageDataUrl(file));
+      setMask(await prepareMaskDataUrl(file, images[0]));
     } catch (err) {
       showError(attachErrorText(err, t));
     }
