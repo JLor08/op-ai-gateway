@@ -2362,7 +2362,7 @@ func (s *Service) Dashboard(ctx context.Context, token auth.Token) DashboardResp
 }
 
 // Models returns the offered-model listing for the portal chat picker, the LM
-// Studio /api/v0/models list and the service allowlist check
+// Studio /api/v1/models list and the service allowlist check
 // (validateServiceAllowedModels): hidden/locked models are SUPPRESSED from the
 // standalone listing (active groups are still added). Each model's flavors are
 // the ones dispatch serves it under (routing.MappingServesAPIFlavor); a model
@@ -2686,7 +2686,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				}
 			}
 			// Owner overlay: fold in the principal's own vendor-account models
-			// (Milestone 3) so the chat picker and /api/v0/models show exactly what
+			// (Milestone 3) so the chat picker and /api/v1/models show exactly what
 			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
 			// suppress==true is Models() (the picker / inference discovery); the
 			// admin management surface (ManageModels(), suppress==false) shows the
