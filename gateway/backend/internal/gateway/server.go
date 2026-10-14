@@ -1527,7 +1527,15 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := openAIModelDTOs(s.Portal.Models(r.Context(), token).Data)
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		item := map[string]any{"id": m.ID, "object": "model", "owned_by": "op-ai-gateway"}
+		item := map[string]any{
+			"id":       m.ID,
+			"object":   "model",
+			"owned_by": "op-ai-gateway",
+			// capabilities is the same object /api/v1/models carries, so the two
+			// listings stay in lockstep; it is always present (unlike
+			// context_length, which is omitted when the window is unknown).
+			"capabilities": modelCapabilities(m),
+		}
 		// context_length is the usable window in tokens, the standard location
 		// clients read a model's context from (no released opencode is known to
 		// read it yet, per issue #171's reading); it is left out, not zero, when no
@@ -1538,6 +1546,24 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// modelCapabilities is the capability object both /v1/models and the LM Studio
+// v2 /api/v1/models carry per model, built by one function so the two listings
+// stay identical. vision (accepts image input), image (generates images) and
+// image_edit (edits images) are the fail-closed AND-folds the portal row already
+// carries. trained_for_tool_use is a CONSTANT true: the gateway tracks no
+// per-model tool-support verdict (see #219), so every chat model it lists is
+// advertised tool-capable. vision and trained_for_tool_use are the two keys the
+// LM Studio v2 shape / opencode read (per issue #171's reading of opencode's
+// source); image and image_edit are gateway extensions beyond those two keys.
+func modelCapabilities(m portal.ModelDTO) map[string]any {
+	return map[string]any{
+		"vision":               m.Vision,
+		"image":                m.Image,
+		"image_edit":           m.ImageEdit,
+		"trained_for_tool_use": true,
+	}
 }
 
 // lmStudioV1ModelsFromDTOs maps portal model rows into the item shape of LM
@@ -1554,9 +1580,10 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 // window is unknown -- the two endpoints have different contracts, so do not
 // harmonise them. loaded_instances holds one instance when the model is loaded
 // and is an empty slice, never nil, when it is not, and the result itself is
-// non-nil even for no rows, so both encode as [] rather than null.
-// trained_for_tool_use is a constant: the gateway tracks no per-model tool
-// support, so every chat model it lists is advertised as tool-capable.
+// non-nil even for no rows, so both encode as [] rather than null. capabilities
+// is the shared modelCapabilities object (vision/image/image_edit +
+// trained_for_tool_use); opencode reads vision and trained_for_tool_use and
+// ignores the image/image_edit extensions.
 func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -1570,7 +1597,7 @@ func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 			"display_name":       m.DisplayName,
 			"max_context_length": m.ContextSize,
 			"loaded_instances":   loaded,
-			"capabilities":       map[string]any{"vision": m.Vision, "trained_for_tool_use": true},
+			"capabilities":       modelCapabilities(m),
 		})
 	}
 	return out

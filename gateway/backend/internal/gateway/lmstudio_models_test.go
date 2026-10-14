@@ -165,28 +165,31 @@ var (
 // context_length when the window is unknown.
 func TestLMStudioV1ModelsFromDTOs(t *testing.T) {
 	got := lmStudioV1ModelsFromDTOs([]portal.ModelDTO{
-		{ID: "loaded-vision", DisplayName: "Loaded Vision", ContextSize: 8192, Vision: true, Loaded: true},
-		{ID: "cold-unknown", DisplayName: "Cold Unknown", ContextSize: 0, Vision: false, Loaded: false},
-		{ID: "loaded-unknown", DisplayName: "Loaded Unknown", ContextSize: 0, Loaded: true},
+		// Each capability flag is true on a DIFFERENT row (vision/image/image_edit
+		// = one-hot across the three), so a fold wired from the wrong ModelDTO
+		// field is caught: Image is independent of Vision, and image_edit of both.
+		{ID: "loaded-vision", DisplayName: "Loaded Vision", ContextSize: 8192, Vision: true, Image: false, ImageEdit: false, Loaded: true},
+		{ID: "cold-unknown", DisplayName: "Cold Unknown", ContextSize: 0, Vision: false, Image: true, ImageEdit: false, Loaded: false},
+		{ID: "loaded-unknown", DisplayName: "Loaded Unknown", ContextSize: 0, Vision: false, Image: false, ImageEdit: true, Loaded: true},
 	})
 	want := []map[string]any{
 		{
 			"type": "llm", "key": "loaded-vision", "display_name": "Loaded Vision",
 			"max_context_length": 8192,
 			"loaded_instances":   []map[string]any{{"config": map[string]any{"context_length": 8192}}},
-			"capabilities":       map[string]any{"vision": true, "trained_for_tool_use": true},
+			"capabilities":       map[string]any{"vision": true, "image": false, "image_edit": false, "trained_for_tool_use": true},
 		},
 		{
 			"type": "llm", "key": "cold-unknown", "display_name": "Cold Unknown",
 			"max_context_length": 0,
 			"loaded_instances":   []map[string]any{},
-			"capabilities":       map[string]any{"vision": false, "trained_for_tool_use": true},
+			"capabilities":       map[string]any{"vision": false, "image": true, "image_edit": false, "trained_for_tool_use": true},
 		},
 		{
 			"type": "llm", "key": "loaded-unknown", "display_name": "Loaded Unknown",
 			"max_context_length": 0,
 			"loaded_instances":   []map[string]any{{"config": map[string]any{"context_length": 0}}},
-			"capabilities":       map[string]any{"vision": false, "trained_for_tool_use": true},
+			"capabilities":       map[string]any{"vision": false, "image": false, "image_edit": true, "trained_for_tool_use": true},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -266,8 +269,12 @@ func TestLMStudioV1ModelsShape(t *testing.T) {
 				if got := string(caps["vision"]); got != want.vision {
 					t.Fatalf("%s vision = %s, want %s", key, got, want.vision)
 				}
-				if len(caps) != 2 {
-					t.Fatalf("%s capabilities = %v, want exactly vision and trained_for_tool_use", key, caps)
+				capKeys := make([]string, 0, len(caps))
+				for capKey := range caps {
+					capKeys = append(capKeys, capKey)
+				}
+				if !sameStrings(capKeys, []string{"image", "image_edit", "trained_for_tool_use", "vision"}) {
+					t.Fatalf("%s capabilities keys = %q, want exactly vision, image, image_edit, trained_for_tool_use; caps = %v", key, capKeys, caps)
 				}
 			}
 		})

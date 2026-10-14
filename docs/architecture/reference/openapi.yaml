@@ -2338,6 +2338,26 @@ components:
               description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
             message: { type: string }
             request_id: { type: string }
+    ModelCapabilities:
+      type: object
+      description: >
+        The capability flags both /v1/models and /api/v1/models carry per model,
+        built by one shared helper so the two listings stay identical (issue
+        #222). vision/image/image_edit are the portal's fail-closed AND-folds;
+        trained_for_tool_use is always true. vision and trained_for_tool_use are
+        the keys the LM Studio v2 shape / opencode read; image and image_edit are
+        gateway extensions beyond those two keys.
+      required: [vision, image, image_edit, trained_for_tool_use]
+      properties:
+        vision: { type: boolean, description: True only when every offering mapping accepts image input (fail-closed). }
+        image: { type: boolean, description: True only when every offering mapping generates images (fail-closed). }
+        image_edit: { type: boolean, description: True only when every offering mapping can edit images (fail-closed). }
+        trained_for_tool_use:
+          type: boolean
+          const: true
+          description: >
+            Always true: the gateway tracks no per-model tool support
+            (ADR-045 (h)); making it truthful is issue #219.
     OpenAIModelList:
       type: object
       description: The OpenAI-shaped model listing of /v1/models.
@@ -2348,11 +2368,12 @@ components:
           type: array
           items:
             type: object
-            required: [id, object, owned_by]
+            required: [id, object, owned_by, capabilities]
             properties:
               id: { type: string, description: The gateway model name. }
               object: { type: string, const: model }
               owned_by: { type: string, const: op-ai-gateway }
+              capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
               context_length:
                 type: integer
                 minimum: 1
@@ -2396,19 +2417,7 @@ components:
                       required: [context_length]
                       properties:
                         context_length: { type: integer, minimum: 0 }
-              capabilities:
-                type: object
-                required: [vision, trained_for_tool_use]
-                properties:
-                  vision:
-                    type: boolean
-                    description: True only when every offering mapping accepts images (fail-closed).
-                  trained_for_tool_use:
-                    type: boolean
-                    const: true
-                    description: >
-                      Always true: the gateway tracks no per-model tool support
-                      (ADR-045 (h)).
+              capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
     TokenVendorAccess:
       type: object
       description: >
