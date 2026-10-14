@@ -171,6 +171,12 @@ type TokenRecord struct {
 	// UnknownModelFallback is the model or group used when LastUsedModel is
 	// empty or no longer offered ("" = none, the request then fails as before).
 	UnknownModelFallback string
+	// ClaudeModelAliases is the opt-in (default false) that auto-exposes this
+	// token's eligible local models and groups under stable
+	// `anthropic-local-<hash>` ids, so Claude-compatible clients that filter
+	// model ids by family can still select them. Stored as
+	// api_tokens.claude_model_aliases; off means no behaviour change.
+	ClaudeModelAliases bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

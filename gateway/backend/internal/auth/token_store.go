@@ -74,6 +74,9 @@ type Token struct {
 	UnknownModelRedirect        bool
 	UnknownModelRedirectBlocked bool
 	UnknownModelFallback        string
+	// ClaudeModelAliases mirrors the token record's opt-in for the automatic
+	// Claude-compatible model aliases — see store.TokenRecord.
+	ClaudeModelAliases bool
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the
