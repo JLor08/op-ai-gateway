@@ -12,6 +12,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
@@ -21,17 +22,33 @@ import (
 	"time"
 )
 
-// maxImageEditBodyBytes bounds the multipart read of POST /v1/images/edits. The
-// body is held in memory whole -- the handler peeks the form before routing and
-// may rebuild it afterwards -- so, unlike the JSON endpoints (readRawJSONUnlimited
-// is uncapped on purpose, to match llama-swap), an unbounded read here is a
-// memory exposure the endpoint has to answer for. The value matches the agent
-// runtime router's own request cap, which an edit to an agent-launched child
-// still has to fit under, rebuilt or not. The cap applies to what the client
-// sends, so a rebuild that grows the body (the model-name rewrite grows it by
-// at most the difference of two names) is not itself bounded by it. It is a
-// constant, not yet an operator setting.
-const maxImageEditBodyBytes = 32 << 20
+// defaultMaxImageEditBodyBytes is the default bound on the multipart read of POST
+// /v1/images/edits, an operator setting (ServerDeps.MaxImageEditBodyBytes, config
+// OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES; the Server's value is
+// imageEditBodyLimit). The body is held in memory whole -- the handler peeks the
+// form before routing and may rebuild it afterwards (a mask conversion, a model
+// rewrite) -- so, unlike the JSON endpoints (readRawJSONUnlimited is uncapped on
+// purpose, to match llama-swap), an unbounded read here is a memory exposure the
+// endpoint has to answer for. The default is the agent runtime router's own
+// request cap (agentRouterMaxBodyBytes).
+//
+// The relation between the two caps: this one bounds what the CLIENT sends, and
+// an edit to an agent-launched model must also fit what the agent accepts after
+// the gateway has prepared it -- and preparing can GROW a body (the converted
+// mask of a highly compressed one, the longer model name, the new boundary). So
+// the body actually handed to an agent target is checked against the agent's cap
+// (relayImageEdit, errImageEditTooLarge), and a client body under this cap but
+// whose prepared form is over that one is refused with a 413 of the gateway's
+// own instead of being sent to come back as the agent's. Raising this setting
+// above the agent's cap therefore never lets an oversized body reach an agent;
+// it only lets larger ones through to external edit upstreams.
+const defaultMaxImageEditBodyBytes = 32 << 20
+
+// agentRouterMaxBodyBytes is the largest request the server agent's runtime router
+// accepts (maxBodyBytes in server-agent/internal/runtime/router.go, a separate
+// module this one does not import; it answers a larger one 413
+// runtime.request_too_large). Keep the two equal.
+const agentRouterMaxBodyBytes = 32 << 20
 
 // maxImageEditFieldBytes bounds ONE text field the handler reads out of the form
 // (model, prompt, response_format, stream). The image and mask parts are never
@@ -47,10 +64,12 @@ const invalidImageEditRequest = "request.invalid"
 
 // imageEditForm is what the handler needs out of an edit's multipart form before
 // it can route the request: the routing model, the fields the validation twin
-// checks, and whether any source image arrived. It is deliberately NOT a general
-// form decoding -- every other field (n, size, mask, strength, output_format,
-// the extra-args prompt block, ...) is the client's own business and reaches the
-// upstream unexamined, exactly as the generations endpoint's JSON does.
+// checks, and whether a source image and a mask arrived. It is deliberately NOT a
+// general form decoding -- every other field (n, size, output_format, the
+// extra-args prompt block that carries strength, ...) is the client's own business
+// and reaches the upstream unexamined, exactly as the generations endpoint's JSON
+// does. (The mask is the one part with a meaning of its own: its alpha is
+// converted, see convertImageEditMask.)
 type imageEditForm struct {
 	// boundary is the multipart boundary of the CLIENT's body, kept so a body
 	// that has to be rebuilt can be read back with the same reader.
@@ -66,9 +85,29 @@ type imageEditForm struct {
 	// images counts the NON-EMPTY parts under `image` or `image[]`, the two
 	// spellings OpenAI's clients use for the source image(s).
 	images int
+	// masks counts the NON-EMPTY `mask` parts: 0 or 1 (a second is refused at
+	// parse). Whether there is one is all the parse says; convertImageEditMask
+	// reads it.
+	masks int
 }
 
 func (f imageEditForm) routingModel() string { return strings.TrimSpace(f.model) }
+
+// imageEditBodyLimit is the multipart read cap in force: the configured one, or
+// the default for a Server that was never given one (a bare &Server{}).
+func (s *Server) imageEditBodyLimit() int64 {
+	if s.maxImageEditBodyBytes > 0 {
+		return s.maxImageEditBodyBytes
+	}
+	return defaultMaxImageEditBodyBytes
+}
+
+// errImageEditTooLarge is the refusal of an edit whose prepared body is past the
+// request limit of the agent it is bound for (agentRouterMaxBodyBytes). Like
+// errImageEditUnavailable it is mapped to a status, code and message in one place
+// (completionHTTPStatus, completionErrorCode, completionErrorResponse): 413
+// request.body_too_large, the code the client's own oversized body gets.
+var errImageEditTooLarge = errors.New(codeRequestBodyTooLarge)
 
 // codeImageEditUnavailable is the code an edit is refused with when its resolved
 // target is an agent that has not declared multipart_proxy: the request is well
@@ -124,8 +163,13 @@ func invalidImageEdit(message string) error {
 //     handler's identity and never from anything in the body. It is derived (a
 //     model that generates images may be edited unless an operator opted out),
 //     which is also what lets the unknown-model redirect find a target.
+//   - A mask is converted (convertImageEditMask) with the rest of the validation:
+//     OpenAI's transparent-means-edit alpha mask becomes the luminance mask
+//     sd-server reads, and a mask that cannot be used is a 400 of its own
+//     (images.mask_invalid, images.edit_unsupported_format) before the gate.
 //   - The relay names the edits endpoint (nativeRelay.endpoint) and its upstream
-//     path, and carries the body's own content type.
+//     path, and carries the body's own content type -- the client's, verbatim,
+//     unless there is a mask or a model name to change (relayImageEdit).
 //
 // Auth is requireInternalOrBearerAnyScope for the reasons handleOpenAIImages
 // gives: a bearer or the internal loopback pair, never a browser session cookie.
@@ -138,7 +182,7 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	liftInferenceDeadlines(w)
-	raw, ok := readImageEditBody(w, r)
+	raw, ok := readImageEditBody(w, r, s.imageEditBodyLimit())
 	if !ok {
 		return
 	}
@@ -150,6 +194,19 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 	if err := validateImageEditRequest(form); err != nil {
 		writeRequestError(w, err)
 		return
+	}
+	// A mask is converted here, with the rest of the validation: its refusals
+	// (size, format, no region) are 400s answered before the gate like any other,
+	// so a bad mask spends no admission. The conversion is bounded work -- the
+	// mask's pixel count is read off its header and capped before anything is
+	// decoded -- and what it produces rides to the relay beside the client's own
+	// bytes, which stay what capture records.
+	var maskPNG []byte
+	if form.masks > 0 {
+		if maskPNG, err = convertImageEditMask(form.boundary, raw); err != nil {
+			writeRequestError(w, err)
+			return
+		}
 	}
 	// Run-as: handleOpenAIImages' block, which is handleOpenAIChat's -- copied for
 	// the same reason (the surrounding code differs too much to factor out) and
@@ -181,20 +238,20 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 	if handled {
 		return
 	}
-	s.relayImageEdit(w, r, token, pf.Req, form, raw)
+	s.relayImageEdit(w, r, token, pf.Req, form, raw, maskPNG)
 }
 
-// readImageEditBody reads the whole multipart body, bounded by
-// maxImageEditBodyBytes. A body past the cap is a 413 whether its length was
-// declared (refused without reading a byte) or only discovered while reading.
-// The JSON readers cannot be used here: readRawJSONLimit decodes one JSON value
-// and refuses anything else.
-func readImageEditBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	if r.ContentLength > maxImageEditBodyBytes {
+// readImageEditBody reads the whole multipart body, bounded by limit (the
+// server's imageEditBodyLimit). A body past the cap is a 413 whether its length
+// was declared (refused without reading a byte) or only discovered while
+// reading. The JSON readers cannot be used here: readRawJSONLimit decodes one
+// JSON value and refuses anything else.
+func readImageEditBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	if r.ContentLength > limit {
 		writeBodyTooLarge(w)
 		return nil, false
 	}
-	body := http.MaxBytesReader(w, r.Body, maxImageEditBodyBytes)
+	body := http.MaxBytesReader(w, r.Body, limit)
 	defer body.Close()
 	raw, err := io.ReadAll(body)
 	if err != nil {
@@ -216,16 +273,19 @@ func readImageEditBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 // the body intact afterwards (to relay it verbatim or to rebuild it).
 //
 // Only the fields the handler owns are read into memory, each bounded by
-// maxImageEditFieldBytes; the image parts are counted and skipped, and every
-// other part is skipped untouched. Each of model, prompt, response_format and
-// stream may appear ONCE. The model decides routing and the allowlist and may be
-// peeked again downstream (the agent's router), so two of them are two answers
-// to "which model" and one must not be silently picked over the other; the rest
-// are refused for the same uniformity rather than inventing a precedence.
+// maxImageEditFieldBytes; the image and mask parts are counted and skipped, and
+// every other part is skipped untouched. Each of model, prompt, response_format,
+// stream and mask may appear ONCE. The model decides routing and the allowlist
+// and may be peeked again downstream (the agent's router), so two of them are two
+// answers to "which model" and one must not be silently picked over the other;
+// the rest are refused for the same uniformity rather than inventing a
+// precedence (and which of two masks is THE mask is not a question to guess at).
 //
-// The whole body is walked even once everything needed has been seen, so a
-// repeated field or a malformed tail is caught here rather than discovered by a
-// consumer later.
+// The whole body is walked, and EVERY part read to its end -- the skipped ones
+// too, because mime/multipart swallows the read error of a part it merely steps
+// over, so a part cut off mid-way would pass here and fail later, in the rebuild,
+// after the request had been admitted. A repeated field or a malformed tail is
+// caught here rather than discovered by a consumer later.
 func parseImageEditForm(contentType string, raw []byte) (imageEditForm, error) {
 	var form imageEditForm
 	mediaType, params, err := mime.ParseMediaType(contentType)
@@ -271,6 +331,22 @@ func parseImageEditForm(contentType string, raw []byte) (imageEditForm, error) {
 			}
 			if n > 0 {
 				form.images++
+			}
+		case "mask":
+			if seen[name] {
+				return form, invalidImageEdit(fmt.Sprintf("form field %q must appear only once", name))
+			}
+			seen[name] = true
+			n, err := io.Copy(io.Discard, part)
+			if err != nil {
+				return form, invalidImageEdit("malformed multipart body")
+			}
+			if n > 0 {
+				form.masks++
+			}
+		default:
+			if _, err := io.Copy(io.Discard, part); err != nil {
+				return form, invalidImageEdit("malformed multipart body")
 			}
 		}
 	}
@@ -325,35 +401,54 @@ func validateImageEditRequest(form imageEditForm) error {
 }
 
 // imageEditNeedsModelRewrite reports whether the relayed form's model field must
-// be replaced with the mapping's AppModelName: only for an agent-launched
-// (server_agent) target, whose agent router keys the child it starts on that
-// name -- routing.Target.ProviderModel -- and which is not the name the client
-// sent (the client names the GATEWAY's model; the two are independent fields of
-// a mapping). The comparison is against the field as the client sent it, so a
-// request that reached the mapping under a differently-spelled name is rewritten
-// too. An EXTERNAL target is never rewritten: sd-server ignores the model field
-// (one process serves one model), so the client's bytes are relayed verbatim,
-// which is also the cheapest and the least damaging thing to do to a body that
-// can carry several megabytes of binary.
+// be replaced with the mapping's own name for the model (routing.Target.
+// ProviderModel, the mapping's AppModelName): for ANY target whose name is set
+// and is not the one the form already carries. The client names the GATEWAY's
+// model, and the two are independent fields of a mapping. An agent-launched
+// target's router keys the child it starts on the mapped name; an external
+// upstream is handed it exactly as the JSON generations relay hands it
+// (rewriteModelField sets it for every provider). For the sd-server this endpoint
+// exists for the field changes nothing -- it ignores it, one process serves one
+// model -- but an external edit upstream that routes on the model (a proxy in
+// front of several) would otherwise route on the gateway's name, and a client
+// could name any model there, past a token's model override or redirect pin.
+// The comparison is against the field as the client sent it, so a request that
+// reached the mapping under a differently-spelled name -- or through an override
+// or redirect that replaced it -- is rewritten too; a form that already carries
+// the mapped name is left alone.
 func imageEditNeedsModelRewrite(target routing.Target, formModel string) bool {
-	return target.Provider == routing.ProviderServerAgent &&
-		target.ProviderModel != "" &&
-		formModel != target.ProviderModel
+	return target.ProviderModel != "" && formModel != target.ProviderModel
 }
 
-// rebuildImageEditBody returns raw with the value of its model field replaced by
-// model, as a new multipart body and its Content-Type (a fresh boundary). Every
-// other part -- its headers, its bytes, and its position -- is copied exactly as
-// the client sent it, so only the field the agent's router reads changes. It
-// reads raw with the boundary parseImageEditForm already validated the body
-// against, so an error here is a defect rather than a bad request.
+// imageEditRebuild says what rebuildImageEditBody changes in a form: the value of
+// its model field when model is set, the content of its mask part when mask is
+// set. Whatever it leaves unset is copied as the client sent it.
+type imageEditRebuild struct {
+	model string
+	mask  []byte
+}
+
+// rebuildImageEditBody returns raw with the changes of rb applied, as a new
+// multipart body and its Content-Type (a fresh boundary). Every part the changes
+// do not touch -- its headers, its bytes, and its position -- is copied exactly
+// as the client sent it. The model change replaces the value of the model field,
+// the one the agent's router (and, now, any model-routing upstream) reads; the
+// mask change replaces the content of the mask part IN PLACE with the converted
+// mask, as a PNG file part (imageEditMaskFilename). A mask edit is therefore
+// always a rebuild, and a rebuild always keeps the model field: dropping it
+// would leave the agent's router unable to find the child to start.
+//
+// It reads raw with the boundary parseImageEditForm already validated the body
+// against -- every part of which parseImageEditForm walked to its end -- so an
+// error here is not expected for a body that function accepted.
 //
 // The body is built in memory at roughly the client's size; the size cap
-// (maxImageEditBodyBytes) is applied to what the client sends, not to this.
-func rebuildImageEditBody(raw []byte, boundary, model string) ([]byte, string, error) {
+// (imageEditBodyLimit) is applied to what the client sends, not to this, which is
+// why relayImageEdit checks what it hands an agent against the agent's own.
+func rebuildImageEditBody(raw []byte, boundary string, rb imageEditRebuild) ([]byte, string, error) {
 	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
 	var out bytes.Buffer
-	out.Grow(len(raw) + len(model) + 512)
+	out.Grow(len(raw) + len(rb.model) + len(rb.mask) + 512)
 	mw := multipart.NewWriter(&out)
 	for {
 		part, err := mr.NextPart()
@@ -363,9 +458,22 @@ func rebuildImageEditBody(raw []byte, boundary, model string) ([]byte, string, e
 		if err != nil {
 			return nil, "", fmt.Errorf("read part: %w", err)
 		}
-		if part.FormName() == "model" {
-			if err := mw.WriteField("model", model); err != nil {
+		if rb.model != "" && part.FormName() == "model" {
+			if err := mw.WriteField("model", rb.model); err != nil {
 				return nil, "", fmt.Errorf("write model field: %w", err)
+			}
+			continue
+		}
+		if rb.mask != nil && part.FormName() == "mask" {
+			h := textproto.MIMEHeader{}
+			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
+			h.Set("Content-Type", "image/png")
+			pw, err := mw.CreatePart(h)
+			if err != nil {
+				return nil, "", fmt.Errorf("create mask part: %w", err)
+			}
+			if _, err := pw.Write(rb.mask); err != nil {
+				return nil, "", fmt.Errorf("write mask part: %w", err)
 			}
 			continue
 		}
@@ -394,14 +502,22 @@ func rebuildImageEditBody(raw []byte, boundary, model string) ([]byte, string, e
 //
 // What differs from relayImages is the request the upstream is sent. The client's
 // multipart body is relayed VERBATIM, with the client's own Content-Type, unless
-// the target is an agent whose router needs a different model name in the form
-// (imageEditNeedsModelRewrite), in which case the body is rebuilt with that one
-// field changed and sent with its own Content-Type. nativeRelay.raw stays the
-// client's bytes either way: that is what capture records. The relay names the
-// edits endpoint, so the upstream path AND the usage row's provider_path are
-// /v1/images/edits -- left unset, the endpoint defaults to the generations one in
-// both places.
-func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form imageEditForm, raw []byte) {
+// there is something to change in it: the model field, when the target needs a
+// different name in it than the form carries (imageEditNeedsModelRewrite --
+// every target, agent or external), or the mask, when the client sent one and
+// maskPNG is its sd luminance conversion (convertImageEditMask). Either makes the
+// body be rebuilt ONCE with all of its changes (rebuildImageEditBody), sent with
+// its own Content-Type; a no-mask edit whose model needs no rewrite stays
+// verbatim. nativeRelay.raw stays the client's bytes either way: that is what
+// capture records. The relay names the edits endpoint, so the upstream path AND
+// the usage row's provider_path are /v1/images/edits -- left unset, the endpoint
+// defaults to the generations one in both places.
+//
+// The body that is finally sent to an agent-launched target must fit the agent
+// router's own request limit (agentRouterMaxBodyBytes), which the cap on what the
+// client sends does not guarantee (imageEditBodyLimit says why): one that does
+// not is refused here, recorded, instead of being sent.
+func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form imageEditForm, raw, maskPNG []byte) {
 	start := time.Now()
 	target, ok := s.resolveImagesTarget(w, r, &token, req, raw, start)
 	if !ok {
@@ -429,19 +545,32 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		endpoint:    endpointImagesEdit,
 		contentType: r.Header.Get("Content-Type"),
 	}
+	sent := len(raw)
+	rebuild := imageEditRebuild{mask: maskPNG}
 	if imageEditNeedsModelRewrite(target, form.model) {
-		body, contentType, err := rebuildImageEditBody(raw, form.boundary, target.ProviderModel)
+		rebuild.model = target.ProviderModel
+	}
+	if rebuild.model != "" || rebuild.mask != nil {
+		body, contentType, err := rebuildImageEditBody(raw, form.boundary, rebuild)
 		if err != nil {
-			// Unreachable for a body parseImageEditForm accepted: it walked the same
-			// parts with the same boundary. Answered as a failed relay (and
-			// recorded) rather than sending the agent a body whose model it would
-			// not recognise.
-			slog.Error("image edit: rebuilding the multipart body for the agent target failed",
+			// Not expected for a body parseImageEditForm accepted: it walked every
+			// part of it to its end with the same reader and boundary. Were it to
+			// happen it is answered as a failed relay (and recorded) rather than
+			// sending the upstream a body whose model or mask it would misread.
+			slog.Error("image edit: rebuilding the multipart body failed",
 				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
 			s.recordImagesRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("rebuild multipart body: %w", err))
 			return
 		}
 		rel.upstreamBody, rel.contentType = body, contentType
+		sent = len(body)
+	}
+	if target.Provider == routing.ProviderServerAgent && sent > agentRouterMaxBodyBytes {
+		slog.Debug("image edit refused: the body to send is past the agent router's request limit",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"bytes", sent, "limit", agentRouterMaxBodyBytes)
+		s.recordImagesRoutingFailure(w, r, token, req, raw, start, errImageEditTooLarge)
+		return
 	}
 	s.proxyNative(w, r, rel)
 }

@@ -979,6 +979,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errImageEditUnavailable) {
 		message = "image edit is not available on this model's server: its agent does not declare the " + multipartProxyFeature + " feature, so update the agent"
 	}
+	if errors.Is(err, errImageEditTooLarge) {
+		message = fmt.Sprintf("the image edit is too large for this model's server: its request limit is %d MiB, counted after the mask and model are prepared", agentRouterMaxBodyBytes>>20)
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -1020,6 +1023,11 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errImageEditUnavailable) {
 		return http.StatusNotFound
 	}
+	// An edit whose prepared body is past the agent's own request limit
+	// (errImageEditTooLarge): the same 413 the client's own oversized body gets.
+	if errors.Is(err, errImageEditTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		return http.StatusServiceUnavailable
 	}
@@ -1034,6 +1042,8 @@ func completionErrorCode(err error) string {
 		return routing.ErrNoModelRoute.Error()
 	case errors.Is(err, errImageEditUnavailable):
 		return codeImageEditUnavailable
+	case errors.Is(err, errImageEditTooLarge):
+		return codeRequestBodyTooLarge
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):

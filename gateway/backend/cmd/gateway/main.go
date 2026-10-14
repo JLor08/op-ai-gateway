@@ -1102,6 +1102,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SettingsVolatile:                b.SettingsVolatile,
 		Captures:                        b.Captures,
 		CaptureMaxBytes:                 b.CaptureMaxBytes,
+		MaxImageEditBodyBytes:           cfg.MaxImageEditBodyBytes,
 		CaptureEnabled:                  func() bool { return captureFlagsHook().Enabled },
 		CaptureOverride:                 func() bool { return captureFlagsHook().Override },
 		AppHealth:                       appHealth,

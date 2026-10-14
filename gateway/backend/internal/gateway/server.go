@@ -117,6 +117,10 @@ type ServerDeps struct {
 	CaptureMaxBytes int
 	CaptureEnabled  func() bool
 	CaptureOverride func() bool
+	// MaxImageEditBodyBytes caps the multipart body POST /v1/images/edits reads
+	// into memory (config OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES). <= 0 defaults
+	// in New to defaultMaxImageEditBodyBytes.
+	MaxImageEditBodyBytes int
 	// SettingsVolatile is true only for the memory driver (a RAM-only settings
 	// store). It is the volatile flag the dispatch path passes to SealTokenSet
 	// when it reseals a refreshed subscription OAuth token: with a cipher it
@@ -382,6 +386,7 @@ type Server struct {
 	selfBaseURL              string
 	Cipher                   *capture.Cipher
 	captureMaxBytes          int
+	maxImageEditBodyBytes    int64 // multipart read cap of POST /v1/images/edits, defaulted in New; a bare &Server{} leaves it 0, which imageEditBodyLimit reads as the default
 	CaptureEnabled           func() bool
 	CaptureOverride          func() bool
 	Active                   *activeRegistry
@@ -723,6 +728,10 @@ func New(deps ServerDeps) *Server {
 	if captureMaxBytes <= 0 {
 		captureMaxBytes = defaultCaptureMaxBytes
 	}
+	maxImageEditBodyBytes := int64(deps.MaxImageEditBodyBytes)
+	if maxImageEditBodyBytes <= 0 {
+		maxImageEditBodyBytes = defaultMaxImageEditBodyBytes
+	}
 	serverPerf := deps.ServerPerf
 	if serverPerf == nil {
 		serverPerf = NewServerPerfRegistry()
@@ -896,6 +905,7 @@ func New(deps ServerDeps) *Server {
 		Cipher:                      deps.Cipher,
 		settingsVolatile:            deps.SettingsVolatile,
 		captureMaxBytes:             captureMaxBytes,
+		maxImageEditBodyBytes:       maxImageEditBodyBytes,
 		CaptureEnabled:              deps.CaptureEnabled,
 		CaptureOverride:             deps.CaptureOverride,
 		Active:                      active,
@@ -2164,8 +2174,12 @@ func writeJSONDecodeError(w http.ResponseWriter, err error) {
 // writeBodyTooLarge answers a request body past its endpoint's cap: 413 with the
 // one code every capped body reader uses.
 func writeBodyTooLarge(w http.ResponseWriter) {
-	writeJSON(w, http.StatusRequestEntityTooLarge, apierror.Response("request.body_too_large", "request body too large", ""))
+	writeJSON(w, http.StatusRequestEntityTooLarge, apierror.Response(codeRequestBodyTooLarge, "request body too large", ""))
 }
+
+// codeRequestBodyTooLarge is the one code every capped body reader answers a body
+// past its cap with.
+const codeRequestBodyTooLarge = "request.body_too_large"
 
 func writeRequestError(w http.ResponseWriter, err error) {
 	var inferenceErr *inference.Error

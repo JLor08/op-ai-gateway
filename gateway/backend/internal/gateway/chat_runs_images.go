@@ -292,7 +292,8 @@ func upstreamErrorCode(body []byte, status string) string {
 // output_format and output_compression and ignores the rest.
 //
 // The advanced sd-server knobs (negative_prompt, sampler, scheduler, steps, cfg,
-// seed, clip_skip) are NOT top-level fields: sd-server reads them only from a
+// seed, clip_skip, and the edit knob strength) are NOT top-level fields:
+// sd-server reads them only from a
 // <sd_cpp_extra_args> block in the prompt, so buildSDExtraArgs renders the set
 // ones into that block and this appends it to the prompt text. The user prompt is
 // first stripped of any literal tag (stripSDExtraArgsTag) so a thread cannot
@@ -345,10 +346,16 @@ const (
 // under sample_params. Every field is omitempty and each nested object is built
 // only when it carries a value, so an unset knob never reaches sd-server and
 // leaves its own per-model default.
+//
+// Strength is the one EDIT knob (top-level, like seed). It has to travel here
+// because sd-server's OpenAI edits route reads no `strength` form field: it
+// takes the value from this block and otherwise uses 0.75, a weak edit. A pointer
+// so an explicit 0 is a value; sd-server ignores it for a generation.
 type sdExtraArgs struct {
 	NegativePrompt string          `json:"negative_prompt,omitempty"`
 	ClipSkip       *int            `json:"clip_skip,omitempty"`
 	Seed           *int            `json:"seed,omitempty"`
+	Strength       *float64        `json:"strength,omitempty"`
 	SampleParams   *sdSampleParams `json:"sample_params,omitempty"`
 }
 
@@ -374,6 +381,7 @@ func buildSDExtraArgs(img *portal.ChatImageSettings) string {
 		NegativePrompt: stripSDExtraArgsTag(img.NegativePrompt),
 		ClipSkip:       img.ClipSkip,
 		Seed:           img.Seed,
+		Strength:       img.Strength,
 	}
 	if img.Steps != nil || img.CFG != nil || img.Sampler != "" || img.Scheduler != "" {
 		sp := &sdSampleParams{

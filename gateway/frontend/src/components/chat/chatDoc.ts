@@ -150,6 +150,12 @@ export type ImageSettings = {
   cfg: string;
   seed: string;
   clip_skip: string;
+  // The EDIT knob: how far an image edit departs from its source image. Blank-able
+  // like the numerics above ("" = sd-server's own default, 0.75, which makes a weak
+  // edit); the gateway delivers a set one in the same <sd_cpp_extra_args> block.
+  // sd-server ignores it for a plain generation, so it lives with the rest of the
+  // thread's settings.
+  strength: string;
 };
 
 export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
@@ -164,6 +170,7 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   cfg: '',
   seed: '',
   clip_skip: '',
+  strength: '',
 };
 
 // The portal's HARD cap on images per request: a portal-side limit (it dates from
@@ -354,6 +361,8 @@ export function imageSetting(
   if (seed !== undefined) image.seed = seed;
   const clipSkip = toImageInt(s.clip_skip);
   if (clipSkip !== undefined) image.clip_skip = clipSkip;
+  const strength = toImageNumber(s.strength);
+  if (strength !== undefined) image.strength = strength;
   return { image };
 }
 
@@ -378,6 +387,7 @@ export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSe
     cfg: imageNumToStr(s.cfg),
     seed: imageNumToStr(s.seed),
     clip_skip: imageNumToStr(s.clip_skip),
+    strength: imageNumToStr(s.strength),
   };
 }
 

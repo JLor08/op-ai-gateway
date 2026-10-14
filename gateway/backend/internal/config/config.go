@@ -109,6 +109,7 @@ type Config struct {
 	CaptureMemoryMaxBytes           int
 	MaxChatBlobBytes                int // per-blob ceiling for one chat binary payload (#124); config only, the service layer enforces it
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
+	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
 	MockDelay                       time.Duration
 	MockUnreachable                 bool
 	SeedAppHealthMode               string
@@ -250,6 +251,7 @@ func Load() (Config, error) {
 		CaptureMemoryMaxBytes:     l.integer("OP_AI_GATEWAY_CAPTURE_MEMORY_MAX_BYTES", 67108864),
 		MaxChatBlobBytes:          l.integer("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", 20<<20),
 		MaxRunHistoryBytes:        l.integer("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", 32<<20),
+		MaxImageEditBodyBytes:     l.integer("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", 32<<20),
 		// Test-only artificial provider delay for the mock provider (default 0 = off,
 		// production-safe). Junk/0/negative -> 0 via integer().
 		MockDelay: time.Duration(l.integer("OP_AI_GATEWAY_MOCK_DELAY_MS", 0)) * time.Millisecond,

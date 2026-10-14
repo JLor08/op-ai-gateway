@@ -15,17 +15,22 @@ import (
 // (images_edit_handler.go). Like validateImagesRequest's, they are written
 // through writeRequestError as *inference.Error values -- a 400 with the code as
 // given -- rather than as sentinel rows in the tables below, so they are
-// constants here. Only the codes a handler uses today are defined: the mask
-// refusals (images.mask_invalid for an init/mask size mismatch,
-// images.edit_unsupported_format for a source or mask the conversion cannot
-// read) arrive with the mask conversion that raises them, and a constant with no
-// raiser would be dead code.
+// constants here. model, prompt, stream and response_format reuse the
+// generations twin's own codes; these are the edit-specific ones.
 const (
 	// imagesImageRequired: the edit form carries no source image -- no non-empty
 	// part under either `image` or `image[]`, the two spellings OpenAI's clients
-	// use. The one edit-specific code; model, prompt, stream and response_format
-	// reuse the generations twin's own.
+	// use.
 	imagesImageRequired = "images.image_required"
+	// imagesMaskInvalid: the mask cannot be used with this source image -- its
+	// size is not the source's, it is larger than the conversion will decode, or
+	// it has no transparent pixel, so it selects nothing to edit
+	// (convertImageEditMask).
+	imagesMaskInvalid = "images.mask_invalid"
+	// imagesEditUnsupportedFormat: a mask that is not a readable PNG, or -- when
+	// a mask is sent -- a source image that is not a readable PNG or JPEG, which
+	// is all sd-server's edit route takes and all the size check can read.
+	imagesEditUnsupportedFormat = "images.edit_unsupported_format"
 )
 
 // errRow is one (sentinel -> HTTP response) mapping row consumed by

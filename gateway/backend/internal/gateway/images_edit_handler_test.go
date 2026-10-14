@@ -360,9 +360,10 @@ func TestImagesEditRefusesInvalidRequests(t *testing.T) {
 
 // THE POINT of peeking the model from the multipart form: the refusals above
 // happen before inferencePreflight, so none of them spends an admission. The
-// limiter here allows ONE request per minute; seven invalid requests go first,
-// the valid one that follows is still admitted, and a second valid one is then
-// denied -- the control showing the limiter was live the whole time.
+// limiter here allows ONE request per minute; every invalid request goes first
+// (the form's own refusals and the mask's), the valid one that follows is still
+// admitted, and a second valid one is then denied -- the control showing the
+// limiter was live the whole time.
 func TestImagesEditValidationRunsBeforeAdmission(t *testing.T) {
 	prov := &recordingProxyProvider{respBody: editsOKBody}
 	srv := newImageCapableTestServerWithProvider(t, prov)
@@ -371,7 +372,7 @@ func TestImagesEditValidationRunsBeforeAdmission(t *testing.T) {
 	now := utc(2026, 3, 15, 12, 0, 0)
 	srv.Limiter = NewPrincipalLimiter(fakeStore, PrincipalLimiterOptions{Now: clockAt(&now)})
 
-	for _, tc := range invalidEditCases() {
+	for _, tc := range append(invalidEditCases(), maskEditCases(t)...) {
 		if rec := postImageEdit(t, srv, tc.parts); rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: status = %d, want 400; body = %s", tc.name, rec.Code, rec.Body.String())
 		}
@@ -392,6 +393,12 @@ func TestImagesEditValidationRunsBeforeAdmission(t *testing.T) {
 // boundary.
 func TestImagesEditRefusesAMalformedBody(t *testing.T) {
 	validBody, validCT := buildEditMultipart(t, validEditParts("sd-turbo"))
+	// A body whose LAST part is one the handler never reads (it is neither a field
+	// it owns nor an image) and which is cut off inside that part. mime/multipart
+	// swallows a skipped part's read error, so only walking such a part to its end
+	// catches this; left to the rebuild it would be a failure after admission.
+	extraBody, extraCT := buildEditMultipart(t, append(validEditParts("sd-turbo"),
+		editPart{name: "reference", filename: "ref.png", contentType: "image/png", body: bytes.Repeat([]byte("r"), 200)}))
 	cases := []struct {
 		name string
 		body []byte
@@ -401,6 +408,7 @@ func TestImagesEditRefusesAMalformedBody(t *testing.T) {
 		{"no content type", validBody, ""},
 		{"multipart without a boundary", validBody, "multipart/form-data"},
 		{"truncated before the closing boundary", validBody[:len(validBody)-16], validCT},
+		{"truncated inside a part the handler does not read", extraBody[:len(extraBody)-100], extraCT},
 		{"empty body", nil, validCT},
 	}
 	for _, tc := range cases {
@@ -435,13 +443,16 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // The multipart read is bounded (the endpoint's body is held in memory, so an
 // unbounded read is a memory exposure). A body past the cap is a 413 whether the
 // size was declared up front -- refused without reading a byte of it -- or only
-// discovered while reading (chunked), when the read stops at the cap.
+// discovered while reading (chunked), when the read stops at the cap. The cap is
+// the server's setting (maxImageEditBodyBytes), lowered here so the fixture stays
+// small; the default is pinned by TestImageEditBodyCapIsASetting.
 func TestImagesEditRefusesABodyPastTheCap(t *testing.T) {
+	const limit = 1 << 20
 	big := validEditParts("sd-turbo")
-	big = append(big, editPart{name: "mask", filename: "m.png", contentType: "image/png", body: bytes.Repeat([]byte{0xAB}, maxImageEditBodyBytes)})
+	big = append(big, editPart{name: "reference", filename: "m.png", contentType: "image/png", body: bytes.Repeat([]byte{0xAB}, limit)})
 	body, ct := buildEditMultipart(t, big)
-	if len(body) <= maxImageEditBodyBytes {
-		t.Fatalf("fixture is %d bytes, want more than the %d cap", len(body), maxImageEditBodyBytes)
+	if len(body) <= limit {
+		t.Fatalf("fixture is %d bytes, want more than the %d cap", len(body), limit)
 	}
 	for _, declared := range []bool{true, false} {
 		name := "chunked"
@@ -451,6 +462,7 @@ func TestImagesEditRefusesABodyPastTheCap(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			prov := &recordingProxyProvider{respBody: editsOKBody}
 			srv := newImageCapableTestServerWithProvider(t, prov)
+			srv.maxImageEditBodyBytes = limit
 			counted := &countingReader{r: bytes.NewReader(body)}
 			req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", io.NopCloser(counted))
 			if declared {
@@ -474,8 +486,8 @@ func TestImagesEditRefusesABodyPastTheCap(t *testing.T) {
 			switch {
 			case declared && counted.n != 0:
 				t.Fatalf("read %d bytes of a body whose declared length was already past the cap", counted.n)
-			case !declared && counted.n > maxImageEditBodyBytes+(1<<20):
-				t.Fatalf("read %d bytes of a chunked body, want the read to stop at the %d cap", counted.n, maxImageEditBodyBytes)
+			case !declared && counted.n > limit+(64<<10):
+				t.Fatalf("read %d bytes of a chunked body, want the read to stop at the %d cap", counted.n, limit)
 			}
 		})
 	}
@@ -793,7 +805,9 @@ func TestImagesEditRewritesTheModelForAnAgentTarget(t *testing.T) {
 		{name: "model", body: []byte("flux-gateway-name")},
 		{name: "prompt", body: []byte("a cat in a hat")},
 		{name: "n", body: []byte("1")},
-		{name: "mask", filename: "mask.png", contentType: "image/png", body: []byte("\x00\xff\r\n\x00mask")},
+		// An extra binary part the gateway knows nothing about. (Not a `mask`: a
+		// mask is converted, which is the mask tests' business, not this one's.)
+		{name: "reference", filename: "ref.png", contentType: "image/png", body: []byte("\x00\xff\r\n\x00reference")},
 	}
 	body, ct := buildEditMultipart(t, parts)
 
@@ -875,11 +889,16 @@ func TestImagesEditRewritesTheModelAnOverrideReplaced(t *testing.T) {
 	}
 }
 
-// The rewrite predicate, axis by axis: only an agent-launched target with a
-// mapped name the form does not already carry is rewritten.
+// The rewrite predicate, axis by axis: any target with a mapped name the form
+// does not already carry is rewritten (the provider does not matter -- the JSON
+// relay's rewriteModelField does not look at it either), and one whose form
+// already says it, or which has no mapped name, is not.
 func TestImageEditNeedsModelRewrite(t *testing.T) {
 	agent := func(app string) routing.Target {
 		return routing.Target{Provider: routing.ProviderServerAgent, Model: "gw", ProviderModel: app}
+	}
+	external := func(app string) routing.Target {
+		return routing.Target{Provider: routing.ProviderVLLM, Model: "gw", ProviderModel: app}
 	}
 	cases := []struct {
 		name   string
@@ -892,8 +911,11 @@ func TestImageEditNeedsModelRewrite(t *testing.T) {
 		{"agent, form carries neither (override / redirect)", agent("app"), "something-else", true},
 		{"agent, form spelled with surrounding space", agent("app"), " app ", true},
 		{"agent, no mapped name", agent(""), "gw", false},
-		{"external target, names differ", routing.Target{Provider: routing.ProviderVLLM, Model: "gw", ProviderModel: "app"}, "gw", false},
-		{"external target, names equal", routing.Target{Provider: routing.ProviderVLLM, Model: "gw", ProviderModel: "gw"}, "gw", false},
+		{"external target, names differ", external("app"), "gw", true},
+		{"external target, form already carries the mapped name", external("app"), "app", false},
+		{"external target, names equal and the form carries them", external("gw"), "gw", false},
+		{"external target, names equal but the form carries another (override / redirect)", external("gw"), "something-else", true},
+		{"external target, no mapped name", external(""), "gw", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -904,14 +926,33 @@ func TestImageEditNeedsModelRewrite(t *testing.T) {
 	}
 }
 
-// An EXTERNAL sd-server target is relayed verbatim even when the mapping's two
-// names differ: sd-server ignores the model field (one process serves one
-// model), so rewriting buys nothing and every rebuild is a chance to damage the
-// body.
-func TestImagesEditRelaysAnExternalTargetVerbatimEvenWhenTheNamesDiffer(t *testing.T) {
+// modelFieldOf returns the value of the model part of a multipart body.
+func modelFieldOf(t *testing.T, body []byte, contentType string) string {
+	t.Helper()
+	for _, p := range readEditParts(t, body, contentType) {
+		if p.name == "model" {
+			return string(p.body)
+		}
+	}
+	return ""
+}
+
+// An EXTERNAL target is handed the mapping's own model name too, exactly as the
+// JSON generations relay hands it (rewriteModelField sets it to the provider
+// model for EVERY provider). sd-server ignores the field, so for the sd-server
+// this endpoint exists for it changes nothing; but an external edit upstream that
+// is a model-routing proxy would otherwise route on the gateway's name, and a
+// client could name any model it likes there. Only the model field changes.
+func TestImagesEditRewritesTheModelForAnExternalTarget(t *testing.T) {
 	up, got := newEditUpstream(t, http.StatusOK, editsOKBody)
 	srv := newImagesHTTPTestServer(t, up.URL) // gw-image-model -> upstream-image-model
-	body, ct := buildEditMultipart(t, validEditParts("gw-image-model"))
+	parts := []editPart{
+		{name: "image", filename: "src.png", contentType: "image/png", body: editTestPNG},
+		{name: "model", body: []byte("gw-image-model")},
+		{name: "prompt", body: []byte("a cat in a hat")},
+		{name: "reference", filename: "ref.png", contentType: "image/png", body: []byte("\x00\xff\r\n\x00reference")},
+	}
+	body, ct := buildEditMultipart(t, parts)
 
 	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
 
@@ -922,8 +963,73 @@ func TestImagesEditRelaysAnExternalTargetVerbatimEvenWhenTheNamesDiffer(t *testi
 	if calls != 1 || path != "/v1/images/edits" {
 		t.Fatalf("upstream calls = %d, path = %q, want one call to /v1/images/edits", calls, path)
 	}
-	if upstreamCT != ct || !bytes.Equal(upstreamBody, body) {
-		t.Fatalf("the external target's body was rebuilt; it must be relayed verbatim")
+	if upstreamCT == ct {
+		t.Fatal("the external target was relayed verbatim although its model name differs: the rebuilt body is sent with its own boundary")
+	}
+	sent := readEditParts(t, upstreamBody, upstreamCT)
+	want := append([]editPart(nil), parts...)
+	want[1].body = []byte("upstream-image-model")
+	if len(sent) != len(want) {
+		t.Fatalf("rebuilt body has %d parts, want %d", len(sent), len(want))
+	}
+	for i := range want {
+		if sent[i].name != want[i].name || sent[i].filename != want[i].filename || sent[i].contentType != want[i].contentType || !bytes.Equal(sent[i].body, want[i].body) {
+			t.Fatalf("part %d = %+v, want %+v", i, sent[i], want[i])
+		}
+	}
+	// What the usage row names is still the client's model and the edits path.
+	if ev := lastUsageEvent(t, srv); ev.Model != "gw-image-model" || ev.ProviderPath != "/v1/images/edits" {
+		t.Fatalf("usage Model/ProviderPath = %q/%q, want gw-image-model and /v1/images/edits", ev.Model, ev.ProviderPath)
+	}
+}
+
+// ...and the rewrite is for a form that does NOT already carry the mapped name:
+// an external target whose form says it already is relayed verbatim -- the
+// cheapest and least damaging thing to do to a body that can carry megabytes of
+// binary. (No mask is the other half of "verbatim"; the sd-turbo fixture of
+// TestImagesEditRelaysMultipartToTheEditsPath has equal names.)
+func TestImagesEditRelaysAnExternalTargetVerbatimWhenTheFormCarriesTheMappedName(t *testing.T) {
+	up, got := newEditUpstream(t, http.StatusOK, editsOKBody)
+	srv := newImagesHTTPTestServer(t, up.URL) // gw-image-model -> upstream-image-model
+	// The token's model override turns whatever the client names into the gateway
+	// name, so the request is routed; the form itself already says the mapped one.
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{
+		ID: "tok_ovr", UserID: "usr_dev", Name: "Override Token", Active: true,
+		Scopes: []string{"gateway:use"}, ModelOverride: "gw-image-model",
+	}, "ovr-secret")
+	body, ct := buildEditMultipart(t, validEditParts("upstream-image-model"))
+
+	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer ovr-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	calls, _, _, upstreamCT, upstreamBody := got.snapshot()
+	if calls != 1 || upstreamCT != ct || !bytes.Equal(upstreamBody, body) {
+		t.Fatalf("calls = %d; a form that already carries the mapped model name must be relayed verbatim", calls)
+	}
+}
+
+// A token's model override (or a redirect) pins what the token may reach: the
+// client's own model string in the form must not be what an external
+// upstream sees, or a client could name another model past the pin.
+func TestImagesEditRewritesTheModelAnExternalOverrideReplaced(t *testing.T) {
+	up, got := newEditUpstream(t, http.StatusOK, editsOKBody)
+	srv := newImagesHTTPTestServer(t, up.URL)
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{
+		ID: "tok_ovr", UserID: "usr_dev", Name: "Override Token", Active: true,
+		Scopes: []string{"gateway:use"}, ModelOverride: "gw-image-model",
+	}, "ovr-secret")
+	body, ct := buildEditMultipart(t, validEditParts("some-other-model"))
+
+	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer ovr-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	_, _, _, upstreamCT, upstreamBody := got.snapshot()
+	if model := modelFieldOf(t, upstreamBody, upstreamCT); model != "upstream-image-model" {
+		t.Fatalf("the upstream was sent model %q, want the mapped upstream-image-model (the client's own string must not get past the override)", model)
 	}
 }
 
@@ -949,9 +1055,10 @@ func TestImagesGenerationsRelayIsUnchangedBySharingTheResolveStep(t *testing.T) 
 
 // What the payload capture records for a REBUILT edit is the CLIENT's request,
 // not the body the agent was sent: nativeRelay.raw stays the client's bytes and
-// the rebuilt one travels beside it as upstreamBody. (The fixture is text-only on
-// purpose: the capture envelope stores a body as a string, so how it stores
-// BINARY multipart is a separate question from which body it stores.)
+// the rebuilt one travels beside it as upstreamBody. It is recorded as the
+// multipart summary (text fields and file metadata; the binary parts are
+// redacted, see buildCaptureEnvelope), so the model field names what the CLIENT
+// sent -- not the app name the rebuild put in -- and the image bytes are nowhere.
 func TestImagesEditCaptureRecordsTheClientsBodyNotTheRebuiltOne(t *testing.T) {
 	prov := &recordingProxyProvider{respBody: editsOKBody}
 	srv := newAgentEditTestServer(t, prov, "flux-gateway-name", "flux1-dev-q8")
@@ -968,7 +1075,7 @@ func TestImagesEditCaptureRecordsTheClientsBodyNotTheRebuiltOne(t *testing.T) {
 	body, ct := buildEditMultipart(t, []editPart{
 		{name: "model", body: []byte("flux-gateway-name")},
 		{name: "prompt", body: []byte("a cat in a hat")},
-		{name: "image", filename: "cat.png", contentType: "image/png", body: []byte("plain-text-image")},
+		{name: "image", filename: "cat.png", contentType: "image/png", body: editTestPNG},
 	})
 
 	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer cap-secret"})
@@ -984,8 +1091,15 @@ func TestImagesEditCaptureRecordsTheClientsBodyNotTheRebuiltOne(t *testing.T) {
 		t.Fatal("no capture saved")
 	}
 	env := decryptCapture(t, saved.Blob)
-	if env.ReqBody != string(body) {
-		t.Fatalf("captured request body = %q, want the client's own bytes %q", env.ReqBody, body)
+	doc := decodeCapturedMultipart(t, env.ReqBody)
+	if len(doc.Parts) != 3 || doc.Parts[0].Text == nil || *doc.Parts[0].Text != "flux-gateway-name" {
+		t.Fatalf("captured request = %q, want the CLIENT's model field (flux-gateway-name), not the rebuilt app name", env.ReqBody)
+	}
+	if p := doc.Parts[2]; p.Name != "image" || p.Filename != "cat.png" || p.Size != int64(len(editTestPNG)) || !p.Redacted {
+		t.Fatalf("captured image part = %+v, want redacted metadata", p)
+	}
+	if strings.ContainsRune(env.ReqBody, '�') || strings.Contains(env.ReqBody, "not-a-boundary") {
+		t.Fatalf("the capture holds binary image bytes (or their corruption): %q", env.ReqBody)
 	}
 }
 

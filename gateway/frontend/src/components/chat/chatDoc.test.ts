@@ -185,10 +185,50 @@ describe('the persisted image settings mirror the backend omitempty', () => {
         steps: '',
         cfg: 'abc',
         seed: '   ',
+        strength: '   ',
       }).image ?? {};
     expect('steps' in image).toBe(false);
     expect('cfg' in image).toBe(false);
     expect('seed' in image).toBe(false);
+    expect('strength' in image).toBe(false);
+  });
+
+  // strength is the edit knob: blank leaves sd-server's own default (0.75), a
+  // value is sent as a wire number (the gateway puts it in the <sd_cpp_extra_args>
+  // block), and 0 is a real value, not "unset".
+  describe('strength', () => {
+    it('is blank by default, so a fresh image thread sends none', () => {
+      expect(DEFAULT_IMAGE_SETTINGS.strength).toBe('');
+      expect('strength' in (imageSetting('image', DEFAULT_IMAGE_SETTINGS).image ?? {})).toBe(false);
+    });
+
+    it('is sent as a number when set, 0 included', () => {
+      expect(
+        imageSetting('image', { ...DEFAULT_IMAGE_SETTINGS, strength: '0.9' }).image?.strength,
+      ).toBe(0.9);
+      expect(
+        imageSetting('image', { ...DEFAULT_IMAGE_SETTINGS, strength: '0' }).image?.strength,
+      ).toBe(0);
+    });
+
+    it('is never put on a text thread', () => {
+      expect(imageSetting(undefined, { ...DEFAULT_IMAGE_SETTINGS, strength: '0.9' })).toEqual({});
+    });
+
+    it('round-trips through imageSettingsFrom (number -> blank-able string)', () => {
+      expect(imageSettingsFrom({ strength: 0.9 }).strength).toBe('0.9');
+      expect(imageSettingsFrom({ strength: 0 }).strength).toBe('0');
+      expect(imageSettingsFrom(undefined).strength).toBe('');
+      expect(imageSettingsFrom({ strength: 'x' as unknown as number }).strength).toBe('');
+    });
+
+    it('survives a save/load of the document (normalizeDoc)', () => {
+      const saved = {
+        settings: { model: 'm', kind: 'image', image: { strength: 0.6 } },
+        messages: [],
+      };
+      expect(imageSettingsFrom(normalizeDoc(saved).settings.image).strength).toBe('0.6');
+    });
   });
 
   it('round-trips advanced knobs through imageSettingsFrom (numbers -> blank-able strings)', () => {

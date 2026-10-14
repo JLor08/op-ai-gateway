@@ -891,6 +891,48 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(body.settings.image).toMatchObject({ steps: 28, negative_prompt: 'blurry' });
     });
 
+    // The edit knob lives in the advanced section: blank by default (sd-server's
+    // own 0.75), explained by a tooltip that also says reference-edit models may
+    // want more, and sent as a number when set.
+    it('offers the edit strength in the advanced section, blank by default, and sends it parsed', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+      expect(screen.queryByLabelText(t.chatImageStrength)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.chatImageAdvanced }));
+
+      const strength = screen.getByLabelText(t.chatImageStrength);
+      expect(strength).toHaveValue(null); // a blank number field: sd-server keeps its default
+      fireEvent.mouseOver(strength);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatImageStrengthHint);
+
+      fireEvent.change(strength, { target: { value: '0.9' } });
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.image?.strength).toBe(0.9);
+    });
+
+    it('sends no strength when the field is left blank', async () => {
+      renderChat(tokens, imageModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, imageModels[0].display_name);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSettings }));
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a cat' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.image).not.toHaveProperty('strength');
+    });
+
     it('disables the attach button for an image model that is not vision-capable', async () => {
       renderChat(tokens, imageModels);
       await waitForChatReady();

@@ -241,6 +241,12 @@ const de = {
   chatImageCFG: 'CFG',
   chatImageSeed: 'Seed',
   chatImageClipSkip: 'Clip Skip',
+  // The EDIT knob (an image attached to the turn makes it an edit): how far the
+  // result departs from the source image. Blank-able like the numerics above;
+  // the tooltip states the sd-server default and who wants more.
+  chatImageStrength: 'Stärke (Bearbeitung)',
+  chatImageStrengthHint:
+    'Wie stark eine Bildbearbeitung vom Ausgangsbild abweicht (0–1). Leer = sd-server-Standard (0,75). Modelle, die mit Referenzbildern bearbeiten, brauchen oft einen höheren Wert.',
   // The composer during an image run's wait (ADR-043 (d)): the pending label
   // and the static "nothing more is coming" sentence -- ImagePendingTurn's
   // only two announced strings (its clock is aria-hidden). Deliberately NOT
@@ -3070,6 +3076,9 @@ const en: PortalMessages = {
   chatImageCFG: 'CFG',
   chatImageSeed: 'Seed',
   chatImageClipSkip: 'Clip skip',
+  chatImageStrength: 'Strength (edit)',
+  chatImageStrengthHint:
+    'How far an image edit departs from the source image (0–1). Blank uses the sd-server default (0.75). Models that edit with reference images often need a higher value.',
   chatImageRunPending: 'Waiting for image',
   chatImageNoIntermediateNews:
     'No intermediate updates – the image arrives finished or not at all.',

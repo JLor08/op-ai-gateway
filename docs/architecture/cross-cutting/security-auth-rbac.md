@@ -920,6 +920,25 @@ Bodies are independently size-capped: `OP_AI_GATEWAY_CAPTURE_MAX_BYTES`
 unrelated ceiling on the *total* size of the in-memory capture/chat store
 used only by the `memory` storage driver.
 
+A `multipart/form-data` **request** body — an image edit,
+`POST /v1/images/edits` — is binary and is not stored as bytes: the
+envelope holds the body as a string that is then JSON-marshalled, which
+would turn every invalid UTF-8 byte into U+FFFD and clip a file mid-way.
+The stored request body is instead a JSON summary
+(`buildCaptureEnvelope` → `summarizeMultipartBody`,
+`internal/gateway/capture_multipart.go`) of the form: each part's name,
+file name, content type and size; the **value** of each text field (the
+prompt, the model, the `<sd_cpp_extra_args>` block), cut on a rune boundary
+to the same `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` budget (`truncated` is set
+when it bites); and `"redacted": true` in place of the content of every
+file part — the source image(s) and the mask are never captured, and a part
+that merely *claims* to be a text field but is not valid UTF-8 is redacted
+too. It fails closed: a body whose Content-Type names no boundary, or that
+breaks off part-way, is summarised with an `error` and the parts read so
+far, never stored raw. Header redaction is unchanged, and the captured
+request is still the **client's** form, not the rebuilt one the upstream was
+sent (a mask conversion or a model-name rewrite changes the latter).
+
 The resulting envelope is gzip-compressed, then — following the scheme in
 [§13](#13-secrets-at-rest) — sealed with the capture cipher when one is
 configured (`KeyVersion` 1), or stored as plain gzip bytes when running the

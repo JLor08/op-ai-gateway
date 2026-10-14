@@ -52,7 +52,7 @@ func TestRebuildImageEditBodyChangesOnlyTheModelField(t *testing.T) {
 	}
 	original, originalCT := buf.Bytes(), mw.FormDataContentType()
 
-	rebuilt, rebuiltCT, err := rebuildImageEditBody(original, mustBoundary(t, originalCT), "app-name")
+	rebuilt, rebuiltCT, err := rebuildImageEditBody(original, mustBoundary(t, originalCT), imageEditRebuild{model: "app-name"})
 	if err != nil {
 		t.Fatalf("rebuildImageEditBody: %v", err)
 	}
@@ -89,8 +89,67 @@ func TestRebuildImageEditBodyChangesOnlyTheModelField(t *testing.T) {
 func TestRebuildImageEditBodyReportsAMalformedBody(t *testing.T) {
 	body, ct := buildEditMultipart(t, validEditParts("sd-turbo"))
 
-	if _, _, err := rebuildImageEditBody(body[:len(body)-20], mustBoundary(t, ct), "app"); err == nil {
+	if _, _, err := rebuildImageEditBody(body[:len(body)-20], mustBoundary(t, ct), imageEditRebuild{model: "app"}); err == nil {
 		t.Fatal("rebuild of a truncated body reported no error")
+	}
+}
+
+// A mask replacement swaps the CONTENT of the mask part, in place, and nothing
+// else: the part keeps its position, gets a file name (sd-server reads a mask
+// out of a file part) and the image/png type of what it now holds, while the
+// model field -- when no rewrite is asked for -- and every other part are exactly
+// as the client sent them.
+func TestRebuildImageEditBodyReplacesOnlyTheMask(t *testing.T) {
+	parts := []editPart{
+		{name: "model", body: []byte("sd-turbo")},
+		{name: "mask", filename: "weird name.webp", contentType: "image/webp", body: []byte("client alpha mask")},
+		{name: "image", filename: "src.png", contentType: "image/png", body: editTestPNG},
+		{name: "prompt", body: []byte("a cat")},
+	}
+	original, ct := buildEditMultipart(t, parts)
+	converted := []byte("\x89PNG converted \x00\xff")
+
+	rebuilt, rebuiltCT, err := rebuildImageEditBody(original, mustBoundary(t, ct), imageEditRebuild{mask: converted})
+	if err != nil {
+		t.Fatalf("rebuildImageEditBody: %v", err)
+	}
+
+	got := readEditParts(t, rebuilt, rebuiltCT)
+	if len(got) != len(parts) {
+		t.Fatalf("rebuilt body has %d parts, want %d", len(got), len(parts))
+	}
+	for i, want := range parts {
+		if got[i].name != want.name {
+			t.Fatalf("part %d is %q, want %q", i, got[i].name, want.name)
+		}
+		if want.name == "mask" {
+			if !bytes.Equal(got[i].body, converted) || got[i].filename != "mask.png" || got[i].contentType != "image/png" {
+				t.Fatalf("mask part = %+v, want the converted bytes as mask.png (image/png)", got[i])
+			}
+			continue
+		}
+		if got[i].filename != want.filename || got[i].contentType != want.contentType || !bytes.Equal(got[i].body, want.body) {
+			t.Fatalf("part %d = %+v, want %+v unchanged", i, got[i], want)
+		}
+	}
+}
+
+// Both replacements in one pass.
+func TestRebuildImageEditBodyReplacesTheModelAndTheMaskTogether(t *testing.T) {
+	original, ct := buildEditMultipart(t, []editPart{
+		{name: "model", body: []byte("gateway-name")},
+		{name: "image", filename: "src.png", contentType: "image/png", body: editTestPNG},
+		{name: "mask", filename: "m.png", contentType: "image/png", body: []byte("old")},
+	})
+
+	rebuilt, rebuiltCT, err := rebuildImageEditBody(original, mustBoundary(t, ct), imageEditRebuild{model: "app-name", mask: []byte("new")})
+	if err != nil {
+		t.Fatalf("rebuildImageEditBody: %v", err)
+	}
+
+	got := readEditParts(t, rebuilt, rebuiltCT)
+	if string(got[0].body) != "app-name" || string(got[2].body) != "new" || !bytes.Equal(got[1].body, editTestPNG) {
+		t.Fatalf("rebuilt parts = %+v, want model app-name, the image untouched and mask new", got)
 	}
 }
 

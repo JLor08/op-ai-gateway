@@ -46,6 +46,10 @@ export type ChatImageSettings = {
   cfg?: number;
   seed?: number;
   clip_skip?: number;
+  // The EDIT knob (how far an edit departs from its source image): omitted =
+  // sd-server's own default (0.75). Rides the same <sd_cpp_extra_args> block;
+  // sd-server ignores it for a generation.
+  strength?: number;
 };
 
 // The per-chat settings the frontend persists inside `content`.

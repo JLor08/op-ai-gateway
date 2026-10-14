@@ -525,6 +525,24 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         }
                         disabled={c.streaming}
                       />
+                      {/* The edit knob: how far an image edit departs from its
+                        source. Blank = sd-server's own default (0.75, stated in
+                        the tooltip, which also notes that reference-edit models
+                        often want more); sd-server ignores it for a generation. */}
+                      <Tooltip title={t.chatImageStrengthHint} describeChild>
+                        <TextField
+                          id="chat-image-strength"
+                          label={t.chatImageStrength}
+                          type="number"
+                          value={c.imageSettings.strength}
+                          placeholder={defaultLabel}
+                          onChange={(event) =>
+                            c.setImageSettings((s) => ({ ...s, strength: event.target.value }))
+                          }
+                          disabled={c.streaming}
+                          slotProps={{ htmlInput: { min: 0, max: 1, step: 0.05 } }}
+                        />
+                      </Tooltip>
                     </Box>
                   )}
                 </>

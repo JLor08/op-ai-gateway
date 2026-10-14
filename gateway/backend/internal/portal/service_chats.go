@@ -461,6 +461,13 @@ type ChatImageSettings struct {
 	CFG            *float64 `json:"cfg,omitempty"`
 	Seed           *int     `json:"seed,omitempty"`
 	ClipSkip       *int     `json:"clip_skip,omitempty"`
+	// Strength is the EDIT knob: how far an image edit departs from its source
+	// (sd-server's own default is 0.75, which makes a weak edit, and a
+	// reference-edit model may want it higher). Like the knobs above it rides the
+	// <sd_cpp_extra_args> block, top-level, and is nil/omitted when unset so
+	// sd-server keeps its default. sd-server ignores it for a generation (no source
+	// image), so a thread that carries it can still generate.
+	Strength *float64 `json:"strength,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
