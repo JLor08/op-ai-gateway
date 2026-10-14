@@ -134,11 +134,7 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 			// was never applied to. Nothing mutates these today; a copy costs a
 			// few entries per offered alias and removes the hazard instead of
 			// leaving a note about it.
-			copied := make(map[string]struct{}, len(flavors))
-			for flavor := range flavors {
-				copied[flavor] = struct{}{}
-			}
-			sets[name] = copied
+			sets[name] = cloneFlavorSet(flavors)
 		}
 		if rule.HideTarget {
 			hidden[rule.To] = struct{}{}
@@ -146,6 +142,35 @@ func applyOverrideAliases(sets, preSuppress map[string]map[string]struct{}, rule
 	}
 	for name := range hidden {
 		delete(sets, name)
+	}
+}
+
+// cloneFlavorSet returns a copy of one name's flavor set, so an alias entry never
+// shares a map object with its target (see applyOverrideAliases).
+func cloneFlavorSet(flavors map[string]struct{}) map[string]struct{} {
+	copied := make(map[string]struct{}, len(flavors))
+	for flavor := range flavors {
+		copied[flavor] = struct{}{}
+	}
+	return copied
+}
+
+// applyGeneratedClaudeAliases overlays a token's GENERATED Claude aliases
+// (claudeAliasesFromListing) onto a flavor set: each alias id is added with a
+// copy of its target's pre-suppression flavors, IN ADDITION to the target, which
+// keeps its own entry (unlike an override rule's hide_target, a generated alias
+// never hides anything). The derivation already guarantees the target is offered
+// to the token and that no alias id is an existing name, so nothing here
+// overwrites an entry. Like applyOverrideAliases it is a LISTING overlay, never
+// an access control, and it runs only on the usage listings, never on
+// ManageModels().
+func applyGeneratedClaudeAliases(sets, preSuppress map[string]map[string]struct{}, aliases map[string]claudeAlias) {
+	for aliasID, alias := range aliases {
+		flavors, ok := preSuppress[alias.OriginalID]
+		if !ok {
+			continue // the target is not a real name here: an alias would be a dead name
+		}
+		sets[aliasID] = cloneFlavorSet(flavors)
 	}
 }
 

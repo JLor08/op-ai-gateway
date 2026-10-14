@@ -4,9 +4,13 @@
 package portal
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
+	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"slices"
 	"strings"
 )
@@ -14,10 +18,12 @@ import (
 // Claude-compatible model aliases (issue #225): a token that opts in sees each
 // eligible local model/group under a stable `anthropic-local-<hash>` id that a
 // Claude client will accept. This file is the one shared derivation both
-// discovery and resolution use, so they cannot disagree. It is a pure unit over
-// plain strings: which models are eligible (offered, Anthropic-Messages
-// capable, local, not hidden/locked/images-only) and which names are reserved is
-// decided by the caller from the token's model views.
+// discovery and resolution use, so they cannot disagree. It has three layers:
+// the pure encoding and collision policy over plain strings (claudeAliasID,
+// claudeAliasMap), the eligibility rules over a token's alias-free listing
+// (claudeAliasEligible), and the token-scoped Service entry points that apply
+// them (claudeAliasesFromListing for the discovery paths that already hold the
+// listing, claudeAliasesForToken for a caller that has only the token).
 //
 // The encoding is a compatibility contract: clients persist alias ids, so
 // changing the prefix, the hash, the window length, the window order or the
@@ -158,4 +164,146 @@ func claudeAliasMap(eligible []string, reserved map[string]bool, displayName fun
 		}
 	}
 	return aliases, diagnostics
+}
+
+// claudeAliasEligible returns, sorted, the gateway model/group ids of a token's
+// ALIAS-FREE listing that may receive a generated alias.
+//
+// listed is the per-name flavor map of the listing after the group overlay and
+// the model_settings suppression but BEFORE any per-token alias overlay, so it
+// holds only real model/group identities that are offered to this token:
+// hidden, locked and suppressed names are already gone, and so is every group
+// that is hidden/locked or has no offerable member. A name qualifies when it
+//
+//   - serves the Anthropic Messages flavor: "anthropic" is among its flavors,
+//     which is already routing.MappingServesAPIFlavor (the application declares
+//     the flavor, the effective flavors list it and the messages mode is not
+//     disabled). That alone drops images-only, openai-only and Messages-disabled
+//     models;
+//   - is not a name the token's own manual rules govern: a name a rule is keyed
+//     on means whatever that rule says for this token, so an alias onto the
+//     unrewritten model would disagree with it, and a target a rule hides
+//     (hide_target) is deliberately out of this token's discovery, which an
+//     alias (original_model_id) would reveal;
+//   - is not a name one of the token's vendor accounts also serves. Vendor models
+//     are never in listed (they are no mapping views and the vendor overlay is
+//     applied after it), but a vendor account is tried before the self-hosted
+//     route (vendor_first), so an alias onto a name the vendor serves would
+//     dispatch to the vendor model.
+//
+// "Local" is not decided here by a label: it holds because listed is composed
+// only of mapping views (an AI server's application, which can only be one of
+// the on-prem application types) and model groups over them, never of vendor
+// accounts. See claudeAliasesFromListing.
+func claudeAliasEligible(listed map[string]map[string]struct{}, rules map[string]auth.ModelOverrideRule, vendor map[string]map[string]struct{}) []string {
+	hidden := make(map[string]struct{})
+	for _, rule := range rules {
+		if rule.HideTarget {
+			hidden[rule.To] = struct{}{}
+		}
+	}
+	eligible := make([]string, 0, len(listed))
+	for name, flavors := range listed {
+		if _, serves := flavors[routing.APIFlavorAnthropic]; !serves {
+			continue
+		}
+		if _, keyed := rules[name]; keyed {
+			continue
+		}
+		if _, hides := hidden[name]; hides {
+			continue
+		}
+		if _, vendorServed := vendor[name]; vendorServed {
+			continue
+		}
+		eligible = append(eligible, name)
+	}
+	slices.Sort(eligible)
+	return eligible
+}
+
+// listingLabel is the display name a listing row carries for a gateway
+// model/group id: the id itself. A model has no display name of its own and the
+// listing labels a group by its gateway id too. A generated alias takes the same
+// label as the row it points to, so the two never disagree and the alias label is
+// never anything but the target's own.
+func listingLabel(id string) string { return id }
+
+// claudeAliasesFromListing is THE token-scoped derivation of generated Claude
+// aliases (aliasID -> target and honest label), shared by both discovery paths
+// (modelsResponse and modelFlavorSetsWithPreSuppress, which hold the listing in
+// hand) and, through claudeAliasesForToken, by inference resolution, so a listed
+// alias and a resolvable alias cannot disagree.
+//
+// listed is the token's alias-free listing (see claudeAliasEligible) and
+// preSuppress the same composition before the hidden/locked suppression, with
+// every active group. overlayLoaded says whether the group/visibility overlay
+// that produced listed was available: when it was not, the listing fails OPEN
+// (no groups, no hidden/locked suppression) so it never blanks, and the
+// derivation fails CLOSED instead: it cannot tell a hidden model from a shown
+// one, and an alias would reveal what the operator hid.
+//
+// Nothing is derived unless token.ClaudeModelAliases is set. That is the whole
+// gate for the token-less portal session principal (gateway/auth.go
+// sessionPrincipal), which never sets it: generated aliases serve external
+// bearer-token clients such as Claude Desktop, not the portal UI.
+//
+// The names an alias must never take (reserved) are every real model/group name
+// of this token's view (preSuppress, hidden ones included), the names of the
+// token's vendor accounts, and its manual rule keys.
+//
+// The second result is one human-readable diagnostic per skipped id; callers log
+// them with logClaudeAliasDiagnostics.
+func (s *Service) claudeAliasesFromListing(ctx context.Context, token auth.Token, listed, preSuppress map[string]map[string]struct{}, overlayLoaded bool) (map[string]claudeAlias, []string) {
+	if !token.ClaudeModelAliases || !overlayLoaded {
+		return nil, nil
+	}
+	vendor := s.vendorModelFlavorSets(ctx, token)
+	reserved := make(map[string]bool, len(preSuppress)+len(vendor)+len(token.ModelOverrideRules))
+	for name := range preSuppress {
+		reserved[name] = true
+	}
+	for name := range listed {
+		reserved[name] = true
+	}
+	for name := range vendor {
+		reserved[name] = true
+	}
+	for name := range token.ModelOverrideRules {
+		reserved[name] = true
+	}
+	return claudeAliasMap(claudeAliasEligible(listed, token.ModelOverrideRules, vendor), reserved, listingLabel)
+}
+
+// claudeAliasesForToken derives a token's generated aliases from scratch: it
+// reads the token's visible mapping views and the group overlay itself and
+// composes the same alias-free listing discovery does (baseFlavorSets), then
+// asks claudeAliasesFromListing. It is the accessor inference resolution uses,
+// so it costs one mapping traversal, one overlay load and one runtime-spec read
+// per call (like ModelOfferingFor, nothing is cached): a caller on the request
+// path should check the cheap preconditions (the setting, and that the requested
+// id starts with claudeAliasIDPrefix) before calling it.
+//
+// A store error yields no aliases (fail closed).
+func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (map[string]claudeAlias, []string) {
+	if !token.ClaudeModelAliases || s.routes == nil {
+		return nil, nil
+	}
+	views, err := s.visibleMappingViews(ctx, token)
+	if err != nil {
+		return nil, nil
+	}
+	overlay, err := s.loadGroupOverlayInputs(ctx)
+	if err != nil {
+		return nil, nil
+	}
+	sets, preSuppress := baseFlavorSets(views, s.runtimeSpecIndexForViews(ctx, views), &overlay)
+	return s.claudeAliasesFromListing(ctx, token, sets, preSuppress, true)
+}
+
+// logClaudeAliasDiagnostics logs the skipped-alias diagnostics of a derivation.
+func logClaudeAliasDiagnostics(diagnostics []string) {
+	for _, diagnostic := range diagnostics {
+		slog.Warn("portal: generated Claude alias skipped", "reason", diagnostic)
+	}
 }
