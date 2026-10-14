@@ -899,7 +899,7 @@ func (pacedNativeProxyProvider) CompleteStream(_ context.Context, _ routing.Targ
 	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &inference.Usage{}})
 }
 
-func (p pacedNativeProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+func (p pacedNativeProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte, string) (*provider.ProxyResponse, error) {
 	return &provider.ProxyResponse{
 		StatusCode: 200,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},

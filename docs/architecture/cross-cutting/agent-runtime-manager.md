@@ -1265,7 +1265,9 @@ only to an agent that declares `runtime_ensure` (§7).
 
 ### 4.2 Model routing
 
-Every other request is routed on a `model` field in a JSON request body.
+Every other request is routed on a `model` field in a JSON request body — or,
+from 0.9.0, in the `model` **part** of a `multipart/form-data` body (the bullet
+on the multipart branch below).
 
 - **Request bodies are buffered** (bounded at 32 MiB; over that is
   `413 runtime.request_too_large`) because the router must read `model` and
@@ -1283,6 +1285,34 @@ Every other request is routed on a `model` field in a JSON request body.
   model** gets `404 runtime.model_not_managed`, before anything is started. See
   §4.5 for what that means for websocket-serving model servers, and §4.1 for why
   it makes `POST /ensure/{model}` harmless on an agent that predates the route.
+- **A `multipart/form-data` body is routed on its `model` part, and always takes
+  the plain proxy** (agent 0.9.0, feature `multipart_proxy`, §7). It exists for
+  the gateway's image **edit** (`POST /v1/images/edits`, [API Compatibility &
+  Inference §3.5](compatibility-and-inference.md#35-openai-images-edits)), whose
+  body is a multipart form rather than one JSON value. A multipart `Content-Type`
+  commits the request to this branch: a JSON body under it is **not** read as JSON,
+  and a type that does not parse at all takes the JSON default as before. The
+  router has already buffered the body (32 MiB, above), and it finds the model
+  with the **same** `mime/multipart.Reader` the gateway's own form parser uses and
+  the same notion of a model part (`FormName() == "model"` — a part whose
+  disposition is `attachment`, or `model`-shaped text in a preamble, an epilogue or
+  another part's body, is not the model): a hand-rolled text scan would let the
+  two sides disagree about *which* model, and the disagreement would be an
+  allowlist bypass. It mirrors the gateway's other rules on that part so there is
+  one answer to "which model": it walks the **whole** body, refuses a second
+  `model` part, a model over 1 MiB and a part it cannot read, and does not trim the
+  value (the gateway compares and rewrites the untrimmed one). It **never** takes
+  the stream proxy — a multipart request has no `stream` notion and the field is
+  never read — so the child's response keeps its own `Content-Type` and no SSE
+  headers. The relay hands the child the client's bytes and `Content-Type`
+  (boundary included) untouched. A missing, empty or malformed `model`, a missing
+  or invalid boundary, and a JSON body under a multipart type all answer the same
+  `404 runtime.model_not_managed` before anything is started. It is deliberately
+  **not a whole-body validator**: it agrees with the gateway on the model for every
+  body the gateway accepts, and does not re-validate parts it does not read (the
+  gateway, which reads the prompt and image, has already refused a truncated one).
+  The `model` value is the mapping's **`app_model_name`**, like the JSON path's —
+  the gateway rewrites the form's `model` field to it before relaying, §7.
 - **The router is a catch-all: it forwards `/v1/responses` and `/v1/messages`
   exactly like any other path**, routing purely on the body's top-level
   `model` field — it has no notion of Codex or Claude Code, and no notion of
@@ -2471,10 +2501,10 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Five
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Six
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
-`runtime_upstream_props`, `runtime_ensure`); one, `capability_source_sdcpp`, is
+`runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`); one, `capability_source_sdcpp`, is
 on the gateway's list only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
@@ -2500,8 +2530,9 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.6.0"`, and
 `runtime_upstream_props` ([§4.1](#41-control-routes),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`,
-and `runtime_ensure` ([§4.1](#41-control-routes),
-[§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`
+`runtime_ensure` ([§4.1](#41-control-routes),
+[§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`, and
+`multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which has no
 `Since` because the agent's registry does not carry it. The gateway's own list is
@@ -2631,6 +2662,34 @@ gateway restarted, because the gateway holds the declared set in memory
 (`agentFeaturesRegistry`, below), and the refusal's label says so. A newer agent
 under an older gateway simply never receives the route. `server-agent`'s
 `Version` moved `0.7.4` → `0.8.0` for this entry, MINOR per the same rule.
+
+`multipart_proxy` is the same shape as `runtime_ensure`, and it exists for the
+same reason: the gateway gates real behaviour on it, fail-closed. It says the
+router finds a managed child from the `model` **part** of a `multipart/form-data`
+body (§4.2), and the gateway reads it off the agent's sample
+(`s.AgentFeatures.Has(target.ServerID, multipartProxyFeature)`) before relaying an
+**image edit** to an agent-launched model ([API Compatibility & Inference
+§3.5](compatibility-and-inference.md#35-openai-images-edits)). Trying the route
+instead could not tell the two cases apart: a router that predates the branch
+peeks the model out of a JSON body, cannot read one out of a form, and answers
+`404 runtime.model_not_managed` — the code it gives an unmanaged model. Without
+the name the gateway refuses the edit with **404 `images.edit_unavailable`** and
+sends the agent nothing. The gate sits after the resolve and the served-flavor
+check, applies to the **edit only** (a generation is JSON, which every router
+serves; an external `openai_images` target has no agent in front of it), and is
+not retried against another application that could have served the model. It
+shipped **before** the agent change, so no window exists in which an agent target
+silently breaks. The refusal also covers an agent that has **not reported since
+the gateway restarted**, and one just upgraded until its first sample under the
+new version, because the gateway holds the declared set in memory
+(`agentFeaturesRegistry`, below); the response says so rather than telling an
+operator whose agent is already 0.9.0 to update it: an agent-launched
+`stable_diffusion_cpp` child serves edits only after the agent's next telemetry
+sample has declared the name, which is the restart warm-up. A newer agent under an
+older gateway simply never receives a multipart request. The name is on the
+agent's list alone and spelled identically on both sides, because the agent
+module imports nothing from the gateway. `server-agent`'s `Version` moved
+`0.8.2` → `0.9.0` for this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -2775,6 +2834,16 @@ nothing on the gateway waits on the agent.
 (§4.1), and the gateway waits on that name before it sends the route (§7). The
 version assertion lives in `TestFeaturesDeclareRuntimeEnsure`, beside the
 newest feature, and `runtime_upstream_props`' `Since` stays `"0.7.0"`.
+
+**`0.8.2` → `0.9.0` (issue #69, image edit) is MINOR for the same plain reason,
+and the reason matters more than the request shape.** `agent.Features` gained
+`multipart_proxy` for the router's multipart model peek (§4.2), and the gateway
+waits on that name before it relays an edit (§7). The changed request shape
+alone — a body the router now reads differently — would have been PATCH; it is
+the **flag** the rule counts. The bump is one for the whole branch, made when the
+agent change landed, however many commits it spans, and the version assertion
+moved to `TestFeaturesDeclareMultipartProxy` beside the newest feature
+(`runtime_ensure`'s test keeps its own presence and `Since` check).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

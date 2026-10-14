@@ -409,6 +409,35 @@ func TestLoadMaxRunHistoryBytesFallsBackOnJunk(t *testing.T) {
 	}
 }
 
+func TestLoadMaxImageEditBodyBytesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", "")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxImageEditBodyBytes != 32<<20 {
+		t.Fatalf("MaxImageEditBodyBytes = %d, want %d (32 MiB, the agent router's own cap)", cfg.MaxImageEditBodyBytes, 32<<20)
+	}
+}
+
+func TestLoadMaxImageEditBodyBytesOverride(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", "67108864")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxImageEditBodyBytes != 67108864 {
+		t.Fatalf("MaxImageEditBodyBytes = %d, want 67108864", cfg.MaxImageEditBodyBytes)
+	}
+}
+
+func TestLoadMaxImageEditBodyBytesFallsBackOnJunk(t *testing.T) {
+	for _, v := range []string{"garbage", "0", "-5"} {
+		t.Setenv("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", v)
+		if got := mustLoad(t).MaxImageEditBodyBytes; got != 32<<20 {
+			t.Fatalf("value %q: MaxImageEditBodyBytes = %d, want %d", v, got, 32<<20)
+		}
+	}
+}
+
 func TestLoadLogLevelDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_LOG_LEVEL", "")
 	if got := mustLoad(t).LogLevel; got != "info" {

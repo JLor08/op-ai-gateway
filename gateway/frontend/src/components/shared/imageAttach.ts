@@ -28,7 +28,7 @@ const HEIC_TYPES = new Set([
 
 // Browsers frequently report an empty MIME type for .heic/.heif files, so fall
 // back to the filename extension when the type is missing/unknown.
-function isHeicFile(file: File): boolean {
+export function isHeicFile(file: File): boolean {
   if (HEIC_TYPES.has(file.type.toLowerCase())) return true;
   return /\.hei[cf]$/i.test(file.name);
 }
@@ -90,6 +90,67 @@ async function downscaleDataUrl(dataUrl: string, mime: string): Promise<string> 
   // The quality arg is ignored for the lossless PNG path.
   const outMime = mime === 'image/jpeg' || mime === 'image/webp' ? mime : 'image/png';
   return canvas.toDataURL(outMime, 0.82);
+}
+
+// How far a mask's shape may be from its source's before it is not "the same picture
+// at another size" any more: 1 % of the aspect ratio. A source downscaled to the cap
+// is rounded to whole pixels, so its shape is never exactly its original's -- a
+// fraction of a percent, far inside this -- while a mask drawn for another picture is
+// off by far more.
+const MASK_SHAPE_TOLERANCE = 0.01;
+
+// Draws `img` on a canvas of exactly `width` x `height` and returns it as a PNG data
+// url (alpha kept: the mask's alpha IS the selection), or null with no 2d context.
+function drawAsPng(img: HTMLImageElement, width: number, height: number): string | null {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.drawImage(img, 0, 0, width, height);
+  return canvas.toDataURL('image/png');
+}
+
+// Prepares the mask of an image edit (inpainting) for the source image it will be
+// sent with. The gateway refuses a mask that is not EXACTLY the size of the edit's
+// source, and the two do not come through the same preparation: an uploaded source
+// goes through prepareImageDataUrl and is downscaled to the 1568 px cap, but a
+// refined image is sent by reference at its stored, natural size -- the composer
+// offers 1792x1024, and a model's own default can be larger still -- so a mask
+// clamped to the cap would never fit it. The mask is therefore sized to the pixels
+// of the source as it is actually sent (`sourceUrl`: what the composer holds, a data
+// url or a gateway reference, read here through the same decoder the thumbnail is):
+//
+//   - the same size: sent as it is, untouched;
+//   - another size but the same shape (the same picture, drawn larger or smaller):
+//     drawn onto a canvas of the source's exact size, PNG, alpha kept;
+//   - any other shape, or a source that cannot be read: the cap every attached image
+//     is held to, as before. Stretching a mask of another shape onto the source would
+//     select the wrong region in silence; the gateway names both sizes instead.
+//
+// A mask is a PNG and only a PNG (a jpeg has no alpha, and the caller has said so
+// to the user already), so there is no HEIC branch.
+export async function prepareMaskDataUrl(file: File, sourceUrl: string): Promise<string> {
+  if (file.type.toLowerCase() !== 'image/png') {
+    throw new ImageAttachError('type', 'a mask must be a PNG');
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    throw new ImageAttachError('size', 'image too large');
+  }
+  const dataUrl = await readAsDataUrl(file);
+  const mask = await loadImage(dataUrl);
+  const { naturalWidth: mw, naturalHeight: mh } = mask;
+  const source = await loadImage(sourceUrl).catch(() => null);
+  const sw = source?.naturalWidth ?? 0;
+  const sh = source?.naturalHeight ?? 0;
+  if (mw && mh && sw && sh) {
+    if (mw === sw && mh === sh) return dataUrl;
+    if (Math.abs(mw * sh - mh * sw) <= MASK_SHAPE_TOLERANCE * mh * sw) {
+      const resized = drawAsPng(mask, sw, sh);
+      if (resized) return resized;
+    }
+  }
+  return downscaleDataUrl(dataUrl, 'image/png');
 }
 
 export async function prepareImageDataUrl(file: File): Promise<string> {

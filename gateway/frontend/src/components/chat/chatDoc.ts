@@ -16,7 +16,12 @@ import type {
   ChatSummary,
   PortalToken,
 } from '../../api';
-import type { ChatContent } from '../shared/chatContent';
+import {
+  isMaskPart,
+  maskPart,
+  type ChatContent,
+  type ChatContentPart,
+} from '../shared/chatContent';
 
 // The persisted status of an assistant turn (mirrors the backend transcript
 // vocabulary). `pending` is written by a server checkpoint while a run is live;
@@ -128,6 +133,90 @@ export const DEFAULTS: ChatSettings = {
 // Type/size validation lives in ../shared/imageAttach.
 export const MAX_IMAGES = 5;
 
+// What an image attached to the composer MEANS for the next send (ADR-043 R1):
+//
+//   'vision' -- an input the picked text model reads;
+//   'edit'   -- the source image of an image EDIT: the thread is an image thread
+//               whose picked model may be edited, and the server turns a turn whose
+//               last user message carries an image into an edit of it;
+//   'none'   -- nothing: the control is disabled and an attachment is refused or
+//               cleared.
+//
+// It is ONE predicate of the thread's kind and the picked model's flags, and the
+// attach control, the clear on a model switch, send() and the replay guard all
+// read it, so they cannot disagree. The THREAD's kind decides first -- a text
+// thread stays a text thread and an image thread an image thread whichever model
+// is picked afterwards -- and `vision` is deliberately not consulted for an image
+// thread: an sd model is vision:false and still edits. On a text thread the old
+// rule stands: a vision model attaches, but a model that also GENERATES images
+// does not (an image model has no use for input on a text thread).
+export type AttachMode = 'edit' | 'vision' | 'none';
+
+export function attachModeOf(
+  kind: string,
+  model: { vision: boolean; image: boolean; imageEdit: boolean },
+): AttachMode {
+  if (kind === 'image') return model.imageEdit ? 'edit' : 'none';
+  return model.vision && !model.image ? 'vision' : 'none';
+}
+
+// The MASK of an image edit is an image part tagged `purpose: 'mask'` (the tag and
+// its predicate, MASK_PURPOSE / maskPart / isMaskPart, are defined with the part
+// shape in ../shared/chatContent -- the message renderer needs them too -- and
+// re-exported here for the chat module). A mask is only ever the mask OF an edit.
+export { MASK_PURPOSE, isMaskPart, maskPart } from '../shared/chatContent';
+
+// The content of the user turn the composer sends: the text alone when no image is
+// attached, otherwise the text, the attached image(s) and -- for an edit of exactly
+// one source image only -- the mask. A mask without a source, or outside an edit
+// (a text model reading an image has no use for one), is left out rather than
+// sent: it could mean nothing there, and the executor would ignore it anyway.
+export function userTurnContent(
+  text: string,
+  images: string[],
+  mask: string | null,
+  mode: AttachMode,
+): ChatContent {
+  if (images.length === 0) return text;
+  const parts: ChatContentPart[] = [
+    { type: 'text', text },
+    ...images.map((url): ChatContentPart => ({ type: 'image_url', image_url: { url } })),
+  ];
+  if (mask !== null && mode === 'edit' && images.length === 1) parts.push(maskPart(mask));
+  return parts;
+}
+
+// The url a stored image is served from: /api/portal/chat-blobs/{id}, owner-scoped to
+// the chat that holds the blob. A transcript's image part is one of these once its
+// run is committed (images live out of the document), and a refine reuses it as the
+// source of the next edit. Bound to ITS chat, unlike an inline data url, which is just
+// bytes and goes wherever the composer goes.
+const CHAT_BLOB_URL_PREFIX = '/api/portal/chat-blobs/';
+
+export function isChatBlobUrl(url: string): boolean {
+  return url.startsWith(CHAT_BLOB_URL_PREFIX);
+}
+
+// The formats the edit route of sd-server reads a source image in. The composer
+// takes no other one for an edit (the picker's `accept`, and handleFiles, which an
+// `accept` cannot bind), so a webp or gif source is refused where the user can
+// still act on it instead of coming back from the upstream as a generic error.
+// Lower case: compared against a file's reported MIME type.
+//
+// HEIC/HEIF are the one exception: they are not a format sd-server would see, because
+// the upload pipeline (prepareImageDataUrl) converts them to JPEG before they are
+// attached, so the guard lets them through (isHeicFile, which also recognises one a
+// browser reports no MIME type for by its extension) and the picker lists them -- the
+// extensions too, since a file dialog matches those when it has no MIME type to go by.
+export const IMAGE_EDIT_SOURCE_TYPES: readonly string[] = ['image/png', 'image/jpeg'];
+export const IMAGE_EDIT_SOURCE_ACCEPT = [
+  ...IMAGE_EDIT_SOURCE_TYPES,
+  'image/heic',
+  'image/heif',
+  '.heic',
+  '.heif',
+].join(',');
+
 // The image-generation knobs the composer edits, as CONCRETE store state (every
 // field defined, unlike the all-optional wire ChatImageSettings). An unset knob
 // is the sentinel that imageSetting() below omits from the wire: "" for
@@ -150,6 +239,12 @@ export type ImageSettings = {
   cfg: string;
   seed: string;
   clip_skip: string;
+  // The EDIT knob: how far an image edit departs from its source image. Blank-able
+  // like the numerics above ("" = sd-server's own default, 0.75, which makes a weak
+  // edit); the gateway delivers a set one in the same <sd_cpp_extra_args> block.
+  // sd-server ignores it for a plain generation, so it lives with the rest of the
+  // thread's settings.
+  strength: string;
 };
 
 export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
@@ -164,6 +259,7 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   cfg: '',
   seed: '',
   clip_skip: '',
+  strength: '',
 };
 
 // The portal's HARD cap on images per request: a portal-side limit (it dates from
@@ -354,6 +450,8 @@ export function imageSetting(
   if (seed !== undefined) image.seed = seed;
   const clipSkip = toImageInt(s.clip_skip);
   if (clipSkip !== undefined) image.clip_skip = clipSkip;
+  const strength = toImageNumber(s.strength);
+  if (strength !== undefined) image.strength = strength;
   return { image };
 }
 
@@ -378,6 +476,7 @@ export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSe
     cfg: imageNumToStr(s.cfg),
     seed: imageNumToStr(s.seed),
     clip_skip: imageNumToStr(s.clip_skip),
+    strength: imageNumToStr(s.strength),
   };
 }
 
@@ -531,6 +630,37 @@ export function historyHasImage(messages: ChatUiMessage[]): boolean {
   return messages.some(
     (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'),
   );
+}
+
+// Whether the LAST user message of a replayed history carries an image -- which,
+// in an image thread, is what makes the replayed turn an EDIT (the server's
+// executor sends exactly that message's images as the source and reads nothing
+// else of the history). Role-aware on purpose, unlike historyHasImage: an image
+// thread's assistant turns hold its own generated results, which are never sent.
+//
+// A SOURCE image: the mask part (maskPart) is an image too, but a message with a
+// mask and no source is no edit -- the executor ignores such a mask -- so it must
+// not be taken for the operand the replay guard protects.
+export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const { role, content } = messages[i];
+    if (role === 'user') {
+      return (
+        Array.isArray(content) && content.some((p) => p.type === 'image_url' && !isMaskPart(p))
+      );
+    }
+  }
+  return false;
+}
+
+// The prompt text of the LAST user message of a replayed history ('' when there is
+// none). What an image edit is asked to do is this text, and the endpoint refuses an
+// edit without it (images.prompt_required) only after the turn was stored.
+export function lastUserText(messages: ChatUiMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === 'user') return textOf(messages[i].content);
+  }
+  return '';
 }
 
 let idSeq = 0;

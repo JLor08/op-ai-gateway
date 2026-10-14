@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useState, type SubmitEvent } from 'react';
+import { useEffect, useRef, useState, type SubmitEvent } from 'react';
 import {
   Box,
   Button,
@@ -17,13 +17,16 @@ import {
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import AddPhotoAlternateIcon from '@mui/icons-material/AddPhotoAlternate';
+import LayersIcon from '@mui/icons-material/Layers';
 import type { ImageModelOptions } from '../api';
 import type { Translation } from './shared/types';
 import type { ChatContent } from './shared/chatContent';
+import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
 import {
+  IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
   IMAGE_N_MAX,
   IMAGE_OUTPUT_FORMATS,
@@ -36,6 +39,18 @@ import {
 import { ChatSidebar } from './chat/ChatSidebar';
 
 const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
+
+// The small round close button on the corner of an attached image's (or mask's)
+// thumbnail in the composer's attach strip.
+const thumbnailRemoveSx = {
+  position: 'absolute',
+  top: -6,
+  right: -6,
+  width: 20,
+  height: 20,
+  bgcolor: 'var(--brand-accent)',
+  color: 'var(--accent-text)',
+} as const;
 
 // A bound or default the model actually reported. The options endpoint omits
 // (omitempty) whatever it does not know, so `undefined` is the ONLY "not
@@ -139,6 +154,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(readSidebarCollapsed);
 
+  // A refine (the per-image action on a generated result) seeds the composer with that
+  // image as the source of the next edit; the user's next move is to say what to
+  // change, and the composer may be far below the image they clicked, so the prompt
+  // field takes the focus (which also scrolls it into view). The store only bumps a
+  // counter; the view acts on a CHANGE of it, so a remount of this view (the store
+  // lives above the view switch) does not replay an old refine.
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+  const handledFocusRequest = useRef(c.composerFocusRequest);
+  useEffect(() => {
+    if (handledFocusRequest.current === c.composerFocusRequest) return;
+    handledFocusRequest.current = c.composerFocusRequest;
+    promptRef.current?.focus();
+  }, [c.composerFocusRequest]);
+
   function toggleSidebar() {
     setSidebarCollapsed((prev) => {
       const next = !prev;
@@ -182,13 +211,29 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // thread keeps its composer even while its model is momentarily unreachable.
   const isImageThread = c.chatKind === 'image';
 
-  // Which capability the disabled attach button is about. The two are
-  // different: an image GENERATOR emits images and accepts none, while a
-  // non-vision model simply cannot read one. Saying "does not support images"
-  // on a generator told the user the opposite of the truth.
+  // The attach control follows ONE predicate, the store's attachMode (the
+  // thread's kind and the picked model -- ADR-043 R1): 'edit' offers the image as
+  // the source of an edit, 'vision' as an input the model reads, 'none' refuses.
+  //
+  // Which capability a REFUSED attach button is about: the two are different -- an
+  // image GENERATOR (that cannot be edited) emits images and accepts none, while a
+  // non-vision model simply cannot read one. Saying "does not support images" on
+  // a generator told the user the opposite of the truth.
   let attachTooltip: string = t.chatAttachImage;
-  if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
-  else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
+  if (c.attachMode === 'edit') attachTooltip = t.chatAttachImageEdit;
+  else if (c.attachMode === 'none') {
+    if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
+    else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
+  }
+
+  // The prompt field's helper text, on an image thread only. An edit-capable
+  // model's thread also edits: the hint says what an attachment does there (there
+  // is no mode to switch, the image is the operand). A generator that cannot be
+  // edited keeps the old wording.
+  let promptHelperText: string | undefined;
+  if (isImageThread) {
+    promptHelperText = c.attachMode === 'edit' ? t.chatImageEditHint : t.chatImageOnlyHint;
+  }
 
   let modelHelperText: string | undefined;
   if (c.overrideModel !== '') {
@@ -525,6 +570,24 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         }
                         disabled={c.streaming}
                       />
+                      {/* The edit knob: how far an image edit departs from its
+                        source. Blank = sd-server's own default (0.75, stated in
+                        the tooltip, which also notes that reference-edit models
+                        often want more); sd-server ignores it for a generation. */}
+                      <Tooltip title={t.chatImageStrengthHint} describeChild>
+                        <TextField
+                          id="chat-image-strength"
+                          label={t.chatImageStrength}
+                          type="number"
+                          value={c.imageSettings.strength}
+                          placeholder={defaultLabel}
+                          onChange={(event) =>
+                            c.setImageSettings((s) => ({ ...s, strength: event.target.value }))
+                          }
+                          disabled={c.streaming}
+                          slotProps={{ htmlInput: { min: 0, max: 1, step: 0.05 } }}
+                        />
+                      </Tooltip>
                     </Box>
                   )}
                 </>
@@ -650,6 +713,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
+                  // The refine of a generated image: only where it can run. attachMode
+                  // 'edit' is the composer's own gate (an image thread, a model whose
+                  // image_edit is served true), so the action is never offered for an
+                  // edit the endpoint would refuse; it moves only with a model switch,
+                  // never per token, so it does not defeat ChatMessage's memo.
+                  onRefine={
+                    message.role === 'assistant' && c.attachMode === 'edit'
+                      ? handlers.onRefine
+                      : undefined
+                  }
                   canRun={c.modelAvailable}
                 />
               );
@@ -669,7 +742,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             <TextField
               id="chat-message"
               label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
-              helperText={isImageThread ? t.chatImageOnlyHint : undefined}
+              helperText={promptHelperText}
               multiline
               minRows={4}
               fullWidth
@@ -679,6 +752,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               // but the notch stays closed and the label sits ON the border. Pin the
               // label shrunk and the notch open so they always match.
               slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+              inputRef={promptRef}
               value={c.input}
               onChange={(event) => c.setInput(event.target.value)}
               onKeyDown={(event) => {
@@ -694,7 +768,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               }}
               disabled={c.streaming}
             />
-            {c.images.length > 0 && (
+            {(c.images.length > 0 || c.mask !== null) && (
               <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
                 {c.images.map((url, index) => (
                   // Key/remove by index (matching the sent-message renderer):
@@ -718,20 +792,38 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       size="small"
                       aria-label={t.chatCancel}
                       onClick={() => c.removeImage(index)}
-                      sx={{
-                        position: 'absolute',
-                        top: -6,
-                        right: -6,
-                        width: 20,
-                        height: 20,
-                        bgcolor: 'var(--brand-accent)',
-                        color: 'var(--accent-text)',
-                      }}
+                      sx={thumbnailRemoveSx}
                     >
                       <CloseIcon fontSize="small" />
                     </IconButton>
                   </Box>
                 ))}
+                {c.mask !== null && (
+                  <Box sx={{ position: 'relative', width: 72, height: 72 }}>
+                    <Box
+                      component="img"
+                      src={c.mask}
+                      alt={t.chatAttachedMask}
+                      sx={{
+                        display: 'block',
+                        width: 72,
+                        height: 72,
+                        objectFit: 'cover',
+                        border: '1px solid var(--line)',
+                        borderRadius: '8px',
+                        background: MASK_THUMBNAIL_BACKGROUND,
+                      }}
+                    />
+                    <IconButton
+                      size="small"
+                      aria-label={t.chatRemoveMask}
+                      onClick={c.removeMask}
+                      sx={thumbnailRemoveSx}
+                    >
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Box>
+                )}
               </Box>
             )}
             <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1.5 }}>
@@ -746,7 +838,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   <IconButton
                     component="label"
                     size="small"
-                    disabled={c.streaming || !c.modelVisionCapable || c.modelImageCapable}
+                    disabled={c.streaming || c.attachMode === 'none'}
                   >
                     <AddPhotoAlternateIcon fontSize="small" />
                     <Box
@@ -767,8 +859,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     </Box>
                     <input
                       type="file"
-                      accept="image/*"
-                      multiple
+                      // An edit's source is png or jpeg (all the edit route of
+                      // sd-server reads); a text model reads any image.
+                      accept={c.attachMode === 'edit' ? IMAGE_EDIT_SOURCE_ACCEPT : 'image/*'}
+                      // An edit has one source image; a text model reads several.
+                      multiple={c.attachMode !== 'edit'}
                       hidden
                       onChange={(event) => {
                         void c.handleFiles(event.target.files);
@@ -778,6 +873,52 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   </IconButton>
                 </span>
               </Tooltip>
+              {/* The mask slot of an edit (inpainting): a PNG the size of the source
+                image whose transparent area marks the region to change. Only an edit
+                has one, and it needs the source first -- so it is disabled, and
+                says why, until one is attached. Same structure as the attach
+                button above: the file input is named by the hidden label text. */}
+              {c.attachMode === 'edit' && (
+                <Tooltip
+                  title={c.images.length === 0 ? t.chatMaskNeedsSource : t.chatAttachMaskTooltip}
+                  describeChild
+                >
+                  <span>
+                    <IconButton
+                      component="label"
+                      size="small"
+                      disabled={c.streaming || c.images.length === 0}
+                    >
+                      <LayersIcon fontSize="small" />
+                      <Box
+                        component="span"
+                        sx={{
+                          position: 'absolute',
+                          width: 1,
+                          height: 1,
+                          p: 0,
+                          m: '-1px',
+                          overflow: 'hidden',
+                          clip: 'rect(0 0 0 0)',
+                          whiteSpace: 'nowrap',
+                          border: 0,
+                        }}
+                      >
+                        {t.chatAttachMask}
+                      </Box>
+                      <input
+                        type="file"
+                        accept="image/png"
+                        hidden
+                        onChange={(event) => {
+                          void c.handleMaskFile(event.target.files);
+                          event.target.value = '';
+                        }}
+                      />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
             </Stack>
             <Tooltip
               title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}

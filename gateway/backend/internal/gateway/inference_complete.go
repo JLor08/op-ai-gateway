@@ -49,7 +49,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	// server, so the running-connections view can label it with the server name
 	// (mirrors completeStream, which registers after Resolve). A resolve failure
 	// above never reaches a server, so it is intentionally not tracked as active.
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
+	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
 	defer s.Active.Remove(id)
 	providerReq := req
 	if target.ProviderModel != "" {
@@ -655,6 +655,16 @@ type usageMeta struct {
 	// usage.ValidateBillingXOR for the contract.
 	BillingUnit     string
 	BillingQuantity float64
+	// Endpoint is the client endpoint this request arrived on. recordUsage reads
+	// it for exactly one thing: the row's ProviderPath, which it recomputes from
+	// the target and the request's FLAVOR rather than taking the path the relay
+	// actually called -- and the flavor cannot tell endpoints that share it apart
+	// (openai_images covers both /v1/images/generations and /v1/images/edits). Only
+	// an images call site needs to set it, and it must: left at its zero value
+	// (endpointChat) it records the generations path, which is wrong for an edit.
+	// Every other call site leaves it zero, which changes nothing for them --
+	// upstreamPath ignores the endpoint for every non-images flavor.
+	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation
 	// window" -- every non-stream call site, native passthrough, and a tool-only
@@ -722,7 +732,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		HTTPStatus:       meta.HTTPStatus,
 		ContentType:      meta.ContentType,
 		ReqPath:          meta.ReqPath,
-		ProviderPath:     upstreamPath(target, req.APIFlavor),
+		ProviderPath:     upstreamPath(target, req.APIFlavor, meta.Endpoint),
 		ProviderModel:    effectiveProviderModel(target, req.Model),
 		Stream:           req.Stream,
 		TokenName:        token.Name,
@@ -966,6 +976,12 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrModelNotCapable) {
 		message = "the requested model is not capable of this endpoint"
 	}
+	if errors.Is(err, errImageEditUnavailable) {
+		message = "image edit is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
+	}
+	if errors.Is(err, errImageEditTooLarge) {
+		message = fmt.Sprintf("the image edit is too large for this model's server: its request limit is %d MiB, counted after the mask and model are prepared", agentRouterMaxBodyBytes>>20)
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -999,6 +1015,19 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, routing.ErrModelNotCapable) || errors.Is(err, routing.ErrNoModelRoute) {
 		return http.StatusNotFound
 	}
+	// An edit whose agent target cannot take one (errImageEditUnavailable): 404
+	// like the capability refusal it is a sibling of -- this model cannot be
+	// edited THERE -- and, like it, a 4xx the OpenAI SDKs do not retry (they retry
+	// 408/409/429 and every 5xx), which a refusal that only a different agent
+	// build can change must not trigger.
+	if errors.Is(err, errImageEditUnavailable) {
+		return http.StatusNotFound
+	}
+	// An edit whose prepared body is past the agent's own request limit
+	// (errImageEditTooLarge): the same 413 the client's own oversized body gets.
+	if errors.Is(err, errImageEditTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		return http.StatusServiceUnavailable
 	}
@@ -1011,6 +1040,10 @@ func completionErrorCode(err error) string {
 		return routing.ErrModelNotCapable.Error()
 	case errors.Is(err, routing.ErrNoModelRoute):
 		return routing.ErrNoModelRoute.Error()
+	case errors.Is(err, errImageEditUnavailable):
+		return codeImageEditUnavailable
+	case errors.Is(err, errImageEditTooLarge):
+		return codeRequestBodyTooLarge
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):

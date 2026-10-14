@@ -7,13 +7,21 @@ import {
   DEFAULTS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
+  MASK_PURPOSE,
   imageSetting,
   imageSettingsFrom,
+  isChatBlobUrl,
+  isMaskPart,
   kindSetting,
+  lastUserHasImage,
+  maskPart,
   metricsOf,
   normalizeDoc,
   optionsOr,
+  userTurnContent,
+  type ChatUiMessage,
 } from './chatDoc';
+import { imageUrlsOf } from '../shared/chatContent';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {
@@ -185,10 +193,50 @@ describe('the persisted image settings mirror the backend omitempty', () => {
         steps: '',
         cfg: 'abc',
         seed: '   ',
+        strength: '   ',
       }).image ?? {};
     expect('steps' in image).toBe(false);
     expect('cfg' in image).toBe(false);
     expect('seed' in image).toBe(false);
+    expect('strength' in image).toBe(false);
+  });
+
+  // strength is the edit knob: blank leaves sd-server's own default (0.75), a
+  // value is sent as a wire number (the gateway puts it in the <sd_cpp_extra_args>
+  // block), and 0 is a real value, not "unset".
+  describe('strength', () => {
+    it('is blank by default, so a fresh image thread sends none', () => {
+      expect(DEFAULT_IMAGE_SETTINGS.strength).toBe('');
+      expect('strength' in (imageSetting('image', DEFAULT_IMAGE_SETTINGS).image ?? {})).toBe(false);
+    });
+
+    it('is sent as a number when set, 0 included', () => {
+      expect(
+        imageSetting('image', { ...DEFAULT_IMAGE_SETTINGS, strength: '0.9' }).image?.strength,
+      ).toBe(0.9);
+      expect(
+        imageSetting('image', { ...DEFAULT_IMAGE_SETTINGS, strength: '0' }).image?.strength,
+      ).toBe(0);
+    });
+
+    it('is never put on a text thread', () => {
+      expect(imageSetting(undefined, { ...DEFAULT_IMAGE_SETTINGS, strength: '0.9' })).toEqual({});
+    });
+
+    it('round-trips through imageSettingsFrom (number -> blank-able string)', () => {
+      expect(imageSettingsFrom({ strength: 0.9 }).strength).toBe('0.9');
+      expect(imageSettingsFrom({ strength: 0 }).strength).toBe('0');
+      expect(imageSettingsFrom(undefined).strength).toBe('');
+      expect(imageSettingsFrom({ strength: 'x' as unknown as number }).strength).toBe('');
+    });
+
+    it('survives a save/load of the document (normalizeDoc)', () => {
+      const saved = {
+        settings: { model: 'm', kind: 'image', image: { strength: 0.6 } },
+        messages: [],
+      };
+      expect(imageSettingsFrom(normalizeDoc(saved).settings.image).strength).toBe('0.6');
+    });
   });
 
   it('round-trips advanced knobs through imageSettingsFrom (numbers -> blank-able strings)', () => {
@@ -220,5 +268,145 @@ describe('optionsOr', () => {
   it('falls back to the static list when the fetched list is absent', () => {
     expect(optionsOr(undefined, IMAGE_SAMPLERS)).toBe(IMAGE_SAMPLERS);
     expect(optionsOr(undefined, IMAGE_SCHEDULERS)).toBe(IMAGE_SCHEDULERS);
+  });
+});
+
+// Masked inpainting (ADR-043 R1). The mask of an edit is stored as an ordinary
+// image part of the user message that carries a TAG -- {"purpose":"mask"} beside
+// image_url -- so it is stored, resolved and owner-checked as an image like the
+// source is, and the gateway's executor (portal.MessageImages / ImagePurposeMask)
+// can send it as the `mask` form field instead of as a second source. The key and
+// the value are the wire contract with that reader.
+describe('the mask part', () => {
+  const src = 'data:image/png;base64,SRC';
+  const mask = 'data:image/png;base64,MASK';
+  const textPart = (text: string) => ({ type: 'text' as const, text });
+  const imagePart = (url: string) => ({ type: 'image_url' as const, image_url: { url } });
+  const user = (content: ChatUiMessage['content'], id = 'u'): ChatUiMessage => ({
+    id,
+    role: 'user',
+    content,
+  });
+
+  it('is an image_url part tagged with purpose "mask", the way the executor reads it', () => {
+    expect(maskPart(mask)).toEqual({
+      type: 'image_url',
+      image_url: { url: mask },
+      purpose: 'mask',
+    });
+    expect(MASK_PURPOSE).toBe('mask');
+  });
+
+  it('is told from a source by the tag alone', () => {
+    expect(isMaskPart(maskPart(mask))).toBe(true);
+    expect(isMaskPart(imagePart(src))).toBe(false);
+    expect(isMaskPart(textPart('hi'))).toBe(false);
+  });
+
+  // The backend reads the tag the way this side does (the key exactly, the last of a
+  // repeated one wins -- portal.MessageImages / isMaskPart, pinned there by
+  // TestMessageImages), so a crafted part is a mask to the executor exactly when it is
+  // one to the bubble that shows it.
+  it('reads a repeated or re-cased tag the way the backend does: exact key, last one wins', () => {
+    const part = (members: string) =>
+      JSON.parse(`{"type":"image_url","image_url":{"url":"u"},${members}}`);
+    expect(isMaskPart(part('"purpose":"mask","purpose":"reference"'))).toBe(false);
+    expect(isMaskPart(part('"purpose":"reference","purpose":"mask"'))).toBe(true);
+    expect(isMaskPart(part('"Purpose":"mask"'))).toBe(false);
+    expect(isMaskPart(part('"purpose":"mask","purpose":3'))).toBe(false);
+  });
+
+  describe('lastUserHasImage', () => {
+    it('counts a source image of the last user message', () => {
+      expect(lastUserHasImage([user([textPart('x'), imagePart(src)])])).toBe(true);
+    });
+
+    it('counts a source that comes with a mask', () => {
+      expect(lastUserHasImage([user([textPart('x'), imagePart(src), maskPart(mask)])])).toBe(true);
+    });
+
+    it('does not take a mask for a source: a message with a mask alone is no edit', () => {
+      expect(lastUserHasImage([user([textPart('x'), maskPart(mask)])])).toBe(false);
+    });
+
+    it("reads only the last user message: an earlier turn's source and mask make no edit of this one", () => {
+      const earlier = user([textPart('old'), imagePart(src), maskPart(mask)], 'u1');
+      const later = user('plain', 'u2');
+      expect(lastUserHasImage([earlier, later])).toBe(false);
+    });
+  });
+
+  describe('userTurnContent', () => {
+    it('is the plain text of a turn with no image', () => {
+      expect(userTurnContent('a cat', [], null, 'edit')).toBe('a cat');
+    });
+
+    it('is the text then the source for an edit with no mask, with nothing else on the part', () => {
+      const content = userTurnContent('make it blue', [src], null, 'edit');
+      expect(content).toEqual([textPart('make it blue'), imagePart(src)]);
+      // The no-mask edit is what it was before masks: the source part has no tag key.
+      expect(Object.keys((content as { type: string }[])[1]).sort()).toEqual(['image_url', 'type']);
+    });
+
+    it('is the text, the source and then the tagged mask for a masked edit', () => {
+      expect(userTurnContent('fill the sky', [src], mask, 'edit')).toEqual([
+        textPart('fill the sky'),
+        imagePart(src),
+        maskPart(mask),
+      ]);
+    });
+
+    it('never carries a mask without a source image', () => {
+      expect(userTurnContent('x', [], mask, 'edit')).toBe('x');
+    });
+
+    it('never carries a mask outside an edit: a text model reading an image has no use for it', () => {
+      expect(userTurnContent('x', [src], mask, 'vision')).toEqual([textPart('x'), imagePart(src)]);
+    });
+
+    it('keeps several images of a vision turn as sources', () => {
+      expect(userTurnContent('x', [src, src], null, 'vision')).toEqual([
+        textPart('x'),
+        imagePart(src),
+        imagePart(src),
+      ]);
+    });
+  });
+});
+
+// What a refine hands the composer is one of a generated turn's image urls, kept as
+// the reference it is: the list is every image part but the edit's mask, and a stored
+// image's url is told by its serving path.
+describe('the images of a message', () => {
+  const ref = '/api/portal/chat-blobs/blob_abc';
+  const textPart = (text: string) => ({ type: 'text' as const, text });
+  const imagePart = (url: string) => ({ type: 'image_url' as const, image_url: { url } });
+
+  it('lists the urls of the image parts in order, text and the mask left out', () => {
+    expect(
+      imageUrlsOf([
+        textPart('x'),
+        imagePart(ref),
+        imagePart('data:image/png;base64,SRC'),
+        maskPart('data:image/png;base64,MASK'),
+      ]),
+    ).toEqual([ref, 'data:image/png;base64,SRC']);
+  });
+
+  it('is empty for a text-only message, whatever its shape', () => {
+    expect(imageUrlsOf('plain')).toEqual([]);
+    expect(imageUrlsOf([textPart('x')])).toEqual([]);
+    expect(imageUrlsOf([])).toEqual([]);
+  });
+
+  it('keeps a stored reference exactly as it is: no copy, no rewrite', () => {
+    expect(imageUrlsOf([imagePart(ref)])[0]).toBe(ref);
+  });
+
+  it('tells a chat-bound stored image from bytes that go wherever the composer goes', () => {
+    expect(isChatBlobUrl(ref)).toBe(true);
+    expect(isChatBlobUrl('data:image/png;base64,AAAA')).toBe(false);
+    expect(isChatBlobUrl('https://example.test/api/portal/chat-blobs/blob_abc')).toBe(false);
+    expect(isChatBlobUrl('')).toBe(false);
   });
 });

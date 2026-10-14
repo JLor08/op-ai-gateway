@@ -27,21 +27,31 @@ import type {
 import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
-import type { ChatContent } from '../shared/chatContent';
-import { prepareImageDataUrl, ImageAttachError } from '../shared/imageAttach';
+import { imageUrlsOf, type ChatContent } from '../shared/chatContent';
+import {
+  prepareImageDataUrl,
+  prepareMaskDataUrl,
+  ImageAttachError,
+  isHeicFile,
+} from '../shared/imageAttach';
 import { offeredFlavors } from '../shared/offeredFlavors';
 import {
   ACTIVE_ID_KEY,
   DEFAULTS,
   MAX_IMAGES,
+  attachModeOf,
   byNewest,
   clearLegacyKeys,
   DEFAULT_IMAGE_SETTINGS,
+  IMAGE_EDIT_SOURCE_TYPES,
   deriveTitle,
   deriveTitleFromMessages,
   historyHasImage,
   imageSetting,
   imageSettingsFrom,
+  isChatBlobUrl,
+  lastUserHasImage,
+  lastUserText,
   lsGet,
   lsSet,
   nextId,
@@ -49,6 +59,8 @@ import {
   readLegacyDoc,
   resolveTokenOverride,
   summaryOf,
+  userTurnContent,
+  type AttachMode,
   type ChatUiMessage,
   type ImageSettings,
 } from './chatDoc';
@@ -58,7 +70,7 @@ import { useChatPersistence } from './useChatPersistence';
 // Re-exported so existing/external imports of these types from ChatStore keep
 // working unchanged after the FA-2 extraction into chatDoc.ts.
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
-export type { ChatUiMessage };
+export type { AttachMode, ChatUiMessage };
 
 // The image-settings presets (and the optionsOr helper that merges a per-model
 // fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
@@ -66,6 +78,7 @@ export type { ChatUiMessage };
 // surface is ChatStore.tsx / ChatSidebar.tsx -- Chat.tsx must not reach into
 // chatDoc.ts directly (arch.test.ts enforces this).
 export {
+  IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
   IMAGE_N_MAX,
   IMAGE_OUTPUT_FORMATS,
@@ -74,6 +87,15 @@ export {
   IMAGE_SIZE_OPTIONS,
   optionsOr,
 } from './chatDoc';
+
+// The per-message actions the transcript's rows are handed (handlersFor): the user
+// turn's edit, the assistant turn's regenerate, and -- on a generated image -- the
+// refine that makes it the source of the next edit.
+type MessageHandlers = {
+  onEdit: (text: string) => void;
+  onRegenerate: () => void;
+  onRefine: (url: string) => void;
+};
 
 export type ChatStore = {
   messages: ChatUiMessage[];
@@ -130,16 +152,29 @@ export type ChatStore = {
   // the reachable chatModels. False while it's temporarily unreachable — the
   // model stays selected/visible (see modelOptions) but sending is blocked.
   modelAvailable: boolean;
-  // Whether the effective model can process image attachments. Drives the
-  // chat's image-attach gate (button disabled, send blocked, images cleared
-  // on switch to a non-capable model).
+  // Whether the effective model can process image attachments as INPUT of a text
+  // turn. One of the flags attachMode (below) is derived from; the attach gate
+  // itself (button disabled, send blocked, images cleared on switch) reads
+  // attachMode, not this.
   modelVisionCapable: boolean;
   // Whether the effective model GENERATES images. Independent of
   // modelVisionCapable, which is whether it ACCEPTS them. Gates only what the
   // composer NEWLY OFFERS (the image-prompt affordances on an unpinned
-  // thread, and the attach button, which an image run has no use for) — never
-  // what an existing thread DOES: that is chatKind's job.
+  // thread) and feeds attachMode -- never what an existing thread DOES: that is
+  // chatKind's job.
   modelImageCapable: boolean;
+  // Whether the effective model may be the target of an image EDIT: the backend's
+  // derived, operator-removable `image_edit` (ModelOption.image_edit, folded like
+  // `image`), read as it is and never recomputed here -- the routing gate reads the
+  // same derivation, so the composer never offers an edit the gate would refuse.
+  // Independent of modelVisionCapable (an sd model edits and is vision:false).
+  modelImageEdit: boolean;
+  // What an attached image MEANS for the next send: 'edit' (the source of an image
+  // edit), 'vision' (an input a text model reads) or 'none' (not accepted). One
+  // predicate of chatKind and the model's flags (attachModeOf, chatDoc.ts) that
+  // the attach control, the clear on a model switch, send() and the replay guard
+  // all read. See ADR-043 (a), R1.
+  attachMode: AttachMode;
   // The per-model sd-server image options (samplers / schedulers / output
   // formats / size limits / batch ceiling / defaults) of the effective model,
   // fetched on demand while that model GENERATES images (api.modelImageOptions).
@@ -206,13 +241,43 @@ export type ChatStore = {
   setInput: Dispatch<SetStateAction<string>>;
   handleFiles: (fileList: FileList | null) => Promise<void>;
   removeImage: (index: number) => void;
+  // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
+  // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
+  // and it is dropped with its source or when the mode changes) and is sent as a
+  // part of the turn tagged as a mask (chatDoc.ts maskPart). Distinct from `images`,
+  // which are the sources.
+  mask: string | null;
+  handleMaskFile: (fileList: FileList | null) => Promise<void>;
+  removeMask: () => void;
+  // A counter the composer watches: it moves each time a refine seeds the composer,
+  // which is the view's cue to put the cursor in the prompt field (the user's next
+  // move is the instruction, and the composer may be far below the image they clicked).
+  // Only its CHANGE means anything; it is 0 until the first refine.
+  composerFocusRequest: number;
   setModel: Dispatch<SetStateAction<string>>;
   setSystemPrompt: Dispatch<SetStateAction<string>>;
   setTemperature: Dispatch<SetStateAction<number>>;
   setMaxTokens: Dispatch<SetStateAction<number>>;
   setSelectedTokenId: Dispatch<SetStateAction<string>>;
-  handlersFor: (id: string) => { onEdit: (text: string) => void; onRegenerate: () => void };
+  handlersFor: (id: string) => MessageHandlers;
 };
+
+// The user-facing sentence for a failed attachment: the reason an image could not be
+// prepared (type, size, or a decode failure -- or anything else, which is generic).
+function attachErrorText(err: unknown, t: Translation): string {
+  if (err instanceof ImageAttachError) {
+    switch (err.reason) {
+      case 'type':
+        return t.chatImageErrorType;
+      case 'size':
+        return t.chatImageErrorSize;
+      default:
+        // "decode" (or any future reason) -> generic
+        return t.chatImageError;
+    }
+  }
+  return t.chatImageError;
+}
 
 // Exported so tests can inject a store value directly (e.g. the Chat view)
 // without spinning up the full stream driver.
@@ -297,6 +362,8 @@ export function ChatStoreProvider({
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
+  const [mask, setMask] = useState<string | null>(null);
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [selectedTokenId, setSelectedTokenId] = useState<string>(DEFAULTS.run_as_token_id);
   const [serverOverride, setServerOverride] = useState<string>(DEFAULTS.server_override);
   const [serverOverrideForceUnreachable, setServerOverrideForceUnreachable] = useState<boolean>(
@@ -423,6 +490,11 @@ export function ChatStoreProvider({
   // them; the backend AND-aggregates both into ModelOption.
   const modelImageCapable =
     chatModels.find((option) => option.id === effectiveModel)?.image ?? false;
+  // Whether the effective model may be EDITED (ModelOption.image_edit, derived in
+  // the backend from `image` unless an operator opted out). Read as served: the
+  // gate and this flag are one derivation (routing.ImpliedImageEdit).
+  const modelImageEdit =
+    chatModels.find((option) => option.id === effectiveModel)?.image_edit ?? false;
 
   // The kind the NEXT send would pin, derived from the picked model. Only
   // ever consulted while the thread has no transcript at all (below), which
@@ -436,6 +508,14 @@ export function ChatStoreProvider({
   // currently-picked model is irrelevant; while it is still empty there is no
   // pin yet, so the composer shows what the next send would establish.
   const chatKind = messages.length > 0 ? pinnedChatKind : prospectiveKind;
+  // What an attached image means for the next send (see attachModeOf): derived
+  // from the thread's kind, so an attachment follows the THREAD, never merely the
+  // picked model.
+  const attachMode = attachModeOf(chatKind, {
+    vision: modelVisionCapable,
+    image: modelImageCapable,
+    imageEdit: modelImageEdit,
+  });
 
   // Refs mirror the latest state so the stable callbacks below (send / edit /
   // regenerate / save) can read current values without being re-created every
@@ -483,6 +563,13 @@ export function ChatStoreProvider({
   // above — an effect would lag by one passive-effect flush.
   const modelVisionCapableRef = useRef(modelVisionCapable);
   modelVisionCapableRef.current = modelVisionCapable;
+  // Likewise the attach predicate and the one capability its refusal wording needs
+  // (an image GENERATOR is told it takes no input, any other model that it cannot
+  // read one).
+  const modelImageCapableRef = useRef(modelImageCapable);
+  modelImageCapableRef.current = modelImageCapable;
+  const attachModeRef = useRef<AttachMode>(attachMode);
+  attachModeRef.current = attachMode;
   // Mirror the thread's kind so the stable send/edit/regenerate callbacks and
   // buildDoc (which read via refs, not props) always see the latest value.
   // Direct render-time assignment, like modelAvailableRef/modelVisionCapableRef
@@ -620,9 +707,7 @@ export function ChatStoreProvider({
 
   // Cache per-message callbacks so memoized ChatMessage children keep stable
   // prop references across re-renders.
-  const handlerCacheRef = useRef(
-    new Map<string, { onEdit: (text: string) => void; onRegenerate: () => void }>(),
-  );
+  const handlerCacheRef = useRef(new Map<string, MessageHandlers>());
 
   // Load a chat's content into the active state. Calls persistence's
   // skipNextSave so the resulting state changes do not trigger an immediate
@@ -684,6 +769,11 @@ export function ChatStoreProvider({
       messagesRef.current = seed;
       chatBuffers.set(chat.id, seed);
       handlerCacheRef.current.clear();
+      // A source seeded by a refine is a reference to a blob of the chat it was
+      // refined in, so it does not follow the user to another chat: sent there the run
+      // would be refused (images.blob_not_owned). An uploaded image is just bytes and
+      // goes where the composer goes, as it always did.
+      setImages((prev) => prev.filter((url) => !isChatBlobUrl(url)));
       setActiveChatId(chat.id);
       activeChatIdRef.current = chat.id;
       activeTitleRef.current = chat.title ?? '';
@@ -837,28 +927,37 @@ export function ChatStoreProvider({
 
   // Clear a composer attachment the (newly) effective model will not use —
   // e.g. switching from a vision-capable model to one that is not, with an
-  // image still attached. Runs whenever either capability flips; a no-op
-  // while there is nothing attached.
+  // image still attached. Runs whenever the attach predicate changes (it is
+  // derived from the thread's kind and the model's flags, see attachModeOf); a
+  // no-op while there is nothing attached.
   //
-  // The image-GENERATOR case is not the same refusal: such a model may well
-  // be vision-capable too, so the vision check below would let the attachment
-  // through — and the run would then drop it in silence, because an image
-  // run's request body is {model, prompt, response_format} with no history
-  // and no attachment at all. It is checked first, and says so in its own
-  // words.
+  // An attachment is cleared only when the new mode accepts NONE. Moving between
+  // 'vision' and 'edit' (an empty thread's kind follows the picked model, so
+  // picking an image model after attaching to a vision one) keeps it: it is the
+  // user's operand either way, and the server decides what it is from the thread.
+  // What a mode cannot take it refuses where it is used (send(), handleFiles).
+  //
+  // The image-GENERATOR case is not the same refusal as a plain non-vision
+  // model: such a model may well be vision-capable too, and a generator that
+  // cannot be edited (an operator's opt-out) takes no input at all -- an image
+  // run without a source is a generation, so the attachment would be dropped in
+  // silence. It says so in its own words.
   useEffect(() => {
-    if (images.length === 0) return;
-    if (modelImageCapable) {
-      setImages([]);
-      showError(t.chatImageGeneratorNoInput);
-      return;
-    }
-    if (!modelVisionCapable) {
-      setImages([]);
-      showError(t.chatImageModelUnsupported);
-    }
+    if (images.length === 0 || attachMode !== 'none') return;
+    setImages([]);
+    showError(modelImageCapable ? t.chatImageGeneratorNoInput : t.chatImageModelUnsupported);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelVisionCapable, modelImageCapable]);
+  }, [attachMode]);
+
+  // A mask is the mask OF an edit's source image, so it cannot outlive either: it
+  // goes when the source is removed (or sent) and when the attach mode is no longer
+  // 'edit' -- a text model reading the same image has no use for one. Nothing needs
+  // to be said: the strip it was in shows it gone, and the source's own clearing
+  // (above) already speaks when a model takes no image at all.
+  useEffect(() => {
+    if (mask === null) return;
+    if (attachMode !== 'edit' || images.length === 0) setMask(null);
+  }, [mask, attachMode, images.length]);
 
   // Reset a stale run-as selection: onRefresh reloads `tokens` after every
   // stream, and a chat may persist a run-as token that was later
@@ -969,16 +1068,39 @@ export function ChatStoreProvider({
       // generated image in a replayed history becomes a vision input just as a
       // user's upload does, and refusing it on a non-vision model is correct.
       //
-      // An IMAGE thread is exempt because its request body carries no history
-      // at all -- just {model, prompt, response_format} -- so there is no
-      // vision input to refuse. Without this exemption an image thread refused
-      // its own regenerate from the second turn onward, telling the user that a
-      // model whose only purpose is images does not support images.
-      if (
-        chatKindRef.current !== 'image' &&
-        !modelVisionCapableRef.current &&
-        historyHasImage(history)
-      ) {
+      // An IMAGE thread's request carries no history: the executor reads the
+      // LAST user message and nothing else, so an older image -- an earlier
+      // edit's source, any generated result -- is never sent and has nothing to
+      // refuse. Without that exemption an image thread refused its own
+      // regenerate from the second turn onward, telling the user that a model
+      // whose only purpose is images does not support images. The exemption
+      // stops exactly at the last user message, though: when IT carries an image
+      // the replayed turn is an EDIT (ADR-043 R1), and an edit needs a model the
+      // gateway will serve one for -- the same predicate that offered the attach
+      // control. Refused here, before any state is touched, rather than started
+      // and answered by the endpoint's own refusal after the transcript was
+      // truncated.
+      //
+      // An edit also needs its prompt, the same rule the composer holds at send():
+      // a replay whose last user message has an image but no text (an edit that
+      // blanks the prompt, or a turn the old composer stored without one) would be
+      // truncated, started, and then refused by the endpoint's images.prompt_required.
+      if (chatKindRef.current === 'image') {
+        if (lastUserHasImage(history)) {
+          if (attachModeRef.current !== 'edit') {
+            showErrorRef.current(
+              modelImageCapableRef.current
+                ? tRef.current.chatImageGeneratorNoInput
+                : tRef.current.chatImageModelUnsupported,
+            );
+            return;
+          }
+          if (lastUserText(history).trim() === '') {
+            showErrorRef.current(tRef.current.chatImageEditPromptRequired);
+            return;
+          }
+        }
+      } else if (!modelVisionCapableRef.current && historyHasImage(history)) {
         showErrorRef.current(tRef.current.chatImageModelUnsupported);
         return;
       }
@@ -1028,6 +1150,9 @@ export function ChatStoreProvider({
       const original = current[index];
       let content: ChatContent = text;
       if (Array.isArray(original.content)) {
+        // Every image part of the turn goes back as it was -- an image thread's edit
+        // turn keeps its source, and a masked edit its tagged mask part too (it is an
+        // image_url part like the source), in their original order.
         const attachedImages = original.content.filter((part) => part.type === 'image_url');
         content = [{ type: 'text', text }, ...attachedImages];
       }
@@ -1062,6 +1187,52 @@ export function ChatStoreProvider({
     [startRunWithHistory, isRunning],
   );
 
+  // Refine a generated image in place: seed the composer with it as the source of the
+  // next edit, BY REFERENCE. The url is the image part's own /api/portal/chat-blobs/{id}
+  // (an old chat's inline data url is the one other shape it can have), so the source
+  // part of the turn the user sends is that same string -- nothing is fetched, copied
+  // or re-embedded, and the transcript never grows by the image's bytes. The run's
+  // commit vets the reference like any other (it must be a blob of THIS chat), and the
+  // executor resolves it to bytes as it does a stored source (PrepareChatRun).
+  //
+  // It only SEEDS: an edit is the prompt applied to the image, so the user types the
+  // instruction and sends, and send() holds the prompt rule as it does for an upload.
+  // Nothing is started or stored here, and no mask is attached for them (the mask slot
+  // is theirs, as it is for any source).
+  //
+  // Same gates as the attach control and the replay guard, from the same predicate: an
+  // edit-capable model on an image thread (attachMode 'edit'), and no live run in this
+  // chat. The view offers the control only where both hold; this refuses the rest
+  // (a stale click, a model switched between render and click) in the same words.
+  // Scope is the generated result: an assistant turn's own image, by id and url, so a
+  // user turn's image or a url the turn does not hold is a no-op, not a source.
+  const refineImage = useCallback(
+    (id: string, url: string) => {
+      const chatId = activeChatIdRef.current;
+      if (!chatId) return;
+      const message = messagesRef.current.find((m) => m.id === id);
+      if (message?.role !== 'assistant' || !imageUrlsOf(message.content).includes(url)) return;
+      if (isRunning(chatId)) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return;
+      }
+      if (attachModeRef.current !== 'edit') {
+        showErrorRef.current(
+          modelImageCapableRef.current
+            ? tRef.current.chatImageGeneratorNoInput
+            : tRef.current.chatImageModelUnsupported,
+        );
+        return;
+      }
+      // An edit has ONE source, so the refined image takes the place of whatever was
+      // attached -- and of the mask drawn for that: it would not fit this image.
+      setImages([url]);
+      setMask(null);
+      setComposerFocusRequest((n) => n + 1);
+    },
+    [isRunning],
+  );
+
   const handlersFor = useCallback(
     (id: string) => {
       const cache = handlerCacheRef.current;
@@ -1070,12 +1241,13 @@ export function ChatStoreProvider({
         handlers = {
           onEdit: (text: string) => editUserMessage(id, text),
           onRegenerate: () => regenerate(id),
+          onRefine: (url: string) => refineImage(id, url),
         };
         cache.set(id, handlers);
       }
       return handlers;
     },
-    [editUserMessage, regenerate],
+    [editUserMessage, regenerate, refineImage],
   );
 
   // Send the composed message: append the optimistic user bubble, clear the
@@ -1095,9 +1267,30 @@ export function ChatStoreProvider({
     }
     const text = input.trim();
     if (!text && images.length === 0) return;
-    if (images.length > 0 && !modelVisionCapableRef.current) {
-      showErrorRef.current(tRef.current.chatImageModelUnsupported);
-      return;
+    if (images.length > 0) {
+      const mode = attachModeRef.current;
+      if (mode === 'none') {
+        showErrorRef.current(
+          modelImageCapableRef.current
+            ? tRef.current.chatImageGeneratorNoInput
+            : tRef.current.chatImageModelUnsupported,
+        );
+        return;
+      }
+      // An edit has one source image. (The picker takes one in this mode; this is
+      // the carry-over from a vision model that had several attached. Nothing is
+      // dropped: the user removes the extras and sends.)
+      if (mode === 'edit' && images.length > 1) {
+        showErrorRef.current(tRef.current.chatImageEditSingleSource);
+        return;
+      }
+      // An edit is the prompt applied to the image: without the prompt the endpoint
+      // answers images.prompt_required, but only after the turn was stored. Refused
+      // here instead, with the composer left as it is (the image stays attached).
+      if (mode === 'edit' && !text) {
+        showErrorRef.current(tRef.current.chatImageEditPromptRequired);
+        return;
+      }
     }
     // This send pins the thread's kind server-side when the thread is still
     // empty (PrepareChatRun accepts the client's kind only on a genuine first
@@ -1106,13 +1299,8 @@ export function ChatStoreProvider({
     // thread's kind comes from the pin rather than from the picked model.
     if (messagesRef.current.length === 0) setPinnedChatKind(chatKindRef.current);
 
-    let content: ChatContent = text;
-    if (images.length > 0) {
-      content = [
-        { type: 'text', text },
-        ...images.map((url) => ({ type: 'image_url' as const, image_url: { url } })),
-      ];
-    }
+    // The text, the attached source and -- for an edit -- the mask, tagged as one.
+    const content = userTurnContent(text, images, mask, attachModeRef.current);
     maybeAutoTitle(text);
     const userMessage: ChatUiMessage = { id: nextId(), role: 'user', content };
     const next = [...messagesRef.current, userMessage];
@@ -1121,6 +1309,7 @@ export function ChatStoreProvider({
     chatBuffers.set(chatId, next);
     setInput('');
     setImages([]);
+    setMask(null);
 
     try {
       const res = await apiRef.current.startChatRun(chatId, {
@@ -1332,40 +1521,75 @@ export function ChatStoreProvider({
 
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
+    // An image edit has ONE source image; every other attachment is capped at
+    // MAX_IMAGES. The cap follows the attach mode like everything else about the
+    // attachment does.
+    const limit = attachMode === 'edit' ? 1 : MAX_IMAGES;
     // Local running counter: the closed-over `images.length` is stale across the
     // awaits below, so a multi-file select would never trip the cap mid-batch.
     let count = images.length;
     let lastError = '';
     for (const file of Array.from(fileList)) {
-      if (count >= MAX_IMAGES) {
-        lastError = t.chatImageErrorCount;
+      if (count >= limit) {
+        lastError = limit === 1 ? t.chatImageEditSingleSource : t.chatImageErrorCount;
         break;
+      }
+      // The edit route of sd-server reads png and jpeg only. The picker offers just
+      // those (and HEIC/HEIF, which prepareImageDataUrl converts to JPEG, so what is
+      // attached -- and sent on -- is a JPEG), but `accept` is a hint a file dialog's
+      // "all files" (or a drop) does not honor, so the type is checked here too.
+      if (
+        attachMode === 'edit' &&
+        !IMAGE_EDIT_SOURCE_TYPES.includes(file.type.toLowerCase()) &&
+        !isHeicFile(file)
+      ) {
+        lastError = t.chatImageEditSourceType;
+        continue;
       }
       try {
         const url = await prepareImageDataUrl(file);
-        setImages((prev) => (prev.length >= MAX_IMAGES ? prev : [...prev, url]));
+        setImages((prev) => (prev.length >= limit ? prev : [...prev, url]));
         count += 1;
       } catch (err) {
-        if (err instanceof ImageAttachError) {
-          switch (err.reason) {
-            case 'type':
-              lastError = t.chatImageErrorType;
-              break;
-            case 'size':
-              lastError = t.chatImageErrorSize;
-              break;
-            default:
-              // "decode" (or any future reason) -> generic
-              lastError = t.chatImageError;
-          }
-        } else {
-          lastError = t.chatImageError;
-        }
+        lastError = attachErrorText(err, t);
       }
     }
     // Set one trailing error so a multi-file batch shows a single toast rather
     // than flickering per file (and no stale error survives a later success).
     if (lastError) showError(lastError);
+  }
+
+  const removeMask = useCallback(() => setMask(null), []);
+
+  // The mask slot of an edit: ONE PNG, and only beside a source image. It is sized to
+  // the source as it is actually sent (prepareMaskDataUrl: size cap, decode check, the
+  // source's own pixel size), NOT clamped to the 1568 px longest edge an uploaded
+  // source is downscaled to. The two sources differ: an upload is downscaled to that
+  // cap, but a refined image is sent by reference at its stored, natural size
+  // (1792x1024 is a size the composer offers), and the gateway refuses a mask that is
+  // not exactly the first source's size -- a clamped mask would never fit a refined
+  // image, and the user has no way to make one that does. A PNG stays a PNG, alpha
+  // included. The gateway checks the rest (a transparent region to edit, and the size
+  // of a mask that was not of the source's shape) and says so with images.mask_invalid.
+  async function handleMaskFile(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) return;
+    if (attachMode !== 'edit' || images.length === 0) {
+      showError(t.chatMaskNeedsSource);
+      return;
+    }
+    const file = fileList[0];
+    // The mask's alpha is the selection, so only a PNG can carry it (a jpeg has no
+    // alpha, a webp or gif would be refused by the gateway). `accept` is a hint, so
+    // the type is checked here too.
+    if (file.type.toLowerCase() !== 'image/png') {
+      showError(t.chatMaskErrorType);
+      return;
+    }
+    try {
+      setMask(await prepareMaskDataUrl(file, images[0]));
+    } catch (err) {
+      showError(attachErrorText(err, t));
+    }
   }
 
   const value: ChatStore = {
@@ -1397,6 +1621,8 @@ export function ChatStoreProvider({
     modelAvailable,
     modelVisionCapable,
     modelImageCapable,
+    modelImageEdit,
+    attachMode,
     modelImageOptions,
     chatKind,
     imageSettings,
@@ -1415,6 +1641,10 @@ export function ChatStoreProvider({
     setInput,
     handleFiles,
     removeImage,
+    mask,
+    handleMaskFile,
+    removeMask,
+    composerFocusRequest,
     setModel,
     setSystemPrompt,
     setTemperature,

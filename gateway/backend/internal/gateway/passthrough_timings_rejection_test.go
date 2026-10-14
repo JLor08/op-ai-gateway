@@ -59,7 +59,7 @@ func (p *rejectingProxyProvider) Complete(context.Context, routing.Target, infer
 	return provider.Response{}, provider.ErrUnavailable
 }
 
-func (p *rejectingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, _ string, body []byte) (*provider.ProxyResponse, error) {
+func (p *rejectingProxyProvider) ProxyNative(_ context.Context, _ routing.Target, _ string, body []byte, _ string) (*provider.ProxyResponse, error) {
 	p.proxyCalls++
 	p.gotBody = append([]byte(nil), body...)
 	return &provider.ProxyResponse{

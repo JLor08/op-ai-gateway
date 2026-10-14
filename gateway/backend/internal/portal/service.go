@@ -1279,6 +1279,17 @@ type ModelDTO struct {
 	// ACCEPTS them, and routing.CapabilityImage's doc comment is explicit that
 	// mapping one onto the other "fails far from its cause".
 	Image bool `json:"image"`
+	// ImageEdit is true only when EVERY offering mapping (or, for a group,
+	// every offerable member) derives the image-edit capability and would be
+	// served an edit (AND aggregation, fail-closed): the composer offers
+	// attaching a source image to an image model only when this is set. The
+	// per-mapping rule is routing.ImpliedImageEdit -- image:yes and no operator
+	// image_edit:no row -- the same function the routing gate and the
+	// unknown-model redirect read, so the composer never offers an edit the gate
+	// would refuse. The gate is a per-candidate any-of while this is an AND, so a
+	// model on one server that opted out and one that did not is served by the
+	// gate but advertised false here: the safe direction.
+	ImageEdit bool `json:"image_edit"`
 }
 
 type ServerOwnerDTO struct {
@@ -2409,16 +2420,18 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// fail-closed outage with no diagnostic trail unless it is
 				// logged. Every sibling best-effort read in this package
 				// logs for exactly that reason.
-				slog.Warn("portal: models-listing capability read failed; vision and image withheld for every model",
+				slog.Warn("portal: models-listing capability read failed; vision, image and image_edit withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
-			// The fold below asks each mapping exactly TWO capability questions
-			// (vision and image), so both rows are picked out here, keyed by
-			// mapping id, rather than by keying that mapping's whole row set by
+			// The fold below asks each mapping exactly TWO single-row capability
+			// questions (vision and image), so both rows are picked out here, keyed
+			// by mapping id, rather than by keying that mapping's whole row set by
 			// name inside the loop -- a map allocated per mapping to answer two
 			// lookups. A mapping with no such row is simply absent, which is
-			// what the fold reads as "not capable" (see below).
+			// what the fold reads as "not capable" (see below). The third question,
+			// image_edit, is DERIVED from two rows (see imageEditOn) and so reads
+			// the whole row set through routing.ImpliedImageEdit instead.
 			visionRows := capabilityRowsFor(capsByMapping, routing.CapabilityVision)
 			// The image flag is imageFlagsByName, the one image fold the
 			// unknown-model redirect asks too (ModelOffering.Capable). Unlike
@@ -2429,6 +2442,12 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// shared by the image fold and the flavor fold below.
 			idx := s.runtimeSpecIndexForViews(ctx, views)
 			imageOn := imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+			// image_edit is imageEditFlagsByName, the one edit fold the
+			// unknown-model redirect asks too. Unlike image it reads each
+			// mapping's WHOLE row set, not one picked row: the verdict is
+			// routing.ImpliedImageEdit (image:yes and no image_edit:no), the
+			// same function the routing gate reads.
+			imageEditOn := imageEditFlagsByName(views, capsByMapping, idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2562,13 +2581,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 						groupContext[e.Name] = minContext
 					}
 				}
-				// A group's vision and image flags are the AND of its offerable
-				// members' flags (same fail-closed rule as a plain model); an EMPTY
-				// offerable member set is false (fail-closed — never claim a
-				// capability on a group with nothing to serve it). Captured before
-				// suppression, mirroring groupOffered/groupContext.
+				// A group's vision, image and image_edit flags are the AND of its
+				// offerable members' flags (same fail-closed rule as a plain
+				// model); an EMPTY offerable member set is false (fail-closed —
+				// never claim a capability on a group with nothing to serve it).
+				// Captured before suppression, mirroring groupOffered/groupContext.
 				groupVision := groupCapabilityFlags(entries, visionOn)
 				groupImage := groupCapabilityFlags(entries, imageOn)
+				groupImageEdit := groupCapabilityFlags(entries, imageEditOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2605,6 +2625,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					visionOn[e.Name] = groupVision[e.Name]
 					imageOn[e.Name] = groupImage[e.Name]
+					imageEditOn[e.Name] = groupImageEdit[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2656,6 +2677,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := imageOn[rule.To]; ok {
 						imageOn[name] = v
 					}
+					if v, ok := imageEditOn[rule.To]; ok {
+						imageEditOn[name] = v
+					}
 					if _, ok := isGroup[rule.To]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -2690,6 +2714,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.ContextSize = contextSizeOn[id]
 				dto.Vision = visionOn[id]
 				dto.Image = imageOn[id]
+				dto.ImageEdit = imageEditOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -2740,6 +2765,41 @@ func capabilityRowsFor(capsByMapping map[string][]routing.CapabilityRow, capabil
 // Image is independent of vision: a generator that accepts no image input is
 // image=true, vision=false.
 func imageFlagsByName(views []mappingView, imageRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return imageRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesImages(view, idx)
+	})
+}
+
+// imageEditFlagsByName is THE image-edit fold, the sibling of imageFlagsByName:
+// per gateway model name among views, whether the composer may offer an edit
+// of it. It backs the listing's ModelDTO.ImageEdit and the unknown-model
+// redirect's ModelOffering.Capable for an edit, so the two cannot disagree.
+//
+// Each mapping's verdict is routing.ImpliedImageEdit over its WHOLE row set
+// (capsByMapping, keyed by mapping id) -- the one function the routing gate
+// reads too, so the composer never offers what the gate refuses. This fold is
+// not a second copy of that rule; do not inline it here. The edits endpoint
+// shares the openai_images flavor with generations, so a mapping must also
+// pass viewServesImages, exactly as the image fold requires.
+//
+// Fail-closed, and ANDed across a name's mappings like every capability fold
+// here: a name starts true on its first mapping and is only ever ANDed down.
+// That makes it STRICTER than the gate, which is a per-candidate any-of: a
+// model on one server that opted out of edit and one that did not is served
+// by the gate and advertised false here, the safe direction. A nil
+// capsByMapping (a failed capability read) folds every name to false.
+func imageEditFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return routing.ImpliedImageEdit(capsByMapping[view.mapping.ID]) && viewServesImages(view, idx)
+	})
+}
+
+// foldMappingFlags is the per-name AND shared by the image folds: for each
+// gateway model name among views, true only when ok holds for EVERY one of its
+// mappings. A name starts true on its first mapping and is only ever ANDed
+// down, never up, so the fold is fail-closed and a name with no mapping is
+// simply absent.
+func foldMappingFlags(views []mappingView, ok func(mappingView) bool) map[string]bool {
 	out := make(map[string]bool)
 	for _, view := range views {
 		name := view.mapping.GatewayModelName
@@ -2747,8 +2807,7 @@ func imageFlagsByName(views []mappingView, imageRows map[string]routing.Capabili
 		if !seen {
 			acc = true
 		}
-		out[name] = acc && imageRows[view.mapping.ID].Verdict == routing.CapabilityYes &&
-			viewServesImages(view, idx)
+		out[name] = acc && ok(view)
 	}
 	return out
 }

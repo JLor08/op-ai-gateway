@@ -193,6 +193,12 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="run-kind">{c.runKind ?? ''}</span>
       <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
+      <span data-testid="model-image-edit">{String(c.modelImageEdit)}</span>
+      <span data-testid="attach-mode">{c.attachMode}</span>
+      {/* The composer's attachment strip: the source image(s) and the mask, as the
+          urls the next send would carry. */}
+      <span data-testid="composer-images">{c.images.join('|')}</span>
+      <span data-testid="composer-mask">{c.mask ?? ''}</span>
       {/* The fetched per-model image options ("null" until/unless one arrives). */}
       <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
@@ -241,6 +247,28 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           </button>
           <button type="button" onClick={() => c.handlersFor(m.id).onEdit('edited text')}>
             edit-{m.id}
+          </button>
+          <button type="button" onClick={() => c.handlersFor(m.id).onEdit('  ')}>
+            edit-blank-{m.id}
+          </button>
+          {/* Refine: the first image part of the message (what ImageTurn hands the
+              handler for it), and a url that is none of the message's images. */}
+          <button
+            type="button"
+            onClick={() => {
+              const part = Array.isArray(m.content)
+                ? m.content.find((p) => p.type === 'image_url')
+                : undefined;
+              c.handlersFor(m.id).onRefine(part?.type === 'image_url' ? part.image_url.url : '');
+            }}
+          >
+            refine-{m.id}
+          </button>
+          <button
+            type="button"
+            onClick={() => c.handlersFor(m.id).onRefine('/api/portal/chat-blobs/blob_foreign')}
+          >
+            refine-foreign-{m.id}
           </button>
         </span>
       ))}
@@ -2307,6 +2335,723 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The run starts and no refusal toast appears.
       await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
       expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
+  });
+
+  // ADR-043 R1. ONE predicate of the THREAD's kind and the picked model decides
+  // what an attached image means -- an image the model reads (vision), a source
+  // the model edits (edit), or nothing -- and the attach control, the clear on a
+  // model switch and send() all read it. The kind decides first: a thread's
+  // attachments follow the thread, not whichever model is picked after it.
+  describe(`ChatStoreProvider attachMode [${locale}]`, () => {
+    const textVision: ModelOption = {
+      id: 'text-vision',
+      display_name: 'text-vision',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+    const textOnly: ModelOption = {
+      ...textVision,
+      id: 'text-only',
+      display_name: 'text-only',
+      vision: false,
+    };
+    const sdEdit: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const sdNoEdit: ModelOption = {
+      ...sdEdit,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const userTurn = { id: 'u1', role: 'user', content: 'hello' };
+    const asstTurn = { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' };
+
+    it.each([
+      // An unsent thread's kind follows the picked model (the next send pins it).
+      ['an empty thread, a vision text model', textVision, undefined, 'vision'],
+      ['an empty thread, a text model without vision', textOnly, undefined, 'none'],
+      ['an empty thread, an edit-capable image model', sdEdit, undefined, 'edit'],
+      [
+        'an empty thread, an edit-capable image model that is also vision',
+        { ...sdEdit, vision: true },
+        undefined,
+        'edit',
+      ],
+      ['an empty thread, an image model without image_edit', sdNoEdit, undefined, 'none'],
+      [
+        'an empty thread, an image model that is vision but cannot edit',
+        { ...sdNoEdit, vision: true },
+        undefined,
+        'none',
+      ],
+      // A pinned thread keeps its kind whatever model is picked.
+      ['an image thread, a vision text model', textVision, 'image', 'none'],
+      ['an image thread, an edit-capable image model', sdEdit, 'image', 'edit'],
+      ['an image thread, an image model without image_edit', sdNoEdit, 'image', 'none'],
+      ['a text thread, an edit-capable image model', sdEdit, '', 'none'],
+      [
+        'a text thread, an image model that is vision and edit-capable',
+        { ...sdEdit, vision: true },
+        '',
+        'none',
+      ],
+      ['a text thread, a vision text model', textVision, '', 'vision'],
+    ] as const)('is derived for %s', async (_name, model, pinnedKind, want) => {
+      const seeded = pinnedKind !== undefined;
+      chatApi = makeChatApi(
+        seeded
+          ? [
+              {
+                id: 'c1',
+                title: 'C1',
+                created_at: T,
+                updated_at: T,
+                content: {
+                  settings: { model: model.id, ...(pinnedKind ? { kind: pinnedKind } : {}) },
+                  messages: [userTurn, asstTurn],
+                },
+              },
+            ]
+          : [],
+      );
+      renderProvider([], { models: [model], altModelId: model.id });
+      await waitForReady();
+      if (!seeded) fireEvent.click(screen.getByRole('button', { name: 'set-model-alt' }));
+
+      expect(screen.getByTestId('attach-mode').textContent).toBe(want);
+      expect(screen.getByTestId('model-image-edit').textContent).toBe(
+        String(model.image_edit ?? false),
+      );
+    });
+  });
+
+  // The replay guard (startRunWithHistory) used to exempt an image thread
+  // outright, on the premise that an image run's request carries no history.
+  // That is false for an EDIT turn: its last user message carries the source.
+  // The exemption is now exactly that: older images (earlier sources, generated
+  // results) are never sent, so they never block; the replayed history's LAST
+  // user message is the turn's source, and an edit needs an edit-capable model.
+  describe(`ChatStoreProvider startRunWithHistory guard for an image thread's edit turn [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const noEditModel: ModelOption = {
+      ...editModel,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const textModel: ModelOption = {
+      id: 'text-model',
+      display_name: 'text-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+    };
+    const sourceRef = '/api/portal/chat-blobs/blob_source';
+    const resultRef = '/api/portal/chat-blobs/blob_result';
+    const editTurn = (id: string) => ({
+      id,
+      role: 'user',
+      content: [
+        { type: 'text', text: 'make it blue' },
+        { type: 'image_url', image_url: { url: sourceRef } },
+      ],
+    });
+    const resultTurn = (id: string) => ({
+      id,
+      role: 'assistant',
+      content: [{ type: 'image_url', image_url: { url: resultRef } }],
+      status: 'complete',
+    });
+    const seed = (model: ModelOption, messages: unknown[]): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: { settings: { model: model.id, kind: 'image' }, messages },
+      },
+    ];
+
+    it('regenerates an edit turn with an edit-capable model, replaying the source part untouched', async () => {
+      chatApi = makeChatApi(seed(editModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+        edited_history: { id: string; content: unknown }[];
+        settings: { kind: string };
+      };
+      expect(body.settings.kind).toBe('image');
+      expect(body.edited_history).toHaveLength(1);
+      // The source goes back as the same stored reference: no copy, no re-embed.
+      expect(body.edited_history[0].content).toEqual(editTurn('u1').content);
+    });
+
+    it('refuses to regenerate an edit turn once the model cannot edit, before touching the transcript', async () => {
+      chatApi = makeChatApi(seed(noEditModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [noEditModel] });
+      await waitForReady();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      // The generator's own sentence: it generates images and takes none as input.
+      expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // The truncation (which a debounced save would then PUT) did not happen.
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('refuses an edit turn on a model that is not an image model at all, with the input sentence', async () => {
+      chatApi = makeChatApi(seed(textModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [textModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatImageModelUnsupported)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+    });
+
+    it('still lets a generation turn regenerate on a model that cannot edit, older sources and results included', async () => {
+      // The exemption that remains: nothing OLDER than the last user message is
+      // ever sent, so an earlier edit's source and every generated result are
+      // history the guard has nothing to protect.
+      chatApi = makeChatApi(
+        seed(noEditModel, [
+          editTurn('u1'),
+          resultTurn('a1'),
+          { id: 'u2', role: 'user', content: 'a dog' },
+          resultTurn('a2'),
+        ]),
+      );
+      renderProvider([], { models: [noEditModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(screen.queryByText(t.chatImageGeneratorNoInput)).toBeNull();
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+    });
+
+    it('checks a regenerate against the replayed history, not the whole transcript', async () => {
+      chatApi = makeChatApi(
+        seed(noEditModel, [
+          { id: 'u1', role: 'user', content: 'a cat' },
+          resultTurn('a1'),
+          editTurn('u2'),
+          resultTurn('a2'),
+        ]),
+      );
+      renderProvider([], { models: [noEditModel] });
+      await waitForReady();
+
+      // Truncation drops the later turn's source: this replay is a plain generation.
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+    });
+
+    it('editing an edit turn keeps its source image and replaces only the prompt text', async () => {
+      chatApi = makeChatApi(seed(editModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+        edited_history: { id: string; content: unknown }[];
+      };
+      expect(body.edited_history).toHaveLength(1);
+      expect(body.edited_history[0].id).toBe('u1');
+      expect(body.edited_history[0].content).toEqual([
+        { type: 'text', text: 'edited text' },
+        { type: 'image_url', image_url: { url: sourceRef } },
+      ]);
+    });
+
+    it('refuses an edit of an edit turn on a model that cannot edit, leaving the transcript alone', async () => {
+      chatApi = makeChatApi(seed(noEditModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [noEditModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+      expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    // A masked edit (inpainting): the mask is a tagged image part of the same user
+    // message and replays exactly as the source does -- an edit of the prompt keeps
+    // it, a regenerate sends it untouched, the guard treats the pair as the edit it
+    // is -- while a message holding a mask and NO source is no edit at all.
+    describe('a masked edit', () => {
+      const maskRef = '/api/portal/chat-blobs/blob_mask';
+      const maskedTurn = (id: string) => ({
+        id,
+        role: 'user',
+        content: [
+          { type: 'text', text: 'fill the sky' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+          { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+        ],
+      });
+
+      it('regenerates with the mask part replayed untouched, tag and reference included', async () => {
+        chatApi = makeChatApi(seed(editModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          edited_history: { id: string; content: unknown }[];
+        };
+        expect(body.edited_history).toHaveLength(1);
+        expect(body.edited_history[0].content).toStrictEqual(maskedTurn('u1').content);
+      });
+
+      it('keeps the source and the mask when only the prompt text of the turn is edited', async () => {
+        chatApi = makeChatApi(seed(editModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          edited_history: { id: string; content: unknown }[];
+        };
+        expect(body.edited_history[0].content).toStrictEqual([
+          { type: 'text', text: 'edited text' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+          { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+        ]);
+      });
+
+      it('is refused as the edit it is on a model that cannot edit, before the transcript is touched', async () => {
+        chatApi = makeChatApi(seed(noEditModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('2');
+      });
+
+      it('is no edit without its source: a message holding only a mask replays as a plain generation', async () => {
+        const maskOnly = {
+          id: 'u1',
+          role: 'user',
+          content: [
+            { type: 'text', text: 'a cat' },
+            { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+          ],
+        };
+        chatApi = makeChatApi(seed(noEditModel, [maskOnly, resultTurn('a1')]));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        // Not refused as an edit (a generator that cannot be edited may still
+        // generate): the executor ignores a mask that has no source.
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(screen.queryByText(t.chatImageGeneratorNoInput)).toBeNull();
+      });
+    });
+
+    // The prompt rule of the composer (an edit needs one) holds on the replay
+    // paths too: an edit that blanks the prompt of an edit turn, or a regenerate of
+    // an edit turn that was stored without one (the old composer allowed that),
+    // would be truncated, started and then answered images.prompt_required.
+    it('refuses to blank the prompt of an edit turn, before touching the transcript', async () => {
+      chatApi = makeChatApi(seed(editModel, [editTurn('u1'), resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'edit-blank-u1' }));
+
+      expect(await screen.findByText(t.chatImageEditPromptRequired)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('refuses to regenerate an edit turn that was stored without a prompt', async () => {
+      const promptless = {
+        id: 'u1',
+        role: 'user',
+        content: [
+          { type: 'text', text: '' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+        ],
+      };
+      chatApi = makeChatApi(seed(editModel, [promptless, resultTurn('a1')]));
+      renderProvider([], { models: [editModel] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatImageEditPromptRequired)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+  });
+
+  // Iterative refine (ADR-043 R1): a generated image of an image thread can be the
+  // source of the next edit. The action seeds the composer with the image's EXISTING
+  // /chat-blobs/{id} reference -- no copy, no re-embed, so the transcript never grows
+  // by the image's bytes -- and the user types the instruction and sends; the turn is
+  // an ordinary edit turn from there (the composer gate, the prompt rule, the replay
+  // handling all apply as they do to an uploaded source).
+  describe(`ChatStoreProvider refine a generated image in place [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const noEditModel: ModelOption = {
+      ...editModel,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const textVisionModel: ModelOption = {
+      id: 'text-vision',
+      display_name: 'text-vision',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+    const resultRef = '/api/portal/chat-blobs/blob_result';
+    const resultTwoRef = '/api/portal/chat-blobs/blob_result_two';
+    const uploadedRef = '/api/portal/chat-blobs/blob_upload';
+    const generated = (id: string, url: string) => ({
+      id,
+      role: 'assistant',
+      content: [{ type: 'image_url', image_url: { url } }],
+      status: 'complete',
+    });
+    // A refine turn as the composer sends it and the server stores it: the prompt, and
+    // the source -- the SAME reference the assistant turn before it holds.
+    const refineTurn = (id: string, url: string, text = 'make the sky purple') => ({
+      id,
+      role: 'user',
+      content: [
+        { type: 'text', text },
+        { type: 'image_url', image_url: { url } },
+      ],
+    });
+    const thread = (model: ModelOption, kind: string, msgs: unknown[]): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: { settings: { model: model.id, ...(kind ? { kind } : {}) }, messages: msgs },
+      },
+    ];
+    const generation = () => [
+      { id: 'u1', role: 'user', content: 'a lighthouse' },
+      generated('a1', resultRef),
+    ];
+    const startBody = () =>
+      chatApi.spies.startChatRun.mock.calls[0][1] as {
+        user_message?: unknown;
+        edited_history?: { id: string; content: unknown }[];
+        settings: { kind: string };
+      };
+
+    describe('the action', () => {
+      it("seeds the composer with the image's own stored reference and starts no run", async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', generation()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        // The reference itself, string for string -- not fetched, not re-encoded.
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultRef);
+        // Nothing was sent or stored yet: the user still has to say what to change.
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('2');
+        // No mask is attached for the user: that is theirs to add.
+        expect(screen.getByTestId('composer-mask').textContent).toBe('');
+      });
+
+      it('sends the refine turn as an edit whose source is that same reference, embedding nothing', async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', generation()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+        fireEvent.change(screen.getByLabelText('probe-input'), {
+          target: { value: 'make the sky purple' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = startBody();
+        expect(body.settings.kind).toBe('image');
+        // The source part is the assistant image's own url: the reference is reused.
+        expect(body.user_message).toStrictEqual([
+          { type: 'text', text: 'make the sky purple' },
+          { type: 'image_url', image_url: { url: resultRef } },
+        ]);
+        // ...and no image bytes ride the request: the transcript does not grow by the
+        // image (the point of storing images out of it).
+        expect(JSON.stringify(body)).not.toContain('data:');
+        // The optimistic turn shows the same reference, after the generation turn.
+        expect(screen.getByTestId('count').textContent).toBe('3');
+        expect(screen.getByTestId('last-parts').textContent).toBe(
+          `text:make the sky purple|image_url:${resultRef}`,
+        );
+        // The strip is spent, like any send's.
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+
+      it("seeds an old chat's inline result as it is: it has no reference to reuse, so it goes out as any upload does", async () => {
+        // Before images were stored out of the transcript a result was an inline data
+        // url (and such a thread migrates on its next run). It is the only handle that
+        // image has, so it is taken verbatim; the commit stores it like an upload.
+        const inline = 'data:image/png;base64,AAAA';
+        chatApi = makeChatApi(
+          thread(editModel, 'image', [
+            { id: 'u1', role: 'user', content: 'a lighthouse' },
+            generated('a1', inline),
+          ]),
+        );
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        expect(screen.getByTestId('composer-images').textContent).toBe(inline);
+      });
+
+      it('keeps the prompt rule of an edit: a refine without an instruction is not sent', async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', generation()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+        expect(await screen.findByText(t.chatImageEditPromptRequired)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        // The image stays attached: the user types the instruction and sends again.
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultRef);
+        expect(screen.getByTestId('count').textContent).toBe('2');
+      });
+
+      it('replaces a source seeded earlier: an edit has one source, so a second refine swaps it', async () => {
+        chatApi = makeChatApi(
+          thread(editModel, 'image', [
+            ...generation(),
+            refineTurn('u2', resultRef),
+            generated('a2', resultTwoRef),
+          ]),
+        );
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultRef);
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a2' }));
+
+        // The newer result replaced the older one: one source, never two.
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultTwoRef);
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a2' }));
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultTwoRef);
+      });
+    });
+
+    describe('where it is allowed', () => {
+      it('refuses on a thread whose model cannot be edited, seeding nothing', async () => {
+        chatApi = makeChatApi(thread(noEditModel, 'image', generation()));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      });
+
+      it('refuses when the model of the thread is not an image model at all', async () => {
+        chatApi = makeChatApi(thread(textVisionModel, 'image', generation()));
+        renderProvider([], { models: [textVisionModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        expect(await screen.findByText(t.chatImageModelUnsupported)).toBeTruthy();
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+
+      it('never seeds a text thread, even with an edit-capable model picked', async () => {
+        // A text thread stays a text thread whichever model is picked afterwards
+        // (attachMode follows the thread's kind): there is nothing to refine in one.
+        chatApi = makeChatApi(thread(editModel, '', generation()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+        expect(screen.getByTestId('attach-mode').textContent).toBe('none');
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+
+      it('is for a generated result only: an image of a user turn and a url the message does not hold seed nothing', async () => {
+        chatApi = makeChatApi(
+          thread(editModel, 'image', [
+            { id: 'u0', role: 'user', content: 'a cat' },
+            generated('a0', resultRef),
+            refineTurn('u1', uploadedRef),
+            generated('a1', resultTwoRef),
+          ]),
+        );
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        // The user's own image (the source of an earlier edit): out of scope.
+        fireEvent.click(screen.getByRole('button', { name: 'refine-u1' }));
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+        // A url that is not one of THAT message's images (a stale or foreign one).
+        fireEvent.click(screen.getByRole('button', { name: 'refine-foreign-a1' }));
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+
+      it('refuses while this chat has a live run, like edit and regenerate do', async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', generation()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'a dog' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+
+        expect(await screen.findByText(t.chatBusy)).toBeTruthy();
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+
+      it('does not carry the reference into another chat: it names a blob of THIS one', async () => {
+        const rows = thread(editModel, 'image', generation());
+        rows.push({
+          id: 'c2',
+          title: 'C2',
+          created_at: T1,
+          updated_at: T1,
+          content: { settings: { model: editModel.id, kind: 'image' }, messages: [] },
+        });
+        chatApi = makeChatApi(rows);
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'refine-a1' }));
+        expect(screen.getByTestId('composer-images').textContent).toBe(resultRef);
+
+        fireEvent.click(screen.getByRole('button', { name: 'select-c2' }));
+        await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c2'));
+
+        // Sent there it would be refused (images.blob_not_owned): the chat-bound
+        // reference is dropped with the chat it belongs to.
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+      });
+    });
+
+    // A refine turn, once sent, is an ordinary edit turn: the replay handling of the
+    // edit turn (replay guard, source part kept on an edit of the prompt) covers it.
+    // What is special about it is only that its source is the very reference an earlier
+    // assistant turn holds -- which the replay must send back untouched, never inline.
+    describe('replaying a refine turn', () => {
+      const refined = () => [
+        ...generation(),
+        refineTurn('u2', resultRef),
+        generated('a2', resultTwoRef),
+      ];
+
+      it('regenerates it with the source part sent back as the same reference', async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', refined()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = startBody();
+        expect(body.settings.kind).toBe('image');
+        expect(body.edited_history?.map((m) => m.id)).toEqual(['u1', 'a1', 'u2']);
+        expect(body.edited_history?.[2].content).toStrictEqual(refineTurn('u2', resultRef).content);
+        expect(JSON.stringify(body)).not.toContain('data:');
+      });
+
+      it('keeps the source when only the instruction of the turn is edited', async () => {
+        chatApi = makeChatApi(thread(editModel, 'image', refined()));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'edit-u2' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = startBody();
+        expect(body.edited_history?.map((m) => m.id)).toEqual(['u1', 'a1', 'u2']);
+        expect(body.edited_history?.[2].content).toStrictEqual([
+          { type: 'text', text: 'edited text' },
+          { type: 'image_url', image_url: { url: resultRef } },
+        ]);
+      });
+
+      it('refuses the replay of it once the model cannot edit, before the transcript is touched', async () => {
+        chatApi = makeChatApi(thread(noEditModel, 'image', refined()));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+
+        expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('4');
+      });
+
+      it('regenerates the generation BEFORE it as a plain generation, dropping the refine turn', async () => {
+        chatApi = makeChatApi(thread(noEditModel, 'image', refined()));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startBody().edited_history?.map((m) => m.id)).toEqual(['u1']);
+        expect(screen.queryByText(t.chatImageGeneratorNoInput)).toBeNull();
+      });
     });
   });
 

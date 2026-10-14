@@ -12,16 +12,16 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations` only) |
+| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations` and `/v1/images/edits` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
 token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`
-(and its `/openai/v1/` alias) accepts **either** the internal trusted-loopback
-pair **or** a bearer token, but never a portal session cookie: it is reachable
-by the gateway's own background executor over loopback, never by a logged-in
-browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
+and `/v1/images/edits` (and their `/openai/v1/` aliases) accept **either** the
+internal trusted-loopback pair **or** a bearer token, but never a portal session
+cookie: they are reachable by the gateway's own background executor over
+loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
 `internal/gateway/auth_internal_or_bearer.go`). Every remaining inference
 endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
 `/v0/models`, `/openai/v1/models`, `/anthropic/v1/models` model-listing
@@ -146,9 +146,10 @@ the caller is already a CSRF-protected authenticated session, so this header
 is a capability *selector*, not a credential) on the requests handled by
 `handleOpenAIChat` — `/v1/chat/completions` (the path the loopback run
 executor actually posts to) and its `/openai/` alias — **and, since the portal
-gained image turns, on `/v1/images/generations` and its `/openai/` alias
-too**: `handleOpenAIImages` (`internal/gateway/images_handler.go`) carries the
-identical block, guarded the identical way, so an image turn started under a
+gained image turns, on `/v1/images/generations`, `/v1/images/edits` and their
+`/openai/` aliases too**: `handleOpenAIImages` (`internal/gateway/images_handler.go`)
+and `handleOpenAIImagesEdit` (`images_edit_handler.go`) carry the identical
+block, guarded the identical way, so an image turn started under a
 run-as token bills, captures and routes under that token rather than under the
 bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
 shows both edges into `AuthorizeRunAsToken`; do not read this section as
@@ -243,7 +244,7 @@ flowchart TD
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
-    D -- "/v1/images/generations\n(/openai/v1/... alias)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    D -- "/v1/images/generations, /v1/images/edits\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
     R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
     R -- no --> T{"Authorization: Bearer present?"}
     T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
@@ -257,9 +258,9 @@ flowchart TD
     Q -- pass --> L
 ```
 
-Note that `/v1/images/generations` resolves its principal through
-`authenticateInternalOrBearer` (`auth_internal_or_bearer.go`) rather than
-through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
+Note that `/v1/images/generations` and `/v1/images/edits` resolve their
+principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
+rather than through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
 duplicated: both entry points call the same `loopbackPrincipal`
 (`internal/gateway/auth.go`), so the constant-time secret comparison and its
 fail-closed conditions (no configured secret, no user lookup, unknown user)
@@ -920,6 +921,25 @@ Bodies are independently size-capped: `OP_AI_GATEWAY_CAPTURE_MAX_BYTES`
 unrelated ceiling on the *total* size of the in-memory capture/chat store
 used only by the `memory` storage driver.
 
+A `multipart/form-data` **request** body — an image edit,
+`POST /v1/images/edits` — is binary and is not stored as bytes: the
+envelope holds the body as a string that is then JSON-marshalled, which
+would turn every invalid UTF-8 byte into U+FFFD and clip a file mid-way.
+The stored request body is instead a JSON summary
+(`buildCaptureEnvelope` → `summarizeMultipartBody`,
+`internal/gateway/capture_multipart.go`) of the form: each part's name,
+file name, content type and size; the **value** of each text field (the
+prompt, the model, the `<sd_cpp_extra_args>` block), cut on a rune boundary
+to the same `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` budget (`truncated` is set
+when it bites); and `"redacted": true` in place of the content of every
+file part — the source image(s) and the mask are never captured, and a part
+that merely *claims* to be a text field but is not valid UTF-8 is redacted
+too. It fails closed: a body whose Content-Type names no boundary, or that
+breaks off part-way, is summarised with an `error` and the parts read so
+far, never stored raw. Header redaction is unchanged, and the captured
+request is still the **client's** form, not the rebuilt one the upstream was
+sent (a mask conversion or a model-name rewrite changes the latter).
+
 The resulting envelope is gzip-compressed, then — following the scheme in
 [§13](#13-secrets-at-rest) — sealed with the capture cipher when one is
 configured (`KeyVersion` 1), or stored as plain gzip bytes when running the
@@ -953,7 +973,12 @@ document cap and the 5 MiB request cap are unchanged.
 `/v1/images/generations` read their body with no `MaxBytesReader` limit at all,
 matching the reality that a chat/completions request can legitimately carry
 large base64-encoded image data. The body is still fully buffered into memory — "uncapped" means no
-*size* ceiling, not streamed processing.
+*size* ceiling, not streamed processing. The one exception is
+`/v1/images/edits`: its `multipart/form-data` body is held whole and capped by
+`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES` (default 32 MiB, `413
+request.body_too_large`), and re-checked against the agent router's own 32 MiB
+after the gateway has prepared it
+([ADR-009](../09-architecture-decisions.md#adr-009--no-body-size-cap-on-inference-1-mib-on-control-plane)).
 
 **Streaming idle watchdog.** A streamed inference response
 (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, default 120s; `0` disables it and

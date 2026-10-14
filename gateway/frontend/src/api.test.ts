@@ -55,6 +55,32 @@ describe('portal api', () => {
     expect(result).toEqual(options);
   });
 
+  it('carries the backend-folded image_edit flag on a model option, independent of image', async () => {
+    // ModelDTO.image_edit is derived and folded in the backend (image:yes and no
+    // operator opt-out, ANDed across a model's mappings), so the client never
+    // recomputes it. It travels beside `image`, not instead of it: an operator's
+    // opt-out lowers image_edit and leaves image true.
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: 'sd-turbo', image: true, image_edit: true },
+            { id: 'sd-no-edit', image: true, image_edit: false },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    const { data } = await api.models();
+
+    expect(data.map((m) => [m.id, m.image, m.image_edit])).toEqual([
+      ['sd-turbo', true, true],
+      ['sd-no-edit', true, false],
+    ]);
+  });
+
   it('sends the CSRF header on mutating requests', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(

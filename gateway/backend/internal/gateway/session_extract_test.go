@@ -108,6 +108,15 @@ func TestExtractClientSession(t *testing.T) {
 			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
 			wantID: "", wantSource: "",
 		},
+		{
+			// The edits endpoint is the same story as images (see the case above):
+			// it takes the same explicit "no signal" cases, so none of the other
+			// endpoints' signals may leak into it.
+			name: "images edit: every other endpoint's signal present -> still empty", endpoint: endpointImagesEdit,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

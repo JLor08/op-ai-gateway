@@ -58,6 +58,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(images[0]).toHaveAttribute('src', 'data:image/png;base64,AAAA');
     });
 
+    it('shows the mask of a masked edit apart from the attached image, under its own name', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="user"
+          content={[
+            { type: 'text', text: 'fill the sky' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,SRC' } },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,MASK' },
+              purpose: 'mask',
+            },
+          ]}
+        />,
+      );
+      const attached = screen.getAllByAltText(t.chatAttachedImage);
+      expect(attached).toHaveLength(1);
+      expect(attached[0]).toHaveAttribute('src', 'data:image/png;base64,SRC');
+      const masks = screen.getAllByAltText(t.chatAttachedMask);
+      expect(masks).toHaveLength(1);
+      expect(masks[0]).toHaveAttribute('src', 'data:image/png;base64,MASK');
+    });
+
     it('saves an edited user message', () => {
       const onEdit = vi.fn();
       render(<ChatMessage t={t} role="user" content="original" onEdit={onEdit} />);
@@ -287,6 +311,58 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // billed quantity from the response because a partial failure makes n and
       // data[] differ.
       expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+    });
+
+    describe('refining a generated image', () => {
+      const first = '/api/portal/chat-blobs/blob_first';
+      const second = '/api/portal/chat-blobs/blob_second';
+      const twoImages = [
+        { type: 'image_url' as const, image_url: { url: first } },
+        { type: 'image_url' as const, image_url: { url: second } },
+      ];
+
+      it("offers one refine control per image, handing over that image's own url", () => {
+        const onRefine = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            promptText="two cats"
+            content={twoImages}
+            onRefine={onRefine}
+          />,
+        );
+
+        const buttons = screen.getAllByRole('button', { name: t.chatRefineImage });
+        expect(buttons).toHaveLength(2);
+        fireEvent.click(buttons[1]);
+        expect(onRefine).toHaveBeenCalledTimes(1);
+        expect(onRefine).toHaveBeenLastCalledWith(second);
+        fireEvent.click(buttons[0]);
+        expect(onRefine).toHaveBeenLastCalledWith(first);
+      });
+
+      it('offers none unless the store allows it: the default is no control', () => {
+        render(<ChatMessage t={t} role="assistant" content={twoImages} />);
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+        // The download control is unaffected.
+        expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+      });
+
+      it('never puts one on an image of a user turn, whatever is passed', () => {
+        render(
+          <ChatMessage t={t} role="user" content={twoImages} onEdit={vi.fn()} onRefine={vi.fn()} />,
+        );
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+      });
+
+      it('has no control on a message without an image', () => {
+        render(<ChatMessage t={t} role="assistant" content="just words" onRefine={vi.fn()} />);
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+      });
     });
 
     it('renders a revised prompt as ordinary text beside the image', () => {

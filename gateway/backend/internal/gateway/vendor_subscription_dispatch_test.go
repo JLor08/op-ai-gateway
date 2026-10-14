@@ -409,7 +409,7 @@ func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
 	if path, mode := endpointModeFor(sub, "openai_responses"); path != "/responses" || mode != routing.EndpointModePassthrough {
 		t.Fatalf("endpointModeFor(openai subscription) = (%q, %q), want (/responses, passthrough)", path, mode)
 	}
-	if got := upstreamPath(sub, "openai_responses"); got != "/responses" {
+	if got := upstreamPath(sub, "openai_responses", endpointResponses); got != "/responses" {
 		t.Fatalf("upstreamPath(openai subscription) = %q, want /responses", got)
 	}
 
@@ -427,7 +427,7 @@ func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
 	if path, mode := endpointModeFor(apiKey, "openai_responses"); path != "/v1/responses" || mode != routing.EndpointModePassthrough {
 		t.Fatalf("endpointModeFor(api-key openai vendor) = (%q, %q), want (/v1/responses, passthrough)", path, mode)
 	}
-	if got := upstreamPath(apiKey, "openai_responses"); got != "/v1/responses" {
+	if got := upstreamPath(apiKey, "openai_responses", endpointResponses); got != "/v1/responses" {
 		t.Fatalf("upstreamPath(api-key openai vendor) = %q, want /v1/responses (passthrough, not the chat-completions translate path)", got)
 	}
 
@@ -440,7 +440,7 @@ func TestEndpointModeForOpenAISubscriptionResponsesPath(t *testing.T) {
 	if chat.ResponsesMode != "" {
 		t.Fatalf("api-key openai vendor + chat: ResponsesMode = %q, want zero (translate)", chat.ResponsesMode)
 	}
-	if got := upstreamPath(chat, "openai_chat_completions"); got != "/v1/chat/completions" {
+	if got := upstreamPath(chat, "openai_chat_completions", endpointChat); got != "/v1/chat/completions" {
 		t.Fatalf("upstreamPath(api-key openai vendor, chat) = %q, want /v1/chat/completions (translate)", got)
 	}
 
@@ -470,9 +470,9 @@ func TestOpenAISubscriptionDispatchAttachesBearerAccountIDAndHeaders(t *testing.
 	// Build the upstream request exactly as proxyNative would: the real path seam
 	// and the real model rewrite, so this exercises production code, not a fixture.
 	ctx := s.upstreamAuthCtx(context.Background(), target)
-	path := upstreamPath(target, "openai_responses")
+	path := upstreamPath(target, "openai_responses", endpointResponses)
 	upstreamBody := rewriteModelField([]byte(openAIResponsesBody), target.ProviderModel)
-	resp, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody)
+	resp, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, path, upstreamBody, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestOpenAISubscriptionDispatchRefreshesResealsAndPersists(t *testing.T) {
 	target := openAISubscriptionTarget("acc_sub_oai", stub.srv.URL)
 
 	ctx := s.upstreamAuthCtx(context.Background(), target)
-	if _, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses"), []byte(openAIResponsesBody)); err != nil {
+	if _, err := provider.NewOpenAIResponsesClient(stub.srv.Client()).ProxyNative(ctx, target, upstreamPath(target, "openai_responses", endpointResponses), []byte(openAIResponsesBody), "application/json"); err != nil {
 		t.Fatalf("ProxyNative: %v", err)
 	}
 

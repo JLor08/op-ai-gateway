@@ -348,6 +348,95 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(submitted[0]).not.toHaveProperty('capability_verdicts');
     });
 
+    // image_edit is the operator's OPT-OUT from a capability the gateway derives
+    // from image (image:yes and no image_edit:no row). `unknown` therefore means
+    // "derived from image" and `no` is the opt-out; `yes` is inert (the gate
+    // derives it), so it is not a choice. This is the mirror image of the image
+    // control above, which offers yes but never no.
+    it('offers unknown and no for image_edit, and never yes -- the gate derives it', async () => {
+      renderForm({ row: makeMapping({ capabilities: [] }) });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.mappingImageEdit }));
+      expect(
+        await screen.findByRole('option', { name: t.mappingCapabilityUnknown }),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: t.mappingCapabilityNo })).toBeInTheDocument();
+      expect(
+        screen.queryByRole('option', { name: t.mappingCapabilityYes }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('sends the image_edit opt-out and nothing for image when moved to no', async () => {
+      const { submitted } = renderForm({
+        row: makeMapping({ capabilities: [capRow('image', 'yes')] }),
+      });
+      await pickOption(t.mappingImageEdit, t.mappingCapabilityNo);
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      // Only the control that moved is sent: the opt-out removes edit, it never
+      // touches the image verdict beside it.
+      expect(submitted[0].capability_verdicts).toEqual({ image_edit: 'no' });
+    });
+
+    it('seeds image_edit from the capability ROW and resets it with an empty verdict', async () => {
+      const { submitted } = renderForm({
+        row: makeMapping({ capabilities: [capRow('image', 'yes'), capRow('image_edit', 'no')] }),
+      });
+      expect(screen.getByRole('combobox', { name: t.mappingImageEdit }).textContent).toBe(
+        t.mappingCapabilityNo,
+      );
+      await pickOption(t.mappingImageEdit, t.mappingCapabilityUnknown);
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      // '' deletes the row, which is how the opt-out is taken back: the mapping
+      // derives edit from image again.
+      expect(submitted[0].capability_verdicts).toEqual({ image_edit: '' });
+    });
+
+    it('sends nothing for an untouched image_edit control', async () => {
+      const { submitted } = renderForm({
+        row: makeMapping({ capabilities: [capRow('image_edit', 'no')] }),
+      });
+      await save();
+
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      // Re-stating a verdict the form merely READ would launder it into a fresh
+      // manual row; an untouched control contributes no entry.
+      expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+    });
+
+    it('shows an image_edit unknown hint of its own, and only while it is unknown', async () => {
+      renderForm({ row: makeMapping({ capabilities: [] }) });
+      expect(screen.getByText(t.mappingImageEditUnknownHint)).toBeInTheDocument();
+      // The edit hint says "derived from image"; it must not be mistaken for the
+      // image control's own detection text.
+      expect(t.mappingImageEditUnknownHint).not.toBe(t.mappingImageCapableUnknownHint);
+      cleanup();
+      renderForm({ row: makeMapping({ capabilities: [capRow('image_edit', 'no')] }) });
+      expect(screen.queryByText(t.mappingImageEditUnknownHint)).not.toBeInTheDocument();
+    });
+
+    it('shows a stored inert image_edit yes without offering it as a pick', async () => {
+      // A yes row can exist (the vocabulary is open) but adds nothing: the gate
+      // derives it. The control must SHOW it -- a Select whose value has no
+      // option renders blank, which reads as nothing on file -- while never
+      // offering yes as a choice. Moving it to unknown deletes the row.
+      const { submitted } = renderForm({
+        row: makeMapping({ capabilities: [capRow('image_edit', 'yes')] }),
+      });
+      const combo = screen.getByRole('combobox', { name: t.mappingImageEdit });
+      expect(combo.textContent).toBe(t.mappingCapabilityYes);
+      fireEvent.mouseDown(combo);
+      const yes = await screen.findByRole('option', { name: t.mappingCapabilityYes });
+      expect(yes).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      await save();
+      await waitFor(() => expect(submitted).toHaveLength(1));
+      expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+    });
+
     it('leaves metrics_locked a CHECKBOX', () => {
       // A policy flag over the numeric metrics, not a capability -- ADR-039 is
       // explicit that it does not guard the capability table any more, so it

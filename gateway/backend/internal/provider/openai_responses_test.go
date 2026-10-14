@@ -404,7 +404,7 @@ func TestOpenAIResponsesClientProxyNativeForwardsRawBodyAndAuth(t *testing.T) {
 	ctx := WithUpstreamAuthHeaders(context.Background(), "", "oauth-token", map[string]string{"chatgpt-account-id": "acc-123"})
 	raw := []byte(`{"model":"gpt-5-codex","input":"hi","stream":true}`)
 
-	resp, err := client.ProxyNative(ctx, openaiResponsesTarget(upstream.URL), "/responses", raw)
+	resp, err := client.ProxyNative(ctx, openaiResponsesTarget(upstream.URL), "/responses", raw, "application/json")
 	if err != nil {
 		t.Fatalf("ProxyNative returned %v", err)
 	}

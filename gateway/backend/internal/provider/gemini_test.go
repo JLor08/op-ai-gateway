@@ -246,7 +246,7 @@ func TestGeminiProxyNativeRelaysVerbatim(t *testing.T) {
 	c := NewGeminiClient(srv.Client())
 	tgt := routing.Target{Endpoint: srv.URL}
 	raw := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
-	pr, err := c.ProxyNative(context.Background(), tgt, "/v1beta/models/gemini-2.5-pro:generateContent", raw)
+	pr, err := c.ProxyNative(context.Background(), tgt, "/v1beta/models/gemini-2.5-pro:generateContent", raw, "application/json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestGeminiProxyNativeDoesNotFollowRedirect(t *testing.T) {
 	defer srv.Close()
 	ctx := WithUpstreamAuthHeaders(context.Background(), "x-goog-api-key", "secret", nil)
 	c := NewGeminiClient(srv.Client())
-	pr, err := c.ProxyNative(ctx, routing.Target{Endpoint: srv.URL}, "/v1beta/models/gemini-2.5-pro:generateContent", []byte(`{}`))
+	pr, err := c.ProxyNative(ctx, routing.Target{Endpoint: srv.URL}, "/v1beta/models/gemini-2.5-pro:generateContent", []byte(`{}`), "application/json")
 	if err != nil {
 		t.Fatal(err)
 	}

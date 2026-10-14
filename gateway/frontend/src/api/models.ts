@@ -459,6 +459,19 @@ export type ModelOption = {
   // OPTIONAL, like `vision`: a fixture that omits it derives `image === false`,
   // which is what keeps every pre-existing non-image test meaningful.
   image?: boolean;
+  // True when this model — and, for a group, EVERY offered member — may be the
+  // target of an image EDIT (POST /v1/images/edits): the composer offers
+  // attaching a source image to an image model only when this is set. DERIVED in
+  // the backend, never recomputed here: each mapping derives it from its `image`
+  // verdict unless an operator opted it out (an `image_edit: no` capability
+  // row), and the listing ANDs it across mappings (ModelDTO.ImageEdit). The
+  // gateway's routing gate reads the same derivation, so the composer never
+  // offers an edit the gate would refuse. Independent of `image`: an opt-out
+  // lowers `image_edit` and leaves `image` true.
+  //
+  // OPTIONAL, like `image`: a fixture that omits it derives `image_edit ===
+  // false`, the fail-closed reading.
+  image_edit?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

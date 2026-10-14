@@ -242,8 +242,8 @@ func emitGeminiDeltas(res geminiwire.Result, emit StreamEmit) error {
 // endpoint path and returns the upstream response, Body still open, for the
 // gateway to relay byte-for-byte. The credential (x-goog-api-key) is the ctx's,
 // applied by applyUpstreamAuth. It uses the no-redirect client; see GeminiClient.
-func (c *GeminiClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
-	return doNativeProxy(ctx, c.noRedirect, target, path, body)
+func (c *GeminiClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
+	return doNativeProxy(ctx, c.noRedirect, target, path, body, contentType)
 }
 
 // renderBody renders the neutral request as a generateContent body. The model is

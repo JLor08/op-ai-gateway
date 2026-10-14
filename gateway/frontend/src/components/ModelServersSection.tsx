@@ -192,6 +192,21 @@ const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capab
 // surfaces here, verbatim, per capabilityChips' own doc-comment.
 const CAPABILITIES_COLUMN_EXCLUDED = new Set(['mtp', 'live_progress']);
 
+// "image_edit" is DERIVED by the gateway from the image verdict (image: yes and
+// no image_edit: no row), never probed, so unlike every capability above it has
+// something to show in ONE direction only. Its `no` row is the operator's
+// opt-out and renders as a translated chip of its own -- a negative chip, which
+// this column otherwise never renders, because the opt-out is the one decision
+// an operator needs to SEE (why an image model offers no edit). Its `yes` row is
+// inert (the gate derives yes anyway) and renders nothing. Either way the name
+// is kept out of the verbatim open-vocabulary bucket below: a raw "image_edit"
+// chip would read as an unvetted upstream string rather than the operator's own
+// switch. The derived-on state is deliberately NOT drawn here: computing it
+// would put a second copy of the derivation in the client (the backend's
+// routing.ImpliedImageEdit is the one), so the column shows only the stored
+// facts.
+const IMAGE_EDIT_CAPABILITY = 'image_edit';
+
 // One rendered chip: which STATUS key it uses (data-status, never colour),
 // its label, and the SOURCE ROW it came from -- the row is threaded through
 // so the caller can render a tooltip naming THIS capability's own
@@ -208,11 +223,12 @@ type CapabilityChip = { status: 'success' | 'standby'; label: string; row: Model
 // straight through, so dropping an unknown value here would silently hide a
 // real, reported capability). A `no` verdict, and a capability with no row at
 // all, both render NO chip -- negatives are not chips, only positives and
-// "reported but uncategorized" are. Verdict chips use the vetted "success"
-// key; unknown-vocabulary chips use the neutral "standby" key instead (see
-// the comment at the push site below) -- chips are still keyed by
-// `data-status`, never by colour, and there is no ranking within either
-// group.
+// "reported but uncategorized" are -- with ONE exception, the image-edit
+// opt-out (IMAGE_EDIT_CAPABILITY above), whose `no` is the chip. Verdict
+// chips use the vetted "success" key; unknown-vocabulary chips use the
+// neutral "standby" key instead (see the comment at the push site below) --
+// chips are still keyed by `data-status`, never by colour, and there is no
+// ranking within either group.
 function capabilityChips(capabilities: ModelServerCapability[], t: Translation): CapabilityChip[] {
   const byName = new Map(capabilities.map((c) => [c.capability, c]));
   const chips: CapabilityChip[] = [];
@@ -222,10 +238,18 @@ function capabilityChips(capabilities: ModelServerCapability[], t: Translation):
       chips.push({ status: 'success', label: known.label(t), row });
     }
   }
+  // The image-edit opt-out sits right after the known verdict chips, so it
+  // reads as a qualifier of the "Image generation" chip beside it. NEUTRAL
+  // ("standby"), not "success": it states that something is switched OFF.
+  const imageEdit = byName.get(IMAGE_EDIT_CAPABILITY);
+  if (imageEdit?.verdict === 'no') {
+    chips.push({ status: 'standby', label: t.capabilityImageEditOptOut, row: imageEdit });
+  }
   for (const row of capabilities) {
     if (
       KNOWN_CAPABILITY_NAMES.has(row.capability) ||
-      CAPABILITIES_COLUMN_EXCLUDED.has(row.capability)
+      CAPABILITIES_COLUMN_EXCLUDED.has(row.capability) ||
+      row.capability === IMAGE_EDIT_CAPABILITY
     ) {
       continue;
     }
@@ -260,6 +284,9 @@ function capabilityChips(capabilities: ModelServerCapability[], t: Translation):
 // checked", because that is exactly what they are.
 const CAPABILITY_TOOLTIP_EXTRAS: Record<string, (t: Translation) => string> = {
   speculation_observed: (t) => t.capabilitySpeculationObservedTooltip,
+  // The image-edit opt-out chip: says what the opt-out does (removes edit) and
+  // does NOT do (touch generation), and where to take it back.
+  [IMAGE_EDIT_CAPABILITY]: (t) => t.capabilityImageEditOptOutTooltip,
 };
 
 // capabilityTooltip folds ONE capability row's own provenance (source) and

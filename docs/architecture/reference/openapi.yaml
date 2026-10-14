@@ -160,6 +160,65 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/images/edits:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible image edit (multipart relay, no translate path)
+      description: >
+        Same auth as /v1/images/generations: scope `gateway:use` or
+        `llm:invoke`, a bearer token OR the internal trusted-loopback header
+        pair (unreachable by any external client, which is why only bearerAuth
+        is modelled below), never a portal session cookie. The body is
+        `multipart/form-data` (the gateway's first multipart request path) and
+        is relayed as multipart to a natively image-shaped upstream
+        (`sd-server`); there is no translate fallback. Required: `model`,
+        `prompt` and at least one non-empty source image under `image` or
+        `image[]` (400 `images.model_required`, `images.prompt_required`,
+        `images.image_required`); each of `model`, `prompt`, `response_format`,
+        `stream` and `mask` may appear once (400 `request.invalid`), and a body
+        that is not a well-formed multipart form is 400 `request.invalid`.
+        Admission takes an application that declares the `openai_images` API
+        flavor (otherwise 404 `routing.no_model_route`) and a mapping whose
+        `image_edit` capability holds (404 `routing.model_not_capable`
+        otherwise). That capability is derived: it holds wherever `image` is
+        `yes`, unless an operator set an `image_edit: no` verdict on the
+        mapping. An agent-launched model's runtime spec must declare the flavor
+        too, and its agent must declare the `multipart_proxy` feature, else
+        404 `images.edit_unavailable`. Non-streaming only (a `stream` of
+        `true` is 400 `images.stream_unsupported`), and `response_format` must
+        be `b64_json` or absent (400 `images.response_format_unsupported`).
+        An OpenAI-style `mask` (an RGBA PNG whose TRANSPARENT pixels mark the
+        region to edit) is converted to the luminance mask sd-server reads; it
+        must be a PNG of exactly the first source image's size, at most 16
+        megapixels, with at least one transparent pixel (400
+        `images.mask_invalid`; 400 `images.edit_unsupported_format` for a mask
+        that is not a readable PNG, or, when a mask is sent, a source that is
+        not a readable PNG or JPEG). The whole body is held in memory and
+        capped by `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES` (default 32 MiB;
+        413 `request.body_too_large`); a body bound for an agent-launched model
+        is checked against the agent's own 32 MiB after the gateway has
+        prepared it, with the same refusal. Metered in output images
+        (`billing_unit: image`); input images and the mask are not metered.
+        Beyond those it answers the same statuses as every other inference
+        path (429/402 from the principal limiter, 503 from the capacity queue
+        or no healthy host), which this path-level spec does not enumerate.
+        Alias: /openai/v1/images/edits.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/ImageEditForm' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/images/edits:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/images/edits
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/ImageEditForm' }
+      responses:
+        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/messages/count_tokens:
     post:
       tags: [inference]
@@ -2111,6 +2170,81 @@ components:
             description: >
               DTO defined by the Go handler (see api-surface.md and the
               gateway source); intentionally not duplicated here.
+    ImageEditForm:
+      required: true
+      description: >
+        The multipart form of POST /v1/images/edits. Fields not named here
+        reach the upstream unexamined, exactly as the generations endpoint
+        treats the fields of its JSON body.
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [model, prompt]
+            properties:
+              image:
+                type: string
+                format: binary
+                description: >
+                  The source image. sd-server's edit route reads PNG and JPEG
+                  only; the gateway passes the source through without checking
+                  its type, except that a source sent with a mask must be a
+                  readable PNG or JPEG (400 `images.edit_unsupported_format`).
+                  Either this or `image[]` must carry at least one non-empty
+                  part. Further `image[]` parts are references.
+              image[]:
+                type: array
+                items: { type: string, format: binary }
+                description: >
+                  The repeated spelling of the source image(s); the first
+                  non-empty part is the source a mask applies to (when a form
+                  carries both spellings, the first `image[]` part wins, as in
+                  sd-server).
+              mask:
+                type: string
+                format: binary
+                description: >
+                  Optional OpenAI-style mask: an RGBA PNG of exactly the first
+                  source image's size (at most 16 megapixels) whose
+                  TRANSPARENT pixels mark the region to regenerate. Needs at
+                  least one transparent pixel. The gateway converts it to the
+                  luminance mask sd-server reads (white = regenerate), so the
+                  edit is relayed as a rebuilt multipart body.
+              model:
+                type: string
+                description: >
+                  The gateway model name. Routing input; the gateway rewrites
+                  the field to the mapping's own model name for the upstream.
+              prompt:
+                type: string
+                description: >
+                  What to edit. sd-server's native knobs ride in a trailing
+                  `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` block, which is
+                  also where an edit's `strength` goes
+                  (`{"strength":0.9}`, sd-server's default is 0.75; a higher
+                  value changes the image more). sd-server's edits route reads
+                  no `strength` form field of its own.
+              n:
+                type: integer
+                description: Number of images to produce.
+              size:
+                type: string
+                description: >
+                  Output size such as `1024x1024`. When absent sd-server derives
+                  it from the source image.
+              response_format:
+                type: string
+                enum: [b64_json]
+                description: Only `b64_json` (or absent) is supported.
+              output_format:
+                type: string
+                enum: [png, jpeg]
+                description: >
+                  The edit route produces png or jpeg only (a generation also
+                  produces webp).
+              output_compression:
+                type: integer
+                description: Compression of a jpeg output.
   responses:
     OpaqueJSON:
       description: >

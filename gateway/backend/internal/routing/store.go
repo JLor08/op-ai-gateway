@@ -1331,6 +1331,23 @@ const (
 	// probe already pins it to generation. It also equals usage.BillingUnitImage,
 	// so the capability and #70's billable unit speak one vocabulary.
 	CapabilityImage = "image"
+
+	// CapabilityImageEdit means the model may be the target of an image EDIT
+	// (POST /v1/images/edits). Unlike every other name here it is DERIVED, not
+	// probed: stable-diffusion.cpp serves /v1/images/edits for any model that
+	// supports img_gen, so no upstream document can say which models edit and
+	// "which models may edit" is a gateway policy. The effective capability is
+	// ImpliedImageEdit -- image:yes AND NOT an operator image_edit:no row --
+	// and that one function is what the routing gate, the unknown-model
+	// redirect and the portal listing all read.
+	//
+	// The stored vocabulary around it is deliberately thin. An (image_edit, no)
+	// row is the operator's opt-out and it is the ONLY row this name ever
+	// needs; (image_edit, yes) is inert, because the derivation already says
+	// yes wherever image does. Nothing in the gateway writes the name itself --
+	// it is on the agent ingest's reserved list for that reason -- and "no row"
+	// means "derive from image", not "unknown" (ImpliedImageEdit).
+	CapabilityImageEdit = "image_edit"
 )
 
 // Capability verdicts.

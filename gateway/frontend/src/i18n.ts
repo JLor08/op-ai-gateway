@@ -218,6 +218,32 @@ const de = {
   // chat document, so there is no shared budget to state.)
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  // The same field's hint, the attach button's tooltip and one refusal for a model
+  // that ALSO edits (ADR-043 R1): an image attached to the turn is the image to
+  // edit -- there is no mode to switch, so the hint says what the attachment
+  // does. An edit has exactly one source image.
+  chatImageEditHint:
+    'Dieses Modell erzeugt und bearbeitet Bilder. Beschreiben Sie ein Bild, oder hängen Sie ein Bild an, um es zu bearbeiten.',
+  chatAttachImageEdit: 'Bild zum Bearbeiten anhängen',
+  chatImageEditSingleSource: 'Eine Bildbearbeitung nimmt genau ein Ausgangsbild.',
+  // Two more refusals of the edit turn, both raised BEFORE anything is sent or
+  // stored: an edit without a prompt (the endpoint answers images.prompt_required
+  // only after the turn was stored), and a source in a format the edit route of
+  // sd-server cannot read (png and jpeg only).
+  chatImageEditPromptRequired:
+    'Beschreiben Sie, wie das Bild bearbeitet werden soll, bevor Sie senden.',
+  chatImageEditSourceType: 'Eine Bildbearbeitung nimmt ein PNG- oder JPEG-Bild.',
+  // The mask of an edit (inpainting): an optional PNG, the size of the source
+  // image, whose transparent area marks the region to change. Its slot is next to
+  // the attach button of an edit and needs the source image first.
+  chatAttachMask: 'Maske anhängen',
+  chatAttachMaskTooltip:
+    'Maske anhängen (PNG in der Größe des Bildes): Der transparente Bereich markiert die Stelle, die bearbeitet wird',
+  chatAttachedMask: 'Maske',
+  chatRemoveMask: 'Maske entfernen',
+  chatMaskNeedsSource:
+    'Eine Maske braucht ein Ausgangsbild. Bitte hängen Sie zuerst das Bild an, das bearbeitet werden soll.',
+  chatMaskErrorType: 'Eine Maske muss ein PNG-Bild sein.',
   // The image-thread settings panel: the generation knobs shown in place of the
   // text-chat controls. The "" options ("Standard …") send nothing and leave
   // sd-server on its own default; output_compression only applies to a lossy
@@ -241,6 +267,12 @@ const de = {
   chatImageCFG: 'CFG',
   chatImageSeed: 'Seed',
   chatImageClipSkip: 'Clip Skip',
+  // The EDIT knob (an image attached to the turn makes it an edit): how far the
+  // result departs from the source image. Blank-able like the numerics above;
+  // the tooltip states the sd-server default and who wants more.
+  chatImageStrength: 'Stärke (Bearbeitung)',
+  chatImageStrengthHint:
+    'Wie stark eine Bildbearbeitung vom Ausgangsbild abweicht (0–1). Leer = sd-server-Standard (0,75). Modelle, die mit Referenzbildern bearbeiten, brauchen oft einen höheren Wert.',
   // The composer during an image run's wait (ADR-043 (d)): the pending label
   // and the static "nothing more is coming" sentence -- ImagePendingTurn's
   // only two announced strings (its clock is aria-hidden). Deliberately NOT
@@ -259,6 +291,10 @@ const de = {
   chatAttachImage: 'Bild anhängen',
   chatAttachedImage: 'Angehängtes Bild',
   chatDownloadImage: 'Bild herunterladen',
+  // The per-image action on a generated image of an image thread whose model may be
+  // edited: it makes THAT image the source of the next edit (the composer takes it
+  // as the attached image; the user then says what to change).
+  chatRefineImage: 'Dieses Bild verfeinern',
   chatGeneratedImage: 'Erzeugtes Bild',
   // Shown inline next to a generated image's download button when the saved
   // transcript's data URL does not decode -- a truncated/corrupted persisted
@@ -613,6 +649,13 @@ const de = {
   mappingImageCapable: 'Bilderzeugung',
   mappingImageCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Bilder erzeugt. Automatisch erkannt wird das in drei Fällen: bei einer stable-diffusion.cpp-Anwendung, die das Gateway direkt erreicht (mit dem nächsten Health-Check, rund 30 s), bei einem stable-diffusion.cpp-Modell, das der Server-Agent startet (Agent 0.7.4 oder neuer), sobald es einmal gelaufen ist, und bei einem Ollama-Modell, das der Server-Agent startet, sobald Ollama für dieses Modell die Fähigkeit „image“ meldet (dann nur als Ja). Eine Startkonfiguration, die noch nie gelaufen ist, hat noch kein Ergebnis, und eine Bildanfrage startet sie nicht: dort „Angeheftet (nie beenden)“ ankreuzen, sie einmal starten oder dies auf Ja setzen. Überall sonst setze es auf Ja, um die Bilderzeugung für dieses Modell freizugeben.',
+  // Bildbearbeitung ist KEIN erkanntes Merkmal, sondern vom Gateway aus der
+  // Bilderzeugung abgeleitet (Bilderzeugung = Ja und kein „Nein“ hier). Darum
+  // gibt es nur zwei Auswahlen: Unbekannt (= abgeleitet) und Nein (die
+  // Ausnahme des Betreibers); ein „Ja“ würde nichts ändern.
+  mappingImageEdit: 'Bildbearbeitung',
+  mappingImageEditUnknownHint:
+    'Unbekannt = aus der Bilderzeugung abgeleitet: Ein Modell, das Bilder erzeugt, nimmt auch Bildbearbeitungen an (/v1/images/edits). Setze „Nein“ für eine Zuordnung, die keine Bildbearbeitung bedienen soll, zum Beispiel einen Upstream ohne /v1/images/edits. Die Bilderzeugung bleibt davon unberührt. Ein „Ja“ gibt es nicht, weil das Gateway es bereits ableitet.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1290,6 +1333,15 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
+  // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
+  // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
+  // capabilityChips in ModelServersSection.tsx.
+  capabilityImageEditOptOut: 'Bildbearbeitung gesperrt',
+  // Ergänzt modelServerCapabilitiesTooltip unten NUR für diesen Chip
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx).
+  capabilityImageEditOptOutTooltip:
+    'Ein Betreiber hat diese Zuordnung von der Bildbearbeitung ausgenommen. Die Bilderzeugung ist davon nicht berührt: Sie folgt ihrem eigenen Chip. Die Ausnahme lässt sich im Zuordnungsformular unter „Bildbearbeitung“ auf Unbekannt zurücksetzen.',
   // "Beobachtet", nicht "Unterstützt": Diese Zeile entsteht ausschließlich
   // aus echtem Traffic (llama.cpp hat mindestens einmal gedraftete Tokens
   // gemeldet), niemals aus einer Fähigkeits-Erklärung von Build oder
@@ -1482,6 +1534,30 @@ const de = {
   errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
   errorImagesUpstreamError:
     'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Bildbearbeitung (ADR-043 R1): die beiden Ablehnungen von /v1/images/edits,
+  // die ein Portal-Lauf erreichen kann, und der Lauf-Code für ein Ausgangsbild,
+  // das sich nicht lesen lässt. Der Server-Text bleibt englisch; hier steht, was
+  // die Nutzerin tun kann.
+  errorImagesImageRequired:
+    'Für eine Bildbearbeitung wird ein Ausgangsbild benötigt. Bitte hängen Sie ein Bild an.',
+  errorImagesEditUnavailable:
+    'Dieser Server kann Bilder derzeit nicht bearbeiten: Sein Agent unterstützt die Bildbearbeitung noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorChatRunImageSourceUnreadable:
+    'Das angehängte Bild oder die Maske konnte nicht gelesen werden. Bitte hängen Sie es erneut an.',
+  // Das Ausgangsbild ist lesbar, aber kein PNG oder JPEG (etwa ein WebP-Ergebnis eines
+  // Threads, dessen Bildformat WebP ist, oder ein älterer Upload): die Bildbearbeitung
+  // des Servers liest nur diese beiden. Der Text sagt, was zu tun ist -- ein erneuter
+  // Versuch hilft nicht.
+  errorChatRunImageSourceUnsupported:
+    'Nur PNG- und JPEG-Bilder lassen sich bearbeiten. Stellen Sie das Bildformat auf PNG oder JPEG ein, und erzeugen Sie das Bild zuerst neu.',
+  // Die beiden Ablehnungen von /v1/images/edits, die nur eine Maske auslösen kann:
+  // eine Maske, die nicht zum Bild passt (andere Größe, größer als das Maximum,
+  // kein transparenter Bereich), und ein Format, das nicht lesbar ist (eine Maske,
+  // die kein PNG ist; mit Maske muss auch das Ausgangsbild PNG oder JPEG sein).
+  errorImagesMaskInvalid:
+    'Die Maske passt nicht zum Bild: Sie muss genau so groß sein wie das Ausgangsbild (höchstens 16 Megapixel) und mindestens einen transparenten Bereich enthalten, der die zu bearbeitende Stelle markiert.',
+  errorImagesEditUnsupportedFormat:
+    'Das Format wird bei der Bildbearbeitung nicht unterstützt: Eine Maske muss ein PNG sein, dessen transparenter Bereich die zu bearbeitende Stelle markiert, und mit einer Maske muss das Ausgangsbild ein PNG oder JPEG sein.',
   // Chat-Binärdatenspeicher: Bilder liegen außerhalb des Verlaufs, und ein
   // Lauf wird abgelehnt, bevor er startet, wenn ein hochgeladenes oder
   // bearbeitetes Bild nicht gespeichert beziehungsweise nicht gelesen werden
@@ -3039,6 +3115,19 @@ const en: PortalMessages = {
   chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
   chatImagePromptLabel: 'Image prompt',
   chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatImageEditHint:
+    'This model generates and edits images. Describe an image, or attach one to edit it.',
+  chatAttachImageEdit: 'Attach an image to edit',
+  chatImageEditSingleSource: 'An image edit takes exactly one source image.',
+  chatImageEditPromptRequired: 'Describe how the image should be edited before sending.',
+  chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
+  chatAttachMask: 'Attach a mask',
+  chatAttachMaskTooltip:
+    'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
+  chatAttachedMask: 'Mask',
+  chatRemoveMask: 'Remove mask',
+  chatMaskNeedsSource: 'A mask needs a source image. Please attach the image to edit first.',
+  chatMaskErrorType: 'A mask must be a PNG image.',
   chatImageSize: 'Image size',
   chatImageSizeDefault: 'Default (model)',
   chatImageCount: 'Number of images',
@@ -3054,6 +3143,9 @@ const en: PortalMessages = {
   chatImageCFG: 'CFG',
   chatImageSeed: 'Seed',
   chatImageClipSkip: 'Clip skip',
+  chatImageStrength: 'Strength (edit)',
+  chatImageStrengthHint:
+    'How far an image edit departs from the source image (0–1). Blank uses the sd-server default (0.75). Models that edit with reference images often need a higher value.',
   chatImageRunPending: 'Waiting for image',
   chatImageNoIntermediateNews:
     'No intermediate updates – the image arrives finished or not at all.',
@@ -3064,6 +3156,7 @@ const en: PortalMessages = {
   chatAttachImage: 'Attach image',
   chatAttachedImage: 'Attached image',
   chatDownloadImage: 'Download image',
+  chatRefineImage: 'Refine this image',
   chatGeneratedImage: 'Generated image',
   chatImageDownloadError: 'Could not download the image.',
   chatReasoning: 'Reasoning',
@@ -3402,6 +3495,13 @@ const en: PortalMessages = {
   mappingImageCapable: 'Image generation',
   mappingImageCapableUnknownHint:
     'Unknown: whether this mapping generates images is not on file. It is detected automatically in three cases: for a stable-diffusion.cpp application the gateway reaches directly (on the next health tick, about 30 s), for a stable-diffusion.cpp model the server agent launches (agent 0.7.4 or newer), once it has run, and for an Ollama model the server agent launches, once Ollama declares its "image" capability for that model (then only ever as Yes). A launch spec that has never run has no verdict yet, and an image request does not start it: tick "Pinned (never stop)" on it, start it once, or set this to Yes. Anywhere else, set it to Yes to enable image generation for this model.',
+  // Image editing is NOT a detected trait: the gateway derives it from image
+  // generation (image generation is Yes and this control is not No). So there
+  // are only two choices -- Unknown (= derived) and No (the operator's
+  // exception); a Yes would change nothing.
+  mappingImageEdit: 'Image editing',
+  mappingImageEditUnknownHint:
+    'Unknown = derived from image generation: a model that generates images also accepts image edits (/v1/images/edits). Set it to No for a mapping that should not serve image edits, for example an upstream without /v1/images/edits. Image generation is unaffected. There is no Yes, because the gateway already derives it.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -4022,6 +4122,15 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  // The chip for the operator's EXCEPTION (image editing = No), not for a
+  // capability: image editing is derived from image generation, so it has
+  // something to show in this one direction only. See capabilityChips in
+  // ModelServersSection.tsx.
+  capabilityImageEditOptOut: 'Image editing disabled',
+  // Appended to modelServerCapabilitiesTooltip below for this one chip only
+  // (CAPABILITY_TOOLTIP_EXTRAS, ModelServersSection.tsx).
+  capabilityImageEditOptOutTooltip:
+    'An operator excluded this mapping from image editing. Image generation is not affected: it follows its own chip. The exception can be reset to Unknown under "Image editing" in the mapping form.',
   // "Observed", not "supported": this row exists only because real traffic
   // produced it (llama.cpp reported at least one completion with drafted
   // tokens), never because a build or a model declared the trait -- see the
@@ -4190,6 +4299,24 @@ const en: PortalMessages = {
   errorImagesStreamUnsupported: 'Image generation does not support streaming.',
   errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
   errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
+  // Image editing (ADR-043 R1): the two refusals of /v1/images/edits a portal run
+  // can reach, and the run code for a source image that cannot be read. The
+  // server's text stays English; this says what the user can do.
+  errorImagesImageRequired: 'An image edit needs a source image. Please attach an image.',
+  errorImagesEditUnavailable:
+    'This server cannot edit images right now: its agent does not support image editing yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
+  errorChatRunImageSourceUnreadable:
+    'The attached image or mask could not be read. Please attach it again.',
+  errorChatRunImageSourceUnsupported:
+    'Only PNG and JPEG images can be edited. Set the image format to PNG or JPEG and regenerate the image first.',
+  // The two refusals of /v1/images/edits only a mask can cause: a mask that does
+  // not fit the image (another size, past the maximum, no transparent area) and a
+  // format that cannot be read (a mask that is not a PNG; with a mask the source
+  // image must be a PNG or JPEG too).
+  errorImagesMaskInvalid:
+    'The mask does not fit the image: it must be exactly the same size as the source image (at most 16 megapixels) and have at least one transparent area that marks the region to edit.',
+  errorImagesEditUnsupportedFormat:
+    'This format is not supported for image edits: a mask must be a PNG whose transparent area marks the region to edit, and with a mask the source image must be a PNG or JPEG.',
   // Chat binary payload store: images live outside the transcript, and a run
   // is refused before it starts when an uploaded or edited image cannot be
   // stored or read. Wire codes: see format.ts (errorLabelByCode).

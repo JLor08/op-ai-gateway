@@ -428,7 +428,7 @@ func (erroringProxyProvider) CompleteStream(context.Context, routing.Target, inf
 	return nil
 }
 
-func (p erroringProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+func (p erroringProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte, string) (*provider.ProxyResponse, error) {
 	return nil, p.err
 }
 
@@ -477,7 +477,7 @@ func (noContentTypeProxyProvider) CompleteStream(context.Context, routing.Target
 	return nil
 }
 
-func (p noContentTypeProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+func (p noContentTypeProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte, string) (*provider.ProxyResponse, error) {
 	return &provider.ProxyResponse{
 		StatusCode: 200,
 		Header:     http.Header{}, // deliberately no Content-Type
@@ -688,10 +688,40 @@ func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
 func TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks(t *testing.T) {
 	target := routing.Target{Provider: routing.ProviderOllama}
 
-	got := upstreamPath(target, apiFlavorImages)
+	got := upstreamPath(target, apiFlavorImages, endpointImages)
 
 	if got != "/v1/images/generations" {
 		t.Fatalf("upstreamPath(images) = %q, want /v1/images/generations", got)
+	}
+}
+
+// TestUpstreamPathImagesEditEndpointReturnsTheEditsPath pins the endpoint axis
+// of upstreamPath's images branch. generations and edits share ONE api flavor
+// (openai_images), so the flavor alone cannot tell them apart -- the endpoint is
+// the only discriminator, and an edit must reach the upstream's
+// /v1/images/edits, never /v1/images/generations. ProviderOllama again, for the
+// same reason as the test above: it is the provider whose own fallback would
+// answer if the images branch did not run.
+func TestUpstreamPathImagesEditEndpointReturnsTheEditsPath(t *testing.T) {
+	target := routing.Target{Provider: routing.ProviderOllama}
+	cases := []struct {
+		name      string
+		apiFlavor string
+		endpoint  sessionEndpoint
+		want      string
+	}{
+		{"generations endpoint", apiFlavorImages, endpointImages, "/v1/images/generations"},
+		{"edits endpoint", apiFlavorImages, endpointImagesEdit, "/v1/images/edits"},
+		// The edit endpoint only discriminates WITHIN the images flavor: a
+		// non-images flavor that somehow carried it keeps its provider-derived path.
+		{"edits endpoint does not hijack a non-images flavor", "openai_chat_completions", endpointImagesEdit, "/api/chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamPath(target, tc.apiFlavor, tc.endpoint); got != tc.want {
+				t.Fatalf("upstreamPath(%q, endpoint %d) = %q, want %q", tc.apiFlavor, tc.endpoint, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -728,7 +758,7 @@ func TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// openai_chat_completions: a flavor with no passthrough mode, so the
 			// provider fallbacks decide.
-			got := upstreamPath(routing.Target{Provider: tc.provider, OpenAIPathPrefix: tc.prefix}, "openai_chat_completions")
+			got := upstreamPath(routing.Target{Provider: tc.provider, OpenAIPathPrefix: tc.prefix}, "openai_chat_completions", endpointChat)
 
 			if got != tc.want {
 				t.Fatalf("upstreamPath(%s, prefix %q) = %q, want %q", tc.provider, tc.prefix, got, tc.want)
@@ -764,7 +794,7 @@ func (plainTextErrorProxyProvider) CompleteStream(context.Context, routing.Targe
 	return nil
 }
 
-func (p plainTextErrorProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte) (*provider.ProxyResponse, error) {
+func (p plainTextErrorProxyProvider) ProxyNative(context.Context, routing.Target, string, []byte, string) (*provider.ProxyResponse, error) {
 	return &provider.ProxyResponse{
 		StatusCode: p.status,
 		Header:     http.Header{"Content-Type": []string{p.contentType}},
@@ -826,6 +856,51 @@ func TestMessagesNonJSONNativePassthroughErrorRelayedVerbatim(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != upstreamContentType {
 		t.Fatalf("content-type = %q, want the upstream's own %q preserved, not overwritten as JSON", ct, upstreamContentType)
+	}
+}
+
+// TestNativePassthroughHandsProxyNativeJSONContentType pins that every JSON
+// endpoint relayed through proxyNative (responses, messages, images generations)
+// still reaches the provider seam as application/json now that the seam carries a
+// content type: the multipart image-edit body is the only caller that may differ.
+func TestNativePassthroughHandsProxyNativeJSONContentType(t *testing.T) {
+	cases := []struct {
+		name   string
+		path   string
+		body   string
+		server func(t *testing.T, prov *recordingProxyProvider) *Server
+	}{
+		{"responses", "/v1/responses", `{"model":"gw-model","input":"hi"}`, func(_ *testing.T, prov *recordingProxyProvider) *Server {
+			return newNativeProxyTestServer(prov, true, false)
+		}},
+		{"messages", "/v1/messages", `{"model":"gw-model","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`, func(_ *testing.T, prov *recordingProxyProvider) *Server {
+			return newNativeProxyTestServer(prov, false, true)
+		}},
+		{"images generations", "/v1/images/generations", `{"model":"sd-turbo","prompt":"a cat","n":1}`, func(t *testing.T, prov *recordingProxyProvider) *Server {
+			return newRedirectingTestServer(t, prov, "", "sd-turbo")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: imagesRelayResponse}
+			srv := tc.server(t, prov)
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer dev-secret")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if prov.proxyCalls != 1 {
+				t.Fatalf("ProxyNative calls = %d, want 1", prov.proxyCalls)
+			}
+			if prov.gotContentType != "application/json" {
+				t.Fatalf("ProxyNative content type = %q, want application/json", prov.gotContentType)
+			}
+		})
 	}
 }
 

@@ -11,6 +11,28 @@ import (
 	"op-ai-gateway/internal/portal"
 )
 
+// The codes of POST /v1/images/edits' own request-shape refusals
+// (images_edit_handler.go). Like validateImagesRequest's, they are written
+// through writeRequestError as *inference.Error values -- a 400 with the code as
+// given -- rather than as sentinel rows in the tables below, so they are
+// constants here. model, prompt, stream and response_format reuse the
+// generations twin's own codes; these are the edit-specific ones.
+const (
+	// imagesImageRequired: the edit form carries no source image -- no non-empty
+	// part under either `image` or `image[]`, the two spellings OpenAI's clients
+	// use.
+	imagesImageRequired = "images.image_required"
+	// imagesMaskInvalid: the mask cannot be used with this source image -- its
+	// size is not the source's, it is larger than the conversion will decode, or
+	// it has no transparent pixel, so it selects nothing to edit
+	// (convertImageEditMask).
+	imagesMaskInvalid = "images.mask_invalid"
+	// imagesEditUnsupportedFormat: a mask that is not a readable PNG, or -- when
+	// a mask is sent -- a source image that is not a readable PNG or JPEG, which
+	// is all sd-server's edit route takes and all the size check can read.
+	imagesEditUnsupportedFormat = "images.edit_unsupported_format"
+)
+
 // errRow is one (sentinel -> HTTP response) mapping row consumed by
 // writeMappedError. msg is the static response message; a row that must
 // surface the underlying error's own text (rather than a fixed string) sets

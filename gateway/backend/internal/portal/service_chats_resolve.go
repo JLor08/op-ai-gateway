@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"log"
 	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 )
 
@@ -28,7 +29,8 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 // a data: or http(s) one without an error, so a reference left in place would
 // silently vanish from the request and the model would answer without seeing the
 // picture. Resolution therefore happens here, where the history is built, for
-// every text run (see PrepareChatRun for why an image run skips it).
+// every text run (see PrepareChatRun for why an image run resolves only the
+// source of its turn, resolveImageRunSource).
 //
 // What it relies on, and what it does not:
 //
@@ -58,34 +60,90 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 // history is not modified; a history with no reference comes back as it is, with
 // no store call.
 func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
-	ids, occurrences, err := collectBlobRefIDs(history)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return history, nil
-	}
-
-	rows, err := s.chats.ChatBlobsByIDs(ctx, chatID, ids)
-	if err != nil {
-		return nil, err
-	}
-	limit := int64(s.maxRunHistoryBytes)
-	usable, err := usableChatBlobs(chatID, ids, occurrences, rows, limit)
-	if err != nil {
-		return nil, err
-	}
-	urls, err := s.blobDataURLs(ids, occurrences, usable, limit)
-	if err != nil {
-		return nil, err
-	}
-	out, unavailable, err := substituteBlobRefs(history, urls)
+	out, unavailable, err := s.resolveBlobRefs(ctx, chatID, history)
 	if err != nil {
 		return nil, err
 	}
 	if unavailable > 0 {
 		log.Printf("portal: chat %s: %d image reference(s) in the run history have no stored image for this chat and were left out", chatID, unavailable)
 	}
+	return out, nil
+}
+
+// resolveBlobRefs is resolveChatBlobRefs, also reporting how many references had
+// no stored image for the chat (each is now an unavailableImagePart). The caller
+// decides what an absent image means for its run: a text run goes on without it,
+// an edit cannot (see resolveImageRunSource).
+func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, int, error) {
+	ids, occurrences, err := collectBlobRefIDs(history)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(ids) == 0 {
+		return history, 0, nil
+	}
+
+	rows, err := s.chats.ChatBlobsByIDs(ctx, chatID, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	limit := int64(s.maxRunHistoryBytes)
+	usable, err := usableChatBlobs(chatID, ids, occurrences, rows, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	urls, err := s.blobDataURLs(ids, occurrences, usable, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	return substituteBlobRefs(history, urls)
+}
+
+// resolveImageRunSource gives an image run the source image of its turn. An image
+// thread's turn is an EDIT when its last user message carries an image: the
+// executor sends that image's bytes to /v1/images/edits. It reads nothing else of
+// the history (an image thread's older images -- earlier sources, its own
+// generated results -- are never sent anywhere), so only the LAST user message is
+// resolved, with the very resolution a text run's whole history gets: the images
+// are fetched scoped to chatID (an id that is another chat's, another user's or
+// never stored is simply absent), the declared and the unsealed sizes are bounded,
+// and the stored document is not touched. A message with no stored reference (a
+// fresh upload arrives inline, a plain prompt carries no image) costs no store
+// call.
+//
+// What it does NOT share with a text run is the tolerance. There an absent image
+// becomes a placeholder and the run carries on without it, which is right for a
+// model that can answer without seeing a picture. An edit cannot: without its
+// source it is a different request, and the executor would generate an unrelated
+// image from the prompt alone. A source this chat does not hold therefore refuses
+// the run with ErrChatBlobNotOwned -- the error a foreign image in a new turn or
+// an edited_history already gets at the commit (extractChatBlobs), here also
+// covering the one message that check never sees: a stored transcript's own last
+// message, whose references nothing vetted at this request. It is raised before
+// anything is stored, so a retry is not a duplicate turn.
+//
+// history is not modified. A history with no user message comes back as it is.
+func (s *Service) resolveImageRunSource(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
+	last := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			last = i
+			break
+		}
+	}
+	if last < 0 {
+		return history, nil
+	}
+	resolved, unavailable, err := s.resolveBlobRefs(ctx, chatID, history[last:last+1])
+	if err != nil {
+		return nil, err
+	}
+	if unavailable > 0 {
+		log.Printf("portal: chat %s: the image to edit has no stored image for this chat; refusing the run", chatID)
+		return nil, ErrChatBlobNotOwned
+	}
+	out := slices.Clone(history)
+	out[last] = resolved[0]
 	return out, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -112,13 +113,37 @@ func (m Mock) Complete(ctx context.Context, target routing.Target, req inference
 
 var _ NativeProxyClient = Mock{}
 
-// ProxyNative returns a canned OpenAI-Responses-style SSE stream so a
-// native-passthrough application works in dev/mock mode. It echoes the resolved
-// upstream model and a terminal response.completed carrying usage, mirroring what
-// a real Codex-capable upstream would emit.
-func (m Mock) ProxyNative(_ context.Context, target routing.Target, _ string, _ []byte) (*ProxyResponse, error) {
+// mockImagesPathPrefix marks an upstream images endpoint (/v1/images/generations,
+// /v1/images/edits). The mock answers those with an images body, never a
+// Responses stream.
+const mockImagesPathPrefix = "/v1/images/"
+
+// mockImagePNGBase64 is a 1x1 PNG, the single image the mock's images answer
+// carries. It is a real image (not a placeholder string) so a consumer that
+// decodes or renders the result, such as the portal chat, works against the mock.
+const mockImagePNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+// ProxyNative returns a canned answer so a native-passthrough application works in
+// dev/mock mode. contentType is accepted for the NativeProxyClient seam but not
+// inspected: the mock does not parse the request body.
+//
+// An images path (/v1/images/...) gets the generations-shaped body sd-server
+// returns, {created, output_format, data:[{b64_json}]} with one image, so a
+// gateway images relay counts a billable image. Every other path gets an
+// OpenAI-Responses-style SSE stream that echoes the resolved upstream model and a
+// terminal response.completed carrying usage, mirroring what a real Codex-capable
+// upstream would emit.
+func (m Mock) ProxyNative(_ context.Context, target routing.Target, path string, _ []byte, _ string) (*ProxyResponse, error) {
 	if m.Unreachable {
 		return nil, ErrUnavailable
+	}
+	if strings.HasPrefix(path, mockImagesPathPrefix) {
+		body := `{"created":` + strconv.FormatInt(time.Now().Unix(), 10) + `,"output_format":"png","data":[{"b64_json":"` + mockImagePNGBase64 + `"}]}`
+		return &ProxyResponse{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{jsonContentType}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
 	}
 	model := target.ProviderModel
 	if model == "" {

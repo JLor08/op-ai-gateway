@@ -14,9 +14,9 @@ import (
 
 // resolveTarget is the single seam through which every inference path
 // resolves a routing target (the translate path's complete and beginStream,
-// through resolveTranslateTarget, plus tryProxyNative and relayImages), so the
-// last-used-model marker is recorded in exactly one place rather than at each
-// of those call sites.
+// through resolveTranslateTarget, plus tryProxyNative and the two images
+// relays), so the last-used-model marker is recorded in exactly one place
+// rather than at each of those call sites.
 //
 // The marker is a property of an api_tokens row (the `last_used_model` column),
 // so it is written only for a principal that HAS such a row — i.e. one with a

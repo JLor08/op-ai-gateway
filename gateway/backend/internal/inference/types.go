@@ -193,7 +193,9 @@ type Request struct {
 	ID        string `json:"id,omitempty"`
 	APIFlavor string `json:"api_flavor"`
 	// RequiredCapabilities are capability names a candidate mapping MUST carry a
-	// "yes" verdict for, or it is not a routing candidate at all. Nil for chat,
+	// "yes" verdict for, or it is not a routing candidate at all -- except
+	// routing.CapabilityImageEdit, which is DERIVED (routing.ImpliedImageEdit:
+	// an image "yes" and no operator image_edit "no"). Nil for chat,
 	// responses and messages -- which is what keeps this a no-op on every
 	// existing path -- and set by an endpoint handler from its own identity,
 	// never from the request body.

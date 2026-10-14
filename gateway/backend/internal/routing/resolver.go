@@ -1273,18 +1273,22 @@ func (r *Resolver) filterProvisioned(ctx context.Context, principal auth.Token, 
 	return out, nil
 }
 
-// filterCapable drops every candidate whose mapping does not carry a "yes"
-// verdict for each of the required capabilities. It is this gateway's FIRST
+// filterCapable drops every candidate whose mapping does not satisfy each of
+// the required capabilities (capabilityRowsSatisfy: a "yes" verdict, or for
+// CapabilityImageEdit the derivation ImpliedImageEdit -- the one capability
+// where an absent row is not "unknown", see there). It is this gateway's FIRST
 // filter that genuinely excludes a model for lacking a capability --
 // wantsLiveProgress annotates and the models-list fold advertises, but neither
 // refuses, and the scorer (scorer.go) reads no verdict at all.
 //
 // An ABSENT row means unknown, not no, and this filter treats unknown as a
-// refusal. That direction is chosen on evidence rather than taste: Extra-sourced
-// rows are written yes-only (cmd/gateway/app_health.go) and the Ollama detector
-// can structurally never emit "no", so treating unknown as permission would
-// refuse nothing in a real fleet -- reproducing the exact defect the gate exists
-// to fix. See ADR-042 for the cost this accepts on day one.
+// refusal (image_edit is the documented exception: it is derived from image,
+// so an absent image_edit row is not a refusal). That direction is chosen on
+// evidence rather than taste: Extra-sourced rows are written yes-only
+// (cmd/gateway/app_health.go) and the Ollama detector can structurally never
+// emit "no", so treating unknown as permission would refuse nothing in a real
+// fleet -- reproducing the exact defect the gate exists to fix. See ADR-042
+// for the cost this accepts on day one.
 //
 // A store error REFUSES rather than failing open, for the same reason.
 func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, required []string) ([]MappingCandidate, error) {
@@ -1312,17 +1316,50 @@ func (r *Resolver) filterCapable(ctx context.Context, cands []MappingCandidate, 
 	return out, nil
 }
 
-// capabilityRowsSatisfy reports whether rows carry a "yes" verdict for every
-// required capability. Shared by filterCapable and resolveAffinity's own gate,
-// which reads its rows from a different place.
+// capabilityRowsSatisfy reports whether rows satisfy every required
+// capability. A name is satisfied by a literal "yes" verdict row, except
+// CapabilityImageEdit, which is DERIVED (ImpliedImageEdit). Shared by
+// filterCapable and resolveAffinity's own gate, which reads its rows from a
+// different place; every satisfaction decision funnels through here, so the
+// derivation has exactly one place to apply in routing.
 func capabilityRowsSatisfy(rows []CapabilityRow, required []string) bool {
 	byName := CapabilityRowsByName(rows)
 	for _, name := range required {
+		if name == CapabilityImageEdit {
+			if !ImpliedImageEdit(rows) {
+				return false
+			}
+			continue
+		}
 		if byName[name].Verdict != CapabilityYes {
 			return false
 		}
 	}
 	return true
+}
+
+// ImpliedImageEdit is THE image-edit derivation: a mapping may serve an image
+// edit when it generates images (an image:yes row) AND its operator has not
+// opted out (an image_edit:no row). It is the one function every reader of
+// the edit capability calls -- the routing gate (capabilityRowsSatisfy), the
+// portal's unknown-model redirect and its models-listing fold -- so the
+// composer can never offer an edit the gate would refuse. Keep any change to
+// the rule HERE; a second copy of it elsewhere is the defect this function
+// exists to prevent (ADR-045: one function both read).
+//
+// "No image_edit row" means "derive from image", NOT "unknown": this is the
+// one capability that does not follow ADR-042's refuse-on-unknown rule,
+// deliberately, because no probe can produce an answer for it (see
+// CapabilityImageEdit). An image_edit:yes row is inert -- it cannot make a
+// mapping that does not generate images an edit target -- and the opt-out
+// removes edit only: the mapping still serves generation.
+//
+// A nil or empty row set (a capability read that failed folds to nothing) is
+// false, so every caller stays fail-closed.
+func ImpliedImageEdit(rows []CapabilityRow) bool {
+	byName := CapabilityRowsByName(rows)
+	return byName[CapabilityImage].Verdict == CapabilityYes &&
+		byName[CapabilityImageEdit].Verdict != CapabilityNo
 }
 
 // filterServesEndpoint drops candidates whose application does not serve the

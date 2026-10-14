@@ -237,11 +237,29 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'gateway.chat_run_no_image': 'errorChatRunNoImage',
   'gateway.chat_run_image_format_unknown': 'errorChatRunImageFormatUnknown',
   'gateway.chat_run_image_response_unreadable': 'errorChatRunImageResponseUnreadable',
+  // An image EDIT turn (ADR-043 R1) whose source the executor cannot read as an
+  // image: failed before anything was sent (imageRunSourceUnreadableMessage).
+  'gateway.chat_run_image_source_unreadable': 'errorChatRunImageSourceUnreadable',
+  // ...and one whose source is a readable image of a type the edit route does not
+  // read (png and jpeg only: a webp result of a thread that generates webp, or an
+  // older upload): refused before anything was sent (imageRunSourceUnsupportedMessage).
+  'gateway.chat_run_image_source_unsupported': 'errorChatRunImageSourceUnsupported',
   'gateway.chat_run_commit_failed': 'errorChatRunCommitFailed',
   'images.prompt_required': 'errorImagesPromptRequired',
   'images.stream_unsupported': 'errorImagesStreamUnsupported',
   'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',
   'images.upstream_error': 'errorImagesUpstreamError',
+  // POST /v1/images/edits, which a portal run reaches over loopback when its turn
+  // carries a source image: no image part (images.image_required), and a target
+  // agent that has not declared multipart_proxy (images.edit_unavailable, a 404 --
+  // an agent older than 0.9.0, or one that has not reported since a gateway
+  // restart). The two refusals only a mask causes (the portal's mask upload,
+  // convertImageEditMask): a mask that does not fit its source (images.mask_invalid)
+  // and a format that cannot be read (images.edit_unsupported_format).
+  'images.image_required': 'errorImagesImageRequired',
+  'images.edit_unavailable': 'errorImagesEditUnavailable',
+  'images.mask_invalid': 'errorImagesMaskInvalid',
+  'images.edit_unsupported_format': 'errorImagesEditUnsupportedFormat',
   // Chat binary payload store (#124): refusals at run start. The first three
   // are rows in error_map.go for portal.ErrChatBlobTypeUnsupported /
   // ErrChatBlobTooLarge / ErrChatBlobNotOwned (an uploaded or edited image is

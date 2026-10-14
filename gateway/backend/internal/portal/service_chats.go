@@ -461,6 +461,13 @@ type ChatImageSettings struct {
 	CFG            *float64 `json:"cfg,omitempty"`
 	Seed           *int     `json:"seed,omitempty"`
 	ClipSkip       *int     `json:"clip_skip,omitempty"`
+	// Strength is the EDIT knob: how far an image edit departs from its source
+	// (sd-server's own default is 0.75, which makes a weak edit, and a
+	// reference-edit model may want it higher). Like the knobs above it rides the
+	// <sd_cpp_extra_args> block, top-level, and is nil/omitted when unset so
+	// sd-server keeps its default. sd-server ignores it for a generation (no source
+	// image), so a thread that carries it can still generate.
+	Strength *float64 `json:"strength,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
@@ -502,8 +509,10 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // self-healed clear is honored rather than silently overridden by the stale
 // value the client submitted. For a text run the history carries its images as
 // data urls, the stored references of the older turns resolved to their bytes
-// (resolveChatBlobRefs); an image run's history is returned as stored.
-// Owner-scoped.
+// (resolveChatBlobRefs); an image run's history is returned as stored, except
+// that the source image of its turn -- the image its last user message carries,
+// which makes the turn an edit -- is resolved to a data url too, or the run is
+// refused (resolveImageRunSource). Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -646,10 +655,13 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// The stored messages reference their images by url; the run's upstream gets
 	// the images themselves (see resolveChatBlobRefs). The turn being sent is in
 	// runMessages with its bytes inline already, so only the older references are
-	// fetched. An image run skips it: its executor reads nothing of the history but
-	// the last prompt's text, so fetching, decrypting and encoding every image of
-	// the thread would be wasted, and the run-size bound would refuse an image
-	// thread for bytes that are never sent.
+	// fetched. An image run reads nothing of the history but the last prompt's text
+	// and -- when the last user message carries an image, which makes the turn an
+	// edit -- that image: fetching, decrypting and encoding every image of the
+	// thread would be wasted, and the run-size bound would refuse an image thread
+	// for bytes that are never sent. So it resolves that one message and no other
+	// (resolveImageRunSource), and refuses a source the chat does not hold rather
+	// than going on without it.
 	//
 	// This is before the commit on purpose: a run refused for its history's size,
 	// or whose images cannot be read, stores nothing, so retrying it is not a
@@ -658,6 +670,8 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
 			return nil, ChatRunSettings{}, err
 		}
+	} else if history, err = s.resolveImageRunSource(ctx, chatID, history); err != nil {
+		return nil, ChatRunSettings{}, err
 	}
 	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
 		return nil, ChatRunSettings{}, err
@@ -739,6 +753,84 @@ func MessageText(content json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// ImagePurposeMask is the value of an image part's "purpose" member that marks it
+// as the MASK of an image edit (inpainting) rather than a source image. The part
+// is an ordinary image_url part otherwise -- {"type":"image_url","image_url":
+// {"url":...},"purpose":"mask"} -- so it is stored as a chat blob, resolved back to
+// bytes and owner-checked by the code that handles every other image of a message;
+// only the image-run executor reads the tag, to send the part as the edit's `mask`
+// form field instead of as a source. The web portal writes the tag (maskPart in
+// frontend components/shared/chatContent.ts), the executor reads it
+// (MessageImages); a part without it is a source.
+const ImagePurposeMask = "mask"
+
+// imagePurposeKey is the member of an image part that carries its purpose.
+const imagePurposeKey = "purpose"
+
+// MessageImage is one image part of a message content: its url, and whether it is
+// tagged as the mask of an edit (ImagePurposeMask).
+type MessageImage struct {
+	URL  string
+	Mask bool
+}
+
+// MessageImages is every image part of a message content, in order: what an
+// image-run executor sends as an edit's source images and mask (an array content;
+// a plain string has none). Exported for the same reason as MessageText, and it
+// reads through rewriteImagePart -- the one definition of an image part the
+// extraction at a run commit and the resolution of a run's history already share
+// -- so the executor and the resolution cannot disagree about what counts as an
+// image (an object whose image_url is an object with a string url, members
+// matched without regard to case). The tag is read the way the portal's JavaScript
+// reads it instead (isMaskPart): its member name exactly, the last of a repeated one,
+// its value exactly, and a part that is not an image has no purpose to speak of.
+func MessageImages(content json.RawMessage) []MessageImage {
+	parts, ok := parseJSONArray(content)
+	if !ok {
+		return nil
+	}
+	var images []MessageImage
+	for _, raw := range parts {
+		var urls []string
+		_, _, _ = rewriteImagePart(raw, func(url string) (string, json.RawMessage, error) {
+			urls = append(urls, url)
+			return url, nil, nil
+		})
+		if len(urls) == 0 {
+			continue
+		}
+		mask := isMaskPart(raw)
+		for _, url := range urls {
+			images = append(images, MessageImage{URL: url, Mask: mask})
+		}
+	}
+	return images
+}
+
+// isMaskPart reports whether an image part carries the mask tag.
+//
+// It reads the tag the way the portal's own JavaScript does (part.purpose, after
+// JSON.parse): the key exactly, and the LAST of a repeated key -- not the first, and
+// not "any of them". The tag is read by nothing but the portal and this function, so
+// there is no other reader whose looser (case-insensitive) matching it has to share,
+// and a part crafted with a repeated or differently-cased key must never be a mask to
+// the executor and a source to the bubble that shows it.
+func isMaskPart(raw json.RawMessage) bool {
+	part, ok := parseJSONObject(raw)
+	if !ok {
+		return false
+	}
+	mask := false
+	for _, member := range part {
+		if member.key != imagePurposeKey {
+			continue
+		}
+		var purpose string
+		mask = json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask
+	}
+	return mask
 }
 
 // AssistantTurn is the generated assistant message a run persists.

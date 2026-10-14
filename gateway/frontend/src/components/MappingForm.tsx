@@ -301,6 +301,8 @@ export function MappingForm({
   const [visionCapable, setVisionCapable] = useState<CapabilityChoice>(visionCapableSeed);
   const [imageCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'image'));
   const [imageCapable, setImageCapable] = useState<CapabilityChoice>(imageCapableSeed);
+  const [imageEditSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'image_edit'));
+  const [imageEdit, setImageEdit] = useState<CapabilityChoice>(imageEditSeed);
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -422,6 +424,7 @@ export function MappingForm({
       { capability: 'mtp', value: isMtp, seed: isMtpSeed },
       { capability: 'vision', value: visionCapable, seed: visionCapableSeed },
       { capability: 'image', value: imageCapable, seed: imageCapableSeed },
+      { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
     ] as const) {
       if (control.value === control.seed) continue;
       verdicts[control.capability] = control.value;
@@ -632,6 +635,31 @@ export function MappingForm({
               {t.mappingCapabilityNo}
             </option>
           )}
+        </SelectField>
+        {/* image_edit is the MIRROR of image above: it offers NO "yes", because
+            the gateway DERIVES the capability (image: yes and no image_edit: no
+            row), so unknown already means "edit is on" and a yes would be inert.
+            What the control exists for is the opt-out -- "no" -- which the
+            backend allows precisely because (image, no) is reserved: a
+            separate image_edit row is how an operator removes edit from a model
+            that still generates images. Unknown DELETES the row, taking the
+            opt-out back. A stored inert yes (the vocabulary is open, so one can
+            exist) is rendered disabled so the control shows it instead of a
+            blank that reads as unknown. */}
+        <SelectField
+          id="mapping-image-edit"
+          label={t.mappingImageEdit}
+          value={imageEdit}
+          onChange={(e) => setImageEdit(e.target.value as CapabilityChoice)}
+          {...unknownHint(imageEdit, t.mappingImageEditUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          {imageEditSeed === 'yes' && (
+            <option value="yes" disabled>
+              {t.mappingCapabilityYes}
+            </option>
+          )}
+          <option value="no">{t.mappingCapabilityNo}</option>
         </SelectField>
         {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
             numeric metrics, not a capability, and ADR-039 is explicit that it

@@ -4,8 +4,13 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"image/png"
+	"io"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"strings"
@@ -203,6 +208,77 @@ func TestMockCompleteStreamDelayReturnsPromptlyOnCanceledContext(t *testing.T) {
 
 // The seeded mock server (http://mock.local:8000) has no real socket, so the
 // mock provider must always report reachable to keep dev/seed/tests green.
+// An images path answers with the generations-shaped body sd-server returns, so
+// the gateway's images relay (and an image-edit e2e against the mock) counts one
+// image instead of reading a Responses SSE stream that has none.
+func TestMockProxyNativeImagesPathReturnsGenerationsBody(t *testing.T) {
+	for _, path := range []string{"/v1/images/edits", "/v1/images/generations"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "sd-cpp-local"}, path, []byte("ignored"), "multipart/form-data; boundary=X")
+			if err != nil {
+				t.Fatalf("ProxyNative: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("content-type = %q, want application/json", ct)
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			var out struct {
+				Created      int64  `json:"created"`
+				OutputFormat string `json:"output_format"`
+				Data         []struct {
+					B64JSON string `json:"b64_json"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(raw, &out); err != nil {
+				t.Fatalf("body %q is not JSON: %v", raw, err)
+			}
+			if out.Created == 0 || out.OutputFormat != "png" {
+				t.Fatalf("created=%d output_format=%q, want a timestamp and png", out.Created, out.OutputFormat)
+			}
+			if len(out.Data) != 1 {
+				t.Fatalf("data has %d items, want exactly 1", len(out.Data))
+			}
+			// The payload must be a real image so the portal can render the
+			// turn it produces, not just a string in the right key.
+			pngBytes, err := base64.StdEncoding.DecodeString(out.Data[0].B64JSON)
+			if err != nil {
+				t.Fatalf("b64_json is not base64: %v", err)
+			}
+			if _, err := png.Decode(bytes.NewReader(pngBytes)); err != nil {
+				t.Fatalf("b64_json does not decode as a PNG: %v", err)
+			}
+		})
+	}
+}
+
+// Every other path keeps the canned Responses-style SSE stream the mock has always
+// returned, whatever content type the caller sends.
+func TestMockProxyNativeOtherPathsKeepResponsesStream(t *testing.T) {
+	resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "qwen-coder"}, "/v1/responses", []byte(`{}`), "application/json")
+	if err != nil {
+		t.Fatalf("ProxyNative: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content-type = %q, want text/event-stream", ct)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "event: response.completed") || !strings.Contains(string(raw), "Mock native passthrough for qwen-coder") {
+		t.Fatalf("body = %q, want the Responses SSE stream echoing the model", raw)
+	}
+}
+
+func TestMockProxyNativeUnreachableFailsOnImagesPathToo(t *testing.T) {
+	_, err := NewMock().WithUnreachable(true).ProxyNative(context.Background(), routing.Target{}, "/v1/images/edits", nil, "multipart/form-data; boundary=X")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
+	}
+}
+
 func TestMockProviderProbeAlwaysReachable(t *testing.T) {
 	if err := NewMock().Probe(context.Background(), routing.Target{Endpoint: "mock://local"}, "/v1/health"); err != nil {
 		t.Fatalf("Probe returned %v, want nil", err)

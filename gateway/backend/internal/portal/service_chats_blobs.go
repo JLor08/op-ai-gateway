@@ -226,7 +226,7 @@ func isDataURL(url string) bool {
 	return len(url) >= len("data:") && strings.EqualFold(url[:len("data:")], "data:")
 }
 
-// decodeInlineImage parses data:<type>;base64,<payload> and returns the media
+// DecodeImageDataURL parses data:<type>;base64,<payload> and returns the media
 // type (canonical lower case) and the decoded bytes. Only that exact form is
 // accepted: a type outside the allow-list, a parameter (charset=...), a payload
 // that is not base64, an empty payload, or base64 that is not the standard
@@ -236,7 +236,17 @@ func isDataURL(url string) bool {
 // breaks, and set bits in the unused tail of the last character -- cannot change
 // the decoded bytes, which are what is stored, so those are simply normalised
 // away: what is served back is re-encoded as standard padded base64.
-func (s *Service) decodeInlineImage(url string) (string, []byte, error) {
+//
+// It is exported, and has no size bound of its own (decodeInlineImage adds the
+// per-blob cap), because it is the ONE definition of what an inline image url is:
+// the run commit that stores an upload and the image-run executor that sends an
+// upload (or a resolved reference, see resolveImageRunSource) as an edit's source
+// image both parse through it, so the executor cannot accept a spelling the store
+// refused, and a url it cannot read is never sent anywhere.
+func DecodeImageDataURL(url string) (string, []byte, error) {
+	if !isDataURL(url) {
+		return "", nil, ErrChatBlobTypeUnsupported
+	}
 	header, payload, ok := strings.Cut(url[len("data:"):], ",")
 	if !ok {
 		return "", nil, ErrChatBlobTypeUnsupported
@@ -252,6 +262,16 @@ func (s *Service) decodeInlineImage(url string) (string, []byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil || len(raw) == 0 {
 		return "", nil, ErrChatBlobTypeUnsupported
+	}
+	return mediaType, raw, nil
+}
+
+// decodeInlineImage is DecodeImageDataURL under the per-blob cap: a payload that
+// decodes to more than s.maxChatBlobBytes is ErrChatBlobTooLarge.
+func (s *Service) decodeInlineImage(url string) (string, []byte, error) {
+	mediaType, raw, err := DecodeImageDataURL(url)
+	if err != nil {
+		return "", nil, err
 	}
 	if len(raw) > s.maxChatBlobBytes {
 		return "", nil, ErrChatBlobTooLarge

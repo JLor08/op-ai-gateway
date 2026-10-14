@@ -255,7 +255,23 @@ evidence is not stamped on a failed write:
   backward-compatible addition. `AgentFeatures.Set` is a **full-snapshot
   replace**, never a merge. Do not add a version here: the agent version rides on
   the sample's top-level `agent_version`, which is what is persisted and
-  rendered.
+  rendered. One name the gateway gates real behaviour on is **`multipart_proxy`**
+  (declared by the agent from 0.9.0, on the agent's list only): the agent's
+  runtime router finds the child to start from the `model` **part** of a
+  `multipart/form-data` body, which an image edit
+  ([API Compatibility & Inference
+  §3.5](compatibility-and-inference.md#35-openai-images-edits)) is. Before relaying
+  an edit to an agent-launched model the gateway asks
+  `AgentFeatures.Has(serverID, "multipart_proxy")` and, when it is false, answers
+  404 `images.edit_unavailable` and relays nothing — trying the route could not
+  tell an agent without multipart support from an unmanaged model, both answering
+  `404 runtime.model_not_managed`. The registry is in memory, so the check is
+  **fail-closed**: it is false for a server that has never reported, which is
+  *every* server after a gateway restart until its next sample, and the
+  full-snapshot replace takes the grant away again from an agent that reconnects
+  as a build without the name
+  ([Agent-Managed Model Runtime
+  §7](agent-runtime-manager.md#7-feature-negotiation)).
 - **`runtimes`** — one entry per managed spec: `spec_id`, `model`, `state`,
   `since`, `pid`/`port` (omitted when there is no live process), `in_flight`,
   `restarts`, `context_size`/`active_requests`/`queue_depth` (the per-child
@@ -744,6 +760,19 @@ answering `''` there.
 The XOR then keeps the five token counts and the two rates at zero for those
 rows, which is exactly what it was built to do; no migration, no new column and
 no LLM path changed.
+
+**`/v1/images/edits` records on the same rails, with two differences worth
+stating.** The unit is the same (`image`), the quantity is the same
+response-sourced count of produced `b64_json` entries, and a failure leaves it
+`0`. What it counts is **output** images only: the source image(s) and the mask an
+edit carries are **unmetered**, so a two-input edit bills like a zero-input
+generation. And the row's `provider_path` is `/v1/images/edits`, not the
+generations path: `recordUsage` recomputes it from the flavor, so the endpoint is
+threaded through the per-call metadata (`usageMeta.Endpoint`) rather than read
+back off the relay. An edit refused before anything was relayed —
+`images.edit_unavailable`, or a prepared body too large for the agent
+(`413 request.body_too_large`) — is one error row billed as `image` with no host,
+route or provider path, because no upstream was called.
 
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
@@ -1754,9 +1783,9 @@ direction (`no` is writable for `image` here, unlike under
 `Warn`, same as the two above; the `image` verdict itself still rides the
 pass.
 
-**Three names are RESERVED and may not arrive from a probe at all: `mtp`,
-`live_progress` and `speculation_observed`.** The criterion is that this
-codebase *reasons about* all three and no detector can *observe* any of them,
+**Four names are RESERVED and may not arrive from a probe at all: `mtp`,
+`live_progress`, `speculation_observed` and `image_edit`.** The criterion is that
+this codebase *reasons about* all four and no detector can *observe* any of them,
 so a probe reporting one is reporting a publisher's string or a bug, never
 evidence. `mtp` is detected nowhere today — the row comes from the portal's
 operator checkbox (`manual`) or its model-name heuristic (`legacy`) — and it
@@ -1783,6 +1812,21 @@ most once per mapping per PROCESS lifetime, so it never rewrites what it
 wrote, and a false verdict would stand until a restart. The criterion above
 ("reasons about it, cannot observe it") is met here by the gateway's own
 observation rather than by a detector's silence.
+
+`image_edit` is the fourth, and it is **derived**, not observed by anyone:
+whether a model may be edited is `image: yes` and no operator `image_edit: no`
+row, read at the gate (`routing.ImpliedImageEdit`, [Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate)), because
+`sd-server` publishes no per-model edit signal. The only row the name ever
+carries is the operator's opt-out, written from the mapping form at `manual`
+rank, so there is no legitimate agent writer in either direction — the reverse of
+`image`, which this list deliberately leaves **off** because the `sd-server`
+probe really does write it. The harm is the `no`: an agent's rank-1
+`image_edit: no` on a mapping that generates would silently disable edit for it,
+and when the operator reset the opt-out (a deleted row is how *unknown* is stored)
+the next sample would write it back; a `yes` is inert to the gate but would show
+the operator an unvetted row as an attested capability
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)).
 
 **Write-once-at-rank-1 is what `mtp` and `speculation_observed` share, not
 what distinguishes them — do not restore an older wording that called it
@@ -1898,8 +1942,8 @@ the rules they share (`agent_ingest.go` names its sibling explicitly, and so
 does `probedCapabilityRows`).
 
 Their *differences* are what a rule has to be placed against. The
-reserved-name refusal — `mtp`, `live_progress` and `speculation_observed` may
-not arrive from a probe — lives on the **agent-ingest path only** among the
+reserved-name refusal — `mtp`, `live_progress`, `speculation_observed` and
+`image_edit` may not arrive from a probe — lives on the **agent-ingest path only** among the
 PROBE writers, deliberately: that is the boundary where an agent's bytes
 arrive, and it is the only probe path with an open vocabulary to police.
 
@@ -1916,7 +1960,10 @@ control on the mapping form able to clear it (that form submits `mtp` and
 structural half of the same argument: its one writer is the gateway's observation
 of relayed traffic, at rank 1 and at most once per mapping per process lifetime,
 so a manual row survives even a restart, and a `"no"` states something its
-vocabulary cannot mean. **`mtp` is on neither list**, because it is the one
+vocabulary cannot mean. `image_edit` is on the probe list above and **not** on this
+one: `image_edit: "no"` is the operator's own opt-out
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
+while `(image, no)`, by contrast, is reserved here. **`mtp` is on neither list**, because it is the one
 internal name that HAS an operator control, whose rank-3 permanence is exactly
 how that control is meant to work.
 

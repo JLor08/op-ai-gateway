@@ -173,6 +173,26 @@ var Features = []Feature{
 	// Since is 0.8.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "runtime_ensure", Since: "0.8.0"},
+	// multipart_proxy: this agent's runtime router takes a multipart/form-data
+	// request -- POST /v1/images/edits -- and routes it on the model in the
+	// form: it reads the part whose form-data name is "model" with
+	// mime/multipart (the parser the gateway reads the same form with, so both
+	// start the same model), starts that model's managed child, and relays the
+	// client's body to it byte for byte under the client's own Content-Type.
+	// A multipart request is always relayed as one buffered, non-streaming
+	// exchange. Like runtime_upstream_props and runtime_ensure, the GATEWAY
+	// gates real behavior on this flag, fail-closed: an image edit is relayed
+	// to an agent-launched target only on positive evidence the agent declared
+	// it, because a router without the branch json-unmarshals the body, finds
+	// no model, and answers 404 runtime.model_not_managed -- the same status
+	// and code it answers an unmanaged model with -- so trying the route cannot
+	// tell the two apart. The gateway spells the identical string in its own
+	// constant (multipartProxyFeature) for the same reason runtimeManagerFeature
+	// is duplicated: this module cannot import it.
+	//
+	// Since is 0.9.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "multipart_proxy", Since: "0.9.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

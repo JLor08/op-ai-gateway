@@ -125,8 +125,8 @@ func (c *OpenAIResponsesClient) CompleteStream(ctx context.Context, target routi
 // /responses path verbatim (the lossless Codex passthrough). It reuses
 // doNativeProxy so this ONE client serves both the passthrough and the translate
 // paths of an OpenAI subscription target.
-func (c *OpenAIResponsesClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte) (*ProxyResponse, error) {
-	return doNativeProxy(ctx, c.http, target, path, body)
+func (c *OpenAIResponsesClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
+	return doNativeProxy(ctx, c.http, target, path, body, contentType)
 }
 
 // stream POSTs body and runs the Responses SSE parse, emitting neutral events. It

@@ -183,12 +183,18 @@ func capBody(b []byte, maxBytes int) ([]byte, bool) {
 // When the translate path collected the upstream exchange, its request headers are
 // redacted (an upstream API key never leaks), its response headers stored verbatim,
 // and both translated bodies clipped to maxBytes.
+//
+// A multipart/form-data REQUEST body (an image edit) is not stored as bytes: it is
+// binary, a body is stored as a string that json.Marshal then rewrites to valid
+// UTF-8 (every invalid byte becomes U+FFFD) and clips mid-file, and the image and
+// mask parts have no business in a payload capture anyway. captureRequestBody
+// stores its text fields and each part's metadata and redacts the rest.
 func buildCaptureEnvelope(in *captureInput, maxBytes int) captureEnvelope {
-	reqBody, reqTrunc := capBody(in.RawReq, maxBytes)
+	reqBody, reqTrunc := captureRequestBody(in, maxBytes)
 	respBody, respTrunc := capBody(in.RespBody, maxBytes)
 	env := captureEnvelope{
 		ReqHeaders:  redactCaptureHeaders(in.ReqHeaders),
-		ReqBody:     string(reqBody),
+		ReqBody:     reqBody,
 		RespHeaders: cloneHeader(in.RespHeaders),
 		RespBody:    string(respBody),
 		Truncated:   reqTrunc || respTrunc,

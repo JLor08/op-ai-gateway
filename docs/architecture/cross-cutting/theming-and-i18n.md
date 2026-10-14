@@ -271,6 +271,25 @@ wrong register); a label is shared by two codes only where an explicit
 and the map is not empty. The consequence is that a new conforming error code
 needs **no test edit**, and only a convention breach or a reused label fails.
 
+**The exception is a family of codes reachable from one flow, which
+`format.test.ts` also pins by literal, in both directions.** The chat-run set
+(`portal.chat_*`, `gateway.chat_run*`, `mapping.capability_reserved`), the
+`images.*` set and the completion set each have a list of exact wire strings:
+every listed code must be mapped, and every mapped code with the family's prefix
+must be listed, so a code added to the map without being named there fails. The
+**image-edit** codes are in those lists — `images.image_required`,
+`images.edit_unavailable`, `images.mask_invalid` and
+`images.edit_unsupported_format` (the refusals of `POST /v1/images/edits` a portal
+run can relay), and the two run codes
+`gateway.chat_run_image_source_unreadable` and
+`gateway.chat_run_image_source_unsupported` — and a further test checks that each
+maps to its own key and has a non-empty, **different** German and English sentence
+that is never the bare code. A run carries only the code and no server text to
+fall back on, so each sentence has to say what the user can do: attach the image
+again, set the format to PNG or JPEG and regenerate, wait for the agent to
+report, or supply a mask the size of the source
+([API Compatibility & Inference §12](compatibility-and-inference.md#12-in-portal-chat-playground)).
+
 ## See also
 
 - [Security, Authentication & Authorization](security-auth-rbac.md) — the session/CSRF model that the theme endpoints deliberately sit outside of (they are public and pre-auth by design).

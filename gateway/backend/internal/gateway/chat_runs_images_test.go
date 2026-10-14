@@ -468,6 +468,71 @@ func TestBuildSDExtraArgsEmitsExplicitZero(t *testing.T) {
 	}
 }
 
+// strength is the edit knob: top-level in the <sd_cpp_extra_args> block (sd-server
+// reads it from there, NOT as a field of its OpenAI edits route -- where it
+// otherwise defaults to 0.75). It rides alone without dragging an empty
+// sample_params object in, and an explicit 0 is a real value, not "unset".
+func TestBuildSDExtraArgsStrengthRidesTheBlock(t *testing.T) {
+	strength := 0.9
+	got := buildSDExtraArgs(&portal.ChatImageSettings{Strength: &strength})
+	const want = `<sd_cpp_extra_args>{"strength":0.9}</sd_cpp_extra_args>`
+	if got != want {
+		t.Fatalf("block = %q, want %q (strength alone: top-level, no empty nesting)", got, want)
+	}
+
+	zero := 0.0
+	if got := buildSDExtraArgs(&portal.ChatImageSettings{Strength: &zero}); !strings.Contains(got, `"strength":0`) {
+		t.Fatalf("an explicit 0 strength was dropped as if unset: %q", got)
+	}
+
+	seed := 7
+	both := buildSDExtraArgs(&portal.ChatImageSettings{Strength: &strength, Seed: &seed, Sampler: "euler"})
+	payload := strings.TrimSuffix(strings.TrimPrefix(both, sdExtraArgsOpen), sdExtraArgsClose)
+	var decoded struct {
+		Strength     float64 `json:"strength"`
+		Seed         int     `json:"seed"`
+		SampleParams struct {
+			SampleMethod string `json:"sample_method"`
+		} `json:"sample_params"`
+	}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("block is not valid JSON (%v): %q", err, payload)
+	}
+	if decoded.Strength != 0.9 || decoded.Seed != 7 || decoded.SampleParams.SampleMethod != "euler" {
+		t.Fatalf("strength beside the other knobs: %+v", decoded)
+	}
+}
+
+// A blank strength (nil) is omitted entirely, so sd-server keeps its own default
+// (0.75): it neither forms a block on its own nor appears in one.
+func TestBuildSDExtraArgsBlankStrengthIsOmitted(t *testing.T) {
+	if got := buildSDExtraArgs(&portal.ChatImageSettings{Size: "512x512"}); got != "" {
+		t.Fatalf("no advanced knob set, yet a block was built: %q", got)
+	}
+	seed := 3
+	if got := buildSDExtraArgs(&portal.ChatImageSettings{Seed: &seed}); strings.Contains(got, "strength") {
+		t.Fatalf("an unset strength leaked into the block: %q", got)
+	}
+}
+
+// End to end through the run's request builder: the prompt carries the block with
+// the strength, after the user's text.
+func TestBuildImagesBodyCarriesStrength(t *testing.T) {
+	strength := 0.6
+	prep := imageRunPrep()
+	prep.Settings.Image = &portal.ChatImageSettings{Strength: &strength}
+
+	raw, err := buildImagesBody(prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := promptOf(t, raw)
+	if !strings.HasPrefix(prompt, "a cat") || !strings.HasSuffix(prompt, `<sd_cpp_extra_args>{"strength":0.6}</sd_cpp_extra_args>`) {
+		t.Fatalf("prompt = %q, want the user's text then the strength block", prompt)
+	}
+}
+
 // runError reads a terminal run's error message the way the existing run tests
 // do: through a subscribe() snapshot rather than the mu-guarded field.
 func runError(t *testing.T, run *ChatRun) string {
@@ -487,6 +552,10 @@ func runError(t *testing.T, run *ChatRun) string {
 type capturedUpstream struct {
 	body []byte
 	path string
+	// contentType is the request's Content-Type as the upstream received it: the
+	// edit hop sends multipart/form-data with the boundary, the generations hop
+	// JSON, and the two must never be confused.
+	contentType string
 }
 
 // imagesUpstream is a stub /v1/images/generations backend: it answers status
@@ -497,7 +566,7 @@ func imagesUpstream(t *testing.T, status int, body string) (*httptest.Server, <-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		select {
-		case seen <- capturedUpstream{body: raw, path: r.URL.Path}:
+		case seen <- capturedUpstream{body: raw, path: r.URL.Path, contentType: r.Header.Get("Content-Type")}:
 		default:
 		}
 		w.Header().Set("Content-Type", "application/json")
