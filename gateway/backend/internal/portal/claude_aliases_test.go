@@ -18,6 +18,13 @@ import (
 
 const claudeAliasPrefix = "anthropic-local-"
 
+// Fragments of the two skip diagnostics, used to tell the reserved-name skip
+// apart from the id-collision skip by their text.
+const (
+	claudeReservedWording  = "existing model, group or manual override"
+	claudeCollisionWording = "also derived from"
+)
+
 // Fixture ids found offline (see the comments at each use). They are plain
 // strings, so the tests stay a pure unit with no model views or Service.
 const (
@@ -148,10 +155,11 @@ func TestClaudeAliasIDFirstWindowKeptWhenClean(t *testing.T) {
 	}
 }
 
-func TestClaudeAliasIDSlidesPastEveryBlockedWindow(t *testing.T) {
-	// With "556f" blocked, the canonical id's offset-0 window is rejected; the
-	// digest 556f772a70b1bea2e56c... slides one char at a time until a window has
-	// no "556f": offset 1 = "56f772a70b1b" contains no "556f".
+func TestClaudeAliasIDSlidesPastBlockedFirstWindow(t *testing.T) {
+	// A one-step slide (the multi-step slide is covered by the fallback fixture
+	// test above). With "556f" blocked, the canonical id's offset-0 window is
+	// rejected; in the digest 556f772a70b1bea2e56c... offset 1 = "56f772a70b1b"
+	// is the first window without "556f".
 	swapClaudeBlockedSubstrings(t, []string{"556f"})
 	id, ok := claudeAliasID("qwen3.8-fast-loaded")
 	if !ok || id != "anthropic-local-56f772a70b1b" {
@@ -332,12 +340,23 @@ func TestClaudeAliasMapTwoIDsSameAliasSkipsBoth(t *testing.T) {
 		if !strings.Contains(d, claudeCollideAlias) {
 			t.Fatalf("diagnostic %q does not name the alias id %q", d, claudeCollideAlias)
 		}
+		if !strings.Contains(d, claudeCollisionWording) || strings.Contains(d, claudeReservedWording) {
+			t.Fatalf("diagnostic %q must use the collision wording %q, not the reserved one", d, claudeCollisionWording)
+		}
 	}
 }
 
 func TestClaudeAliasMapCollisionIsOrderIndependent(t *testing.T) {
 	gotAB, diagsAB := claudeAliasMap([]string{claudeCollideA, claudeCollideB, "gpt-oss-20b"}, nil, claudeDisplayNameFor)
 	gotBA, diagsBA := claudeAliasMap([]string{"gpt-oss-20b", claudeCollideB, claudeCollideA}, nil, claudeDisplayNameFor)
+	// Premise: both orders produce the non-trivial result (the colliding pair is
+	// skipped, the unrelated id survives), so an empty-vs-empty match cannot pass.
+	if len(gotAB) != 1 || len(gotBA) != 1 {
+		t.Fatalf("want exactly the unrelated alias in both orders, got %v and %v", gotAB, gotBA)
+	}
+	if len(diagsAB) != 2 || len(diagsBA) != 2 {
+		t.Fatalf("want one diagnostic per colliding id in both orders, got %v and %v", diagsAB, diagsBA)
+	}
 	if len(gotAB) != len(gotBA) {
 		t.Fatalf("map size depends on input order: %v vs %v", gotAB, gotBA)
 	}
@@ -401,6 +420,9 @@ func TestClaudeAliasMapReservedAliasIsSkipped(t *testing.T) {
 	if !strings.Contains(diags[0], "qwen3.8-fast-loaded") || !strings.Contains(diags[0], "anthropic-local-556f772a70b1") {
 		t.Fatalf("diagnostic %q should name the gateway id and the alias id", diags[0])
 	}
+	if !strings.Contains(diags[0], claudeReservedWording) || strings.Contains(diags[0], claudeCollisionWording) {
+		t.Fatalf("diagnostic %q must use the reserved wording %q, not the collision one", diags[0], claudeReservedWording)
+	}
 }
 
 func TestClaudeAliasMapReservedIgnoresUnrelatedNames(t *testing.T) {
@@ -423,6 +445,26 @@ func TestClaudeAliasMapReservedWinsOverCollision(t *testing.T) {
 	}
 	if len(diags) != 2 {
 		t.Fatalf("want one diagnostic per skipped id, got %d: %v", len(diags), diags)
+	}
+	// Pin the precedence by the diagnostic text: each skipped id is reported as a
+	// reserved-name skip, never with the collision wording.
+	for _, id := range []string{claudeCollideA, claudeCollideB} {
+		var found bool
+		for _, d := range diags {
+			if !strings.Contains(d, id) {
+				continue
+			}
+			found = true
+			if !strings.Contains(d, claudeReservedWording) {
+				t.Fatalf("diagnostic for %q %q must use the reserved wording %q", id, d, claudeReservedWording)
+			}
+			if strings.Contains(d, claudeCollisionWording) {
+				t.Fatalf("diagnostic for %q %q must not use the collision wording %q (reserved wins)", id, d, claudeCollisionWording)
+			}
+		}
+		if !found {
+			t.Fatalf("no diagnostic mentions %q: %v", id, diags)
+		}
 	}
 }
 
