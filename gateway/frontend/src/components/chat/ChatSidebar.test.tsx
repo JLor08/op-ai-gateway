@@ -67,12 +67,13 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     mask: null,
     handleMaskFile: vi.fn(async () => {}),
     removeMask: vi.fn(),
+    composerFocusRequest: 0,
     setModel: vi.fn(),
     setSystemPrompt: vi.fn(),
     setTemperature: vi.fn(),
     setMaxTokens: vi.fn(),
     setSelectedTokenId: vi.fn(),
-    handlersFor: vi.fn(() => ({ onEdit: () => {}, onRegenerate: () => {} })),
+    handlersFor: vi.fn(() => ({ onEdit: () => {}, onRegenerate: () => {}, onRefine: () => {} })),
     ...overrides,
   };
 }

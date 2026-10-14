@@ -132,6 +132,100 @@ func TestPrepareChatRunImageKindResolvesTheEditSourceOfAReplayedHistory(t *testi
 	requireNoGatewayURL(t, history)
 }
 
+// Iterative refine: the source of an edit turn is a GENERATED image of the thread,
+// named by the reference its assistant turn already holds. The turn is vetted and
+// stored like any other with a reference -- the blob is the chat's own, so it passes,
+// and the stored message carries the SAME reference (no new blob, no inline bytes:
+// the transcript does not grow by the image) -- and the run is handed the result's
+// bytes, fetched in one batch scoped to this chat for exactly that id. The same
+// reference held by ANOTHER chat's assistant turn is refused like any foreign source.
+func TestPrepareChatRunImageKindRefinesAGeneratedResultByReference(t *testing.T) {
+	ctx := context.Background()
+	for _, withCipher := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cipher=%v", withCipher), func(t *testing.T) {
+			e := newResolveEnv(t, withCipher, 0)
+			generate := func(chatID string, raw []byte) string {
+				t.Helper()
+				if _, err := e.sendKind(chatID, "image", json.RawMessage(`"a lighthouse"`)); err != nil {
+					t.Fatal(err)
+				}
+				if err := e.svc.CommitAssistant(ctx, e.owner, chatID, AssistantTurn{ContentParts: imageContent("", dataURL("image/png", raw))}, "complete"); err != nil {
+					t.Fatal(err)
+				}
+				ids := e.storedBlobIDs(t, chatID)
+				if len(ids) != 1 {
+					t.Fatalf("stored blob ids = %v, want the one result", ids)
+				}
+				return gatewayBlobPrefix + ids[0]
+			}
+			chatID := e.emptyChat(t)
+			result := blobTestBytes(2600, 31)
+			resultRef := generate(chatID, result)
+			e.byIDs.calls = nil
+
+			history, err := e.sendKind(chatID, "image", imageContent("make the sky purple", resultRef))
+			if err != nil {
+				t.Fatalf("PrepareChatRun: %v", err)
+			}
+
+			// The run is handed the result's own bytes, from ONE lookup scoped to this chat.
+			if len(e.byIDs.calls) != 1 || e.byIDs.calls[0].chatID != chatID || !slices.Equal(e.byIDs.calls[0].ids, []string{strings.TrimPrefix(resultRef, gatewayBlobPrefix)}) {
+				t.Fatalf("calls = %+v, want ONE batch scoped to chat %s for exactly the result", e.byIDs.calls, chatID)
+			}
+			lastURLs := messageImageURLs(history[len(history)-1].Content)
+			if len(lastURLs) != 1 {
+				t.Fatalf("the refine turn carries %d image urls, want the one source", len(lastURLs))
+			}
+			if mediaType, raw := decodeResolvedURL(t, lastURLs[0]); mediaType != "image/png" || !bytes.Equal(raw, result) {
+				t.Fatalf("the source resolved to %s with %d bytes, want the generated %d bytes", mediaType, len(raw), len(result))
+			}
+
+			// The stored turn holds the same reference as the assistant turn, and nothing
+			// inline: reused, not copied.
+			stored := docMessages(t, e.stored(t, chatID))
+			if len(stored) != 3 {
+				t.Fatalf("stored %d messages, want prompt, result, refine turn", len(stored))
+			}
+			if got := messageImageURLs(messageContentOf(t, stored[1])); !slices.Equal(got, []string{resultRef}) {
+				t.Fatalf("the assistant turn holds %v, want only the result %s", got, resultRef)
+			}
+			if got := messageImageURLs(messageContentOf(t, stored[2])); !slices.Equal(got, []string{resultRef}) {
+				t.Fatalf("the refine turn's source is %v, want the result's own reference %s", got, resultRef)
+			}
+			if ids := e.storedBlobIDs(t, chatID); !slices.Equal(ids, []string{strings.TrimPrefix(resultRef, gatewayBlobPrefix), strings.TrimPrefix(resultRef, gatewayBlobPrefix)}) {
+				t.Fatalf("stored references = %v, want the one blob named twice (no new blob for the source)", ids)
+			}
+			if strings.Contains(string(e.stored(t, chatID)), "data:") {
+				t.Fatal("the stored document gained inline bytes")
+			}
+
+			// Another chat's generated result is nobody's source here: refused, nothing stored.
+			otherChat := e.emptyChat(t)
+			foreignRef := generate(otherChat, blobTestBytes(1900, 41))
+			before := e.stored(t, chatID)
+			if _, err := e.sendKind(chatID, "image", imageContent("steal it", foreignRef)); !errors.Is(err, ErrChatBlobNotOwned) {
+				t.Fatalf("err = %v, want ErrChatBlobNotOwned for another chat's result", err)
+			}
+			if after := e.stored(t, chatID); !bytes.Equal(before, after) {
+				t.Fatal("a refused refine changed the stored document")
+			}
+		})
+	}
+}
+
+// messageContentOf is the raw `content` of one stored message (an element of
+// docMessages).
+func messageContentOf(t *testing.T, message string) json.RawMessage {
+	t.Helper()
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(message), &m); err != nil {
+		t.Fatal(err)
+	}
+	return m.Content
+}
+
 // An image thread's older messages are never resolved, a source they carried
 // included: only the LAST user message is the turn's source. A turn whose last
 // user message is plain text is a generation and touches the blob store not at all.

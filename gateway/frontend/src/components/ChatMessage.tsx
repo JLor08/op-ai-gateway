@@ -11,7 +11,7 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
-import { isMaskPart } from './shared/chatContent';
+import { imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { ImageTurn } from './ImageTurn';
@@ -32,15 +32,8 @@ function imageParts(content: ChatContent): ImagePart[] {
   return content.filter((part): part is ImagePart => part.type === 'image_url');
 }
 
-// The images of a message as the user sees them: attachments, edit sources and
-// generated results. The MASK of a masked edit is an image part too, but it is not
-// one of these -- it has its own thumbnail and its own name (contentMask below).
-function contentImages(content: ChatContent): string[] {
-  return imageParts(content)
-    .filter((part) => !isMaskPart(part))
-    .map((part) => part.image_url.url);
-}
-
+// The MASK of a masked edit is an image part too, but it is not one of a message's
+// images (imageUrlsOf) -- it has its own thumbnail and its own name.
 function contentMask(content: ChatContent): string | undefined {
   return imageParts(content).find(isMaskPart)?.image_url.url;
 }
@@ -68,6 +61,7 @@ function ChatMessageComponent({
   tokensPerSecond,
   onEdit,
   onRegenerate,
+  onRefine,
   canRun = true,
 }: Readonly<{
   t: Translation;
@@ -107,13 +101,19 @@ function ChatMessageComponent({
   tokensPerSecond?: number;
   onEdit?: (text: string) => void;
   onRegenerate?: () => void;
+  // Refine a generated image in place: given the url of ONE of this assistant turn's
+  // images, the store makes it the source of the next edit. Supplied (by Chat.tsx, from
+  // the store's per-message handler cache) only where that can run -- an image thread
+  // whose model may be edited -- so a turn without it simply offers no control. Only
+  // the assistant branch has images to refine; a user turn never shows one.
+  onRefine?: (url: string) => void;
   // Whether a new run may be started. False while the model is unavailable —
   // the Edit/Regenerate controls (which each start a run) are disabled to match
   // the blocked Send. Defaults true so callers that don't gate stay unchanged.
   canRun?: boolean;
 }>) {
   const text = contentText(content);
-  const images = contentImages(content);
+  const images = imageUrlsOf(content);
   const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -300,7 +300,13 @@ function ChatMessageComponent({
           )}
         </Box>
         {images.length > 0 && (
-          <ImageTurn t={t} images={images} prompt={promptText} turnId={turnId ?? ''} />
+          <ImageTurn
+            t={t}
+            images={images}
+            prompt={promptText}
+            turnId={turnId ?? ''}
+            onRefine={onRefine}
+          />
         )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (

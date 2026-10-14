@@ -187,6 +187,17 @@ export function userTurnContent(
   return parts;
 }
 
+// The url a stored image is served from: /api/portal/chat-blobs/{id}, owner-scoped to
+// the chat that holds the blob. A transcript's image part is one of these once its
+// run is committed (images live out of the document), and a refine reuses it as the
+// source of the next edit. Bound to ITS chat, unlike an inline data url, which is just
+// bytes and goes wherever the composer goes.
+const CHAT_BLOB_URL_PREFIX = '/api/portal/chat-blobs/';
+
+export function isChatBlobUrl(url: string): boolean {
+  return url.startsWith(CHAT_BLOB_URL_PREFIX);
+}
+
 // The formats the edit route of sd-server reads a source image in. The composer
 // takes no other one for an edit (the picker's `accept`, and handleFiles, which an
 // `accept` cannot bind), so a webp or gif source is refused where the user can

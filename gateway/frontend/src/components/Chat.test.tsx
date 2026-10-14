@@ -1704,6 +1704,267 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // Iterative refine: a per-image action on a GENERATED image seeds the composer
+  // with that image as the source of the next edit, by its existing stored
+  // reference. The user types the instruction and sends; from there it is an
+  // ordinary edit turn (the prompt rule, the optional mask, the replay handling).
+  describe(`Chat: refining a generated image in place (ADR-043 R1) [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const noEditModel: ModelOption = {
+      ...editModel,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const visionModel: ModelOption = {
+      id: 'vision-model',
+      display_name: 'vision-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+    const resultRef = '/api/portal/chat-blobs/blob_result';
+    const uploadRef = '/api/portal/chat-blobs/blob_upload';
+
+    // A chat holding one generation: the prompt and its result, as the server stores
+    // them (the image is a gateway reference, not inline bytes).
+    function seedGeneration(model: ModelOption, kind = 'image', extra: unknown[] = []) {
+      chatApi.rows.push({
+        id: 'c_refine',
+        title: 'Lighthouse',
+        created_at: '2026-07-19T12:00:00Z',
+        updated_at: '2026-07-19T12:00:00Z',
+        content: {
+          settings: { model: model.id, ...(kind ? { kind } : {}) },
+          messages: [
+            { id: 'u1', role: 'user', content: 'a lighthouse' },
+            {
+              id: 'a1',
+              role: 'assistant',
+              content: [{ type: 'image_url', image_url: { url: resultRef } }],
+              status: 'complete',
+            },
+            ...extra,
+          ],
+        },
+      });
+    }
+    const refineControl = () => screen.queryByRole('button', { name: t.chatRefineImage });
+    function attachSource(name = 'source.png') {
+      fireEvent.change(screen.getByLabelText(t.chatAttachImage), {
+        target: { files: [new File(['s'], name, { type: 'image/png' })] },
+      });
+    }
+    function attachMask() {
+      fireEvent.change(screen.getByLabelText(t.chatAttachMask), {
+        target: { files: [new File(['m'], 'mask.png', { type: 'image/png' })] },
+      });
+    }
+
+    it('offers the action on the generated image of an image thread with an edit-capable model', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+
+      expect(await screen.findByRole('button', { name: t.chatRefineImage })).toBeInTheDocument();
+    });
+
+    it('seeds the composer with the image by its stored reference, focuses the prompt, and sends that reference as the source', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+
+      fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+
+      // The composer's thumbnail is the result's own url -- not a fetched copy.
+      const thumbnail = await screen.findByAltText(t.chatAttachedImage);
+      expect(thumbnail).toHaveAttribute('src', resultRef);
+      // The user's next move is the instruction: the prompt field has the focus.
+      const prompt = screen.getByLabelText(t.chatImagePromptLabel);
+      await waitFor(() => expect(prompt).toHaveFocus());
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+
+      fireEvent.change(prompt, { target: { value: 'make the sky purple' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.settings.kind).toBe('image');
+      expect(body.user_message).toStrictEqual([
+        { type: 'text', text: 'make the sky purple' },
+        { type: 'image_url', image_url: { url: resultRef } },
+      ]);
+      // Nothing was copied into the request: no inline bytes anywhere.
+      expect(JSON.stringify(body)).not.toContain('data:');
+    });
+
+    it('does not send a refine without an instruction: the image stays attached and the field says why', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+      fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+      await screen.findByAltText(t.chatAttachedImage);
+
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditPromptRequired);
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByAltText(t.chatAttachedImage)).toHaveAttribute('src', resultRef);
+    });
+
+    it('lets the user add a mask to the refine, which rides the same turn after the source', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+      fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+      await screen.findByAltText(t.chatAttachedImage);
+
+      // The mask slot is open (a source is attached) and nothing was attached for us.
+      expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
+      attachMask();
+      await screen.findByAltText(t.chatAttachedMask);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'fill the sky' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      expect(body.user_message).toStrictEqual([
+        { type: 'text', text: 'fill the sky' },
+        { type: 'image_url', image_url: { url: resultRef } },
+        {
+          type: 'image_url',
+          image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+          purpose: 'mask',
+        },
+      ]);
+    });
+
+    it('swaps a source attached by hand for the refined image, and drops the mask that belonged to it', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+      attachSource();
+      await screen.findByAltText(t.chatAttachedImage);
+      attachMask();
+      await screen.findByAltText(t.chatAttachedMask);
+
+      fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+
+      await waitFor(() =>
+        expect(screen.getByAltText(t.chatAttachedImage)).toHaveAttribute('src', resultRef),
+      );
+      // One source, and the old source's mask is gone with it: it was drawn for
+      // another image and would not fit this one.
+      expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+      expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
+    });
+
+    it('is not offered on an image thread whose model cannot be edited', async () => {
+      seedGeneration(noEditModel);
+      renderChat(tokens, [noEditModel]);
+      await screen.findByText('Lighthouse');
+      // The generated image itself is there...
+      expect(await screen.findByRole('button', { name: t.chatDownloadImage })).toBeInTheDocument();
+
+      // ...but the action is not: it could not run.
+      expect(refineControl()).toBeNull();
+    });
+
+    it('is not offered on a text thread', async () => {
+      seedGeneration(visionModel, '');
+      renderChat(tokens, [visionModel]);
+      await screen.findByText('Lighthouse');
+      expect(await screen.findByRole('button', { name: t.chatDownloadImage })).toBeInTheDocument();
+
+      expect(refineControl()).toBeNull();
+    });
+
+    it('follows the picked model: gone on one that cannot edit, back on one that can', async () => {
+      seedGeneration(editModel);
+      renderChat(tokens, [editModel, noEditModel]);
+      await screen.findByText('Lighthouse');
+      expect(await screen.findByRole('button', { name: t.chatRefineImage })).toBeInTheDocument();
+
+      await pickOption(t.chatModel, noEditModel.display_name);
+      await waitFor(() => expect(refineControl()).toBeNull());
+
+      await pickOption(t.chatModel, editModel.display_name);
+      expect(await screen.findByRole('button', { name: t.chatRefineImage })).toBeInTheDocument();
+    });
+
+    it('is for generated results only: the source image of an earlier edit has no such control', async () => {
+      seedGeneration(editModel, 'image', [
+        {
+          id: 'u2',
+          role: 'user',
+          content: [
+            { type: 'text', text: 'make it blue' },
+            { type: 'image_url', image_url: { url: uploadRef } },
+          ],
+        },
+        {
+          id: 'a2',
+          role: 'assistant',
+          content: [{ type: 'image_url', image_url: { url: '/api/portal/chat-blobs/blob_two' } }],
+          status: 'complete',
+        },
+      ]);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+
+      // Two generated results, two controls; the user turn's thumbnail adds none.
+      await waitFor(() =>
+        expect(screen.getAllByRole('button', { name: t.chatRefineImage })).toHaveLength(2),
+      );
+      expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+    });
+
+    it('refines the image the user clicked: a newer result seeds ITS reference', async () => {
+      const newerRef = '/api/portal/chat-blobs/blob_newer';
+      seedGeneration(editModel, 'image', [
+        {
+          id: 'u2',
+          role: 'user',
+          content: [
+            { type: 'text', text: 'make it blue' },
+            { type: 'image_url', image_url: { url: resultRef } },
+          ],
+        },
+        {
+          id: 'a2',
+          role: 'assistant',
+          content: [{ type: 'image_url', image_url: { url: newerRef } }],
+          status: 'complete',
+        },
+      ]);
+      renderChat(tokens, [editModel]);
+      await screen.findByText('Lighthouse');
+      await waitFor(() =>
+        expect(screen.getAllByRole('button', { name: t.chatRefineImage })).toHaveLength(2),
+      );
+
+      fireEvent.click(screen.getAllByRole('button', { name: t.chatRefineImage })[1]);
+
+      // The sent turn's thumbnail (the older result, as u2's source) wears the same
+      // alt text as the composer's, so tell the composer's by what only it can hold:
+      // the newer result's reference.
+      await waitFor(() =>
+        expect(
+          screen.getAllByAltText(t.chatAttachedImage).map((img) => img.getAttribute('src')),
+        ).toContain(newerRef),
+      );
+    });
+  });
+
   describe(`Chat: the advanced image controls follow the picked model's options [${locale}]`, () => {
     const imageModels: ModelOption[] = [
       {

@@ -10,6 +10,7 @@ import {
   MASK_PURPOSE,
   imageSetting,
   imageSettingsFrom,
+  isChatBlobUrl,
   isMaskPart,
   kindSetting,
   lastUserHasImage,
@@ -20,6 +21,7 @@ import {
   userTurnContent,
   type ChatUiMessage,
 } from './chatDoc';
+import { imageUrlsOf } from '../shared/chatContent';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {
@@ -369,5 +371,42 @@ describe('the mask part', () => {
         imagePart(src),
       ]);
     });
+  });
+});
+
+// What a refine hands the composer is one of a generated turn's image urls, kept as
+// the reference it is: the list is every image part but the edit's mask, and a stored
+// image's url is told by its serving path.
+describe('the images of a message', () => {
+  const ref = '/api/portal/chat-blobs/blob_abc';
+  const textPart = (text: string) => ({ type: 'text' as const, text });
+  const imagePart = (url: string) => ({ type: 'image_url' as const, image_url: { url } });
+
+  it('lists the urls of the image parts in order, text and the mask left out', () => {
+    expect(
+      imageUrlsOf([
+        textPart('x'),
+        imagePart(ref),
+        imagePart('data:image/png;base64,SRC'),
+        maskPart('data:image/png;base64,MASK'),
+      ]),
+    ).toEqual([ref, 'data:image/png;base64,SRC']);
+  });
+
+  it('is empty for a text-only message, whatever its shape', () => {
+    expect(imageUrlsOf('plain')).toEqual([]);
+    expect(imageUrlsOf([textPart('x')])).toEqual([]);
+    expect(imageUrlsOf([])).toEqual([]);
+  });
+
+  it('keeps a stored reference exactly as it is: no copy, no rewrite', () => {
+    expect(imageUrlsOf([imagePart(ref)])[0]).toBe(ref);
+  });
+
+  it('tells a chat-bound stored image from bytes that go wherever the composer goes', () => {
+    expect(isChatBlobUrl(ref)).toBe(true);
+    expect(isChatBlobUrl('data:image/png;base64,AAAA')).toBe(false);
+    expect(isChatBlobUrl('https://example.test/api/portal/chat-blobs/blob_abc')).toBe(false);
+    expect(isChatBlobUrl('')).toBe(false);
   });
 });

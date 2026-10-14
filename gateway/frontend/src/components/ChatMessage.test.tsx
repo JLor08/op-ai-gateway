@@ -313,6 +313,58 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
     });
 
+    describe('refining a generated image', () => {
+      const first = '/api/portal/chat-blobs/blob_first';
+      const second = '/api/portal/chat-blobs/blob_second';
+      const twoImages = [
+        { type: 'image_url' as const, image_url: { url: first } },
+        { type: 'image_url' as const, image_url: { url: second } },
+      ];
+
+      it("offers one refine control per image, handing over that image's own url", () => {
+        const onRefine = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            promptText="two cats"
+            content={twoImages}
+            onRefine={onRefine}
+          />,
+        );
+
+        const buttons = screen.getAllByRole('button', { name: t.chatRefineImage });
+        expect(buttons).toHaveLength(2);
+        fireEvent.click(buttons[1]);
+        expect(onRefine).toHaveBeenCalledTimes(1);
+        expect(onRefine).toHaveBeenLastCalledWith(second);
+        fireEvent.click(buttons[0]);
+        expect(onRefine).toHaveBeenLastCalledWith(first);
+      });
+
+      it('offers none unless the store allows it: the default is no control', () => {
+        render(<ChatMessage t={t} role="assistant" content={twoImages} />);
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+        // The download control is unaffected.
+        expect(screen.getAllByRole('button', { name: t.chatDownloadImage })).toHaveLength(2);
+      });
+
+      it('never puts one on an image of a user turn, whatever is passed', () => {
+        render(
+          <ChatMessage t={t} role="user" content={twoImages} onEdit={vi.fn()} onRefine={vi.fn()} />,
+        );
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+      });
+
+      it('has no control on a message without an image', () => {
+        render(<ChatMessage t={t} role="assistant" content="just words" onRefine={vi.fn()} />);
+
+        expect(screen.queryByRole('button', { name: t.chatRefineImage })).toBeNull();
+      });
+    });
+
     it('renders a revised prompt as ordinary text beside the image', () => {
       render(
         <ChatMessage

@@ -3,6 +3,7 @@
 
 import { useState } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
+import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
 import DownloadIcon from '@mui/icons-material/Download';
 import { downloadBinary } from './shared/downloadBinary';
 import type { Translation } from './shared/types';
@@ -40,16 +41,24 @@ function downloadNameFor(turnId: string, index: number, extension: string): stri
 // rather than arriving from ChatMessage as an onDownload prop -- an inline arrow
 // built in the parent's render would give every message a new callback
 // identity on every render and defeat ChatMessage's shallow-compare memo.
+//
+// The refine control is the opposite case and is handed in: it needs the store, and
+// the store's per-message handler (ChatStore.handlersFor) is cached, hence stable. It
+// takes the image's url, which is only known here, so what arrives is the one
+// callback of the turn and this component calls it with the image it sits under. It
+// is absent (no control) whenever the store cannot run a refine.
 export function ImageTurn({
   t,
   images,
   prompt,
   turnId,
+  onRefine,
 }: Readonly<{
   t: Translation;
   images: string[];
   prompt?: string;
   turnId: string;
+  onRefine?: (url: string) => void;
 }>) {
   // The prompt is the accessible name when we have one; chatGeneratedImage is
   // the fallback for a transcript whose preceding user turn is gone (an old
@@ -104,28 +113,40 @@ export function ImageTurn({
               borderRadius: '6px',
             }}
           />
-          <Tooltip title={t.chatDownloadImage}>
-            <IconButton
-              size="small"
-              aria-label={t.chatDownloadImage}
-              onClick={() => {
-                // The name is a function of the extension because a stored
-                // image's media type is only known once its bytes have been
-                // fetched; a legacy data: URL gets its extension from its own
-                // prefix through the same call. downloadBinary resolves false
-                // for every failure it knows of; the catch is for the one it
-                // does not (a browser API throwing while the file is built), so
-                // that surfaces as the same inline error instead of an
-                // unhandled rejection.
-                void downloadBinary((extension) => downloadNameFor(turnId, index, extension), url)
-                  .then((ok) => setFailedIndex(ok ? null : index))
-                  .catch(() => setFailedIndex(index));
-              }}
-              sx={{ alignSelf: 'flex-end' }}
-            >
-              <DownloadIcon fontSize="small" />
-            </IconButton>
-          </Tooltip>
+          <Box sx={{ display: 'flex', gap: 0.5, alignSelf: 'flex-end' }}>
+            {onRefine && (
+              <Tooltip title={t.chatRefineImage}>
+                <IconButton
+                  size="small"
+                  aria-label={t.chatRefineImage}
+                  onClick={() => onRefine(url)}
+                >
+                  <AutoFixHighIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            )}
+            <Tooltip title={t.chatDownloadImage}>
+              <IconButton
+                size="small"
+                aria-label={t.chatDownloadImage}
+                onClick={() => {
+                  // The name is a function of the extension because a stored
+                  // image's media type is only known once its bytes have been
+                  // fetched; a legacy data: URL gets its extension from its own
+                  // prefix through the same call. downloadBinary resolves false
+                  // for every failure it knows of; the catch is for the one it
+                  // does not (a browser API throwing while the file is built), so
+                  // that surfaces as the same inline error instead of an
+                  // unhandled rejection.
+                  void downloadBinary((extension) => downloadNameFor(turnId, index, extension), url)
+                    .then((ok) => setFailedIndex(ok ? null : index))
+                    .catch(() => setFailedIndex(index));
+                }}
+              >
+                <DownloadIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          </Box>
           {failedIndex === index && (
             <Typography role="alert" color="error" sx={{ fontSize: 12 }}>
               {t.chatImageDownloadError}

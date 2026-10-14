@@ -27,7 +27,7 @@ import type {
 import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
-import type { ChatContent } from '../shared/chatContent';
+import { imageUrlsOf, type ChatContent } from '../shared/chatContent';
 import { prepareImageDataUrl, ImageAttachError, isHeicFile } from '../shared/imageAttach';
 import { offeredFlavors } from '../shared/offeredFlavors';
 import {
@@ -44,6 +44,7 @@ import {
   historyHasImage,
   imageSetting,
   imageSettingsFrom,
+  isChatBlobUrl,
   lastUserHasImage,
   lastUserText,
   lsGet,
@@ -81,6 +82,15 @@ export {
   IMAGE_SIZE_OPTIONS,
   optionsOr,
 } from './chatDoc';
+
+// The per-message actions the transcript's rows are handed (handlersFor): the user
+// turn's edit, the assistant turn's regenerate, and -- on a generated image -- the
+// refine that makes it the source of the next edit.
+type MessageHandlers = {
+  onEdit: (text: string) => void;
+  onRegenerate: () => void;
+  onRefine: (url: string) => void;
+};
 
 export type ChatStore = {
   messages: ChatUiMessage[];
@@ -234,12 +244,17 @@ export type ChatStore = {
   mask: string | null;
   handleMaskFile: (fileList: FileList | null) => Promise<void>;
   removeMask: () => void;
+  // A counter the composer watches: it moves each time a refine seeds the composer,
+  // which is the view's cue to put the cursor in the prompt field (the user's next
+  // move is the instruction, and the composer may be far below the image they clicked).
+  // Only its CHANGE means anything; it is 0 until the first refine.
+  composerFocusRequest: number;
   setModel: Dispatch<SetStateAction<string>>;
   setSystemPrompt: Dispatch<SetStateAction<string>>;
   setTemperature: Dispatch<SetStateAction<number>>;
   setMaxTokens: Dispatch<SetStateAction<number>>;
   setSelectedTokenId: Dispatch<SetStateAction<string>>;
-  handlersFor: (id: string) => { onEdit: (text: string) => void; onRegenerate: () => void };
+  handlersFor: (id: string) => MessageHandlers;
 };
 
 // The user-facing sentence for a failed attachment: the reason an image could not be
@@ -343,6 +358,7 @@ export function ChatStoreProvider({
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
   const [mask, setMask] = useState<string | null>(null);
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [selectedTokenId, setSelectedTokenId] = useState<string>(DEFAULTS.run_as_token_id);
   const [serverOverride, setServerOverride] = useState<string>(DEFAULTS.server_override);
   const [serverOverrideForceUnreachable, setServerOverrideForceUnreachable] = useState<boolean>(
@@ -686,9 +702,7 @@ export function ChatStoreProvider({
 
   // Cache per-message callbacks so memoized ChatMessage children keep stable
   // prop references across re-renders.
-  const handlerCacheRef = useRef(
-    new Map<string, { onEdit: (text: string) => void; onRegenerate: () => void }>(),
-  );
+  const handlerCacheRef = useRef(new Map<string, MessageHandlers>());
 
   // Load a chat's content into the active state. Calls persistence's
   // skipNextSave so the resulting state changes do not trigger an immediate
@@ -750,6 +764,11 @@ export function ChatStoreProvider({
       messagesRef.current = seed;
       chatBuffers.set(chat.id, seed);
       handlerCacheRef.current.clear();
+      // A source seeded by a refine is a reference to a blob of the chat it was
+      // refined in, so it does not follow the user to another chat: sent there the run
+      // would be refused (images.blob_not_owned). An uploaded image is just bytes and
+      // goes where the composer goes, as it always did.
+      setImages((prev) => prev.filter((url) => !isChatBlobUrl(url)));
       setActiveChatId(chat.id);
       activeChatIdRef.current = chat.id;
       activeTitleRef.current = chat.title ?? '';
@@ -1163,6 +1182,52 @@ export function ChatStoreProvider({
     [startRunWithHistory, isRunning],
   );
 
+  // Refine a generated image in place: seed the composer with it as the source of the
+  // next edit, BY REFERENCE. The url is the image part's own /api/portal/chat-blobs/{id}
+  // (an old chat's inline data url is the one other shape it can have), so the source
+  // part of the turn the user sends is that same string -- nothing is fetched, copied
+  // or re-embedded, and the transcript never grows by the image's bytes. The run's
+  // commit vets the reference like any other (it must be a blob of THIS chat), and the
+  // executor resolves it to bytes as it does a stored source (PrepareChatRun).
+  //
+  // It only SEEDS: an edit is the prompt applied to the image, so the user types the
+  // instruction and sends, and send() holds the prompt rule as it does for an upload.
+  // Nothing is started or stored here, and no mask is attached for them (the mask slot
+  // is theirs, as it is for any source).
+  //
+  // Same gates as the attach control and the replay guard, from the same predicate: an
+  // edit-capable model on an image thread (attachMode 'edit'), and no live run in this
+  // chat. The view offers the control only where both hold; this refuses the rest
+  // (a stale click, a model switched between render and click) in the same words.
+  // Scope is the generated result: an assistant turn's own image, by id and url, so a
+  // user turn's image or a url the turn does not hold is a no-op, not a source.
+  const refineImage = useCallback(
+    (id: string, url: string) => {
+      const chatId = activeChatIdRef.current;
+      if (!chatId) return;
+      const message = messagesRef.current.find((m) => m.id === id);
+      if (message?.role !== 'assistant' || !imageUrlsOf(message.content).includes(url)) return;
+      if (isRunning(chatId)) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return;
+      }
+      if (attachModeRef.current !== 'edit') {
+        showErrorRef.current(
+          modelImageCapableRef.current
+            ? tRef.current.chatImageGeneratorNoInput
+            : tRef.current.chatImageModelUnsupported,
+        );
+        return;
+      }
+      // An edit has ONE source, so the refined image takes the place of whatever was
+      // attached -- and of the mask drawn for that: it would not fit this image.
+      setImages([url]);
+      setMask(null);
+      setComposerFocusRequest((n) => n + 1);
+    },
+    [isRunning],
+  );
+
   const handlersFor = useCallback(
     (id: string) => {
       const cache = handlerCacheRef.current;
@@ -1171,12 +1236,13 @@ export function ChatStoreProvider({
         handlers = {
           onEdit: (text: string) => editUserMessage(id, text),
           onRegenerate: () => regenerate(id),
+          onRefine: (url: string) => refineImage(id, url),
         };
         cache.set(id, handlers);
       }
       return handlers;
     },
-    [editUserMessage, regenerate],
+    [editUserMessage, regenerate, refineImage],
   );
 
   // Send the composed message: append the optimistic user bubble, clear the
@@ -1570,6 +1636,7 @@ export function ChatStoreProvider({
     mask,
     handleMaskFile,
     removeMask,
+    composerFocusRequest,
     setModel,
     setSystemPrompt,
     setTemperature,

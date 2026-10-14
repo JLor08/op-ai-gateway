@@ -450,6 +450,150 @@ func TestImageRunEditsFromAStoredReferenceWithoutCopyingIt(t *testing.T) {
 	}
 }
 
+// Iterative refine (ADR-043 R1): the source of an edit turn is a GENERATED image of
+// the thread, named by the /chat-blobs/{id} reference its own assistant turn already
+// holds. Nothing here is specific to a generated blob -- it is the stored-reference
+// path above -- but this is the shape the portal's "refine this image" action sends,
+// so it is pinned whole, through the real portal service and the loopback: the
+// executor resolves the result's reference to its bytes and posts them as the
+// multipart `image`; the turn that names it stores the SAME reference (no new blob,
+// no inline bytes, so the transcript never grows by the image); and replaying the
+// refine turn (regenerate, edit: the history the browser holds, references and all)
+// edits the same bytes again.
+func TestImageRunRefinesAGeneratedResultFromItsStoredReference(t *testing.T) {
+	generated := editSourceBytes(7000, 9)
+	upstream, seen := imagesUpstream(t, http.StatusOK,
+		fmt.Sprintf(`{"created":1,"output_format":"png","data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(generated)))
+	chats := store.NewMemoryChatStore(0)
+	srv, _, owner, _ := newImageRunTestServerWithChats(t, upstream.URL, chats)
+	ctx := context.Background()
+	created, err := srv.Portal.CreateChat(ctx, owner, portal.CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatID := created.ID
+
+	run := func(req portal.PrepareRunRequest) capturedUpstream {
+		t.Helper()
+		req.Settings = portal.ChatRunSettings{Model: "sd-turbo", Kind: chatRunKindImage}
+		history, settings, err := srv.Portal.PrepareChatRun(ctx, owner, chatID, req)
+		if err != nil {
+			t.Fatalf("PrepareChatRun: %v", err)
+		}
+		r, got, ok := runToTerminal(t, srv, owner, chatID, PrepareRunResult{History: history, Settings: settings}, seen)
+		if r.statusValue() != "completed" || !ok {
+			t.Fatalf("status = %q (err %q), upstream saw a request: %v", r.statusValue(), runError(t, r), ok)
+		}
+		return got
+	}
+	// stored is the chat's transcript as the browser would hold it: the messages with
+	// their image references, and the blobs those references name.
+	stored := func() (messages []json.RawMessage, blobs []storedImageBlob) {
+		t.Helper()
+		chat, err := srv.Portal.GetChat(ctx, owner, chatID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(chat.Content), "data:") {
+			t.Fatalf("the transcript holds inline image bytes: %.200s", chat.Content)
+		}
+		var doc struct {
+			Messages []json.RawMessage `json:"messages"`
+		}
+		if err := json.Unmarshal(chat.Content, &doc); err != nil {
+			t.Fatal(err)
+		}
+		return doc.Messages, storedImageBlobs(t, chats, chat.Content)
+	}
+
+	// Turn 1: a plain prompt -- a generation. Its result is stored as a blob and the
+	// assistant turn references it.
+	got := run(portal.PrepareRunRequest{UserMessage: json.RawMessage(`"a lighthouse"`)})
+	if got.path != "/v1/images/generations" {
+		t.Fatalf("first turn path = %q, want a generation", got.path)
+	}
+	_, blobs := stored()
+	if len(blobs) != 1 || !bytes.Equal(blobs[0].plain, generated) {
+		t.Fatalf("after the generation the transcript names %d blobs, want the one result (its %d bytes)", len(blobs), len(generated))
+	}
+	resultRef := "/api/portal/chat-blobs/" + blobs[0].ID
+
+	// Turn 2: refine -- the source part is the result's own reference.
+	refineMessage := json.RawMessage(fmt.Sprintf(`[{"type":"text","text":"make the sky purple"},{"type":"image_url","image_url":{"url":%q}}]`, resultRef))
+	got = run(portal.PrepareRunRequest{UserMessage: refineMessage})
+	if got.path != "/v1/images/edits" {
+		t.Fatalf("refine path = %q, want the edit", got.path)
+	}
+	parts := parseEditBody(t, got)
+	imgs := editImageParts(parts)
+	if len(imgs) != 1 || imgs[0].name != "image" || imgs[0].contentType != "image/png" {
+		t.Fatalf("the edit carries %d image parts (first %+v), want the one source as `image`, image/png", len(imgs), imgs)
+	}
+	if !bytes.Equal(imgs[0].data, generated) {
+		t.Fatalf("the source reached the upstream as %d bytes, want the generated result's %d (byte for byte)", len(imgs[0].data), len(generated))
+	}
+	if prompt, _ := editField(t, parts, "prompt"); !strings.HasPrefix(prompt, "make the sky purple") {
+		t.Fatalf("prompt = %.60q, want the instruction typed next to the source", prompt)
+	}
+
+	// No copy: the refine turn points at the very blob the assistant turn does. A new
+	// blob for the source would mean the image's bytes were duplicated on the way.
+	messages, blobs := stored()
+	if len(blobs) != 3 {
+		t.Fatalf("the transcript names %d blobs, want result, the refine turn's source, new result", len(blobs))
+	}
+	if blobs[1].ID != blobs[0].ID {
+		t.Fatalf("the refine turn's source is blob %s, want the result's %s (a reference, not a copy)", blobs[1].ID, blobs[0].ID)
+	}
+	if blobs[2].ID == blobs[0].ID {
+		t.Fatal("the refined result reuses the old result's blob: it is a new image and gets its own")
+	}
+	if len(messages) != 4 {
+		t.Fatalf("the transcript holds %d messages, want prompt, result, refine turn, refined result", len(messages))
+	}
+
+	// Replay of the refine turn (regenerate): the browser sends back the history up to
+	// it as it holds it, references and all. The source resolves again and the
+	// transcript is again free of inline bytes.
+	got = run(portal.PrepareRunRequest{EditedHistory: messages[:3]})
+	if got.path != "/v1/images/edits" {
+		t.Fatalf("replayed refine path = %q, want the edit", got.path)
+	}
+	if imgs := editImageParts(parseEditBody(t, got)); len(imgs) != 1 || !bytes.Equal(imgs[0].data, generated) {
+		t.Fatal("the replayed refine did not edit the generated result byte for byte")
+	}
+	messages, blobs = stored()
+	if len(messages) != 4 || len(blobs) != 3 || blobs[1].ID != blobs[0].ID {
+		t.Fatalf("after the replay: %d messages, %d blobs (source blob %s, result %s), want the same shape with the source still the result's reference", len(messages), len(blobs), blobs[1].ID, blobs[0].ID)
+	}
+
+	// Edit of the refine turn's instruction keeps its source part: same history, the
+	// prompt text replaced.
+	var edited map[string]any
+	if err := json.Unmarshal(messages[2], &edited); err != nil {
+		t.Fatal(err)
+	}
+	editedParts := edited["content"].([]any)
+	editedParts[0] = map[string]any{"type": "text", "text": "make the sky green"}
+	editedRaw, err := json.Marshal(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = run(portal.PrepareRunRequest{EditedHistory: []json.RawMessage{messages[0], messages[1], editedRaw}})
+	parts = parseEditBody(t, got)
+	if prompt, _ := editField(t, parts, "prompt"); !strings.HasPrefix(prompt, "make the sky green") {
+		t.Fatalf("prompt = %.60q, want the edited instruction", prompt)
+	}
+	if imgs := editImageParts(parts); len(imgs) != 1 || !bytes.Equal(imgs[0].data, generated) {
+		t.Fatal("the edited refine did not keep its source")
+	}
+	if _, blobs = stored(); blobs[1].ID != blobs[0].ID {
+		t.Fatalf("after the edit the refine turn's source is blob %s, want the result's %s", blobs[1].ID, blobs[0].ID)
+	}
+}
+
 // A source the chat does not hold never reaches the executor: the run is refused
 // at its start, so there is nothing to send -- and above all no foreign bytes.
 func TestImageRunRefusesAForeignSourceBeforeAnythingIsSent(t *testing.T) {

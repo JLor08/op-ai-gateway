@@ -42,3 +42,17 @@ export function maskPart(url: string): ChatContentPart {
 export function isMaskPart(part: ChatContentPart): boolean {
   return part.type === 'image_url' && part.purpose === MASK_PURPOSE;
 }
+
+type ImagePart = Extract<ChatContentPart, { type: 'image_url' }>;
+
+// The urls of the images of a message as the user sees them -- attachments, an edit's
+// source, generated results -- in order: every image part but the MASK of an edit,
+// which is shown apart under its own name. What a refine hands the composer as the
+// source is one of these (a generated result's /chat-blobs/{id} reference), and the
+// message renderer lists exactly these.
+export function imageUrlsOf(content: ChatContent): string[] {
+  if (typeof content === 'string') return [];
+  return content
+    .filter((part): part is ImagePart => part.type === 'image_url' && !isMaskPart(part))
+    .map((part) => part.image_url.url);
+}

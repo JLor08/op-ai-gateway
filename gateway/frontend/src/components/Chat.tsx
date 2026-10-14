@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useState, type SubmitEvent } from 'react';
+import { useEffect, useRef, useState, type SubmitEvent } from 'react';
 import {
   Box,
   Button,
@@ -153,6 +153,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // power-user controls below the common size/count/format settings.
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(readSidebarCollapsed);
+
+  // A refine (the per-image action on a generated result) seeds the composer with that
+  // image as the source of the next edit; the user's next move is to say what to
+  // change, and the composer may be far below the image they clicked, so the prompt
+  // field takes the focus (which also scrolls it into view). The store only bumps a
+  // counter; the view acts on a CHANGE of it, so a remount of this view (the store
+  // lives above the view switch) does not replay an old refine.
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+  const handledFocusRequest = useRef(c.composerFocusRequest);
+  useEffect(() => {
+    if (handledFocusRequest.current === c.composerFocusRequest) return;
+    handledFocusRequest.current = c.composerFocusRequest;
+    promptRef.current?.focus();
+  }, [c.composerFocusRequest]);
 
   function toggleSidebar() {
     setSidebarCollapsed((prev) => {
@@ -690,6 +704,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
+                  // The refine of a generated image: only where it can run. attachMode
+                  // 'edit' is the composer's own gate (an image thread, a model whose
+                  // image_edit is served true), so the action is never offered for an
+                  // edit the endpoint would refuse; it moves only with a model switch,
+                  // never per token, so it does not defeat ChatMessage's memo.
+                  onRefine={
+                    message.role === 'assistant' && c.attachMode === 'edit'
+                      ? handlers.onRefine
+                      : undefined
+                  }
                   canRun={c.modelAvailable}
                 />
               );
@@ -728,6 +752,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               // but the notch stays closed and the label sits ON the border. Pin the
               // label shrunk and the notch open so they always match.
               slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+              inputRef={promptRef}
               value={c.input}
               onChange={(event) => c.setInput(event.target.value)}
               onKeyDown={(event) => {

@@ -291,6 +291,10 @@ const de = {
   chatAttachImage: 'Bild anhängen',
   chatAttachedImage: 'Angehängtes Bild',
   chatDownloadImage: 'Bild herunterladen',
+  // The per-image action on a generated image of an image thread whose model may be
+  // edited: it makes THAT image the source of the next edit (the composer takes it
+  // as the attached image; the user then says what to change).
+  chatRefineImage: 'Dieses Bild verfeinern',
   chatGeneratedImage: 'Erzeugtes Bild',
   // Shown inline next to a generated image's download button when the saved
   // transcript's data URL does not decode -- a truncated/corrupted persisted
@@ -3146,6 +3150,7 @@ const en: PortalMessages = {
   chatAttachImage: 'Attach image',
   chatAttachedImage: 'Attached image',
   chatDownloadImage: 'Download image',
+  chatRefineImage: 'Refine this image',
   chatGeneratedImage: 'Generated image',
   chatImageDownloadError: 'Could not download the image.',
   chatReasoning: 'Reasoning',
