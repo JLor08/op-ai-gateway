@@ -90,73 +90,18 @@ func unsupportedImageEditFormat(message string) error {
 //
 // It reads raw with the boundary parseImageEditForm validated the body against.
 func convertImageEditMask(boundary string, raw []byte) ([]byte, error) {
-	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
-	// The first non-empty part under each spelling of the source image. sd-server
-	// takes its init image from the `image[]` parts when there are any and only
-	// otherwise from `image`, so that is the order the two are consulted in here.
-	var bracket, plain sourceProbe
-	var maskBytes []byte
-	for {
-		part, err := mr.NextPart()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, invalidImageEdit("malformed multipart body")
-		}
-		switch name := part.FormName(); name {
-		case "image", "image[]":
-			probe := &plain
-			if name == "image[]" {
-				probe = &bracket
-			}
-			br := bufio.NewReader(part)
-			if _, err := br.Peek(1); err != nil {
-				if errors.Is(err, io.EOF) {
-					continue // an empty part is not the source image
-				}
-				return nil, invalidImageEdit("malformed multipart body")
-			}
-			if !probe.seen {
-				probe.seen = true
-				if cfg, _, err := image.DecodeConfig(br); err == nil {
-					probe.cfg, probe.readable = cfg, true
-				}
-			}
-			if _, err := io.Copy(io.Discard, br); err != nil {
-				return nil, invalidImageEdit("malformed multipart body")
-			}
-		case "mask":
-			b, err := io.ReadAll(part)
-			if err != nil {
-				return nil, invalidImageEdit("malformed multipart body")
-			}
-			maskBytes = b
-		}
+	scan, err := scanImageEditMaskForm(boundary, raw)
+	if err != nil {
+		return nil, err
 	}
-	if len(maskBytes) == 0 {
+	if len(scan.mask) == 0 {
 		return nil, nil
 	}
-
-	maskCfg, err := png.DecodeConfig(bytes.NewReader(maskBytes))
-	if err != nil {
-		return nil, unsupportedImageEditFormat("mask must be a PNG image whose transparent pixels mark the region to edit")
-	}
-	if pixels := int64(maskCfg.Width) * int64(maskCfg.Height); pixels > maxImageEditMaskPixels {
-		return nil, invalidImageEditMask(fmt.Sprintf("mask is %dx%d pixels, more than the supported maximum of %d megapixels", maskCfg.Width, maskCfg.Height, maxImageEditMaskPixels>>20))
-	}
-	source := plain
-	if bracket.seen {
-		source = bracket
-	}
-	if !source.seen || !source.readable {
-		return nil, unsupportedImageEditFormat("with a mask, the source image must be a PNG or JPEG file")
-	}
-	if maskCfg.Width != source.cfg.Width || maskCfg.Height != source.cfg.Height {
-		return nil, invalidImageEditMask(fmt.Sprintf("mask is %dx%d pixels but the image is %dx%d; they must be the same size", maskCfg.Width, maskCfg.Height, source.cfg.Width, source.cfg.Height))
+	if err := checkImageEditMaskHeader(scan.mask, scan.source()); err != nil {
+		return nil, err
 	}
 
-	decoded, err := png.Decode(bytes.NewReader(maskBytes))
+	decoded, err := png.Decode(bytes.NewReader(scan.mask))
 	if err != nil {
 		return nil, unsupportedImageEditFormat("mask could not be decoded as a PNG image")
 	}
@@ -172,6 +117,109 @@ func convertImageEditMask(boundary string, raw []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// imageEditMaskScan is what one walk of the form learns for the mask conversion:
+// the mask part's bytes, and the first non-empty part under each spelling of the
+// source image.
+type imageEditMaskScan struct {
+	bracket, plain sourceProbe
+	mask           []byte
+}
+
+// source is the probe of the source image the mask applies to. sd-server takes its
+// init image from the `image[]` parts when there are any and only otherwise from
+// `image`, so that is the order the two are consulted in here.
+func (s *imageEditMaskScan) source() sourceProbe {
+	if s.bracket.seen {
+		return s.bracket
+	}
+	return s.plain
+}
+
+// scanImageEditMaskForm walks the whole multipart body raw once, with the boundary
+// parseImageEditForm validated it against, and returns what the mask conversion
+// needs of it: the mask bytes (the last mask part, if the form were to carry more
+// than the one parseImageEditForm lets through) and the source image probes. A body
+// that breaks off part-way is refused as a malformed one.
+func scanImageEditMaskForm(boundary string, raw []byte) (imageEditMaskScan, error) {
+	var scan imageEditMaskScan
+	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return scan, nil
+		}
+		if err != nil {
+			return scan, invalidImageEdit(malformedMultipartBodyMessage)
+		}
+		if err := scan.addPart(part); err != nil {
+			return scan, err
+		}
+	}
+}
+
+// addPart records what one part contributes to the scan: a source image under its
+// spelling's probe, or the mask. Any other part is left unread.
+func (s *imageEditMaskScan) addPart(part *multipart.Part) error {
+	switch part.FormName() {
+	case "image":
+		return s.plain.read(part)
+	case "image[]":
+		return s.bracket.read(part)
+	case "mask":
+		b, err := io.ReadAll(part)
+		if err != nil {
+			return invalidImageEdit(malformedMultipartBodyMessage)
+		}
+		s.mask = b
+	}
+	return nil
+}
+
+// read reads one part under a source image spelling to its end. An empty part is
+// not the source image and is passed over; the first non-empty one is the source
+// of this spelling, whose header is probed (readable is false for an image of a
+// format the decoders registered here do not know) -- and every non-empty part is
+// read through, so a part that breaks off is refused as a malformed body.
+func (p *sourceProbe) read(part io.Reader) error {
+	br := bufio.NewReader(part)
+	if _, err := br.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return invalidImageEdit(malformedMultipartBodyMessage)
+	}
+	if !p.seen {
+		p.seen = true
+		if cfg, _, err := image.DecodeConfig(br); err == nil {
+			p.cfg, p.readable = cfg, true
+		}
+	}
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return invalidImageEdit(malformedMultipartBodyMessage)
+	}
+	return nil
+}
+
+// checkImageEditMaskHeader checks, from the image headers alone, that maskBytes is
+// a PNG within the pixel cap and the same size as the source image, in the order
+// convertImageEditMask documents, before any pixel is decoded.
+func checkImageEditMaskHeader(maskBytes []byte, source sourceProbe) error {
+	maskCfg, err := png.DecodeConfig(bytes.NewReader(maskBytes))
+	if err != nil {
+		return unsupportedImageEditFormat("mask must be a PNG image whose transparent pixels mark the region to edit")
+	}
+	if pixels := int64(maskCfg.Width) * int64(maskCfg.Height); pixels > maxImageEditMaskPixels {
+		return invalidImageEditMask(fmt.Sprintf("mask is %dx%d pixels, more than the supported maximum of %d megapixels", maskCfg.Width, maskCfg.Height, maxImageEditMaskPixels>>20))
+	}
+	if !source.seen || !source.readable {
+		return unsupportedImageEditFormat("with a mask, the source image must be a PNG or JPEG file")
+	}
+	if maskCfg.Width != source.cfg.Width || maskCfg.Height != source.cfg.Height {
+		return invalidImageEditMask(fmt.Sprintf("mask is %dx%d pixels but the image is %dx%d; they must be the same size", maskCfg.Width, maskCfg.Height, source.cfg.Width, source.cfg.Height))
+	}
+	return nil
+}
+
 // alphaMaskToLuminance maps an OpenAI-style mask onto sd-server's: a pixel's
 // luminance is 255 minus its alpha, so a fully transparent pixel is white
 // (regenerate), a fully opaque one black (keep) whatever colour either carries,
@@ -181,24 +229,10 @@ func alphaMaskToLuminance(img image.Image) *image.Gray {
 	out := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
 	switch src := img.(type) {
 	case *image.NRGBA:
-		// The type a PNG with an alpha channel decodes to (gray+alpha included):
-		// the pixel loop of a 16-megapixel mask must not go through At and
-		// color.Color per pixel.
-		for y := 0; y < b.Dy(); y++ {
-			row := src.Pix[src.PixOffset(b.Min.X, b.Min.Y+y):]
-			dst := out.Pix[y*out.Stride:]
-			for x := 0; x < b.Dx(); x++ {
-				dst[x] = 255 - row[x*4+3]
-			}
-		}
+		// The type a PNG with an alpha channel decodes to (gray+alpha included).
+		copyAlphaToLuminance(out, b, src.Pix, src.PixOffset)
 	case *image.RGBA:
-		for y := 0; y < b.Dy(); y++ {
-			row := src.Pix[src.PixOffset(b.Min.X, b.Min.Y+y):]
-			dst := out.Pix[y*out.Stride:]
-			for x := 0; x < b.Dx(); x++ {
-				dst[x] = 255 - row[x*4+3]
-			}
-		}
+		copyAlphaToLuminance(out, b, src.Pix, src.PixOffset)
 	case *image.Gray, *image.Gray16:
 		// No alpha channel: everything is opaque, so every pixel is black.
 	default:
@@ -210,6 +244,20 @@ func alphaMaskToLuminance(img image.Image) *image.Gray {
 		}
 	}
 	return out
+}
+
+// copyAlphaToLuminance fills out with 255 minus the alpha byte of each pixel of an
+// image of 4 bytes per pixel, alpha last (the Pix and PixOffset of an *image.NRGBA
+// or an *image.RGBA), over its bounds b. This is the pixel loop of a 16-megapixel
+// mask, which must not go through At and color.Color per pixel.
+func copyAlphaToLuminance(out *image.Gray, b image.Rectangle, pix []uint8, pixOffset func(x, y int) int) {
+	for y := 0; y < b.Dy(); y++ {
+		row := pix[pixOffset(b.Min.X, b.Min.Y+y):]
+		dst := out.Pix[y*out.Stride:]
+		for x := 0; x < b.Dx(); x++ {
+			dst[x] = 255 - row[x*4+3]
+		}
+	}
 }
 
 // hasEditRegion reports whether any pixel of the converted mask is not black,

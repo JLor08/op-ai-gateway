@@ -130,6 +130,10 @@ const maxBodyBytes = 32 << 20
 // model fields are too large to be a model name at all.
 const maxMultipartModelBytes = 1 << 20
 
+// headerContentType is the Content-Type header name, read off the inbound request
+// to tell a multipart body from a JSON one and set on the router's own responses.
+const headerContentType = "Content-Type"
+
 // heartbeatInterval is the cadence of `: keepalive` SSE comment lines during
 // a streaming request's silent window (cold start or time-to-first-token).
 // Package-level var, not const, so a test can shrink it -- the
@@ -603,7 +607,7 @@ func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	// always has. One that names multipart/form-data but carries a bad
 	// parameter (mime.ErrInvalidMediaParameter) still comes back as
 	// multipart/form-data, and is refused below rather than read as JSON.
-	mediaType, params, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	mediaType, params, mtErr := mime.ParseMediaType(r.Header.Get(headerContentType))
 	if mediaType == "multipart/form-data" {
 		var model string
 		if mtErr == nil {
@@ -809,7 +813,7 @@ func (rt *router) serveStreamProxy(w http.ResponseWriter, r *http.Request, model
 		}
 		committed = true
 		refreshWriteDeadline(w) // I5: about to write headers -- start the deadline before, not after
-		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set(headerContentType, "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
@@ -1223,7 +1227,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(headerContentType, "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body) //nolint:errcheck // best-effort: the client may already be gone
 }

@@ -226,6 +226,15 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
     else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
   }
 
+  // The prompt field's helper text, on an image thread only. An edit-capable
+  // model's thread also edits: the hint says what an attachment does there (there
+  // is no mode to switch, the image is the operand). A generator that cannot be
+  // edited keeps the old wording.
+  let promptHelperText: string | undefined;
+  if (isImageThread) {
+    promptHelperText = c.attachMode === 'edit' ? t.chatImageEditHint : t.chatImageOnlyHint;
+  }
+
   let modelHelperText: string | undefined;
   if (c.overrideModel !== '') {
     modelHelperText = `${t.chatModelFromToken}: ${c.overrideModel}`;
@@ -733,16 +742,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             <TextField
               id="chat-message"
               label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
-              // An edit-capable model's thread also edits: the hint says what an
-              // attachment does there (there is no mode to switch, the image is the
-              // operand). A generator that cannot be edited keeps the old wording.
-              helperText={
-                isImageThread
-                  ? c.attachMode === 'edit'
-                    ? t.chatImageEditHint
-                    : t.chatImageOnlyHint
-                  : undefined
-              }
+              helperText={promptHelperText}
               multiline
               minRows={4}
               fullWidth

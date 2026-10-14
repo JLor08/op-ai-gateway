@@ -17,7 +17,6 @@ import type {
   PortalToken,
 } from '../../api';
 import {
-  MASK_PURPOSE,
   isMaskPart,
   maskPart,
   type ChatContent,
@@ -165,7 +164,7 @@ export function attachModeOf(
 // its predicate, MASK_PURPOSE / maskPart / isMaskPart, are defined with the part
 // shape in ../shared/chatContent -- the message renderer needs them too -- and
 // re-exported here for the chat module). A mask is only ever the mask OF an edit.
-export { MASK_PURPOSE, isMaskPart, maskPart };
+export { MASK_PURPOSE, isMaskPart, maskPart } from '../shared/chatContent';
 
 // The content of the user turn the composer sends: the text alone when no image is
 // attached, otherwise the text, the attached image(s) and -- for an edit of exactly

@@ -16,8 +16,9 @@ const (
 	codeEdgeCertificateNotFound = "certificate.not_found"
 	msgNoEdgeCertificateIssued  = "no edge certificate has been issued yet"
 
-	// contentTypeHeader is the response header name set by the PEM/CA-bundle
-	// download handlers below.
+	// contentTypeHeader is the Content-Type header name: set by the PEM/CA-bundle
+	// download handlers below, and read off the request (and set on the rebuilt
+	// mask part) by the image edit handler.
 	contentTypeHeader = "Content-Type"
 )
 

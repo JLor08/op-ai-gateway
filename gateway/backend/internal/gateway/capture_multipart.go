@@ -89,35 +89,62 @@ func summarizeMultipartBody(raw []byte, boundary string, maxBytes int) (string, 
 			doc.Error = "malformed multipart body: the parts end where it breaks off"
 			break
 		}
-		p := captureMultipartPart{Name: part.FormName(), Filename: part.FileName(), ContentType: part.Header.Get("Content-Type")}
-		var head []byte
-		var readErr error
-		if declaresATextField(p) {
-			head, readErr = io.ReadAll(io.LimitReader(part, captureTextPartMaxBytes+1))
-		}
-		rest, drainErr := io.Copy(io.Discard, part)
-		p.Size = int64(len(head)) + rest
-		if readErr != nil || drainErr != nil {
+		p, head, err := readCapturePart(part)
+		if err != nil {
 			doc.Error = "malformed multipart body: the parts end where it breaks off"
 			break
 		}
-		if head != nil && len(head) <= captureTextPartMaxBytes && utf8.Valid(head) {
-			text := string(head)
-			if len(text) > budget {
-				cut := budget
-				for cut > 0 && !utf8.RuneStart(text[cut]) {
-					cut--
-				}
-				text, p.Truncated, truncated = text[:cut], true, true
-			}
-			budget -= len(text)
-			p.Text = &text
-		} else {
-			p.Redacted = true
-		}
+		used, cut := applyCaptureText(&p, head, budget)
+		budget -= used
+		truncated = truncated || cut
 		doc.Parts = append(doc.Parts, p)
 	}
 	return encodeMultipartSummary(doc), truncated
+}
+
+// readCapturePart reads one part to its end, as much of it as the summary needs
+// kept: the part's name, file name, type and size, and -- only when it presents
+// itself as a text field (declaresATextField) -- up to captureTextPartMaxBytes+1 of
+// its leading bytes (head; nil for any other part). Whatever was not kept is still
+// read, and counted in Size, so the walk reaches the next part. The error is the
+// first failure of either read: the part broke off.
+func readCapturePart(part *multipart.Part) (p captureMultipartPart, head []byte, err error) {
+	p = captureMultipartPart{Name: part.FormName(), Filename: part.FileName(), ContentType: part.Header.Get("Content-Type")}
+	var readErr error
+	if declaresATextField(p) {
+		head, readErr = io.ReadAll(io.LimitReader(part, captureTextPartMaxBytes+1))
+	}
+	rest, drainErr := io.Copy(io.Discard, part)
+	p.Size = int64(len(head)) + rest
+	return p, head, errors.Join(readErr, drainErr)
+}
+
+// applyCaptureText decides what p carries of its content: the value of a text field
+// -- head, when there is one, within captureTextPartMaxBytes and valid UTF-8 -- cut
+// on a rune boundary to fit budget (the room left for the text values of the whole
+// summary), or nothing, in which case the part is marked Redacted. It returns how
+// much of the budget the value used and whether it had to be cut.
+func applyCaptureText(p *captureMultipartPart, head []byte, budget int) (used int, cut bool) {
+	if head == nil || len(head) > captureTextPartMaxBytes || !utf8.Valid(head) {
+		p.Redacted = true
+		return 0, false
+	}
+	text := string(head)
+	if len(text) > budget {
+		text, cut = text[:runeCutPoint(text, budget)], true
+		p.Truncated = true
+	}
+	p.Text = &text
+	return len(text), cut
+}
+
+// runeCutPoint is the largest index at or below limit (which must be inside s) at
+// which s can be cut without splitting a rune.
+func runeCutPoint(s string, limit int) int {
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return limit
 }
 
 // declaresATextField reports whether a part presents itself as a plain form field:

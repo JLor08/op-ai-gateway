@@ -486,25 +486,35 @@ func imageEditInputsOf(history []portal.ChatAPIMessage) (imageEditInputs, error)
 	}
 	var in imageEditInputs
 	for i, img := range images {
-		mediaType, data, err := portal.DecodeImageDataURL(img.URL)
-		if err != nil {
-			// The url is logged by its scheme only: a data: url is the image itself.
-			return imageEditInputs{}, fmt.Errorf("image %d of %d (%s): %w", i+1, len(images), urlKind(img.URL), err)
+		if err := in.add(i, len(images), img); err != nil {
+			return imageEditInputs{}, err
 		}
-		src := imageEditSource{mediaType: mediaType, data: data}
-		if !img.Mask {
-			if !imageEditSourceTypes[mediaType] {
-				return imageEditInputs{}, fmt.Errorf("image %d of %d: the source is a %s: %w", i+1, len(images), mediaType, errImageEditSourceType)
-			}
-			in.sources = append(in.sources, src)
-			continue
-		}
-		if mediaType != "image/png" {
-			return imageEditInputs{}, fmt.Errorf("image %d of %d: the mask is a %s, not a PNG", i+1, len(images), mediaType)
-		}
-		in.mask = &src
 	}
 	return in, nil
+}
+
+// add reads the image part img, the i-th (from 0) of n image parts of the message,
+// and files it as a source or as the mask of the edit, refusing one that is not
+// readable or not of a type that role is sent in (see imageEditInputsOf).
+func (in *imageEditInputs) add(i, n int, img portal.MessageImage) error {
+	mediaType, data, err := portal.DecodeImageDataURL(img.URL)
+	if err != nil {
+		// The url is logged by its scheme only: a data: url is the image itself.
+		return fmt.Errorf("image %d of %d (%s): %w", i+1, n, urlKind(img.URL), err)
+	}
+	src := imageEditSource{mediaType: mediaType, data: data}
+	if !img.Mask {
+		if !imageEditSourceTypes[mediaType] {
+			return fmt.Errorf("image %d of %d: the source is a %s: %w", i+1, n, mediaType, errImageEditSourceType)
+		}
+		in.sources = append(in.sources, src)
+		return nil
+	}
+	if mediaType != mediaTypePNG {
+		return fmt.Errorf("image %d of %d: the mask is a %s, not a PNG", i+1, n, mediaType)
+	}
+	in.mask = &src
+	return nil
 }
 
 // imageEditSourceTypes are the media types the edit route of sd-server reads a source
@@ -512,9 +522,15 @@ func imageEditInputsOf(history []portal.ChatAPIMessage) (imageEditInputs, error)
 // (errImageEditSourceType, imageRunSourceUnsupportedMessage); the composer's own check
 // of a new attachment (IMAGE_EDIT_SOURCE_TYPES in the portal frontend) is the same set.
 var imageEditSourceTypes = map[string]bool{
-	"image/png":  true,
+	mediaTypePNG: true,
 	"image/jpeg": true,
 }
+
+// mediaTypePNG is the media type of a PNG image: the one a mask must be stored as
+// (imageEditInputsOf), the one of the converted mask part the edits endpoint
+// rebuilds a form with (writeConvertedMaskPart), and a key of the edit source
+// tables below.
+const mediaTypePNG = "image/png"
 
 // errImageEditSourceType marks an edit source that is a readable image of a type the
 // edit route does not read, so that the caller can tell it from an unreadable one.
@@ -538,7 +554,7 @@ func urlKind(url string) string {
 // DecodeImageDataURL enforces, so no other media type -- and nothing the url
 // itself chose -- ever reaches a part header.
 var imageEditFilenames = map[string]string{
-	"image/png":  "image.png",
+	mediaTypePNG: "image.png",
 	"image/jpeg": "image.jpg",
 	"image/webp": "image.webp",
 	"image/gif":  "image.gif",

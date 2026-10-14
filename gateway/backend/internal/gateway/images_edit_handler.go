@@ -62,6 +62,12 @@ const maxImageEditFieldBytes = 1 << 20
 // they are.
 const invalidImageEditRequest = "request.invalid"
 
+// malformedMultipartBodyMessage is the message of the invalidImageEditRequest
+// refusal for a body whose parts cannot be walked to their end: the one the form
+// parse (parseImageEditForm, readImageEditField) and the mask conversion
+// (convertImageEditMask) both give for it.
+const malformedMultipartBodyMessage = "malformed multipart body"
+
 // imageEditForm is what the handler needs out of an edit's multipart form before
 // it can route the request: the routing model, the fields the validation twin
 // checks, and whether a source image and a mask arrived. It is deliberately NOT a
@@ -186,7 +192,7 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	form, err := parseImageEditForm(r.Header.Get("Content-Type"), raw)
+	form, err := parseImageEditForm(r.Header.Get(contentTypeHeader), raw)
 	if err != nil {
 		writeRequestError(w, err)
 		return
@@ -208,26 +214,9 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	// Run-as: handleOpenAIImages' block, which is handleOpenAIChat's -- copied for
-	// the same reason (the surrounding code differs too much to factor out) and
-	// with the same effect: only the loopback principal (token.ID == "") ever
-	// reaches it, and without it a portal edit would bill and capture against the
-	// bare session instead of the token the run executes as.
-	if token.ID == "" {
-		if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
-			if s.Portal == nil {
-				// Fail closed: the caller explicitly asked to run as a specific
-				// token and, with no Portal, there is no way to authorize it.
-				writePortalTokenError(w, portal.ErrTokenForbidden)
-				return
-			}
-			runAs, rErr := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
-			if rErr != nil {
-				writePortalTokenError(w, rErr)
-				return
-			}
-			token = runAs
-		}
+	token, ok = s.imageEditRunAs(w, r, token)
+	if !ok {
+		return
 	}
 	pf, handled := s.inferencePreflight(w, r, token, raw, inferenceShape{
 		apiFlavor:            apiFlavorImages,
@@ -239,6 +228,36 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.relayImageEdit(w, r, token, pf.Req, form, raw, maskPNG)
+}
+
+// imageEditRunAs is the run-as block of handleOpenAIImages, which is
+// handleOpenAIChat's -- copied for the same reason (the surrounding code differs too
+// much to factor out) and with the same effect: only the loopback principal
+// (token.ID == "") ever reaches it, and without it a portal edit would bill and
+// capture against the bare session instead of the token the run executes as. It
+// returns the token the edit executes as -- token itself unless the loopback
+// principal named a token to run as -- and false when it has refused the request
+// and written the response.
+func (s *Server) imageEditRunAs(w http.ResponseWriter, r *http.Request, token auth.Token) (auth.Token, bool) {
+	if token.ID != "" {
+		return token, true
+	}
+	runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName))
+	if runAsID == "" {
+		return token, true
+	}
+	if s.Portal == nil {
+		// Fail closed: the caller explicitly asked to run as a specific token and,
+		// with no Portal, there is no way to authorize it.
+		writePortalTokenError(w, portal.ErrTokenForbidden)
+		return token, false
+	}
+	runAs, err := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
+	if err != nil {
+		writePortalTokenError(w, err)
+		return token, false
+	}
+	return runAs, true
 }
 
 // readImageEditBody reads the whole multipart body, bounded by limit (the
@@ -301,62 +320,97 @@ func parseImageEditForm(contentType string, raw []byte) (imageEditForm, error) {
 			return form, nil
 		}
 		if err != nil {
-			return form, invalidImageEdit("malformed multipart body")
+			return form, invalidImageEdit(malformedMultipartBodyMessage)
 		}
-		name := part.FormName()
-		switch name {
-		case "model", "prompt", "response_format", "stream":
-			if seen[name] {
-				return form, invalidImageEdit(fmt.Sprintf("form field %q must appear only once", name))
-			}
-			seen[name] = true
-			value, err := readImageEditField(part)
-			if err != nil {
-				return form, err
-			}
-			switch name {
-			case "model":
-				form.model = value
-			case "prompt":
-				form.prompt = value
-			case "response_format":
-				form.responseFormat = value
-			case "stream":
-				form.stream = value
-			}
-		case "image", "image[]":
-			n, err := io.Copy(io.Discard, part)
-			if err != nil {
-				return form, invalidImageEdit("malformed multipart body")
-			}
-			if n > 0 {
-				form.images++
-			}
-		case "mask":
-			if seen[name] {
-				return form, invalidImageEdit(fmt.Sprintf("form field %q must appear only once", name))
-			}
-			seen[name] = true
-			n, err := io.Copy(io.Discard, part)
-			if err != nil {
-				return form, invalidImageEdit("malformed multipart body")
-			}
-			if n > 0 {
-				form.masks++
-			}
-		default:
-			if _, err := io.Copy(io.Discard, part); err != nil {
-				return form, invalidImageEdit("malformed multipart body")
-			}
+		if err := form.readPart(part, seen); err != nil {
+			return form, err
 		}
 	}
+}
+
+// readPart reads one part of the form into f, by the field it is: the four text
+// fields are read and kept, the image and mask parts are counted and skipped, and
+// any other part is skipped untouched. seen is the set of the single-use fields
+// (the four text ones and mask) already met.
+func (f *imageEditForm) readPart(part *multipart.Part, seen map[string]bool) error {
+	name := part.FormName()
+	switch name {
+	case "model", "prompt", "response_format", "stream":
+		return f.readTextField(part, name, seen)
+	case "image", "image[]":
+		return countNonEmptyPart(part, &f.images)
+	case "mask":
+		if err := markImageEditFieldSeen(seen, name); err != nil {
+			return err
+		}
+		return countNonEmptyPart(part, &f.masks)
+	default:
+		_, err := discardImageEditPart(part)
+		return err
+	}
+}
+
+// readTextField reads the value of one of the four text fields into f, once: a
+// repeat is refused before its value is read.
+func (f *imageEditForm) readTextField(part *multipart.Part, name string, seen map[string]bool) error {
+	if err := markImageEditFieldSeen(seen, name); err != nil {
+		return err
+	}
+	value, err := readImageEditField(part)
+	if err != nil {
+		return err
+	}
+	switch name {
+	case "model":
+		f.model = value
+	case "prompt":
+		f.prompt = value
+	case "response_format":
+		f.responseFormat = value
+	case "stream":
+		f.stream = value
+	}
+	return nil
+}
+
+// markImageEditFieldSeen records that the single-use field name has been met, and
+// refuses a second one.
+func markImageEditFieldSeen(seen map[string]bool, name string) error {
+	if seen[name] {
+		return invalidImageEdit(fmt.Sprintf("form field %q must appear only once", name))
+	}
+	seen[name] = true
+	return nil
+}
+
+// discardImageEditPart reads a part to its end without keeping it, and returns how
+// many bytes it held: a part that breaks off is a malformed body.
+func discardImageEditPart(part *multipart.Part) (int64, error) {
+	n, err := io.Copy(io.Discard, part)
+	if err != nil {
+		return 0, invalidImageEdit(malformedMultipartBodyMessage)
+	}
+	return n, nil
+}
+
+// countNonEmptyPart reads a part to its end without keeping it and adds one to
+// *count if it held any bytes (an empty image or mask part is not one).
+func countNonEmptyPart(part *multipart.Part, count *int) error {
+	n, err := discardImageEditPart(part)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		*count++
+	}
+	return nil
 }
 
 // readImageEditField reads one text field, bounded.
 func readImageEditField(part *multipart.Part) (string, error) {
 	b, err := io.ReadAll(io.LimitReader(part, maxImageEditFieldBytes+1))
 	if err != nil {
-		return "", invalidImageEdit("malformed multipart body")
+		return "", invalidImageEdit(malformedMultipartBodyMessage)
 	}
 	if len(b) > maxImageEditFieldBytes {
 		return "", invalidImageEdit(fmt.Sprintf("form field %q is too large", part.FormName()))
@@ -458,37 +512,54 @@ func rebuildImageEditBody(raw []byte, boundary string, rb imageEditRebuild) ([]b
 		if err != nil {
 			return nil, "", fmt.Errorf("read part: %w", err)
 		}
-		if rb.model != "" && part.FormName() == "model" {
-			if err := mw.WriteField("model", rb.model); err != nil {
-				return nil, "", fmt.Errorf("write model field: %w", err)
-			}
-			continue
-		}
-		if rb.mask != nil && part.FormName() == "mask" {
-			h := textproto.MIMEHeader{}
-			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
-			h.Set("Content-Type", "image/png")
-			pw, err := mw.CreatePart(h)
-			if err != nil {
-				return nil, "", fmt.Errorf("create mask part: %w", err)
-			}
-			if _, err := pw.Write(rb.mask); err != nil {
-				return nil, "", fmt.Errorf("write mask part: %w", err)
-			}
-			continue
-		}
-		pw, err := mw.CreatePart(part.Header)
-		if err != nil {
-			return nil, "", fmt.Errorf("create part %q: %w", part.FormName(), err)
-		}
-		if _, err := io.Copy(pw, part); err != nil {
-			return nil, "", fmt.Errorf("copy part %q: %w", part.FormName(), err)
+		if err := writeRebuiltPart(mw, part, rb); err != nil {
+			return nil, "", err
 		}
 	}
 	if err := mw.Close(); err != nil {
 		return nil, "", fmt.Errorf("close multipart writer: %w", err)
 	}
 	return out.Bytes(), mw.FormDataContentType(), nil
+}
+
+// writeRebuiltPart writes one part of the client's form into the rebuilt body: the
+// model field with rb.model for its value when that is set, the mask part with the
+// converted rb.mask for its content when that is set, and every other part -- its
+// headers and its bytes -- as the client sent it.
+func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRebuild) error {
+	if rb.model != "" && part.FormName() == "model" {
+		if err := mw.WriteField("model", rb.model); err != nil {
+			return fmt.Errorf("write model field: %w", err)
+		}
+		return nil
+	}
+	if rb.mask != nil && part.FormName() == "mask" {
+		return writeConvertedMaskPart(mw, rb.mask)
+	}
+	pw, err := mw.CreatePart(part.Header)
+	if err != nil {
+		return fmt.Errorf("create part %q: %w", part.FormName(), err)
+	}
+	if _, err := io.Copy(pw, part); err != nil {
+		return fmt.Errorf("copy part %q: %w", part.FormName(), err)
+	}
+	return nil
+}
+
+// writeConvertedMaskPart writes the converted mask as the form's mask part: a PNG
+// file part named imageEditMaskFilename.
+func writeConvertedMaskPart(mw *multipart.Writer, mask []byte) error {
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
+	h.Set(contentTypeHeader, mediaTypePNG)
+	pw, err := mw.CreatePart(h)
+	if err != nil {
+		return fmt.Errorf("create mask part: %w", err)
+	}
+	if _, err := pw.Write(mask); err != nil {
+		return fmt.Errorf("write mask part: %w", err)
+	}
+	return nil
 }
 
 // relayImageEdit resolves the routing target for an already-gated edit and
@@ -543,7 +614,7 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		raw:         raw,
 		pfReq:       req,
 		endpoint:    endpointImagesEdit,
-		contentType: r.Header.Get("Content-Type"),
+		contentType: r.Header.Get(contentTypeHeader),
 	}
 	sent := len(raw)
 	rebuild := imageEditRebuild{mask: maskPNG}
