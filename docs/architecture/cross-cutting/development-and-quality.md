@@ -272,8 +272,8 @@ reports success on a broken corpus is worse than no checker.
   such a change.
 
 > **Only `e2e:runtime` runs in CI; the other 19 Playwright suites do not.**
-> `.github/workflows/ci.yml` has five jobs — `go`, `docs`, `sonar-scripts`,
-> `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
+> `.github/workflows/ci.yml` has six jobs — `go`, `docs`, `sonar-scripts`,
+> `opencode-config-script`, `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
 > least-exercised subsystem, and the one whose three-commit regression no gate
 > noticed — issue #24). Every **other** suite is still a **local-only gate a
 > pull request can pass without running**: `make test-e2e` runs the base suite

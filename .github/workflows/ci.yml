@@ -3,7 +3,8 @@
 #
 # Continuous integration: format check, lint, build, and test for the Go
 # backend + server-agent and the React/TypeScript frontend; the docs
-# consistency check; the offline tests of the local Sonar tooling; and the
+# consistency check; the offline tests of the local Sonar tooling; the offline
+# test of the opencode config generator (gen-opencode-config.sh); and the
 # e2e:runtime Playwright suite. Ready to run as soon as a runner is attached to
 # the repository.
 name: CI

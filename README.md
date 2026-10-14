@@ -253,10 +253,11 @@ make lint        # golangci-lint across both Go modules (make fmt to format)
 Scenario e2e suites (certificates, capture, TOTP, SMTP, limits, the
 agent-managed model runtime, …) live in `gateway/e2e` as npm scripts and are
 local-only gates, except `e2e:runtime`, the one Playwright suite CI runs. CI's
-other jobs cover Go, the frontend, docs consistency and the offline tests of
-the Sonar scripts. Architecture tests (frozen dependency rules for
-both Go modules and the frontend) run inside the normal test suites, and a
-local, headless **SonarQube quality gate** is available via `make sonar-up` /
+other jobs cover Go, the frontend, docs consistency, the offline tests of
+the Sonar scripts and the offline test of the opencode config generator.
+Architecture tests (frozen dependency rules for both Go modules and the
+frontend) run inside the normal test suites, and a local, headless
+**SonarQube quality gate** is available via `make sonar-up` /
 `make sonar-gate`. The full tooling reference is
 [Development Tooling & Quality Gates](docs/architecture/cross-cutting/development-and-quality.md).
 
