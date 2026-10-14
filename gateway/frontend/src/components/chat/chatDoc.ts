@@ -192,8 +192,20 @@ export function userTurnContent(
 // `accept` cannot bind), so a webp or gif source is refused where the user can
 // still act on it instead of coming back from the upstream as a generic error.
 // Lower case: compared against a file's reported MIME type.
+//
+// HEIC/HEIF are the one exception: they are not a format sd-server would see, because
+// the upload pipeline (prepareImageDataUrl) converts them to JPEG before they are
+// attached, so the guard lets them through (isHeicFile, which also recognises one a
+// browser reports no MIME type for by its extension) and the picker lists them -- the
+// extensions too, since a file dialog matches those when it has no MIME type to go by.
 export const IMAGE_EDIT_SOURCE_TYPES: readonly string[] = ['image/png', 'image/jpeg'];
-export const IMAGE_EDIT_SOURCE_ACCEPT = IMAGE_EDIT_SOURCE_TYPES.join(',');
+export const IMAGE_EDIT_SOURCE_ACCEPT = [
+  ...IMAGE_EDIT_SOURCE_TYPES,
+  'image/heic',
+  'image/heif',
+  '.heic',
+  '.heif',
+].join(',');
 
 // The image-generation knobs the composer edits, as CONCRETE store state (every
 // field defined, unlike the all-optional wire ChatImageSettings). An unset knob

@@ -3,6 +3,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { heicTo } from 'heic-to';
 
 import { Chat } from './Chat';
 import {
@@ -23,6 +24,13 @@ import type {
   ServerModelOption,
   StartChatRunBody,
 } from '../api';
+
+// heic-to loads a libheif WASM decoder at runtime, which jsdom cannot run: mock it
+// (as imageAttach.test.ts does) to a JPEG blob, so a HEIC attachment can be followed
+// through the real upload pipeline (prepareImageDataUrl) into the sent message.
+vi.mock('heic-to', () => ({
+  heicTo: vi.fn(async () => new Blob(['jpeg-bytes'], { type: 'image/jpeg' })),
+}));
 
 // Captured before any spy is installed, so a mocked createElement can build a
 // real element without recursing into itself.
@@ -1375,17 +1383,20 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     describe('the source format', () => {
-      it('is png or jpeg in the picker of an edit, and any image for a text model', async () => {
+      it('is png, jpeg and heic/heif in the picker of an edit, and any image for a text model', async () => {
         renderChat(tokens, [editModel, visionModel]);
         await waitForChatReady();
 
         await pickOption(t.chatModel, visionModel.display_name);
         expect(screen.getByLabelText(t.chatAttachImage)).toHaveAttribute('accept', 'image/*');
 
+        // HEIC/HEIF are listed because the upload pipeline converts them to JPEG
+        // before they are attached (so sd-server never sees one); a browser that
+        // reports no MIME type for them matches on the extension.
         await pickOption(t.chatModel, editModel.display_name);
         expect(screen.getByLabelText(t.chatAttachImage)).toHaveAttribute(
           'accept',
-          'image/png,image/jpeg',
+          'image/png,image/jpeg,image/heic,image/heif,.heic,.heif',
         );
       });
 
@@ -1393,6 +1404,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         ['webp', 'image/webp'],
         ['gif', 'image/gif'],
       ])('refuses a %s source for an edit, however it got past the picker', async (ext, type) => {
+        vi.mocked(heicTo).mockClear();
         renderChat(tokens, [editModel]);
         await waitForChatReady();
         await pickOption(t.chatModel, editModel.display_name);
@@ -1401,6 +1413,36 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditSourceType);
         expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+        expect(heicTo).not.toHaveBeenCalled();
+      });
+
+      // A HEIC photo (an iPhone's default) was a working edit source before the
+      // png/jpeg restriction, because the upload pipeline already converts it to
+      // JPEG: the restriction is about what sd-server SEES, and it never sees HEIC.
+      it.each([
+        ['by its MIME type', 'photo.heic', 'image/heic'],
+        ['by its MIME type, the heif spelling', 'photo.heif', 'image/heif'],
+        ['by its extension when the browser reports no MIME type', 'IMG_0001.HEIC', ''],
+      ])('takes a HEIC source for an edit %s and sends it as a JPEG', async (_how, name, type) => {
+        vi.mocked(heicTo).mockClear();
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+
+        attachFile(name, type);
+
+        expect(await screen.findByAltText(t.chatAttachedImage)).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(heicTo).toHaveBeenCalledWith(expect.objectContaining({ type: 'image/jpeg' }));
+        fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+          target: { value: 'make it blue' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+        const parts = body.user_message as { type: string; image_url?: { url: string } }[];
+        // What goes to the server -- and on to sd-server -- is JPEG, not HEIC.
+        expect(parts[1].image_url?.url).toMatch(/^data:image\/jpeg;base64,/);
       });
 
       it.each([

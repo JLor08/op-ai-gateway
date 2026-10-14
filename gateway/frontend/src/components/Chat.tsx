@@ -21,6 +21,7 @@ import LayersIcon from '@mui/icons-material/Layers';
 import type { ImageModelOptions } from '../api';
 import type { Translation } from './shared/types';
 import type { ChatContent } from './shared/chatContent';
+import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
@@ -38,6 +39,18 @@ import {
 import { ChatSidebar } from './chat/ChatSidebar';
 
 const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
+
+// The small round close button on the corner of an attached image's (or mask's)
+// thumbnail in the composer's attach strip.
+const thumbnailRemoveSx = {
+  position: 'absolute',
+  top: -6,
+  right: -6,
+  width: 20,
+  height: 20,
+  bgcolor: 'var(--brand-accent)',
+  color: 'var(--accent-text)',
+} as const;
 
 // A bound or default the model actually reported. The options endpoint omits
 // (omitempty) whatever it does not know, so `undefined` is the ONLY "not
@@ -754,15 +767,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       size="small"
                       aria-label={t.chatCancel}
                       onClick={() => c.removeImage(index)}
-                      sx={{
-                        position: 'absolute',
-                        top: -6,
-                        right: -6,
-                        width: 20,
-                        height: 20,
-                        bgcolor: 'var(--brand-accent)',
-                        color: 'var(--accent-text)',
-                      }}
+                      sx={thumbnailRemoveSx}
                     >
                       <CloseIcon fontSize="small" />
                     </IconButton>
@@ -781,25 +786,14 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         objectFit: 'cover',
                         border: '1px solid var(--line)',
                         borderRadius: '8px',
-                        // A mask is mostly transparent: a checkerboard behind it shows
-                        // the transparent region (the one to edit) as what it is.
-                        background:
-                          'repeating-conic-gradient(#c8c8c8 0% 25%, #ffffff 0% 50%) 0 0 / 12px 12px',
+                        background: MASK_THUMBNAIL_BACKGROUND,
                       }}
                     />
                     <IconButton
                       size="small"
                       aria-label={t.chatRemoveMask}
                       onClick={c.removeMask}
-                      sx={{
-                        position: 'absolute',
-                        top: -6,
-                        right: -6,
-                        width: 20,
-                        height: 20,
-                        bgcolor: 'var(--brand-accent)',
-                        color: 'var(--accent-text)',
-                      }}
+                      sx={thumbnailRemoveSx}
                     >
                       <CloseIcon fontSize="small" />
                     </IconButton>

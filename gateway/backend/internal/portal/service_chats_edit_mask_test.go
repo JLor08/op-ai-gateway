@@ -50,7 +50,15 @@ func TestMessageImages(t *testing.T) {
 			"a tagged part is the mask", `[{"type":"image_url","image_url":{"url":"u1"}},{"type":"image_url","image_url":{"url":"m"},"purpose":"mask"}]`,
 			[]MessageImage{{URL: "u1"}, {URL: "m", Mask: true}},
 		},
-		{"the tag's key case is ignored too", `[{"type":"image_url","image_url":{"url":"m"},"Purpose":"mask"}]`, []MessageImage{{URL: "m", Mask: true}}},
+		// The tag is read the way the portal's own JavaScript reads it (part.purpose
+		// after JSON.parse): the key EXACTLY, and when it is repeated the LAST one wins.
+		// Only the portal and this reader know the tag, so there is no other reader whose
+		// case-insensitive matching it would have to share, and a part must never be a
+		// mask to the executor and a source to the bubble that shows it.
+		{"the tag's key is exact: another case is no tag", `[{"type":"image_url","image_url":{"url":"m"},"Purpose":"mask"}]`, []MessageImage{{URL: "m"}}},
+		{"a repeated tag: the last one wins (a mask first, another purpose last)", `[{"type":"image_url","image_url":{"url":"m"},"purpose":"mask","purpose":"reference"}]`, []MessageImage{{URL: "m"}}},
+		{"a repeated tag: the last one wins (another purpose first, a mask last)", `[{"type":"image_url","image_url":{"url":"m"},"purpose":"reference","purpose":"mask"}]`, []MessageImage{{URL: "m", Mask: true}}},
+		{"a repeated tag: a last one that is not a string is no mask", `[{"type":"image_url","image_url":{"url":"m"},"purpose":"mask","purpose":3}]`, []MessageImage{{URL: "m"}}},
 		{"the tag's place in the part does not matter", `[{"purpose":"mask","image_url":{"url":"m"},"type":"image_url"}]`, []MessageImage{{URL: "m", Mask: true}}},
 		{"another purpose is not a mask", `[{"type":"image_url","image_url":{"url":"u1"},"purpose":"reference"}]`, []MessageImage{{URL: "u1"}}},
 		{"a purpose that is not a string is not a mask", `[{"type":"image_url","image_url":{"url":"u1"},"purpose":true}]`, []MessageImage{{URL: "u1"}}},

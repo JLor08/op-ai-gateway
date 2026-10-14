@@ -12,6 +12,7 @@ import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
 import { isMaskPart } from './shared/chatContent';
+import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
@@ -441,9 +442,7 @@ function ChatMessageComponent({
                     objectFit: 'cover',
                     border: '1px solid var(--line)',
                     borderRadius: '8px',
-                    // Mostly transparent: a checkerboard shows the region to edit.
-                    background:
-                      'repeating-conic-gradient(#c8c8c8 0% 25%, #ffffff 0% 50%) 0 0 / 12px 12px',
+                    background: MASK_THUMBNAIL_BACKGROUND,
                   }}
                 />
               )}

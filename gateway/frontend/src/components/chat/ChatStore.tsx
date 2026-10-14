@@ -28,7 +28,7 @@ import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
 import type { ChatContent } from '../shared/chatContent';
-import { prepareImageDataUrl, ImageAttachError } from '../shared/imageAttach';
+import { prepareImageDataUrl, ImageAttachError, isHeicFile } from '../shared/imageAttach';
 import { offeredFlavors } from '../shared/offeredFlavors';
 import {
   ACTIVE_ID_KEY,
@@ -1464,9 +1464,14 @@ export function ChatStoreProvider({
         break;
       }
       // The edit route of sd-server reads png and jpeg only. The picker offers just
-      // those, but `accept` is a hint a file dialog's "all files" (or a drop) does
-      // not honor, so the type is checked here too.
-      if (attachMode === 'edit' && !IMAGE_EDIT_SOURCE_TYPES.includes(file.type.toLowerCase())) {
+      // those (and HEIC/HEIF, which prepareImageDataUrl converts to JPEG, so what is
+      // attached -- and sent on -- is a JPEG), but `accept` is a hint a file dialog's
+      // "all files" (or a drop) does not honor, so the type is checked here too.
+      if (
+        attachMode === 'edit' &&
+        !IMAGE_EDIT_SOURCE_TYPES.includes(file.type.toLowerCase()) &&
+        !isHeicFile(file)
+      ) {
         lastError = t.chatImageEditSourceType;
         continue;
       }

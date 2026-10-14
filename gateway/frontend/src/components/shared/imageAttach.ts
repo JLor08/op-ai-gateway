@@ -28,7 +28,7 @@ const HEIC_TYPES = new Set([
 
 // Browsers frequently report an empty MIME type for .heic/.heif files, so fall
 // back to the filename extension when the type is missing/unknown.
-function isHeicFile(file: File): boolean {
+export function isHeicFile(file: File): boolean {
   if (HEIC_TYPES.has(file.type.toLowerCase())) return true;
   return /\.hei[cf]$/i.test(file.name);
 }

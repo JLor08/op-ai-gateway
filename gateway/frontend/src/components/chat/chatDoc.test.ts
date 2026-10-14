@@ -301,6 +301,19 @@ describe('the mask part', () => {
     expect(isMaskPart(textPart('hi'))).toBe(false);
   });
 
+  // The backend reads the tag the way this side does (the key exactly, the last of a
+  // repeated one wins -- portal.MessageImages / isMaskPart, pinned there by
+  // TestMessageImages), so a crafted part is a mask to the executor exactly when it is
+  // one to the bubble that shows it.
+  it('reads a repeated or re-cased tag the way the backend does: exact key, last one wins', () => {
+    const part = (members: string) =>
+      JSON.parse(`{"type":"image_url","image_url":{"url":"u"},${members}}`);
+    expect(isMaskPart(part('"purpose":"mask","purpose":"reference"'))).toBe(false);
+    expect(isMaskPart(part('"purpose":"reference","purpose":"mask"'))).toBe(true);
+    expect(isMaskPart(part('"Purpose":"mask"'))).toBe(false);
+    expect(isMaskPart(part('"purpose":"mask","purpose":3'))).toBe(false);
+  });
+
   describe('lastUserHasImage', () => {
     it('counts a source image of the last user message', () => {
       expect(lastUserHasImage([user([textPart('x'), imagePart(src)])])).toBe(true);

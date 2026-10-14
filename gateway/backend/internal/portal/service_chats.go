@@ -783,9 +783,9 @@ type MessageImage struct {
 // extraction at a run commit and the resolution of a run's history already share
 // -- so the executor and the resolution cannot disagree about what counts as an
 // image (an object whose image_url is an object with a string url, members
-// matched without regard to case). The tag is read the same way: its member name
-// without regard to case, its value exactly, and a part that is not an image has
-// no purpose to speak of.
+// matched without regard to case). The tag is read the way the portal's JavaScript
+// reads it instead (isMaskPart): its member name exactly, the last of a repeated one,
+// its value exactly, and a part that is not an image has no purpose to speak of.
 func MessageImages(content json.RawMessage) []MessageImage {
 	parts, ok := parseJSONArray(content)
 	if !ok {
@@ -810,21 +810,27 @@ func MessageImages(content json.RawMessage) []MessageImage {
 }
 
 // isMaskPart reports whether an image part carries the mask tag.
+//
+// It reads the tag the way the portal's own JavaScript does (part.purpose, after
+// JSON.parse): the key exactly, and the LAST of a repeated key -- not the first, and
+// not "any of them". The tag is read by nothing but the portal and this function, so
+// there is no other reader whose looser (case-insensitive) matching it has to share,
+// and a part crafted with a repeated or differently-cased key must never be a mask to
+// the executor and a source to the bubble that shows it.
 func isMaskPart(raw json.RawMessage) bool {
 	part, ok := parseJSONObject(raw)
 	if !ok {
 		return false
 	}
+	mask := false
 	for _, member := range part {
-		if !strings.EqualFold(member.key, imagePurposeKey) {
+		if member.key != imagePurposeKey {
 			continue
 		}
 		var purpose string
-		if json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask {
-			return true
-		}
+		mask = json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask
 	}
-	return false
+	return mask
 }
 
 // AssistantTurn is the generated assistant message a run persists.
