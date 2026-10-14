@@ -2019,16 +2019,25 @@ upload to the composer — and, for an inpainting edit, a mask — and neither h
 number of its own to state either. Since
 [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
 a chat image is a reference out of the sealed transcript, so the shared 4 MiB
-budget this paragraph measures against does not bind an edit at all: its source
-and its mask are each bounded by the store's per-blob cap `MaxChatBlobBytes`
-(20 MiB, also the composer's per-image cap), and the whole edit body — source,
-mask and a handful of fields — by the edits endpoint's own multipart cap
+budget this paragraph measures against does not bind an edit at all. Three
+different bounds apply, by where the bytes are. A stored image — an edit's source
+or mask once it is a `chat_blobs` row, so a **refine**'s source, which is a stored
+blob resolved server-side — is bounded by the store's per-blob cap
+`MaxChatBlobBytes` (default 20 MiB, also the composer's per-image cap), and the
+whole edit body the executor then sends over loopback — source, mask and a
+handful of fields — by the edits endpoint's own multipart cap
 (`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB, see
-[ADR-009](#adr-009--no-body-size-cap-on-inference-1-mib-on-control-plane)), not
-by the 4 MiB text-document cap. Two 20 MiB files can exceed 32 MiB together, and
-the run then ends `request.body_too_large`; the composer downscales an image
-above 1568 px, so reaching that takes an unusually heavy file or a raw API
-client. What the composer
+[ADR-009](#adr-009--no-body-size-cap-on-inference-1-mib-on-control-plane)), not by
+the 4 MiB text-document cap; two maximal stored files can exceed 32 MiB together,
+and the run then ends `request.body_too_large`. A freshly **uploaded** source or
+mask is different: it additionally rides **inline** in the run-start body
+(`user_message`), which the run-start endpoint reads under
+`portal.MaxChatRequestBytes` (5 MiB, the 4 MiB content cap plus the JSON envelope,
+[ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
+(f): "one upload still rides inline in the run body"). An upload of an edit is
+therefore refused `413 request.body_too_large` at about 5 MiB, long before the
+20 MiB and 32 MiB figures, for the composer and a raw API client alike; only a
+stored source can approach those. What the composer
 does refuse up front is the edit shape the server would otherwise answer with
 its own refusal after the fact: more than one source image, an edit with no
 prompt, a source that is not PNG or JPEG (a HEIC photo is converted to JPEG

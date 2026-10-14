@@ -35,9 +35,12 @@ sequenceDiagram
     GW->>U: record usage event (tokens, cost, energy, status)
 ```
 
-Notes: all five inference endpoints read the request body with no size cap (large
-multimodal payloads) and lift the server read/write deadlines; SSE streams are
-bounded by an idle watchdog and client disconnect, not a total cap. See
+Notes: the five JSON inference endpoints read the request body with no size cap
+(large multimodal payloads); the sixth, the multipart image edit
+(`POST /v1/images/edits`), is the one capped body
+(`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB). All six lift the
+server read/write deadlines; SSE streams are bounded by an idle watchdog and
+client disconnect, not a total cap. See
 [Compatibility & Inference](cross-cutting/compatibility-and-inference.md).
 
 ## 6.2 Portal login (session + CSRF) with optional TOTP

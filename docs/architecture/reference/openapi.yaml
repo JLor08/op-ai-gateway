@@ -2186,9 +2186,12 @@ components:
                 type: string
                 format: binary
                 description: >
-                  The source image (PNG or JPEG; sd-server's edit route reads
-                  no other type). Either this or `image[]` must carry at least
-                  one non-empty part. Further `image[]` parts are references.
+                  The source image. sd-server's edit route reads PNG and JPEG
+                  only; the gateway passes the source through without checking
+                  its type, except that a source sent with a mask must be a
+                  readable PNG or JPEG (400 `images.edit_unsupported_format`).
+                  Either this or `image[]` must carry at least one non-empty
+                  part. Further `image[]` parts are references.
               image[]:
                 type: array
                 items: { type: string, format: binary }

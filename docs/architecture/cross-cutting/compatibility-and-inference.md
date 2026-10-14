@@ -985,8 +985,8 @@ watchdog timer is reset on every event the provider emits, so an arbitrarily
 long but continuously-producing stream never times out. `http.ResponseController`
 (`SetReadDeadline`/`SetWriteDeadline`) is used for two distinct purposes:
 `liftInferenceDeadlines` clears the connection's default 30s read/write
-deadline entirely for all five inference endpoints at request start (an
-uncapped multimodal upload can take longer than 30s to arrive), and the streaming
+deadline entirely for all six POST inference endpoints at request start (a
+large multimodal upload can take longer than 30s to arrive), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
 caught, without needing a second timer. **No provider `CompleteStream`
@@ -1474,11 +1474,16 @@ sent to come back as the agent's own refusal; raising the setting only admits
 larger bodies to **external** edit upstreams. Edge nginx is uncapped for `/v1/`
 (`client_max_body_size 0`), so the gateway's setting is the effective limit.
 A portal edit's body is the source image, the optional mask and a handful of
-fields; its source and its mask are each bounded by `MaxChatBlobBytes` (20 MiB,
-below), so two maximal files exceed the 32 MiB together — the loopback hop then
-answers `request.body_too_large` and the run fails cleanly (the composer
-downscales an image above 1568 px, so reaching it takes an unusually heavy file or
-a raw API client).
+fields, and three bounds apply by where the bytes are. A freshly **uploaded**
+source or mask additionally rides **inline** in the run-start body, which is read
+under `portal.MaxChatRequestBytes` (5 MiB, the 4 MiB content cap plus the JSON
+envelope, [ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
+(f)), so an uploaded edit is refused `413 request.body_too_large` at about 5 MiB
+whatever the client, long before the figures below. Only a **stored** source — a
+refine's, resolved server-side from `chat_blobs` — can approach them: each stored
+image is bounded by `MaxChatBlobBytes` (default 20 MiB, below), so two maximal
+files exceed the 32 MiB of the loopback hop together, which then answers
+`request.body_too_large` and the run fails cleanly.
 
 A stored chat image is **not** part of that document: it lives in `chat_blobs`
 and the document carries only its URL ([§12](#12-in-portal-chat-playground),
