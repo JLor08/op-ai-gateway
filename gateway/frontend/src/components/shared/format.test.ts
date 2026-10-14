@@ -436,10 +436,13 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // (relayed by upstreamErrorCode): an edit with no image part
     // (`imagesImageRequired`, images_edit_handler.go) and an edit whose target
     // is an agent that has not declared multipart_proxy (`codeImageEditUnavailable`,
-    // 404). The mask refusals (`images.mask_invalid`, `images.edit_unsupported_format`)
-    // join them with the portal's mask upload.
+    // 404). The two refusals only a mask can cause join them with the portal's
+    // mask upload (`imagesMaskInvalid`, `imagesEditUnsupportedFormat`, error_map.go;
+    // raised by convertImageEditMask and relayed by upstreamErrorCode).
     'images.image_required',
     'images.edit_unavailable',
+    'images.mask_invalid',
+    'images.edit_unsupported_format',
   ] as const;
 
   it('carries every images.* refusal code reachable from a chat run, by its exact wire string', () => {
@@ -464,6 +467,8 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   it.each([
     ['images.image_required', 'errorImagesImageRequired'],
     ['images.edit_unavailable', 'errorImagesEditUnavailable'],
+    ['images.mask_invalid', 'errorImagesMaskInvalid'],
+    ['images.edit_unsupported_format', 'errorImagesEditUnsupportedFormat'],
     ['gateway.chat_run_image_source_unreadable', 'errorChatRunImageSourceUnreadable'],
   ] as const)('labels the image-edit code %s with %s, in both locales', (code, key) => {
     expect(errorLabelByCode[code]).toBe(key);

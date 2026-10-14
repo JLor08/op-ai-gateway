@@ -70,7 +70,7 @@ func TestPrepareChatRunImageKindResolvesTheEditSource(t *testing.T) {
 			if got := MessageText(last.Content); got != "now greener" {
 				t.Fatalf("the prompt next to the source = %q, want it kept", got)
 			}
-			lastURLs := MessageImageURLs(last.Content)
+			lastURLs := messageImageURLs(last.Content)
 			if len(lastURLs) != 1 {
 				t.Fatalf("the last user message carries %d image urls, want 1", len(lastURLs))
 			}
@@ -79,7 +79,7 @@ func TestPrepareChatRunImageKindResolvesTheEditSource(t *testing.T) {
 			}
 			// The earlier turns keep their references: only the source is fetched.
 			for i, m := range history[:len(history)-1] {
-				for _, u := range MessageImageURLs(m.Content) {
+				for _, u := range messageImageURLs(m.Content) {
 					if !strings.HasPrefix(u, gatewayBlobPrefix) {
 						t.Fatalf("history message %d was resolved (%.60s), want only the last user message resolved", i, u)
 					}
@@ -155,7 +155,7 @@ func TestPrepareChatRunImageKindLeavesAnOlderSourceAlone(t *testing.T) {
 		t.Fatalf("a generation turn issued %d ChatBlobsByIDs calls, want 0", len(e.byIDs.calls))
 	}
 	for i, m := range history {
-		for _, u := range MessageImageURLs(m.Content) {
+		for _, u := range messageImageURLs(m.Content) {
 			if !strings.HasPrefix(u, gatewayBlobPrefix) {
 				t.Fatalf("history message %d was resolved (%.60s), want the older images left as references", i, u)
 			}
@@ -299,30 +299,12 @@ func TestDecodeImageDataURL(t *testing.T) {
 	}
 }
 
-// MessageImageURLs reads the image urls of a message the way the extraction and
-// the resolution do: the same shape (an object whose image_url is an object with a
-// string url), members matched without regard to case, plain-string content and
-// non-image parts yielding nothing.
-func TestMessageImageURLs(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		content string
-		want    []string
-	}{
-		{"plain string", `"hello"`, nil},
-		{"text parts only", `[{"type":"text","text":"hi"}]`, nil},
-		{"one image", `[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"u1"}}]`, []string{"u1"}},
-		{"two images in order", `[{"type":"image_url","image_url":{"url":"u1"}},{"type":"image_url","image_url":{"url":"u2"}}]`, []string{"u1", "u2"}},
-		{"member case is ignored", `[{"type":"image_url","Image_Url":{"URL":"u1"}}]`, []string{"u1"}},
-		{"image_url that is not an object", `[{"type":"image_url","image_url":"u1"}]`, nil},
-		{"an image_url without a string url", `[{"type":"image_url","image_url":{"url":3}}]`, nil},
-		{"not JSON", `nope`, nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := MessageImageURLs(json.RawMessage(tc.content))
-			if !slices.Equal(got, tc.want) {
-				t.Fatalf("MessageImageURLs(%s) = %v, want %v", tc.content, got, tc.want)
-			}
-		})
+// messageImageURLs is the url of every image part of a content, mask included, in
+// order (how MessageImages reads a message is TestMessageImages' business).
+func messageImageURLs(content json.RawMessage) []string {
+	var urls []string
+	for _, img := range MessageImages(content) {
+		urls = append(urls, img.URL)
 	}
+	return urls
 }

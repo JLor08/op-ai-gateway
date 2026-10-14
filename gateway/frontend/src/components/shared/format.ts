@@ -249,9 +249,13 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // carries a source image: no image part (images.image_required), and a target
   // agent that has not declared multipart_proxy (images.edit_unavailable, a 404 --
   // an agent older than 0.9.0, or one that has not reported since a gateway
-  // restart). The mask refusals are labelled with the portal's mask upload.
+  // restart). The two refusals only a mask causes (the portal's mask upload,
+  // convertImageEditMask): a mask that does not fit its source (images.mask_invalid)
+  // and a format that cannot be read (images.edit_unsupported_format).
   'images.image_required': 'errorImagesImageRequired',
   'images.edit_unavailable': 'errorImagesEditUnavailable',
+  'images.mask_invalid': 'errorImagesMaskInvalid',
+  'images.edit_unsupported_format': 'errorImagesEditUnsupportedFormat',
   // Chat binary payload store (#124): refusals at run start. The first three
   // are rows in error_map.go for portal.ErrChatBlobTypeUnsupported /
   // ErrChatBlobTooLarge / ErrChatBlobNotOwned (an uploaded or edited image is

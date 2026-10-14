@@ -17,6 +17,7 @@ import {
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import AddPhotoAlternateIcon from '@mui/icons-material/AddPhotoAlternate';
+import LayersIcon from '@mui/icons-material/Layers';
 import type { ImageModelOptions } from '../api';
 import type { Translation } from './shared/types';
 import type { ChatContent } from './shared/chatContent';
@@ -729,7 +730,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               }}
               disabled={c.streaming}
             />
-            {c.images.length > 0 && (
+            {(c.images.length > 0 || c.mask !== null) && (
               <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
                 {c.images.map((url, index) => (
                   // Key/remove by index (matching the sent-message renderer):
@@ -767,6 +768,43 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     </IconButton>
                   </Box>
                 ))}
+                {c.mask !== null && (
+                  <Box sx={{ position: 'relative', width: 72, height: 72 }}>
+                    <Box
+                      component="img"
+                      src={c.mask}
+                      alt={t.chatAttachedMask}
+                      sx={{
+                        display: 'block',
+                        width: 72,
+                        height: 72,
+                        objectFit: 'cover',
+                        border: '1px solid var(--line)',
+                        borderRadius: '8px',
+                        // A mask is mostly transparent: a checkerboard behind it shows
+                        // the transparent region (the one to edit) as what it is.
+                        background:
+                          'repeating-conic-gradient(#c8c8c8 0% 25%, #ffffff 0% 50%) 0 0 / 12px 12px',
+                      }}
+                    />
+                    <IconButton
+                      size="small"
+                      aria-label={t.chatRemoveMask}
+                      onClick={c.removeMask}
+                      sx={{
+                        position: 'absolute',
+                        top: -6,
+                        right: -6,
+                        width: 20,
+                        height: 20,
+                        bgcolor: 'var(--brand-accent)',
+                        color: 'var(--accent-text)',
+                      }}
+                    >
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </Box>
+                )}
               </Box>
             )}
             <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1.5 }}>
@@ -816,6 +854,52 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   </IconButton>
                 </span>
               </Tooltip>
+              {/* The mask slot of an edit (inpainting): a PNG the size of the source
+                image whose transparent area marks the region to change. Only an edit
+                has one, and it needs the source first -- so it is disabled, and
+                says why, until one is attached. Same structure as the attach
+                button above: the file input is named by the hidden label text. */}
+              {c.attachMode === 'edit' && (
+                <Tooltip
+                  title={c.images.length === 0 ? t.chatMaskNeedsSource : t.chatAttachMaskTooltip}
+                  describeChild
+                >
+                  <span>
+                    <IconButton
+                      component="label"
+                      size="small"
+                      disabled={c.streaming || c.images.length === 0}
+                    >
+                      <LayersIcon fontSize="small" />
+                      <Box
+                        component="span"
+                        sx={{
+                          position: 'absolute',
+                          width: 1,
+                          height: 1,
+                          p: 0,
+                          m: '-1px',
+                          overflow: 'hidden',
+                          clip: 'rect(0 0 0 0)',
+                          whiteSpace: 'nowrap',
+                          border: 0,
+                        }}
+                      >
+                        {t.chatAttachMask}
+                      </Box>
+                      <input
+                        type="file"
+                        accept="image/png"
+                        hidden
+                        onChange={(event) => {
+                          void c.handleMaskFile(event.target.files);
+                          event.target.value = '';
+                        }}
+                      />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
             </Stack>
             <Tooltip
               title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}

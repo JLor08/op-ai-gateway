@@ -755,21 +755,76 @@ func MessageText(content json.RawMessage) string {
 	return ""
 }
 
-// MessageImageURLs is the url of every image part of a message content, in order:
-// what an image-run executor sends as an edit's source images (an array content;
+// ImagePurposeMask is the value of an image part's "purpose" member that marks it
+// as the MASK of an image edit (inpainting) rather than a source image. The part
+// is an ordinary image_url part otherwise -- {"type":"image_url","image_url":
+// {"url":...},"purpose":"mask"} -- so it is stored as a chat blob, resolved back to
+// bytes and owner-checked by the code that handles every other image of a message;
+// only the image-run executor reads the tag, to send the part as the edit's `mask`
+// form field instead of as a source. The web portal writes the tag (maskPart in
+// frontend components/shared/chatContent.ts), the executor reads it
+// (MessageImages); a part without it is a source.
+const ImagePurposeMask = "mask"
+
+// imagePurposeKey is the member of an image part that carries its purpose.
+const imagePurposeKey = "purpose"
+
+// MessageImage is one image part of a message content: its url, and whether it is
+// tagged as the mask of an edit (ImagePurposeMask).
+type MessageImage struct {
+	URL  string
+	Mask bool
+}
+
+// MessageImages is every image part of a message content, in order: what an
+// image-run executor sends as an edit's source images and mask (an array content;
 // a plain string has none). Exported for the same reason as MessageText, and it
-// reads through rewriteImageParts -- the one definition of an image part the
+// reads through rewriteImagePart -- the one definition of an image part the
 // extraction at a run commit and the resolution of a run's history already share
 // -- so the executor and the resolution cannot disagree about what counts as an
 // image (an object whose image_url is an object with a string url, members
-// matched without regard to case).
-func MessageImageURLs(content json.RawMessage) []string {
-	var urls []string
-	_, _, _ = rewriteImageParts(content, func(url string) (string, json.RawMessage, error) {
-		urls = append(urls, url)
-		return url, nil, nil
-	})
-	return urls
+// matched without regard to case). The tag is read the same way: its member name
+// without regard to case, its value exactly, and a part that is not an image has
+// no purpose to speak of.
+func MessageImages(content json.RawMessage) []MessageImage {
+	parts, ok := parseJSONArray(content)
+	if !ok {
+		return nil
+	}
+	var images []MessageImage
+	for _, raw := range parts {
+		var urls []string
+		_, _, _ = rewriteImagePart(raw, func(url string) (string, json.RawMessage, error) {
+			urls = append(urls, url)
+			return url, nil, nil
+		})
+		if len(urls) == 0 {
+			continue
+		}
+		mask := isMaskPart(raw)
+		for _, url := range urls {
+			images = append(images, MessageImage{URL: url, Mask: mask})
+		}
+	}
+	return images
+}
+
+// isMaskPart reports whether an image part carries the mask tag.
+func isMaskPart(raw json.RawMessage) bool {
+	part, ok := parseJSONObject(raw)
+	if !ok {
+		return false
+	}
+	for _, member := range part {
+		if !strings.EqualFold(member.key, imagePurposeKey) {
+			continue
+		}
+		var purpose string
+		if json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask {
+			return true
+		}
+	}
+	return false
 }
 
 // AssistantTurn is the generated assistant message a run persists.

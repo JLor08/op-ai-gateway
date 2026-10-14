@@ -233,6 +233,17 @@ const de = {
   chatImageEditPromptRequired:
     'Beschreiben Sie, wie das Bild bearbeitet werden soll, bevor Sie senden.',
   chatImageEditSourceType: 'Eine Bildbearbeitung nimmt ein PNG- oder JPEG-Bild.',
+  // The mask of an edit (inpainting): an optional PNG, the size of the source
+  // image, whose transparent area marks the region to change. Its slot is next to
+  // the attach button of an edit and needs the source image first.
+  chatAttachMask: 'Maske anhängen',
+  chatAttachMaskTooltip:
+    'Maske anhängen (PNG in der Größe des Bildes): Der transparente Bereich markiert die Stelle, die bearbeitet wird',
+  chatAttachedMask: 'Maske',
+  chatRemoveMask: 'Maske entfernen',
+  chatMaskNeedsSource:
+    'Eine Maske braucht ein Ausgangsbild. Bitte hängen Sie zuerst das Bild an, das bearbeitet werden soll.',
+  chatMaskErrorType: 'Eine Maske muss ein PNG-Bild sein.',
   // The image-thread settings panel: the generation knobs shown in place of the
   // text-chat controls. The "" options ("Standard …") send nothing and leave
   // sd-server on its own default; output_compression only applies to a lossy
@@ -1528,7 +1539,15 @@ const de = {
   errorImagesEditUnavailable:
     'Dieser Server kann Bilder derzeit nicht bearbeiten: Sein Agent unterstützt die Bildbearbeitung noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
   errorChatRunImageSourceUnreadable:
-    'Das angehängte Bild konnte nicht gelesen werden. Bitte hängen Sie es erneut an.',
+    'Das angehängte Bild oder die Maske konnte nicht gelesen werden. Bitte hängen Sie es erneut an.',
+  // Die beiden Ablehnungen von /v1/images/edits, die nur eine Maske auslösen kann:
+  // eine Maske, die nicht zum Bild passt (andere Größe, größer als das Maximum,
+  // kein transparenter Bereich), und ein Format, das nicht lesbar ist (eine Maske,
+  // die kein PNG ist; mit Maske muss auch das Ausgangsbild PNG oder JPEG sein).
+  errorImagesMaskInvalid:
+    'Die Maske passt nicht zum Bild: Sie muss genau so groß sein wie das Ausgangsbild (höchstens 16 Megapixel) und mindestens einen transparenten Bereich enthalten, der die zu bearbeitende Stelle markiert.',
+  errorImagesEditUnsupportedFormat:
+    'Das Format wird bei der Bildbearbeitung nicht unterstützt: Eine Maske muss ein PNG sein, dessen transparenter Bereich die zu bearbeitende Stelle markiert, und mit einer Maske muss das Ausgangsbild ein PNG oder JPEG sein.',
   // Chat-Binärdatenspeicher: Bilder liegen außerhalb des Verlaufs, und ein
   // Lauf wird abgelehnt, bevor er startet, wenn ein hochgeladenes oder
   // bearbeitetes Bild nicht gespeichert beziehungsweise nicht gelesen werden
@@ -3092,6 +3111,13 @@ const en: PortalMessages = {
   chatImageEditSingleSource: 'An image edit takes exactly one source image.',
   chatImageEditPromptRequired: 'Describe how the image should be edited before sending.',
   chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
+  chatAttachMask: 'Attach a mask',
+  chatAttachMaskTooltip:
+    'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
+  chatAttachedMask: 'Mask',
+  chatRemoveMask: 'Remove mask',
+  chatMaskNeedsSource: 'A mask needs a source image. Please attach the image to edit first.',
+  chatMaskErrorType: 'A mask must be a PNG image.',
   chatImageSize: 'Image size',
   chatImageSizeDefault: 'Default (model)',
   chatImageCount: 'Number of images',
@@ -4269,7 +4295,15 @@ const en: PortalMessages = {
   errorImagesEditUnavailable:
     'This server cannot edit images right now: its agent does not support image editing yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
   errorChatRunImageSourceUnreadable:
-    'The attached image could not be read. Please attach it again.',
+    'The attached image or mask could not be read. Please attach it again.',
+  // The two refusals of /v1/images/edits only a mask can cause: a mask that does
+  // not fit the image (another size, past the maximum, no transparent area) and a
+  // format that cannot be read (a mask that is not a PNG; with a mask the source
+  // image must be a PNG or JPEG too).
+  errorImagesMaskInvalid:
+    'The mask does not fit the image: it must be exactly the same size as the source image (at most 16 megapixels) and have at least one transparent area that marks the region to edit.',
+  errorImagesEditUnsupportedFormat:
+    'This format is not supported for image edits: a mask must be a PNG whose transparent area marks the region to edit, and with a mask the source image must be a PNG or JPEG.',
   // Chat binary payload store: images live outside the transcript, and a run
   // is refused before it starts when an uploaded or edited image cannot be
   // stored or read. Wire codes: see format.ts (errorLabelByCode).

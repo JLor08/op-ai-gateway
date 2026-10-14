@@ -58,6 +58,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(images[0]).toHaveAttribute('src', 'data:image/png;base64,AAAA');
     });
 
+    it('shows the mask of a masked edit apart from the attached image, under its own name', () => {
+      render(
+        <ChatMessage
+          t={t}
+          role="user"
+          content={[
+            { type: 'text', text: 'fill the sky' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,SRC' } },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,MASK' },
+              purpose: 'mask',
+            },
+          ]}
+        />,
+      );
+      const attached = screen.getAllByAltText(t.chatAttachedImage);
+      expect(attached).toHaveLength(1);
+      expect(attached[0]).toHaveAttribute('src', 'data:image/png;base64,SRC');
+      const masks = screen.getAllByAltText(t.chatAttachedMask);
+      expect(masks).toHaveLength(1);
+      expect(masks[0]).toHaveAttribute('src', 'data:image/png;base64,MASK');
+    });
+
     it('saves an edited user message', () => {
       const onEdit = vi.fn();
       render(<ChatMessage t={t} role="user" content="original" onEdit={onEdit} />);

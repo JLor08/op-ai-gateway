@@ -10,7 +10,8 @@ import ReplayIcon from '@mui/icons-material/Replay';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
-import type { ChatContent } from './shared/chatContent';
+import type { ChatContent, ChatContentPart } from './shared/chatContent';
+import { isMaskPart } from './shared/chatContent';
 import type { Translation } from './shared/types';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
@@ -23,14 +24,24 @@ function contentText(content: ChatContent): string {
     .join('\n');
 }
 
-function contentImages(content: ChatContent): string[] {
+type ImagePart = Extract<ChatContentPart, { type: 'image_url' }>;
+
+function imageParts(content: ChatContent): ImagePart[] {
   if (typeof content === 'string') return [];
-  return content
-    .filter(
-      (part): part is { type: 'image_url'; image_url: { url: string } } =>
-        part.type === 'image_url',
-    )
+  return content.filter((part): part is ImagePart => part.type === 'image_url');
+}
+
+// The images of a message as the user sees them: attachments, edit sources and
+// generated results. The MASK of a masked edit is an image part too, but it is not
+// one of these -- it has its own thumbnail and its own name (contentMask below).
+function contentImages(content: ChatContent): string[] {
+  return imageParts(content)
+    .filter((part) => !isMaskPart(part))
     .map((part) => part.image_url.url);
+}
+
+function contentMask(content: ChatContent): string | undefined {
+  return imageParts(content).find(isMaskPart)?.image_url.url;
 }
 
 // Rendered markdown links always open in a new tab. A stable module-level
@@ -102,6 +113,7 @@ function ChatMessageComponent({
 }>) {
   const text = contentText(content);
   const images = contentImages(content);
+  const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
   const [showRaw, setShowRaw] = useState(false);
@@ -399,7 +411,7 @@ function ChatMessageComponent({
       ) : (
         <>
           <Box>{text}</Box>
-          {images.length > 0 && (
+          {(images.length > 0 || mask !== undefined) && (
             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
               {images.map((url, index) => (
                 <Box
@@ -417,6 +429,24 @@ function ChatMessageComponent({
                   }}
                 />
               ))}
+              {mask !== undefined && (
+                <Box
+                  component="img"
+                  src={mask}
+                  alt={t.chatAttachedMask}
+                  sx={{
+                    display: 'block',
+                    width: 72,
+                    height: 72,
+                    objectFit: 'cover',
+                    border: '1px solid var(--line)',
+                    borderRadius: '8px',
+                    // Mostly transparent: a checkerboard shows the region to edit.
+                    background:
+                      'repeating-conic-gradient(#c8c8c8 0% 25%, #ffffff 0% 50%) 0 0 / 12px 12px',
+                  }}
+                />
+              )}
             </Box>
           )}
           {onEdit && (

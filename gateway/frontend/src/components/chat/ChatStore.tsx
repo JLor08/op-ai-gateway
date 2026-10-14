@@ -53,6 +53,7 @@ import {
   readLegacyDoc,
   resolveTokenOverride,
   summaryOf,
+  userTurnContent,
   type AttachMode,
   type ChatUiMessage,
   type ImageSettings,
@@ -225,6 +226,14 @@ export type ChatStore = {
   setInput: Dispatch<SetStateAction<string>>;
   handleFiles: (fileList: FileList | null) => Promise<void>;
   removeImage: (index: number) => void;
+  // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
+  // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
+  // and it is dropped with its source or when the mode changes) and is sent as a
+  // part of the turn tagged as a mask (chatDoc.ts maskPart). Distinct from `images`,
+  // which are the sources.
+  mask: string | null;
+  handleMaskFile: (fileList: FileList | null) => Promise<void>;
+  removeMask: () => void;
   setModel: Dispatch<SetStateAction<string>>;
   setSystemPrompt: Dispatch<SetStateAction<string>>;
   setTemperature: Dispatch<SetStateAction<number>>;
@@ -232,6 +241,23 @@ export type ChatStore = {
   setSelectedTokenId: Dispatch<SetStateAction<string>>;
   handlersFor: (id: string) => { onEdit: (text: string) => void; onRegenerate: () => void };
 };
+
+// The user-facing sentence for a failed attachment: the reason an image could not be
+// prepared (type, size, or a decode failure -- or anything else, which is generic).
+function attachErrorText(err: unknown, t: Translation): string {
+  if (err instanceof ImageAttachError) {
+    switch (err.reason) {
+      case 'type':
+        return t.chatImageErrorType;
+      case 'size':
+        return t.chatImageErrorSize;
+      default:
+        // "decode" (or any future reason) -> generic
+        return t.chatImageError;
+    }
+  }
+  return t.chatImageError;
+}
 
 // Exported so tests can inject a store value directly (e.g. the Chat view)
 // without spinning up the full stream driver.
@@ -316,6 +342,7 @@ export function ChatStoreProvider({
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
+  const [mask, setMask] = useState<string | null>(null);
   const [selectedTokenId, setSelectedTokenId] = useState<string>(DEFAULTS.run_as_token_id);
   const [serverOverride, setServerOverride] = useState<string>(DEFAULTS.server_override);
   const [serverOverrideForceUnreachable, setServerOverrideForceUnreachable] = useState<boolean>(
@@ -898,6 +925,16 @@ export function ChatStoreProvider({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attachMode]);
 
+  // A mask is the mask OF an edit's source image, so it cannot outlive either: it
+  // goes when the source is removed (or sent) and when the attach mode is no longer
+  // 'edit' -- a text model reading the same image has no use for one. Nothing needs
+  // to be said: the strip it was in shows it gone, and the source's own clearing
+  // (above) already speaks when a model takes no image at all.
+  useEffect(() => {
+    if (mask === null) return;
+    if (attachMode !== 'edit' || images.length === 0) setMask(null);
+  }, [mask, attachMode, images.length]);
+
   // Reset a stale run-as selection: onRefresh reloads `tokens` after every
   // stream, and a chat may persist a run-as token that was later
   // deleted/disabled/expired or lost gateway:use — it would otherwise keep
@@ -1089,6 +1126,9 @@ export function ChatStoreProvider({
       const original = current[index];
       let content: ChatContent = text;
       if (Array.isArray(original.content)) {
+        // Every image part of the turn goes back as it was -- an image thread's edit
+        // turn keeps its source, and a masked edit its tagged mask part too (it is an
+        // image_url part like the source), in their original order.
         const attachedImages = original.content.filter((part) => part.type === 'image_url');
         content = [{ type: 'text', text }, ...attachedImages];
       }
@@ -1188,13 +1228,8 @@ export function ChatStoreProvider({
     // thread's kind comes from the pin rather than from the picked model.
     if (messagesRef.current.length === 0) setPinnedChatKind(chatKindRef.current);
 
-    let content: ChatContent = text;
-    if (images.length > 0) {
-      content = [
-        { type: 'text', text },
-        ...images.map((url) => ({ type: 'image_url' as const, image_url: { url } })),
-      ];
-    }
+    // The text, the attached source and -- for an edit -- the mask, tagged as one.
+    const content = userTurnContent(text, images, mask, attachModeRef.current);
     maybeAutoTitle(text);
     const userMessage: ChatUiMessage = { id: nextId(), role: 'user', content };
     const next = [...messagesRef.current, userMessage];
@@ -1203,6 +1238,7 @@ export function ChatStoreProvider({
     chatBuffers.set(chatId, next);
     setInput('');
     setImages([]);
+    setMask(null);
 
     try {
       const res = await apiRef.current.startChatRun(chatId, {
@@ -1439,26 +1475,42 @@ export function ChatStoreProvider({
         setImages((prev) => (prev.length >= limit ? prev : [...prev, url]));
         count += 1;
       } catch (err) {
-        if (err instanceof ImageAttachError) {
-          switch (err.reason) {
-            case 'type':
-              lastError = t.chatImageErrorType;
-              break;
-            case 'size':
-              lastError = t.chatImageErrorSize;
-              break;
-            default:
-              // "decode" (or any future reason) -> generic
-              lastError = t.chatImageError;
-          }
-        } else {
-          lastError = t.chatImageError;
-        }
+        lastError = attachErrorText(err, t);
       }
     }
     // Set one trailing error so a multi-file batch shows a single toast rather
     // than flickering per file (and no stale error survives a later success).
     if (lastError) showError(lastError);
+  }
+
+  const removeMask = useCallback(() => setMask(null), []);
+
+  // The mask slot of an edit: ONE PNG, and only beside a source image. It goes
+  // through the same preparation as the source (size cap, decode check, the 1568 px
+  // longest-edge downscale), which is what keeps the two the same size when the
+  // source is downscaled -- the same function of the same pixel size gives the same
+  // result -- and a PNG stays a PNG, alpha included. The gateway checks the rest
+  // (the mask's size against the source's, a transparent region to edit) and says
+  // so with images.mask_invalid.
+  async function handleMaskFile(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) return;
+    if (attachMode !== 'edit' || images.length === 0) {
+      showError(t.chatMaskNeedsSource);
+      return;
+    }
+    const file = fileList[0];
+    // The mask's alpha is the selection, so only a PNG can carry it (a jpeg has no
+    // alpha, a webp or gif would be refused by the gateway). `accept` is a hint, so
+    // the type is checked here too.
+    if (file.type.toLowerCase() !== 'image/png') {
+      showError(t.chatMaskErrorType);
+      return;
+    }
+    try {
+      setMask(await prepareImageDataUrl(file));
+    } catch (err) {
+      showError(attachErrorText(err, t));
+    }
   }
 
   const value: ChatStore = {
@@ -1510,6 +1562,9 @@ export function ChatStoreProvider({
     setInput,
     handleFiles,
     removeImage,
+    mask,
+    handleMaskFile,
+    removeMask,
     setModel,
     setSystemPrompt,
     setTemperature,

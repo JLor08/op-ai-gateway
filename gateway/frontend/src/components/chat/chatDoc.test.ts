@@ -7,12 +7,18 @@ import {
   DEFAULTS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
+  MASK_PURPOSE,
   imageSetting,
   imageSettingsFrom,
+  isMaskPart,
   kindSetting,
+  lastUserHasImage,
+  maskPart,
   metricsOf,
   normalizeDoc,
   optionsOr,
+  userTurnContent,
+  type ChatUiMessage,
 } from './chatDoc';
 
 describe('metricsOf', () => {
@@ -260,5 +266,95 @@ describe('optionsOr', () => {
   it('falls back to the static list when the fetched list is absent', () => {
     expect(optionsOr(undefined, IMAGE_SAMPLERS)).toBe(IMAGE_SAMPLERS);
     expect(optionsOr(undefined, IMAGE_SCHEDULERS)).toBe(IMAGE_SCHEDULERS);
+  });
+});
+
+// Masked inpainting (ADR-043 R1). The mask of an edit is stored as an ordinary
+// image part of the user message that carries a TAG -- {"purpose":"mask"} beside
+// image_url -- so it is stored, resolved and owner-checked as an image like the
+// source is, and the gateway's executor (portal.MessageImages / ImagePurposeMask)
+// can send it as the `mask` form field instead of as a second source. The key and
+// the value are the wire contract with that reader.
+describe('the mask part', () => {
+  const src = 'data:image/png;base64,SRC';
+  const mask = 'data:image/png;base64,MASK';
+  const textPart = (text: string) => ({ type: 'text' as const, text });
+  const imagePart = (url: string) => ({ type: 'image_url' as const, image_url: { url } });
+  const user = (content: ChatUiMessage['content'], id = 'u'): ChatUiMessage => ({
+    id,
+    role: 'user',
+    content,
+  });
+
+  it('is an image_url part tagged with purpose "mask", the way the executor reads it', () => {
+    expect(maskPart(mask)).toEqual({
+      type: 'image_url',
+      image_url: { url: mask },
+      purpose: 'mask',
+    });
+    expect(MASK_PURPOSE).toBe('mask');
+  });
+
+  it('is told from a source by the tag alone', () => {
+    expect(isMaskPart(maskPart(mask))).toBe(true);
+    expect(isMaskPart(imagePart(src))).toBe(false);
+    expect(isMaskPart(textPart('hi'))).toBe(false);
+  });
+
+  describe('lastUserHasImage', () => {
+    it('counts a source image of the last user message', () => {
+      expect(lastUserHasImage([user([textPart('x'), imagePart(src)])])).toBe(true);
+    });
+
+    it('counts a source that comes with a mask', () => {
+      expect(lastUserHasImage([user([textPart('x'), imagePart(src), maskPart(mask)])])).toBe(true);
+    });
+
+    it('does not take a mask for a source: a message with a mask alone is no edit', () => {
+      expect(lastUserHasImage([user([textPart('x'), maskPart(mask)])])).toBe(false);
+    });
+
+    it("reads only the last user message: an earlier turn's source and mask make no edit of this one", () => {
+      const earlier = user([textPart('old'), imagePart(src), maskPart(mask)], 'u1');
+      const later = user('plain', 'u2');
+      expect(lastUserHasImage([earlier, later])).toBe(false);
+    });
+  });
+
+  describe('userTurnContent', () => {
+    it('is the plain text of a turn with no image', () => {
+      expect(userTurnContent('a cat', [], null, 'edit')).toBe('a cat');
+    });
+
+    it('is the text then the source for an edit with no mask, with nothing else on the part', () => {
+      const content = userTurnContent('make it blue', [src], null, 'edit');
+      expect(content).toEqual([textPart('make it blue'), imagePart(src)]);
+      // The no-mask edit is what it was before masks: the source part has no tag key.
+      expect(Object.keys((content as { type: string }[])[1]).sort()).toEqual(['image_url', 'type']);
+    });
+
+    it('is the text, the source and then the tagged mask for a masked edit', () => {
+      expect(userTurnContent('fill the sky', [src], mask, 'edit')).toEqual([
+        textPart('fill the sky'),
+        imagePart(src),
+        maskPart(mask),
+      ]);
+    });
+
+    it('never carries a mask without a source image', () => {
+      expect(userTurnContent('x', [], mask, 'edit')).toBe('x');
+    });
+
+    it('never carries a mask outside an edit: a text model reading an image has no use for it', () => {
+      expect(userTurnContent('x', [src], mask, 'vision')).toEqual([textPart('x'), imagePart(src)]);
+    });
+
+    it('keeps several images of a vision turn as sources', () => {
+      expect(userTurnContent('x', [src, src], null, 'vision')).toEqual([
+        textPart('x'),
+        imagePart(src),
+        imagePart(src),
+      ]);
+    });
   });
 });

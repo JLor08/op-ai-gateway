@@ -1430,6 +1430,238 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // Masked inpainting (ADR-043 R1): an edit may also carry a MASK -- a PNG, the size
+  // of the source image, whose transparent area marks the region to change. It has
+  // its own slot next to the attach button, takes exactly one PNG, needs the source
+  // first, and rides the turn as an image part tagged purpose "mask" (chatDoc.ts), so
+  // the server stores, resolves and replays it like the source and sends it as the
+  // `mask` form field. (The drawing canvas is a later step: this is the upload.)
+  describe(`Chat: masked inpainting upload (ADR-043 R1) [${locale}]`, () => {
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    const noEditModel: ModelOption = {
+      ...editModel,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const visionModel: ModelOption = {
+      id: 'vision-model',
+      display_name: 'vision-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+
+    function attachSource(name = 'source.png') {
+      fireEvent.change(screen.getByLabelText(t.chatAttachImage), {
+        target: { files: [new File(['s'], name, { type: 'image/png' })] },
+      });
+    }
+    function attachMask(name = 'mask.png', type = 'image/png') {
+      fireEvent.change(screen.getByLabelText(t.chatAttachMask), {
+        target: { files: [new File(['m'], name, { type })] },
+      });
+    }
+    const maskButton = () => screen.getByRole('button', { name: t.chatAttachMask });
+
+    async function editThreadWithSource() {
+      renderChat(tokens, [editModel, noEditModel, visionModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+      attachSource();
+      await screen.findByAltText(t.chatAttachedImage);
+    }
+
+    describe('the slot', () => {
+      it('is offered for an edit only, and not for a text model reading images', async () => {
+        renderChat(tokens, [editModel, noEditModel, visionModel]);
+        await waitForChatReady();
+
+        await pickOption(t.chatModel, visionModel.display_name);
+        expect(screen.queryByLabelText(t.chatAttachMask)).not.toBeInTheDocument();
+
+        await pickOption(t.chatModel, noEditModel.display_name);
+        expect(screen.queryByLabelText(t.chatAttachMask)).not.toBeInTheDocument();
+
+        await pickOption(t.chatModel, editModel.display_name);
+        expect(screen.getByLabelText(t.chatAttachMask)).toBeInTheDocument();
+      });
+
+      it('waits for the source image: disabled, and saying why, until one is attached', async () => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+
+        expect(maskButton()).toHaveAttribute('aria-disabled', 'true');
+        fireEvent.mouseOver(maskButton());
+        expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatMaskNeedsSource);
+
+        attachSource();
+        await screen.findByAltText(t.chatAttachedImage);
+        await waitFor(() => expect(maskButton()).not.toHaveAttribute('aria-disabled', 'true'));
+        fireEvent.mouseOver(maskButton());
+        await waitFor(() =>
+          expect(screen.getByRole('tooltip')).toHaveTextContent(t.chatAttachMaskTooltip),
+        );
+      });
+
+      it('takes exactly one PNG: the picker offers png only and no multiple selection', async () => {
+        await editThreadWithSource();
+
+        const input = screen.getByLabelText(t.chatAttachMask);
+        expect(input).toHaveAttribute('accept', 'image/png');
+        expect(input).not.toHaveAttribute('multiple');
+      });
+    });
+
+    describe('attaching a mask', () => {
+      it('shows it beside the source, under its own name, and removes it on request', async () => {
+        await editThreadWithSource();
+
+        attachMask();
+
+        expect(await screen.findByAltText(t.chatAttachedMask)).toBeInTheDocument();
+        // The source is still the one attached image: a mask is not a second one.
+        expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRemoveMask }));
+
+        expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
+        expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+      });
+
+      it.each([
+        ['a jpeg', 'mask.jpg', 'image/jpeg'],
+        ['a webp', 'mask.webp', 'image/webp'],
+        ['a gif', 'mask.gif', 'image/gif'],
+      ])('refuses %s: a mask is a PNG, its alpha is the selection', async (_what, name, type) => {
+        await editThreadWithSource();
+
+        attachMask(name, type);
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatMaskErrorType);
+        expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
+      });
+
+      it('refuses a mask while no source image is attached, however the picker was reached', async () => {
+        renderChat(tokens, [editModel]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, editModel.display_name);
+
+        // The control is disabled, but a change event still reaches the input.
+        attachMask();
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatMaskNeedsSource);
+        expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
+      });
+    });
+
+    describe('sending', () => {
+      it('sends the mask after the source as an image part tagged purpose "mask"', async () => {
+        await editThreadWithSource();
+        attachMask();
+        await screen.findByAltText(t.chatAttachedMask);
+        fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+          target: { value: 'fill the sky' },
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+        expect(body.settings.kind).toBe('image');
+        expect(body.user_message).toEqual([
+          { type: 'text', text: 'fill the sky' },
+          {
+            type: 'image_url',
+            image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+          },
+          {
+            type: 'image_url',
+            image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+            purpose: 'mask',
+          },
+        ]);
+        // The source part carries no tag: only the mask is told apart.
+        const parts = body.user_message as { purpose?: string }[];
+        expect(parts[1]).not.toHaveProperty('purpose');
+        // The turn shows both, apart; the composer's own strip is empty again.
+        expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+        expect(screen.getAllByAltText(t.chatAttachedMask)).toHaveLength(1);
+      });
+
+      it('sends an edit with no mask exactly as before: the source alone, untagged', async () => {
+        await editThreadWithSource();
+        fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+          target: { value: 'make it blue' },
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+        expect(body.user_message).toStrictEqual([
+          { type: 'text', text: 'make it blue' },
+          {
+            type: 'image_url',
+            image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+          },
+        ]);
+      });
+    });
+
+    describe('a mask cannot outlive what it belongs to', () => {
+      it('goes when its source image is removed', async () => {
+        await editThreadWithSource();
+        attachMask();
+        await screen.findByAltText(t.chatAttachedMask);
+
+        // The source's remove button is the first of the strip.
+        fireEvent.click(screen.getAllByRole('button', { name: t.chatCancel })[0]);
+
+        await waitFor(() =>
+          expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument(),
+        );
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+        expect(maskButton()).toHaveAttribute('aria-disabled', 'true');
+      });
+
+      it('goes with the source when the thread moves to a model that cannot edit', async () => {
+        await editThreadWithSource();
+        attachMask();
+        await screen.findByAltText(t.chatAttachedMask);
+
+        await pickOption(t.chatModel, noEditModel.display_name);
+
+        await waitFor(() =>
+          expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument(),
+        );
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatAttachMask)).not.toBeInTheDocument();
+      });
+
+      it('goes alone when an edit model is swapped for a text model that reads images: the image stays', async () => {
+        await editThreadWithSource();
+        attachMask();
+        await screen.findByAltText(t.chatAttachedMask);
+
+        await pickOption(t.chatModel, visionModel.display_name);
+
+        await waitFor(() =>
+          expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument(),
+        );
+        expect(screen.getByAltText(t.chatAttachedImage)).toBeInTheDocument();
+      });
+    });
+  });
+
   describe(`Chat: the advanced image controls follow the picked model's options [${locale}]`, () => {
     const imageModels: ModelOption[] = [
       {

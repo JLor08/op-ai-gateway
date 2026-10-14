@@ -16,7 +16,13 @@ import type {
   ChatSummary,
   PortalToken,
 } from '../../api';
-import type { ChatContent } from '../shared/chatContent';
+import {
+  MASK_PURPOSE,
+  isMaskPart,
+  maskPart,
+  type ChatContent,
+  type ChatContentPart,
+} from '../shared/chatContent';
 
 // The persisted status of an assistant turn (mirrors the backend transcript
 // vocabulary). `pending` is written by a server checkpoint while a run is live;
@@ -153,6 +159,32 @@ export function attachModeOf(
 ): AttachMode {
   if (kind === 'image') return model.imageEdit ? 'edit' : 'none';
   return model.vision && !model.image ? 'vision' : 'none';
+}
+
+// The MASK of an image edit is an image part tagged `purpose: 'mask'` (the tag and
+// its predicate, MASK_PURPOSE / maskPart / isMaskPart, are defined with the part
+// shape in ../shared/chatContent -- the message renderer needs them too -- and
+// re-exported here for the chat module). A mask is only ever the mask OF an edit.
+export { MASK_PURPOSE, isMaskPart, maskPart };
+
+// The content of the user turn the composer sends: the text alone when no image is
+// attached, otherwise the text, the attached image(s) and -- for an edit of exactly
+// one source image only -- the mask. A mask without a source, or outside an edit
+// (a text model reading an image has no use for one), is left out rather than
+// sent: it could mean nothing there, and the executor would ignore it anyway.
+export function userTurnContent(
+  text: string,
+  images: string[],
+  mask: string | null,
+  mode: AttachMode,
+): ChatContent {
+  if (images.length === 0) return text;
+  const parts: ChatContentPart[] = [
+    { type: 'text', text },
+    ...images.map((url): ChatContentPart => ({ type: 'image_url', image_url: { url } })),
+  ];
+  if (mask !== null && mode === 'edit' && images.length === 1) parts.push(maskPart(mask));
+  return parts;
 }
 
 // The formats the edit route of sd-server reads a source image in. The composer
@@ -583,11 +615,17 @@ export function historyHasImage(messages: ChatUiMessage[]): boolean {
 // executor sends exactly that message's images as the source and reads nothing
 // else of the history). Role-aware on purpose, unlike historyHasImage: an image
 // thread's assistant turns hold its own generated results, which are never sent.
+//
+// A SOURCE image: the mask part (maskPart) is an image too, but a message with a
+// mask and no source is no edit -- the executor ignores such a mask -- so it must
+// not be taken for the operand the replay guard protects.
 export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const { role, content } = messages[i];
     if (role === 'user') {
-      return Array.isArray(content) && content.some((p) => p.type === 'image_url');
+      return (
+        Array.isArray(content) && content.some((p) => p.type === 'image_url' && !isMaskPart(p))
+      );
     }
   }
   return false;

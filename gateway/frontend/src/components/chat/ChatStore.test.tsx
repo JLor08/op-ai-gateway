@@ -2577,6 +2577,89 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('count').textContent).toBe('2');
     });
 
+    // A masked edit (inpainting): the mask is a tagged image part of the same user
+    // message and replays exactly as the source does -- an edit of the prompt keeps
+    // it, a regenerate sends it untouched, the guard treats the pair as the edit it
+    // is -- while a message holding a mask and NO source is no edit at all.
+    describe('a masked edit', () => {
+      const maskRef = '/api/portal/chat-blobs/blob_mask';
+      const maskedTurn = (id: string) => ({
+        id,
+        role: 'user',
+        content: [
+          { type: 'text', text: 'fill the sky' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+          { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+        ],
+      });
+
+      it('regenerates with the mask part replayed untouched, tag and reference included', async () => {
+        chatApi = makeChatApi(seed(editModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          edited_history: { id: string; content: unknown }[];
+        };
+        expect(body.edited_history).toHaveLength(1);
+        expect(body.edited_history[0].content).toStrictEqual(maskedTurn('u1').content);
+      });
+
+      it('keeps the source and the mask when only the prompt text of the turn is edited', async () => {
+        chatApi = makeChatApi(seed(editModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [editModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          edited_history: { id: string; content: unknown }[];
+        };
+        expect(body.edited_history[0].content).toStrictEqual([
+          { type: 'text', text: 'edited text' },
+          { type: 'image_url', image_url: { url: sourceRef } },
+          { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+        ]);
+      });
+
+      it('is refused as the edit it is on a model that cannot edit, before the transcript is touched', async () => {
+        chatApi = makeChatApi(seed(noEditModel, [maskedTurn('u1'), resultTurn('a1')]));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        expect(await screen.findByText(t.chatImageGeneratorNoInput)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('2');
+      });
+
+      it('is no edit without its source: a message holding only a mask replays as a plain generation', async () => {
+        const maskOnly = {
+          id: 'u1',
+          role: 'user',
+          content: [
+            { type: 'text', text: 'a cat' },
+            { type: 'image_url', image_url: { url: maskRef }, purpose: 'mask' },
+          ],
+        };
+        chatApi = makeChatApi(seed(noEditModel, [maskOnly, resultTurn('a1')]));
+        renderProvider([], { models: [noEditModel] });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        // Not refused as an edit (a generator that cannot be edited may still
+        // generate): the executor ignores a mask that has no source.
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(screen.queryByText(t.chatImageGeneratorNoInput)).toBeNull();
+      });
+    });
+
     // The prompt rule of the composer (an edit needs one) holds on the replay
     // paths too: an edit that blanks the prompt of an edit turn, or a regenerate of
     // an edit turn that was stored without one (the old composer allowed that),

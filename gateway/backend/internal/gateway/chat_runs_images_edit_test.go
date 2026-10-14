@@ -504,7 +504,9 @@ func storedImageURLsOf(t *testing.T, content json.RawMessage) []string {
 	}
 	var urls []string
 	for _, m := range doc.Messages {
-		urls = append(urls, portal.MessageImageURLs(m.Content)...)
+		for _, img := range portal.MessageImages(m.Content) {
+			urls = append(urls, img.URL)
+		}
 	}
 	return urls
 }
