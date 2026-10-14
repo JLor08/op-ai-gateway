@@ -668,8 +668,11 @@ plausible-looking validation rule would break the normal case:
   A capability NAME
   is validated only for emptiness; the vocabulary is otherwise open on purpose
   (`vision`,
-  `video`, `audio`, `tools`, `mtp`, `live_progress` and
-  `speculation_observed` are the names the code itself reasons about, while an
+  `video`, `audio`, `tools`, `mtp`, `live_progress`,
+  `speculation_observed` and `image_edit` are the names the code itself reasons
+  about — `image_edit` is **derived** from `image` at the gate and its only
+  stored row is an operator's `no` opt-out, [ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
+  — while an
   upstream may report others — since #54 the agent's Ollama probe actually
   produces such rows, carrying `insert`,
   `thinking`, `embedding`, `image` and any manifest-declared publisher string
@@ -689,9 +692,11 @@ plausible-looking validation rule would break the normal case:
     outside the clamp.
   - The RESERVED-name refusal is at the **gateway's agent ingest**
     (`internal/gateway/agent_ingest.go`): no probe-sourced pass, under either
-    probe source, may report `mtp`, `live_progress` or
-    `speculation_observed` — the three names this codebase reasons about that
-    no probe can observe. The agent's detector skips the first two as defence
+    probe source, may report `mtp`, `live_progress`,
+    `speculation_observed` or `image_edit` — the four names this codebase
+    reasons about that no probe can observe (`image_edit` is derived, so an
+    agent has no legitimate row to write: a rank-1 `no` would silently disable
+    edit and re-assert itself over the operator's reset). The agent's detector skips the first two as defence
     in depth; the gateway's list is the load-bearing one, because a buggy or
     hostile agent puts a name straight into the verdicts it sends and no
     agent-side filter is in that path.
@@ -714,6 +719,9 @@ plausible-looking validation rule would break the normal case:
     admin request rather than a probe's bytes — which is exactly why it narrows
     a VERDICT instead of banning a name: an admin has legitimate reasons to
     write most of these rows, so only the pair that causes the harm is refused.
+    The two lists are not kept in step: `image_edit: "no"` is on the agent list
+    above and **not** on this one, because it is the operator's own opt-out
+    (`(image, no)`, by contrast, is reserved here).
 
   Where each rule is NOT matters as much: the ingest enforces **no** count or
   length bound of its own, so what bounds an arriving pass is the honest

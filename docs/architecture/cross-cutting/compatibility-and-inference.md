@@ -53,6 +53,7 @@ flowchart TD
         Msg["POST /v1/messages\n/anthropic/v1/messages"]
         CT["POST /v1/messages/count_tokens"]
         Img["POST /v1/images/generations\n/openai/v1/images/generations"]
+        ImgEdit["POST /v1/images/edits (multipart)\n/openai/v1/images/edits"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
@@ -62,6 +63,9 @@ flowchart TD
     Img --> CapGate{"Resolve with\nRequiredCapabilities=[image]"}
     CapGate -->|refused| Reject3["404 routing.model_not_capable"]
     CapGate -->|target| Native3["relayImages -> proxyNative:\nforward raw body\nto upstream /v1/images/generations"]
+    ImgEdit --> CapGateE{"Resolve with\nRequiredCapabilities=[image_edit]"}
+    CapGateE -->|refused| Reject4["404 routing.model_not_capable /\nimages.edit_unavailable"]
+    CapGateE -->|target| Native4["relayImageEdit -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/images/edits"]
 
     NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
@@ -79,6 +83,7 @@ flowchart TD
     Native --> ProxyMux["provider.Multiplexer.ProxyNative\n(dispatch by target.Provider)"]
     Native2 --> ProxyMux
     Native3 --> ProxyMux
+    Native4 --> ProxyMux
 
     Mux --> Ollama["OllamaClient\n/api/chat"]
     Mux --> OAIC["OpenAICompatibleClient\n{prefix}/chat/completions (default /v1)"]
@@ -121,6 +126,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI Responses (Codex) | `/v1/responses`, `/openai/v1/responses` | `handleOpenAIResponses` | `requireAnyScope` (bearer only) | `Target.ResponsesMode` (§6) |
 | Anthropic Messages (Claude Code) | `/v1/messages`, `/anthropic/v1/messages` | `handleAnthropicMessages` | `requireAnyScope` (bearer only) | `Target.MessagesMode` (§6) |
 | OpenAI Images generations | `/v1/images/generations`, `/openai/v1/images/generations` | `handleOpenAIImages` | `requireInternalOrBearerAnyScope` (bearer or internal loopback — never a session cookie) | **always** — there is no translate path (§3.4) |
+| OpenAI Images edits (multipart) | `/v1/images/edits`, `/openai/v1/images/edits` | `handleOpenAIImagesEdit` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart relay, no translate path (§3.5) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -130,9 +136,10 @@ extractor (§4) discriminates them by `sessionEndpoint`
 service token's sole `llm:invoke` scope (service accounts); `requireWebAnyScope`
 additionally accepts the portal session cookie (+ CSRF header on state-changing
 methods) — `/v1/chat/completions` is deliberately the one inference endpoint
-reachable that way (§9). All bodies are read with `readRawJSONUnlimited`
-(§7); all five POST endpoints call `liftInferenceDeadlines` before reading the
-body (§6).
+reachable that way (§9). Every body but the edits one is read with
+`readRawJSONUnlimited` (§7); the edits body is `multipart/form-data` and is read
+by its own capped reader (§3.5, §10). All six POST endpoints call
+`liftInferenceDeadlines` before reading the body (§6).
 
 ### 3.1 OpenAI Chat Completions
 
@@ -236,9 +243,15 @@ Neither refusal needs a gate of its own here — the handler consumes the shared
 `admitPrincipal` call site (there is exactly one in the package, deliberately).
 Consequently
 `endpointModeFor` has **no case** for this flavor — there is no `images_mode`
-column to read — and `upstreamPath` answers `/v1/images/generations` directly,
-before the mode lookup and provider fallbacks that only chat, Responses and
-Messages need.
+column to read — and `upstreamPath` answers the images path directly, before the
+mode lookup and provider fallbacks that only chat, Responses and Messages need.
+`upstreamPath(target, apiFlavor, endpoint)` is **endpoint-aware**: the images
+flavor answers `/v1/images/generations` for every endpoint but
+`endpointImagesEdit`, for which it answers `/v1/images/edits` (§3.5), and every
+other flavor ignores the endpoint. The same endpoint reaches `recordUsage`
+(`usageMeta.Endpoint`, whose zero value is the generations path), because the
+usage row recomputes its `provider_path` from the flavor, not from the relay's
+path, and would otherwise record the generations path for an edit.
 
 **2. It validates its own shape and never calls
 `inference.Request.Validate()`.** That validator requires `len(Messages) > 0`,
@@ -328,7 +341,8 @@ bounded by `captureMaxBytes`, not by a wider cap.
 - **Resolving an image request writes the token's last-used-model marker,
   and an image request is redirected only onto an image-capable model.**
   `relayImages` goes
-  through the shared `resolveTarget`, so an image model becomes the marker a
+  through the shared `resolveImagesTarget` (which `relayImageEdit` shares, §3.5)
+  and so through `resolveTarget`, so an image model becomes the marker a
   **later chat request**'s unknown-model redirect tries first under
   `UnknownModelRedirect` ([Routing & Model Selection
   §2.1](routing-and-model-selection.md#21-per-token-model-resolution)). That
@@ -476,6 +490,150 @@ changes nothing about how a run is sent
   best-effort throughout: it answers `200` whatever the caches hold, and the
   only failure it reports is its own visibility read (`500`
   `model.image_options_failed`).
+
+### 3.5 OpenAI Images edits
+
+`POST /v1/images/edits` (`handleOpenAIImagesEdit`,
+`internal/gateway/images_edit_handler.go`) edits an image on the same upstream,
+under the same auth, flavor gate and metering as §3.4, and is the gateway's
+**first multipart request path**
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
+records why each piece is shaped as it is). Both the public bearer endpoint and
+the portal chat (server-side, over the loopback pair, §12) use this one handler.
+What differs from §3.4:
+
+**1. The body is `multipart/form-data`, and only a few fields are the gateway's
+business.** `model` and `prompt` are required (400 `images.model_required` /
+`images.prompt_required`) and at least one **non-empty** part must arrive under
+`image` **or** `image[]`, the two spellings OpenAI's clients use (400
+`images.image_required`). `response_format` must be `b64_json` or absent (400
+`images.response_format_unsupported`) and `stream` may only be false or absent
+(400 `images.stream_unsupported`), for the reasons §3.4 gives. `mask` is the one
+part with a meaning of its own (below). Everything else — `n`, `size`,
+`output_format`, `output_compression`, any other field — reaches the upstream
+unexamined. The edit route of `sd-server` produces **png and jpeg** only (a
+generation also produces webp); `size`, when absent, is derived from the source
+image. **`strength` is not a form field**: `sd-server`'s edit route reads no such
+field, and takes the value from the `<sd_cpp_extra_args>{"strength":…}</sd_cpp_extra_args>`
+block at the end of `prompt` (the same block §12 describes for the native knobs),
+otherwise using its own default of 0.75 — a weak edit for models that edit with
+reference images, which want a higher value.
+
+**2. The form is read once, bounded, before anything is admitted.**
+`readImageEditBody` reads the whole body into memory, capped by
+`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES` (default 32 MiB, §10; `413
+request.body_too_large`, from a declared `Content-Length` without reading a byte
+or from `http.MaxBytesReader` when none was declared). `parseImageEditForm` then
+walks it **once** with `mime/multipart` and the request's own boundary — never
+`ParseMultipartForm`, which spills to temp files and consumes the body this
+handler still has to relay — reading `model`, `prompt`, `response_format` and
+`stream` (each a single value of at most 1 MiB; a **repeated** one is 400
+`request.invalid`, because two `model` fields would be two answers to "which
+model" and the agent's router reads it again), counting the image parts, and
+reading **every** part to its end (`mime/multipart` swallows the read error of a
+part it merely steps over, so a truncated tail would otherwise fail later, after
+admission). A body that is not multipart, has no boundary or is malformed is 400
+`request.invalid`. All of this, and the mask conversion below, runs **before**
+`inferencePreflight`, so a refused request spends no admission.
+
+**3. The model gate is a derived capability, and the target is checked twice
+more.** The handler sets `RequiredCapabilities = ["image_edit"]` from its own
+identity, never from the body. `image_edit` is **derived** — a mapping with an
+`image: yes` verdict is edit-capable unless an operator set `image_edit: no` — and
+the one function that says so is read by the gate, by the unknown-model redirect
+and by the portal listing alike ([Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate)), so an unknown
+edit model is redirected to an edit-capable fallback like an unknown image model
+is, and an opted-out one answers 404 `routing.model_not_capable` while the same
+model still generates. The candidate must also declare the `openai_images`
+flavor, and `resolveImagesTarget` — the resolve and the post-resolve served-flavor
+conjunct (§6), **extracted** from `relayImages` so the two relays share one copy —
+refuses an agent-launched child whose spec lists only text with 404
+`routing.no_model_route`. Then, for a `server_agent` target only, the relay
+checks that its agent has **declared `multipart_proxy`**
+(`AgentFeatures.Has(serverID, "multipart_proxy")`,
+[Agent-Managed Model Runtime
+§7](agent-runtime-manager.md#7-feature-negotiation)): an agent that predates it
+would answer the multipart body `404 runtime.model_not_managed`, the same answer
+it gives an unmanaged model, so trying the route could not tell the two apart. A
+target that fails the check is refused **before anything is relayed** with
+**404 `images.edit_unavailable`**, recorded as one error row with
+`billing_unit: image` and no upstream. The check is fail-closed by construction
+— the registry is in memory, so it is also false for an agent that **has not
+reported since the gateway restarted**, and for one that was just upgraded until
+its first telemetry sample under the new version — and its message names both
+causes (an agent older than 0.9.0, or one that has not reported yet), so the
+operator is not told to update an agent that is already current. 404, not 409 or a 5xx, because the OpenAI SDKs
+retry 408/409/429 and every 5xx and a refusal only a different agent build can
+change must not be retried. It gates the **edit** only (generations are JSON,
+which every router serves), does not apply to an external target (no agent in
+front of it), and, like the conjunct, is **not retried against another
+application** that could have served the model.
+
+**4. The relay carries the form's own Content-Type, and rebuilds the body only
+when something in it must change.** `provider.NativeProxyClient.ProxyNative`
+takes the request's `Content-Type` as a parameter (§8) and `nativeRelay` gains an
+optional `upstreamBody`, so the relay can send the **client's bytes verbatim**
+(boundary included) or a body built for the upstream. It is **rebuilt once**
+(`rebuildImageEditBody`: every part copied with its headers, bytes and position,
+a fresh boundary) when either holds: the **`model` field must carry the mapping's
+own model name** (`Target.ProviderModel`) and the form's differs — for **every**
+target, since the JSON generations relay rewrites it for every provider too, an
+agent's router keys the child on that name, and a model-routing upstream would
+otherwise route on the gateway's name; the comparison is against the *form's*
+value, because a token override or a redirect can land on a mapping whose two
+names are equal — or the form carries a **mask**, which is always a rebuild. A
+no-mask edit whose model needs no rewrite is relayed verbatim. `nativeRelay.raw`
+stays the client's bytes either way, which is what capture records. The usage row
+records `/v1/images/edits` as its `provider_path`. A body bound for
+an agent-launched target is checked against **the agent's own 32 MiB** *after*
+the rebuild (§10); one over it is refused `413 request.body_too_large` and
+recorded rather than sent.
+
+**5. The mask: alpha in, luminance out.** An OpenAI edit marks the region to
+regenerate by **transparency** (an RGBA PNG whose transparent pixels are the
+edit); `sd-server` reads the `mask` field as **luminance** — white regenerates,
+black keeps — and drops the alpha channel, so a mask forwarded as sent would edit
+the opposite region. The gateway converts it (`convertImageEditMask`,
+`internal/gateway/images_edit_mask.go`):
+
+| Mask pixel | Sent to `sd-server` | Meaning |
+|---|---|---|
+| fully transparent | white (255) | regenerate |
+| fully opaque, whatever its colour | black (0) | keep |
+| partly transparent | grey, `255 − alpha` | a soft edge stays soft |
+
+The result is an 8-bit grayscale PNG file part named `mask.png` (the field needs a
+filename to be read as a file, and a client's own name may not be ASCII).
+Everything is checked from the image headers **before** a pixel is decoded, and
+each refusal is a 400 of its own: **`images.mask_invalid`** — the mask's size is
+not the **first** source image's (the first `image[]` part when there is one,
+else the first `image`, as `sd-server` picks; further `image[]` parts are
+references and may be any size), the mask is past **16 megapixels** (4096 × 4096,
+`sd-server`'s own edge limit; a PNG is a few bytes of header for any pixel count,
+so the body cap does not bound a decode's memory), or it has **no transparent
+pixel** (it selects nothing to edit — an opaque mask, or an sd-style luminance
+mask sent to this endpoint, would otherwise be a silent "edit nothing" that still
+costs a full diffusion run); and **`images.edit_unsupported_format`** — a mask that
+is not a readable PNG (a JPEG has no alpha) or has cut-off pixel data, or, **when a
+mask is sent**, a source that is not a readable PNG or JPEG (all `sd-server`'s edit
+route reads, and all the size check can read; with no mask nothing is decoded and
+the source's type is the upstream's business). Two `mask` parts are 400
+`request.invalid`, and an empty mask part is no mask.
+
+**6. The response, the usage row and the capture are the generations
+endpoint's, with three differences.** The upstream answers the same
+`{created, output_format, data:[{b64_json}]}` document, so the non-2xx
+normalisation (`images.upstream_error`), the `b64_json` counter and the buffered,
+`target.Timeout`-bounded relay of §3.4 apply unchanged, and the request takes **no
+affinity pin** and has **no session signal** (its own empty `sessionEndpoint`
+case). The differences: billing counts **output** images only — the source and
+the mask are **unmetered**, so a two-input edit bills like a zero-input generation
+([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event));
+the usage row's path is the edits path; and a multipart **request** is not stored
+as bytes by capture — the envelope holds a JSON summary of the form with the
+text fields and each file part `redacted`
+([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
 ## 4. Session / continuity signals
 
@@ -642,10 +800,12 @@ only resolves per-model, after a candidate has already been picked:
    reaches the translate path. That holds only for the target it judged; what
    reaches the translate path unjudged is set out below.
 
-**The images relay applies the same flavor conjunct.** `relayImages`
-(`internal/gateway/images_handler.go`) calls `proxyNative` directly rather than
-through `tryProxyNative`, so it runs `targetServesFlavor` itself after
-resolution: an agent-launched child whose spec excludes `openai_images` is
+**The images relays apply the same flavor conjunct.** `relayImages` and
+`relayImageEdit` (`internal/gateway/images_handler.go`,
+`images_edit_handler.go`) call `proxyNative` directly rather than through
+`tryProxyNative`, so they run `targetServesFlavor` themselves after resolution —
+in `resolveImagesTarget`, the one shared step that does both, so the two relays
+cannot drift apart on it: an agent-launched child whose spec excludes `openai_images` is
 refused with 404 `routing.no_model_route`, the answer candidacy would have
 given had it been the model's only route. The usage row records no upstream,
 since none was called. **The refusal is not retried against another
@@ -838,9 +998,9 @@ cancellation sources are the idle watchdog above, a benchmark stream's own
 watchdog (§7.2), and any deadline or cancellation on the caller's own context,
 such as a capacity level's budget or the model warmer's 60 s ceiling.
 
-`/v1/images/generations` sits entirely on the *other* side of that split: it
-pins `Stream` to `false`, so it always takes the buffered branch and is bounded
-by `target.Timeout` alone, with no idle watchdog at all. Because a diffusion
+`/v1/images/generations` and `/v1/images/edits` sit entirely on the *other* side
+of that split: each pins `Stream` to `false`, so it always takes the buffered
+branch and is bounded by `target.Timeout` alone, with no idle watchdog at all. Because a diffusion
 request can legitimately occupy that whole budget without emitting anything,
 the application's `timeout_ms` is the only thing standing between a working
 long generation and a cancelled one — see §3.4.
@@ -1048,6 +1208,21 @@ and OpenAI vendor target leaves it empty and composes exactly the paths this tab
 always named, while an OpenAI-compatible vendor account sets its preset's prefix
 (`/v1beta/openai` for Gemini's OpenAI shim, `/gateway` for Kilo,
 [External Vendor Accounts §4.4](external-vendor-accounts.md#44-openai-compatible-vendors)).
+
+**`ProxyNative` carries the request's `Content-Type`.** The interface is
+`ProxyNative(ctx, target, path, body, contentType)`: the value is sent upstream
+verbatim as the request's `Content-Type` (there is no empty-string fallback; the
+method is still `POST`, and the defaults and `applyUpstreamAuth` ordering are
+untouched). Every JSON caller passes `application/json`, the same value the
+method used to hard-code, so a JSON passthrough is byte-for-byte what it was; the
+image edit relay (§3.5) passes the multipart type **with its boundary**, which the
+upstream needs to read the body. All six implementers
+(`multiplexer`, `openai_compatible`, `anthropic_messages`, `openai_responses`,
+`gemini`, `mock`) thread it through. The **mock** answers any path under
+`/v1/images/` — generations and edits alike — with a one-image generations-shaped
+body (`{created, output_format, data:[{b64_json}]}`, a real decodable 1×1 PNG) and
+`Content-Type: application/json`, so an images request round-trips end to end
+without an upstream; every other path keeps its canned Responses-shaped SSE.
 
 The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachability probe) and, where applicable,
 `LoadedModelLister`/`ModelInfoProber`/`MemoryProber`/`ModelUnloader` for the
@@ -1275,6 +1450,7 @@ would serve — the same fail-closed AND the chat and the redirect use.
 | Scope | Reader | Cap |
 |---|---|---|
 | The five inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full |
+| The image edit endpoint (`/v1/images/edits`), whose body is `multipart/form-data` | `readImageEditBody` (`internal/gateway/images_edit_handler.go`; `readRawJSONLimit` would refuse anything but one JSON value) | `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB: a declared `Content-Length` over it is refused without a read, an undeclared body is stopped by `http.MaxBytesReader`, both `413 request.body_too_large` |
 | The portal chat documents (`POST /api/portal/chats`, `PUT /api/portal/chats/{id}`, `POST /api/portal/chats/{id}/runs`) | `readRawJSONLimit` | `portal.MaxChatRequestBytes` = 5 MiB (the 4 MiB content cap plus the JSON envelope); the bundled nginx allows the same on `/api/portal/chats` |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
@@ -1282,6 +1458,27 @@ This mirrors llama-swap's own behavior of proxying request bodies without a
 size limit. The chat documents are bounded, not uncapped: the gateway reads
 them at the chat request cap and the service enforces the content cap —
 unrelated to the inference size policy documented here.
+
+**The edit endpoint is the one inference body that is capped, and the cap has a
+second half** ([ADR-009](../09-architecture-decisions.md#adr-009--no-body-size-cap-on-inference-1-mib-on-control-plane),
+[ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
+(j)). The handler holds the body whole — it peeks the form before routing and may
+rebuild it afterwards — so an unbounded read is a memory exposure. The default
+equals the **agent router's own** request limit (32 MiB, `runtime.request_too_large`
+there), but the setting bounds what the **client** sends, and preparing a body can
+**grow** it: a converted mask of a highly compressed one, the longer model name,
+the new boundary. So the body actually handed to an **agent-launched** target is
+re-checked against the agent's 32 MiB **after** any rebuild, and one over it is
+refused `413 request.body_too_large` at the gateway (and recorded) rather than
+sent to come back as the agent's own refusal; raising the setting only admits
+larger bodies to **external** edit upstreams. Edge nginx is uncapped for `/v1/`
+(`client_max_body_size 0`), so the gateway's setting is the effective limit.
+A portal edit's body is the source image, the optional mask and a handful of
+fields; its source and its mask are each bounded by `MaxChatBlobBytes` (20 MiB,
+below), so two maximal files exceed the 32 MiB together — the loopback hop then
+answers `request.body_too_large` and the run fails cleanly (the composer
+downscales an image above 1568 px, so reaching it takes an unusually heavy file or
+a raw API client).
 
 A stored chat image is **not** part of that document: it lives in `chat_blobs`
 and the document carries only its URL ([§12](#12-in-portal-chat-playground),
@@ -1302,6 +1499,14 @@ them, and a model can carry both, either or neither. Advertising a generator as
 a consumer (or the reverse) fails far from its cause, which is why the two
 capability names are kept distinct all the way down to the verdict rows
 ([ADR-038](../09-architecture-decisions.md#adr-038--capability-detection-one-props-read-three-states-an-open-vocabulary)).
+A third name, `image_edit` (§3.5), joins them without folding into either: it
+means a generator may be handed an image **as the source of an edit** — an image
+*generator* taking an image *input*, which is the case `vision` was never about.
+It is derived from `image` rather than probed
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
+and the portal's attach control reads it, **never `vision`**, on an image thread
+(§12): an sd model is `vision: false` and edits, while on a text thread the
+control still needs `vision` and still refuses a model that also generates images.
 
 On the wire, an input image is always a `ContentImage` `ContentPart` carrying
 either a `data:<mime>;base64,...` URI or a plain URL:
@@ -1327,10 +1532,13 @@ type or a `.heic`/`.heif` filename fallback, since browsers often report an
 empty type for these) via client-side conversion to JPEG using the `heic-to`
 library **before** the normal validation/size checks. `heic-to` inlines the
 libheif WASM decoder (~3 MB minified), so it is loaded via dynamic import on
-the first HEIC upload and stays out of the eagerly loaded portal bundle. Every accepted image is
-downscaled (longest edge ≤ 1568px, canvas re-encode) to keep a chat transcript
-under the browser's `localStorage` quota; a 20 MB cap applies to the original
-file before conversion.
+the first HEIC upload and stays out of the eagerly loaded portal bundle. An
+accepted image whose longest edge exceeds 1568px is downscaled (canvas
+re-encode); one already within it is passed through untouched. A 20 MB cap applies
+to the original file before conversion. On an **edit** turn (§12) the picker takes
+PNG and JPEG — and HEIC/HEIF, which is converted to JPEG here, so the server
+never sees it — and refuses WebP and GIF with its own message, because
+`sd-server`'s edit route reads only PNG and JPEG; the mask slot takes a PNG only.
 
 **Where an attached image goes once sent.** In the in-portal chat the image is
 stored outside the transcript (`chat_blobs`, [§12](#12-in-portal-chat-playground))
@@ -1350,18 +1558,20 @@ from the browser. Instead:
    `EventSource` on `/api/portal/chats/{id}/runs/{runId}/events` for live deltas.
 2. The gateway's own background run executor (`executeRun`,
    `internal/gateway/chat_runs.go`) makes a **loopback** `POST` to its own
-   `/v1/chat/completions` — or to `/v1/images/generations`, when the run's kind
-   is `image` (below) — authenticating via the internal trusted-loopback
+   `/v1/chat/completions` — or, when the run's kind is `image` (below), to
+   `/v1/images/generations`, or to `/v1/images/edits` when the turn carries a
+   source image — authenticating via the internal trusted-loopback
    header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first*
    by `loopbackPrincipal`, `internal/gateway/auth.go`, which both
    `authenticateWeb` and, for the images hop, `authenticateInternalOrBearer`
    call before anything else; blanked by nginx at the public edge so an
    external client can never inject them), plus the same `X-OP-CSRF` header a
    direct browser call would need.
-3. `/v1/chat/completions` and `/v1/images/generations` are the only two
-   inference endpoints reachable through a token-less, session-shaped
-   principal — chat completions via `requireWebAnyScope` → `authenticateWeb`
-   (session cookie, internal loopback, or bearer), images via
+3. `/v1/chat/completions`, `/v1/images/generations` and `/v1/images/edits` are
+   the only three inference endpoints reachable through a token-less,
+   session-shaped principal — chat completions via `requireWebAnyScope` →
+   `authenticateWeb` (session cookie, internal loopback, or bearer), both images
+   endpoints via
    `requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`
    (`auth_internal_or_bearer.go`, `authenticateWeb` minus its cookie branch:
    internal loopback or bearer, **never** a session cookie). `/v1/responses`
@@ -1369,9 +1579,10 @@ from the browser. Instead:
    `authenticate` → `LookupBearer`, which always yields a populated token id).
    That populated-vs-empty token id — not the headers a request happens to
    carry — is what actually gates the run-as header (`X-OP-Run-As-Token`):
-   `handleOpenAIChat` and `handleOpenAIImages` both honour it, guarded on
-   `token.ID == ""`, so it can only ever act on a session-shaped principal
-   from one of those two endpoints; it structurally cannot reach
+   `handleOpenAIChat`, `handleOpenAIImages` and `handleOpenAIImagesEdit` all
+   honour it, guarded on `token.ID == ""`, so it can only ever act on a
+   session-shaped principal from one of those three endpoints; it structurally
+   cannot reach
    `/v1/responses` or `/v1/messages`, whose bearer-derived token id is never
    empty. `applyServerOverride` runs from `inferencePreflight`
    (`internal/gateway/inference_handlers.go`), which **all four** inference
@@ -1387,7 +1598,8 @@ forced back on every later one, so what the executor posts to is a property of
 the **thread** rather than of the model the picker currently shows
 ([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)).
 `""` is text — the default, and every chat that predates the field — and
-`image` posts to `/v1/images/generations` instead, with the prompt built from
+`image` posts to `/v1/images/generations` instead (or to `/v1/images/edits`,
+when the turn is an edit, below), with the prompt built from
 the last user message and `response_format: "b64_json"` stated explicitly
 rather than inherited from the endpoint's tolerance of an absent value (§3.4).
 An image thread also carries a `ChatImageSettings` that the composer's settings
@@ -1399,12 +1611,18 @@ blob, cleared for any non-image kind — so a text chat's settings stay
 byte-identical. Two groups of knobs: the OpenAI-shaped fields sd-server honors as
 top-level JSON (`size`, `n`, `output_format`, `output_compression`, §3.4), and —
 in a collapsible "advanced" section — sd-server's **native** knobs
-(`negative_prompt`, `sampler`, `scheduler`, `steps`, `cfg`, `seed`, `clip_skip`).
+(`negative_prompt`, `sampler`, `scheduler`, `steps`, `cfg`, `seed`, `clip_skip`,
+and `strength`, the edit knob).
 The native ones are **not** top-level fields upstream: `buildImagesBody` renders
 the set ones (via `json.Marshal` of a typed struct, in sd-server's native
 `sample_params`/`guidance` schema) into a `<sd_cpp_extra_args>{…}</sd_cpp_extra_args>`
 block appended to the prompt — sd-server's own extension point — and strips any
-literal tag the user typed so the appended block is unambiguous. The gateway
+literal tag the user typed so the appended block is unambiguous. `strength`
+(0–1, how far an edit departs from its source; blank leaves sd-server's own 0.75)
+is a pointer in that block so an explicit `0` is a value and blank is omitted;
+sd-server's edit route reads no `strength` form field, which is why it travels
+here rather than as one, and a generation that carries it simply ignores it
+(§3.5). The gateway
 forwards every knob opaquely (it does not own sd-server's sampler enum or numeric
 caps); the composer offers the static sd-cpp sampler/scheduler superset until the
 picked model's own options arrive (next paragraph).
@@ -1472,6 +1690,45 @@ listing sets it only when the images endpoint would actually serve the model
 declare `openai_images` is offered as the text model it is, not as an image
 model every turn of which would 404. A saved model that is no longer listed
 still appears, as a synthetic trailing option.
+
+**The attach control follows what the picked model can do with an image, and a
+generated image can be refined in place.** `ModelOption.image_edit` carries the
+backend's folded `ModelDTO.ImageEdit` (§3.5; the client never re-derives it), and
+**one** predicate, `attachModeOf(kind, {vision, image, imageEdit})` in
+`chatDoc.ts`, turns the thread's kind and the picked model's flags into
+`'edit'`, `'vision'` or `'none'`: on an **image** thread it is `'edit'` exactly
+when the model is edit-capable — it never consults `vision`, because an sd model is
+`vision: false` and edits — and on a text thread it is `'vision'` for a model that
+reads images and does not generate them, as before. It drives the attach button
+(disabled while a run is live or in mode `'none'`, with the tooltip for the
+reason), the file picker (`multiple` off for an edit), the prompt field's hint, the
+clear-on-model-switch effect (an attachment is dropped only when the mode becomes
+`'none'`: a switch between a vision and an edit model keeps it, being the operand
+either way), `send()`, `handleFiles` (one source for an edit) and the replay
+guard. That guard used to exempt image threads on the premise that an image
+request carries no history, which is **false for an edit turn** — it carries the
+source — so a replay (regenerate, edit a message) whose last user message holds a
+source is refused on a model that cannot edit **before** the transcript is
+truncated. An edit also needs a prompt: `send()` (and a replay with blank text)
+refuses an image with no instruction, leaving the image attached; a vision text
+turn keeps its optional prompt.
+
+The **mask slot** is a second attach control, shown in edit mode only, that takes
+a PNG, no `multiple`, and is disabled until a source is attached (a mask without a
+source is impossible to send three ways: the slot refuses it, an effect drops a
+mask whose source goes, and `userTurnContent` never emits one). The user turn is
+built in one place, `userTurnContent(text, images, mask, mode)`, which appends the
+`purpose: "mask"` part only for an edit with exactly one source; the bubble shows
+the mask apart, as its own thumbnail. **Refine** is a per-image control on a
+generated result (`ImageTurn`'s `onRefine`, offered on assistant turns and only
+where `attachMode` is `'edit'`): it **seeds the composer** — it never sends — with
+that image's own `/api/portal/chat-blobs/{id}` reference, replacing whatever was
+attached (an edit has one source) and any mask (one drawn for the old source would
+not fit), then focuses the prompt. The reference is the transcript's own, string
+for string, so nothing is copied or re-embedded and no `data:` URL appears in the
+request; because it is chat-bound, switching chats drops it (an uploaded `data:`
+attachment still carries across), and an old chat's inline `data:` result is
+seeded verbatim and migrates on its run as an upload does.
 
 **`kind` and a server-measured `elapsed_ms` ride on every run shape a client
 reads**: the `201` from run start, each row of the active-runs listing, and the
@@ -1607,7 +1864,7 @@ live outside the transcript" below).
 **A non-200 on the loopback hop surfaces the upstream error code.** The
 executor turned any non-200 into `"upstream status " + resp.Status` without
 reading the body at all, discarding every code either endpoint was built to
-return — the four `images.*` codes and every routing refusal in §13 — and
+return — the `images.*` codes and every routing refusal in §13 — and
 showing the chat a bare status line instead. It now reads the body bounded by
 `OP_AI_GATEWAY_CAPTURE_MAX_BYTES` (an error body has no reason to exceed it,
 and this is not the ordinary streamed 200) and lifts `error.code` out of the
@@ -1644,6 +1901,94 @@ asks for it. The same server answers `jpeg` and `webp` when asked for them,
 with the decoded bytes' magic number agreeing every time — so the field is
 genuinely variable and a hardcoded `image/png` would have been wrong, not
 merely unwarranted.
+
+**An image turn is an EDIT when its last user message carries an image
+(ADR-043 R1,
+[ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)).**
+The thread's kind stays `image`; what the executor posts to is a function of the
+kind **and** the turn, decided server-side from the prepared history and never
+from a client setting. `generateImageTurn` asks `imageEditInputsOf` for the images
+of the **last user message only** — an earlier user turn's images were an earlier
+turn's and an assistant turn's are its results, and none is ever sent — split by
+`portal.MessageImages` (the one definition of an image part) into **sources** and
+at most one **mask**, a part tagged `purpose: "mask"` (an ordinary `image_url`
+part with that one extra member, so it inherits the source's whole lifecycle —
+extraction into `chat_blobs`, owner-scoped resolution, edit and replay). With one
+or more sources it posts a **multipart** body to `/v1/images/edits` over the same
+loopback (`buildImageEditBody`, the multipart `Content-Type` set after the shared
+header helper): the fields `model`, `prompt` (the text plus the
+`<sd_cpp_extra_args>` block, `strength` among its knobs, §3.5),
+`response_format=b64_json` and whichever of `size`, `n`, `output_format` and
+`output_compression` the thread set, then the sources — `image` for one, repeated
+`image[]` for several, in order, the mask not counted — each a file part named
+after its media type, and the mask as `mask.png`. The part headers use the
+canonical `form-data; name="…"; filename="…"` spelling, which `sd-server`'s HTTP
+parser matches. With no source it posts the unchanged JSON generation, byte for
+byte, and a mask that arrives without a source is **not an edit**: it is ignored,
+not even decoded. The edit takes **one** source in the composer (the executor
+itself sends several, which lifts the cap with no backend change) and requires a
+prompt. The mask is an OpenAI-style alpha PNG (transparent = edit) of the
+source's size, which the gateway's endpoint converts (§3.5).
+
+**Run start resolves an edit's source and mask, fail-closed.** For an image run
+`PrepareChatRun` calls `resolveImageRunSource` where a text run calls
+`resolveChatBlobRefs`: it resolves **only the last user message** to bytes through
+the same chat-scoped, size-bounded `ChatBlobsByIDs` batch (a fresh upload is
+already an inline `data:` URL and needs no round trip; a stored `/chat-blobs/`
+reference becomes the blob's bytes), so a **refine** — whose source is the
+existing reference of an earlier generated image, **never copied or re-embedded**
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
+(h)) — reaches the executor exactly as an upload does. It deliberately does
+**not** take the text run's `[image unavailable]` placeholder tolerance: a
+reference the chat does not hold (another chat's, never stored, evicted) is
+refused `400 images.blob_not_owned` **before the turn is stored**, because an
+edit that silently lost its source would answer as an unrelated generation.
+
+**Two terminal codes name an edit whose image cannot be sent, and they are
+siblings with different remedies.** Each fails the run and sends **nothing** —
+the prompt alone, or the edit without the offending image or without its mask
+(which would repaint what the user meant to keep), would answer a request the user
+did not make:
+
+- `gateway.chat_run_image_source_unreadable` — an image or mask the executor
+  cannot turn into bytes it may send: an external link (a run never fetches one),
+  a gateway reference that was not resolved, a bad base64, a type outside the
+  stored image types, a mask that is not a PNG (the part is labelled `image/png`;
+  refusing beats mislabelling), or a second mask. The remedy is to attach it
+  again.
+- `gateway.chat_run_image_source_unsupported` — a **source** that is a readable
+  image of a type the edit route does not read. `sd-server`'s edit route takes
+  **PNG and JPEG only**, and nothing on the way checks a whole-image edit's source
+  type (the gateway's endpoint looks at it only when a mask is sent), so a webp or
+  gif would be forwarded and come back as the generic `images.upstream_error`,
+  whose "try again" can never come true. It is refused in the **portal's executor**
+  (`imageEditSourceTypes`), before anything is sent, with copy that says what to
+  do: set the image format to PNG or JPEG and **regenerate the image first**.
+  The usual way to meet it is a **refine** of the webp result of a thread whose
+  format is webp, or the replay of an older upload; the composer's own picker
+  already refuses a new webp or gif attachment. **The public
+  `/v1/images/edits` is deliberately not so restricted** — an external client may
+  send what its own `sd-server` build reads.
+
+Both are mapped in `format.ts`'s `errorLabelByCode` with their own German and
+English sentence, as are the four `images.*` refusals of the edit endpoint a run
+can relay through `upstreamErrorCode` — `images.image_required`,
+`images.edit_unavailable`, `images.mask_invalid`,
+`images.edit_unsupported_format` (§13), plus the older `request.body_too_large`
+for a body past the edits cap. A both-directions test pins the `images.*` set and
+the chat-run set, so a code added to the map without being named there fails.
+
+**Known behavior: webp output is silently defaulted on edit turns.** An edit's
+form **omits** an `output_format` outside `{png, jpeg}` together with its
+`output_compression` (`imageRequestFields(prep, edit)`), because the edit route
+cannot produce webp and would otherwise refuse the whole edit as an upstream
+error. A thread whose format is **webp** therefore gets the upstream's own default
+on its **edit** turns — silently, from the user's point of view — while its stored
+setting is untouched and its **generations** still honor webp. The omission lives
+in the executor rather than the composer because the executor is the one place
+that knows a turn is an edit on every path (send, edit a message, regenerate).
+Together with the source limit above it means a webp thread's results cannot be
+refined until its format is PNG or JPEG.
 
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
@@ -1697,9 +2042,11 @@ are bounded by `MaxRunHistoryBytes`, counted per occurrence; a run over it is
 refused `400 portal.chat_run_history_too_large` **before** its turn is stored
 (declared sizes are checked first, so a refusal decrypts nothing), so a retry is
 not a duplicate turn. The turn being sent keeps the bytes it was uploaded with
-and needs no round trip, and an image run skips the step (its executor reads
-only the last prompt's text, so decrypting the thread's images would be wasted
-and the bound would refuse a thread for bytes never sent).
+and needs no round trip, and an image run skips the **history** step (its
+executor reads only the last user message, so decrypting the thread's images
+would be wasted and the bound would refuse a thread for bytes never sent). It
+resolves that one message instead, so an edit's source and mask arrive as bytes
+("An image turn is an EDIT", above).
 
 **The run's terminal event carries what was committed, and only that.** The
 SSE `snapshot`/`done` events carry a `content_parts` field alongside `content`.
@@ -1794,13 +2141,18 @@ Every inference error response uses the gateway-wide envelope
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
-| `images.model_required` / `images.prompt_required` | 400 | the images body failed `validateImagesRequest` (§3.4) |
+| `images.model_required` / `images.prompt_required` | 400 | the images body failed `validateImagesRequest` (§3.4), or the edit form failed its twin `validateImageEditRequest` (§3.5) |
 | `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url`, and any non-string value (§3.4) |
 | `images.stream_unsupported` | 400 | an images request asking for a streamed response (`stream: true`, or a non-boolean `stream`); this endpoint is pinned to the buffered path (§3.4) |
-| `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) |
-| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images relay answers when the resolved agent-launched child's spec excludes `openai_images`, and what the text translate path answers when that child's spec is images-only (§6) |
+| `images.image_required` | 400 | an image edit whose form has no non-empty part under `image` or `image[]` (§3.5) |
+| `images.mask_invalid` | 400 | an edit's mask that is not the first source's size, is past 16 megapixels, or has no transparent pixel (§3.5) |
+| `images.edit_unsupported_format` | 400 | an edit's mask that is not a readable PNG, or — when a mask is sent — a source that is not a readable PNG or JPEG (§3.5) |
+| `images.edit_unavailable` | 404 | an edit resolved to an agent-launched model whose agent has not declared `multipart_proxy` (an agent older than 0.9.0, or one that has not reported since the gateway restarted or the agent was upgraded); nothing is relayed (§3.5) |
+| `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, or one that is over the agent router's 32 MiB once the gateway has prepared it (§10) |
+| `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) — an edit relays it the same way |
+| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images relays (generations and edits) answer when the resolved agent-launched child's spec excludes `openai_images`, and what the text translate path answers when that child's spec is images-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
-| `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
+| `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires — for an edit's `image_edit`, one that is not **derived**: no `image: yes`, or an operator's `image_edit: no` ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |
 | `provider.timeout` / `.invalid_response` / `.unavailable` | 502 | upstream call failed or returned something unparseable |
 | `provider.stream_idle_timeout` | mid-stream error frame | idle watchdog fired (§7) |
@@ -1834,10 +2186,16 @@ attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
   `responses.endpoint_disabled` / `messages.endpoint_disabled` (only knowable
   after model resolution, and recorded against the resolved target), and every
   `provider.*` outcome. The images codes fall on both sides of the line, as the
-  rule predicts: the three `images.*` 400s are pre-`Resolve` body validation
-  and are **not** recorded, while `images.upstream_error` is post-`Resolve` and
-  **is** — carrying `billing_unit: "image"` with a zero quantity, because
-  nothing was produced
+  rule predicts: the `images.*` 400s of both endpoints (`images.model_required`,
+  `images.prompt_required`, `images.response_format_unsupported`,
+  `images.stream_unsupported`, and the edit's `images.image_required`,
+  `images.mask_invalid` and `images.edit_unsupported_format` — the mask is
+  converted before the preflight on purpose), the edit's `request.invalid`
+  refusals of a malformed form and its client-body `413` are pre-`Resolve`
+  validation and are **not** recorded, while `images.upstream_error`,
+  `images.edit_unavailable` and the `413` of a prepared body that is too large for
+  the agent are post-`Resolve` and **are** — carrying `billing_unit: "image"` with
+  a zero quantity, because nothing was produced
   ([§8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
 So the honest answer to "is my 429'd request in Activity?" is *it depends which

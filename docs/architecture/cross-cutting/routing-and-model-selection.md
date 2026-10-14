@@ -317,14 +317,17 @@ for native passthrough alike — and it walks a four-step chain:
 
 Steps 1–2 are `resolveModelOverride`; step 3 is `redirectUnknownModel`
 (`internal/gateway/inference_redirect.go`). For a request that requires a
-capability — today `/v1/images/generations`, which requires `image` — step 3
+capability — today the two image endpoints, `/v1/images/generations`, which
+requires `image`, and `/v1/images/edits`, which requires the derived `image_edit`
+(§2.3) — step 3
 takes a `LastUsedModel` or fallback only when that name also carries every
 required capability (`ModelOffering.Capable`, §2.2). A candidate without it is
 skipped and the chain moves on, because the capability gate would refuse it
 right after, with a 404 `routing.model_not_capable` about a model the client
 never named. So an images request for an unknown name is served by an
 image-capable fallback, and answers 404 `routing.no_model_route` for its own
-name when neither candidate carries `image`. Step 3 judges the **effective**
+name when neither candidate carries `image` (an edit: `image_edit`, which an
+operator's opt-out removes from a model that still generates). Step 3 judges the **effective**
 name steps 1–2 produced, so an override that already resolves to a usable
 model ends the chain there. The catch-all has no requested name of its own —
 it is a single string, not a row — and therefore carries none of the per-row
@@ -391,7 +394,7 @@ redirect each of these answers a 404:
 | `/v1/chat/completions` | an images-only child | `routing.no_model_route` |
 | `/v1/responses` | an images-only child | `responses.endpoint_disabled` |
 | `/v1/messages` | an agent child whose spec lacks `anthropic` | `messages.endpoint_disabled` |
-| `/v1/images/generations` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict |
+| `/v1/images/generations`, `/v1/images/edits` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict (for an edit: without the derived `image_edit`) |
 
 An override that targets such a child counts the same way, because step 3
 judges the effective name. A **messages-disabled** model — its effective
@@ -567,7 +570,13 @@ the rule behind a model's `image` flag in the portal: an `image: yes` verdict
 on every mapping of the name this token reaches, the application's
 `openai_images` and, for an
 agent-launched model with a spec, the spec's too; a group only when every
-offerable member qualifies. The flavor cannot answer this by itself:
+offerable member qualifies. For `image_edit` it is judged by the sibling fold
+(`imageEditFlagsByName`, the rule behind a model's `image_edit` flag): the same,
+with the **derived** capability (§2.3) in place of the literal verdict. When a
+request requires both, `Capable` is the intersection of the two. Before the
+derived capability existed `capableNames` returned the empty set for any required
+name but `image`, which made the unknown-model redirect dead on arrival for an
+edit. The flavor cannot answer this by itself:
 `Callable` for `openai_images` holds every model whose route declares the
 flavor — its application and, for an agent-launched model with a spec, the
 spec too — whatever its verdict. A required capability with no fold
@@ -625,7 +634,8 @@ degrade the answer; it would route to a model that produces the wrong one.
 `inference.Request.RequiredCapabilities []string`, set by the endpoint handler
 from its **own identity** and never from the request body — nil for chat,
 Responses and Messages, `["image"]` for `/v1/images/generations`
-([API Compatibility & Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)).
+([API Compatibility & Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)),
+`["image_edit"]` for `/v1/images/edits` ([§3.5](compatibility-and-inference.md#35-openai-images-edits)).
 A candidate survives only if its mapping carries a `yes` verdict for **every**
 name in that list. The verdicts come from one bulk
 `Store.MappingCapabilitiesForMappings` read over the candidate list (§1), not
@@ -727,6 +737,63 @@ why).
   `server_agent` application and on its spec (§1,
   [Agent-Managed Model Runtime
   §3.4](agent-runtime-manager.md#a-worked-sd-server-launch-under-stable_diffusion_cpp)).
+
+**`image_edit` is the one capability that is DERIVED, not read from a row, and
+it is operator-removable.** An edit has no probe — `sd-server` serves
+`/v1/images/edits` whenever its loaded model can generate and states no per-model
+signal — so the gateway owns the policy
+([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)).
+The rule is one function, `routing.ImpliedImageEdit(rows)`
+(`internal/routing/resolver.go`): **`image: yes` and not `image_edit: no`.** So a
+mapping that generates can be edited wherever its route declares `openai_images`,
+with no row to write; an absent `image_edit` row means *derive from `image`*, not
+*unknown* — **the one documented exception to the "absent row refuses" rule above**
+([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+amended) — while every other required name is still a literal `yes` row and an
+empty row set (a failed read) derives nothing, so it still refuses. An
+`image_edit: yes` row is stored but **inert**: it cannot grant what `image` does
+not. The one row the name ever carries in earnest is an operator's `no`, set on
+the mapping (the mapping form's `image_edit` control: *unknown* = derived, *no* =
+opt-out, never *yes*), which removes edit for that mapping while generation of the
+same model keeps working — which is why it is its own row: `(image, no)` is
+reserved (below) and would also remove generation.
+
+Three readers consume the one function, so the gate and the composer can never
+disagree in direction: the **gate** (`capabilityRowsSatisfy`, through which every
+satisfaction decision funnels — `filterCapable` at its three sites and the
+affinity read of site 4 — so one special case covers routing); the **redirect's
+`Capable`** (`capableNames`, §2.2); and the **portal listing's fold**
+(`ModelDTO.ImageEdit`). Their invariant is that the composer **never offers what
+the gate refuses**, not that they agree exactly: the gate is per-candidate
+any-of while the fold ANDs across a model's mappings, so a model on server A
+(`image_edit: no`) and server B (derived) is **served** but **advertised false** —
+the safe direction, the same asymmetry `image` has. Two consequences are stated
+rather than hidden. The derivation is **type-blind**: it keys on the
+`openai_images` flavor and an `image: yes` verdict, so a non-`sd-server` upstream
+that declares the flavor with a manual `image: yes` (a LiteLLM or custom backend
+with no `/v1/images/edits`) is edit-capable too, and the per-mapping
+`image_edit: no` is the remedy. And an edit the resolved agent **cannot serve** is
+refused by a separate, later check that is not a capability and not a routing
+sentinel — the agent must have declared the `multipart_proxy` feature, else 404
+`images.edit_unavailable`, decided in the edit relay after the resolve
+([API Compatibility & Inference
+§3.5](compatibility-and-inference.md#35-openai-images-edits), [Agent-Managed Model
+Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
+
+**The reserved-list decisions** are not symmetric. `reservedAgentCapabilityNames`
+(`internal/gateway/agent_ingest.go`, the names an agent's open verdict list may
+not carry — its criterion is names this codebase reasons about that no agent probe
+can observe) **gains `image_edit`**: nothing an agent observes produces it, and
+without the entry a buggy or hostile agent could report `{image_edit, no}` at rank
+1 and silently disable edit, re-overwriting the operator's reset on every sample.
+That is the **opposite** of ADR-042 (f)'s rule for `image`, which stays *off* the
+list because a legitimate agent writer exists for it.
+`reservedManualVerdicts` (`internal/portal/service_applications.go`, the
+`(capability, verdict)` pairs an *operator* may not state) is **unchanged**: the
+vocabulary is open, so `(image_edit, no)` is already writable — and adding it would
+forbid the very opt-out above — while `(image, no)` stays reserved for the reason
+the `image` verdict section gives. Only the list's doc comment grew, and a test
+pins the non-change. The two lists still must not be kept in step.
 
 **Four places apply it**, three of them ordinary candidate filters and one a
 deviation:
@@ -950,7 +1017,7 @@ its coarse flavor is `openai_images`, its own (§1), so its key never matches a
 chat client's. For images the guards are therefore redundant — they stay
 because they are keyed on the capability list rather than on a flavor, so a
 future capability-carrying endpoint whose coarse flavor coincides with a text
-one (speech or multipart uploads under `openai`: issues #68/#69) inherits
+one (speech under `openai`: issue #68; the multipart image edit of #69 chose `openai_images` and did not need it) inherits
 them without touching the resolver, and because they keep image traffic
 pin-free. What each still does:
 
@@ -1322,9 +1389,9 @@ caller may see, for a dashboard-style overview without subscribing per server.
 
 | Routing error | HTTP status | When |
 |---|---|---|
-| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images relay when the spec excludes `openai_images`, and the text translate dispatch when the spec is images-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
+| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images relays (generations and edits) when the spec excludes `openai_images`, and the text translate dispatch when the spec is images-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
-| `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) |
+| `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
@@ -1337,8 +1404,8 @@ indistinguishable from an upstream *outage*. Both were remapped in the same
 change that added `ErrModelNotCapable`, because a gate that refuses legibly on
 one branch and illegibly on another is not a legible gate. **The remap is
 global**: it applies to `/v1/chat/completions`, `/v1/responses`, `/v1/messages`
-and `/v1/images/generations`, their prefixed aliases and their streaming
-variants alike. It is the one externally visible behavior change, and a
+and `/v1/images/generations` (and `/v1/images/edits`, which has only ever had
+the remapped answers), their prefixed aliases and their streaming variants alike. It is the one externally visible behavior change, and a
 consumer that retries 502 but not 404 now sees the second where it used to see
 the first — the correct reading of both facts
 ([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
