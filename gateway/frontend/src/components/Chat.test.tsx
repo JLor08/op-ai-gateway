@@ -1868,6 +1868,55 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByAltText(t.chatAttachedMask)).not.toBeInTheDocument();
     });
 
+    // The composer's attachment follows the user across chats -- except a reference,
+    // which names a blob of the chat it was refined in (sent in another chat it would
+    // be refused as images.blob_not_owned). The two halves are one flow: only the kind
+    // of the attachment differs, so a switch that dropped everything, or kept
+    // everything, fails one of them.
+    describe('switching chats', () => {
+      async function twoImageChats() {
+        seedGeneration(editModel);
+        chatApi.rows.push({
+          id: 'c_other',
+          title: 'Other',
+          created_at: '2026-07-18T12:00:00Z',
+          updated_at: '2026-07-18T12:00:00Z',
+          content: { settings: { model: editModel.id, kind: 'image' }, messages: [] },
+        });
+        renderChat(tokens, [editModel]);
+        await screen.findByText('Lighthouse');
+        await screen.findByText('Other');
+      }
+      const openOther = async () => {
+        fireEvent.click(screen.getByText('Other'));
+        // The generation of the first chat is gone: the second chat is on screen.
+        await waitFor(() => expect(screen.queryByText('a lighthouse')).not.toBeInTheDocument());
+      };
+
+      it('keeps an uploaded source: it is only bytes, and goes where the composer goes', async () => {
+        await twoImageChats();
+        attachSource();
+        await screen.findByAltText(t.chatAttachedImage);
+
+        await openOther();
+
+        expect(screen.getByAltText(t.chatAttachedImage)).toHaveAttribute(
+          'src',
+          expect.stringMatching(/^data:image\/png;base64,/),
+        );
+      });
+
+      it('drops a refined reference: it names a blob of the chat it was refined in', async () => {
+        await twoImageChats();
+        fireEvent.click(await screen.findByRole('button', { name: t.chatRefineImage }));
+        await screen.findByAltText(t.chatAttachedImage);
+
+        await openOther();
+
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument();
+      });
+    });
+
     it('is not offered on an image thread whose model cannot be edited', async () => {
       seedGeneration(noEditModel);
       renderChat(tokens, [noEditModel]);

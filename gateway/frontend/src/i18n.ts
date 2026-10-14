@@ -1544,6 +1544,12 @@ const de = {
     'Dieser Server kann Bilder derzeit nicht bearbeiten: Sein Agent unterstützt die Bildbearbeitung noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
   errorChatRunImageSourceUnreadable:
     'Das angehängte Bild oder die Maske konnte nicht gelesen werden. Bitte hängen Sie es erneut an.',
+  // Das Ausgangsbild ist lesbar, aber kein PNG oder JPEG (etwa ein WebP-Ergebnis eines
+  // Threads, dessen Bildformat WebP ist, oder ein älterer Upload): die Bildbearbeitung
+  // des Servers liest nur diese beiden. Der Text sagt, was zu tun ist -- ein erneuter
+  // Versuch hilft nicht.
+  errorChatRunImageSourceUnsupported:
+    'Nur PNG- und JPEG-Bilder lassen sich bearbeiten. Stellen Sie das Bildformat auf PNG oder JPEG ein, und erzeugen Sie das Bild zuerst neu.',
   // Die beiden Ablehnungen von /v1/images/edits, die nur eine Maske auslösen kann:
   // eine Maske, die nicht zum Bild passt (andere Größe, größer als das Maximum,
   // kein transparenter Bereich), und ein Format, das nicht lesbar ist (eine Maske,
@@ -4301,6 +4307,8 @@ const en: PortalMessages = {
     'This server cannot edit images right now: its agent does not support image editing yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
   errorChatRunImageSourceUnreadable:
     'The attached image or mask could not be read. Please attach it again.',
+  errorChatRunImageSourceUnsupported:
+    'Only PNG and JPEG images can be edited. Set the image format to PNG or JPEG and regenerate the image first.',
   // The two refusals of /v1/images/edits only a mask can cause: a mask that does
   // not fit the image (another size, past the maximum, no transparent area) and a
   // format that cannot be read (a mask that is not a PNG; with a mask the source

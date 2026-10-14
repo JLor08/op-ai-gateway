@@ -240,6 +240,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // An image EDIT turn (ADR-043 R1) whose source the executor cannot read as an
   // image: failed before anything was sent (imageRunSourceUnreadableMessage).
   'gateway.chat_run_image_source_unreadable': 'errorChatRunImageSourceUnreadable',
+  // ...and one whose source is a readable image of a type the edit route does not
+  // read (png and jpeg only: a webp result of a thread that generates webp, or an
+  // older upload): refused before anything was sent (imageRunSourceUnsupportedMessage).
+  'gateway.chat_run_image_source_unsupported': 'errorChatRunImageSourceUnsupported',
   'gateway.chat_run_commit_failed': 'errorChatRunCommitFailed',
   'images.prompt_required': 'errorImagesPromptRequired',
   'images.stream_unsupported': 'errorImagesStreamUnsupported',

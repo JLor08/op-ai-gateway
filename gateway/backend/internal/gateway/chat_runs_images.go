@@ -147,6 +147,22 @@ const (
 	// chat simply does not hold never gets this far: the run is refused at its
 	// start, see portal.Service.resolveImageRunSource.)
 	imageRunSourceUnreadableMessage = "gateway.chat_run_image_source_unreadable"
+	// imageRunSourceUnsupportedMessage: the turn is an edit whose SOURCE image is
+	// readable but of a type the edit route does not read. sd-server's reads png and
+	// jpeg only, and nothing between this run and it checks a source's type on a
+	// whole-image edit (the gateway's edits endpoint converts a mask, and only then
+	// looks at the source), so a webp or gif source would be forwarded and come back
+	// as the upstream's own failure -- images.upstream_error, whose "please try
+	// again" can never come true. Refused here instead, before anything is sent, with
+	// a code of its own that says what to do (the portal labels it): the source is
+	// typically the webp result of a thread whose output format is webp (a refine),
+	// or an older upload that the composer's check of a NEW attachment never saw (a
+	// replay). Distinct from imageRunSourceUnreadableMessage -- there the user is told
+	// to attach the image again, which would change nothing here -- and from the
+	// endpoint's images.edit_unsupported_format, whose wording is about masks. The
+	// public /v1/images/edits is not touched: an external client may send what its
+	// own sd build reads.
+	imageRunSourceUnsupportedMessage = "gateway.chat_run_image_source_unsupported"
 )
 
 // imageSubtypePattern bounds what may be interpolated into the data: URL's
@@ -212,6 +228,9 @@ func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *C
 	if err != nil {
 		// The operator's copy says which image and why; the user's is the code.
 		log.Printf("chat run %s: the edit's source image or mask is unusable: %v", run.ID, err)
+		if errors.Is(err, errImageEditSourceType) {
+			return nil, "error", imageRunSourceUnsupportedMessage
+		}
 		return nil, "error", imageRunSourceUnreadableMessage
 	}
 	path := "/v1/images/generations"
@@ -432,7 +451,10 @@ type imageEditInputs struct {
 // Every image that is used must be readable as a data: url of a stored image type
 // (portal.DecodeImageDataURL, the same definition the run commit stores uploads
 // by), and any that is not fails the whole call -- see
-// imageRunSourceUnreadableMessage. By the time the executor runs, a stored
+// imageRunSourceUnreadableMessage. A SOURCE must in addition be a png or a jpeg
+// (imageEditSourceTypes): the edit route reads no other, and what it would do with a
+// webp or gif is fail after the upstream round trip -- see
+// imageRunSourceUnsupportedMessage. By the time the executor runs, a stored
 // reference -- a source's or a mask's, they are resolved alike -- has already been
 // resolved to such a url (portal.Service.PrepareChatRun, resolveImageRunSource), so
 // what is left that is not one is an external link or an unresolved reference, and
@@ -471,6 +493,9 @@ func imageEditInputsOf(history []portal.ChatAPIMessage) (imageEditInputs, error)
 		}
 		src := imageEditSource{mediaType: mediaType, data: data}
 		if !img.Mask {
+			if !imageEditSourceTypes[mediaType] {
+				return imageEditInputs{}, fmt.Errorf("image %d of %d: the source is a %s: %w", i+1, len(images), mediaType, errImageEditSourceType)
+			}
 			in.sources = append(in.sources, src)
 			continue
 		}
@@ -481,6 +506,19 @@ func imageEditInputsOf(history []portal.ChatAPIMessage) (imageEditInputs, error)
 	}
 	return in, nil
 }
+
+// imageEditSourceTypes are the media types the edit route of sd-server reads a source
+// image in. A source of any other stored type (webp, gif) is refused before the call
+// (errImageEditSourceType, imageRunSourceUnsupportedMessage); the composer's own check
+// of a new attachment (IMAGE_EDIT_SOURCE_TYPES in the portal frontend) is the same set.
+var imageEditSourceTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+}
+
+// errImageEditSourceType marks an edit source that is a readable image of a type the
+// edit route does not read, so that the caller can tell it from an unreadable one.
+var errImageEditSourceType = errors.New("edit source type not supported")
 
 // urlKind names an image url for a log line without repeating it: a data: url
 // carries the whole image and any other may carry a credential.

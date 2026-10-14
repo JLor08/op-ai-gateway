@@ -215,17 +215,17 @@ func TestImageRunWithASourceImagePostsAMultipartEdit(t *testing.T) {
 	}
 }
 
-// Every format the store holds is sent under its own name and type: the part's
-// filename extension and Content-Type come from the source's media type, never
-// from a constant.
+// Every format an edit takes as a source (png and jpeg: the edit route of sd-server
+// reads no other, and the executor refuses the rest, see
+// chat_runs_images_edit_srctype_test.go) is sent under its own name and type: the
+// part's filename extension and Content-Type come from the source's media type,
+// never from a constant.
 func TestImageRunEditNamesTheSourcePartAfterItsMediaType(t *testing.T) {
 	for _, tc := range []struct {
 		mediaType, filename string
 	}{
 		{"image/png", "image.png"},
 		{"image/jpeg", "image.jpg"},
-		{"image/webp", "image.webp"},
-		{"image/gif", "image.gif"},
 	} {
 		t.Run(tc.mediaType, func(t *testing.T) {
 			upstream, seen := imagesUpstream(t, http.StatusOK, imagesOKBody)

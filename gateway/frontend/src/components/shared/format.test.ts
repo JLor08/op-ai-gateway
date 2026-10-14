@@ -385,6 +385,9 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // An image EDIT whose source cannot be read as an image (ADR-043 R1):
     // `imageRunSourceUnreadableMessage`, chat_runs_images.go.
     'gateway.chat_run_image_source_unreadable',
+    // ...and one whose source is a type the edit route does not read (a generated or
+    // uploaded webp/gif): `imageRunSourceUnsupportedMessage`, chat_runs_images.go.
+    'gateway.chat_run_image_source_unsupported',
     'gateway.chat_run_commit_failed',
   ] as const;
 
@@ -470,6 +473,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     ['images.mask_invalid', 'errorImagesMaskInvalid'],
     ['images.edit_unsupported_format', 'errorImagesEditUnsupportedFormat'],
     ['gateway.chat_run_image_source_unreadable', 'errorChatRunImageSourceUnreadable'],
+    ['gateway.chat_run_image_source_unsupported', 'errorChatRunImageSourceUnsupported'],
   ] as const)('labels the image-edit code %s with %s, in both locales', (code, key) => {
     expect(errorLabelByCode[code]).toBe(key);
     for (const locale of ['de', 'en'] as const) {
