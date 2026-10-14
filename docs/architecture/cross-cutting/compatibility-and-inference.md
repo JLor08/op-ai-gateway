@@ -1282,7 +1282,15 @@ OpenAI decoder every other OpenAI-compatible type uses (`decodeOpenAIModelList`)
 is not that strict: a body that is not JSON is an error, but a JSON `null`, an
 object without `data`, or a `data` list whose entries carry no `id` decodes to
 an empty list without one, and reconcile then disables every mapping of the
-application. The loaded-models probe reads the same listing through the
+application. Both decoders — and the Ollama `/api/tags` decoder — read the
+listing through `decodeSingleJSON`, which rejects **any bytes after the first
+JSON value** (trailing whitespace aside). A `json.Decoder` stops at the end of
+its first value and ignores what follows, so without this a 200 body of `[]`
+followed by a reverse proxy's error page would decode as an empty listing and
+disable every mapping; trailing data is therefore an error even when the first
+value is a real, non-empty list, since a 200 carrying bytes after a complete
+JSON document is malformed and cannot be trusted. The loaded-models probe reads
+the same listing through the
 `sdcpp_models` format (the type's default `loaded_models_path` is
 `/sdapi/v1/sd-models`), and the two share the one function that extracts a
 model name, so a mapping's name and the probe's loaded name agree by
