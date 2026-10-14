@@ -737,6 +737,7 @@ func TestImagesEditRefusesServerAgentChildWhoseSpecExcludesImages(t *testing.T) 
 	t.Run("images spec is served", func(t *testing.T) {
 		prov := &recordingProxyProvider{respBody: editsOKBody}
 		srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages})
+		declareMultipartProxy(srv)
 
 		rec := postImageEdit(t, srv, validEditParts("flux1-dev"))
 
@@ -749,12 +750,28 @@ func TestImagesEditRefusesServerAgentChildWhoseSpecExcludesImages(t *testing.T) 
 	})
 }
 
+// agentEditServerID is the server the server_agent images fixture
+// (newServerAgentImagesSpecTestServer) places its one agent application on.
+const agentEditServerID = "srv-agent-images"
+
+// declareMultipartProxy records, the way a telemetry sample does, that the
+// fixture's agent serves multipart edits. The feature name is spelled as a
+// LITERAL on purpose: it is what an agent puts on the wire (Task B), so a typo in
+// the gateway's constant must fail here rather than agree with itself.
+func declareMultipartProxy(srv *Server) {
+	srv.AgentFeatures.Set(agentEditServerID, []string{"runtime_manager", "multipart_proxy"})
+}
+
 // newAgentEditTestServer is the server_agent images fixture with its single
 // mapping renamed so the client-facing name (GatewayModelName) and the name the
-// agent's router keys the child on (AppModelName) differ.
+// agent's router keys the child on (AppModelName) differ. Its agent declares
+// multipart_proxy: every test built on it is about HOW an edit is relayed to an
+// agent that can take one (the gate itself is
+// TestImagesEditRefusesAnAgentTargetWithoutMultipartProxy).
 func newAgentEditTestServer(t *testing.T, prov *recordingProxyProvider, gatewayName, appName string) *Server {
 	t.Helper()
 	srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages})
+	declareMultipartProxy(srv)
 	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
 	if err := srv.Routes.UpdateMapping(context.Background(), routing.ModelMapping{ID: "route-agent-images", ApplicationID: "app-agent-images", GatewayModelName: gatewayName, AppModelName: appName, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("UpdateMapping: %v", err)
@@ -969,5 +986,151 @@ func TestImagesEditCaptureRecordsTheClientsBodyNotTheRebuiltOne(t *testing.T) {
 	env := decryptCapture(t, saved.Blob)
 	if env.ReqBody != string(body) {
 		t.Fatalf("captured request body = %q, want the client's own bytes %q", env.ReqBody, body)
+	}
+}
+
+// An edit relays as MULTIPART, and an agent's router that predates the
+// multipart branch peeks the model out of a JSON body: it cannot read one out of
+// a form, so it answers 404 runtime.model_not_managed -- the same status and
+// code it answers an unmanaged model with, which is why trying the route cannot
+// tell the two apart. The gateway therefore refuses an edit to an agent target
+// unless that agent has DECLARED multipart_proxy, and refuses it as itself
+// (images.edit_unavailable) instead of relaying a request that is known to 404.
+//
+// Every case is an agent the gateway has no positive evidence about, so each is
+// refused: fail-closed is the registry's own default (AgentFeatures.Has). Each is
+// falsifiable against a gate that is too loose -- "any features reported", "the
+// feature on some server", a prefix match -- and against one that is not a gate
+// at all (ProxyNative must not be reached, and no upstream call may be recorded).
+func TestImagesEditRefusesAnAgentTargetWithoutMultipartProxy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		declared func(*Server)
+	}{
+		{"the agent has never reported", func(*Server) {}},
+		{"the agent reports other features but not multipart_proxy", func(srv *Server) {
+			srv.AgentFeatures.Set(agentEditServerID, []string{"runtime_manager", "runtime_ensure", "runtime_model_probe"})
+		}},
+		{"only another server declares multipart_proxy", func(srv *Server) {
+			srv.AgentFeatures.Set("srv-elsewhere", []string{"multipart_proxy"})
+		}},
+		{"a name that merely resembles it", func(srv *Server) {
+			srv.AgentFeatures.Set(agentEditServerID, []string{"multipart", "multipart-proxy", "multipart_proxy_v2"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: editsOKBody}
+			srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages})
+			tc.declared(srv)
+
+			rec := postImageEdit(t, srv, validEditParts("flux1-dev"))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "images.edit_unavailable")
+			if body := rec.Body.String(); !strings.Contains(body, "not available") || !strings.Contains(body, "multipart_proxy") {
+				t.Fatalf("body = %s, want a message saying the edit is not available and naming the missing feature", body)
+			}
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0 -- an edit must never be sent multipart to an agent that did not declare multipart_proxy", prov.proxyCalls)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 {
+				t.Fatalf("usage events = %d, want exactly one error row", len(events))
+			}
+			ev := events[0]
+			if ev.ErrorCode != "images.edit_unavailable" || ev.HTTPStatus != http.StatusNotFound || ev.BillingUnit != usage.BillingUnitImage {
+				t.Fatalf("usage row = %+v, want an images.edit_unavailable 404 billed as image", ev)
+			}
+			if ev.Host != "" || ev.RouteID != "" || ev.ProviderPath != "" {
+				t.Fatalf("usage row = %+v, want Host/RouteID/ProviderPath empty: no upstream call was made", ev)
+			}
+		})
+	}
+}
+
+// The positive control of the gate, and its edge: an agent that declares
+// multipart_proxy is relayed to exactly as before (the edits path, the client's
+// multipart Content-Type), and the registry is a FULL snapshot per sample, so an
+// agent that stops declaring it -- a downgrade, an older binary reconnecting --
+// is refused again on its very next edit rather than keeping a stale grant.
+func TestImagesEditRelaysToAnAgentTargetThatDeclaresMultipartProxyAndStopsWhenItDoesNot(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: editsOKBody}
+	srv := newAgentEditTestServer(t, prov, "flux1-dev", "flux1-dev") // declares multipart_proxy
+	body, ct := buildEditMultipart(t, validEditParts("flux1-dev"))
+
+	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 || prov.gotPath != "/v1/images/edits" || prov.gotContentType != ct {
+		t.Fatalf("ProxyNative calls/path/Content-Type = %d/%q/%q, want 1, /v1/images/edits and the client's multipart type", prov.proxyCalls, prov.gotPath, prov.gotContentType)
+	}
+
+	// The agent reconnects as a build that no longer declares it.
+	srv.AgentFeatures.Set(agentEditServerID, []string{"runtime_manager"})
+
+	rec = postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status after the agent stopped declaring the feature = %d, want 404; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "images.edit_unavailable")
+	if prov.proxyCalls != 1 {
+		t.Fatalf("ProxyNative calls = %d, want still 1 -- the refused edit must not be relayed", prov.proxyCalls)
+	}
+}
+
+// The gate is the EDIT's: a generation is JSON, which every agent router serves,
+// so an agent without multipart_proxy keeps serving images. A gate that sat on
+// "images to an agent" rather than on "edits to an agent" would silently take
+// image generation away from every agent until Task B ships.
+func TestImagesGenerationToAnAgentTargetIsNotGatedOnMultipartProxy(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: editsOKBody}
+	srv := newServerAgentImagesSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIImages}) // no feature declared
+
+	rec := postImages(t, srv, `{"model":"flux1-dev","prompt":"a cat"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if prov.proxyCalls != 1 || prov.gotPath != "/v1/images/generations" {
+		t.Fatalf("ProxyNative calls/path = %d/%q, want 1 and /v1/images/generations", prov.proxyCalls, prov.gotPath)
+	}
+}
+
+// An EXTERNAL target (an sd-server the operator runs and registered as an
+// application, not one an agent launches) has no agent and no router in between,
+// so there is nothing to gate: it relays an edit whatever the feature registry
+// says. The second case is the one that tells "the target is an agent" apart
+// from "the server has an agent": the server DID report features, none of them
+// multipart_proxy, and the edit still goes through because the TARGET is not a
+// server_agent application.
+func TestImagesEditToAnExternalTargetIsNotGatedOnMultipartProxy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		declared func(*Server)
+	}{
+		{"the server never reported features", func(*Server) {}},
+		{"the server reports features without multipart_proxy", func(srv *Server) {
+			srv.AgentFeatures.Set("srv-sd-turbo-fake", []string{"runtime_manager"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: editsOKBody}
+			srv := newImageCapableTestServerWithProvider(t, prov)
+			tc.declared(srv)
+
+			rec := postImageEdit(t, srv, validEditParts("sd-turbo"))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+			}
+			if prov.proxyCalls != 1 || prov.gotPath != "/v1/images/edits" {
+				t.Fatalf("ProxyNative calls/path = %d/%q, want 1 and /v1/images/edits", prov.proxyCalls, prov.gotPath)
+			}
+		})
 	}
 }

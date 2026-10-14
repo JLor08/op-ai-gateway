@@ -20,8 +20,9 @@ import (
 // independently. A name that states a fact about one side alone need only be
 // on that side's list: capability_source_sdcpp is on this list only, and the
 // agent-declared gpu_selection, runtime_api_token, runtime_model_probe,
-// runtime_upstream_props (RuntimeUpstreamPropsFeature) and runtime_ensure
-// (runtimeEnsureFeature) are on the agent's only.
+// runtime_upstream_props (RuntimeUpstreamPropsFeature), runtime_ensure
+// (runtimeEnsureFeature) and multipart_proxy (multipartProxyFeature) are on the
+// agent's only.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
 // runtime_logs is declared here for completeness of the negotiation contract
@@ -69,6 +70,25 @@ const capabilitySourceSdcppFeature = "capability_source_sdcpp"
 // prevent. It is exported for the app-health loop in cmd/gateway, which
 // checks it too.
 const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
+
+// multipartProxyFeature is the agent-declared capability meaning: this agent's
+// runtime router peeks the model out of a multipart/form-data body, so it can
+// route an image EDIT (POST /v1/images/edits, which is multipart) to the child
+// it keys on that model. It is on the agent's list only, not on
+// gatewayAgentFeatures, and the GATEWAY gates real behavior on it, fail-closed:
+// an edit is relayed to an agent target only on positive evidence the agent
+// declared it (imageEditTargetServed). Trying the route instead cannot work. A
+// router without the multipart branch json-unmarshals the body to find the
+// model, fails, and answers 404 runtime.model_not_managed -- the same status and
+// code it answers an unmanaged model with -- so a request relayed to it is known
+// to fail and cannot be told apart from an unknown model.
+//
+// The agent module cannot import this package, so an agent that serves
+// multipart edits names the identical string in its own registry
+// (server-agent/internal/agent/features.go) -- the same arrangement as
+// runtimeEnsureFeature. The two spellings must stay equal;
+// TestMultipartProxyFeatureName pins this side.
+const multipartProxyFeature = "multipart_proxy"
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

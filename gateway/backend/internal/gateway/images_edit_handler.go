@@ -70,6 +70,39 @@ type imageEditForm struct {
 
 func (f imageEditForm) routingModel() string { return strings.TrimSpace(f.model) }
 
+// codeImageEditUnavailable is the code an edit is refused with when its resolved
+// target is an agent that has not declared multipart_proxy: the request is well
+// formed and the model is edit-capable, but this server cannot take an edit.
+// errImageEditUnavailable is its sentinel -- like the routing refusals it is
+// mapped to a status, code and message in one place (completionHTTPStatus,
+// completionErrorCode, completionErrorResponse), so the response and the usage
+// row recordImagesRoutingFailure writes cannot disagree about it.
+const codeImageEditUnavailable = "images.edit_unavailable"
+
+var errImageEditUnavailable = errors.New(codeImageEditUnavailable)
+
+// imageEditTargetServed reports whether target can be sent an image edit. An
+// agent-launched (server_agent) target is sent the edit through the agent's
+// runtime router, which peeks the model out of the body to find the child to
+// start; only an agent that has DECLARED multipart_proxy peeks it out of a
+// multipart one, and a router that has not answers 404 for every edit -- a
+// failure no later signal distinguishes from an unknown model. So an agent target
+// is served only on positive evidence: AgentFeatures.Has is false for a server
+// that has never reported (a gateway restart empties the registry until the next
+// telemetry sample), for one whose last sample lacked the name, and for a nil
+// registry.
+//
+// Every other target is served: an external openai_images target (an sd-server
+// the operator registered as an application) has no agent in front of it, and its
+// relay is exactly what it was before this gate existed. The decision is on the
+// TARGET's provider, not on whether its server happens to run an agent.
+func (s *Server) imageEditTargetServed(target routing.Target) bool {
+	if target.Provider != routing.ProviderServerAgent {
+		return true
+	}
+	return s.AgentFeatures.Has(target.ServerID, multipartProxyFeature)
+}
+
 func invalidImageEdit(message string) error {
 	return &inference.Error{Code: invalidImageEditRequest, Message: message}
 }
@@ -353,7 +386,9 @@ func rebuildImageEditBody(raw []byte, boundary, model string) ([]byte, string, e
 // relayImageEdit resolves the routing target for an already-gated edit and
 // relays it via proxyNative. The resolve and the effective-served conjunct are
 // the generations relay's own (resolveImagesTarget), so an agent child whose spec
-// excludes images refuses an edit exactly as it refuses a generation. req is
+// excludes images refuses an edit exactly as it refuses a generation. An agent
+// target whose agent has not declared multipart_proxy is then refused
+// images.edit_unavailable (imageEditTargetServed) instead of being relayed. req is
 // pf.Req from the caller's inferencePreflight call, already carrying
 // RequiredCapabilities = [routing.CapabilityImageEdit].
 //
@@ -370,6 +405,19 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 	start := time.Now()
 	target, ok := s.resolveImagesTarget(w, r, &token, req, raw, start)
 	if !ok {
+		return
+	}
+	// The multipart_proxy gate (imageEditTargetServed): after the resolve and the
+	// served-flavor conjunct, so a refusal those make still wins, and before
+	// anything is built or sent, so an agent that cannot take the edit is never
+	// handed a multipart body (it would 404). Like the conjunct it is NOT retried
+	// against another application that might serve the model: the resolve has
+	// already picked this target.
+	if !s.imageEditTargetServed(target) {
+		slog.Debug("image edit refused: the target's agent has not declared multipart_proxy",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID, "feature", multipartProxyFeature)
+		s.recordImagesRoutingFailure(w, r, token, req, raw, start, errImageEditUnavailable)
 		return
 	}
 	rel := nativeRelay{

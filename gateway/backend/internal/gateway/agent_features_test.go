@@ -142,3 +142,18 @@ func TestRuntimeUpstreamPropsFeatureIsAgentDeclaredOnly(t *testing.T) {
 		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeUpstreamPropsFeature)
 	}
 }
+
+// TestMultipartProxyFeatureName pins the literal an agent that serves multipart
+// image edits declares in its own registry (server-agent/internal/agent/
+// features.go; the agent module cannot import this one), and that the name
+// stays off the gateway's own list: it states a fact about the agent's router
+// alone, and the gateway only reads it off the agent's declared set before it
+// relays an edit (imageEditTargetServed).
+func TestMultipartProxyFeatureName(t *testing.T) {
+	if multipartProxyFeature != "multipart_proxy" {
+		t.Fatalf("multipartProxyFeature = %q, want the agent's literal %q", multipartProxyFeature, "multipart_proxy")
+	}
+	if slices.Contains(gatewayAgentFeatures, multipartProxyFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, multipartProxyFeature)
+	}
+}

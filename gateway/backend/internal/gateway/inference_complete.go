@@ -976,6 +976,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrModelNotCapable) {
 		message = "the requested model is not capable of this endpoint"
 	}
+	if errors.Is(err, errImageEditUnavailable) {
+		message = "image edit is not available on this model's server: its agent does not declare the " + multipartProxyFeature + " feature, so update the agent"
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -1009,6 +1012,14 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, routing.ErrModelNotCapable) || errors.Is(err, routing.ErrNoModelRoute) {
 		return http.StatusNotFound
 	}
+	// An edit whose agent target cannot take one (errImageEditUnavailable): 404
+	// like the capability refusal it is a sibling of -- this model cannot be
+	// edited THERE -- and, like it, a 4xx the OpenAI SDKs do not retry (they retry
+	// 408/409/429 and every 5xx), which a refusal that only a different agent
+	// build can change must not trigger.
+	if errors.Is(err, errImageEditUnavailable) {
+		return http.StatusNotFound
+	}
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		return http.StatusServiceUnavailable
 	}
@@ -1021,6 +1032,8 @@ func completionErrorCode(err error) string {
 		return routing.ErrModelNotCapable.Error()
 	case errors.Is(err, routing.ErrNoModelRoute):
 		return routing.ErrNoModelRoute.Error()
+	case errors.Is(err, errImageEditUnavailable):
+		return codeImageEditUnavailable
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):
