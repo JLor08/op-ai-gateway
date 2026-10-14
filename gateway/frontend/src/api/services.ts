@@ -107,6 +107,9 @@ export type ServiceTokenDTO = {
   unknown_model_redirect?: boolean;
   unknown_model_redirect_blocked?: boolean;
   unknown_model_fallback?: string;
+  // Opt-in Claude-compatible model aliases, identical in meaning to
+  // PortalToken's.
+  claude_model_aliases?: boolean;
 };
 
 export type CreateServiceTokenRequest = {
@@ -122,6 +125,8 @@ export type CreateServiceTokenRequest = {
   unknown_model_redirect?: boolean;
   unknown_model_redirect_blocked?: boolean;
   unknown_model_fallback?: string;
+  // Claude-compatible model aliases (see ServiceTokenDTO); omitted = off.
+  claude_model_aliases?: boolean;
 };
 
 // The one-time reveal response for both create and rotate.

@@ -71,6 +71,10 @@ export type PortalToken = {
   unknown_model_redirect?: boolean;
   unknown_model_redirect_blocked?: boolean;
   unknown_model_fallback?: string;
+  // Opt-in Claude-compatible model aliases: when true, model discovery and
+  // inference additionally offer neutral anthropic-local-… aliases of the
+  // models this token may use (the originals stay available).
+  claude_model_aliases?: boolean;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -102,6 +106,8 @@ export type CreateTokenRequest = {
   unknown_model_redirect?: boolean;
   unknown_model_redirect_blocked?: boolean;
   unknown_model_fallback?: string;
+  // Claude-compatible model aliases (see PortalToken); omitted = off.
+  claude_model_aliases?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -131,6 +137,9 @@ export type UpdateTokenRequest = {
   unknown_model_redirect?: boolean;
   unknown_model_redirect_blocked?: boolean;
   unknown_model_fallback?: string;
+  // Claude-compatible model aliases (see PortalToken). Omitted = keep the
+  // current value.
+  claude_model_aliases?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;

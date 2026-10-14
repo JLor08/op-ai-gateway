@@ -119,6 +119,8 @@ export function ServiceTokensSection({
   const [tokenUnknownRedirect, setTokenUnknownRedirect] = useState(false);
   const [tokenUnknownRedirectBlocked, setTokenUnknownRedirectBlocked] = useState(false);
   const [tokenUnknownFallback, setTokenUnknownFallback] = useState('');
+  // Opt-in Claude-compatible model aliases — see TokenList.
+  const [tokenClaudeAliases, setTokenClaudeAliases] = useState(false);
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -136,6 +138,7 @@ export function ServiceTokensSection({
     setTokenUnknownRedirect(false);
     setTokenUnknownRedirectBlocked(false);
     setTokenUnknownFallback('');
+    setTokenClaudeAliases(false);
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
     setTokenFormOpen(true);
@@ -155,6 +158,7 @@ export function ServiceTokensSection({
         unknown_model_redirect: tokenUnknownRedirect,
         unknown_model_redirect_blocked: tokenUnknownRedirectBlocked,
         unknown_model_fallback: tokenUnknownFallback,
+        claude_model_aliases: tokenClaudeAliases,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
       });
@@ -413,6 +417,20 @@ export function ServiceTokensSection({
               </Typography>
               {/* Create-only form: there is never a last-used value yet. */}
               <Typography variant="body2">{t.tokenLastUsedModelNone}</Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenClaudeAliases}
+                    onChange={(e) => setTokenClaudeAliases(e.target.checked)}
+                  />
+                }
+                label={t.tokenClaudeAliases}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenClaudeAliasesHint}
+              </Typography>
             </Box>
             <FormControlLabel
               control={
