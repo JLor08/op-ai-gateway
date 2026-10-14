@@ -172,6 +172,10 @@ reports success on a broken corpus is worse than no checker.
   gate's scripts ([§7](#7-sonarqube-quality-gate-local)). The gate itself stays
   out of CI; these need only the checkout, `git` and `jq`, and the job fails
   rather than skips when `jq` is missing.
+- **opencode config generator job**: `sh scripts/gen-opencode-config.test.sh`,
+  the offline test of `scripts/gen-opencode-config.sh` (it reads `context_length`
+  from `/v1/models`; the test runs the real script against a stub `curl`). Needs
+  only the checkout and `jq`, and fails rather than skips when `jq` is missing.
 - **Frontend job**: `npm ci`, `npm run format:check`, `npm run lint`,
   `npm run build` (the type-checked build is the i18n de/en parity guard —
   `en: PortalMessages` fails to compile on a missing or excess key), and
