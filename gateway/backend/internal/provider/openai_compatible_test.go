@@ -1370,6 +1370,14 @@ func TestListModelsStableDiffusionCppFailsClosed(t *testing.T) {
 		"object instead of list":     `{"models":[]}`,
 		"entries without model_name": `[{"filename":"flux1-dev.safetensors"}]`,
 		"null instead of list":       `null`,
+		// Trailing data: json.Decoder stops after the first value, so an empty
+		// list followed by a proxy's error page would otherwise decode as [] --
+		// the one result reconcile reads as "serves nothing" and uses to disable
+		// every mapping. A second JSON value, or a real list trailed by garbage,
+		// is equally untrustworthy and must fail closed.
+		"empty list then html page":  `[]<html><body>502 Bad Gateway</body></html>`,
+		"empty list then json value": `[] [{"model_name":"flux1-dev"}]`,
+		"real list then garbage":     `[{"model_name":"flux1-dev"}]garbage`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := serve(t, body)
@@ -1389,6 +1397,40 @@ func TestListModelsStableDiffusionCppFailsClosed(t *testing.T) {
 			t.Fatalf("ListModels = %v, %v; want [], nil", got, err)
 		}
 	})
+
+	// A trailing newline (or other whitespace) after the one value is not
+	// trailing data: the guard must still accept it.
+	t.Run("trailing whitespace is accepted", func(t *testing.T) {
+		srv := serve(t, "[{\"model_name\":\"flux1-dev\"}]\n")
+		got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: routing.ProviderStableDiffusionCpp, Endpoint: srv.URL})
+		if err != nil || !slices.Equal(got, []string{"flux1-dev"}) {
+			t.Fatalf("ListModels = %v, %v; want [flux1-dev], nil", got, err)
+		}
+	})
+}
+
+// TestListModelsOpenAIRejectsTrailingData pins that the OpenAI-shape decoder
+// every non-sd.cpp type uses also fails closed on bytes after the first JSON
+// value. Without the end-of-input check, `{"data":[]}` followed by a proxy's
+// error page decodes as an empty listing, which reconcile reads as "serves
+// nothing" and uses to disable every mapping of the application.
+func TestListModelsOpenAIRejectsTrailingData(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty data then html page":  `{"data":[]}<html><body>502 Bad Gateway</body></html>`,
+		"empty data then json value": `{"data":[]}{"data":[{"id":"qwen-coder"}]}`,
+		"real data then garbage":     `{"data":[{"id":"qwen-coder"}]}garbage`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			got, err := NewOpenAICompatibleClient(srv.Client()).ListModels(context.Background(), routing.Target{Provider: routing.ProviderLlamaCPP, Endpoint: srv.URL})
+			if !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("ListModels = %v, %v; want ErrInvalidResponse", got, err)
+			}
+		})
+	}
 }
 
 // TestSdcppDiscoveryAndLoadedProbeAgree pins the invariant that makes both

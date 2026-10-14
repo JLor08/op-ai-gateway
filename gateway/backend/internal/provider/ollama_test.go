@@ -99,6 +99,30 @@ func TestOllamaClientListModels(t *testing.T) {
 	}
 }
 
+// TestOllamaClientListModelsRejectsTrailingData pins that /api/tags discovery
+// fails closed on bytes after the first JSON value: `{"models":[]}` followed by
+// a proxy's error page must be an error, not an empty listing that reconcile
+// would read as "serves nothing" and use to disable every mapping.
+func TestOllamaClientListModelsRejectsTrailingData(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty models then html page":  `{"models":[]}<html><body>502 Bad Gateway</body></html>`,
+		"empty models then json value": `{"models":[]}{"models":[{"name":"n1"}]}`,
+		"real models then garbage":     `{"models":[{"name":"n1"}]}garbage`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer upstream.Close()
+
+			_, err := NewOllamaClient(http.DefaultClient).ListModels(context.Background(), routing.Target{Endpoint: upstream.URL, Timeout: 5 * time.Second})
+			if !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("ListModels error = %v, want ErrInvalidResponse", err)
+			}
+		})
+	}
+}
+
 func TestOllamaClientListModelsReturnsUnavailableForNon2xx(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
