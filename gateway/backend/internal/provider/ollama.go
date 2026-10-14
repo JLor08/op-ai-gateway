@@ -332,7 +332,8 @@ func (c *OllamaClient) ListModels(ctx context.Context, target routing.Target) ([
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	if err := json.NewDecoder(httpResp.Body).Decode(&decoded); err != nil {
+	// Fail closed on bytes after the first JSON value (see decodeSingleJSON).
+	if err := decodeSingleJSON(httpResp.Body, &decoded); err != nil {
 		return nil, fmt.Errorf("%w: decode response: %v", ErrInvalidResponse, err)
 	}
 	models := make([]string, 0, len(decoded.Models))

@@ -197,6 +197,31 @@ func modelDiscoveryFor(providerType, pathPrefix string) (path string, decode fun
 	return pathPrefix + "/models", decodeOpenAIModelList
 }
 
+// decodeSingleJSON decodes exactly one JSON value from r into v and requires
+// that nothing but optional whitespace follows it. Model-discovery listings
+// feed reconcileApplicationModels, which reads an empty listing as "the
+// upstream serves nothing" and disables every mapping -- permanently, since it
+// never re-enables one. json.Decoder.Decode stops at the end of the first value
+// and ignores trailing bytes, so without this a 200 body of `[]` followed by a
+// proxy's error page would decode as an empty listing and trigger that disable.
+// The second Decode returns io.EOF when only whitespace remains (clean), nil
+// when another JSON value follows, and a syntax error on non-JSON bytes; every
+// non-EOF outcome is the trailing data we reject.
+func decodeSingleJSON(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	switch err := dec.Decode(&json.RawMessage{}); {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err == nil:
+		return errors.New("unexpected data after JSON value")
+	default:
+		return fmt.Errorf("unexpected data after JSON value: %w", err)
+	}
+}
+
 // decodeOpenAIModelList decodes the OpenAI {"data":[{"id":...}]} listing.
 func decodeOpenAIModelList(r io.Reader) ([]string, error) {
 	var decoded struct {
@@ -204,7 +229,7 @@ func decodeOpenAIModelList(r io.Reader) ([]string, error) {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(r).Decode(&decoded); err != nil {
+	if err := decodeSingleJSON(r, &decoded); err != nil {
 		return nil, err
 	}
 	models := make([]string, 0, len(decoded.Data))
@@ -226,7 +251,7 @@ func decodeOpenAIModelList(r io.Reader) ([]string, error) {
 // slice with no decode error and so must be rejected explicitly.
 func decodeSdcppModelList(r io.Reader) ([]string, error) {
 	var entries []any
-	if err := json.NewDecoder(r).Decode(&entries); err != nil {
+	if err := decodeSingleJSON(r, &entries); err != nil {
 		return nil, err
 	}
 	if entries == nil {

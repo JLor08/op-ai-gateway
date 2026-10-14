@@ -4115,39 +4115,48 @@ func TestSyncApplicationModelsNeverDiscoversFromTheLoadedModelsPath(t *testing.T
 
 // TestSyncApplicationModelsStableDiffusionCppUnreadableListingChangesNothing
 // pins fail-closed at the call site: a 200 carrying something that is not the
-// model list (a reverse proxy's error page, say) must fail the sync and leave
-// every mapping as it was, exactly like a transport error.
+// model list must fail the sync and leave every mapping as it was, exactly like
+// a transport error. The trailing-data body is the subtle case: `[]` decodes on
+// its own, so without the end-of-input check the sync would read an empty
+// listing and disable the mapping instead of failing.
 func TestSyncApplicationModelsStableDiffusionCppUnreadableListingChangesNothing(t *testing.T) {
-	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
-	upstream := newRecordingUpstream(t, map[string]string{
-		"/sdapi/v1/sd-models": `<html><body>502 Bad Gateway</body></html>`,
-	})
-	svc, routeStore := newServerTestServiceWithLister(t, now, realDiscovery(upstream.Client()))
-	server := createTestServer(t, svc, "S", "s.example.test")
-	appDTO, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
-		Type: routing.ProviderStableDiffusionCpp, Port: 7860, Scheme: "http",
-		APIFlavors: []string{routing.APIFlavorOpenAIImages},
-	})
-	if err != nil {
-		t.Fatalf("CreateApplication: %v", err)
-	}
-	if err := routeStore.CreateMapping(context.Background(), routing.ModelMapping{
-		ID: "map_seed", ApplicationID: appDTO.ID, GatewayModelName: "flux1-dev", AppModelName: "flux1-dev",
-		Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("seed mapping: %v", err)
-	}
-	routeServer, app := storedPointedAt(t, routeStore, upstream, server.ID, appDTO.ID)
+	for name, listing := range map[string]string{
+		"reverse proxy error page":   `<html><body>502 Bad Gateway</body></html>`,
+		"empty list then error page": `[]<html><body>502 Bad Gateway</body></html>`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+			upstream := newRecordingUpstream(t, map[string]string{
+				"/sdapi/v1/sd-models": listing,
+			})
+			svc, routeStore := newServerTestServiceWithLister(t, now, realDiscovery(upstream.Client()))
+			server := createTestServer(t, svc, "S", "s.example.test")
+			appDTO, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+				Type: routing.ProviderStableDiffusionCpp, Port: 7860, Scheme: "http",
+				APIFlavors: []string{routing.APIFlavorOpenAIImages},
+			})
+			if err != nil {
+				t.Fatalf("CreateApplication: %v", err)
+			}
+			if err := routeStore.CreateMapping(context.Background(), routing.ModelMapping{
+				ID: "map_seed", ApplicationID: appDTO.ID, GatewayModelName: "flux1-dev", AppModelName: "flux1-dev",
+				Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("seed mapping: %v", err)
+			}
+			routeServer, app := storedPointedAt(t, routeStore, upstream, server.ID, appDTO.ID)
 
-	if _, err := svc.SyncApplicationModelsForApp(context.Background(), routeServer, app); !errors.Is(err, ErrApplicationSyncFailed) {
-		t.Fatalf("sync err = %v, want ErrApplicationSyncFailed", err)
-	}
-	mappings, err := routeStore.MappingsByApplication(context.Background(), app.ID)
-	if err != nil {
-		t.Fatalf("MappingsByApplication: %v", err)
-	}
-	if len(mappings) != 1 || mappings[0].Status != routing.ServerStatusActive {
-		t.Fatalf("mappings changed despite an unreadable listing: %#v", mappings)
+			if _, err := svc.SyncApplicationModelsForApp(context.Background(), routeServer, app); !errors.Is(err, ErrApplicationSyncFailed) {
+				t.Fatalf("sync err = %v, want ErrApplicationSyncFailed", err)
+			}
+			mappings, err := routeStore.MappingsByApplication(context.Background(), app.ID)
+			if err != nil {
+				t.Fatalf("MappingsByApplication: %v", err)
+			}
+			if len(mappings) != 1 || mappings[0].Status != routing.ServerStatusActive {
+				t.Fatalf("mappings changed despite an unreadable listing: %#v", mappings)
+			}
+		})
 	}
 }
 
