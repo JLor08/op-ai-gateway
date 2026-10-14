@@ -13,7 +13,7 @@ import (
 // the principal's vendor-account models from: each of the PRINCIPAL's own ACTIVE
 // vendor accounts together with the models it serves. The listing overlay
 // (vendorModelFlavorSets: /v1/models, the Anthropic list, the chat picker,
-// /api/v0/models) and the dashboard's route table (vendorDashboardRoutes) both
+// /api/v1/models) and the dashboard's route table (vendorDashboardRoutes) both
 // go through it, so which accounts and models they surface cannot drift.
 //
 // Only the accounts the TOKEN may use are listed (token.VendorAccess, strict by
@@ -142,10 +142,11 @@ func vendorAccountServedFlavors(acc routing.VendorAccount) []string {
 
 // overlayVendorModels unions the principal's vendor-model flavor overlay into an
 // existing per-name flavor set map, in place. Both listing paths use it: the
-// per-flavor path (modelFlavorSets → ModelsForFlavor → /v1/models, the Anthropic
-// list) and the DTO path (modelsResponse → Models() → the chat picker,
-// /api/v0/models). A name a vendor account shares with a self-hosted model simply
-// gets the union of their flavors, so there is one entry per name (deduped).
+// per-flavor path (modelFlavorSets → ModelsForFlavor → /anthropic/v1/models, its
+// only gateway consumer) and the DTO path (modelsResponse → Models() → the chat
+// picker, plus /v1/models and /api/v1/models through openAIModelDTOs). A name a
+// vendor account shares with a self-hosted model simply gets the union of their
+// flavors, so there is one entry per name (deduped).
 func (s *Service) overlayVendorModels(ctx context.Context, token auth.Token, sets map[string]map[string]struct{}) {
 	for name, flavors := range s.vendorModelFlavorSets(ctx, token) {
 		set := sets[name]

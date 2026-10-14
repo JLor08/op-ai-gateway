@@ -130,7 +130,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
-| LM Studio-shaped discovery | `/api/v0/models` | `handleLMStudioModels` | `requireScope("gateway:use")` | n/a |
+| LM Studio v2 model discovery | `/api/v1/models`, `/openai/api/v1/models` | `handleLMStudioV1Models` | `requireAnyScope` (bearer only) | n/a |
 
 `requireAnyScope` accepts **either** a normal `gateway:use` principal **or** a
 service token's sole `llm:invoke` scope (service accounts); `requireWebAnyScope`
@@ -678,14 +678,28 @@ string end to end, so a client's exact formatting (key order, whitespace)
 survives a round trip.
 
 **opencode.** As an OpenAI-compatible coding agent, opencode drives the plain
-Chat Completions edge and is the primary tested case for the null-content
-tool-call-replay shape (§3.1) and for context-window reporting: it auto-detects
-a model's context window via the LM-Studio-shaped `GET /api/v0/models`
-(`handleLMStudioModels`, `internal/gateway/server.go`), which reports, for
-each model offered under `openai` (the names `/v1/models` lists, §9), its
-`max_context_length` (and, when currently loaded, `loaded_context_length`)
-alongside an LM-Studio `state` (`loaded`/`not-loaded`) — metadata only; chat
-still flows over `/v1/chat/completions`.
+Chat Completions edge, and the null-content tool-call-replay shape (§3.1) is
+modelled on what such an agent sends (a parser fixture pins it; nothing here is
+tested against opencode itself). The gateway also reports each model's context
+window for it, which is metadata only (chat always flows over
+`/v1/chat/completions`) and is served on two listings (§9), both for exactly the
+models offered under `openai` (the names `/v1/models` lists). A current
+opencode's LM Studio provider is understood to
+learn a model's window from the LM Studio v2 listing `GET /api/v1/models`
+(`handleLMStudioV1Models`, `internal/gateway/server.go`), which reports it as
+`max_context_length` (that is issue #171's reading of opencode's source; it is
+not verified against opencode here); the standard OpenAI-style `GET /v1/models`
+carries the same number as `context_length`, the place a generic
+OpenAI-compatible client reads a model's window. No released opencode is known
+to read that `/v1/models` field yet, and a hand-written `openai-compatible`
+provider in `opencode.json` is understood to discover nothing on its own, which
+is why
+`scripts/gen-opencode-config.sh` reads `context_length` from `/v1/models` and
+writes the limits into the file it generates
+([Development & Quality §5](development-and-quality.md#5-continuous-integration)). LM Studio's earlier v0
+listing, `/api/v0/models`, has no known current client and is retired: it
+answers 404 ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(h)).
 
 ## 6. Endpoint modes and native passthrough
 
@@ -1315,9 +1329,9 @@ client lacks it answers `provider.unavailable`
 
 | Endpoint | Shape | Filtering |
 |---|---|---|
-| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway"}]}` | `Portal.ModelsForFlavor(token, "openai")` |
+| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway","context_length"?}]}` — `context_length` is omitted when the window is unknown | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai` (`openAIModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "openai")` lists |
 | `GET /anthropic/v1/models` | Anthropic `{"data":[{"id","type":"model","display_name","created_at"}]}` | `Portal.ModelsForFlavor(token, "anthropic")` |
-| `GET /api/v0/models` | LM Studio `{"object":"list","data":[{"id","object":"model","type":"llm","state","max_context_length","loaded_context_length"}]}` | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai`, so it lists exactly the names `/v1/models` lists |
+| `GET /api/v1/models`, `/openai/api/v1/models` | LM Studio v2 `{"models":[{"type":"llm","key","display_name","max_context_length","loaded_instances":[{"config":{"context_length"}}],"capabilities":{"vision","trained_for_tool_use"}}]}` — `max_context_length` is always present | the same `openAIModelDTOs` rows as `/v1/models`, so it lists exactly the same names |
 
 `ModelsForFlavor` (`internal/portal/service.go`) returns the sorted gateway
 model names that have at least one **active** mapping that passes the served
@@ -1325,11 +1339,41 @@ rule for that flavor (below), or for a group an offerable member that does,
 filtered to what the calling principal may see under
 resource-group provisioning visibility — the list is intentionally **not**
 filtered by a service token's model allowlist (discovery is unrestricted;
-invocation is gated separately, §3/§6). With no routing store configured, all
+invocation is gated separately, §3/§6). It is the source of
+`/anthropic/v1/models`; the two `openai` listings read the richer `Models()`
+rows instead (next paragraph), and a test pins their ids to
+`ModelsForFlavor(token, "openai")`. With no routing store configured, all
 three fall back to two fixed seed model names so a fresh/dev instance always
 answers something. The seeds are text models: they carry `anthropic` and
 `openai` and never `openai_images` (`seedAPIFlavors`, kept apart from the
 listing's own flavor set on purpose).
+
+**The two `openai` listings carry the model's context window.**
+`/v1/models` and `/api/v1/models` both list from `Portal.Models(token)` narrowed
+by `openAIModelDTOs` (`internal/gateway/server.go`), so each row has the
+portal's `ContextSize`: the **minimum** known (`> 0`) `context_size` across the
+model's offering mappings (conservative, so it never overstates when the
+servers differ), and `0` when no mapping reports one (a vendor-only model, a
+seed name). The two listings treat an unknown window differently, on purpose:
+`/v1/models` **omits** `context_length` (a client that reads
+`context_length ?? fallback` would be blocked by a `0`), while `/api/v1/models`
+always writes `max_context_length`, `0` included (LM Studio's v2 contract
+requires the key, and a client keeps its own default for `0`) — the two
+contracts differ, so they are not harmonised. Either way the fix for an unknown
+window is to set the mapping's `context_size`, by the `/props` probe or by hand.
+`/api/v1/models` is reported to be decoded strictly by its clients (issue
+#171), so `models` and every `loaded_instances` encode as `[]`, never `null`. `loaded_instances` holds one
+`{"config":{"context_length":N}}` while the model is loaded on some offering
+server and is empty otherwise; `capabilities.vision` is the portal's
+fail-closed vision fold; `capabilities.trained_for_tool_use` is the constant
+`true`, because the gateway tracks no per-model tool support — the one place it
+drops tools is a native `ollama` application, whose client sends no `tools` to
+`/api/chat` (tracked as issue #219, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
+(h)). The v2 listing is registered under `/api/v1/models` and
+`/openai/api/v1/models` only, never under `/anthropic/`, whose prefix has no OpenAI
+chat-completions route a discovered model could be used with. Both are bearer-only
+(`requireAnyScope`, so a service token's `llm:invoke` reaches them, like
+`/v1/models`); a session cookie is not accepted.
 
 **The portal listing's `image` means "the images endpoint would serve this
 model".** `modelsResponse` AND-folds it across the model's offering mappings,
@@ -1348,14 +1392,16 @@ not.** Every listing keeps only the coarse flavors it knows
 (`knownAPIFlavors`: `anthropic`, `openai`, `openai_images`), so a model that
 is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
-(§12). `/v1/models` asks for `openai` alone, so the same model is **not**
-listed there: that listing is what an external OpenAI client fills its *chat*
-picker from, and an images-only model offered for chat would fail.
+(§12). `/v1/models` keeps only the rows that carry `openai`, so the same model
+is **not** listed there (nor in `/api/v1/models`): that listing is what an
+external OpenAI client fills its *chat* picker from, and an images-only model
+offered for chat would fail.
 
 **Every listing's flavors follow the rule dispatch follows.** A model's
-`flavors`, and the per-flavor filter behind `/v1/models` and
-`/anthropic/v1/models`, hold the flavors under which at least one of its
-mappings passes the served rule ([Routing & Model Selection
+`flavors`, and the per-flavor filters behind the listings — `/anthropic/v1/models`
+through `ModelsForFlavor`, `/v1/models` and `/api/v1/models` through the
+`openai`-flavored `Models()` rows (`openAIModelDTOs`) — hold the flavors under
+which at least one of its mappings passes the served rule ([Routing & Model Selection
 §2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither),
 [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)):
 `openai` when the application declares it and the effective flavors — the
@@ -1370,11 +1416,11 @@ the union of its offerable members'. So an agent-launched child whose spec is
 declares, and appears on neither text listing. When a `server_agent`
 application's spec read fails, its models take the application's flavors and
 messages mode for as long as the read fails (fail-open, like every listing),
-while their `image` stays false. `/api/v0/models` keeps only the portal rows
-whose `flavors` contain `openai` and types each `"llm"`; because the portal
-listing and the per-flavor sets apply the same views, group overlay,
-suppression and override aliases, it lists exactly `/v1/models`' names, groups
-and aliases included.
+while their `image` stays false. `/v1/models` and `/api/v1/models` keep only the
+portal rows whose `flavors` contain `openai` (the v2 listing types each
+`"llm"`); because the portal listing and the per-flavor sets apply the same
+views, group overlay, suppression and override aliases, the two list exactly the
+same names, groups and aliases included.
 
 **A name that no flavor serves keeps its row, with `flavors: []`.** No mapping
 of it, and for a group no offerable member, passes the served rule for any
@@ -1398,8 +1444,9 @@ name a model that no flavor serves, which is refused with 400
 last, over the finished listing:
 
 - `offer` adds the **requested** name to this token's listing, inheriting its
-  target's API flavors — and, in the richer portal/LM-Studio shape, the
-  target's loaded state, offering servers, context size, vision flag, and
+  target's API flavors — and, in the richer portal shape (the `Models()` rows the
+  `openai` listings are built from), the target's loaded state, offering
+  servers, context size, vision flag, and
   whether the target is a model *group*, so the alias row looks exactly like
   its target's row filed under a different name. Flavors are read from the
   pre-suppression set, so an alias onto a hidden or locked target is still

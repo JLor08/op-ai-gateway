@@ -3,7 +3,8 @@
 #
 # Continuous integration: format check, lint, build, and test for the Go
 # backend + server-agent and the React/TypeScript frontend; the docs
-# consistency check; the offline tests of the local Sonar tooling; and the
+# consistency check; the offline tests of the local Sonar tooling; the offline
+# test of the opencode config generator (gen-opencode-config.sh); and the
 # e2e:runtime Playwright suite. Ready to run as soon as a runner is attached to
 # the repository.
 name: CI
@@ -112,6 +113,21 @@ jobs:
         run: sh scripts/sonar/branch-findings.test.sh
       - name: Startup wait, version record and main guard (sonar.sh)
         run: bash scripts/sonar/sonar.test.sh
+
+  # gen-opencode-config.sh turns the gateway's /v1/models list into an opencode
+  # provider block. Its offline test runs the real script against a stub curl, so
+  # it needs only the checkout and jq (both on the runner image).
+  opencode-config-script:
+    name: opencode config generator (offline test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The test SKIPs, exit 0, without jq; a job that went green while testing
+      # nothing would read as a pass.
+      - name: Require jq
+        run: jq --version
+      - name: Generator (gen-opencode-config.sh)
+        run: sh scripts/gen-opencode-config.test.sh
 
   frontend:
     name: Frontend (portal)

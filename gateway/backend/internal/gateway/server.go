@@ -1294,7 +1294,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/images/edits", s.handleOpenAIImagesEdit)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/v1/models", s.handleOpenAIModels)
-	s.mux.HandleFunc("/api/v0/models", s.handleLMStudioModels)
+	s.mux.HandleFunc("/openai/api/v1/models", s.handleLMStudioV1Models)
+	s.mux.HandleFunc("/api/v1/models", s.handleLMStudioV1Models)
 	s.mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicMessages)
 	s.mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
 	s.mux.HandleFunc("/anthropic/v1/messages/count_tokens", s.handleAnthropicCountTokens)
@@ -1519,49 +1520,68 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ids := s.Portal.ModelsForFlavor(r.Context(), token, routing.APIFlavorOpenAI)
-	data := make([]map[string]string, 0, len(ids))
-	for _, id := range ids {
-		data = append(data, map[string]string{"id": id, "object": "model", "owned_by": "op-ai-gateway"})
+	// The rows are the portal's Models() narrowed to the openai flavor, which
+	// openAIModelDTOs documents as exactly the names ModelsForFlavor lists (a
+	// test pins it); unlike that ids-only list they carry each model's context
+	// window.
+	models := openAIModelDTOs(s.Portal.Models(r.Context(), token).Data)
+	data := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		item := map[string]any{"id": m.ID, "object": "model", "owned_by": "op-ai-gateway"}
+		// context_length is the usable window in tokens, the standard location
+		// clients read a model's context from (no released opencode is known to
+		// read it yet, per issue #171's reading); it is left out, not zero, when no
+		// mapping of the model knows it.
+		if m.ContextSize > 0 {
+			item["context_length"] = m.ContextSize
+		}
+		data = append(data, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-// lmStudioModelsFromDTOs maps portal model rows into LM Studio's
-// GET /api/v0/models item shape so opencode's lmstudio provider can auto-detect
-// each model's context window (max_context_length). Chat still flows over the
-// OpenAI-compatible /v1/chat/completions path; only the metadata is emulated.
-// It maps every row it is given; handleLMStudioModels passes only the rows
-// openAIModelDTOs keeps.
-func lmStudioModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
+// lmStudioV1ModelsFromDTOs maps portal model rows into the item shape of LM
+// Studio's native v2 GET /api/v1/models listing, which is where an LM Studio
+// client (a current opencode, per issue #171's reading of its source) learns
+// each model's context window. Chat still flows over the OpenAI-compatible
+// /v1/chat/completions path; only the metadata is emulated. It maps every row
+// it is given; handleLMStudioV1Models passes only the rows openAIModelDTOs
+// keeps.
+//
+// max_context_length is ALWAYS present, even at 0 (an unknown window): LM
+// Studio's v2 contract requires it and a client keeps its own default for 0.
+// That is deliberately unlike /v1/models, which omits context_length when the
+// window is unknown -- the two endpoints have different contracts, so do not
+// harmonise them. loaded_instances holds one instance when the model is loaded
+// and is an empty slice, never nil, when it is not, and the result itself is
+// non-nil even for no rows, so both encode as [] rather than null.
+// trained_for_tool_use is a constant: the gateway tracks no per-model tool
+// support, so every chat model it lists is advertised as tool-capable.
+func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
-		state := "not-loaded"
+		loaded := make([]map[string]any, 0, 1)
 		if m.Loaded {
-			state = "loaded"
+			loaded = append(loaded, map[string]any{"config": map[string]any{"context_length": m.ContextSize}})
 		}
-		item := map[string]any{
-			"id":     m.ID,
-			"object": "model",
-			"type":   "llm",
-			"state":  state,
-		}
-		if m.ContextSize > 0 {
-			item["max_context_length"] = m.ContextSize
-			if m.Loaded {
-				item["loaded_context_length"] = m.ContextSize
-			}
-		}
-		out = append(out, item)
+		out = append(out, map[string]any{
+			"type":               "llm",
+			"key":                m.ID,
+			"display_name":       m.DisplayName,
+			"max_context_length": m.ContextSize,
+			"loaded_instances":   loaded,
+			"capabilities":       map[string]any{"vision": m.Vision, "trained_for_tool_use": true},
+		})
 	}
 	return out
 }
 
 // openAIModelDTOs keeps the portal model rows whose flavors carry openai: the
-// names /v1/chat/completions serves. A client of /api/v0/models chats over that
+// names /v1/chat/completions serves. /v1/models and the LM Studio-shaped
+// /api/v1/models both list from these rows, and their clients chat over that
 // endpoint, so a row without openai -- an anthropic-only or images-only model,
 // a model offered under no API at all, or a group or offered alias of only
-// such models -- would be offered as an "llm" that every chat request to it
+// such models -- would be offered as a chat model that every chat request to it
 // fails. Models() applies the same views, group overlay, suppression and
 // override aliases as ModelsForFlavor, so the rows kept are exactly the names
 // /v1/models lists.
@@ -1575,16 +1595,22 @@ func openAIModelDTOs(models []portal.ModelDTO) []portal.ModelDTO {
 	return out
 }
 
-func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
+// handleLMStudioV1Models serves LM Studio's native v2 model listing
+// (GET /api/v1/models, also under /openai/api/v1/models), the endpoint an LM
+// Studio client (a current opencode, per issue #171) reads each model's context
+// window from. Like /v1/models it is bearer-only and reachable to a service
+// token (llm:invoke) as well as a normal gateway:use token: discovery is not
+// invocation. It lists exactly the names /v1/models lists.
+func (s *Server) handleLMStudioV1Models(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	token, ok := s.requireScope(w, r, scopeGatewayUse)
+	token, ok := s.requireAnyScope(w, r, scopeGatewayUse, scopeLLMInvoke)
 	if !ok {
 		return
 	}
 	models := openAIModelDTOs(s.Portal.Models(r.Context(), token).Data)
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": lmStudioModelsFromDTOs(models)})
+	writeJSON(w, http.StatusOK, map[string]any{"models": lmStudioV1ModelsFromDTOs(models)})
 }
 
 func (s *Server) handleAnthropicModels(w http.ResponseWriter, r *http.Request) {

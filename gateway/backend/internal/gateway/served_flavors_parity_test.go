@@ -100,7 +100,7 @@ func TestListingsAdvertiseExactlyWhatDispatchServes(t *testing.T) {
 // image=yes verdict, and asks chat completions, /v1/messages (with a model the
 // routing probe reads) and the images relay whether they serve gw-model. The
 // portal Models() row must then list exactly the served flavors and carry the
-// images relay's answer as its image flag, and /v1/models, /api/v0/models and
+// images relay's answer as its image flag, and /v1/models, /api/v1/models and
 // /anthropic/v1/models must list gw-model exactly when its flavor is served.
 func requireListingsMatchDispatch(t *testing.T, appFlavors, specFlavors []string, mode routing.EndpointMode) {
 	t.Helper()
@@ -138,7 +138,7 @@ func requireListingsMatchDispatch(t *testing.T, appFlavors, specFlavors []string
 		flavor string
 	}{
 		{"/v1/models", routing.APIFlavorOpenAI},
-		{"/api/v0/models", routing.APIFlavorOpenAI},
+		{"/api/v1/models", routing.APIFlavorOpenAI},
 		{"/anthropic/v1/models", routing.APIFlavorAnthropic},
 	}
 	for _, l := range listings {

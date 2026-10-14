@@ -9,14 +9,14 @@
 # provider with per-model context/output limits, so opencode's TUI shows the
 # context-window fill ("Weg B" / deterministic fallback).
 #
-# It reads the gateway's LM Studio-compatible metadata endpoint
-# (GET /api/v0/models) to learn each active gateway model's context window
-# (max_context_length), and emits a provider block whose models carry
-# limit.context (the reported window) and limit.output (min(context/4, 8192),
-# the established heuristic). Models the gateway reports without a known context
-# size are skipped (opencode falls back to its own default for those) — set the
-# mapping's context_size in the gateway (via the /props probe or manually) to
-# have them appear with a real value.
+# It reads the gateway's OpenAI-compatible model list (GET /v1/models) to learn
+# each active gateway model's context window (the per-model context_length
+# field), and emits a provider block whose models carry limit.context (the
+# reported window) and limit.output (min(context/4, 8192), the established
+# heuristic). Models the gateway lists without a known context size (it omits
+# context_length for those) are skipped (opencode falls back to its own default
+# for those) — set the mapping's context_size in the gateway (via the /props
+# probe or manually) to have them appear with a real value.
 #
 # The streaming token counter is delivered by the gateway itself (it emits a
 # final usage chunk when the client sends stream_options.include_usage, which
@@ -46,7 +46,7 @@ token="${OP_GATEWAY_TOKEN:-}"
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 usage() {
-  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^# Requires:/p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -68,17 +68,18 @@ command -v jq   >/dev/null 2>&1 || die "jq is required but not installed (brew i
 [ -n "$token" ] || die "missing --token (or OP_GATEWAY_TOKEN)"
 
 # Normalize: strip a trailing slash, then a trailing "/v1" if the user pasted the
-# OpenAI base URL. We want the origin so we can hit /api/v0/models and build /v1.
+# OpenAI base URL. We want the origin so we can build both /v1/models and the
+# provider's /v1 baseURL from it.
 base="${url%/}"
 base="${base%/v1}"
 
-models_url="$base/api/v0/models"
+models_url="$base/v1/models"
 
 resp="$(curl -fsS "$models_url" -H "Authorization: Bearer $token")" \
-  || die "request to $models_url failed (is the gateway deployed with this feature, and the token valid?)"
+  || die "request to $models_url failed (is the gateway reachable at that URL, and the token valid?)"
 
 echo "$resp" | jq -e 'has("data") and (.data | type == "array")' >/dev/null 2>&1 \
-  || die "unexpected response from $models_url (not an LM Studio model list): $resp"
+  || die "unexpected response from $models_url (not an OpenAI model list): $resp"
 
 config="$(printf '%s' "$resp" | jq \
   --arg gw "$base/v1" --arg tok "$token" --arg prov "$provider" '{
@@ -88,11 +89,11 @@ config="$(printf '%s' "$resp" | jq \
         options: { baseURL: $gw, apiKey: $tok },
         models: (
           [ .data[]
-            | select(.max_context_length != null and .max_context_length > 0)
+            | select(.context_length != null and .context_length > 0)
             | { key: .id,
                 value: { name: .id,
-                         limit: { context: .max_context_length,
-                                  output: ([ (.max_context_length / 4 | floor), 8192 ] | min) } } }
+                         limit: { context: .context_length,
+                                  output: ([ (.context_length / 4 | floor), 8192 ] | min) } } }
           ] | from_entries
         )
       }
@@ -109,5 +110,5 @@ else
 fi
 
 if [ "$count" -eq 0 ]; then
-  printf 'warning: no model reported a context size — set context_size on the mappings in the gateway (/props probe or manual), then re-run.\n' >&2
+  printf 'warning: no model reported a context size — set context_size on the mappings in the gateway (/props probe or manual), or upgrade the gateway if it predates context_length on /v1/models, then re-run.\n' >&2
 fi

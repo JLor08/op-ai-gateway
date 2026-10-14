@@ -2362,7 +2362,7 @@ func (s *Service) Dashboard(ctx context.Context, token auth.Token) DashboardResp
 }
 
 // Models returns the offered-model listing for the portal chat picker, the LM
-// Studio /api/v0/models list and the service allowlist check
+// Studio /api/v1/models list and the service allowlist check
 // (validateServiceAllowedModels): hidden/locked models are SUPPRESSED from the
 // standalone listing (active groups are still added). Each model's flavors are
 // the ones dispatch serves it under (routing.MappingServesAPIFlavor); a model
@@ -2686,7 +2686,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				}
 			}
 			// Owner overlay: fold in the principal's own vendor-account models
-			// (Milestone 3) so the chat picker and /api/v0/models show exactly what
+			// (Milestone 3) so the chat picker and /api/v1/models show exactly what
 			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
 			// suppress==true is Models() (the picker / inference discovery); the
 			// admin management surface (ManageModels(), suppress==false) shows the
@@ -4140,7 +4140,8 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 //	                                                                                                                                       (plus the alias's loaded/offered/context/
 //	                                                                                                                                        vision/is-group row data, copied from
 //	                                                                                                                                        the target so the alias row looks like it)
-//	ModelsForFlavor() (/v1/models, per flavor)     yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	ModelsForFlavor() (/anthropic/v1/models, per   yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	  flavor; /v1/models reads Models() instead)
 //	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass         no — keyed by a REAL model name; an alias
 //	  (handlePortalModelServers /                                                                                                              is not one, and the name it hides stays
 //	   handlePortalModelServersEvents)                                                                                                          fully callable (see below)
@@ -4215,8 +4216,8 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 // of them, so a flavor missing here is a flavor no listing reports -- an
 // images-only model would reach the chat with no flavors at all. A model
 // carries the ones dispatch serves it under (routing.MappingServesAPIFlavor),
-// and each per-flavor listing (ModelsForFlavor, i.e. /v1/models) asks for its
-// OWN flavor, so an images-only model never appears in a text listing.
+// and each per-flavor listing (ModelsForFlavor, i.e. /anthropic/v1/models) asks
+// for its OWN flavor, so an images-only model never appears in a text listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
 var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
@@ -4248,9 +4249,10 @@ func isSeedAPIFlavor(flavor string) bool {
 // not routable under that name, while a name the last two layers removed stays
 // fully callable. ModelOffering.Callable is the set that answers reach.
 //
-// Drives per-flavor discovery (ModelsForFlavor(), i.e. /v1/models et al.); the
-// portal Models() overview builds its own view via modelsResponse, applying the
-// same three layers (see the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
+// Drives per-flavor discovery (ModelsForFlavor(), i.e. /anthropic/v1/models);
+// the portal Models() overview, which /v1/models and /api/v1/models list from,
+// builds its own view via modelsResponse, applying the same three layers (see
+// the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
 	if err != nil {
