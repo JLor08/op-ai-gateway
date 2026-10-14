@@ -182,13 +182,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // thread keeps its composer even while its model is momentarily unreachable.
   const isImageThread = c.chatKind === 'image';
 
-  // Which capability the disabled attach button is about. The two are
-  // different: an image GENERATOR emits images and accepts none, while a
-  // non-vision model simply cannot read one. Saying "does not support images"
-  // on a generator told the user the opposite of the truth.
+  // The attach control follows ONE predicate, the store's attachMode (the
+  // thread's kind and the picked model -- ADR-043 R1): 'edit' offers the image as
+  // the source of an edit, 'vision' as an input the model reads, 'none' refuses.
+  //
+  // Which capability a REFUSED attach button is about: the two are different -- an
+  // image GENERATOR (that cannot be edited) emits images and accepts none, while a
+  // non-vision model simply cannot read one. Saying "does not support images" on
+  // a generator told the user the opposite of the truth.
   let attachTooltip: string = t.chatAttachImage;
-  if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
-  else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
+  if (c.attachMode === 'edit') attachTooltip = t.chatAttachImageEdit;
+  else if (c.attachMode === 'none') {
+    if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
+    else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
+  }
 
   let modelHelperText: string | undefined;
   if (c.overrideModel !== '') {
@@ -687,7 +694,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             <TextField
               id="chat-message"
               label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
-              helperText={isImageThread ? t.chatImageOnlyHint : undefined}
+              // An edit-capable model's thread also edits: the hint says what an
+              // attachment does there (there is no mode to switch, the image is the
+              // operand). A generator that cannot be edited keeps the old wording.
+              helperText={
+                isImageThread
+                  ? c.attachMode === 'edit'
+                    ? t.chatImageEditHint
+                    : t.chatImageOnlyHint
+                  : undefined
+              }
               multiline
               minRows={4}
               fullWidth
@@ -764,7 +780,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   <IconButton
                     component="label"
                     size="small"
-                    disabled={c.streaming || !c.modelVisionCapable || c.modelImageCapable}
+                    disabled={c.streaming || c.attachMode === 'none'}
                   >
                     <AddPhotoAlternateIcon fontSize="small" />
                     <Box
@@ -786,7 +802,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     <input
                       type="file"
                       accept="image/*"
-                      multiple
+                      // An edit has one source image; a text model reads several.
+                      multiple={c.attachMode !== 'edit'}
                       hidden
                       onChange={(event) => {
                         void c.handleFiles(event.target.files);

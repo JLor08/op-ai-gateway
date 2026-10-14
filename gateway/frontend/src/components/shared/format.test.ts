@@ -382,6 +382,9 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'gateway.chat_run_no_image',
     'gateway.chat_run_image_format_unknown',
     'gateway.chat_run_image_response_unreadable',
+    // An image EDIT whose source cannot be read as an image (ADR-043 R1):
+    // `imageRunSourceUnreadableMessage`, chat_runs_images.go.
+    'gateway.chat_run_image_source_unreadable',
     'gateway.chat_run_commit_failed',
   ] as const;
 
@@ -429,6 +432,14 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'images.blob_type_unsupported',
     'images.blob_too_large',
     'images.blob_not_owned',
+    // The two refusals of POST /v1/images/edits a portal edit turn can hit
+    // (relayed by upstreamErrorCode): an edit with no image part
+    // (`imagesImageRequired`, images_edit_handler.go) and an edit whose target
+    // is an agent that has not declared multipart_proxy (`codeImageEditUnavailable`,
+    // 404). The mask refusals (`images.mask_invalid`, `images.edit_unsupported_format`)
+    // join them with the portal's mask upload.
+    'images.image_required',
+    'images.edit_unavailable',
   ] as const;
 
   it('carries every images.* refusal code reachable from a chat run, by its exact wire string', () => {
@@ -444,6 +455,25 @@ describe('errorLabelByCode (whole-map invariants)', () => {
         .map(([code]) => code)
         .sort(),
     ).toEqual(imagesWireCodes.slice().sort());
+  });
+
+  // An image edit's refusals reach a chat run as the terminal CODE (the loopback
+  // endpoint's error.code, relayed by upstreamErrorCode), so each must map to its
+  // own localized sentence in BOTH locales -- and, as a run carries no server
+  // text to fall back on, never degrade to the bare code.
+  it.each([
+    ['images.image_required', 'errorImagesImageRequired'],
+    ['images.edit_unavailable', 'errorImagesEditUnavailable'],
+    ['gateway.chat_run_image_source_unreadable', 'errorChatRunImageSourceUnreadable'],
+  ] as const)('labels the image-edit code %s with %s, in both locales', (code, key) => {
+    expect(errorLabelByCode[code]).toBe(key);
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(t[key].length).toBeGreaterThan(0);
+      expect(formatChatRunErrorCode(code, t)).toBe(t[key]);
+      expect(formatChatRunErrorCode(code, t)).not.toBe(code);
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
   });
 
   /**

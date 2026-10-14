@@ -8,13 +8,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"maps"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -82,13 +87,14 @@ type imageURLPart struct {
 	ImageURL imageURLTarget `json:"image_url"`
 }
 
-// The four terminal codes this path adds. All are CODES, not prose, for the
+// The five terminal codes this path adds. All are CODES, not prose, for the
 // reason runTimedOutMessage already is one: the frontend maps a run's error to
 // a localized label, and each describes a condition a user has to be able to
 // tell apart from an ordinary failure.
 const (
 	// imageRunDispatchFailedMessage: the run never got its request to the
-	// gateway's own /v1/images/generations at all -- marshalling our own body
+	// gateway's own /v1/images/generations (or /v1/images/edits, for an edit)
+	// at all -- marshalling our own body
 	// failed, the request could not be constructed, or the loopback round
 	// trip failed outright. All three previously returned err.Error(), and
 	// the third one's Go error embeds the request URL, so a gateway that
@@ -128,6 +134,17 @@ const (
 	// code -- runContextOutcome already reports that distinctly and is checked
 	// first at each call site.
 	imageRunResponseUnreadableMessage = "gateway.chat_run_image_response_unreadable"
+	// imageRunSourceUnreadableMessage: the turn is an edit -- its last user
+	// message carries an image -- but an image it carries cannot be turned into
+	// bytes this run may send: an external link (a run never fetches a url), a
+	// gateway reference that was not resolved to bytes, or a data: url that does not
+	// decode as one of the stored image types. The run fails and sends NOTHING.
+	// Sending the rest -- the prompt alone, as a generation, or the edit without the
+	// unreadable image -- would answer a request the user did not make with an image
+	// they did not ask for, which is the silent drop every other code here exists
+	// to refuse. (An image the chat simply does not hold never gets this far: the
+	// run is refused at its start, see portal.Service.resolveImageRunSource.)
+	imageRunSourceUnreadableMessage = "gateway.chat_run_image_source_unreadable"
 )
 
 // imageSubtypePattern bounds what may be interpolated into the data: URL's
@@ -156,8 +173,9 @@ const (
 var imageSubtypePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9+.-]{0,31}$`)
 
 // executeImageRun is executeRun's image branch: one buffered request to the
-// gateway's own /v1/images/generations, and one terminal commit carrying the
-// generated image(s) as the assistant turn's structured content.
+// gateway's own /v1/images/generations -- or, when the turn carries a source image,
+// /v1/images/edits -- and one terminal commit carrying the generated image(s) as
+// the assistant turn's structured content.
 //
 // It calls finishRunWithParts EXACTLY ONCE, on every path, because the work
 // is split into a function that only COMPUTES the outcome (generateImageTurn,
@@ -178,18 +196,50 @@ func (s *Server) executeImageRun(ctx context.Context, owner auth.Token, run *Cha
 // and returns the turn's outcome: the content parts to commit, the run status,
 // and the terminal error message. It never commits, never finishes the run and
 // never publishes a delta -- there are none to publish.
+//
+// WHICH request is decided by the turn alone (ADR-043 R1): when the last user
+// message carries an image, the turn is an EDIT of it -- multipart to
+// /v1/images/edits -- and otherwise a generation, the JSON body to
+// /v1/images/generations that this executor has always sent. The thread's kind is
+// image either way; the user attached an image or did not, and there is no mode
+// for the executor to read. The response is the same document from both
+// endpoints, so everything after the request is shared.
 func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) (json.RawMessage, string, string) {
-	body, err := buildImagesBody(prep)
+	sources, err := imageEditSources(prep.History)
+	if err != nil {
+		// The operator's copy says which image and why; the user's is the code.
+		log.Printf("chat run %s: the edit's source image is unreadable: %v", run.ID, err)
+		return nil, "error", imageRunSourceUnreadableMessage
+	}
+	path := "/v1/images/generations"
+	// contentType stays empty for the JSON body: setRunLoopbackHeaders already
+	// states it.
+	var (
+		body        []byte
+		contentType string
+	)
+	if len(sources) > 0 {
+		path = "/v1/images/edits"
+		body, contentType, err = buildImageEditBody(prep, sources)
+	} else {
+		body, err = buildImagesBody(prep)
+	}
 	if err != nil {
 		log.Printf("chat run %s: build images body failed: %v", run.ID, err)
 		return nil, "error", imageRunDispatchFailedMessage
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/images/generations", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+path, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("chat run %s: build images request failed: %v", run.ID, err)
 		return nil, "error", imageRunDispatchFailedMessage
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
+	if contentType != "" {
+		// After the shared helper, which sets application/json: a multipart body's
+		// type carries its boundary, which only the writer that built it knows. It
+		// is the one header the edit hop changes (see setRunLoopbackHeaders).
+		req.Header.Set("Content-Type", contentType)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -305,6 +355,15 @@ func upstreamErrorCode(body []byte, status string) string {
 // would be free to drift from the endpoint's. The refusal reaches the run
 // through upstreamErrorCode above.
 func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
+	return json.Marshal(imageRequestFields(prep))
+}
+
+// imageRequestFields are the request fields buildImagesBody's doc comment
+// describes, as a map: json.Marshal of it is the generations body, and an edit
+// (buildImageEditBody) sends the very same fields as form values, so the two
+// requests cannot disagree about what the thread's settings mean. The values are
+// strings and integers only.
+func imageRequestFields(prep PrepareRunResult) map[string]any {
 	prompt := stripSDExtraArgsTag(lastUserPrompt(prep.History))
 	body := map[string]any{
 		"model":           prep.Settings.Model,
@@ -328,7 +387,133 @@ func buildImagesBody(prep PrepareRunResult) ([]byte, error) {
 		}
 	}
 	body["prompt"] = prompt
-	return json.Marshal(body)
+	return body
+}
+
+// imageEditSource is one image the turn is an edit of: its decoded bytes and the
+// media type the store holds it under.
+type imageEditSource struct {
+	mediaType string
+	data      []byte
+}
+
+// imageEditSources returns the images of the LAST user message in the prepared
+// history, in order, or none when it carries none (the turn is then a
+// generation). Only the last user message counts: an earlier one's image was an
+// earlier turn's source, and an assistant turn's images are its results; none of
+// them is sent anywhere.
+//
+// Every image must be readable as a data: url of a stored image type
+// (portal.DecodeImageDataURL, the same definition the run commit stores uploads
+// by), and any that is not fails the whole call -- see
+// imageRunSourceUnreadableMessage. By the time the executor runs, a stored
+// reference has already been resolved to such a url (portal.Service.
+// PrepareChatRun, resolveImageRunSource), so what is left that is not one is an
+// external link or an unresolved reference, and neither is ever fetched or sent.
+//
+// The image parts are found by portal.MessageImageURLs, the one definition of an
+// image part, so this cannot count a part the resolution did not see.
+func imageEditSources(history []portal.ChatAPIMessage) ([]imageEditSource, error) {
+	message, ok := lastUserMessage(history)
+	if !ok {
+		return nil, nil
+	}
+	urls := portal.MessageImageURLs(message.Content)
+	sources := make([]imageEditSource, 0, len(urls))
+	for i, url := range urls {
+		mediaType, data, err := portal.DecodeImageDataURL(url)
+		if err != nil {
+			// The url is logged by its scheme only: a data: url is the image itself.
+			return nil, fmt.Errorf("image %d of %d (%s): %w", i+1, len(urls), urlKind(url), err)
+		}
+		sources = append(sources, imageEditSource{mediaType: mediaType, data: data})
+	}
+	return sources, nil
+}
+
+// urlKind names an image url for a log line without repeating it: a data: url
+// carries the whole image and any other may carry a credential.
+func urlKind(url string) string {
+	switch {
+	case strings.HasPrefix(strings.ToLower(url), "data:"):
+		return "data url"
+	case strings.HasPrefix(url, chatBlobRoutePrefix):
+		return "unresolved gateway reference"
+	}
+	return "external url"
+}
+
+// imageEditFilenames is the file name each stored image type is sent under: the
+// upstream reads a part's file name, and the extension is what a server that
+// sniffs by name falls back on. The keys are exactly the allow-list
+// DecodeImageDataURL enforces, so no other media type -- and nothing the url
+// itself chose -- ever reaches a part header.
+var imageEditFilenames = map[string]string{
+	"image/png":  "image.png",
+	"image/jpeg": "image.jpg",
+	"image/webp": "image.webp",
+	"image/gif":  "image.gif",
+}
+
+// buildImageEditBody is the edit's request: the same fields buildImagesBody
+// sends, as multipart form values, and the source image(s) as file parts. It
+// returns the body and the Content-Type to send it under (which carries the
+// boundary).
+//
+// One image is the `image` part, several are the repeated `image[]` -- the two
+// spellings the endpoint reads (parseImageEditForm), in the order they came, so
+// the first stays the first (sd-server reads its init image from it). The fields
+// are written in sorted order so the body is deterministic.
+//
+// The strength knob and the other advanced ones are not form fields: like for a
+// generation they ride the prompt's <sd_cpp_extra_args> block (imageRequestFields),
+// which is where sd-server's edits route reads them.
+//
+// The thread's size, count, output_format and output_compression travel as set,
+// exactly as on a generation: the executor does not second-guess what an upstream
+// accepts (the same stance the sampler and scheduler knobs take). The edit route's
+// output formats are narrower than a generation's -- png and jpeg -- so a thread
+// set to webp has that refused upstream, which reaches the run as
+// images.upstream_error; narrowing the composer's format list for an edit turn is
+// the remedy if that proves a real complaint.
+func buildImageEditBody(prep PrepareRunResult, sources []imageEditSource) ([]byte, string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fields := imageRequestFields(prep)
+	for _, name := range slices.Sorted(maps.Keys(fields)) {
+		if err := mw.WriteField(name, fmt.Sprint(fields[name])); err != nil {
+			return nil, "", err
+		}
+	}
+	field := "image"
+	if len(sources) > 1 {
+		field = "image[]"
+	}
+	for _, src := range sources {
+		filename, ok := imageEditFilenames[src.mediaType]
+		if !ok {
+			return nil, "", fmt.Errorf("no file name for media type %q", src.mediaType)
+		}
+		header := make(textproto.MIMEHeader)
+		// The canonical spelling every client sends -- quoted values, name first
+		// -- and not mime.FormatMediaType's (sorted parameters, unquoted tokens):
+		// sd-server's form parser (cpp-httplib) has matched this header with a
+		// pattern that wants exactly `form-data; name="..."; filename="..."`.
+		// Both values are constants, so there is nothing to escape.
+		header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, field, filename))
+		header.Set("Content-Type", src.mediaType)
+		part, err := mw.CreatePart(header)
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := part.Write(src.data); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
 // sdExtraArgsOpen / sdExtraArgsClose delimit the block sd-server parses the
@@ -430,12 +615,22 @@ func stripSDExtraArgsTag(s string) string {
 // have (a plain string, or an array of parts) are understood in exactly one
 // place.
 func lastUserPrompt(history []portal.ChatAPIMessage) string {
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == "user" {
-			return portal.MessageText(history[i].Content)
-		}
+	if message, ok := lastUserMessage(history); ok {
+		return portal.MessageText(message.Content)
 	}
 	return ""
+}
+
+// lastUserMessage is the LAST user message of the prepared history: the turn this
+// run is about, whose text is the prompt and whose images (if any) are the
+// edit's sources.
+func lastUserMessage(history []portal.ChatAPIMessage) (portal.ChatAPIMessage, bool) {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			return history[i], true
+		}
+	}
+	return portal.ChatAPIMessage{}, false
 }
 
 // imagePartsFrom turns the upstream response into the assistant turn's

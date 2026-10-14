@@ -1030,6 +1030,266 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // ADR-043 R1: an image ATTACHED to a turn of an edit-capable image thread makes
+  // that turn an image edit. There is no mode and no button: the attach control
+  // follows ONE predicate (the store's attachMode) of the thread's kind and the
+  // picked model's flags, and the server decides edit vs generation from whether
+  // the last user message carries an image.
+  describe(`Chat: attaching an image to an image thread edits it (ADR-043 R1) [${locale}]`, () => {
+    // An image generator whose mapping may also be edited. `vision` is deliberately
+    // absent: sd models are vision:false, and the attach control must not depend on it.
+    const editModel: ModelOption = {
+      id: 'sd-edit',
+      display_name: 'sd-edit',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      image: true,
+      image_edit: true,
+    };
+    // The same, with the operator's opt-out (image_edit: no): it still generates.
+    const noEditModel: ModelOption = {
+      ...editModel,
+      id: 'sd-noedit',
+      display_name: 'sd-noedit',
+      image_edit: false,
+    };
+    const visionModel: ModelOption = {
+      id: 'vision-model',
+      display_name: 'vision-model',
+      flavors: ['openai'],
+      loading_on_count: 0,
+      vision: true,
+    };
+
+    function attach(...names: string[]) {
+      fireEvent.change(screen.getByLabelText(t.chatAttachImage), {
+        target: { files: names.map((n) => new File(['x'], n, { type: 'image/png' })) },
+      });
+    }
+
+    it('enables the attach control for an edit-capable image model, without needing vision', async () => {
+      renderChat(tokens, [editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).not.toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+      fireEvent.mouseOver(screen.getByRole('button', { name: t.chatAttachImage }));
+      const tip = await screen.findByRole('tooltip');
+      expect(tip).toHaveTextContent(t.chatAttachImageEdit);
+    });
+
+    it('says the thread edits too, in the prompt hint, only for an edit-capable model', async () => {
+      renderChat(tokens, [editModel, noEditModel]);
+      await waitForChatReady();
+
+      await pickOption(t.chatModel, editModel.display_name);
+      expect(screen.getByText(t.chatImageEditHint)).toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageOnlyHint)).not.toBeInTheDocument();
+
+      // The non-edit-capable generator keeps today's wording, and attach stays
+      // refused with the generator sentence.
+      await pickOption(t.chatModel, noEditModel.display_name);
+      expect(screen.getByText(t.chatImageOnlyHint)).toBeInTheDocument();
+      expect(screen.queryByText(t.chatImageEditHint)).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+        'aria-disabled',
+        'true',
+      );
+      fireEvent.mouseOver(screen.getByRole('button', { name: t.chatAttachImage }));
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatImageGeneratorNoInput);
+    });
+
+    it('offers a source image for ONE image only: the picker takes a single file', async () => {
+      renderChat(tokens, [editModel, visionModel]);
+      await waitForChatReady();
+
+      await pickOption(t.chatModel, visionModel.display_name);
+      expect(screen.getByLabelText(t.chatAttachImage)).toHaveAttribute('multiple');
+
+      await pickOption(t.chatModel, editModel.display_name);
+      expect(screen.getByLabelText(t.chatAttachImage)).not.toHaveAttribute('multiple');
+    });
+
+    it('refuses a SECOND source image with its own message', async () => {
+      renderChat(tokens, [editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+
+      attach('a.png');
+      await screen.findByAltText(t.chatAttachedImage);
+      attach('b.png');
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditSingleSource);
+      expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(1);
+    });
+
+    it('sends an attached image as the turn: the image part rides the user message of an image run', async () => {
+      renderChat(tokens, [editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+
+      attach('source.png');
+      await screen.findByAltText(t.chatAttachedImage);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'make it blue' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+      // The kind stays "image": there is no edit kind, the attachment is the operand.
+      expect(body.settings.kind).toBe('image');
+      expect(body.user_message).toEqual([
+        { type: 'text', text: 'make it blue' },
+        {
+          type: 'image_url',
+          image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) },
+        },
+      ]);
+      // The composer's attachment strip is cleared by the send, like any turn's.
+      await waitFor(() => expect(screen.getByLabelText(t.chatImagePromptLabel)).toHaveValue(''));
+    });
+
+    it('keeps the thread an image thread across an edit turn, and a later plain prompt is a plain turn', async () => {
+      renderChat(tokens, [editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+
+      attach('source.png');
+      await screen.findByAltText(t.chatAttachedImage);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'edit it' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      // The real backend commits the canonical transcript -- the source and the
+      // result, both as stored references -- before it emits `done`, and the
+      // store refetches it right after.
+      const generated = [
+        { type: 'image_url', image_url: { url: '/api/portal/chat-blobs/blob_1' } },
+      ];
+      chatApi.rows[0].content = {
+        settings: { model: editModel.id, kind: 'image' },
+        messages: [
+          {
+            id: 'u1',
+            role: 'user',
+            content: [
+              { type: 'text', text: 'edit it' },
+              { type: 'image_url', image_url: { url: '/api/portal/chat-blobs/blob_src' } },
+            ],
+          },
+          { id: 'a1', role: 'assistant', content: generated, status: 'complete' },
+        ],
+      };
+      await act(async () => {
+        FakeEventSource.instances[0].emit('done', {
+          content: '',
+          status: 'completed',
+          content_parts: generated,
+        });
+      });
+      // The canonical refetch (a new chat is created, not loaded, so this is the
+      // first chat() call there is).
+      await waitFor(() => expect(chatApi.spies.chat).toHaveBeenCalled());
+      await waitFor(() => expect(screen.queryByRole('button', { name: t.chatStop })).toBeNull());
+
+      // Still an image thread: the image prompt label, not the text one.
+      expect(screen.getByLabelText(t.chatImagePromptLabel)).toBeInTheDocument();
+      expect(screen.queryByLabelText(t.messageLabel)).not.toBeInTheDocument();
+
+      // The next turn has no attachment: a string message, the same kind -- the
+      // server's executor, not this client, reads that as a generation.
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'a dog' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(2));
+      const second = chatApi.spies.startChatRun.mock.calls[1][1] as StartChatRunBody;
+      expect(second.settings.kind).toBe('image');
+      expect(second.user_message).toBe('a dog');
+    });
+
+    it('clears an attached source when the thread moves to a model that cannot edit', async () => {
+      renderChat(tokens, [editModel, noEditModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, editModel.display_name);
+      attach('source.png');
+      await screen.findByAltText(t.chatAttachedImage);
+
+      await pickOption(t.chatModel, noEditModel.display_name);
+
+      await waitFor(() =>
+        expect(screen.queryByAltText(t.chatAttachedImage)).not.toBeInTheDocument(),
+      );
+      expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageGeneratorNoInput);
+    });
+
+    it('keeps an attachment when a vision model is swapped for an edit-capable one: it becomes the source', async () => {
+      renderChat(tokens, [visionModel, editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, visionModel.display_name);
+      attach('source.png');
+      await screen.findByAltText(t.chatAttachedImage);
+
+      await pickOption(t.chatModel, editModel.display_name);
+
+      expect(screen.getByAltText(t.chatAttachedImage)).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('refuses to send several images as one edit, and starts no run', async () => {
+      renderChat(tokens, [visionModel, editModel]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, visionModel.display_name);
+      attach('a.png', 'b.png');
+      await waitFor(() => expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(2));
+
+      await pickOption(t.chatModel, editModel.display_name);
+      fireEvent.change(screen.getByLabelText(t.chatImagePromptLabel), {
+        target: { value: 'edit' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(t.chatImageEditSingleSource);
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // Nothing was lost: the user removes one and sends.
+      expect(screen.getAllByAltText(t.chatAttachedImage)).toHaveLength(2);
+    });
+
+    it('does not offer attach on a text thread for an image-edit model that is also vision-capable', async () => {
+      // chatKind "" (a text thread) + a model that is vision AND an image model:
+      // the text thread's rule is vision && !image, so this stays refused.
+      chatApi.rows.push({
+        id: 'c_text',
+        title: 'T',
+        created_at: '2026-07-19T12:00:00Z',
+        updated_at: '2026-07-19T12:00:00Z',
+        content: {
+          settings: { model: 'sd-vision-edit' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'hello' },
+            { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+          ],
+        },
+      });
+      renderChat(tokens, [
+        { ...editModel, id: 'sd-vision-edit', display_name: 'sd-vision-edit', vision: true },
+      ]);
+      await screen.findByText('T');
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: t.chatAttachImage })).toHaveAttribute(
+          'aria-disabled',
+          'true',
+        ),
+      );
+    });
+  });
+
   describe(`Chat: the advanced image controls follow the picked model's options [${locale}]`, () => {
     const imageModels: ModelOption[] = [
       {

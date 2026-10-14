@@ -128,6 +128,33 @@ export const DEFAULTS: ChatSettings = {
 // Type/size validation lives in ../shared/imageAttach.
 export const MAX_IMAGES = 5;
 
+// What an image attached to the composer MEANS for the next send (ADR-043 R1):
+//
+//   'vision' -- an input the picked text model reads;
+//   'edit'   -- the source image of an image EDIT: the thread is an image thread
+//               whose picked model may be edited, and the server turns a turn whose
+//               last user message carries an image into an edit of it;
+//   'none'   -- nothing: the control is disabled and an attachment is refused or
+//               cleared.
+//
+// It is ONE predicate of the thread's kind and the picked model's flags, and the
+// attach control, the clear on a model switch, send() and the replay guard all
+// read it, so they cannot disagree. The THREAD's kind decides first -- a text
+// thread stays a text thread and an image thread an image thread whichever model
+// is picked afterwards -- and `vision` is deliberately not consulted for an image
+// thread: an sd model is vision:false and still edits. On a text thread the old
+// rule stands: a vision model attaches, but a model that also GENERATES images
+// does not (an image model has no use for input on a text thread).
+export type AttachMode = 'edit' | 'vision' | 'none';
+
+export function attachModeOf(
+  kind: string,
+  model: { vision: boolean; image: boolean; imageEdit: boolean },
+): AttachMode {
+  if (kind === 'image') return model.imageEdit ? 'edit' : 'none';
+  return model.vision && !model.image ? 'vision' : 'none';
+}
+
 // The image-generation knobs the composer edits, as CONCRETE store state (every
 // field defined, unlike the all-optional wire ChatImageSettings). An unset knob
 // is the sentinel that imageSetting() below omits from the wire: "" for
@@ -541,6 +568,21 @@ export function historyHasImage(messages: ChatUiMessage[]): boolean {
   return messages.some(
     (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'),
   );
+}
+
+// Whether the LAST user message of a replayed history carries an image -- which,
+// in an image thread, is what makes the replayed turn an EDIT (the server's
+// executor sends exactly that message's images as the source and reads nothing
+// else of the history). Role-aware on purpose, unlike historyHasImage: an image
+// thread's assistant turns hold its own generated results, which are never sent.
+export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const { role, content } = messages[i];
+    if (role === 'user') {
+      return Array.isArray(content) && content.some((p) => p.type === 'image_url');
+    }
+  }
+  return false;
 }
 
 let idSeq = 0;

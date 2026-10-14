@@ -509,8 +509,10 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // self-healed clear is honored rather than silently overridden by the stale
 // value the client submitted. For a text run the history carries its images as
 // data urls, the stored references of the older turns resolved to their bytes
-// (resolveChatBlobRefs); an image run's history is returned as stored.
-// Owner-scoped.
+// (resolveChatBlobRefs); an image run's history is returned as stored, except
+// that the source image of its turn -- the image its last user message carries,
+// which makes the turn an edit -- is resolved to a data url too, or the run is
+// refused (resolveImageRunSource). Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -653,10 +655,13 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// The stored messages reference their images by url; the run's upstream gets
 	// the images themselves (see resolveChatBlobRefs). The turn being sent is in
 	// runMessages with its bytes inline already, so only the older references are
-	// fetched. An image run skips it: its executor reads nothing of the history but
-	// the last prompt's text, so fetching, decrypting and encoding every image of
-	// the thread would be wasted, and the run-size bound would refuse an image
-	// thread for bytes that are never sent.
+	// fetched. An image run reads nothing of the history but the last prompt's text
+	// and -- when the last user message carries an image, which makes the turn an
+	// edit -- that image: fetching, decrypting and encoding every image of the
+	// thread would be wasted, and the run-size bound would refuse an image thread
+	// for bytes that are never sent. So it resolves that one message and no other
+	// (resolveImageRunSource), and refuses a source the chat does not hold rather
+	// than going on without it.
 	//
 	// This is before the commit on purpose: a run refused for its history's size,
 	// or whose images cannot be read, stores nothing, so retrying it is not a
@@ -665,6 +670,8 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
 			return nil, ChatRunSettings{}, err
 		}
+	} else if history, err = s.resolveImageRunSource(ctx, chatID, history); err != nil {
+		return nil, ChatRunSettings{}, err
 	}
 	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
 		return nil, ChatRunSettings{}, err
@@ -746,6 +753,23 @@ func MessageText(content json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// MessageImageURLs is the url of every image part of a message content, in order:
+// what an image-run executor sends as an edit's source images (an array content;
+// a plain string has none). Exported for the same reason as MessageText, and it
+// reads through rewriteImageParts -- the one definition of an image part the
+// extraction at a run commit and the resolution of a run's history already share
+// -- so the executor and the resolution cannot disagree about what counts as an
+// image (an object whose image_url is an object with a string url, members
+// matched without regard to case).
+func MessageImageURLs(content json.RawMessage) []string {
+	var urls []string
+	_, _, _ = rewriteImageParts(content, func(url string) (string, json.RawMessage, error) {
+		urls = append(urls, url)
+		return url, nil, nil
+	})
+	return urls
 }
 
 // AssistantTurn is the generated assistant message a run persists.

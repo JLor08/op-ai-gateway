@@ -218,6 +218,14 @@ const de = {
   // chat document, so there is no shared budget to state.)
   chatImagePromptLabel: 'Bildprompt',
   chatImageOnlyHint: 'Dieses Modell erzeugt Bilder. Dieser Thread nimmt nur Bildprompts an.',
+  // The same field's hint, the attach button's tooltip and one refusal for a model
+  // that ALSO edits (ADR-043 R1): an image attached to the turn is the image to
+  // edit -- there is no mode to switch, so the hint says what the attachment
+  // does. An edit has exactly one source image.
+  chatImageEditHint:
+    'Dieses Modell erzeugt und bearbeitet Bilder. Beschreiben Sie ein Bild, oder hängen Sie ein Bild an, um es zu bearbeiten.',
+  chatAttachImageEdit: 'Bild zum Bearbeiten anhängen',
+  chatImageEditSingleSource: 'Eine Bildbearbeitung nimmt genau ein Ausgangsbild.',
   // The image-thread settings panel: the generation knobs shown in place of the
   // text-chat controls. The "" options ("Standard …") send nothing and leave
   // sd-server on its own default; output_compression only applies to a lossy
@@ -1504,6 +1512,16 @@ const de = {
   errorImagesResponseFormatUnsupported: 'Nicht unterstütztes Antwortformat für die Bilderzeugung.',
   errorImagesUpstreamError:
     'Der Bilderzeugungs-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Bildbearbeitung (ADR-043 R1): die beiden Ablehnungen von /v1/images/edits,
+  // die ein Portal-Lauf erreichen kann, und der Lauf-Code für ein Ausgangsbild,
+  // das sich nicht lesen lässt. Der Server-Text bleibt englisch; hier steht, was
+  // die Nutzerin tun kann.
+  errorImagesImageRequired:
+    'Für eine Bildbearbeitung wird ein Ausgangsbild benötigt. Bitte hängen Sie ein Bild an.',
+  errorImagesEditUnavailable:
+    'Dieser Server kann Bilder derzeit nicht bearbeiten: Sein Agent unterstützt die Bildbearbeitung noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorChatRunImageSourceUnreadable:
+    'Das angehängte Bild konnte nicht gelesen werden. Bitte hängen Sie es erneut an.',
   // Chat-Binärdatenspeicher: Bilder liegen außerhalb des Verlaufs, und ein
   // Lauf wird abgelehnt, bevor er startet, wenn ein hochgeladenes oder
   // bearbeitetes Bild nicht gespeichert beziehungsweise nicht gelesen werden
@@ -3061,6 +3079,10 @@ const en: PortalMessages = {
   chatImageGeneratorNoInput: 'This model generates images; it does not accept images as input.',
   chatImagePromptLabel: 'Image prompt',
   chatImageOnlyHint: 'This model generates images. This thread accepts image prompts only.',
+  chatImageEditHint:
+    'This model generates and edits images. Describe an image, or attach one to edit it.',
+  chatAttachImageEdit: 'Attach an image to edit',
+  chatImageEditSingleSource: 'An image edit takes exactly one source image.',
   chatImageSize: 'Image size',
   chatImageSizeDefault: 'Default (model)',
   chatImageCount: 'Number of images',
@@ -4231,6 +4253,14 @@ const en: PortalMessages = {
   errorImagesStreamUnsupported: 'Image generation does not support streaming.',
   errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
   errorImagesUpstreamError: 'The image generation server reported an error. Please try again.',
+  // Image editing (ADR-043 R1): the two refusals of /v1/images/edits a portal run
+  // can reach, and the run code for a source image that cannot be read. The
+  // server's text stays English; this says what the user can do.
+  errorImagesImageRequired: 'An image edit needs a source image. Please attach an image.',
+  errorImagesEditUnavailable:
+    'This server cannot edit images right now: its agent does not support image editing yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
+  errorChatRunImageSourceUnreadable:
+    'The attached image could not be read. Please attach it again.',
   // Chat binary payload store: images live outside the transcript, and a run
   // is refused before it starts when an uploaded or edited image cannot be
   // stored or read. Wire codes: see format.ts (errorLabelByCode).

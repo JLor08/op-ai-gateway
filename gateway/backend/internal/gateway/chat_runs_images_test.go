@@ -552,6 +552,10 @@ func runError(t *testing.T, run *ChatRun) string {
 type capturedUpstream struct {
 	body []byte
 	path string
+	// contentType is the request's Content-Type as the upstream received it: the
+	// edit hop sends multipart/form-data with the boundary, the generations hop
+	// JSON, and the two must never be confused.
+	contentType string
 }
 
 // imagesUpstream is a stub /v1/images/generations backend: it answers status
@@ -562,7 +566,7 @@ func imagesUpstream(t *testing.T, status int, body string) (*httptest.Server, <-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		select {
-		case seen <- capturedUpstream{body: raw, path: r.URL.Path}:
+		case seen <- capturedUpstream{body: raw, path: r.URL.Path, contentType: r.Header.Get("Content-Type")}:
 		default:
 		}
 		w.Header().Set("Content-Type", "application/json")

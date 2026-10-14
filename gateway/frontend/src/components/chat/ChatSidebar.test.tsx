@@ -41,6 +41,8 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelAvailable: true,
     modelVisionCapable: true,
     modelImageCapable: false,
+    modelImageEdit: false,
+    attachMode: 'vision',
     modelImageOptions: null,
     chatKind: '',
     imageSettings: DEFAULT_IMAGE_SETTINGS,

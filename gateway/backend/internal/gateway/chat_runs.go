@@ -831,16 +831,23 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 // principal on both hops -- but through two DIFFERENT helpers, and the
 // difference is the point. /v1/chat/completions resolves it in
 // requireWebAnyScope -> authenticateWeb, which also admits a browser session
-// cookie; /v1/images/generations resolves it in
+// cookie; /v1/images/generations and /v1/images/edits resolve it in
 // requireInternalOrBearerAnyScope -> authenticateInternalOrBearer, which is
-// that ladder MINUS the cookie branch, so no logged-in browser can reach it.
+// that ladder MINUS the cookie branch, so no logged-in browser can reach them.
 // Only the loopback check itself is shared: both helpers call the same
 // loopbackPrincipal (auth.go), so the secret comparison exists once.
 //
-// The session header is set to the chat id on both, and the extractor reads
+// The session header is set to the chat id on every hop, and the extractor reads
 // that explicit override BEFORE its per-endpoint switch (session_extract.go),
 // so an image request is tagged as a chat session exactly like a chat one even
-// though /v1/images/generations has no session signal of its own.
+// though the images endpoints have no session signal of their own.
+//
+// Content-Type is application/json here, which every hop but one sends. The
+// image EDIT hop is multipart, and a multipart type carries the boundary of the
+// writer that built the body, so only its caller can state it: generateImageTurn
+// overrides this one header after calling this (chat_runs_images.go). Nothing
+// else in the set varies with the endpoint, which is why there is no variant of
+// this function for it.
 //
 // The chat's (self-healed, see portal.Service.PrepareChatRun) per-run server
 // override rides as the same two headers the gateway's own applyServerOverride

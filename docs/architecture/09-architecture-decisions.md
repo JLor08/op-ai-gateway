@@ -1774,7 +1774,10 @@ one sealed document under a hard 4 MiB ceiling, which images, and essentially
 nothing else, can exhaust.
 
 **(a) The picked model is the ONLY affordance, and a model whose `image`
-verdict is `yes` makes every turn in that thread an image turn.** No mode
+verdict is `yes` makes every turn in that thread an image turn.** (Amended by
+ADR-057: "the ONLY affordance" no longer holds for a model that can also be
+edited — an image attached to the turn is a second one, see the end of this
+paragraph.) No mode
 toggle, no "generate an image" button, no sniffing the prompt for intent. This
 mirrors how `vision` already works: `portal.ModelDTO.Vision` is AND-folded
 across a mapping's servers in `modelsResponse` and the attach control is
@@ -1785,7 +1788,20 @@ something the gate will refuse. (Amended by
 (f): the fold now also requires each mapping's route to declare
 `openai_images`, because once that flavor gates candidacy the verdict alone no
 longer makes the endpoint serve a model; that is what keeps this sentence
-true.)
+true.) (Amended by ADR-057 — R1, the attached image: "One axis" is superseded.
+For a model that is also **edit-capable** (`image_edit`, derived from `image` and
+removable by an operator, folded across a model's mappings exactly as `image` is,
+`ModelDTO.ImageEdit`) an image **attached** to a turn of an image thread makes
+that turn an **edit** of it. No toggle and no "edit" button come back with it:
+the attachment is the user's *operand*, not a mode, and what the composer offers
+is still decided by the picked model through a model-derived flag. The sentence's
+last clause is kept by the new flag rather than by the old axis — the composer
+offers the attach control only where the gate will serve an edit, and the same
+derivation feeds both — and the single predicate that says so
+(`attachMode`, a function of the thread's kind and the picked model's flags)
+deliberately does **not** consult `vision`: an sd model is `vision: false` and
+edits. A turn is an edit or a generation by what its last user message carries;
+the thread's kind stays `image` across both.)
 
 **Rejected: a mode toggle.** A second, independent axis of user intent makes
 reachable a state the capability gate must then refuse **at the bottom of the
@@ -1796,7 +1812,9 @@ steps.
 
 **Consequence: `vision` and `image` are one word apart and point in opposite
 directions, so the attach control stays gated on `vision` and its refusal had
-to be reworded.** An image *generator* has no reason to accept an image
+to be reworded.** (Amended by ADR-057: on an **image** thread the attach control
+is no longer gated on `vision` but on `image_edit`, see the end of this
+paragraph.) An image *generator* has no reason to accept an image
 *input*, so an image-only thread whose mapping does not also declare `vision`
 correctly has attachment disabled — but the tooltip said "this model does not
 support images", about a model whose entire job is images. The generic string
@@ -1807,7 +1825,16 @@ to keep the two axes from being folded into one). **And the verdict
 finally has a writer:** ADR-042 (b) left `(image, yes)` writable on purpose for
 this, so the mapping form's capability write loop and the model-servers
 capability display both carry `image` now. `(image, no)` stays reserved — the
-UI writes the enabling verdict, never the refusing one.
+UI writes the enabling verdict, never the refusing one. (Amended by ADR-057: an
+image *generator* may well accept an image — as the source of an edit. On an
+image thread the attach control therefore follows `image_edit`, never `vision`:
+it is enabled for an edit-capable model and refused for a generator whose
+operator opted it out of editing, which keeps this paragraph's sentence about a
+generator taking no input, now as the refusal of exactly that model. The two
+axes stay separate — `vision` is whether a *text* model reads an image, and on a
+text thread the control still needs it and still refuses a model that also
+generates images. The prompt field's hint gets an edit-capable variant beside
+`chatImageOnlyHint`.)
 
 **(b) The thread's kind is PINNED at its first send, and it is a UI constraint
 — not an authorization.** (a) is a property of the **thread**; implemented
@@ -1821,7 +1848,12 @@ thread's entire multi-megabyte image history is then POSTed to
 thread the rule called image-only. So the kind is persisted on
 `portal.ChatRunSettings` as a `kind` **string** (not an `image_only` boolean:
 the same value selects the request URL, and it extends to a future audio or
-speech kind without a second flag), `omitempty` so every pre-existing chat
+speech kind without a second flag) (Amended by ADR-057: the kind alone no longer
+selects the request URL — for the image kind the URL is a function of the kind
+**and** the turn: a last user message that carries an image posts to
+`/v1/images/edits`, any other to `/v1/images/generations`. The kind stays `image`
+across both; there is no edit kind, and the decision is the executor's, read off
+the prepared history, never a client setting), `omitempty` so every pre-existing chat
 stays byte-identical on the wire, and the model picker filters to the thread's
 kind rather than the picker deciding the thread's.
 
@@ -1865,7 +1897,13 @@ amendment at the end of (c).) It is
 persisted as an OpenAI-style `image_url` content part carrying a `data:` URL —
 the identical shape an uploaded vision image already has, so history
 construction feeds it back as a vision input on the next turn for free and the
-existing renderer applies to it. This is policy-compliant rather than a hole in
+existing renderer applies to it. (Amended by ADR-057: "feeds it back for free"
+holds for a *text* thread's vision replay only. An image thread's executor reads
+no history but its LAST user message, whose images it sends as the source of an
+edit — an upload's stored reference, resolved to bytes server-side exactly as a
+text run resolves its history's, or the stored `image_url` of an earlier result
+that a later turn names as its source, which is the same shape reused and never
+copied or re-embedded. An older image of the thread is still never sent.) This is policy-compliant rather than a hole in
 the no-persist rule: chat transcripts are already among what the capture
 encryption key seals ([Security, Authentication & Authorization
 §13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)), so an inline
@@ -1928,7 +1966,14 @@ honour rather than relaying and mis-measuring, and spending minutes of
 diffusion CPU on an artifact we can already prove we cannot store is the same
 error. Every panel design surfaced the cap only *afterwards* — toasts, chips,
 download rescues — which is four recovery mechanisms for a failure that can
-simply be declined.
+simply be declined. (Amended by ADR-057: an edit turn adds an upload to the
+composer, and that upload has no number of its own to state either. The source
+is bounded by the per-image cap the composer already enforces (20 MiB, also the
+store's per-blob cap), so an edit's body — the source plus a handful of fields —
+stays inside the edits endpoint's default multipart read cap (32 MiB). What the composer does
+refuse up front is the edit shape the server would otherwise answer with its own
+refusal after the fact: more than one source image, and an attachment on a model
+the gateway will not edit.)
 
 **The cap is SERVED, never duplicated.** `MaxChatContentBytes` was package-
 private and no DTO carried it. A second `4 << 20` literal in TypeScript would
