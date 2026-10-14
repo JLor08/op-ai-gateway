@@ -1674,8 +1674,10 @@ resolves through `modelFlavorSetsWithPreSuppress` → `flavorSetsFromViews`
 (`internal/portal/service.go`), neither of which reads a capability row at all.
 (Amended by [ADR-045](#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
 (h): `handleOpenAIModels` now keeps the `Models()` rows whose `flavors` contain
-`openai`, which are the same names and read no capability row either; the
-hardcoded flavor is now `openAIModelDTOs`'s.)
+`openai`, which are the same names; no capability row decides which names are
+listed, though `Models()` does batch-read the capability rows to fill each row's
+`vision`, `image` and `image_edit` fields. The hardcoded flavor is now
+`openAIModelDTOs`'s.)
 So an images-only model is still listed to a chat client, and a chat model is
 still listed to an images client. **There are two consumers of this gap and
 they are different code paths**: the listing above, and the unknown-model
@@ -2357,9 +2359,11 @@ it has one. So an images-only child on an application that also declares
 `openai` is no longer listed to chat clients or taken as a chat redirect
 target, a name that no flavor serves lists `flavors: []`, and the LM Studio
 listing lists what `/v1/models` lists (`/api/v0/models` then, `/api/v1/models`
-since ADR-045 (h)). What stays is that `/v1/models` reads no
-capability row, and that an images client reading it still sees the chat
-models; ADR-042 (d) is narrowed again, not closed.
+since ADR-045 (h)). What stays is that no capability row decides which names
+`/v1/models` lists (the membership is flavor-based; since ADR-045 (h) the
+capability rows only fill the `Models()` row fields behind it), and that an
+images client reading it still sees the chat models; ADR-042 (d) is narrowed
+again, not closed.
 
 **Rejected:** **discovery from `loaded_models_path`** — the consequence in (c)
 was measured, not predicted. — **`openai_images` in the empty default** — (a).
@@ -2649,7 +2653,14 @@ decisions, which leave (a) to (g) as they are:
 mapping's `context_size`, by the `/props` probe or by hand. A vendor-only
 model has no `context_size`, so it lists without `context_length` and with
 `max_context_length: 0`. `/v1/models` now does one `Models()` read where it
-did a `ModelsForFlavor` read, a small cost shared with `/api/v1/models`.
+did a `ModelsForFlavor` read, and `Models()` does more than the ids-only list:
+on top of the visible views, group overlay and runtime-spec read both share, it
+adds a batch capability read (`MappingCapabilitiesForMappings`, for the
+`vision`, `image` and `image_edit` flags the OpenAI listing does not emit), a
+second `model_settings` read (for each row's `Visibility`), and the per-view
+loaded-state, offered-on, context and group assembly. That is the work the
+portal chat picker and `/api/v1/models` already do per request, now also paid
+by every `/v1/models` call.
 **Rejected:** **keeping `/api/v0/models` as a deprecated alias** — no known
 client reads it, and a dead listing is what produced the four wrong claims. —
 **`context_length: 0` on `/v1/models`** — it blocks a client's fallback. —

@@ -142,8 +142,9 @@ func newContextListingTestServer(t *testing.T) *Server {
 }
 
 // TestOpenAIModelsCarryContextLengthWhenKnown: a model whose context window is
-// known lists it as context_length (the field opencode and other OpenAI-style
-// clients read); a model whose window is unknown (0) omits the key entirely
+// known lists it as context_length (the standard location OpenAI-style clients
+// read a model's context from; no released opencode is known to read it yet, per
+// issue #171); a model whose window is unknown (0) omits the key entirely
 // rather than advertising a window of 0. /v1/models and /openai/v1/models share
 // one handler, so both get the field, and the listing offers the same ids as
 // Portal.ModelsForFlavor(openai).

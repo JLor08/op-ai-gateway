@@ -193,6 +193,7 @@ run --url https://gw.example --token tok-123 --output -
 check_eq "a list with no context sizes still succeeds (exit 0)" 0 "$STATUS"
 check_jq "...and emits an empty models map" '.provider["op-gateway"].models == {}'
 check_has "...and warns that no model reported a context size" "warning: no model reported a context size" "$ERR"
+check_has "...and names an older gateway (no context_length on /v1/models) as the other cause" "predates context_length on /v1/models" "$ERR"
 
 printf '%s' '{"object":"list","data":[]}' >"$CURL_BODY"
 run --url https://gw.example --token tok-123 --output "$FIX/empty.json"

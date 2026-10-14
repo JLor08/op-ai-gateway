@@ -110,5 +110,5 @@ else
 fi
 
 if [ "$count" -eq 0 ]; then
-  printf 'warning: no model reported a context size — set context_size on the mappings in the gateway (/props probe or manual), then re-run.\n' >&2
+  printf 'warning: no model reported a context size — set context_size on the mappings in the gateway (/props probe or manual), or upgrade the gateway if it predates context_length on /v1/models, then re-run.\n' >&2
 fi

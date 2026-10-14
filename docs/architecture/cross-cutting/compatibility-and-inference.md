@@ -678,11 +678,13 @@ string end to end, so a client's exact formatting (key order, whitespace)
 survives a round trip.
 
 **opencode.** As an OpenAI-compatible coding agent, opencode drives the plain
-Chat Completions edge and is the primary tested case for the null-content
-tool-call-replay shape (§3.1) and for context-window reporting, which is
-metadata only (chat always flows over `/v1/chat/completions`) and is served on
-two listings (§9), both for exactly the models offered under `openai` (the names
-`/v1/models` lists). A current opencode's LM Studio provider is understood to
+Chat Completions edge, and the null-content tool-call-replay shape (§3.1) is
+modelled on what such an agent sends (a parser fixture pins it; nothing here is
+tested against opencode itself). The gateway also reports each model's context
+window for it, which is metadata only (chat always flows over
+`/v1/chat/completions`) and is served on two listings (§9), both for exactly the
+models offered under `openai` (the names `/v1/models` lists). A current
+opencode's LM Studio provider is understood to
 learn a model's window from the LM Studio v2 listing `GET /api/v1/models`
 (`handleLMStudioV1Models`, `internal/gateway/server.go`), which reports it as
 `max_context_length` (that is issue #171's reading of opencode's source; it is

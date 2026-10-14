@@ -1529,8 +1529,9 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		item := map[string]any{"id": m.ID, "object": "model", "owned_by": "op-ai-gateway"}
 		// context_length is the usable window in tokens, the standard location
-		// clients read a model's context from (no released opencode reads it
-		// yet); it is left out, not zero, when no mapping of the model knows it.
+		// clients read a model's context from (no released opencode is known to
+		// read it yet, per issue #171's reading); it is left out, not zero, when no
+		// mapping of the model knows it.
 		if m.ContextSize > 0 {
 			item["context_length"] = m.ContextSize
 		}
