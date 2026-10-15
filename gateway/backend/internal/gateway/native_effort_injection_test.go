@@ -277,6 +277,9 @@ type effortSeed struct {
 	spec *routing.RuntimeSpec
 	// flag is the token's claude_effort_compatibility switch.
 	flag bool
+	// translate puts the Messages endpoint on TRANSLATE (to /v1/chat/completions)
+	// instead of passthrough, for the tests of the translate-path effort handling.
+	translate bool
 }
 
 // agentSpec is a server_agent runtime spec of the given kind with Messages on
@@ -311,7 +314,11 @@ func newEffortCompatTestServer(t *testing.T, prov provider.Client, seed effortSe
 	if err := routeStore.CreateAIServer(ctx, routing.AIServer{ID: "srv-ec", Name: "Effort Upstream", Domain: "ec.example.test", Provider: routing.ProviderLlamaCPP, Endpoint: "http://ec.example.test:8000", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateAIServer: %v", err)
 	}
-	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-ec", ServerID: "srv-ec", Type: seed.appType, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: routing.EndpointModePassthrough, CreatedAt: now, UpdatedAt: now}); err != nil {
+	messagesMode := routing.EndpointModePassthrough
+	if seed.translate {
+		messagesMode = routing.EndpointModeTranslate
+	}
+	if err := routeStore.CreateApplication(ctx, routing.Application{ID: "app-ec", ServerID: "srv-ec", Type: seed.appType, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: routing.ServerStatusActive, ResponsesMode: routing.EndpointModePassthrough, MessagesMode: messagesMode, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("CreateApplication: %v", err)
 	}
 	if err := routeStore.CreateMapping(ctx, routing.ModelMapping{ID: "route-ec", ApplicationID: "app-ec", GatewayModelName: "gw-model", AppModelName: "upstream-model", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {

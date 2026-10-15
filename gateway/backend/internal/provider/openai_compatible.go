@@ -53,6 +53,7 @@ func (c *OpenAICompatibleClient) Complete(ctx context.Context, target routing.Ta
 	}
 	openAIToolFields(reqBody, req)
 	openAISamplingFields(reqBody, req)
+	openAIChatTemplateReasoningEffort(reqBody, req)
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: encode request", ErrInvalidResponse)
@@ -454,6 +455,27 @@ func openAISamplingFields(body map[string]any, req inference.Request) {
 	}
 }
 
+// openAIChatTemplateReasoningEffort adds chat_template_kwargs.reasoning_effort so
+// a chat-template-driven backend (Qwen on llama.cpp / vLLM) actually applies the
+// effort; the top-level reasoning_effort from openAISamplingFields is kept too.
+// Gated by the gateway directive, so only the opted-in Anthropic-translate path
+// sets it and a direct OpenAI chat request stays top-level only. The body is
+// built by the gateway (no client passthrough of chat_template_kwargs on this
+// path), so the merge only has to tolerate an absent kwargs object. A pure
+// function of its arguments, like the surrounding helpers, so the stream retry
+// rebuilds cleanly.
+func openAIChatTemplateReasoningEffort(body map[string]any, req inference.Request) {
+	if !req.ReasoningEffortViaTemplateKwargs || req.ReasoningEffort == "" {
+		return
+	}
+	kwargs, ok := body["chat_template_kwargs"].(map[string]any)
+	if !ok || kwargs == nil {
+		kwargs = map[string]any{}
+	}
+	kwargs["reasoning_effort"] = req.ReasoningEffort
+	body["chat_template_kwargs"] = kwargs
+}
+
 var _ NativeProxyClient = (*OpenAICompatibleClient)(nil)
 
 // ProxyNative forwards the raw client body to the upstream's own endpoint path
@@ -485,6 +507,7 @@ func streamRequestBody(target routing.Target, req inference.Request, withLivePro
 	}
 	openAIToolFields(body, req)
 	openAISamplingFields(body, req)
+	openAIChatTemplateReasoningEffort(body, req)
 	if withLiveProgress {
 		// Ask for an EXACT running output-token count mid-stream. llama.cpp then
 		// attaches its timings object (predicted_n + predicted_per_second) to every

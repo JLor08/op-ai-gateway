@@ -260,6 +260,16 @@ type Request struct {
 	// to place cache_control breakpoints. Internal only: set by the gateway, never
 	// parsed from or serialized to a client body.
 	PromptCache *PromptCacheDirective `json:"-"`
+	// ReasoningEffortViaTemplateKwargs, when true alongside a non-empty
+	// ReasoningEffort, directs the OpenAI-compatible provider to ALSO send the
+	// effort as chat_template_kwargs.reasoning_effort (the top-level
+	// reasoning_effort is kept), so a chat-template-driven backend (Qwen on
+	// llama.cpp / vLLM) actually applies it. Internal only: set by the gateway
+	// effort policy (gateway.applyChatTemplateEffortPolicy) for an
+	// Anthropic-translate request whose resolved target reads chat_template_kwargs;
+	// never parsed from or serialized to a client body, so a direct OpenAI chat
+	// request that merely sets reasoning_effort stays top-level only.
+	ReasoningEffortViaTemplateKwargs bool `json:"-"`
 }
 
 func (r Request) Validate() *Error {
