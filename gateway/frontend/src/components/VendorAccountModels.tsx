@@ -65,11 +65,16 @@ export function VendorAccountModels({
   account,
   busy,
   onRefresh,
+  subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
   account: VendorAccount;
   busy: boolean;
   onRefresh: (id: VendorAccount['id']) => Promise<VendorModelsRefresh>;
+  // When subscriptions are disabled the detail view hides the connect panel, so
+  // the "reconnect via that panel" hint below would point at nothing. Defaults
+  // to true so a caller that does not thread the flag keeps today's behavior.
+  subscriptionsEnabled?: boolean;
 }>) {
   const { showError } = useToast();
   const [running, setRunning] = useState(false);
@@ -149,7 +154,7 @@ export function VendorAccountModels({
                 <Typography variant="body2" color="text.secondary">
                   {t.vendorModelsRefreshUnchanged}
                 </Typography>
-                {account.status === 'needs_reconnect' && (
+                {account.status === 'needs_reconnect' && subscriptionsEnabled && (
                   <Typography variant="body2">
                     {t.vendorModelsRefreshReconnect(t.vendorConnectTitle)}
                   </Typography>

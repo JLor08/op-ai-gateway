@@ -4040,6 +4040,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(fakeApi.updateVendorAccount.mock.calls[0][1].status).toBe('needs_reconnect');
       });
 
+      it('omits the reconnect hint while subscriptions are off, since that panel is hidden', async () => {
+        renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          subscriptionsEnabled: false,
+          refreshModels: async (id) => ({
+            account: makeVendorAccount({
+              ...SUBSCRIPTION,
+              id,
+              subscription_connected: true,
+              status: 'needs_reconnect',
+            }),
+            refresh: makeRefresh({
+              status: 'unverifiable',
+              discovered: 0,
+              detail: 'the refresh token was rejected',
+            }),
+          }),
+        });
+        await openDetail('Team Claude Max');
+
+        fireEvent.click(refreshButton());
+
+        // The refresh still runs and reports "unchanged"...
+        await within(panel()).findByText(t.vendorModelsRefreshUnverifiable);
+        expect(within(outcome()).getByText(t.vendorModelsRefreshUnchanged)).toBeInTheDocument();
+        // ...but the "reconnect via that panel" hint is suppressed, because the
+        // connect panel is hidden while subscriptions are disabled, so it would
+        // otherwise point at a control that is not on the page.
+        expect(
+          within(outcome()).queryByText(t.vendorModelsRefreshReconnect(t.vendorConnectTitle)),
+        ).toBeNull();
+      });
+
       it('never renders a token, whatever the outcome says', async () => {
         const { container } = renderView({
           refreshModels: async () => refreshed(PREFIXED_MODELS),

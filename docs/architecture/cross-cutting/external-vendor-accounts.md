@@ -1890,7 +1890,12 @@ explicit `false` turns it off. While it is off:
 - **The portal says so.** The Anbieter page marks each subscription account with a
   notice that it cannot currently be used. The notice is render-only and reads
   `subscriptions_enabled` from the probe below; viewing, renaming and deleting an
-  account stay available (§8).
+  account stay available (§8). The page also stops inviting the actions the
+  backend would refuse: the create form disables the Subscription auth-type option
+  (with an inline reason) and never submits a subscription create, and a blocked
+  account's connect/reconnect panel is hidden — so a models-refresh outcome also
+  drops its "reconnect via that panel" hint, which would otherwise point at a
+  control that is not on the page.
 
 **Fail direction.** The master flag fails **closed** (an unreadable store reads as
 off). This switch fails **open**: an unreadable settings store, or an absent, blank or

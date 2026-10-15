@@ -774,6 +774,7 @@ export function VendorAccountsView({
             account={account}
             busy={busy}
             onRefresh={refreshAccountModels}
+            subscriptionsEnabled={subscriptionsEnabled}
           />
         </Box>
 
