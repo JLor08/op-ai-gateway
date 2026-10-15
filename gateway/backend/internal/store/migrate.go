@@ -124,6 +124,7 @@ var migrations = []migration{
 	{version: 89, name: "token_claude_effort_compatibility", up: migration89Up},
 	{version: 90, name: "user_group_managers_can_manage_vendor_accounts", up: migration90Up},
 	{version: 91, name: "vendor_account_admin_groups", up: migration91Up},
+	{version: 92, name: "resource_group_vendor_accounts", up: migration92Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4111,6 +4112,49 @@ func migration91Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	for _, s := range stmts {
 		if err := execTx(ctx, tx, dl, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration92Up creates resource_group_vendor_accounts, the link table that
+// records which vendor accounts are provisioned into a resource group (shared
+// vendor accounts via resource groups, #183 Phase 2). It is the vendor-account
+// twin of resource_group_servers from migration54Up — vendor_accounts takes the
+// place of ai_servers — and is schema only: no store accessor, DTO field or
+// routing eligibility check reads it yet.
+//
+// Both sides are REAL foreign keys declared ON DELETE CASCADE, enforced by both
+// SQL dialects: deleting a resource group drops its vendor-account links, and
+// deleting a vendor account drops its resource-group links, each side leaving
+// the other parent untouched. unique(resource_group_id, vendor_account_id) makes
+// a link idempotent, and the vendor_account_id index serves the reverse lookup
+// (which resource groups hold this account), the one the unique pair's implicit
+// index — led by resource_group_id — does not cover. The index is named by
+// migration54Up's rule, idx_<table>_<column without _id>.
+//
+// Like resource_group_servers, the table has no baseline predecessor: it is
+// created SOLELY by this migration, on every database, fresh or upgrading (a
+// fresh install runs v1..v91 first, so resource_groups and vendor_accounts
+// already exist). created_at uses dl.timestampType(), migration54Up's choice,
+// which keeps postgres on timestamptz. Create-if-not-exists on the table and
+// the index make a second run change nothing.
+func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists resource_group_vendor_accounts (
+			resource_group_id text not null,
+			vendor_account_id text not null,
+			created_at ` + ts + ` not null,
+			unique(resource_group_id, vendor_account_id),
+			foreign key(resource_group_id) references resource_groups(id) on delete cascade,
+			foreign key(vendor_account_id) references vendor_accounts(id) on delete cascade
+		)`,
+		`create index if not exists idx_resource_group_vendor_accounts_vendor_account on resource_group_vendor_accounts(vendor_account_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
 			return err
 		}
 	}
