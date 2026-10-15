@@ -656,7 +656,7 @@ func TestGroupManagerPermissionsEndToEnd(t *testing.T) {
 // wire name `can_manage_vendor_accounts` is pinned independently of the Go
 // struct tag, and responses are decoded into untyped maps so the DTO key is
 // pinned the same way. Each step sets ONE facet differently from the rest, so a
-// handler that transposed two positional bools fails by name.
+// handler that mapped a request field onto the wrong facet fails by name.
 func TestGroupManagerVendorAccountsEndToEnd(t *testing.T) {
 	srv, dir := newAuthTestServer(t)
 	seedLoginUser(t, dir, "usr_sysadmin", "sysadmin@example.test", "password-1", "system_admin")

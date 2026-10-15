@@ -56,10 +56,10 @@ func TestServiceManageGroupIDs(t *testing.T) {
 	}
 	e.mustAddMembers(owner, ag.ID, "usr_cms", "usr_cmg", "usr_pm")
 
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", ManagerPermissions{CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cms (can_manage_services only): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", false, true, false, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", ManagerPermissions{CanManageGroup: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cmg (can_manage_group only): %v", err)
 	}
 
@@ -123,10 +123,10 @@ func TestAuthorizeServiceReadMatrix(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_full", "usr_token", "usr_cms", "usr_cmg")
 	ag := e.mustCreateGroup(sysAdmin, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(sysAdmin, ag.ID, "usr_cms", "usr_cmg")
-	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cms", false, false, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cms", ManagerPermissions{CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cms (can_manage_services only): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cmg", false, true, false, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cmg", ManagerPermissions{CanManageGroup: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cmg (can_manage_group only): %v", err)
 	}
 
@@ -235,10 +235,10 @@ func TestAuthorizeServiceSettingsMatrix(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_full", "usr_token", "usr_cms", "usr_cmg")
 	ag := e.mustCreateGroup(sysAdmin, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(sysAdmin, ag.ID, "usr_cms", "usr_cmg")
-	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cms", false, false, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cms", ManagerPermissions{CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cms (can_manage_services only): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cmg", false, true, false, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, sysAdmin, ag.ID, "usr_cmg", ManagerPermissions{CanManageGroup: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cmg (can_manage_group only): %v", err)
 	}
 

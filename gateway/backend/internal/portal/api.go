@@ -150,7 +150,7 @@ type API interface {
 	ProjectCandidates(context.Context, auth.Token, string) ([]UserRefDTO, []GroupRefDTO, error)
 	ProjectMembersView(context.Context, auth.Token, string) (ProjectMembersDTO, error)
 	ProjectTokens(context.Context, auth.Token, string) (ProjectTokensView, error)
-	PromoteManager(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool, bool) error
+	PromoteManager(context.Context, auth.Token, string, string, ManagerPermissions) error
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView
@@ -201,7 +201,7 @@ type API interface {
 	SetBenchmarkRuntimeSpecsPinned(context.Context, []string, bool, bool) (BenchmarkSpecsOutcome, error)
 	SetCaptureSecret(auth.Token, string, bool) error
 	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
-	SetManagerPermissions(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool, bool) error
+	SetManagerPermissions(context.Context, auth.Token, string, string, ManagerPermissions) error
 	SetModelVisibility(context.Context, auth.Token, string, string) error
 	SetNetbirdNetwork(context.Context, auth.Token, NetbirdNetworkDTO) (NetbirdNetworkDTO, error)
 	SetResourceGroupAdminGroups(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)

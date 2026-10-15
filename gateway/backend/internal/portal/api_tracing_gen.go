@@ -1443,7 +1443,7 @@ func (_d *APIWithTracing) ProjectTokens(ctx context.Context, t1 auth.Token, s1 s
 	return _d.API.ProjectTokens(ctx, t1, s1)
 }
 
-func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool, b6 bool) (err error) {
+func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 string, s2 string, m1 ManagerPermissions) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PromoteManager")
 	defer span.End()
 	defer func() {
@@ -1452,7 +1452,7 @@ func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.PromoteManager(ctx, t1, s1, s2, b1, b2, b3, b4, b5, b6)
+	return _d.API.PromoteManager(ctx, t1, s1, s2, m1)
 }
 
 func (_d *APIWithTracing) PublicCertificateBundlePEM(ctx context.Context, s1 string) (s2 string, err error) {
@@ -2048,7 +2048,7 @@ func (_d *APIWithTracing) SetCoResidency(ctx context.Context, t1 auth.Token, s1 
 	return _d.API.SetCoResidency(ctx, t1, s1, s2)
 }
 
-func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool, b6 bool) (err error) {
+func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, m1 ManagerPermissions) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetManagerPermissions")
 	defer span.End()
 	defer func() {
@@ -2057,7 +2057,7 @@ func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Tok
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.SetManagerPermissions(ctx, t1, s1, s2, b1, b2, b3, b4, b5, b6)
+	return _d.API.SetManagerPermissions(ctx, t1, s1, s2, m1)
 }
 
 func (_d *APIWithTracing) SetModelVisibility(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {

@@ -141,10 +141,10 @@ func TestManageableUserIDs(t *testing.T) {
 	}
 	e.mustAddMembers(owner, ag.ID, "usr_cmu", "usr_cmg", "usr_pm", "usr_t1")
 
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmu", true, false, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmu", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote CMU: %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", false, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", ManagerPermissions{CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote CMG: %v", err)
 	}
 
@@ -670,7 +670,7 @@ func TestGroupManage_NoLeakOwnerVsManager(t *testing.T) {
 	// Promote usr_mgr (must first be a member of AG, and — admin-tier rule —
 	// an admin who is also a member of the parent system group).
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 
@@ -830,7 +830,7 @@ func TestRemoveMemberCascade_ThreeLevel(t *testing.T) {
 	ag := e.mustCreateGroup(admin, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(admin, ag.ID, "usr_u")
 	// Promote U to AG co-manager so the manager-row cascade is exercised too.
-	if err := e.svc.PromoteManager(e.ctx, admin, ag.ID, "usr_u", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, admin, ag.ID, "usr_u", allManagerPerms); err != nil {
 		t.Fatalf("promote usr_u in AG: %v", err)
 	}
 
@@ -963,21 +963,21 @@ func TestPromoteManager_Eligibility(t *testing.T) {
 	}
 
 	// Non-member -> ineligible.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_sysadmin", true, true, true, true, true, true); !errors.Is(err, ErrGroupCandidateInvalid) {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_sysadmin", allManagerPerms); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("promote non-member: got %v, want ErrGroupCandidateInvalid", err)
 	}
 	// Member but a plain user (not admin) -> ineligible for an ADMIN-tier
 	// group's manager seat.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_plain_member", true, true, true, true, true, true); !errors.Is(err, ErrGroupCandidateInvalid) {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_plain_member", allManagerPerms); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("promote plain-user member: got %v, want ErrGroupCandidateInvalid", err)
 	}
 	// Member, admin role, but NOT a member of the parent system group ->
 	// ineligible.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_admin_outside_sg", true, true, true, true, true, true); !errors.Is(err, ErrGroupCandidateInvalid) {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_admin_outside_sg", allManagerPerms); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("promote admin outside parent SG: got %v, want ErrGroupCandidateInvalid", err)
 	}
 	// Member, admin role, AND a member of the parent system group -> ok.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_admin_member", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_admin_member", allManagerPerms); err != nil {
 		t.Fatalf("promote eligible admin: %v", err)
 	}
 	managers, err := e.dir.UserGroupManagers(e.ctx, ag.ID)
@@ -1005,11 +1005,11 @@ func TestPromoteManager_UserTierRequiresMembership(t *testing.T) {
 
 	ug := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierUser, Name: "UG"})
 	// usr_stranger is never invited/added to UG.
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_stranger", true, true, true, true, true, true); !errors.Is(err, ErrGroupCandidateInvalid) {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_stranger", allManagerPerms); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("promote non-member of user group: got %v, want ErrGroupCandidateInvalid", err)
 	}
 	e.mustAddMembers(owner, ug.ID, "usr_member")
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_member", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_member", allManagerPerms); err != nil {
 		t.Fatalf("promote member: %v", err)
 	}
 }
@@ -1028,12 +1028,12 @@ func TestManagerActions_OwnerOnly(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr", "usr_candidate")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr", "usr_candidate")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
 
 	// A co-manager may not promote/demote/transfer.
-	if err := e.svc.PromoteManager(e.ctx, mgr, ag.ID, "usr_candidate", true, true, true, true, true, true); !errors.Is(err, ErrGroupForbidden) {
+	if err := e.svc.PromoteManager(e.ctx, mgr, ag.ID, "usr_candidate", allManagerPerms); !errors.Is(err, ErrGroupForbidden) {
 		t.Fatalf("manager promote: got %v, want ErrGroupForbidden", err)
 	}
 	if err := e.svc.DemoteManager(e.ctx, mgr, ag.ID, "usr_mgr"); !errors.Is(err, ErrGroupForbidden) {
@@ -1044,7 +1044,7 @@ func TestManagerActions_OwnerOnly(t *testing.T) {
 	}
 
 	// The owner may do all three.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_candidate", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_candidate", allManagerPerms); err != nil {
 		t.Fatalf("owner promote: %v", err)
 	}
 	if err := e.svc.DemoteManager(e.ctx, owner, ag.ID, "usr_candidate"); err != nil {
@@ -1070,7 +1070,7 @@ func TestTransferOwnership_MustBeCurrentManager(t *testing.T) {
 	if err := e.svc.TransferOwnership(e.ctx, owner, ag.ID, "usr_plain_member"); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("transfer to non-manager: got %v, want ErrGroupCandidateInvalid", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.TransferOwnership(e.ctx, owner, ag.ID, "usr_mgr"); err != nil {
@@ -1116,10 +1116,10 @@ func TestSuccession_UserTier(t *testing.T) {
 	// Promote in "oldest first" order so store insertion order == the
 	// intended succession order (works around the memory store's manager
 	// listing not tracking created_at order the way the SQL store does).
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr_a", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr_a", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr_b", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr_b", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1292,7 +1292,7 @@ func TestSuccession_AdminTier_SkipsDisabledManager(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr", "usr_member_admin")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr", "usr_member_admin")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 
@@ -1335,7 +1335,7 @@ func TestSuccession_AdminTier_SkipsDowngradedManager(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr", "usr_parent_admin")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 
@@ -1380,7 +1380,7 @@ func TestSuccession_UserTier_SkipsDisabledManager(t *testing.T) {
 
 	ug := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierUser, Name: "UG"})
 	e.mustAddMembers(owner, ug.ID, "usr_mgr", "usr_member")
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 	e.setUserStatus("usr_mgr", store.UserStatusDisabled)
@@ -1450,10 +1450,10 @@ func TestReassignGroupsOwnedBy(t *testing.T) {
 	ag2 := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG2"})
 	e.mustAddMembers(owner, ag1.ID, "usr_mgr")
 	e.mustAddMembers(owner, ag2.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag2.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag2.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2005,7 +2005,7 @@ func TestGroupMembers_RosterAndAuthorization(t *testing.T) {
 
 	ug := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierUser, Name: "UG"})
 	e.mustAddMembers(owner, ug.ID, "usr_a") // accepted -> state=member
-	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_a", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ug.ID, "usr_a", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager usr_a: %v", err)
 	}
 	// usr_b is invited but does NOT accept -> stays state=invited.
@@ -2263,7 +2263,7 @@ func TestAuthorizeGroupManage_NeedMatrix(t *testing.T) {
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
 	// Narrow usr_mgr to CanManageUsers only (no structure permission).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_mgr (users-only): %v", err)
 	}
 	mgr := token("usr_mgr", "admin")
@@ -2313,7 +2313,7 @@ func TestPromoteManager_PersistsPermissionFlags(t *testing.T) {
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
 
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 	roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2354,28 +2354,28 @@ func TestSetManagerPermissions_OwnerOnlyAndTargetMustBeManager(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr", "usr_member")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr", "usr_member")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("promote usr_mgr: %v", err)
 	}
 	mgr := token("usr_mgr", "admin")
 
 	// A plain member (never promoted) is an ineligible target.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_member", true, true, true, true, true, true); !errors.Is(err, ErrGroupCandidateInvalid) {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_member", allManagerPerms); !errors.Is(err, ErrGroupCandidateInvalid) {
 		t.Fatalf("target not a manager: got %v, want ErrGroupCandidateInvalid", err)
 	}
 	// A co-manager (visible, but not owner) gets Forbidden -- even trying to
 	// edit their OWN flags.
-	if err := e.svc.SetManagerPermissions(e.ctx, mgr, ag.ID, "usr_mgr", false, false, true, true, true, true); !errors.Is(err, ErrGroupForbidden) {
+	if err := e.svc.SetManagerPermissions(e.ctx, mgr, ag.ID, "usr_mgr", ManagerPermissions{CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); !errors.Is(err, ErrGroupForbidden) {
 		t.Fatalf("co-manager caller: got %v, want ErrGroupForbidden", err)
 	}
 	// A total stranger (not visible at all) gets the no-leak 404, distinct
 	// from the co-manager's Forbidden above.
-	if err := e.svc.SetManagerPermissions(e.ctx, stranger, ag.ID, "usr_mgr", false, false, true, true, true, true); !errors.Is(err, ErrGroupNotFound) {
+	if err := e.svc.SetManagerPermissions(e.ctx, stranger, ag.ID, "usr_mgr", ManagerPermissions{CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("stranger caller: got %v, want ErrGroupNotFound", err)
 	}
 
 	// The owner narrows usr_mgr to CanManageGroup only.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", false, true, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("owner narrow: %v", err)
 	}
 	roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2396,7 +2396,7 @@ func TestSetManagerPermissions_OwnerOnlyAndTargetMustBeManager(t *testing.T) {
 	}
 
 	// A system_admin may also widen/narrow, same as the owner.
-	if err := e.svc.SetManagerPermissions(e.ctx, sysAdmin, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, sysAdmin, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("system_admin widen: %v", err)
 	}
 }
@@ -2418,14 +2418,14 @@ func TestRenameGroup_RequiresCanManageGroup(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote (users-only): %v", err)
 	}
 
 	if _, err := e.svc.RenameGroup(e.ctx, mgr, ag.ID, "AG-Renamed"); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("rename without can_manage_group: got %v, want ErrGroupNotFound", err)
 	}
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("widen: %v", err)
 	}
 	renamed, err := e.svc.RenameGroup(e.ctx, mgr, ag.ID, "AG-Renamed")
@@ -2455,14 +2455,14 @@ func TestResolveInviteAdminGroup_RequiresCanManageUsers(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", false, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote (group-only): %v", err)
 	}
 
 	if _, _, err := e.svc.ResolveInviteAdminGroup(e.ctx, mgr, ag.ID); !errors.Is(err, ErrInviteAdminGroupInvalid) {
 		t.Fatalf("resolve without can_manage_users: got %v, want ErrInviteAdminGroupInvalid", err)
 	}
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("widen: %v", err)
 	}
 	gid, parent, err := e.svc.ResolveInviteAdminGroup(e.ctx, mgr, ag.ID)
@@ -2488,7 +2488,7 @@ func TestGroupDTO_CanManageSplitByFlag(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_mgr")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG"})
 	e.mustAddMembers(owner, ag.ID, "usr_mgr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote (users-only): %v", err)
 	}
 
@@ -2501,7 +2501,7 @@ func TestGroupDTO_CanManageSplitByFlag(t *testing.T) {
 		t.Fatalf("mgr dto = %+v, want my_role=manager can_manage_users=true can_manage=false", dto)
 	}
 
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", false, true, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("narrow to group-only: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2530,7 +2530,7 @@ func TestPromoteManager_PersistsCanManageServers(t *testing.T) {
 	// canUsers=true, canGroup=true, canServers=false -- proves the third flag
 	// is independently settable at promote time (not coupled to the other
 	// two).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 	roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2573,7 +2573,7 @@ func TestGroupDTO_CanManageServersSplitByFlag(t *testing.T) {
 
 	// Promote with all three true -- reproduces "a co-manager can do
 	// everything", including CanManageServers.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("promote (full rights): %v", err)
 	}
 
@@ -2588,7 +2588,7 @@ func TestGroupDTO_CanManageServersSplitByFlag(t *testing.T) {
 
 	// Narrow ONLY CanManageServers -- the other two facets (structure +
 	// user-assignment) must be UNCHANGED.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, true, false, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("narrow servers-only: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2599,7 +2599,7 @@ func TestGroupDTO_CanManageServersSplitByFlag(t *testing.T) {
 	// Widen CanManageServers back while narrowing CanManage (structure) --
 	// proves the flags remain independently settable in both directions, and
 	// GroupMembers surfaces the same state as groupDTO.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("widen servers, narrow group: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2644,7 +2644,7 @@ func TestPromoteManager_PersistsCanManageServices(t *testing.T) {
 	// canUsers=true, canGroup=true, canServers=true, canServices=false --
 	// proves the fourth flag is independently settable at promote time (not
 	// coupled to the other three).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 	roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2688,7 +2688,7 @@ func TestGroupDTO_CanManageServicesSplitByFlag(t *testing.T) {
 
 	// Promote with all four true -- reproduces "a co-manager can do
 	// everything", including CanManageServices.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("promote (full rights): %v", err)
 	}
 
@@ -2703,7 +2703,7 @@ func TestGroupDTO_CanManageServicesSplitByFlag(t *testing.T) {
 
 	// Narrow ONLY CanManageServices -- the other three facets (structure +
 	// user-assignment + server-management) must be UNCHANGED.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, false, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("narrow services-only: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2714,7 +2714,7 @@ func TestGroupDTO_CanManageServicesSplitByFlag(t *testing.T) {
 	// Widen CanManageServices back while narrowing CanManage (structure) --
 	// proves the flags remain independently settable in both directions, and
 	// GroupMembers surfaces the same state as groupDTO.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("widen services, narrow group: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2759,7 +2759,7 @@ func TestPromoteManager_PersistsCanManageResources(t *testing.T) {
 	// canUsers=true, canGroup=true, canServers=true, canServices=true,
 	// canResources=false -- proves the fifth flag is independently settable
 	// at promote time (not coupled to the other four).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 	roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2803,7 +2803,7 @@ func TestGroupDTO_CanManageResourcesSplitByFlag(t *testing.T) {
 
 	// Promote with all five true -- reproduces "a co-manager can do
 	// everything", including CanManageResources.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("promote (full rights): %v", err)
 	}
 
@@ -2819,7 +2819,7 @@ func TestGroupDTO_CanManageResourcesSplitByFlag(t *testing.T) {
 	// Narrow ONLY CanManageResources -- the other four facets (structure +
 	// user-assignment + server-management + service-management) must be
 	// UNCHANGED.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, false, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("narrow resources-only: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2830,7 +2830,7 @@ func TestGroupDTO_CanManageResourcesSplitByFlag(t *testing.T) {
 	// Widen CanManageResources back while narrowing CanManage (structure) --
 	// proves the flags remain independently settable in both directions, and
 	// GroupMembers surfaces the same state as groupDTO.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", true, false, true, true, true, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("widen resources, narrow group: %v", err)
 	}
 	dto = e.svc.groupDTO(e.ctx, mgr, g)
@@ -2855,32 +2855,37 @@ func TestGroupDTO_CanManageResourcesSplitByFlag(t *testing.T) {
 	}
 }
 
-// managerFlags names the SIX co-manager permission flags so a test can assert
-// each one BY NAME rather than by position. PromoteManager and
-// SetManagerPermissions take them as positional bools, so a transposed
-// argument is a silent authorization bug (it grants/denies the wrong
-// permission); only a test that varies ONE flag at a time can catch that.
-type managerFlags struct {
-	users, group, servers, services, resources, vendorAccounts bool
+// allManagerPerms is the "a co-manager can do everything" pattern -- all six
+// flags true, the pre-feature behavior -- shared by every test that only needs
+// a fully-privileged co-manager.
+var allManagerPerms = ManagerPermissions{
+	CanManageUsers: true, CanManageGroup: true, CanManageServers: true,
+	CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true,
 }
 
-// namedManagerFlags is a managerFlags pattern plus a label for failure output.
+// namedManagerFlags is a ManagerPermissions pattern plus a label for failure
+// output.
 type namedManagerFlags struct {
 	name  string
-	flags managerFlags
+	flags ManagerPermissions
 }
 
 // managerFlagPatterns returns every pattern that discriminates the six
-// positional bools: each flag alone true (one-hot), each flag alone false
-// (one-cold), plus all-true and all-false. A test that only ever sets every
-// flag true (or varies just one flag) cannot tell two adjacent positions
-// apart; the one-hot/one-cold sweep pins every position against every other.
+// flags: each flag alone true (one-hot), each flag alone false (one-cold),
+// plus all-true and all-false. PromoteManager and SetManagerPermissions take
+// ManagerPermissions as one struct, so a flag can no longer be transposed at a
+// call site, but a service that DROPS, couples or mis-maps a field when it
+// builds the store row is still an authorization bug (it grants/denies the
+// wrong permission); only a test that varies ONE flag at a time can catch
+// that. A test that only ever sets every flag true (or varies just one flag)
+// cannot tell two fields apart; the one-hot/one-cold sweep pins every field
+// against every other.
 func managerFlagPatterns() []namedManagerFlags {
 	names := []string{"users", "group", "servers", "services", "resources", "vendorAccounts"}
-	build := func(on func(i int) bool) managerFlags {
-		return managerFlags{
-			users: on(0), group: on(1), servers: on(2),
-			services: on(3), resources: on(4), vendorAccounts: on(5),
+	build := func(on func(i int) bool) ManagerPermissions {
+		return ManagerPermissions{
+			CanManageUsers: on(0), CanManageGroup: on(1), CanManageServers: on(2),
+			CanManageServices: on(3), CanManageResources: on(4), CanManageVendorAccounts: on(5),
 		}
 	}
 	out := []namedManagerFlags{
@@ -2896,15 +2901,14 @@ func managerFlagPatterns() []namedManagerFlags {
 	return out
 }
 
-// promote/setPerms are the ONLY places in this test file's sweep that spell
-// the six positional bools from a named managerFlags; everything else reads
-// the result back by field name.
-func (e *groupTestEnv) promote(actor auth.Token, groupID, userID string, f managerFlags) error {
-	return e.svc.PromoteManager(e.ctx, actor, groupID, userID, f.users, f.group, f.servers, f.services, f.resources, f.vendorAccounts)
+// promote/setPerms drive the sweep's service calls with one ManagerPermissions
+// pattern; everything else reads the result back by field name.
+func (e *groupTestEnv) promote(actor auth.Token, groupID, userID string, f ManagerPermissions) error {
+	return e.svc.PromoteManager(e.ctx, actor, groupID, userID, f)
 }
 
-func (e *groupTestEnv) setPerms(actor auth.Token, groupID, userID string, f managerFlags) error {
-	return e.svc.SetManagerPermissions(e.ctx, actor, groupID, userID, f.users, f.group, f.servers, f.services, f.resources, f.vendorAccounts)
+func (e *groupTestEnv) setPerms(actor auth.Token, groupID, userID string, f ManagerPermissions) error {
+	return e.svc.SetManagerPermissions(e.ctx, actor, groupID, userID, f)
 }
 
 // TestManagerPermissionFlags_SixFlagsAreIndependent proves that every one of
@@ -2917,7 +2921,7 @@ func (e *groupTestEnv) setPerms(actor auth.Token, groupID, userID string, f mana
 // It closes a real gap: the store persisted CanManageVendorAccounts, but the
 // service built UserGroupManagerPerm WITHOUT it, so a promote / set-permissions
 // silently wrote false. Each pattern sets exactly one flag differently from the
-// rest, so a dropped, transposed or coupled argument fails by name.
+// rest, so a dropped, mis-mapped or coupled field fails by name.
 func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 	e := newGroupTestEnv(t)
 	e.createUser("usr_sysadmin", "system_admin")
@@ -2934,7 +2938,7 @@ func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 
 	// assertStored reads usr_mgr's flags back through every surface and
 	// compares each BY NAME against want.
-	assertStored := func(t *testing.T, label string, want managerFlags) {
+	assertStored := func(t *testing.T, label string, want ManagerPermissions) {
 		t.Helper()
 
 		roster, err := e.svc.GroupMembers(e.ctx, owner, ag.ID)
@@ -2950,9 +2954,9 @@ func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 		if row == nil || !row.IsManager {
 			t.Fatalf("%s: usr_mgr roster row = %+v, want a manager row", label, row)
 		}
-		gotRoster := managerFlags{
-			users: row.CanManageUsers, group: row.CanManageGroup, servers: row.CanManageServers,
-			services: row.CanManageServices, resources: row.CanManageResources, vendorAccounts: row.CanManageVendorAccounts,
+		gotRoster := ManagerPermissions{
+			CanManageUsers: row.CanManageUsers, CanManageGroup: row.CanManageGroup, CanManageServers: row.CanManageServers,
+			CanManageServices: row.CanManageServices, CanManageResources: row.CanManageResources, CanManageVendorAccounts: row.CanManageVendorAccounts,
 		}
 		if gotRoster != want {
 			t.Fatalf("%s: GroupMembers flags = %+v, want %+v", label, gotRoster, want)
@@ -2963,9 +2967,9 @@ func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 			t.Fatalf("%s: load group: %v", label, err)
 		}
 		dto := e.svc.groupDTO(e.ctx, mgr, g)
-		gotDTO := managerFlags{
-			users: dto.CanManageUsers, group: dto.CanManage, servers: dto.CanManageServers,
-			services: dto.CanManageServices, resources: dto.CanManageResources, vendorAccounts: dto.CanManageVendorAccounts,
+		gotDTO := ManagerPermissions{
+			CanManageUsers: dto.CanManageUsers, CanManageGroup: dto.CanManage, CanManageServers: dto.CanManageServers,
+			CanManageServices: dto.CanManageServices, CanManageResources: dto.CanManageResources, CanManageVendorAccounts: dto.CanManageVendorAccounts,
 		}
 		if dto.MyRole != "manager" || gotDTO != want {
 			t.Fatalf("%s: groupDTO(manager) = role %q flags %+v, want manager %+v", label, dto.MyRole, gotDTO, want)
@@ -2978,10 +2982,10 @@ func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 			fn   func(context.Context, auth.Token) (map[string]bool, error)
 			want bool
 		}{
-			{"serverManageGroupIDs", e.svc.serverManageGroupIDs, want.servers},
-			{"serviceManageGroupIDs", e.svc.serviceManageGroupIDs, want.services},
-			{"resourceManageGroupIDs", e.svc.resourceManageGroupIDs, want.resources},
-			{"vendorAccountManageGroupIDs", e.svc.vendorAccountManageGroupIDs, want.vendorAccounts},
+			{"serverManageGroupIDs", e.svc.serverManageGroupIDs, want.CanManageServers},
+			{"serviceManageGroupIDs", e.svc.serviceManageGroupIDs, want.CanManageServices},
+			{"resourceManageGroupIDs", e.svc.resourceManageGroupIDs, want.CanManageResources},
+			{"vendorAccountManageGroupIDs", e.svc.vendorAccountManageGroupIDs, want.CanManageVendorAccounts},
 		} {
 			ids, err := p.fn(e.ctx, mgr)
 			if err != nil {
@@ -3012,7 +3016,7 @@ func TestManagerPermissionFlags_SixFlagsAreIndependent(t *testing.T) {
 	})
 
 	t.Run("SetManagerPermissions", func(t *testing.T) {
-		if err := e.promote(owner, ag.ID, "usr_mgr", managerFlags{}); err != nil {
+		if err := e.promote(owner, ag.ID, "usr_mgr", ManagerPermissions{}); err != nil {
 			t.Fatalf("promote baseline: %v", err)
 		}
 		// Walk every pattern in sequence: each step changes MANY flags at
@@ -3050,10 +3054,10 @@ func TestPromoteManager_PersistsCanManageVendorAccounts(t *testing.T) {
 
 	// usr_va: vendor accounts ONLY. usr_other: everything EXCEPT vendor
 	// accounts.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_va", false, false, false, false, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_va", ManagerPermissions{CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager(va): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_other", true, true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_other", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
 		t.Fatalf("PromoteManager(other): %v", err)
 	}
 
@@ -3087,14 +3091,14 @@ func TestPromoteManager_PersistsCanManageVendorAccounts(t *testing.T) {
 	}
 
 	// Set-permissions toggles the flag OFF for usr_va (and nothing else).
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_va", false, false, false, false, false, false); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_va", ManagerPermissions{}); err != nil {
 		t.Fatalf("SetManagerPermissions(va off): %v", err)
 	}
 	if dto := e.svc.groupDTO(e.ctx, va, g); dto.CanManageVendorAccounts {
 		t.Fatalf("usr_va dto after set-permissions off = %+v, want can_manage_vendor_accounts=false", dto)
 	}
 	// ...and back ON, with a different facet toggled in the same call.
-	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_va", false, false, true, false, false, true); err != nil {
+	if err := e.svc.SetManagerPermissions(e.ctx, owner, ag.ID, "usr_va", ManagerPermissions{CanManageServers: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("SetManagerPermissions(va on+servers): %v", err)
 	}
 	if dto := e.svc.groupDTO(e.ctx, va, g); !dto.CanManageVendorAccounts || !dto.CanManageServers || dto.CanManage || dto.CanManageUsers || dto.CanManageServices || dto.CanManageResources {
@@ -3127,17 +3131,17 @@ func TestVendorAccountManageGroupIDs(t *testing.T) {
 
 	// usr_mgr: vendor accounts ONLY on AG1; vendor accounts + everything
 	// else on AG2; every OTHER flag but NOT vendor accounts on AG3.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr", false, false, false, false, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr", ManagerPermissions{CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager(ag1): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag2.ID, "usr_mgr", true, true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag2.ID, "usr_mgr", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager(ag2): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag3.ID, "usr_mgr", true, true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag3.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
 		t.Fatalf("PromoteManager(ag3): %v", err)
 	}
 	// usr_mgr_without: every OTHER flag true, vendor accounts FALSE.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_without", true, true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_without", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
 		t.Fatalf("PromoteManager(without): %v", err)
 	}
 
@@ -3201,7 +3205,7 @@ func TestGroupDTO_CanManageVendorAccountsAcrossBranches(t *testing.T) {
 	e.mustAddMembers(owner, ag.ID, "usr_mgr", "usr_plain")
 	// The manager holds EVERY facet except vendor accounts, so the manager
 	// branch can only report true if it reads the vendor flag itself.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", true, true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
 		t.Fatalf("PromoteManager: %v", err)
 	}
 

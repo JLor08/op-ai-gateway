@@ -1561,19 +1561,29 @@ func (s *Service) authorizeOwnerAction(ctx context.Context, principal auth.Token
 	return g, nil
 }
 
+// ManagerPermissions is the set of per-permission flags a co-manager of a
+// group holds (per-Admin-Group co-manager permissions, spec 2026-08-10 +
+// Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1
+// 2026-08-11 + shared vendor accounts, issue #183). All six true reproduces
+// the pre-feature "a co-manager can do everything" behavior byte-for-byte.
+// PromoteManager and SetManagerPermissions take it as one value so each flag
+// is set BY NAME -- there is no positional order to transpose.
+type ManagerPermissions struct {
+	CanManageUsers          bool
+	CanManageGroup          bool
+	CanManageServers        bool
+	CanManageServices       bool
+	CanManageResources      bool
+	CanManageVendorAccounts bool
+}
+
 // PromoteManager promotes userID to co-manager of groupID (owner/system_admin
 // only). Eligibility (spec §8): a user-tier promotee must already be a
 // MEMBER; an admin-tier promotee must be a MEMBER, hold role admin/
 // system_admin, AND be a member of the parent system group.
-// canUsers/canGroup/canServers/canServices/canResources/canVendorAccounts set
-// the new co-manager's per-permission flags (per-Admin-Group co-manager
-// permissions, spec 2026-08-10 + Phase B 2026-08-10 + Phase C 2026-08-10 +
-// Resource Groups Phase 1 2026-08-11 + shared vendor accounts, issue #183) --
-// all six true reproduces the pre-feature "a co-manager can do everything"
-// behavior byte-for-byte. The flags are POSITIONAL bools in exactly that
-// order; callers must not transpose them (a swap silently grants/denies the
-// wrong permission).
-func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, groupID, userID string, canUsers, canGroup, canServers, canServices, canResources, canVendorAccounts bool) error {
+// perms sets the new co-manager's per-permission flags (see
+// ManagerPermissions).
+func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, groupID, userID string, perms ManagerPermissions) error {
 	g, err := s.authorizeOwnerAction(ctx, principal, groupID)
 	if err != nil {
 		return err
@@ -1602,9 +1612,9 @@ func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, grou
 		return err
 	}
 	return s.groups.SetUserGroupManagerPermissions(ctx, groupID, store.UserGroupManagerPerm{
-		UserID: userID, CanManageUsers: canUsers, CanManageGroup: canGroup,
-		CanManageServers: canServers, CanManageServices: canServices, CanManageResources: canResources,
-		CanManageVendorAccounts: canVendorAccounts,
+		UserID: userID, CanManageUsers: perms.CanManageUsers, CanManageGroup: perms.CanManageGroup,
+		CanManageServers: perms.CanManageServers, CanManageServices: perms.CanManageServices, CanManageResources: perms.CanManageResources,
+		CanManageVendorAccounts: perms.CanManageVendorAccounts,
 	})
 }
 
@@ -1616,16 +1626,16 @@ func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, grou
 // userID must already hold a co-manager row on groupID, else
 // ErrGroupCandidateInvalid (mirrors TransferOwnership's "target must be a
 // current manager" rule -- here enforced by the store's zero-rows-affected
-// ErrNotFound, since the UPDATE only ever touches an EXISTING row). The flags
-// are POSITIONAL bools in the same order as PromoteManager's.
-func (s *Service) SetManagerPermissions(ctx context.Context, principal auth.Token, groupID, userID string, canUsers, canGroup, canServers, canServices, canResources, canVendorAccounts bool) error {
+// ErrNotFound, since the UPDATE only ever touches an EXISTING row). perms is
+// the same ManagerPermissions PromoteManager takes.
+func (s *Service) SetManagerPermissions(ctx context.Context, principal auth.Token, groupID, userID string, perms ManagerPermissions) error {
 	if _, err := s.authorizeOwnerAction(ctx, principal, groupID); err != nil {
 		return err
 	}
 	if err := s.groups.SetUserGroupManagerPermissions(ctx, groupID, store.UserGroupManagerPerm{
-		UserID: userID, CanManageUsers: canUsers, CanManageGroup: canGroup,
-		CanManageServers: canServers, CanManageServices: canServices, CanManageResources: canResources,
-		CanManageVendorAccounts: canVendorAccounts,
+		UserID: userID, CanManageUsers: perms.CanManageUsers, CanManageGroup: perms.CanManageGroup,
+		CanManageServers: perms.CanManageServers, CanManageServices: perms.CanManageServices, CanManageResources: perms.CanManageResources,
+		CanManageVendorAccounts: perms.CanManageVendorAccounts,
 	}); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return ErrGroupCandidateInvalid

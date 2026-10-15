@@ -60,6 +60,19 @@ type groupManagerRequest struct {
 	CanManageVendorAccounts bool   `json:"can_manage_vendor_accounts"`
 }
 
+// perms projects the six permission flags onto the portal's ManagerPermissions
+// (the wire fields and their JSON tags are unchanged).
+func (r groupManagerRequest) perms() portal.ManagerPermissions {
+	return portal.ManagerPermissions{
+		CanManageUsers:          r.CanManageUsers,
+		CanManageGroup:          r.CanManageGroup,
+		CanManageServers:        r.CanManageServers,
+		CanManageServices:       r.CanManageServices,
+		CanManageResources:      r.CanManageResources,
+		CanManageVendorAccounts: r.CanManageVendorAccounts,
+	}
+}
+
 // handlePortalGroups backs GET (list the caller's group landscape) / POST
 // (create a group) on the exact path /api/portal/groups. Internal tier
 // authorization (system/admin/user, parent-membership, name uniqueness) lives
@@ -310,7 +323,7 @@ func (s *Server) handlePortalGroupManagers(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 		return
 	}
-	if err := s.Portal.PromoteManager(r.Context(), token, id, req.UserID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources, req.CanManageVendorAccounts); err != nil {
+	if err := s.Portal.PromoteManager(r.Context(), token, id, req.UserID, req.perms()); err != nil {
 		writeGroupError(w, err, "group.promote_failed")
 		return
 	}
@@ -340,7 +353,7 @@ func (s *Server) handlePortalGroupManagerSingle(w http.ResponseWriter, r *http.R
 			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 			return
 		}
-		if err := s.Portal.SetManagerPermissions(r.Context(), token, id, userID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources, req.CanManageVendorAccounts); err != nil {
+		if err := s.Portal.SetManagerPermissions(r.Context(), token, id, userID, req.perms()); err != nil {
 			writeGroupError(w, err, "group.set_manager_permissions_failed")
 			return
 		}
