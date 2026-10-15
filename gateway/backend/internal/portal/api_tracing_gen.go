@@ -2466,6 +2466,12 @@ func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	return _d.API.VendorAccountsEnabled(ctx)
 }
 
+func (_d *APIWithTracing) VendorSubscriptionsEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorSubscriptionsEnabled")
+	defer span.End()
+	return _d.API.VendorSubscriptionsEnabled(ctx)
+}
+
 func (_d *APIWithTracing) VisibleUserIDs(ctx context.Context, t1 auth.Token) (m1 map[string]bool, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VisibleUserIDs")
 	defer span.End()

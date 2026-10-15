@@ -389,7 +389,8 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 }
 
 // CreateVendorAccount creates an account owned by the calling principal
-// (ErrVendorAccountsDisabled while the master flag is off). Any authenticated user may create their own (no admin requirement); a principal
+// (ErrVendorAccountsDisabled while the master flag is off; ErrVendorSubscriptionsDisabled
+// for a subscription account while vendor_subscriptions_enabled is off). Any authenticated user may create their own (no admin requirement); a principal
 // with no user identity cannot own one. The api key is sealed BEFORE the store
 // write, so a keyless disk store fails with capture.ErrKeyRequired and persists
 // nothing.
@@ -411,6 +412,12 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	authType, err := normalizeVendorAccountAuthType(req.AuthType)
 	if err != nil {
 		return VendorAccountDTO{}, err
+	}
+	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
+	// created (an api_key one is unaffected). Checked before anything is built or
+	// stored, so a refusal persists nothing.
+	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
+		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
 	}
 	// A preset vendor (OpenAI-compatible or native Gemini) is api-key only (it has
 	// no subscription/OAuth flow) and carries an immutable root url. openai and

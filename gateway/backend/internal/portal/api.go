@@ -241,6 +241,7 @@ type API interface {
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
 	VendorAccountRoutingMode(context.Context) string
 	VendorAccountsEnabled(context.Context) bool
+	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string
 }

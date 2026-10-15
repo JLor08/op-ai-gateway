@@ -127,7 +127,9 @@ func vendorConnectExpired(p pendingVendorConnect, now time.Time) bool {
 // connectableVendorAccount is the gate every connect method runs: the master
 // flag first, then OWNER-ONLY authorization (a stranger and an unknown id are
 // both ErrVendorAccountNotFound, even for a body that is invalid anyway), then
-// the subscription-only check. It returns the freshly loaded account.
+// the subscription-only check, then the vendor_subscriptions_enabled switch
+// (ErrVendorSubscriptionsDisabled while it is off). It returns the freshly loaded
+// account.
 func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return routing.VendorAccount{}, err
@@ -138,6 +140,13 @@ func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.T
 	}
 	if acc.AuthType != routing.VendorAuthSubscription {
 		return routing.VendorAccount{}, ErrVendorAccountNotSubscription
+	}
+	// vendor_subscriptions_enabled: while off, no connect flow (token import,
+	// code-paste, device) may run. Checked after the owner and subscription-only
+	// checks, so a stranger or an unknown id is still a not-found and an api_key
+	// account still "not a subscription account" (the switch masks neither).
+	if !s.VendorSubscriptionsEnabled(ctx) {
+		return routing.VendorAccount{}, ErrVendorSubscriptionsDisabled
 	}
 	return acc, nil
 }

@@ -622,6 +622,11 @@ type Server struct {
 	// share edgeSwitch's generation-based disarm-race guard.
 	vendorEnabledCache     settingCache[bool]
 	vendorRoutingModeCache settingCache[string]
+	// vendorSubscriptionsEnabledCache is the same kind of cache for the
+	// vendor_subscriptions_enabled switch (subscription-type accounts only) that
+	// the resolver's third injected accessor reads; invalidateVendorSettingsCache
+	// drops it after a PUT that carried the switch.
+	vendorSubscriptionsEnabledCache settingCache[bool]
 	// anthropicPromptCachingCache is the TTL cache (settingCache, invalidatable
 	// mode) behind anthropicPromptCachingEnabledCached, so the Anthropic
 	// prompt-cache policy (applyAnthropicCachePolicy) does not issue a
@@ -961,10 +966,12 @@ func New(deps ServerDeps) *Server {
 		// system_settings store on the resolve hot path. Closed over s so they read
 		// the SAME caches handleSystemSettings invalidates. A resolver with no
 		// portal leaves the branch off (the accessors fail closed to disabled /
-		// vendor_first).
+		// vendor_first); the subscriptions switch is the one default-ON accessor,
+		// so without a portal it stays allowed (the branch is off anyway).
 		resolver.SetVendorAccountAccessors(
 			func() bool { return s.vendorAccountsEnabledCached(context.Background()) },
 			func() string { return s.vendorAccountRoutingModeCached(context.Background()) },
+			func() bool { return s.vendorSubscriptionsEnabledCached(context.Background()) },
 		)
 	}
 	s.routes()

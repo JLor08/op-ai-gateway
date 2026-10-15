@@ -419,6 +419,9 @@ var portalVendorAccountErrRows = []errRow{
 	// netbird.module_disabled. The portal hides the area in that state, so this
 	// is reached by a stale tab or a direct API client.
 	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: "vendor_accounts.module_disabled", msg: "vendor accounts are not enabled"},
+	// The vendor_subscriptions_enabled switch is off: creating or connecting a
+	// SUBSCRIPTION account is a 409 too (api_key accounts are never refused).
+	{err: portal.ErrVendorSubscriptionsDisabled, status: http.StatusConflict, code: "vendor_accounts.subscriptions_disabled", msg: "vendor subscription accounts are not enabled"},
 	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
 	{err: portal.ErrVendorAccountNameRequired, status: http.StatusBadRequest, code: "vendor_account.name_required", msg: "vendor account name is required"},
 	{err: portal.ErrVendorAccountVendorInvalid, status: http.StatusBadRequest, code: "vendor_account.vendor_invalid", msg: "vendor account vendor is invalid"},

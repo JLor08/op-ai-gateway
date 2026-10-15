@@ -69,7 +69,7 @@ func resolveSubscriptionAnthropicTarget(t *testing.T, routes *routing.MemoryStor
 	t.Helper()
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	resolver := routing.NewResolver(routes, func() time.Time { return now }, nil)
-	resolver.SetVendorAccountAccessors(func() bool { return true }, nil) // flag on, mode defaults to vendor_first
+	resolver.SetVendorAccountAccessors(func() bool { return true }, nil, nil) // flag on, mode defaults to vendor_first
 
 	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_sub_anthropic", UserID: ownerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}, inference.Request{Model: subMessagesModel, APIFlavor: fineFlavor})
 	if err != nil {

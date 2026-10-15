@@ -24,7 +24,10 @@ import (
 //
 // Returns nil (nothing to overlay) unless the vendor_accounts_enabled master flag
 // is on, the principal is a USER (a service token has no UserID and owns no vendor
-// accounts), and a routing store is wired. Best-effort and FAIL-OPEN like the
+// accounts), and a routing store is wired. While the vendor_subscriptions_enabled
+// switch is off the owner's SUBSCRIPTION accounts are left out (their api_key
+// accounts are not), mirroring the resolver's skip so no model is advertised that
+// cannot be routed. Best-effort and FAIL-OPEN like the
 // group overlay: a store error yields what was read so far (nil on the first
 // read) rather than blanking the whole listing, and an account whose model rows
 // cannot be read is skipped.
@@ -51,9 +54,18 @@ func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) 
 		return nil, false
 	}
 	loaded = true
+	// The vendor_subscriptions_enabled switch, read once for the whole listing (like
+	// the master flag above): while it is off a SUBSCRIPTION account is not
+	// advertised, exactly as the resolver (resolveVendorAccount) no longer routes it,
+	// so the two stay in lock-step. api_key accounts are untouched. The read is
+	// default-on, so an unreadable settings store keeps subscriptions listed.
+	subscriptionsOn := s.VendorSubscriptionsEnabled(ctx)
 	var out []vendorAccountModels
 	for _, acc := range accounts {
 		if acc.Status != routing.VendorAccountStatusActive {
+			continue
+		}
+		if acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn {
 			continue
 		}
 		prefix, allowed := routing.TokenVendorPrefix(token.VendorAccess, acc)

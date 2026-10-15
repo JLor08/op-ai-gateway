@@ -270,7 +270,7 @@ func TestVendorModelsAreAdvertisedUnderTheirPrefixedName(t *testing.T) {
 	// Advertised == requestable: the resolver serves each prefixed name and sends
 	// the raw slug upstream.
 	resolver := routing.NewResolver(routeStore, func() time.Time { return now }, nil)
-	resolver.SetVendorAccountAccessors(func() bool { return true }, nil)
+	resolver.SetVendorAccountAccessors(func() bool { return true }, nil, nil)
 	for name, wantUpstream := range map[string]string{"work/gpt-5": "gpt-5", subPrefix + subSlug: subSlug} {
 		target, err := resolver.Resolve(ctx, owner, inference.Request{Model: name, APIFlavor: "openai_chat"})
 		if err != nil {

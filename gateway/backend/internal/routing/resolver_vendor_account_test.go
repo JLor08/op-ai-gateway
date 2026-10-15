@@ -39,7 +39,7 @@ func seedVendorAccount(t *testing.T, store *MemoryStore, now time.Time, id, owne
 // state it exercises.
 func vendorResolver(store resolverStore, now time.Time, enabled bool, mode string) *Resolver {
 	r := NewResolver(store, func() time.Time { return now }, nil)
-	r.SetVendorAccountAccessors(func() bool { return enabled }, func() string { return mode })
+	r.SetVendorAccountAccessors(func() bool { return enabled }, func() string { return mode }, nil)
 	return r
 }
 
@@ -171,7 +171,7 @@ func TestVendorAccountDisabledFlagSkipsBranch(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			resolver := NewResolver(store, func() time.Time { return now }, nil)
 			if name == "flag off" {
-				resolver.SetVendorAccountAccessors(func() bool { return false }, func() string { return vendorRoutingModeVendorFirst })
+				resolver.SetVendorAccountAccessors(func() bool { return false }, func() string { return vendorRoutingModeVendorFirst }, nil)
 			}
 			if _, err := resolver.Resolve(ctx, ownerToken(), inference.Request{Model: "gpt-4o", APIFlavor: "openai_chat"}); !errors.Is(err, ErrNoModelRoute) {
 				t.Fatalf("Resolve = %v, want ErrNoModelRoute (vendor branch must be off)", err)
