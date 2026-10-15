@@ -931,9 +931,19 @@ that listing gets an alias when every one of these holds:
 **It fails closed.** When the group and visibility overlay cannot be loaded,
 the listing fails open (no groups, no hidden or locked suppression) so it never
 blanks, but the derivation does not: it cannot tell a hidden model from a shown
-one, and an alias would reveal what the operator hid. On the resolution side a
-store error likewise yields no aliases. A token without the setting derives
-nothing, and neither does the token-less portal session principal.
+one, and an alias would reveal what the operator hid. A vendor account or
+model read error closes it too: an owner-read failure
+(`VendorAccountsByOwner`) or an unreadable account
+(`VendorAccountModels`) leaves the vendor set incomplete, and the
+vendor-shadow exclusion above needs the complete set, so no aliases are derived
+until the read recovers. The vendor *listing* overlay stays fail-open: it folds
+in whatever set was read (none or a partial one), so the real model listing
+still renders. The `vendor_accounts_enabled` master-flag read is the exception
+to that closure and stays fail-open, in parity with the resolver: a flag that
+cannot be read reads as off, which is "no vendor access", not an incomplete
+set. On the resolution side a store error likewise yields no aliases. A token
+without the setting derives nothing, and neither does the token-less portal
+session principal.
 
 **Precedence.** Step 2 of §2.1 is one function, `resolveModelOverride`
 (`internal/gateway/inference_handlers.go`), and its order is:

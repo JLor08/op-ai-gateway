@@ -279,8 +279,12 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	// composition above cannot carry these: vendor-account models are not mapping
 	// views. vendorModelFlavorSets returns nil unless the vendor-accounts flag is
 	// on, the principal is a user and a routing store is wired, so this is a
-	// no-op for every token with no vendor access.
-	for name, flavors := range s.vendorModelFlavorSets(ctx, token) {
+	// no-op for every token with no vendor access. A vendor read error leaves the
+	// set nil or partial and is not acted on here (the completeness flag is for the
+	// generated-alias derivation, which fails closed on it); that is this fold's
+	// unchanged, best-effort behavior.
+	vendor, _ := s.vendorModelFlavorSets(ctx, token)
+	for name, flavors := range vendor {
 		if _, ok := flavors[flavor]; !ok {
 			continue
 		}

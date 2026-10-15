@@ -1804,7 +1804,11 @@ Every listing reads **one** source, `ownVendorAccountModels`: the principal's
 own **active** vendor accounts and their rows that the principal's **token may
 use** (§11) — each named under the token's effective prefix — behind the master
 flag, for a user principal only (a service token owns no account) and fail-open
-per account. The owner's interactive portal session may use all of them, so the
+per account. (That fail-open is the listing's: for the **generated Claude alias
+derivation** an unreadable account, like a failed owner read, makes the vendor
+set incomplete and yields no generated aliases at all, fail-closed, because its
+vendor-shadow exclusion needs the whole set; see
+[Routing and Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).) The owner's interactive portal session may use all of them, so the
 table below describes what a session sees; an API token sees the subset, and the
 names, its policy grants. What
 the listings advertise and what the dashboard shows therefore cannot drift, and a
