@@ -122,6 +122,7 @@ var migrations = []migration{
 	{version: 87, name: "chat_blobs", up: migration87Up},
 	{version: 88, name: "token_claude_model_aliases", up: migration88Up},
 	{version: 89, name: "token_claude_effort_compatibility", up: migration89Up},
+	{version: 90, name: "user_group_managers_can_manage_vendor_accounts", up: migration90Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4039,4 +4040,20 @@ func migration88Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // the upgrade changes no behavior. addColumnIfMissing keeps it re-runnable.
 func migration89Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_effort_compatibility integer not null default 0")
+}
+
+// migration90Up adds user_group_managers.can_manage_vendor_accounts (shared
+// vendor accounts via resource groups, #183 Phase 2) — the SIXTH per-admin-group
+// co-manager flag, `integer not null default 1` — mirrors migration49Up and
+// migration53Up exactly (same table, same default-1 rationale: a co-manager row
+// that predates this migration, and a brand-new row inserted by
+// SetUserGroupManager [which does not name this column either], both pick up
+// the default of "full co-manager rights", so no existing co-manager is
+// narrowed on the day the flag lands, until a later Phase 1 task starts
+// consuming it). The default is deliberately 1 and not the 0 of the opt-in
+// token flags in migrations 88/89: like every sibling can_manage_* column this
+// is a co-manager permission, not a feature switch. Additive,
+// duplicate-tolerant, both dialects through addColumnIfMissing.
+func migration90Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "user_group_managers", "can_manage_vendor_accounts integer not null default 1")
 }
