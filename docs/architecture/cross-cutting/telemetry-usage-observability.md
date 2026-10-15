@@ -1124,8 +1124,12 @@ by shape, so tests pin both:
 
 - **`timings_per_token` is added to a relayed body only where the operator asked
   for it, and never over a value the client set itself.** It is the one request
-  parameter the gateway ever adds on this path, and the second of the only two
-  body edits `proxyNative` makes — the other being the model rewrite.
+  parameter the gateway adds on this path on the operator's behalf, and the
+  second of the three body edits `proxyNative` makes — the others being the model
+  rewrite and, for a token that opted in, Claude Code's effort delivered as
+  `chat_template_kwargs.reasoning_effort` on an Anthropic Messages relay ([API
+  Compatibility & Inference
+  §9.2](compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility)).
   `wantsResponsesLiveTimings` (`responses_live_timings.go`) is the whole of what
   the operator's CONFIGURATION permits, and it answers true only when **all
   five** of these hold:
@@ -1415,7 +1419,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-88-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-89-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -1883,7 +1887,7 @@ llama.cpp's `/props`, Ollama's `/api/show` or stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-88-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-89-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 88 migrations in order, same as
+- **Only-pending.** A fresh install runs all 89 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -211,6 +211,19 @@ Rules that keep this safe over time:
   the column shape, the pre-upgrade token reading back *off*, and an idempotent
   replay, on both dialects; the migration-40 rebuild test re-applies the column
   next to the other later `api_tokens` columns it already re-applies.
+  Migration 89 (`token_claude_effort_compatibility`) is its sibling and takes
+  the identical shape: `api_tokens.claude_effort_compatibility` (`integer not
+  null default 0`) through `addColumnIfMissing`, the `default 0` backfilling
+  every existing token to *off* with no data step, and the column is one more
+  name at the same token sites, `AuthorizeRunAsToken`'s field-by-field copy
+  included. It is a separate column from `claude_model_aliases` because the two
+  settings are independent switches (neither implies the other) and, unlike
+  the alias flag, this one is **management-only** to set
+  ([Security, Authentication & Authorization
+  §4](security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting)).
+  `TestMigration89AddsTokenClaudeEffortCompatibility` pins it against a genuine
+  v88 database the way the migration-88 test does, and the migration-40 rebuild
+  test re-applies this column too.
 - **Split a feature's DDL along rollback lines, not for tidiness.** The
   agent-managed runtime arrived as three migrations —
   65 `agent_runtime_manager` (specs, spec GPUs, co-residency),

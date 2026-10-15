@@ -993,6 +993,14 @@ and then, uncached, one mapping traversal, one group-overlay load, one
 runtime-spec read per `server_agent` application and the vendor-model read —
 the profile of `ModelOfferingFor` (§2.1).
 
+A sibling opt-in, `claude_effort_compatibility`, also looks at the **resolved**
+target but adds no name and changes no routing: after resolution it asks whether
+the target's effective kind (`Target.Provider`, or `Target.LiveProgressSpecType`
+for a `server_agent` application) is `llama_cpp` or `vllm`, and only then
+delivers Claude Code's effort as `chat_template_kwargs.reasoning_effort`
+([API Compatibility & Inference
+§9.2](compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility)).
+
 ## 3. Candidate scoring
 
 `selectCandidate` (`internal/routing/resolver.go`) narrows the candidate pool

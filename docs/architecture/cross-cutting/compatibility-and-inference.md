@@ -209,6 +209,12 @@ requires native passthrough.
 subset from the OpenAI-canonical `InputTokens` so the two numbers never
 double-count.
 
+**Effort.** Claude Code's `output_config.effort` is not translated by default:
+the parser leaves `output_config` alone. A token with `claude_effort_compatibility`
+on gets it read into the neutral `ReasoningEffort` and delivered to a llama.cpp
+or vLLM target as `chat_template_kwargs.reasoning_effort`, on this path and on
+native passthrough alike ([§9.2](#92-claude-code-reasoning-effort-compatibility)).
+
 Rendering (`compat.AnthropicMessageResponse`) emits content blocks in
 Anthropic's required order: `thinking` (if any) → `text` (if any, or always
 when there are no tool calls) → one `tool_use` block per tool call, each with
@@ -1640,6 +1646,161 @@ here — the gateway provides the contract above. Genuine Anthropic model ids ar
 never aliased or altered: a vendor-account model, an Anthropic account's
 included, is not a mapping view and never receives an alias.
 
+### 9.2 Claude Code reasoning-effort compatibility
+
+A token that opts in with the `claude_effort_compatibility` setting (a plain
+boolean, **off by default**, on user and service tokens alike, and
+**management-only** to set — [Security, Authentication & Authorization
+§4](security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting))
+makes the reasoning effort Claude Code selects control a chat-template-driven
+local backend: Qwen served by llama.cpp or vLLM. Claude Code states the level
+as `output_config.effort` on every Messages request (its per-session `/effort`
+command picks it; the levels Qwen's template knows are `low`, `medium` and
+`xhigh`, `xhigh` being its default, and `/effort auto` was observed to be
+unreliable), and without this setting that field never reaches the model's chat
+template, so the picker changes nothing. The setting is **independent of
+`claude_model_aliases`** (§9.1): either, both or neither may be on, and enabling
+one never enables the other.
+
+**One mechanism, because only one field reaches the template.** Qwen's chat
+template, including the fixed one this deployment runs
+(`froggeric/Qwen-Fixed-Chat-Templates`, `chat_template.jinja`), reads effort
+**only** from the jinja variable `reasoning_effort`, which the server fills from
+`chat_template_kwargs`. A jinja template cannot read a raw request field, so
+Anthropic's `output_config.effort` has no effect on its own, and what else sets
+the variable differs per backend:
+
+| Backend and endpoint | What sets Qwen's `reasoning_effort` | Status |
+|---|---|---|
+| llama.cpp native `/v1/messages` | `chat_template_kwargs.reasoning_effort` **only**: its Anthropic-to-OpenAI converter drops both `output_config.effort` and a top-level `reasoning_effort` (read in the source at the pinned build `08698c81`) | verified in source |
+| llama.cpp `/v1/chat/completions` | a top-level `reasoning_effort` **or** `chat_template_kwargs.reasoning_effort` (the request parser maps the top-level field into the kwargs) | verified |
+| vLLM `/v1/chat/completions` | `chat_template_kwargs.reasoning_effort` always; a top-level `reasoning_effort` only on current builds | kwargs verified, top-level version-dependent |
+| vLLM native `/v1/messages` | its Anthropic endpoint understands `output_config.effort` on capable builds; `chat_template_kwargs` is robust on all | version-gated |
+| Ollama | no reliable per-level effort for Qwen, no effort field on its Anthropic route, no `chat_template_kwargs` injection | out of scope |
+
+So the gateway delivers the level as `chat_template_kwargs.reasoning_effort`, on
+**both** the native Messages passthrough and the Anthropic-to-OpenAI translate
+path, for the two backends whose template reads it. A top-level
+`reasoning_effort` is not the lever: it is enough for llama.cpp and the newest
+vLLM and harmless elsewhere, but not sufficient for a released vLLM.
+
+**Which targets: a resolved-type selector.** `targetUsesChatTemplateKwargs`
+(`internal/gateway/chat_template_effort.go`) answers from the **resolved**
+`routing.Target`, the way `wantsResponsesLiveTimings` does: the kind is
+`Target.Provider`, or, when that is the literal `server_agent`,
+`Target.LiveProgressSpecType`, and it is capable only when that kind is
+`llama_cpp` or `vllm`. A direct llama.cpp or vLLM application and an
+agent-managed one both qualify. `llama_swap` (it proxies to an arbitrary
+downstream), Ollama, a generic OpenAI-compatible application, a native Anthropic
+application and any vendor account do not, and the answer is **never** inferred
+from an alias name, a model family or the mere presence of `/v1/messages`. It is
+deliberately not `routing.LiveTimingsCapableKind`, which answers a different
+question (which upstreams take llama.cpp's live-progress parameters) and agrees
+with it only for llama.cpp today. Both vocabularies spell the two kinds with one
+string, which `TestChatTemplateKwargsKindsShareOneStringAcrossBothVocabularies`
+pins.
+
+**The value is forwarded verbatim.** The effort is a JSON string, trimmed of
+surrounding whitespace, passed on by name: there is no enum check and no
+`high`-to-`xhigh` mapping, because the template aliases names itself and a
+mapping here would be the gateway second-guessing a template it cannot see. A
+missing, `null` or blank effort means the client supplied none, so nothing is
+injected and **no default is invented**; unrelated `output_config` properties are
+ignored. The cost is a documented limitation: a different Qwen template that
+only reads `low`, `medium` and `high` would see the raw value.
+
+**Native passthrough: the third body edit.** `proxyNative` makes at most three
+edits to a relayed body, all value-lossless: the `model` rewrite, llama.cpp's
+`timings_per_token` (§6) and this one. The edit
+(`injectChatTemplateReasoningEffort`, `native_effort_injection.go`) runs only
+when **all three** hold: the token opted in, the resolved target is
+`chat_template_kwargs`-capable, and the request is the Anthropic Messages flavor
+with a JSON body (`wantsChatTemplateEffort`). With any of them false the body is
+not even inspected. It then reads `output_config.effort` and merges it into
+`chat_template_kwargs.reasoning_effort`, **preserving** every other key of an
+existing `chat_template_kwargs`; `output_config`, `thinking`, `messages`, `tools`
+and everything else stay as the client wrote them. The rules for an existing
+value are a contract:
+
+| Existing `chat_template_kwargs` in the body | Result |
+|---|---|
+| absent, or JSON `null` (read as absent, like `effort: null`) | created, holding only `reasoning_effort` |
+| an object without `reasoning_effort` | `reasoning_effort` added beside its other keys |
+| an object already holding the **same** string | no-op, forwarded unchanged |
+| an object holding **anything else** under `reasoning_effort` (a different string, a non-string, `null`) | `400 messages.invalid_output_config` |
+| not an object (string, number, array, boolean) | `400 messages.invalid_output_config` |
+
+A non-string `output_config.effort` is the same 400. All three refuse to guess,
+because delivering the effort would otherwise override or discard a value the
+client sent deliberately. The rejection is the native relay's own pre-dispatch
+refusal, written with `writeJSONCaptured` and recorded as a failed usage row
+against the resolved target, **not** through `writeRequestError`, so it is
+**captured and shows in Activity and Logs**, like the endpoint-disabled refusal
+(§6) and unlike a parse failure; it runs before the running-connections row is
+added and before anything is sent upstream, so it costs the upstream nothing. The
+message names fields, never values. The edit returns a **fresh** slice and never
+writes into the client's bytes (`rel.raw`), which are read again after dispatch
+to build the payload capture, so the capture holds what the client sent; the body
+is re-serialized with numbers kept lossless, so it is value-identical rather than
+byte-identical (keys may reorder, `<`, `>` and `&` are HTML-escaped). A body that
+is not a JSON object, or is a bare `null`, is forwarded unchanged. An
+`output_config` that is not an object holds no effort and is not rejected.
+
+**Translate path: a neutral request plus an internal directive.** With the flag
+on, `compat.ParseAnthropicMessagesWithOptions` (`ParseAnthropicMessages`
+delegates with the zero options) reads `output_config.effort` into the neutral
+`inference.Request.ReasoningEffort`, the field the Responses parser already
+fills. With the flag **off** the parser never inspects `output_config`, exactly
+as before, and `CountAnthropicTokens` stays off. The parser takes a bool from the
+handler and never touches token storage. After target resolution
+`applyChatTemplateEffortPolicy` (`internal/gateway/chat_template_effort_policy.go`)
+edits the **upstream copy** of the request, the way `applyAnthropicCachePolicy`
+does, so nothing leaks into the response echo or the usage record:
+
+- **A capable target** (llama.cpp or vLLM, direct or agent-managed) gets the
+  internal directive `ReasoningEffortViaTemplateKwargs` (`json:"-"`, never parsed
+  from or serialized to a client body). The OpenAI-compatible provider then
+  emits `chat_template_kwargs.reasoning_effort` **in addition to** the existing
+  top-level `reasoning_effort`, in both the buffered and the streaming request
+  builders.
+- **Any other translate target has the effort cleared.** On this path the field is
+  only ever filled by this feature, so clearing removes exactly what the feature
+  added. Without it the setting would leak off its scope: a generic or vendor
+  OpenAI-compatible target would receive a top-level `reasoning_effort`, a Gemini
+  target a `thinkingConfig`, and an OpenAI Responses target an overridden effort
+  default. The feature is **strictly scoped to llama.cpp and vLLM**; every other
+  backend behaves as if it were off.
+- A **direct** OpenAI chat or Responses request that merely sets a reasoning
+  effort of its own never meets the policy (it acts only on the Anthropic
+  Messages flavor), so it keeps today's top-level-only behavior.
+
+On the translate path a malformed effort is judged where the parser reads it:
+for an opted-in token a non-string `output_config.effort`, or an `output_config`
+that is neither an object nor `null`, is `400 messages.invalid_output_config` whatever backend
+the request resolved to. It is a plain parse failure, so, like every
+`request.*` body error (§13), it leaves no usage row.
+
+**The on/off contract.** With the flag off, every path keeps its exact previous
+behavior: a native body is never inspected, the translate parser never reads
+`output_config`, and a request that carries one, however malformed, is **never
+newly rejected**. With it on, the only changes are the two above on a llama.cpp
+or vLLM target, plus the validation of a body that cannot be delivered. Native
+Anthropic and other native Messages providers, Ollama, `llama_swap`, generic
+OpenAI-compatible, and direct OpenAI chat and Responses requests, streaming and
+non-streaming alike, are unchanged, and routing, model permissions, quotas and
+requested-versus-served attribution are untouched. A passthrough route is never
+forced into translation.
+
+**Limits.** Only the two chat-template-kwargs backends are covered; Ollama is
+out of scope, and so are a thinking on/off switch, `thinking.budget_tokens`
+translation and a graphical effort selector in Claude Desktop, all of which are
+separate from effort. The upstream model must itself honor the effort level: the
+gateway delivers a value, it does not make a model reason differently. A
+llama.cpp that maps `output_config.effort` itself would be an alternative to the
+native edit; the deployed build and template are what decide, and a manual smoke
+test that the template actually consumes the injected value, not merely that the
+gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../09-architecture-decisions.md#adr-059--claude-code-effort-is-delivered-as-a-chat-template-kwarg-on-both-paths-for-llamacpp-and-vllm-and-is-a-management-only-token-setting).
+
 ## 10. Request bodies and size limits
 
 | Scope | Reader | Cap |
@@ -2349,6 +2510,7 @@ Every inference error response uses the gateway-wide envelope
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
+| `messages.invalid_output_config` | 400 | an opted-in token (`claude_effort_compatibility`) whose `/v1/messages` effort cannot be delivered: on a native llama.cpp or vLLM relay a non-string `output_config.effort`, a non-object `chat_template_kwargs`, or a `chat_template_kwargs.reasoning_effort` that conflicts with the effort; on the translate path a non-string effort or an `output_config` that is neither an object nor `null` (§9.2) |
 | `images.model_required` / `images.prompt_required` | 400 | the images body failed `validateImagesRequest` (§3.4), or the edit form failed its twin `validateImageEditRequest` (§3.5) |
 | `images.response_format_unsupported` | 400 | a `response_format` other than `b64_json` or absent — including OpenAI's own documented default, `url`, and any non-string value (§3.4) |
 | `images.stream_unsupported` | 400 | an images request asking for a streamed response (`stream: true`, or a non-boolean `stream`); this endpoint is pinned to the buffered path (§3.4) |
@@ -2392,7 +2554,9 @@ attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
   `routing.no_model_route` / `routing.no_healthy_host` /
   `routing.model_not_capable`, both `routing.admission_queue_*` rejections,
   `responses.endpoint_disabled` / `messages.endpoint_disabled` (only knowable
-  after model resolution, and recorded against the resolved target), and every
+  after model resolution, and recorded against the resolved target), the native
+  relay's `messages.invalid_output_config` (§9.2; its translate-path twin is a
+  parse failure and, as above, not recorded), and every
   `provider.*` outcome. The images codes fall on both sides of the line, as the
   rule predicts: the `images.*` 400s of both endpoints (`images.model_required`,
   `images.prompt_required`, `images.response_format_unsupported`,

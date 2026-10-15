@@ -113,6 +113,7 @@ principal, or the internal loopback all eventually resolve into. Key fields:
 | `ModelOverride` / `ModelOverrideRules` | catch-all / per-requested-name rewrite applied before routing; a rule is `{to, offer, hide_target}`, the two switches shaping only this token's model *listing* |
 | `UnknownModelRedirect` / `UnknownModelRedirectBlocked` / `UnknownModelFallback` / `LastUsedModel` | the opt-in unknown-model redirect and the marker it aims at — see [Routing & Model Selection §2.1](routing-and-model-selection.md) |
 | `ClaudeModelAliases` | the opt-in (default off) that additionally offers the token's eligible local models and groups under generated `anthropic-local-<hash>` ids, in discovery and in resolution — see [below](#claude-model-aliases-are-discovery-and-resolution-not-authorization) |
+| `ClaudeEffortCompatibility` | the opt-in (default off) that delivers Claude Code's `output_config.effort` to a llama.cpp or vLLM target as `chat_template_kwargs.reasoning_effort` — and, unlike `ClaudeModelAliases`, is **management-only** to set — see [below](#claude-code-effort-compatibility-is-a-management-only-setting) |
 | `AllowedModels` | non-empty only on a service token; a per-model allowlist (empty = every model) |
 | `LogCommunication`, `Secret` | this principal's opt-in/secret-visibility flags for [payload capture](#14-capture-redaction-of-sensitive-headers) |
 | `ProjectID` | usage-attribution project, user tokens only |
@@ -175,6 +176,66 @@ reach**:
 - **Both gates fail closed.** With the visibility overlay unreadable, or on a
   store error during resolution, no alias is derived — it would otherwise reveal
   what an operator hid.
+
+#### Claude Code effort compatibility is a management-only setting
+
+The per-token `claude_effort_compatibility` setting (a plain boolean, default
+off, on user tokens and, at creation, on service tokens) makes Claude Code's
+`output_config.effort` reach a llama.cpp or vLLM target as
+`chat_template_kwargs.reasoning_effort` ([API Compatibility & Inference
+§9.2](compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility)).
+It is documented beside `claude_model_aliases` because it is its sibling, and it
+differs from it in exactly one respect: **who may set it**. The alias flag is an
+ordinary token setting that any holder of `gateway:use` may change on their own
+tokens. The effort flag changes what the gateway sends to the upstream, and an
+operator, not an inference credential, decides that, so it is a **management**
+operation:
+
+- **Who may set it.** An authenticated **portal session** (cookie and CSRF, which
+  `authenticateWebSession` already enforced before the handler body runs) or a
+  **bearer holding the `admin` scope**. An **inference-only bearer**
+  (`gateway:use` / `llm:invoke` without `admin`) never may, **including on its own
+  token** and including by creating a token with the opt-in enabled.
+- **Why the HTTP gate cannot decide it.** The token routes are guarded by
+  `requireWebScope(gateway:use)`, a baseline every user bearer carries, so the
+  route cannot tell an inference-only bearer editing its own settings from a
+  management principal. The check therefore lives in the **service layer**, the
+  single chokepoint no caller can skip, as
+  `principalMayManageTokenSetting(owner)` (`internal/portal/authz.go`):
+  `owner.ID == "" || isAdmin(owner)`. A session principal, and the gateway's own
+  trusted loopback built the same way, comes from `sessionPrincipal` with an
+  **empty** `auth.Token.ID` (no `api_tokens` row stands behind it); a bearer's
+  principal always carries its token's non-empty id, and is management-capable
+  only if it was minted with `admin`. The predicate is deliberately not
+  `hasGatewayUse`, which is exactly the scope the bearer already holds.
+- **Where it is enforced.** `CreateToken` refuses **only when the request enables
+  the flag** (`false` is the default and needs no privilege); `UpdateToken`
+  refuses **any present value**, `true` or `false`, so an inference-only bearer
+  can neither turn it on nor strip it off, and the foreign-token case stays a
+  plain not-found because ownership is checked first; `CreateServiceToken`
+  refuses a `true`, after the object gate, so a principal with no access to the
+  service gets the same not-found as without the flag (no existence leak). Service
+  tokens themselves are already excluded from the token routes by
+  `requireWebScope`'s `IsService` rejection.
+- **A refusal has no side effect.** The service returns
+  `portal.ErrPrincipalForbidden`, HTTP **403 `portal.principal_forbidden`**, before
+  any lookup, any field is applied or anything is written, so a request that
+  mixes the flag with other edits writes none of them. `CreateToken`'s POST
+  handler lists its errors by hand, so it carries its own `ErrPrincipalForbidden`
+  row; without it the refusal fell through to the generic 500 instead of a 403.
+  It is the one place the sentinel is expected over HTTP ([HTTP API Surface,
+  Authorization refusals](../reference/api-surface.md#authorization-refusals-across-the-portal-surface)).
+- **Contrast with `claude_model_aliases`, which stays non-gated.** The alias flag
+  is changed with the plain `gateway:use` baseline and no further check, because
+  it changes only which name is requested and listed ([above](#claude-model-aliases-are-discovery-and-resolution-not-authorization)).
+  The two settings are independent switches, written and gated separately:
+  holding the right to flip one confers nothing about the other.
+- **It grants no reach.** Like the aliases, the setting adds no access: the
+  service-token allowlist, locked models, resource-group provisioning, the
+  principal limiter and every other gate judge the request exactly as without it,
+  and a run-as token carries its token's setting onto the run
+  (`AuthorizeRunAsToken` copies the field), while the portal session principal
+  itself never has it, so portal chat gets no effort edit.
 
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 

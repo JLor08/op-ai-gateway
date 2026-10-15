@@ -86,7 +86,7 @@ Session-or-bearer, scope `gateway:use` unless noted. This is the bulk of the aut
 
 | Path | Methods | Purpose |
 |---|---|---|
-| `/api/portal/tokens`, `/api/portal/tokens/{id}[/rotate]` | GET/POST, PATCH/DELETE/POST | Own API token CRUD + rotate. A token carries its **vendor-account access policy** (`vendor_access`, a strict opt-in: absent = no vendor accounts) on the list, create and update; see [Token vendor access](#token-vendor-access). The opt-in `claude_model_aliases` flag is writable on create and update and always read back; see [Generated Claude model aliases](#generated-claude-model-aliases) |
+| `/api/portal/tokens`, `/api/portal/tokens/{id}[/rotate]` | GET/POST, PATCH/DELETE/POST | Own API token CRUD + rotate. A token carries its **vendor-account access policy** (`vendor_access`, a strict opt-in: absent = no vendor accounts) on the list, create and update; see [Token vendor access](#token-vendor-access). The opt-in `claude_model_aliases` flag is writable on create and update and always read back; see [Generated Claude model aliases](#generated-claude-model-aliases). The opt-in `claude_effort_compatibility` flag is likewise writable on create and update and always read back, **but only by a portal session or an admin-scope bearer**: an inference-only bearer that sets it, on its own token or another, is refused `403 portal.principal_forbidden`; see [Claude Code effort compatibility](#claude-code-effort-compatibility) |
 | `/api/portal/chats`, `/api/portal/chats/{id}[/runs...]` | GET/POST, GET/PUT/DELETE + run sub-paths | Portal built-in chat CRUD, run start/SSE events/cancel. The **listing** also carries `max_content_bytes` (`portal.MaxChatContentBytes`, the 4 MiB pre-seal cap on the chat's **text** document). It is **informational**: it used to feed the composer's remaining-image-capacity line, which is gone now that images are stored outside the document (see the next row), and no portal code consumes it. The chat's images are not part of that document: after a run commit an image part carries `/api/portal/chat-blobs/{id}` instead of a `data:` URL (old chats keep inline `data:` parts until their next run). A run start (`POST …/runs`) can answer `400` `images.blob_type_unsupported` (an inline image is not a standard-padded base64 `data:` URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif`), `images.blob_too_large` (one decoded image over `MaxChatBlobBytes`), `images.blob_not_owned` (a `/chat-blobs/` URL in the request that this chat does not hold; for an **image** run also one in the last user message of the stored transcript — an edit's source or mask — which the run-start resolution refuses rather than replacing with a placeholder, so an edit never silently turns into a generation) or `portal.chat_run_history_too_large` (the stored images the run would send upstream exceed `MaxRunHistoryBytes`); none of them stores the turn. **PUT is refused with 409 `portal.chat_run_active` while a run is active for that chat**, because it replaces the whole document and would overwrite what the run has checkpointed or is about to commit. A run's `201`, the active-runs rows and the `snapshot`/`done` SSE events carry the run's `kind` (`""` text, `"image"`) and a server-measured `elapsed_ms`. An `image` run whose last user message carries an image is an **edit**: the executor posts it to `/v1/images/edits` (an image part tagged `"purpose": "mask"` is the mask), and sends nothing upstream and ends the run `error` with `gateway.chat_run_image_source_unreadable` (an image or mask that cannot be turned into bytes: an external link, an unresolved reference, bad base64, a non-image type, a mask that is not a PNG, a second mask) or `gateway.chat_run_image_source_unsupported` (a readable source that is not PNG or JPEG — typically the webp result of a thread whose format is webp being refined, or an older upload; the label says to set the thread's image format to PNG or JPEG and regenerate first; the public edits endpoint is not so restricted); the edit endpoint's own refusals reach the run as their codes (`images.image_required`, `images.edit_unavailable`, `images.mask_invalid`, `images.edit_unsupported_format`, `request.body_too_large`), every one of them labelled in German and English by the portal, and a webp `output_format` is left out of an edit's form (the upstream default applies on edit turns); see [API Compatibility & Inference §12](../cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) |
 | `/api/portal/chat-blobs/{id}` | GET | The raw bytes of one chat image, as referenced by an `image_url.url` of `/api/portal/chat-blobs/{id}` in a stored transcript ([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)). **Standard portal auth** (`requireWebScopeNoTouch` → `authenticateWebSession`: the internal loopback principal, else the session cookie, else a bearer token; scope `gateway:use`), with the **passive** variant for the cookie: it validates the session without the idle-window touch, so an `<img>` load does not extend the idle window and a chat of N images does not fan out N session writes onto the connection pool. It is not an inference endpoint. **Owner-scoped on the blob, not on a transcript that mentions it**: the blob's chat must belong to the authenticated user (whatever the credential kind), else `404 portal.chat_blob_not_found`, which is also the answer for a missing, deleted, evicted or non-servable blob (no existence leak, and a code distinct from `portal.chat_not_found`); `401` without a valid credential; `403 auth.insufficient_scope` without `gateway:use`; `405` for any other method (`Allow: GET`); `500 portal.chat_blob_failed` when the store or the cipher fails (never a 404). The `Content-Type` is always one of the allow-listed `image/png`, `image/jpeg`, `image/webp`, `image/gif` (re-checked at read time, whatever the row says), and the response is locked down: `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`, `Cache-Control: private, no-store`. See [Security, Authentication & Authorization §13.1](../cross-cutting/security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url) |
 | `/api/portal/usage`, `/usage/stats`, `/usage/groups`, `/usage/timeseries`, `/usage/events` | GET | Own (or, with `admin` scope + `scope=all`, fleet-wide) usage analytics in various shapes. A listed row for a vendor-account request carries the persisted `account_id` and, read-time only, `account_name` (`omitempty`; resolved only for the account's owner or a system admin, empty for everyone else and for a deleted account — [Telemetry §8.4.1](../cross-cutting/telemetry-usage-observability.md#841-the-usage-event)) |
@@ -149,6 +149,7 @@ disagree (see
 | `unknown_model_redirect_blocked` | bool | widen "unknown" from "no such model" to "also models this token may not use"; ignored (stored `false`) while the redirect is off |
 | `unknown_model_fallback` | string | model or group used when the marker below is empty or no longer routable; cleared while the redirect is off |
 | `claude_model_aliases` | bool | opt into the [generated Claude model aliases](#generated-claude-model-aliases): the token's eligible local models and groups are additionally offered, and resolved, under `anthropic-local-<hash>` ids. Off by default; **always emitted** on a token read (never `omitempty`), so a client that reads a token and writes it back keeps it. Create: absent = off. Update (user token): absent keeps the stored value, a present value replaces it. A service token takes it on create only and reads it back |
+| `claude_effort_compatibility` | bool | opt into [Claude Code effort compatibility](#claude-code-effort-compatibility): Claude Code's `output_config.effort` is also delivered to a llama.cpp or vLLM target as `chat_template_kwargs.reasoning_effort`, which is the only field a Qwen chat template reads. Off by default; **always emitted** on a token read (never `omitempty`), so a client that reads a token and writes it back keeps it. Create: absent = off. Update (user token): absent keeps the stored value, a present value, `true` **or** `false`, replaces it. A service token takes it on create only and reads it back. Independent of `claude_model_aliases`: enabling one never enables the other. **Management-only to set**, unlike every other field in this table: a request that creates a token with it `true`, or that carries it at all on an update, is `403 portal.principal_forbidden` unless the caller is a portal session (cookie and CSRF) or a bearer holding the `admin` scope, and nothing is written; a service-token create with it `true` follows the same rule ([Security, Authentication & Authorization §4](../cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting)) |
 | `last_used_model` | string, **read-only** | the gateway model or group of this token's last successfully routed request. Present on token DTOs, accepted on no request body — a writable marker would let a client choose where its own unknown requests go |
 
 The rule object is the only accepted wire shape; the legacy
@@ -180,6 +181,40 @@ On the wire:
 | `GET /v1/models`, `/openai/v1/models`, `/api/v1/models`, `/openai/api/v1/models`, `GET /anthropic/v1/models` | A generated alias row is a normal row of the listing under the alias id, plus `original_model_id` (the real gateway id) and `display_name` (the honest label, never a Claude product name) as **top-level siblings of `capabilities`**. Only generated alias rows carry them; a manual override alias never does. The row follows its target's flavors, so an `anthropic`-only model's alias appears only on `/anthropic/v1/models`. |
 | `GET /api/portal/models` | The same `original_model_id` (omitted when empty) for an API token with the setting. The portal session and `?manage=1` never list an alias. |
 | The inference endpoints (`POST /v1/messages`, `/v1/chat/completions`, `/v1/responses`, …) | A request whose `model` is a generated alias is resolved once to its target before any gate; an explicit `model_override_map` row for that id wins, and the alias beats the catch-all. |
+
+#### Claude Code effort compatibility
+
+With `claude_effort_compatibility` on, the reasoning effort Claude Code selects
+(`/effort low|medium|xhigh`, sent on every Messages request as
+`output_config.effort`) reaches a chat-template-driven local backend, Qwen on
+llama.cpp or vLLM, as `chat_template_kwargs.reasoning_effort`, the one field
+that backend's chat template reads. Without it the level never reaches the
+model's template at all. It rides `POST /v1/messages` and its alias
+`/anthropic/v1/messages` and adds no field to any other endpoint. The setting is
+**independent of `claude_model_aliases`** (either, both or neither may be on),
+and the full contract (the research behind the single mechanism, the
+per-backend table, the validation and the on/off guarantee) is in [API
+Compatibility & Inference
+§9.2](../cross-cutting/compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility).
+On the wire:
+
+| Where | What |
+|---|---|
+| `POST /v1/messages` served by **native passthrough** to a llama.cpp or vLLM target | The relayed body gains `chat_template_kwargs.reasoning_effort` set to `output_config.effort`; `output_config`, `thinking`, `messages`, `tools` and every other field are kept as the client sent them (apart from the existing `model` rewrite). A relay that has no effort, or any other target, is forwarded exactly as before. |
+| `POST /v1/messages` served by **translation** to an OpenAI-compatible llama.cpp or vLLM target | The upstream `/v1/chat/completions` request carries `chat_template_kwargs.reasoning_effort` **and** the top-level `reasoning_effort`. A translate target of any other kind gets **no** effort at all. |
+
+Scope: llama.cpp and vLLM, whether registered directly or launched by an
+agent-managed runtime. Ollama, `llama_swap`, a generic OpenAI-compatible
+application and a native Anthropic application or vendor account are outside
+it and keep their unchanged behavior with the flag on. The effort is forwarded
+**verbatim** (trimmed of surrounding whitespace, never remapped).
+
+Error codes on this surface (the first is new):
+
+| Code | Status | Source |
+|---|---|---|
+| `messages.invalid_output_config` | 400 | an opted-in token's `/v1/messages` request whose effort cannot be delivered without guessing. **Native passthrough** to a llama.cpp or vLLM target: `output_config.effort` is present and not a string, `chat_template_kwargs` is present and not an object (a JSON `null` counts as absent), or `chat_template_kwargs.reasoning_effort` already holds a value different from the effort. The rejection happens before anything is sent upstream, and it is **captured** like any other recorded request, so it appears in Activity and Logs. **Translation**: `output_config` is neither an object nor `null`, or its `effort` is not a string, for the opted-in token whatever the resolved backend; that rejection is a plain parse failure and, like every other `request.*`-class body error, leaves no usage row |
+| `portal.principal_forbidden` | 403 | `POST /api/portal/tokens` with `claude_effort_compatibility: true`, `PATCH /api/portal/tokens/{id}` carrying the field, or `POST /api/portal/services/{id}/tokens` with it `true`, from an inference-only bearer ([Authorization refusals](#authorization-refusals-across-the-portal-surface)) |
 
 #### Token vendor access
 
@@ -973,10 +1008,10 @@ interchangeable — a client that cannot tell them apart retries the wrong one:
 | `auth.insufficient_scope` | 403 | the HTTP-layer scope gate (`requireWebScope`/`requireScope`/`requireAnyScope`): the session or token does not carry the `gateway:use`/`admin`/`system` scope the route demands. Checked before the handler body runs, so this is what a caller short of a scope actually meets |
 | `<domain>.not_found` — `server.not_found`, `service.not_found`, `application.not_found`, `mapping.not_found`, `project.not_found`, … | **404** | object-level authorization inside `internal/portal.Service`: the caller has the scope, but the object is outside its ownership/delegation/admin-group set. Deliberately indistinguishable from "no such object" — the no-existence-leak rule stated at the top of this document |
 | `<domain>.forbidden` — `server.forbidden`, `service.forbidden`, `project.forbidden`, `group.forbidden`, `resource_group.forbidden` | 403 | the same per-domain authorization where there is nothing to hide: a **create** (`CreateServer`/`CreateService` for a principal managing no admin group, `createSystemGroup` for a non-`system` one) or a **field** the caller may not set on an object it already reaches (`UpdateServer` with `owner_ids` from a non-`admin`) |
-| `portal.principal_forbidden` | 403 | the domain-less backstop: one shared sentinel (`portal.ErrPrincipalForbidden`, message `not allowed`, mapped in `sharedErrorMap`) for the **fifteen** token-carrying mutating service methods that re-check the blanket scope themselves — `isAdmin` for `SetUserLimits`, `UserTokens`, `AddUserToAdminGroup`, `ReassignGroupsOwnedBy`; `isSystem` for `UpdateSystemSettings`, the NetBird writes (`SetServerNetbird`, `SetNetbirdNetwork`, `RotateNetbirdToken`, `CreateGatewaySetupKey`, `EnrollGatewaySidecar`, `TestNetbird`) and the certificate actions (`ReissueAllCertificates`, `ReissueEdgeCertificate`, `RenewCertificateNow`, `RotateCertificateCA`). They span unrelated domains, so none of the per-domain sentinels above fits them |
+| `portal.principal_forbidden` | 403 | the domain-less backstop: one shared sentinel (`portal.ErrPrincipalForbidden`, message `not allowed`, mapped in `sharedErrorMap`) for the **fifteen** token-carrying mutating service methods that re-check the blanket scope themselves — `isAdmin` for `SetUserLimits`, `UserTokens`, `AddUserToAdminGroup`, `ReassignGroupsOwnedBy`; `isSystem` for `UpdateSystemSettings`, the NetBird writes (`SetServerNetbird`, `SetNetbirdNetwork`, `RotateNetbirdToken`, `CreateGatewaySetupKey`, `EnrollGatewaySidecar`, `TestNetbird`) and the certificate actions (`ReissueAllCertificates`, `ReissueEdgeCertificate`, `RenewCertificateNow`, `RotateCertificateCA`). They span unrelated domains, so none of the per-domain sentinels above fits them. It has one **second, field-level use that a client can and does meet**: `CreateToken`, `UpdateToken` and `CreateServiceToken` answer it when an inference-only bearer sets `claude_effort_compatibility` (see below and [Claude Code effort compatibility](#claude-code-effort-compatibility)) |
 
-`portal.principal_forbidden` is the one a client should expect **never** to
-see. Every route that reaches one of those fifteen methods already enforces
+For those fifteen methods `portal.principal_forbidden` is the one a client
+should expect **never** to see. Every route that reaches one of them already enforces
 the identical scope at the HTTP layer — `requireWebScope(…, "admin")` for the
 four `isAdmin` methods, `requireWebScope(…, "system")` for the eleven
 `isSystem` ones — so a caller without the scope is answered
@@ -987,6 +1022,22 @@ service gate disagree, which is a gateway defect and not something a retry
 fixes. (The certificate, edge-certificate and system-settings handlers emit
 the same code as a literal, `portal.CodePrincipalForbidden`, because their
 error paths do not run through `sharedErrorMap` — same status, same string.)
+
+The **token routes are the deliberate exception**, and the only place the
+sentinel is expected over HTTP. Their gate is the `gateway:use` baseline, which
+every user bearer carries, so the HTTP layer cannot tell an inference-only
+bearer from a management principal; `claude_effort_compatibility` is a
+management-only setting, so `CreateToken` (only when the opt-in is `true`),
+`UpdateToken` (only when the field is present) and `CreateServiceToken` (only
+when it is `true`) check `principalMayManageTokenSetting` themselves: a portal
+session or a bearer holding `admin` passes, an inference-only bearer does not,
+even on its own token. The refusal is `403 portal.principal_forbidden`, raised
+before any field is applied, so a request that mixes the flag with other edits
+writes none of them. A token create reaches it through its own error ladder (a
+row of `handlePortalTokens`' create branch), not `sharedErrorMap`; update and
+service-token create map it through `sharedErrorMap`. Here the route gate and
+the service gate disagree **on purpose**, so receiving the code is the
+documented answer and not a gateway defect.
 
 ## 4. System endpoints (`/api/system/*`)
 
