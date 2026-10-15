@@ -268,9 +268,25 @@ type VendorAccount struct {
 	// BaseURL is the upstream ROOT url of an OpenAI-compatible account (no /v1 or
 	// other path prefix — the client adds the preset's prefix). "" for the bespoke
 	// openai/anthropic accounts. Set at create and immutable thereafter.
-	BaseURL   string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	BaseURL string
+	// ShareLevel is how far the account is shared beyond its owner
+	// (VendorShareLevelNone | VendorShareLevelShared | VendorShareLevelFull,
+	// migration 91). It is read off the row by every reader and decides which of
+	// the two write gates a non-owner can pass (portal.authorizeVendorAccountOperate
+	// / authorizeVendorAccountCredential). Like the sibling AuthType and Status it is
+	// a plain string the store keeps verbatim; the service validates transitions.
+	// CreateVendorAccount ignores it: a new account is always 'none' (the column
+	// DEFAULT), and the level changes only through UpdateVendorAccountShareLevel
+	// and ClearVendorAccountSharing. UpdateVendorAccount never writes it either, so a
+	// full-row write of a stale struct cannot revert a concurrent raise or downgrade.
+	ShareLevel string
+	// SystemGroupID is the containment root (migration 91): the parent system group
+	// the account's management groups share while it is shared/full, "" while it is
+	// private. Same write rules as ShareLevel -- UpdateVendorAccountSystemGroup and
+	// ClearVendorAccountSharing only.
+	SystemGroupID string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // VendorAccountModel is one model a vendor account serves: the public id a
@@ -2355,9 +2371,12 @@ type RuntimeStore interface {
 // dependent rows -- including its vendor_account_admin_groups and
 // resource_group_vendor_accounts links.
 //
-// Sharing (migrations 91 and 92): share_level and system_group_id have their own
-// narrow writers and are not fields of VendorAccount yet, so Create, Update and
-// every reader leave them to their column DEFAULTs ('none' and the empty string).
+// Sharing (migrations 91 and 92): share_level and system_group_id are fields of
+// VendorAccount (ShareLevel, SystemGroupID) and every reader returns them, but
+// they have their own narrow writers: Create starts every account at the column
+// DEFAULTs ('none' and the empty string) whatever the struct carries, and Update
+// never writes them. Only UpdateVendorAccountShareLevel,
+// UpdateVendorAccountSystemGroup and ClearVendorAccountSharing change them.
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error

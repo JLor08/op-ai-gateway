@@ -126,8 +126,12 @@ var (
 	// Vendor accounts ("Anbieter"): per-user external AI vendor accounts.
 	// ErrVendorAccountNotFound covers both "no such account" AND "principal does
 	// not own it" (no existence leak, mirrors ErrServerNotFound).
-	// ErrVendorAccountForbidden is the create gate for a principal that is not a
-	// real user (no UserID to own the account).
+	// ErrVendorAccountForbidden (403) has two uses. It is the create gate for a
+	// principal that is not a real user (no UserID to own the account). And it is
+	// authorizeVendorAccountCredential's answer to a CM of a `shared` account: they
+	// can see and operate the account, so a credential operation is forbidden, not
+	// "not found". It is NEVER returned to a principal who cannot see the account
+	// (that is ErrVendorAccountNotFound, so a stranger learns nothing).
 	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
 	// account, whose only credential is the OAuth token set.
 	// ErrVendorAccountAPIKeyInvalid rejects a whitespace-only api_key on update:

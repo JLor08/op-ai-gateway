@@ -13,15 +13,26 @@ import (
 	"time"
 )
 
+// vendorAccountInsertColumns is the column list CreateVendorAccount writes. It
+// deliberately omits share_level and system_group_id (migration 91): a new account
+// is always private, so both take their column DEFAULTs ('none' and the empty
+// string) whatever the routing.VendorAccount carries -- a zero-value struct must
+// not write an empty string into share_level and bypass the DEFAULT. The two
+// columns are changed only by their narrow writers (UpdateVendorAccountShareLevel,
+// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing).
+const vendorAccountInsertColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+
 // vendorAccountColumns is the single column list every vendor_accounts reader
-// selects, in the order scanVendorAccount scans them.
-const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+// selects, in the order scanVendorAccount scans them: the insert columns, then
+// the two sharing columns the narrow writers own.
+const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
-// exactly as given -- the caller seals them first. A duplicate id is
-// ErrConflict.
+// exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
+// are ignored: the account starts at the column DEFAULTs (private). A duplicate id
+// is ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
-	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountColumns+`)
+	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountInsertColumns+`)
 		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt)
 	if err != nil {
@@ -412,7 +423,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

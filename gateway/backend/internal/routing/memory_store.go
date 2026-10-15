@@ -166,14 +166,6 @@ type MemoryStore struct {
 	// account-first like serverAdminGroups, so DeleteVendorAccount cascades it
 	// with one single-key delete.
 	vendorAccountAdminGroups map[string]map[string]time.Time
-	// vendorAccountShareLevels / vendorAccountSystemGroups mirror the
-	// vendor_accounts.share_level and .system_group_id columns (migration v91):
-	// account id -> value. Neither is a field of VendorAccount yet (no reader
-	// exposes them), so they live beside it; an ABSENT entry reads as the column
-	// DEFAULT ('none' / ''), and an account's entries are dropped with the
-	// account (see DeleteVendorAccount).
-	vendorAccountShareLevels  map[string]string
-	vendorAccountSystemGroups map[string]string
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -215,8 +207,6 @@ func NewMemoryStore() *MemoryStore {
 
 		resourceGroupVendorAccounts: map[string]map[string]time.Time{},
 		vendorAccountAdminGroups:    map[string]map[string]time.Time{},
-		vendorAccountShareLevels:    map[string]string{},
-		vendorAccountSystemGroups:   map[string]string{},
 	}
 }
 
@@ -2866,19 +2856,25 @@ func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID st
 // --- VendorAccountStore: per-user external AI vendor accounts (migration 82) ---
 
 // CreateVendorAccount stores a new account; a duplicate id is ErrConflict,
-// mirroring the vendor_accounts primary key.
+// mirroring the vendor_accounts primary key. Like the SQL driver (whose INSERT
+// omits both columns) it ignores ShareLevel and SystemGroupID: a new account
+// starts at the column DEFAULTs ('none' and the empty string), so a zero-value
+// struct never stores an empty share level.
 func (m *MemoryStore) CreateVendorAccount(_ context.Context, a VendorAccount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.vendorAccounts[a.ID]; ok {
 		return storeerr.ErrConflict
 	}
+	a.ShareLevel = VendorShareLevelNone
+	a.SystemGroupID = ""
 	m.vendorAccounts[a.ID] = copyVendorAccount(a)
 	return nil
 }
 
 // UpdateVendorAccount replaces every mutable column of an existing account
-// (owner, vendor and created_at are immutable, as in the SQL driver). An
+// (owner, vendor and created_at are immutable, as in the SQL driver; so are
+// ShareLevel and SystemGroupID, which only their narrow writers change). An
 // unknown id is ErrNotFound.
 func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) error {
 	m.mu.Lock()
@@ -2974,9 +2970,9 @@ func (m *MemoryStore) vendorAccountsLocked(keep func(VendorAccount) bool) []Vend
 
 // DeleteVendorAccount removes the account and its child rows -- the model
 // catalog, the usage snapshot, its admin-group links and its resource-group
-// links -- mirroring the SQL drivers' ON DELETE CASCADE FKs, and drops its
-// share_level / system_group_id state so a re-create under the same id starts
-// private. An unknown id is ErrNotFound.
+// links -- mirroring the SQL drivers' ON DELETE CASCADE FKs. Its share_level /
+// system_group_id live on the account record, so they go with it and a re-create
+// under the same id starts private. An unknown id is ErrNotFound.
 func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2987,8 +2983,6 @@ func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	delete(m.vendorAccountModels, id)
 	delete(m.vendorAccountUsage, id)
 	delete(m.vendorAccountAdminGroups, id) // vendor_account_admin_groups (keyed account-first: one delete)
-	delete(m.vendorAccountShareLevels, id)
-	delete(m.vendorAccountSystemGroups, id)
 	m.dropVendorAccountFromResourceGroupsLocked(id)
 	return nil
 }
@@ -3012,10 +3006,12 @@ func (m *MemoryStore) dropVendorAccountFromResourceGroupsLocked(accountID string
 func (m *MemoryStore) UpdateVendorAccountShareLevel(_ context.Context, id, level string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.vendorAccounts[id]; !ok {
+	cur, ok := m.vendorAccounts[id]
+	if !ok {
 		return storeerr.ErrNotFound
 	}
-	m.vendorAccountShareLevels[id] = level
+	cur.ShareLevel = level
+	m.vendorAccounts[id] = copyVendorAccount(cur)
 	return nil
 }
 
@@ -3024,10 +3020,12 @@ func (m *MemoryStore) UpdateVendorAccountShareLevel(_ context.Context, id, level
 func (m *MemoryStore) UpdateVendorAccountSystemGroup(_ context.Context, id, systemGroupID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.vendorAccounts[id]; !ok {
+	cur, ok := m.vendorAccounts[id]
+	if !ok {
 		return storeerr.ErrNotFound
 	}
-	m.vendorAccountSystemGroups[id] = systemGroupID
+	cur.SystemGroupID = systemGroupID
+	m.vendorAccounts[id] = copyVendorAccount(cur)
 	return nil
 }
 
@@ -3096,22 +3094,24 @@ func (m *MemoryStore) VendorAccountsByAdminGroups(_ context.Context, groupIDs []
 	}), nil
 }
 
-// ClearVendorAccountSharing returns an account to private: share level 'none'
-// FIRST, then both link sets emptied, then the containment root cleared -- the
-// order the SQL driver's single transaction uses. Under m.mu the whole call is
-// atomic to every other store method, so the order cannot be observed here; it
-// is kept so the two drivers read the same. An unknown id is ErrNotFound; an
-// already-private account is a successful no-op.
+// ClearVendorAccountSharing returns an account to private: share level 'none',
+// the containment root cleared and both link sets emptied. The SQL driver does
+// this in one transaction that writes the level FIRST so a torn write still
+// leaves the account owner-only; under m.mu the whole call is atomic to every
+// other store method, so no such window exists here. An unknown id is
+// ErrNotFound; an already-private account is a successful no-op.
 func (m *MemoryStore) ClearVendorAccountSharing(_ context.Context, accountID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.vendorAccounts[accountID]; !ok {
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
 		return storeerr.ErrNotFound
 	}
-	m.vendorAccountShareLevels[accountID] = VendorShareLevelNone
+	cur.ShareLevel = VendorShareLevelNone
+	cur.SystemGroupID = ""
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
 	delete(m.vendorAccountAdminGroups, accountID)
 	m.dropVendorAccountFromResourceGroupsLocked(accountID)
-	m.vendorAccountSystemGroups[accountID] = ""
 	return nil
 }
 

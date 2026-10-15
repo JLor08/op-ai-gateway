@@ -296,6 +296,20 @@ func (s *Service) sealVendorAPIKey(raw string) (string, error) {
 	return capture.SealSecret(s.cipher, s.settingsVolatile, strings.TrimSpace(raw))
 }
 
+// loadVendorAccount loads the account, mapping the store's not-found to
+// ErrVendorAccountNotFound. It decides nothing about WHO may see the account:
+// every caller follows it with one of the gates below.
+func (s *Service) loadVendorAccount(ctx context.Context, id string) (routing.VendorAccount, error) {
+	acc, err := s.routes.VendorAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return routing.VendorAccount{}, ErrVendorAccountNotFound
+		}
+		return routing.VendorAccount{}, err
+	}
+	return acc, nil
+}
+
 // authorizeVendorAccount loads the account and returns ErrVendorAccountNotFound
 // unless the principal OWNS it. With write=false (a READ) system scope is also
 // let through, so an operator can inspect any account's credential-free
@@ -306,21 +320,148 @@ func (s *Service) sealVendorAPIKey(raw string) (string, error) {
 // disable the account, or delete it. As with authorizeServer, an unknown id and
 // a stranger's account are indistinguishable (404-no-leak), and a plain admin
 // who is not the owner is a stranger too.
+//
+// This is the pre-sharing owner-only gate, and it stays the gate of every call
+// site that has not been moved onto a share-level gate yet: the reads
+// (GetVendorAccount and the name lookup widen to CMs in the management read) and
+// the writes that belong to later steps of the sharing work (the PATCH, the
+// credential methods, delete). Owner-only is the safe side of both new gates, so
+// a site left here is merely stricter than the spec, never looser. New code that
+// writes to an account uses authorizeVendorAccountOperate or
+// authorizeVendorAccountCredential instead.
 func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string, write bool) (routing.VendorAccount, error) {
-	acc, err := s.routes.VendorAccountByID(ctx, id)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return routing.VendorAccount{}, ErrVendorAccountNotFound
-		}
 		return routing.VendorAccount{}, err
 	}
-	if principal.UserID != "" && acc.OwnerUserID == principal.UserID {
+	if isVendorAccountOwner(principal, acc) {
 		return acc, nil
 	}
 	if !write && isSystem(principal) {
 		return acc, nil
 	}
 	return routing.VendorAccount{}, ErrVendorAccountNotFound
+}
+
+// isVendorAccountOwner reports whether principal is the account's owning user. A
+// principal with no user identity (a service token, say) owns nothing.
+func isVendorAccountOwner(principal auth.Token, acc routing.VendorAccount) bool {
+	return principal.UserID != "" && acc.OwnerUserID == principal.UserID
+}
+
+// isVendorAccountManager reports whether principal is a CM of acc: a co-manager
+// (or the owner) of an admin group the account is assigned to, holding
+// can_manage_vendor_accounts there. It is the INTERSECTION of the account's
+// vendor_account_admin_groups with vendorAccountManageGroupIDs(principal), both
+// read live, so un-assigning the group or demoting the co-manager revokes the
+// reach on the very next call.
+//
+// It says nothing about whether the account is shared: that is the share level's
+// job, and the two gates below check it BEFORE they ask. A CM link that outlives
+// its level (a torn downgrade, a store written directly) must grant nothing.
+// Scope never enters into it: a system-scope token is a CM only if its own user is
+// one, exactly like any other token of that user.
+func (s *Service) isVendorAccountManager(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
+	if principal.UserID == "" {
+		return false, nil
+	}
+	groupIDs, err := s.routes.VendorAccountAdminGroups(ctx, acc.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(groupIDs) == 0 {
+		return false, nil
+	}
+	manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
+	if err != nil {
+		return false, err
+	}
+	for _, gid := range groupIDs {
+		if manageGroups[gid] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// vendorAccountSharedLevel reports whether level is one at which a non-owner can
+// reach the account at all (shared or full). Anything else, an unrecognised value
+// included, is private: fail closed.
+func vendorAccountSharedLevel(level string) bool {
+	return level == routing.VendorShareLevelShared || level == routing.VendorShareLevelFull
+}
+
+// authorizeVendorAccountOperate is the gate of the OPERATE operations: status,
+// model prefix, rename, model refresh, connection test, usage refresh (spec
+// 2026-10-15 section 6). acc is the record as the store returned it, so the share
+// level it carries is the live one. Allowed for:
+//
+//   - the owner, at every level;
+//   - a CM of the account, while it is `shared` or `full`.
+//
+// Everyone else, system scope included, gets ErrVendorAccountNotFound
+// (404-no-leak): an operate call opens the owner's sealed credential and sends it
+// upstream, and system scope never bypasses a write. At `none` the account has no
+// management group, so no CM can exist and owner-only falls out; the level check
+// comes first anyway so a leftover admin-group link at `none` grants nothing.
+//
+// This gate says nothing about the credential-bearing operations (see
+// authorizeVendorAccountCredential), nor about the subscription exception that
+// makes some operate calls owner-only at `shared` for a subscription account.
+func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
+	if isVendorAccountOwner(principal, acc) {
+		return nil
+	}
+	if !vendorAccountSharedLevel(acc.ShareLevel) {
+		return ErrVendorAccountNotFound
+	}
+	manager, err := s.isVendorAccountManager(ctx, principal, acc)
+	if err != nil {
+		return err
+	}
+	if manager {
+		return nil
+	}
+	return ErrVendorAccountNotFound
+}
+
+// authorizeVendorAccountCredential is the gate of every operation that
+// establishes, replaces or clears the account's credential or acts as its
+// strongest lever (connect, reconnect, device connect, import, api key set or
+// change, and the rows the spec ties to it: delete and downgrade). Allowed for:
+//
+//   - the owner, at every level;
+//   - a CM of the account, at `full` only (complete owner-equivalent delegation).
+//
+// The two denials differ on purpose:
+//
+//   - a CM at `shared` gets ErrVendorAccountForbidden (403): they can already see
+//     and operate the account, so "not found" would be a lie;
+//   - anyone who cannot see the account at all (a stranger, a co-manager without
+//     the vendor-account flag, system scope, a principal with no user identity, or a
+//     CM whose link outlived the shared level) gets ErrVendorAccountNotFound
+//     (404-no-leak), identical to an unknown id.
+//
+// Like the operate gate it works on the loaded record's share level, and an
+// unrecognised level is treated as private.
+func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
+	if isVendorAccountOwner(principal, acc) {
+		return nil
+	}
+	if !vendorAccountSharedLevel(acc.ShareLevel) {
+		return ErrVendorAccountNotFound
+	}
+	manager, err := s.isVendorAccountManager(ctx, principal, acc)
+	if err != nil {
+		return err
+	}
+	if !manager {
+		return ErrVendorAccountNotFound
+	}
+	if acc.ShareLevel == routing.VendorShareLevelFull {
+		return nil
+	}
+	return ErrVendorAccountForbidden
 }
 
 // ListVendorAccounts returns the calling principal's OWN accounts, oldest first,

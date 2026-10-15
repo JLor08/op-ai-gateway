@@ -40,6 +40,7 @@ func TestRoutingStoreVendorAccountCRUD(t *testing.T) {
 			ID: "va_one", OwnerUserID: "u_va", Vendor: routing.VendorOpenAI,
 			AuthType: routing.VendorAuthAPIKey, Name: "My OpenAI", Status: routing.VendorAccountStatusActive,
 			APIKey: "enc:seeded", OAuthTokens: "", ModelPrefix: "work/", BaseURL: "https://api.x.ai", CreatedAt: now, UpdatedAt: now,
+			ShareLevel: routing.VendorShareLevelNone, // what every reader returns for a created account (Create leaves it at the column DEFAULT)
 		}
 		if err := s.CreateVendorAccount(ctx, acc); err != nil {
 			t.Fatalf("create: %v", err)
@@ -113,11 +114,13 @@ func TestRoutingStoreVendorAccountUpdateAndDeleteContract(t *testing.T) {
 			ID: "va_mine", OwnerUserID: "u_va_a", Vendor: routing.VendorAnthropic,
 			AuthType: routing.VendorAuthAPIKey, Name: "Mine", Status: routing.VendorAccountStatusActive,
 			APIKey: "enc:key", ModelPrefix: "mine/", BaseURL: "https://api.groq.com", CreatedAt: now, UpdatedAt: now,
+			ShareLevel: routing.VendorShareLevelNone, // the value a created account reads back
 		}
 		theirs := routing.VendorAccount{
 			ID: "va_theirs", OwnerUserID: "u_va_b", Vendor: routing.VendorOpenAI,
 			AuthType: routing.VendorAuthSubscription, Name: "Theirs", Status: routing.VendorAccountStatusNeedsReconnect,
 			OAuthTokens: "enc:tokens", ModelPrefix: "theirs/", CreatedAt: now, UpdatedAt: now,
+			ShareLevel: routing.VendorShareLevelNone, // the value a created account reads back
 		}
 		for _, acc := range []routing.VendorAccount{theirs, mine} {
 			if err := s.CreateVendorAccount(ctx, acc); err != nil {

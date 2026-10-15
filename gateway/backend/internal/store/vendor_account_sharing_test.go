@@ -24,12 +24,11 @@ import (
 // cascades that keep the link tables free of dangling rows.
 //
 // Every test runs through routing.Store on MEMORY, SQLITE and POSTGRES
-// (forEachRoutingStoreSeeded). share_level and system_group_id are NOT fields of
-// routing.VendorAccount (no reader selects them yet), so their value cannot be
-// read back through the interface: the SQL legs read the two columns straight
-// off the row (vendorShareColumns), and the memory leg's equivalent state is
-// asserted in package routing (TestMemoryStoreVendorAccountSharing), which can
-// see MemoryStore's own fields.
+// (forEachRoutingStoreSeeded). share_level and system_group_id are fields of
+// routing.VendorAccount (ShareLevel, SystemGroupID), so every leg reads them back
+// through VendorAccountByID; the SQL legs additionally read the two columns
+// straight off the row (vendorShareColumns), which checks the reader against the
+// storage rather than against itself.
 
 const (
 	vasOwnerID       = "u_vas_owner"
@@ -88,9 +87,8 @@ func createSharingResourceGroups(t *testing.T, s routing.Store, now time.Time, i
 	}
 }
 
-// vendorShareColumns reads share_level and system_group_id off the
-// vendor_accounts row. ok is false on the memory driver, whose state for them
-// is asserted in package routing instead.
+// vendorShareColumns reads share_level and system_group_id straight off the
+// vendor_accounts row. ok is false on the memory driver, which has no row.
 func vendorShareColumns(t *testing.T, s routing.Store, id string) (level, systemGroupID string, ok bool) {
 	t.Helper()
 	sqlStore, isSQL := s.(*SQLStore)
@@ -103,17 +101,34 @@ func vendorShareColumns(t *testing.T, s routing.Store, id string) (level, system
 	return level, systemGroupID, true
 }
 
-// requireVendorShareColumns asserts the two columns on the legs that can read
-// them (SQL) and is a no-op on memory.
+// requireVendorShareColumns asserts the account's share level and containment
+// root as the reader returns them (every leg), and as stored in the row (the SQL
+// legs).
 func requireVendorShareColumns(t *testing.T, s routing.Store, id, wantLevel, wantSystemGroup, stage string) {
 	t.Helper()
+	acc, err := s.VendorAccountByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("%s: VendorAccountByID(%s): %v", stage, id, err)
+	}
+	if acc.ShareLevel != wantLevel || acc.SystemGroupID != wantSystemGroup {
+		t.Fatalf("%s: %s read back ShareLevel/SystemGroupID = %q/%q, want %q/%q", stage, id, acc.ShareLevel, acc.SystemGroupID, wantLevel, wantSystemGroup)
+	}
 	level, systemGroup, ok := vendorShareColumns(t, s, id)
 	if !ok {
 		return
 	}
 	if level != wantLevel || systemGroup != wantSystemGroup {
-		t.Fatalf("%s: %s share_level/system_group_id = %q/%q, want %q/%q", stage, id, level, systemGroup, wantLevel, wantSystemGroup)
+		t.Fatalf("%s: %s share_level/system_group_id columns = %q/%q, want %q/%q", stage, id, level, systemGroup, wantLevel, wantSystemGroup)
 	}
+}
+
+// withoutShareState returns acc with the two columns only the narrow share
+// writers own blanked, so a "nothing else moved" comparison across a writer call
+// does not trip over the very columns that writer is supposed to change (those are
+// asserted separately, by requireVendorShareColumns).
+func withoutShareState(acc routing.VendorAccount) routing.VendorAccount {
+	acc.ShareLevel, acc.SystemGroupID = "", ""
+	return acc
 }
 
 func requireIDs(t *testing.T, what string, got []string, err error, want ...string) {
@@ -257,6 +272,53 @@ func TestRoutingStoreVendorAccountAdminGroups(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreVendorAccountStartsPrivate pins the create default on every
+// driver. A newly created account reads back share_level 'none' and no containment
+// root -- NEVER the empty string a zero-value struct would carry if Create wrote
+// the struct's value over the column DEFAULT -- and Create ignores a ShareLevel or
+// SystemGroupID the caller put on the struct: sharing starts only through the
+// narrow writers. The same goes for UpdateVendorAccount: a full-row write of a
+// STALE struct (loaded before a raise) must not revert the level.
+func TestRoutingStoreVendorAccountStartsPrivate(t *testing.T) {
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStoreSeeded(t, func(t *testing.T, s *SQLStore) { seedVendorSharingSQL(t, s, now) }, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+
+		zero := newSharingAccount("va_sp_zero", now) // ShareLevel/SystemGroupID left at their zero values
+		if err := s.CreateVendorAccount(ctx, zero); err != nil {
+			t.Fatalf("create zero-value account: %v", err)
+		}
+		requireVendorShareColumns(t, s, "va_sp_zero", routing.VendorShareLevelNone, "", "account created from a zero-value struct")
+
+		forced := newSharingAccount("va_sp_forced", now)
+		forced.ShareLevel, forced.SystemGroupID = routing.VendorShareLevelFull, vasSystemGroupID
+		if err := s.CreateVendorAccount(ctx, forced); err != nil {
+			t.Fatalf("create account carrying a share level: %v", err)
+		}
+		requireVendorShareColumns(t, s, "va_sp_forced", routing.VendorShareLevelNone, "", "account created with ShareLevel/SystemGroupID on the struct")
+
+		// A struct read BEFORE a raise, written back AFTER it, leaves the level alone.
+		stale, err := s.VendorAccountByID(ctx, "va_sp_zero")
+		if err != nil {
+			t.Fatalf("VendorAccountByID: %v", err)
+		}
+		if err := s.UpdateVendorAccountShareLevel(ctx, "va_sp_zero", routing.VendorShareLevelShared); err != nil {
+			t.Fatalf("raise: %v", err)
+		}
+		if err := s.UpdateVendorAccountSystemGroup(ctx, "va_sp_zero", vasSystemGroupID); err != nil {
+			t.Fatalf("set root: %v", err)
+		}
+		stale.Name = "renamed from a stale read"
+		if err := s.UpdateVendorAccount(ctx, stale); err != nil {
+			t.Fatalf("UpdateVendorAccount(stale): %v", err)
+		}
+		requireVendorShareColumns(t, s, "va_sp_zero", routing.VendorShareLevelShared, vasSystemGroupID, "after a full-row write of a stale struct")
+		if got, err := s.VendorAccountByID(ctx, "va_sp_zero"); err != nil || got.Name != "renamed from a stale read" {
+			t.Fatalf("the stale write did not apply its own column: %+v, %v", got, err)
+		}
+	})
+}
+
 // TestRoutingStoreVendorAccountShareWriters pins the two narrow writers: an
 // unknown id is ErrNotFound, the value lands in its own column, and NOTHING else
 // about the account changes (the writers touch one column each, like
@@ -303,7 +365,7 @@ func TestRoutingStoreVendorAccountShareWriters(t *testing.T) {
 		if err != nil {
 			t.Fatalf("VendorAccountByID after the writers: %v", err)
 		}
-		if !reflect.DeepEqual(normalizeVendorAccountForCompare(after), normalizeVendorAccountForCompare(before)) {
+		if !reflect.DeepEqual(normalizeVendorAccountForCompare(withoutShareState(after)), normalizeVendorAccountForCompare(withoutShareState(before))) {
 			t.Fatalf("a share writer changed a column it does not own:\n got  %+v\n want %+v", after, before)
 		}
 		// The sibling account is untouched.
@@ -602,7 +664,7 @@ func TestRoutingStoreClearVendorAccountSharing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("VendorAccountByID after Clear: %v", err)
 		}
-		if !reflect.DeepEqual(normalizeVendorAccountForCompare(after), normalizeVendorAccountForCompare(before)) {
+		if !reflect.DeepEqual(normalizeVendorAccountForCompare(withoutShareState(after)), normalizeVendorAccountForCompare(withoutShareState(before))) {
 			t.Fatalf("Clear changed an account column:\n got  %+v\n want %+v", after, before)
 		}
 		for _, rgID := range []string{"rg_clr_1", "rg_clr_2"} {
