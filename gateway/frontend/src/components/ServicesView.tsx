@@ -40,6 +40,7 @@ import {
   distinctParentGroups,
   editAdminGroupOptions,
 } from './shared/adminGroupLinkage';
+import { ServiceResourceGroupsSection } from './ServiceResourceGroupsSection';
 import { ServiceTokensSection } from './ServiceTokensSection';
 
 type Mode = 'list' | 'create' | { kind: 'detail'; service: PortalService };
@@ -68,8 +69,11 @@ export function ServicesView({
     | 'createServiceToken'
     | 'deleteService'
     | 'deleteServiceToken'
+    | 'joinServiceResourceGroup'
+    | 'leaveServiceResourceGroup'
     | 'rotateServiceToken'
     | 'serviceAdminGroupCandidates'
+    | 'serviceResourceGroups'
     | 'serviceTokens'
     | 'services'
     | 'setServiceAdminGroups'
@@ -656,6 +660,19 @@ export function ServicesView({
             </Panel>
           </Box>
         )}
+
+        {/* Service-side resource-group self-service (#183 Phase 0): which
+            resource groups this service is provisioned into, with join/leave --
+            the analogue of the server-owner section. Deliberately NOT gated on
+            `editable`: the backend authorizes a service MANAGER
+            (can_manage_services owner/co-manager, or system scope) -- who need
+            not be a delegate and so may not be `editable` here -- and refuses a
+            delegate; its 404 renders as the empty state. Sits before the token
+            panel because the groups decide which shared resources the tokens
+            below can reach. key= resets the section's state per service. */}
+        <Box sx={{ mt: 3 }}>
+          <ServiceResourceGroupsSection key={`rg-${svc.id}`} t={t} api={api} service={svc} />
+        </Box>
 
         <ServiceTokensSection
           t={t}

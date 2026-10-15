@@ -2434,6 +2434,14 @@ const de = {
   serviceAdminGroupsSectionTitle: 'Verwaltungsgruppen',
   serviceAdminGroupsSave: 'Verwaltungsgruppen speichern',
   serviceAdminGroupsSaved: 'Verwaltungsgruppen gespeichert.',
+  // Service-side resource-group self-service (#183 Phase 0): the service-manager
+  // analogue of the serverResourceGroups* keys.
+  serviceResourceGroupsTitle: 'Ressourcengruppen',
+  serviceResourceGroupsColGroup: 'Ressourcengruppe',
+  serviceResourceGroupsColMember: 'Mitglied',
+  serviceResourceGroupsEmpty: 'Keine berechtigten Ressourcengruppen.',
+  serviceResourceGroupsJoinError: 'Dienst konnte nicht eingetragen werden.',
+  serviceResourceGroupsLeaveError: 'Dienst konnte nicht entfernt werden.',
   resourceGroups: 'Ressourcen',
   resourceGroupsIntro:
     'Ressourcengruppen bündeln Server unter einer Verwaltungsgruppen-Verknüpfung.',
@@ -5189,6 +5197,14 @@ const en: PortalMessages = {
   serviceAdminGroupsSectionTitle: 'Admin groups',
   serviceAdminGroupsSave: 'Save admin groups',
   serviceAdminGroupsSaved: 'Admin groups saved.',
+  // Service-side resource-group self-service (#183 Phase 0): the service-manager
+  // analogue of the serverResourceGroups* keys.
+  serviceResourceGroupsTitle: 'Resource groups',
+  serviceResourceGroupsColGroup: 'Resource group',
+  serviceResourceGroupsColMember: 'Member',
+  serviceResourceGroupsEmpty: 'No eligible resource groups.',
+  serviceResourceGroupsJoinError: 'Could not add the service.',
+  serviceResourceGroupsLeaveError: 'Could not remove the service.',
   resourceGroups: 'Resources',
   resourceGroupsIntro: 'Resource groups bundle servers under an admin-group linkage.',
   resourceGroupListTitle: 'Resource group list',

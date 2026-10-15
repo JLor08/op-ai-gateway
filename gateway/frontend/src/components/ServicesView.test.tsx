@@ -12,6 +12,7 @@ import type {
   CreateServiceRequest,
   ModelOption,
   PortalService,
+  ServiceResourceGroup,
   ServiceTokenDTO,
   UpdateServiceRequest,
 } from '../api';
@@ -150,6 +151,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // which care about admin-group linkage) keeps working unchanged.
       serviceAdminGroupCandidates: vi.fn(async () => defaultAdminGroupCandidates),
       setServiceAdminGroups: vi.fn(),
+      // Service-side resource-group self-service (#183 Phase 0): the detail
+      // view always mounts the section, so every test needs these. Default to
+      // "no reachable group" (the empty state) so tests that don't care about
+      // resource groups keep working unchanged.
+      serviceResourceGroups: vi.fn(async () => [] as ServiceResourceGroup[]),
+      joinServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+      leaveServiceResourceGroup: vi.fn(async () => ({ ok: true })),
     };
     Object.assign(fakeApi, opts.overrides ?? {});
 
@@ -296,6 +304,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         serviceTokens: vi.fn(async () => ({ data: [] })),
         setServiceAdminGroups: vi.fn(),
         updateService: vi.fn(),
+        // The detail view mounts the resource-group section (#183 Phase 0);
+        // the create-flow tests never open it, so inert stubs suffice.
+        serviceResourceGroups: vi.fn(async () => [] as ServiceResourceGroup[]),
+        joinServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+        leaveServiceResourceGroup: vi.fn(async () => ({ ok: true })),
       };
       render(
         <ToastProvider>
@@ -647,6 +660,101 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(dialog.getByRole('button', { name: t.serviceActionDelete }));
 
       await waitFor(() => expect(fakeApi.deleteService).toHaveBeenCalledWith('svc_del'));
+    });
+  });
+
+  describe(`ServicesView detail — resource-group self-service (#183) [${locale}]`, () => {
+    const reachable: ServiceResourceGroup[] = [
+      { id: 'rg-1', name: 'Alpha', member: true },
+      { id: 'rg-2', name: 'Beta', member: false },
+    ];
+
+    it('mounts the section between the admin-groups editor and the token panel', async () => {
+      const svc = makeService({
+        id: 'svc_rg',
+        admin_groups: [{ id: 'ag_default', name: 'Default Admin Group' }],
+        system_group_id: 'sg_default',
+        system_group_name: 'Default System Group',
+      });
+      const { fakeApi } = renderServicesView({
+        services: [svc],
+        overrides: { serviceResourceGroups: vi.fn(async () => reachable) },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const adminGroups = await screen.findByRole('region', {
+        name: t.serviceAdminGroupsSectionTitle,
+      });
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      const tokens = screen.getByRole('region', { name: t.serviceTokensTitle });
+
+      // DOM order: admin groups -> resource groups -> tokens.
+      expect(
+        adminGroups.compareDocumentPosition(resourceGroups) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        resourceGroups.compareDocumentPosition(tokens) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+
+      // Scoped to the opened service, listing each group with its member state.
+      await waitFor(() => expect(fakeApi.serviceResourceGroups).toHaveBeenCalledWith('svc_rg'));
+      expect(
+        (await within(resourceGroups).findByRole('switch', { name: 'Alpha' })) as HTMLInputElement,
+      ).toBeChecked();
+      expect(within(resourceGroups).getByRole('switch', { name: 'Beta' })).not.toBeChecked();
+    });
+
+    it('joins the opened service into a resource group from the detail view', async () => {
+      const svc = makeService({ id: 'svc_rg', name: 'Join Me' });
+      const { fakeApi } = renderServicesView({
+        services: [svc],
+        overrides: { serviceResourceGroups: vi.fn(async () => reachable) },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      fireEvent.click(await within(resourceGroups).findByRole('switch', { name: 'Beta' }));
+
+      await waitFor(() =>
+        expect(fakeApi.joinServiceResourceGroup).toHaveBeenCalledWith('svc_rg', 'rg-2'),
+      );
+      expect(fakeApi.leaveServiceResourceGroup).not.toHaveBeenCalled();
+    });
+
+    it('folds a refused load (a delegate the backend 404s) to the empty state and keeps the token panel', async () => {
+      const svc = makeService({
+        id: 'svc_rg_ro',
+        delegates: [
+          {
+            user_id: 'usr_token_delegate',
+            user_name: 'Token Delegate',
+            can_manage_settings: false,
+          },
+        ],
+      });
+      renderServicesView({
+        services: [svc],
+        role: 'user',
+        userId: 'usr_token_delegate',
+        overrides: {
+          serviceResourceGroups: vi.fn(async () => {
+            throw new Error('not found');
+          }),
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      expect(
+        await within(resourceGroups).findByText(t.serviceResourceGroupsEmpty),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.serviceTokenCreate })).toBeInTheDocument();
     });
   });
 

@@ -140,6 +140,14 @@ export type CreateServiceTokenResponse = {
   secret: string;
 };
 
+// One resource group a service MANAGER may enter their service into (#183
+// Phase 0, the service-side analogue of ServerResourceGroup): id + name +
+// whether the service is currently provisioned into it. Mirrors
+// portal.ServiceResourceGroupDTO. Drives the per-service "Resource groups"
+// join/leave section in ServicesView; never exposes any other target of the
+// resource group.
+export type ServiceResourceGroup = { id: string; name: string; member: boolean };
+
 export function servicesApi(fetcher: Fetcher) {
   return {
     // Service Accounts (Phase 1): admin-created, delegate-managed principals
@@ -202,6 +210,28 @@ export function servicesApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(
         fetcher,
         `/api/portal/services/${encodeURIComponent(serviceId)}/tokens/${encodeURIComponent(tokenId)}`,
+        { method: 'DELETE' },
+      ),
+    // Service-side resource-group self-service (#183 Phase 0, the analogue of
+    // the server-owner trio in api/servers.ts): a service MANAGER lists the
+    // resource groups they can reach (each with a `member` flag = the service
+    // is provisioned into it) and joins/leaves their service. Mirrors
+    // serverResourceGroups / joinResourceGroup / leaveResourceGroup exactly.
+    serviceResourceGroups: (serviceId: string) =>
+      request<{ data: ServiceResourceGroup[] }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups`,
+      ).then((r) => r.data),
+    joinServiceResourceGroup: (serviceId: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'PUT' },
+      ),
+    leaveServiceResourceGroup: (serviceId: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups/${encodeURIComponent(rgId)}`,
         { method: 'DELETE' },
       ),
   };
