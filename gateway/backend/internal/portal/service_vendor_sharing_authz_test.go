@@ -77,8 +77,9 @@ func requireAuthzOutcome(t *testing.T, label string, err error, want authzOutcom
 // flag, and one vendor account per share level, all owned by usr_va_owner.
 type vendorAuthzEnv struct {
 	*groupTestEnv
-	ag       UserGroupDTO
-	accounts map[string]routing.VendorAccount // keyed by share level
+	ag          UserGroupDTO
+	accounts    map[string]routing.VendorAccount // keyed by share level
+	discoverers *fakeVendorDiscoverers           // the vendor fetchers every operate call runs through
 }
 
 const vendorAuthzOwnerID = "usr_va_owner"
@@ -88,7 +89,7 @@ func newVendorAuthzEnv(t *testing.T) *vendorAuthzEnv {
 	e := &vendorAuthzEnv{groupTestEnv: newGroupTestEnv(t), accounts: map[string]routing.VendorAccount{}}
 	setVendorAccountsEnabled(t, e.svc, true)
 	installFakeVendorValidators(e.svc)
-	installFakeVendorDiscoverers(e.svc)
+	e.discoverers = installFakeVendorDiscoverers(e.svc)
 
 	e.createUser("usr_s", "system_admin")
 	e.createUser("usr_agowner", "admin")
