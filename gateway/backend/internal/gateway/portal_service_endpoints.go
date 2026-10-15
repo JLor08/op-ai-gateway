@@ -59,7 +59,9 @@ func (s *Server) handlePortalServices(w http.ResponseWriter, r *http.Request) {
 // handlePortalServiceItem dispatches every "/api/portal/services/{id}[/...]"
 // route (spec §7) after a single session-scope check: "/{id}" (single
 // service), "/{id}/tokens" (token collection), "/{id}/tokens/{tid}" (a single
-// token, delete-only), and "/{id}/tokens/{tid}/rotate" (rotate, post-only).
+// token, delete-only), "/{id}/tokens/{tid}/rotate" (rotate, post-only),
+// "/{id}/admin-groups" (linkage editor), and "/{id}/resource-groups[/{rgId}]"
+// (the service-side resource-group self-service).
 // Mirrors handlePortalServerItem/handlePortalTokenItem's path-parsing shape.
 func (s *Server) handlePortalServiceItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
@@ -84,6 +86,8 @@ func (s *Server) handlePortalServiceItem(w http.ResponseWriter, r *http.Request)
 		s.handlePortalServiceTokenRotate(w, r, token, id, parts[2])
 	case len(parts) == 2 && parts[1] == "admin-groups":
 		s.handlePortalServiceAdminGroups(w, r, token, id)
+	case len(parts) >= 2 && parts[1] == "resource-groups":
+		s.handlePortalServiceResourceGroups(w, r, token, parts)
 	default:
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServiceNotFound, msgServiceNotFound, ""))
 	}
@@ -222,6 +226,55 @@ func (s *Server) handlePortalServiceAdminGroups(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, dto)
 }
 
+// handlePortalServiceResourceGroups backs the service-side resource-group
+// self-service path (#183 Phase 0, spec §9a; the service analogue of
+// handlePortalServerResourceGroups):
+//
+//	GET    /api/portal/services/{id}/resource-groups        -> reachable groups + member flag
+//	PUT    /api/portal/services/{id}/resource-groups/{rgId} -> provision the service into the group (idempotent)
+//	DELETE /api/portal/services/{id}/resource-groups/{rgId} -> remove it (idempotent)
+//
+// parts[0] = service id, parts[1] = "resource-groups", parts[2] = rgId (item
+// paths). The service-manager + reachable-group gates and their 404-no-leak
+// errors live in the portal service; writePortalServiceResourceGroupError maps
+// them.
+func (s *Server) handlePortalServiceResourceGroups(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) {
+	serviceID := parts[0]
+	switch len(parts) {
+	case 2:
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		data, err := s.Portal.ServiceResourceGroups(r.Context(), token, serviceID)
+		if err != nil {
+			writePortalServiceResourceGroupError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": data})
+	case 3:
+		rgID := parts[2]
+		switch r.Method {
+		case http.MethodPut:
+			if err := s.Portal.AddServiceToResourceGroup(r.Context(), token, serviceID, rgID); err != nil {
+				writePortalServiceResourceGroupError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		case http.MethodDelete:
+			if err := s.Portal.RemoveServiceFromResourceGroup(r.Context(), token, serviceID, rgID); err != nil {
+				writePortalServiceResourceGroupError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		default:
+			w.Header().Set("Allow", http.MethodPut+", "+http.MethodDelete)
+			writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
+		}
+	default:
+		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeServiceNotFound, msgServiceNotFound, ""))
+	}
+}
+
 // handleServiceAdminGroupCandidates backs GET
 // /api/portal/service-admin-group-candidates: the admin-tier groups the
 // caller may create/link a service into (system scope -> every admin-tier
@@ -276,4 +329,21 @@ var portalServiceErrRows = []errRow{
 // the client (mirrors writePortalServerError/writePortalTokenError).
 func writePortalServiceError(w http.ResponseWriter, err error, defaultCode string) {
 	writeMappedError(w, err, portalServiceErrRows, http.StatusInternalServerError, defaultCode, "service request failed")
+}
+
+// portalServiceResourceGroupErrRows are writePortalServiceResourceGroupError's
+// rows: the two 404-no-leak gates of the service-side resource-group
+// self-service path -- the service-manager gate (portal.ErrServiceNotFound,
+// also what a stranger and an unknown service id get) and the reachable-group
+// gate (portal.ErrResourceGroupNotFound, also what a non-existent group id gets).
+var portalServiceResourceGroupErrRows = []errRow{
+	{err: portal.ErrServiceNotFound, status: http.StatusNotFound, code: portal.CodeServiceNotFound, msg: msgServiceNotFound},
+	{err: portal.ErrResourceGroupNotFound, status: http.StatusNotFound, code: portal.CodeResourceGroupNotFound, msg: msgResourceGroupNotFound},
+}
+
+// writePortalServiceResourceGroupError maps the service-side resource-group
+// self-service errors (see portalServiceResourceGroupErrRows); anything else is
+// a 500 service.resource_group_failed with a STATIC message, never err.Error().
+func writePortalServiceResourceGroupError(w http.ResponseWriter, err error) {
+	writeMappedError(w, err, portalServiceResourceGroupErrRows, http.StatusInternalServerError, "service.resource_group_failed", "service resource group request failed")
 }

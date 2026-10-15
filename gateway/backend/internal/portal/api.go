@@ -22,6 +22,7 @@ type API interface {
 	AddProjectGroups(context.Context, auth.Token, string, []string) error
 	AddProjectMembers(context.Context, auth.Token, string, []string) error
 	AddServerToResourceGroup(context.Context, auth.Token, string, string) error
+	AddServiceToResourceGroup(context.Context, auth.Token, string, string) error
 	AddUserToAdminGroup(context.Context, auth.Token, string, string, string) error
 	AdminOwnerCandidates(context.Context, auth.Token) ([]AdminOwnerCandidateDTO, error)
 	AgentTokenStatus(context.Context, auth.Token, string) (AgentTokenDTO, error)
@@ -166,6 +167,7 @@ type API interface {
 	RemoveProjectGroup(context.Context, auth.Token, string, string) error
 	RemoveProjectMember(context.Context, auth.Token, string, string) error
 	RemoveServerFromResourceGroup(context.Context, auth.Token, string, string) error
+	RemoveServiceFromResourceGroup(context.Context, auth.Token, string, string) error
 	RenameGroup(context.Context, auth.Token, string, string) (UserGroupDTO, error)
 	RenewCertificateNow(context.Context, auth.Token, string) error
 	ResolveGatewayPeerDNS(context.Context) (string, error)
@@ -192,6 +194,7 @@ type API interface {
 	ServerPerfHistory(context.Context, auth.Token, string, time.Duration) ([]routing.TelemetrySample, error)
 	ServerRuntimeReportView(context.Context, auth.Token, string) (ServerRuntimeReportViewDTO, error)
 	ServiceAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	ServiceResourceGroups(context.Context, auth.Token, string) ([]ServiceResourceGroupDTO, error)
 	SetBenchmarkOverrideLease(context.Context, string, BenchmarkOverrideLease) error
 	SetBenchmarkRuntimeSpecAdminState(context.Context, string, string, string) (RuntimeSpecDTO, error)
 	SetBenchmarkRuntimeSpecsAdminState(context.Context, []string, string, string) (BenchmarkSpecsOutcome, error)

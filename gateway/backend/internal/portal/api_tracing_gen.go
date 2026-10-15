@@ -95,6 +95,18 @@ func (_d *APIWithTracing) AddServerToResourceGroup(ctx context.Context, t1 auth.
 	return _d.API.AddServerToResourceGroup(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) AddServiceToResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddServiceToResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AddServiceToResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) AddUserToAdminGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddUserToAdminGroup")
 	defer span.End()
@@ -1636,6 +1648,18 @@ func (_d *APIWithTracing) RemoveServerFromResourceGroup(ctx context.Context, t1 
 	return _d.API.RemoveServerFromResourceGroup(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) RemoveServiceFromResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RemoveServiceFromResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RemoveServiceFromResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) RenameGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (u1 UserGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RenameGroup")
 	defer span.End()
@@ -1946,6 +1970,18 @@ func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 au
 		}
 	}()
 	return _d.API.ServiceAdminGroupCandidates(ctx, t1)
+}
+
+func (_d *APIWithTracing) ServiceResourceGroups(ctx context.Context, t1 auth.Token, s1 string) (sa1 []ServiceResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServiceResourceGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServiceResourceGroups(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) SetBenchmarkOverrideLease(ctx context.Context, s1 string, b1 BenchmarkOverrideLease) (err error) {

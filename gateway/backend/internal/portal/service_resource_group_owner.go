@@ -89,6 +89,23 @@ func (s *Service) resourceGroupForOwner(ctx context.Context, principal auth.Toke
 	return routing.ResourceGroup{}, ErrResourceGroupNotFound
 }
 
+// reachableResourceGroups lists the resource groups a self-service caller may
+// enter/leave something into/from: system scope -> every resource group;
+// anyone else -> the groups linked to >=1 admin group in memberGroups
+// (precomputed by memberAdminGroupIDs). It is the list-side counterpart of
+// resourceGroupForOwner (the same reach rule, applied to one id), shared by the
+// server-owner and the service-manager self-service paths.
+func (s *Service) reachableResourceGroups(ctx context.Context, principal auth.Token, memberGroups map[string]bool) ([]routing.ResourceGroup, error) {
+	if isSystem(principal) {
+		return s.routes.ResourceGroups(ctx)
+	}
+	ids := make([]string, 0, len(memberGroups))
+	for gid := range memberGroups {
+		ids = append(ids, gid)
+	}
+	return s.routes.ResourceGroupsByAdminGroups(ctx, ids)
+}
+
 // ServerOwnerResourceGroups lists the resource groups a server OWNER may enter
 // their server into: strict-owner gate on serverID, then the resource groups
 // linked to an admin group the owner is a MEMBER of AND sharing the server's
@@ -102,23 +119,9 @@ func (s *Service) ServerOwnerResourceGroups(ctx context.Context, principal auth.
 	if err != nil {
 		return nil, err
 	}
-	var groups []routing.ResourceGroup
-	if isSystem(principal) {
-		all, err := s.routes.ResourceGroups(ctx)
-		if err != nil {
-			return nil, err
-		}
-		groups = all
-	} else {
-		ids := make([]string, 0, len(memberGroups))
-		for gid := range memberGroups {
-			ids = append(ids, gid)
-		}
-		byGroup, err := s.routes.ResourceGroupsByAdminGroups(ctx, ids)
-		if err != nil {
-			return nil, err
-		}
-		groups = byGroup
+	groups, err := s.reachableResourceGroups(ctx, principal, memberGroups)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]ServerResourceGroupDTO, 0, len(groups))
 	for _, rg := range groups {
