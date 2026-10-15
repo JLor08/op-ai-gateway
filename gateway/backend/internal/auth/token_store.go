@@ -77,6 +77,10 @@ type Token struct {
 	// ClaudeModelAliases mirrors the token record's opt-in for the automatic
 	// Claude-compatible model aliases — see store.TokenRecord.
 	ClaudeModelAliases bool
+	// ClaudeEffortCompatibility mirrors the token record's opt-in for delivering
+	// Claude Code's effort to llama.cpp / vLLM as chat_template_kwargs — see
+	// store.TokenRecord.
+	ClaudeEffortCompatibility bool
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the

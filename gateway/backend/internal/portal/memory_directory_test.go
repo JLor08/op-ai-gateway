@@ -636,6 +636,88 @@ func TestMemoryDirectoryTokenClaudeModelAliasesCarryThrough(t *testing.T) {
 	}
 }
 
+// TestMemoryDirectoryTokenClaudeEffortCompatibilityCarryThrough proves the
+// memory driver carries the opt-in claude_effort_compatibility flag (#230) at
+// all three build sites, onto both the TokenRecord and the mirrored auth.Token
+// the bearer store hands back: CreatePlainToken (initial mirror),
+// UpdateTokenMetadata (selective copy-in + rebuilt mirror, flipped in BOTH
+// directions so a missing copy line cannot pass by leaving the create-time
+// value in place) and SetServiceTokensState (the wholesale service-token
+// rebuild, which would otherwise silently drop the flag the first time a
+// service is edited).
+func TestMemoryDirectoryTokenClaudeEffortCompatibilityCarryThrough(t *testing.T) {
+	ctx := context.Background()
+	tokens := auth.NewTokenStore()
+	dir := NewMemoryDirectory(tokens)
+	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+	dir.AddUser(store.User{ID: "usr_1", Email: "a@b.test", DisplayName: "A", Role: "user", Status: store.UserStatusActive, CreatedAt: now, UpdatedAt: now})
+
+	on := store.TokenRecord{
+		ID: "tok_on", UserID: "usr_1", Name: "on", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		ClaudeEffortCompatibility: true,
+	}
+	off := store.TokenRecord{
+		ID: "tok_off", UserID: "usr_1", Name: "off", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dir.CreatePlainToken(ctx, on, "on-sekret"); err != nil {
+		t.Fatalf("CreatePlainToken(on): %v", err)
+	}
+	if err := dir.CreatePlainToken(ctx, off, "off-sekret"); err != nil {
+		t.Fatalf("CreatePlainToken(off): %v", err)
+	}
+	if tok, ok := tokens.LookupBearer("Bearer on-sekret"); !ok || !tok.ClaudeEffortCompatibility {
+		t.Fatalf("after create, bearer(on) ok=%v ClaudeEffortCompatibility=%v, want true", ok, tok.ClaudeEffortCompatibility)
+	} else if tok.ClaudeModelAliases {
+		t.Fatalf("after create, bearer(on) leaked ClaudeEffortCompatibility into ClaudeModelAliases")
+	}
+	if tok, ok := tokens.LookupBearer("Bearer off-sekret"); !ok || tok.ClaudeEffortCompatibility {
+		t.Fatalf("after create, bearer(off) ok=%v ClaudeEffortCompatibility=%v, want false", ok, tok.ClaudeEffortCompatibility)
+	}
+	if got, err := dir.TokenByID(ctx, "tok_on"); err != nil || !got.ClaudeEffortCompatibility {
+		t.Fatalf("after create, TokenByID(on) err=%v ClaudeEffortCompatibility=%v, want true", err, got.ClaudeEffortCompatibility)
+	}
+	if got, err := dir.TokenByID(ctx, "tok_off"); err != nil || got.ClaudeEffortCompatibility {
+		t.Fatalf("after create, TokenByID(off) err=%v ClaudeEffortCompatibility=%v, want false", err, got.ClaudeEffortCompatibility)
+	}
+
+	on.ClaudeEffortCompatibility = false
+	on.UpdatedAt = now.Add(time.Minute)
+	off.ClaudeEffortCompatibility = true
+	off.UpdatedAt = now.Add(time.Minute)
+	if err := dir.UpdateTokenMetadata(ctx, on); err != nil {
+		t.Fatalf("UpdateTokenMetadata(on->off): %v", err)
+	}
+	if err := dir.UpdateTokenMetadata(ctx, off); err != nil {
+		t.Fatalf("UpdateTokenMetadata(off->on): %v", err)
+	}
+	if got, err := dir.TokenByID(ctx, "tok_on"); err != nil || got.ClaudeEffortCompatibility {
+		t.Fatalf("after update, TokenByID(on->off) err=%v ClaudeEffortCompatibility=%v, want false", err, got.ClaudeEffortCompatibility)
+	}
+	if got, err := dir.TokenByID(ctx, "tok_off"); err != nil || !got.ClaudeEffortCompatibility {
+		t.Fatalf("after update, TokenByID(off->on) err=%v ClaudeEffortCompatibility=%v, want true", err, got.ClaudeEffortCompatibility)
+	}
+	if tok, ok := tokens.LookupBearer("Bearer on-sekret"); !ok || tok.ClaudeEffortCompatibility {
+		t.Fatalf("after update, bearer(on->off) ok=%v ClaudeEffortCompatibility=%v, want false", ok, tok.ClaudeEffortCompatibility)
+	}
+	if tok, ok := tokens.LookupBearer("Bearer off-sekret"); !ok || !tok.ClaudeEffortCompatibility {
+		t.Fatalf("after update, bearer(off->on) ok=%v ClaudeEffortCompatibility=%v, want true", ok, tok.ClaudeEffortCompatibility)
+	}
+
+	svc := store.TokenRecord{
+		ID: "tok_svc", ServiceID: "svc_1", Kind: store.TokenKindService, Name: "S", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now,
+		ClaudeEffortCompatibility: true,
+	}
+	if err := dir.CreatePlainToken(ctx, svc, "svc-sekret"); err != nil {
+		t.Fatalf("CreatePlainToken(service): %v", err)
+	}
+	if err := dir.SetServiceTokensState(ctx, "svc_1", false, []string{"m1"}); err != nil {
+		t.Fatalf("SetServiceTokensState: %v", err)
+	}
+	if tok, ok := tokens.LookupBearer("Bearer svc-sekret"); !ok || !tok.ClaudeEffortCompatibility {
+		t.Fatalf("after SetServiceTokensState, bearer(service) ok=%v ClaudeEffortCompatibility=%v, want true", ok, tok.ClaudeEffortCompatibility)
+	}
+}
+
 // TestAuthorizeRunAsTokenCarriesVendorAccess pins that the run-as principal
 // (the token a portal chat request runs under) carries the token's vendor-access
 // policy, exactly as a bearer lookup of the same token would.
@@ -696,6 +778,48 @@ func TestAuthorizeRunAsTokenCarriesClaudeModelAliases(t *testing.T) {
 		}
 		if runAs.ClaudeModelAliases != tc.want {
 			t.Fatalf("run-as ClaudeModelAliases for %s = %v, want %v", tc.id, runAs.ClaudeModelAliases, tc.want)
+		}
+	}
+}
+
+// TestAuthorizeRunAsTokenCarriesClaudeEffortCompatibility pins that the run-as
+// principal (the token a portal chat request runs under) carries the token's
+// opt-in claude_effort_compatibility flag (#230), exactly as a bearer lookup of
+// the same token would. AuthorizeRunAsToken assembles the auth.Token field by
+// field from the record, so a dropped field reads as false -- the plausible
+// "off" value -- and portal chat under a flag-enabled token would silently skip
+// the effort delivery. Both polarities are asserted so neither a dropped field
+// nor a hard-coded true can pass, and ClaudeModelAliases stays off throughout
+// (the two settings are independent).
+func TestAuthorizeRunAsTokenCarriesClaudeEffortCompatibility(t *testing.T) {
+	ctx := context.Background()
+	dir := NewMemoryDirectory(auth.NewTokenStore())
+	now := time.Now().UTC()
+	_ = dir.CreateUser(ctx, store.User{ID: "usr_1", Email: "u1@example.test", DisplayName: "U1", Role: "user", Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now})
+	for _, rec := range []store.TokenRecord{
+		{ID: "tok_cec_on", UserID: "usr_1", Name: "on", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now, ClaudeEffortCompatibility: true},
+		{ID: "tok_cec_off", UserID: "usr_1", Name: "off", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := dir.CreatePlainToken(ctx, rec, "secret-"+rec.ID); err != nil {
+			t.Fatalf("create token %s: %v", rec.ID, err)
+		}
+	}
+	svc := NewService(ServiceDeps{Users: dir, Tokens: dir})
+	principal := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
+
+	for _, tc := range []struct {
+		id   string
+		want bool
+	}{{"tok_cec_on", true}, {"tok_cec_off", false}} {
+		runAs, err := svc.AuthorizeRunAsToken(ctx, principal, tc.id)
+		if err != nil {
+			t.Fatalf("AuthorizeRunAsToken(%s): %v", tc.id, err)
+		}
+		if runAs.ClaudeEffortCompatibility != tc.want {
+			t.Fatalf("run-as ClaudeEffortCompatibility for %s = %v, want %v", tc.id, runAs.ClaudeEffortCompatibility, tc.want)
+		}
+		if runAs.ClaudeModelAliases {
+			t.Fatalf("run-as ClaudeModelAliases for %s = true, want false (independent setting)", tc.id)
 		}
 	}
 }

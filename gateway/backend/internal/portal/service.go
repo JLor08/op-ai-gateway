@@ -4821,6 +4821,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
+		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
