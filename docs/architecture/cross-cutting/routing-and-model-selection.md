@@ -306,20 +306,21 @@ it is not.
 Before the resolver sees anything, the edge decides **which name to resolve**.
 `inferencePreflight` (`internal/gateway/inference_handlers.go`) is the single
 place that happens — once per client request, for the translate handlers and
-for native passthrough alike — and it walks a four-step chain:
+for native passthrough alike — and it walks a five-step chain:
 
 | # | Step | Source | Applies when |
 |---|---|---|---|
 | 1 | Exact override row | `token.ModelOverrideRules[requested].To` | the token has a row for exactly this requested name |
-| 2 | Catch-all override | `token.ModelOverride` | no row matched and the catch-all is set |
-| 3 | Unknown-model redirect | `token.LastUsedModel`, then `token.UnknownModelFallback` | the token opted in **and** the name steps 1–2 produced does not apply (below) |
-| 4 | — | — | nothing claimed the name: the request keeps it and fails exactly as it would without the redirect |
+| 2 | Generated Claude alias | `Service.ClaudeAliasTarget` (the token's generated `anthropic-local-<hash>` aliases, [§2.4](#24-generated-claude-model-aliases)) | the token has the `claude_model_aliases` setting, no row matched, and the requested id is one of its generated aliases |
+| 3 | Catch-all override | `token.ModelOverride` | no row matched, no generated alias matched and the catch-all is set |
+| 4 | Unknown-model redirect | `token.LastUsedModel`, then `token.UnknownModelFallback` | the token opted in **and** the name steps 1–3 produced does not apply (below) |
+| 5 | — | — | nothing claimed the name: the request keeps it and fails exactly as it would without the redirect |
 
-Steps 1–2 are `resolveModelOverride`; step 3 is `redirectUnknownModel`
+Steps 1–3 are `resolveModelOverride`; step 4 is `redirectUnknownModel`
 (`internal/gateway/inference_redirect.go`). For a request that requires a
 capability — today the two image endpoints, `/v1/images/generations`, which
 requires `image`, and `/v1/images/edits`, which requires the derived `image_edit`
-(§2.3) — step 3
+(§2.3) — step 4
 takes a `LastUsedModel` or fallback only when that name also carries every
 required capability (`ModelOffering.Capable`, §2.2). A candidate without it is
 skipped and the chain moves on, because the capability gate would refuse it
@@ -327,8 +328,8 @@ right after, with a 404 `routing.model_not_capable` about a model the client
 never named. So an images request for an unknown name is served by an
 image-capable fallback, and answers 404 `routing.no_model_route` for its own
 name when neither candidate carries `image` (an edit: `image_edit`, which an
-operator's opt-out removes from a model that still generates). Step 3 judges the **effective**
-name steps 1–2 produced, so an override that already resolves to a usable
+operator's opt-out removes from a model that still generates). Step 4 judges the **effective**
+name steps 1–3 produced, so an override that already resolves to a usable
 model ends the chain there. The catch-all has no requested name of its own —
 it is a single string, not a row — and therefore carries none of the per-row
 listing switches (`offer`/`hide_target`, see
@@ -338,7 +339,9 @@ listing switches (`offer`/`hide_target`, see
 flowchart TD
     Req["client's requested model\n(inferencePreflight)"] --> Row{"exact override row\nfor this name?"}
     Row -->|yes| Eff["effective model"]
-    Row -->|no| Catch{"catch-all\nModelOverride set?"}
+    Row -->|no| Alias{"generated Claude alias\nof this token?\n(claude_model_aliases, §2.4)"}
+    Alias -->|"yes: its real target,\nresolved once"| Eff
+    Alias -->|no| Catch{"catch-all\nModelOverride set?"}
     Catch -->|yes| Eff
     Catch -->|no| Eff
     Eff --> Opt{"UnknownModelRedirect\nopted in?"}
@@ -360,7 +363,7 @@ this document reserves *admission* for the CP4 capacity queue in
 other side of `Resolve` — see [Compatibility & Inference
 §13](compatibility-and-inference.md#13-errors) for why the distinction is
 operator-visible.) The redirect changes *which* name is requested,
-never *what* a token may reach. That is why step 3 sits where it does — before
+never *what* a token may reach. That is why step 4 sits where it does — before
 `applyServerOverride`, `modelAllowed`, and `admitPrincipal`, not after them —
 and why it is never terminal: with nothing usable to redirect onto, the
 request keeps its model and produces the same error it always did.
@@ -396,7 +399,7 @@ redirect each of these answers a 404:
 | `/v1/messages` | an agent child whose spec lacks `anthropic` | `messages.endpoint_disabled` |
 | `/v1/images/generations`, `/v1/images/edits` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict (for an edit: without the derived `image_edit`) |
 
-An override that targets such a child counts the same way, because step 3
+An override that targets such a child counts the same way, because step 4
 judges the effective name. A **messages-disabled** model — its effective
 messages mode `disabled`, on an ordinary application, on an agent child's spec
 or through that child's application fallback, or a group of only such members
@@ -532,7 +535,7 @@ the redirect's questions with deliberately distinct per-flavor sets.
 Confusing them produces a wrong redirect. The **listing** is in the table for
 contrast only — it is not part of `ModelOffering`:
 
-| Set | Question it answers | Per-token reach | `hidden` names | `locked` names | override aliases |
+| Set | Question it answers | Per-token reach | `hidden` names | `locked` names | aliases (override and generated, §2.4) |
 |---|---|---|---|---|---|
 | `Callable` | what this token can route to directly: the names that pass the flavor rule's **served** rule | applied | **kept** | dropped | not applied |
 | `Capable` | which of those carry every capability the request requires | applied | kept | dropped | not applied |
@@ -581,9 +584,11 @@ edit. The flavor cannot answer this by itself:
 flavor — its application and, for an agent-launched model with a spec, the
 spec too — whatever its verdict. A required capability with no fold
 leaves `Capable` empty, so nothing is a candidate. The listing is neither a subset nor a superset of
-`Callable`: it loses the suppressed names and gains the token's own aliases,
-which are rewritten before routing and are therefore not routable names — so it
-answers no question the redirect asks. `ModelOffering` carried an `Offered`
+`Callable`: it loses the suppressed names and gains the token's own aliases (its
+manual override aliases and its generated Claude aliases,
+[§2.4](#24-generated-claude-model-aliases)), which are rewritten before routing
+and are therefore not routable names — so it answers no question the redirect
+asks. `ModelOffering` carried an `Offered`
 field mirroring it until that field was found to have no reader in production;
 it was removed rather than kept as a second, cost-bearing copy of an answer the
 discovery endpoints already give. The visibility matrix on `Service.Models`
@@ -872,6 +877,111 @@ refresh rewrites the row it just read with only those two timestamps advanced �
 `ApplicationID`/`ServerID`/`ExpiresAt` unchanged, and `LastUsedAt` is never
 read for a routing decision anywhere in the backend. That is why the refresh is
 not one of the two guarded writes in §4.
+
+### 2.4 Generated Claude model aliases
+
+A token with the `claude_model_aliases` setting is offered each eligible local
+model or group under a neutral `anthropic-local-<hash>` id, and a request that
+names such an id reaches the real target. This section is the **routing** side:
+which names are eligible, and where resolution sits in the chain of §2.1. The
+alias id, its hash and filter-safe fallback, the collision policy and the
+discovery metadata are [API Compatibility & Inference
+§9.1](compatibility-and-inference.md#91-generated-claude-model-aliases); the
+setting itself is a plain per-token boolean, default off, documented with the
+other token fields in [Security, Authentication & Authorization
+§4](security-auth-rbac.md#4-bearer-api-tokens).
+
+**One derivation feeds both discovery and resolution**
+(`internal/portal/claude_aliases.go`), so a listed alias and a resolvable alias
+cannot disagree. It starts from the token's **alias-free listing**: the per-name
+flavor map after the group overlay and the `model_settings` suppression but
+**before** any alias of either kind, so it holds only real model and group
+identities that are offered to this token. Generated aliases are therefore never
+derived from a manual override alias or from another generated alias. A name in
+that listing gets an alias when every one of these holds:
+
+- **It is local.** The listing is composed only of mapping views — an AI
+  server's application, which can only be one of the on-prem application types —
+  and of the model groups over them. A vendor-account model, an Anthropic
+  account's included, is no mapping view and never appears in it. Locality
+  follows from that composition, never from a display label.
+- **It serves the Anthropic Messages flow, natively or through the translate
+  path.** `anthropic` is among its flavors, which already is
+  `routing.MappingServesAPIFlavor` (§2.2): the application declares the flavor,
+  the effective flavors list it and the effective messages mode is not
+  `disabled`; a group holds the union over its offerable members. That one test
+  drops an images-only name, an `openai`-only name and a Messages-disabled name.
+- **It is offered to this token.** A name hidden or locked by `model_settings`
+  is already out of the listing, so it gets no alias — also when it is only a
+  member of a listed group, whose own alias stays and whose row names the group
+  alone. A group that is hidden, locked or has no offerable member is out too.
+- **No manual rule governs it.** A name a `model_override_map` row is keyed on,
+  or one a row hides with `hide_target`, gets no alias: an alias onto the
+  unrewritten model would disagree with the rule, and an alias's
+  `original_model_id` would reveal a target the rule keeps out of this token's
+  discovery on purpose.
+- **No vendor account of the token also serves the name.** Under `vendor_first`
+  a vendor account is tried before the self-hosted route, so an alias onto a name
+  the vendor serves would dispatch to the vendor model. The exclusion does not
+  look at the vendor mode, so it also applies under `fallback_only`, where the
+  name would resolve locally: the mode is runtime-configurable and could flip
+  between discovery and a later resolution, and dropping the alias is the safe
+  direction.
+
+**It fails closed.** When the group and visibility overlay cannot be loaded,
+the listing fails open (no groups, no hidden or locked suppression) so it never
+blanks, but the derivation does not: it cannot tell a hidden model from a shown
+one, and an alias would reveal what the operator hid. On the resolution side a
+store error likewise yields no aliases. A token without the setting derives
+nothing, and neither does the token-less portal session principal.
+
+**Precedence.** Step 2 of §2.1 is one function, `resolveModelOverride`
+(`internal/gateway/inference_handlers.go`), and its order is:
+
+1. an explicit `model_override_map` row for the requested id, with a non-blank
+   target;
+2. a **generated alias**, only for a token with the setting;
+3. the catch-all `model_override`;
+4. the requested name unchanged, which the unknown-model redirect then judges as
+   before.
+
+- **A manual rule always wins.** A row keyed on the alias id beats the alias, and
+  the derivation skips such an id, so no generated metadata claims a different
+  target.
+- **Single resolution, no alias-of-alias.** The alias is looked up once, by the
+  *requested* id, and its result — a real gateway id — is returned as it is:
+  neither a rule nor the catch-all is applied to it afterwards, and the targets
+  come from the alias-free listing, so an alias can never chain into another
+  name.
+- **A resolvable alias is exactly an offered one.** The gateway reaches the
+  derivation through `Service.ClaudeAliasTarget` (a `portal.API` method), which
+  answers from the same derivation the listings use. An alias a manual rule owns,
+  a real name, an ambiguous one, or one whose target is hidden, locked or no
+  longer Messages-capable does not resolve.
+- **Every gate judges the target.** `inferencePreflight` resolves the alias
+  before any gate, so the service-token allowlist, locked models, the server
+  override, resource-group provisioning, the capability checks, the principal's
+  rate, quota and budget limits and the unknown-model redirect all see the
+  **effective** name. `RequestedModel` keeps the alias the client sent, so the
+  usage event records both, as it does for a manual override. As everywhere, the
+  allowlist restricts invocation, not discovery (§2.2).
+- **Disabling is immediate and total.** Switching the setting off removes the
+  generated rows and the generated resolution together, while the manual rules
+  stay as they were. A disabled, removed or stale alias then follows the existing
+  unknown-model behavior — it fails like any other unknown name, or is redirected
+  when the token opted in — with no secret fallback and no reuse of the alias for
+  another model.
+- **Another token gains nothing.** An alias id is a pure function of the gateway
+  id, so a second token can compute it, but the alias map is derived from the
+  *calling* token's own offered listing: for a model that token is not offered,
+  the alias does not exist.
+
+**Cost.** A token without the setting pays one boolean test and no store work.
+An opted-in token pays for a derivation only when the requested id starts with
+`anthropic-local-` (every ordinary model name returns before deriving anything),
+and then, uncached, one mapping traversal, one group-overlay load, one
+runtime-spec read per `server_agent` application and the vendor-model read —
+the profile of `ModelOfferingFor` (§2.1).
 
 ## 3. Candidate scoring
 

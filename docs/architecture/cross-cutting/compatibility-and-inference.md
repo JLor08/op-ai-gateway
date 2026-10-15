@@ -1337,9 +1337,9 @@ client lacks it answers `provider.unavailable`
 
 | Endpoint | Shape | Filtering |
 |---|---|---|
-| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway","capabilities":{"vision","image","image_edit","trained_for_tool_use"},"context_length"?}]}` — `context_length` is omitted when the window is unknown; `capabilities` is always present | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai` (`openAIModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "openai")` lists |
-| `GET /anthropic/v1/models` | Anthropic `{"data":[{"id","type":"model","display_name","created_at"}]}` | `Portal.ModelsForFlavor(token, "anthropic")` |
-| `GET /api/v1/models`, `/openai/api/v1/models` | LM Studio v2 `{"models":[{"type":"llm","key","display_name","max_context_length","loaded_instances":[{"config":{"context_length"}}],"capabilities":{"vision","image","image_edit","trained_for_tool_use"}}]}` — `max_context_length` is always present | the same `openAIModelDTOs` rows as `/v1/models`, so it lists exactly the same names |
+| `GET /v1/models`, `/openai/v1/models` | OpenAI `{"object":"list","data":[{"id","object":"model","owned_by":"op-ai-gateway","capabilities":{"vision","image","image_edit","trained_for_tool_use"},"context_length"?,"original_model_id"?,"display_name"?}]}` — `context_length` is omitted when the window is unknown; `capabilities` is always present; `original_model_id` and `display_name` appear on a [generated Claude alias row](#91-generated-claude-model-aliases) only | `Portal.Models(token)`, kept to the rows whose `flavors` contain `openai` (`openAIModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "openai")` lists |
+| `GET /anthropic/v1/models` | Anthropic `{"data":[{"id","type":"model","display_name","created_at","original_model_id"?}]}` — `display_name` is the id, except on a generated Claude alias row, where it is the honest label and `original_model_id` is present | `Portal.Models(token)`, kept to the rows whose `flavors` contain `anthropic` (`anthropicModelDTOs`) — exactly the names `Portal.ModelsForFlavor(token, "anthropic")` lists |
+| `GET /api/v1/models`, `/openai/api/v1/models` | LM Studio v2 `{"models":[{"type":"llm","key","display_name","max_context_length","loaded_instances":[{"config":{"context_length"}}],"capabilities":{"vision","image","image_edit","trained_for_tool_use"},"original_model_id"?}]}` — `max_context_length` is always present; `original_model_id` appears on a generated Claude alias row only | the same `openAIModelDTOs` rows as `/v1/models`, so it lists exactly the same names |
 
 `ModelsForFlavor` (`internal/portal/service.go`) returns the sorted gateway
 model names that have at least one **active** mapping that passes the served
@@ -1347,14 +1347,18 @@ rule for that flavor (below), or for a group an offerable member that does,
 filtered to what the calling principal may see under
 resource-group provisioning visibility — the list is intentionally **not**
 filtered by a service token's model allowlist (discovery is unrestricted;
-invocation is gated separately, §3/§6). It is the source of
-`/anthropic/v1/models`; the two `openai` listings read the richer `Models()`
-rows instead (next paragraph), and a test pins their ids to
-`ModelsForFlavor(token, "openai")`. With no routing store configured, all
-three fall back to two fixed seed model names so a fresh/dev instance always
-answers something. The seeds are text models: they carry `anthropic` and
-`openai` and never `openai_images` (`seedAPIFlavors`, kept apart from the
-listing's own flavor set on purpose).
+invocation is gated separately, §3/§6). It is the ids-only **reference** of
+the per-flavor listings, not their production source: all three HTTP listings
+read the richer `Models()` rows (next paragraph), narrowed by flavor —
+`openAIModelDTOs` for the two `openai` listings, `anthropicModelDTOs` for
+`/anthropic/v1/models` — because only a row carries the metadata of a generated
+Claude alias ([§9.1](#91-generated-claude-model-aliases)); tests pin each
+listing's ids to `ModelsForFlavor` for the same token and flavor, in order.
+With no routing store configured, all three fall back to two fixed seed model
+names so a fresh/dev instance always answers something (and no generated alias,
+which needs the routing views). The seeds are text models: they carry
+`anthropic` and `openai` and never `openai_images` (`seedAPIFlavors`, kept apart
+from the listing's own flavor set on purpose).
 
 **The two `openai` listings carry the model's context window.**
 `/v1/models` and `/api/v1/models` both list from `Portal.Models(token)` narrowed
@@ -1413,8 +1417,9 @@ offered for chat would fail.
 
 **Every listing's flavors follow the rule dispatch follows.** A model's
 `flavors`, and the per-flavor filters behind the listings — `/anthropic/v1/models`
-through `ModelsForFlavor`, `/v1/models` and `/api/v1/models` through the
-`openai`-flavored `Models()` rows (`openAIModelDTOs`) — hold the flavors under
+through the `anthropic`-flavored `Models()` rows (`anthropicModelDTOs`),
+`/v1/models` and `/api/v1/models` through the `openai`-flavored ones
+(`openAIModelDTOs`), all pinned to `ModelsForFlavor` — hold the flavors under
 which at least one of its mappings passes the served rule ([Routing & Model Selection
 §2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither),
 [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)):
@@ -1432,9 +1437,10 @@ application's spec read fails, its models take the application's flavors and
 messages mode for as long as the read fails (fail-open, like every listing),
 while their `image` stays false. `/v1/models` and `/api/v1/models` keep only the
 portal rows whose `flavors` contain `openai` (the v2 listing types each
-`"llm"`); because the portal listing and the per-flavor sets apply the same
-views, group overlay, suppression and override aliases, the two list exactly the
-same names, groups and aliases included.
+`"llm"`), `/anthropic/v1/models` only those that contain `anthropic`; because the
+portal listing and the per-flavor sets apply the same views, group overlay,
+suppression and override aliases, each lists exactly the names `ModelsForFlavor`
+returns for its flavor, groups and aliases included.
 
 **A name that no flavor serves keeps its row, with `flavors: []`.** No mapping
 of it, and for a group no offerable member, passes the served rule for any
@@ -1476,6 +1482,10 @@ and the portal's own Models view; it is never applied to the admin management
 surface (`ManageModels`), which shows the system's real models rather than one
 token's aliases.
 
+A second, automatic overlay exists for a token with the `claude_model_aliases`
+setting: its *generated* Claude aliases, which no rule configures
+([§9.1](#91-generated-claude-model-aliases)).
+
 **This is a display, never an access control.** A target hidden by
 `hide_target` stays fully callable under its real name — the three sets that
 keep listing and reach apart are
@@ -1505,6 +1515,130 @@ DTO carries no agent-launched marker and no member list. The column's text
 filter matches the displayed label. A name that mixes an image-capable mapping
 with one lacking a verdict hides `openai_images`, although the capable one
 would serve — the same fail-closed AND the chat and the redirect use.
+
+### 9.1 Generated Claude model aliases
+
+A token that opts in with the `claude_model_aliases` setting (a plain boolean,
+**off by default**, on user and service tokens alike — [Security, Authentication
+& Authorization §4](security-auth-rbac.md#4-bearer-api-tokens)) is offered each
+eligible local model or group a second time, under a neutral
+`anthropic-local-<hash>` id, **in addition to** the real one. The aim is a
+Claude client that cannot select the real id. Claude Desktop 2.37337.1 and
+Claude Code 2.1.295 (macOS, checked 2026-10-15) filter a discovered model's
+`id` and reject several non-Anthropic family markers such as `qwen` and `gpt`,
+while accepting `anthropic-local-556f772a70b1`; they do not scan `display_name`,
+a label override or unknown extension attributes for those names, and they
+discard unknown discovery attributes they do not use. That is an observation of
+the tested client versions, not a documented Anthropic guarantee, which is why
+the feature stays opt-in and its labels stay truthful. It is **naming,
+discovery and routing only**: it does not make an incompatible backend
+Anthropic-compatible, promises no tool support per model, and does not
+configure the client's per-model context, vision or reasoning controls.
+
+**The alias id.** `anthropic-local-` followed by the first 12 lowercase
+hexadecimal characters of the SHA-256 of the UTF-8 **gateway model or group
+id** (`GatewayModelName`, or the group name), so `qwen3.8-fast-loaded` becomes
+`anthropic-local-556f772a70b1`. The hash input is never the upstream
+application model name, a display label, a list position, the loaded state or
+the group member currently serving, so an alias is stable across list
+reordering, restarts, metadata changes, load and unload events and group
+membership changes; a gateway id that is renamed is a new identity and gets a
+new alias. Aliases are **computed from the token's current offering on every
+use** and never written into the token's `model_override_map`: a new eligible
+model appears, a removed one disappears, and the operator's manual rules are
+untouched (`internal/portal/claude_aliases.go`).
+
+**The filter-safe fallback stays hexadecimal.** If the 12-character window
+makes the id contain an entry of the denylist of client-blocked family markers
+(`abab`, `qwen`, `gpt`, `llama`, `mistral`, `gemini`, `deepseek`; only `abab`
+is expressible in hex, so only it can ever trigger this), the window **slides**
+along the 64-character digest (offset 0, 1, 2, …) and the first window whose
+whole alias id contains none of them is used; there is no switch to another
+encoding. A digest with no clean window (astronomically unlikely) skips the
+alias with a diagnostic, like a collision. The encoding — the prefix, the
+hash, the window length and order, and the hex-expressible denylist entries —
+is a **compatibility contract**: clients persist alias ids, so changing any of
+it renames existing aliases, and adding a hex-expressible denylist entry
+renames the aliases whose window contains it. A unit test pins the canonical
+example and the slide.
+
+**Collisions are deterministic, never silent.** Two distinct gateway ids that
+derive the same alias id are **both skipped**, so one alias is never routed to
+two targets. An alias id equal to a real model or group name of the token's
+view, a model name one of the token's vendor accounts serves, or a key of its
+manual `model_override_map` is skipped as well: the real identity or the manual
+rule wins, and no generated metadata is published for it. Each skip logs a
+`portal: generated Claude alias skipped` warning naming the reason.
+
+**What a generated row looks like.** A row is the target's row filed under the
+alias id, built like an `offer` override alias that never hides its target: the
+flavors from the pre-suppression composition, the loaded and offered state, the
+context size, `vision`/`image`/`image_edit` and the group flag are the
+target's, copied rather than invented — a capability the target does
+not state stays unstated, and an id that starts with `anthropic` implies
+nothing. Because the flavors are the target's, an alias follows the listings
+its target is in: a model served under both `openai` and `anthropic` has its
+alias on `/v1/models`, `/api/v1/models` and `/anthropic/v1/models`, while an
+`anthropic`-only model's alias appears on `/anthropic/v1/models` alone — an
+Anthropic-only alias is not pushed into the OpenAI chat listing to populate a
+Claude picker. The overlay runs on the usage listings (`Models()` and
+`ModelsForFlavor()`) after the manual override-alias overlay, and **never** on
+the admin management view (`ManageModels`, `?manage=1`), which keeps showing the
+system's real models. The portal session principal gets none (the setting lives
+on a token), so the portal chat picker shows no alias. Which models are eligible
+is [Routing & Model Selection
+§2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).
+
+**The discovery metadata contract.** A generated alias row — and only such a
+row — carries two keys that a listing serializes as **top-level siblings of
+`capabilities`**, neither nested nor under a vendor namespace
+(`addClaudeAliasMetadata`, `internal/gateway/server.go`, the one helper all
+three listings call):
+
+| Key | Value |
+|---|---|
+| `original_model_id` | the real gateway model or group id the alias resolves to |
+| `display_name` | the honest label: the target's own listing label, which today is its gateway id (a model has no display name of its own and a group is labelled by its id too) — never a Claude product name |
+
+On `/v1/models` and `/openai/v1/models` the two keys are added next to
+`capabilities`, where an ordinary row has no `display_name` at all;
+`/api/v1/models` already writes `display_name` on every row and adds
+`original_model_id`; `/anthropic/v1/models` keeps its response shape and
+required fields (`id`, `type`, `display_name`, `created_at`, where an ordinary
+row's `display_name` is its id) and adds the same two. A **manual** override
+alias row never carries `original_model_id`: a manual alias may intentionally
+hide its target, so it never says what it points to. The portal's own models
+API serializes the same field (`original_model_id`, omitted when empty) for a
+bearer token with the setting, and the `loading_on_count` the gateway injects
+into that listing takes the target's count for such a row.
+
+**Resolution** is the other half: a client that sends a generated alias as its
+`model` reaches the real target through the shared preflight, once, with the
+explicit manual rule still winning and every access check judging the target
+([Routing & Model Selection
+§2.4](routing-and-model-selection.md#24-generated-claude-model-aliases)). No
+response-model rewriting is added for aliases; the tested clients accept a served
+model id that differs from the requested alias.
+
+**The external sync contract.** With only an inference token and no
+token-management API, a config-sync script can fetch `/anthropic/v1/models`,
+recognize the alias rows by `original_model_id`, write one Claude Desktop
+`inferenceModels` entry per row with `name` = the row's `id` and `labelOverride`
+= its `display_name` (falling back to `original_model_id`), leave genuine
+Anthropic entries unchanged and omit the duplicate original local entries, with
+`modelDiscoveryEnabled: false`. For the row
+
+```json
+{"id": "anthropic-local-556f772a70b1", "type": "model", "display_name": "qwen3.8-fast-loaded",
+ "created_at": "2026-07-09T00:00:00Z", "original_model_id": "qwen3.8-fast-loaded"}
+```
+
+the entry is `{"name": "anthropic-local-556f772a70b1", "labelOverride":
+"qwen3.8-fast-loaded"}`. Shape and names follow the Claude Desktop version
+tested; installing, scheduling or distributing such a script is out of scope
+here — the gateway provides the contract above. Genuine Anthropic model ids are
+never aliased or altered: a vendor-account model, an Anthropic account's
+included, is not a mapping view and never receives an alias.
 
 ## 10. Request bodies and size limits
 

@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 87 migrations in order, same as
+- **Only-pending.** A fresh install runs all 88 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -190,6 +190,27 @@ Rules that keep this safe over time:
   is pure `CREATE TABLE`/`INDEX`.
 - **Transactional per migration** (the `rawUp` case still commits its DDL
   and bookkeeping atomically).
+- **An opt-in flag is one `integer not null default 0` column, and the
+  `default` is the backfill.** Migration 88 (`token_claude_model_aliases`) adds
+  `api_tokens.claude_model_aliases` through `addColumnIfMissing`, the shape the
+  `unknown_model_redirect` flags of migration 63 use. The `default 0` makes the
+  same `ALTER` backfill every existing token to *off*, so there is no separate
+  data step and the upgrade changes no token's behavior; a boolean is an integer
+  on both dialects (the wide types of [§4](#4-the-postgres-narrow-type-rule) are
+  about numeric widths, not flags), and `sanitizeArgs` writes the `0`/`1`. The
+  column is one more name at every token site: the insert column list,
+  `tokenColumns`, `UpdateTokenMetadata`'s `SET`, `scanToken` (read as
+  `int64 != 0`) and `LookupBearer`'s `auth.Token` assembly, mirrored by the four
+  places the memory driver builds a token record or bearer entry. The one site
+  that is not a store at all is `portal.Service.AuthorizeRunAsToken`, which
+  copies the record onto the run-as principal **field by field**: a field it does
+  not copy reads as `false`, the plausible "off", and a flagged token would
+  silently resolve without its setting through the portal chat while a bearer
+  lookup of the same token honored it. `TestMigration88AddsTokenClaudeModelAliases`
+  runs the migration against a genuine v87 database that holds a token and pins
+  the column shape, the pre-upgrade token reading back *off*, and an idempotent
+  replay, on both dialects; the migration-40 rebuild test re-applies the column
+  next to the other later `api_tokens` columns it already re-applies.
 - **Split a feature's DDL along rollback lines, not for tidiness.** The
   agent-managed runtime arrived as three migrations —
   65 `agent_runtime_manager` (specs, spec GPUs, co-residency),
@@ -602,4 +623,4 @@ itself is never returned to a client.
 ## See also
 
 - [Data Model (Reference)](../reference/data-model.md) — the concrete
-  tables, the domain types they back, and the full 71-migration history.
+  tables, the domain types they back, and the full migration history.

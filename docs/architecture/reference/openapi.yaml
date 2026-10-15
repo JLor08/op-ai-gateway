@@ -246,7 +246,11 @@ paths:
         unfiltered by a service token's own allowlist but IS filtered by
         resource-group provisioning visibility. Each entry carries the
         model's usable context window as `context_length` when it is known;
-        the field is omitted, never 0, when no mapping reports one. Alias:
+        the field is omitted, never 0, when no mapping reports one. A token
+        with the claude_model_aliases setting also sees its generated Claude
+        alias rows (`anthropic-local-<hash>` ids), which alone carry
+        original_model_id and the honest display_name as siblings of
+        `capabilities` (see the OriginalModelId schema). Alias:
         /openai/v1/models.
       security: [{ bearerAuth: [] }]
       responses:
@@ -272,10 +276,19 @@ paths:
     get:
       tags: [inference]
       summary: Anthropic-shaped model listing
-      description: Bearer-only, scope `gateway:use`.
+      description: >
+        Bearer-only, scope `gateway:use`. Lists the models offered under the
+        `anthropic` flavor. A token with the claude_model_aliases setting also
+        sees its generated Claude alias rows (`anthropic-local-<hash>` ids),
+        whose display_name is the honest label and which alone carry
+        original_model_id (see the OriginalModelId schema).
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The models offered under the `anthropic` flavor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnthropicModelList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /api/v1/models:
     get:
@@ -287,7 +300,8 @@ paths:
         Bearer-only (scope `gateway:use` or `llm:invoke`), and it lists
         exactly the names /v1/models lists. Unlike /v1/models,
         `max_context_length` is always present (0 when the window is
-        unknown). Alias: /openai/api/v1/models (there is no /anthropic/
+        unknown). A generated Claude alias row alone carries
+        original_model_id. Alias: /openai/api/v1/models (there is no /anthropic/
         variant). LM Studio's earlier /api/v0/models is not served and
         answers 404.
       security: [{ bearerAuth: [] }]
@@ -475,7 +489,11 @@ paths:
       vendor_access policy (see the TokenVendorAccess schema): which of the
       owner's vendor ("Anbieter") accounts the token may use. Strict opt-in:
       a token without the field has NO vendor access. The same field is
-      writable on create and update and readable on the list.
+      writable on create and update and readable on the list. A token also
+      carries the opt-in claude_model_aliases flag (default false, always
+      present on a read): when true, its eligible local models and groups are
+      additionally listed and resolved under generated `anthropic-local-<hash>`
+      ids (see the OriginalModelId schema and api-surface.md).
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -501,6 +519,7 @@ paths:
                       additionalProperties: true
                       properties:
                         vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
+                        claude_model_aliases: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)
@@ -524,10 +543,13 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access is modeled here.
+                only vendor_access and claude_model_aliases are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
+                claude_model_aliases:
+                  type: boolean
+                  description: Opt into the generated Claude model aliases. Absent means off.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -552,10 +574,13 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access is modeled here.
+                only vendor_access and claude_model_aliases are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
+                claude_model_aliases:
+                  type: boolean
+                  description: Replaces the stored flag when present; absent keeps it.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1221,7 +1246,10 @@ paths:
   /api/portal/services:
     description: >
       Service (service-account) collection. Per-service sub-paths (see
-      api-surface.md): tokens, admin-groups.
+      api-surface.md): tokens, admin-groups. A service token takes the same
+      claude_model_aliases flag as a user token, on create only
+      (POST /api/portal/services/{id}/tokens; there is no field-level update),
+      and reads it back on the token list.
     get:
       tags: [portal]
       summary: List services
@@ -2358,6 +2386,15 @@ components:
           description: >
             Always true: the gateway tracks no per-model tool support
             (ADR-045 (h)); making it truthful is issue #219.
+    OriginalModelId:
+      type: string
+      description: >
+        Present ONLY on a generated Claude alias row (a token with the
+        claude_model_aliases setting): the real gateway model or group id the
+        `anthropic-local-<hash>` id resolves to. A top-level sibling of
+        `capabilities`, never nested. The row's display_name is then the honest
+        label (the target's own listing label, never a Claude model name). No
+        other row, a manual override alias included, carries it.
     OpenAIModelList:
       type: object
       description: The OpenAI-shaped model listing of /v1/models.
@@ -2381,6 +2418,12 @@ components:
                   The model's usable context window in tokens: the minimum
                   known across its offering mappings. Omitted, never 0, when no
                   mapping reports one.
+              original_model_id: { $ref: '#/components/schemas/OriginalModelId' }
+              display_name:
+                type: string
+                description: >
+                  Present only on a generated Claude alias row: the honest label
+                  (the target's own listing label). Ordinary rows carry none.
     LMStudioModelList:
       type: object
       description: >
@@ -2418,6 +2461,30 @@ components:
                       properties:
                         context_length: { type: integer, minimum: 0 }
               capabilities: { $ref: '#/components/schemas/ModelCapabilities' }
+              original_model_id: { $ref: '#/components/schemas/OriginalModelId' }
+    AnthropicModelList:
+      type: object
+      description: The Anthropic-shaped model listing of /anthropic/v1/models.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, type, display_name, created_at]
+            properties:
+              id: { type: string, description: The gateway model name, or a generated Claude alias id. }
+              type: { type: string, const: model }
+              display_name:
+                type: string
+                description: >
+                  The id for an ordinary row; the honest label on a generated
+                  Claude alias row.
+              created_at:
+                type: string
+                format: date-time
+                description: A fixed placeholder; model mappings carry no creation time.
+              original_model_id: { $ref: '#/components/schemas/OriginalModelId' }
     TokenVendorAccess:
       type: object
       description: >
