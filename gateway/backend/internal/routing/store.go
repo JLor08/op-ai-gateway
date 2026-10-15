@@ -234,6 +234,14 @@ const (
 	VendorAccountStatusActive         = "active"
 	VendorAccountStatusDisabled       = "disabled"
 	VendorAccountStatusNeedsReconnect = "needs_reconnect"
+
+	// The vendor_accounts.share_level values (migration 91): how far an account
+	// is shared beyond its owner. 'none' is the column DEFAULT, a private
+	// account. The store keeps the value verbatim, like auth_type and status;
+	// which transitions are allowed, and to whom, is the service layer's call.
+	VendorShareLevelNone   = "none"
+	VendorShareLevelShared = "shared"
+	VendorShareLevelFull   = "full"
 )
 
 // VendorAccount is a per-user external AI vendor account ("Anbieter"): either a
@@ -1924,7 +1932,9 @@ type ServiceStore interface {
 // ResourceGroupStore is Resource Groups (Phase 1 management structure,
 // migration v54): CRUD, the admin-group MANAGEMENT linkage
 // (resource_group_admin_groups), the server MEMBERSHIP linkage
-// (resource_group_servers), and Phase 2 provisioning
+// (resource_group_servers), the vendor-account linkage
+// (resource_group_vendor_accounts, migration v92 — which shared vendor accounts
+// are provisioned into the group), and Phase 2 provisioning
 // (resource_group_provisions — which principals may USE the group's
 // servers, distinct from management/membership).
 type ResourceGroupStore interface {
@@ -1973,6 +1983,23 @@ type ResourceGroupStore interface {
 	// ResourceGroupsByServer returns every resource group serverID is a
 	// member of (deduped by resource-group id).
 	ResourceGroupsByServer(ctx context.Context, serverID string) ([]ResourceGroup, error)
+	// SetResourceGroupVendorAccount links rgID to accountID (a
+	// resource_group_vendor_accounts row: the vendor account is PROVISIONED INTO
+	// the resource group -- membership, not management; the vendor-account twin
+	// of SetResourceGroupServer). Idempotent (on-conflict-do-nothing on the
+	// (resource_group_id, vendor_account_id) unique pair); a missing rgID or
+	// accountID is ErrNotFound (FK violation).
+	SetResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error
+	// RemoveResourceGroupVendorAccount unlinks rgID from accountID. A no-op
+	// (non-error) when the link does not exist.
+	RemoveResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error
+	// ResourceGroupVendorAccounts lists every vendor-account id linked into
+	// rgID, ordered by created_at then vendor_account_id. Always non-nil, empty
+	// when none.
+	ResourceGroupVendorAccounts(ctx context.Context, rgID string) ([]string, error)
+	// ResourceGroupsByVendorAccount returns every resource group accountID is
+	// linked into (deduped by resource-group id, ordered by id).
+	ResourceGroupsByVendorAccount(ctx context.Context, accountID string) ([]ResourceGroup, error)
 
 	// Resource Group provisioning (Phase 2, migration v55,
 	// resource_group_provisions) — a resource group's "provisioned for" set:
@@ -2325,7 +2352,12 @@ type RuntimeStore interface {
 // vendor and created_at — and its base_url are immutable, so every driver
 // ignores a changed value there. An unknown id is ErrNotFound on Update and Delete, a duplicate id is
 // ErrConflict on Create. Deleting an account (or its owning user) cascades its
-// dependent rows.
+// dependent rows -- including its vendor_account_admin_groups and
+// resource_group_vendor_accounts links.
+//
+// Sharing (migrations 91 and 92): share_level and system_group_id have their own
+// narrow writers and are not fields of VendorAccount yet, so Create, Update and
+// every reader leave them to their column DEFAULTs ('none' and the empty string).
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
@@ -2345,6 +2377,44 @@ type VendorAccountStore interface {
 	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
 	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
 	DeleteVendorAccount(ctx context.Context, id string) error
+
+	// UpdateVendorAccountShareLevel writes only share_level (migration 91) with a
+	// targeted UPDATE of that one column, so it cannot race a concurrent
+	// full-row write; updated_at is deliberately left alone, like
+	// UpdateServerSystemGroup. The level is stored verbatim -- validating it and
+	// deciding who may change it is the service's job. An unknown id is
+	// ErrNotFound.
+	UpdateVendorAccountShareLevel(ctx context.Context, id, level string) error
+	// UpdateVendorAccountSystemGroup writes only system_group_id -- the
+	// containment root (migration 91) -- with a targeted UPDATE of that one
+	// column, mirroring UpdateServerSystemGroup. An unknown id is ErrNotFound.
+	UpdateVendorAccountSystemGroup(ctx context.Context, id, systemGroupID string) error
+	// SetVendorAccountAdminGroup links accountID to groupID (a
+	// vendor_account_admin_groups row: groupID may MANAGE the account).
+	// Idempotent (on-conflict-do-nothing on the (vendor_account_id, group_id)
+	// unique pair, mirrors SetServerAdminGroup); a missing accountID or groupID
+	// is ErrNotFound (FK violation). The in-memory driver keeps groupID opaque --
+	// it holds no user groups to check it against.
+	SetVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error
+	// RemoveVendorAccountAdminGroup unlinks accountID from groupID. A no-op
+	// (non-error) when the link does not exist.
+	RemoveVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error
+	// VendorAccountAdminGroups lists every admin-group id linked to accountID,
+	// ordered by created_at then group_id. Always non-nil, empty when none.
+	VendorAccountAdminGroups(ctx context.Context, accountID string) ([]string, error)
+	// VendorAccountsByAdminGroups returns every vendor account linked to ANY of
+	// groupIDs (deduped by account id, ordered by id). An empty groupIDs returns
+	// an empty slice without issuing a query.
+	VendorAccountsByAdminGroups(ctx context.Context, groupIDs []string) ([]VendorAccount, error)
+	// ClearVendorAccountSharing returns accountID to a private account in ONE
+	// transaction: share_level is set to 'none' FIRST, then every
+	// vendor_account_admin_groups link and every resource_group_vendor_accounts
+	// link of the account is deleted, then system_group_id is cleared to ''. The
+	// order is load-bearing: the account is already owner-only before any link
+	// row disappears, so no concurrent routing read can see a live non-'none'
+	// level over half-deleted links. Idempotent on an already-private account;
+	// an unknown id is ErrNotFound.
+	ClearVendorAccountSharing(ctx context.Context, accountID string) error
 
 	// VendorAccountModels returns the models accountID serves, sorted by
 	// gateway_model. Always non-nil (empty when the account has none, or does

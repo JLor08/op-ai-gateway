@@ -56,8 +56,8 @@ func (s *SQLiteStore) UpdateResourceGroup(ctx context.Context, rg routing.Resour
 }
 
 // DeleteResourceGroup removes a resource group; the FK cascade (on delete
-// cascade) removes its resource_group_admin_groups and resource_group_servers
-// rows. An unknown id is ErrNotFound.
+// cascade) removes its resource_group_admin_groups, resource_group_servers and
+// resource_group_vendor_accounts rows. An unknown id is ErrNotFound.
 func (s *SQLiteStore) DeleteResourceGroup(ctx context.Context, id string) error {
 	res, err := s.exec(ctx, `delete from resource_groups where id = ?`, id)
 	if err != nil {
@@ -232,6 +232,70 @@ func (s *SQLiteStore) ResourceGroupsByServer(ctx context.Context, serverID strin
 		order by rg.id`, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("resource groups by server: %w", err)
+	}
+	defer rows.Close()
+	return scanResourceGroups(rows)
+}
+
+// SetResourceGroupVendorAccount links rgID to accountID
+// (resource_group_vendor_accounts): accountID becomes PROVISIONED INTO the
+// resource group. Idempotent on the (resource_group_id, vendor_account_id)
+// unique pair -- mirrors SetResourceGroupServer. A missing rgID or accountID
+// surfaces ErrNotFound (FK violation).
+func (s *SQLiteStore) SetResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error {
+	_, err := s.exec(ctx, `insert into resource_group_vendor_accounts (resource_group_id, vendor_account_id, created_at)
+		values (?, ?, ?) on conflict (resource_group_id, vendor_account_id) do nothing`,
+		rgID, accountID, time.Now().UTC())
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("set resource group vendor account: %w", err)
+	}
+	return nil
+}
+
+// RemoveResourceGroupVendorAccount unlinks rgID from accountID. A no-op
+// (non-error) when the link does not exist.
+func (s *SQLiteStore) RemoveResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error {
+	_, err := s.exec(ctx, `delete from resource_group_vendor_accounts where resource_group_id = ? and vendor_account_id = ?`, rgID, accountID)
+	if err != nil {
+		return fmt.Errorf("remove resource group vendor account: %w", err)
+	}
+	return nil
+}
+
+// ResourceGroupVendorAccounts lists every vendor-account id linked into rgID,
+// ordered by created_at then vendor_account_id. Always non-nil, empty when
+// none.
+func (s *SQLiteStore) ResourceGroupVendorAccounts(ctx context.Context, rgID string) ([]string, error) {
+	rows, err := s.query(ctx, `select vendor_account_id from resource_group_vendor_accounts where resource_group_id = ? order by created_at, vendor_account_id`, rgID)
+	if err != nil {
+		return nil, fmt.Errorf("list resource group vendor accounts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan resource group vendor account: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ResourceGroupsByVendorAccount returns every resource group accountID is
+// linked into (deduped by resource-group id), mirroring ResourceGroupsByServer.
+func (s *SQLiteStore) ResourceGroupsByVendorAccount(ctx context.Context, accountID string) ([]routing.ResourceGroup, error) {
+	rows, err := s.query(ctx, `
+		select distinct rg.id, rg.name, rg.system_group_id, rg.status, rg.created_at, rg.updated_at
+		from resource_groups rg
+		join resource_group_vendor_accounts a on a.resource_group_id = rg.id
+		where a.vendor_account_id = ?
+		order by rg.id`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("resource groups by vendor account: %w", err)
 	}
 	defer rows.Close()
 	return scanResourceGroups(rows)

@@ -152,14 +152,19 @@ func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 				"owner_user_id", "status", "updated_at", "vendor",
 			},
 			ignored: map[string]string{
-				// migration 91 is schema only: vendorAccountColumns and
-				// scanVendorAccount do not select these two yet, and no writer names
-				// them (both rely on their column DEFAULTs). The task that adds them
-				// to routing.VendorAccount and the readers must move them to seeded
-				// and seed a distinct value per row, so a reader that drops one fails
-				// the parity test above instead of staying green.
-				"share_level":     "added by migration 91 (schema only); not yet read or written by any store accessor",
-				"system_group_id": "added by migration 91 (schema only); not yet read or written by any store accessor",
+				// vendorAccountColumns and scanVendorAccount do not select these two
+				// (routing.VendorAccount has no field for them), so no reader returns
+				// them; CreateVendorAccount and UpdateVendorAccount do not name them
+				// either (both rely on the column DEFAULTs). They are written ONLY by
+				// their narrow writers -- UpdateVendorAccountShareLevel,
+				// UpdateVendorAccountSystemGroup and ClearVendorAccountSharing --
+				// which TestRoutingStoreVendorAccountShareWriters and
+				// TestRoutingStoreClearVendorAccountSharing read back off the row. The
+				// task that adds them to routing.VendorAccount and the readers must
+				// move them to seeded and seed a distinct value per row, so a reader
+				// that drops one fails the parity test above instead of staying green.
+				"share_level":     "migration 91; written by its narrow writers (read back off the row in vendor_account_sharing_test.go), selected by no reader",
+				"system_group_id": "migration 91; written by its narrow writers (read back off the row in vendor_account_sharing_test.go), selected by no reader",
 			},
 		})
 	})
