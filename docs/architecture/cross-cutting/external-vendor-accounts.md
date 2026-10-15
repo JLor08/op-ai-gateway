@@ -119,6 +119,15 @@ Reverse-engineered, undocumented, and restricted by both vendors' consumer Terms
 (§10). A subscription account is created **unconnected**; a connect flow (§3) fills
 its sealed OAuth token set afterwards.
 
+The `subscription` type is also **independently switchable**. The
+`vendor_subscriptions_enabled` system setting (default **on**, §7), distinct from the
+`vendor_accounts_enabled` module flag, gates this auth type and nothing else: while it
+is off a subscription account cannot be created or connected, and an existing one is
+kept but neither routed nor listed, whereas an `api_key` account is never affected. An
+operator can therefore keep the documented API-key path and shut the experimental,
+ToS-restricted one off without turning the whole module off. (It is an
+operator-wide switch, not account sharing, which stays deferred, §1.)
+
 ## 3. Connect flows (`internal/vendorauth`)
 
 All vendor OAuth constants — client ids, authorize/token URLs, redirect URIs,
@@ -130,8 +139,10 @@ overridable `Endpoints` struct, so a live operator (or a unit test against an
 flow code. `vendorauth` may import `capture` (for sealing) and nothing from
 `provider`, `portal` or `routing`.
 
-Three connect methods exist. All are owner-only and gated by the
-`vendor_accounts_enabled` master flag in `portal.Service`, and a successful
+Three connect methods exist. All are owner-only and gated in `portal.Service` by the
+`vendor_accounts_enabled` master flag and, as the last check, the
+`vendor_subscriptions_enabled` switch (a refused connect is
+`409 vendor_accounts.subscriptions_disabled`, §7), and a successful
 connect (by any method) sets the account's status to `active`, clearing a prior
 `needs_reconnect`, and then runs a best-effort **model discovery** (§6.2) so the
 account serves the models its vendor really offers rather than the static guess;
@@ -419,6 +430,13 @@ id (a **service token**), a **server-override** is set, the request is
 flavor is **images** (`openai_images`). That the resolver and the listing overlay
 agree on what each account serves is what makes the "served-flavors parity"
 between dispatch and the model listing (§6.7) meaningful.
+
+One further skip is per account, not per request: an **active `subscription`
+account does not serve while `vendor_subscriptions_enabled` is off** (§7). It falls
+through to the standard path exactly like a `needs_reconnect` account (a same-named
+self-hosted mapping, or `routing.no_model_route`), and the listing overlay applies the
+identical skip (§6.7), so the two move together and parity holds in both states. An
+`api_key` account is untouched.
 
 A user token the owner has **not** opted in does not skip the branch: it runs, but
 `TokenVendorPrefix` denies every account (§11.2), so it enumerates nothing and the
@@ -1803,7 +1821,8 @@ resolver, so it needs no cache (§7).
 Every listing reads **one** source, `ownVendorAccountModels`: the principal's
 own **active** vendor accounts and their rows that the principal's **token may
 use** (§11) — each named under the token's effective prefix — behind the master
-flag, for a user principal only (a service token owns no account) and fail-open
+flag (and, for a `subscription` account, the `vendor_subscriptions_enabled` switch,
+§7), for a user principal only (a service token owns no account) and fail-open
 per account. (That fail-open is the listing's: for the **generated Claude alias
 derivation** an unreadable account, like a failed owner read, makes the vendor
 set incomplete and yields no generated aliases at all, fail-closed, because its
@@ -1822,6 +1841,7 @@ which applies to self-hosted models.
 | **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
 | Another user's account, or a disabled / `needs_reconnect` account | Never. |
+| A `subscription` account while `vendor_subscriptions_enabled` is off | Never on any row above (the account is kept, and listed again once the switch is back on); its `api_key` siblings are unaffected. The listing reads the same switch as the resolver's skip (§4), from one settings read together with the master flag, and the skip also drops the account's models from the generated-alias vendor-shadow set. |
 
 The asymmetry is intended and worth stating, because it can read as a bug: an
 admin who connects an account sees its models on their own Dashboard, in the
@@ -1831,35 +1851,85 @@ the id clients request, and carries the refresh button.
 
 ## 7. Feature flag and routing mode
 
-Three system settings govern the feature (all read from the `system_settings`
-store). The **resolver** reads the first two through a cached accessor that is
-**invalidated on the settings PUT** whenever it carries either key
+Four system settings govern the feature (all read from the `system_settings`
+store). The **resolver** reads the first three (the master flag, the subscriptions
+switch and the routing mode) each through its own cached accessor
+(`vendorEnabledCache`, `vendorSubscriptionsEnabledCache`, `vendorRoutingModeCache`),
+**invalidated on the settings PUT** whenever it carries any of those keys
 (`invalidateVendorSettingsCache`), so a portal toggle takes effect on the next
-resolve; the accessor's short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
+resolve; the accessors' short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
 **out-of-band** change, such as a direct database edit. `portal.Service` (the CRUD
-gate, the model-listing overlay and the discovery client version) reads them
-uncached, so a PUT is visible on its very next call:
+and connect gates, the model-listing overlay and the discovery client version)
+reads them uncached, so a PUT is visible on its very next call:
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
 | `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
+| `vendor_subscriptions_enabled` | bool | **on** (opt-out) | Gates **only** `auth_type = subscription` accounts, strictly narrower than the master flag (it only matters while the module is on, and it never affects an `api_key` account). When off: creating a subscription account and every connect flow answer `409 vendor_accounts.subscriptions_disabled`; existing subscription accounts are **kept** but stop routing and are dropped from every listing (the resolver and the listing move in lock-step, §4, §6.7); the portal Anbieter page flags each one as currently unusable. Default on, and an absent, blank or unparseable value, or an unreadable settings store, reads as **on**. Detail below. |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor accounts and the self-hosted/shared routes. `vendor_first`: an owned account wins when it serves the requested model. `fallback_only`: an owned account is used only when no self-hosted/shared route exists. |
 | `vendor_openai_codex_client_version` | version string | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (§6.6). The ChatGPT backend **hides every model whose `minimal_client_version` exceeds it**, so a stale value silently hides new models: **raise it when OpenAI ships a newer Codex app** (System settings, no redeploy). Blank resets to the built-in default (`vendorauth.CodexModelsClientVersionDefault`); a malformed value is a `400 system.vendor_openai_codex_client_version_invalid`. Read only by `portal.Service` (never the resolver), so it has no cache. VERIFY-LIVE. |
 
-The frontend reads the master flag through a portal-scoped
-`GET /api/portal/vendor-accounts/enabled` (`{module_enabled}`, readable by any
-user even while the module is off — it exists to let the shell show or hide the
-nav item without granting the system-scoped settings read), mirroring the
-NetBird/certificates `/enabled` endpoints. The exact-path route wins over the
-`{id}` subtree because account ids are always `va_`-prefixed.
+**`vendor_subscriptions_enabled` in detail.** It is the one **opt-out** setting of the
+set, the narrowest, and it can only restrict further inside an enabled module. Only an
+explicit `false` turns it off. While it is off:
+
+- **Create and connect are refused.** `CreateVendorAccount` with
+  `auth_type = subscription` and every connect method (token import, code-paste
+  begin/complete, device begin/poll, all of which run through one gate) answer
+  `409 vendor_accounts.subscriptions_disabled`, and nothing is stored. The check is
+  deliberately late so that it masks no other answer: after the master flag, the
+  owner authorization and the subscription-only check on a connect (a stranger or an
+  unknown id is still `404`, an `api_key` account still `400 not_subscription`), and
+  after request validation on a create (a preset vendor asked for a `subscription` is
+  still `400 auth_type_invalid`).
+- **Existing accounts are kept but inert.** Nothing is deleted or changed, and there
+  is no schema change or migration (the setting is one more `system_settings` key), so
+  switching it back on restores every account as it was. The resolver skips them (§4)
+  and the listing overlay leaves them out (§6.7), reading the same switch, so no model
+  is advertised that cannot be routed.
+- **The portal says so.** The Anbieter page marks each subscription account with a
+  notice that it cannot currently be used. The notice is render-only and reads
+  `subscriptions_enabled` from the probe below; viewing, renaming and deleting an
+  account stay available (§8).
+
+**Fail direction.** The master flag fails **closed** (an unreadable store reads as
+off). This switch fails **open**: an unreadable settings store, or an absent, blank or
+unparseable value, reads as on, in the portal, in the resolver's accessor (a resolver
+built without one allows subscriptions) and in the settings read-back, so a transient
+read error can never silently take an operator's subscription accounts out of service.
+The price is the mirror image of the master flag's cache tail: because the resolver
+reads the switch through a 5 s cache (`vendorSettingsCacheTTL`) and a read that fails
+is cached as on, a failed read right after an operator turned subscriptions off can
+keep the resolver routing them for up to ~5 s, until the next successful read
+reflects off. Create, connect and the listing read it uncached through
+`portal.Service`, so they see an off on their very next call (a failed read there is
+likewise treated as on).
+
+**What "off" does not stop.** Turning subscriptions off blocks inference routing,
+model advertising, create and connect, and nothing else. The owner-initiated **test
+connection**, **model refresh** and **usage refresh** on an *existing* subscription
+account (§8) are not gated by it: each still opens the stored OAuth credential and
+sends it to the vendor, and a refresh may renew and so rotate the stored token set
+(§3.4). "Off" is therefore not "the gateway never contacts the vendor's subscription
+endpoints". An operator who needs that turns the master flag off (which blocks those
+actions too) or deletes the account.
+
+The frontend reads both switches through a portal-scoped
+`GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled}`,
+readable by any user even while the module is off — it exists to let the shell show
+or hide the nav item, and the Anbieter page flag inert subscription accounts, without
+granting the system-scoped settings read; it returns only those two booleans),
+mirroring the NetBird/certificates `/enabled` endpoints. The exact-path route wins
+over the `{id}` subtree because account ids are always `va_`-prefixed.
 
 The same master flag gates the **model-listing owner overlay** and the dashboard
-rows that carry an account's models (§6.7).
+rows that carry an account's models (§6.7); for a subscription account the
+subscriptions switch gates them too.
 
 A fourth system setting, `anthropic_prompt_caching_enabled` (bool, **off**,
 experimental), is not part of the vendor-account policy but applies to its Anthropic
 targets: it lets the translate path place prompt-cache breakpoints. Like the first
-two it is read on the hot path through a TTL cache that is invalidated on a PUT
+three it is read on the hot path through a TTL cache that is invalidated on a PUT
 that carries the key, but through its **own** gateway-side cache
 (`anthropicPromptCachingEnabledCached`, 5 s), separate from the resolver's
 vendor-settings cache (see *Translate prompt caching* in §4.1).
@@ -1879,6 +1949,10 @@ owner-only for the `system` scope too, because each sends the stored credential 
 the vendor: they are authorized like a write, not like a metadata read. Routing and
 the model listings (§6.7) enforce the same owner scope by enumerating only the
 principal's own accounts, so one user's account can never serve, or be listed to, another.
+The `vendor_subscriptions_enabled` switch (§7) is an operator-wide gate, not an
+owner-scope rule: it narrows what a subscription account may do (create, connect,
+serve, be listed) but never who may reach it, and it leaves an owner's view, rename and
+delete of an existing account, and the three vendor-contacting actions above, as they are.
 A token's vendor-access policy (§11) narrows that further, never widens it: it can
 name only accounts the token's owner owns, and a stale id matches nothing.
 The Activity list follows the same read rule for the account's **name**: a usage
@@ -2081,7 +2155,8 @@ An override value follows the account-prefix rule (§1: at most 64 bytes from
 `A-Z a-z 0-9 - _ . ~ : / @ +`, no `..`); an enabled one that breaks it is refused at
 save. Only **active** accounts are ever reachable — a `disabled` or
 `needs_reconnect` account is neither listed nor routed whatever the policy says —
-and the master flag (§7) still gates the whole feature. The stored policy decodes
+and the master flag (§7) still gates the whole feature, the subscriptions switch (§7)
+the `subscription` accounts among them. The stored policy decodes
 tolerantly: a blank or malformed value reads as the strict default and an entry
 without an account id is dropped, so a bad row can never break token resolution or
 open access. An account deleted after a grant leaves a stale id behind, which
@@ -2206,7 +2281,7 @@ enabled vendor accounts is affected.
   their error codes; [token vendor access](../reference/api-surface.md#token-vendor-access)
   for the per-token `vendor_access` field and its two error codes.
 - [Configuration & Environment Variables](../reference/config-env.md) — the cipher
-  key and the three system settings.
+  key and the four system settings.
 - [ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)
   — the first-class-entity and experimental-subscription decisions.
 - [ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)

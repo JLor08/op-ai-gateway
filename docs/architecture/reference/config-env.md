@@ -147,13 +147,14 @@ These are read directly via `os.Getenv` in `cmd/gateway/main.go`, only apply whe
 
 ### Vendor accounts (system settings, no env-var form)
 
-The external-vendor-accounts ("Anbieter") feature is governed by **three system
+The external-vendor-accounts ("Anbieter") feature is governed by **four system
 settings** held in the `system_settings` store and edited in the portal's System
 settings — there is no `OP_AI_GATEWAY_*` env var or config-file key for any of them:
 
 | System setting | Values | Default | Effect |
 |---|---|---|---|
 | `vendor_accounts_enabled` | `bool` | **off** | The master module flag. When off the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch + model-listing overlay are no-ops. |
+| `vendor_subscriptions_enabled` | `bool` | **on** (opt-out) | Gates **only** the subscription-type accounts (`auth_type = subscription`, the experimental consumer-OAuth path), strictly narrower than the master flag: it only matters while `vendor_accounts_enabled` is on and never affects an api-key account. When off, creating or connecting a subscription account answers `409 vendor_accounts.subscriptions_disabled`, and existing subscription accounts are **kept** (nothing is deleted; no migration) but stop routing and are dropped from `/v1/models`, the chat picker and the dashboard's live routes, so switching it back on restores them. An absent, blank or unparseable value reads as **on**, and so does an unreadable settings store, so a transient read error never silently disables the accounts. The resolver reads it through a 5 s cache that a settings PUT invalidates. This is not account sharing (a later phase). |
 | `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor account and the self-hosted/shared routes (an invalid value is rejected with `system.vendor_account_routing_mode_invalid`). |
 | `vendor_openai_codex_client_version` | version string (digit first, `[0-9A-Za-z._+-]`, ≤ 64 chars) | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (`/backend-api/codex/models?client_version=<V>`). The backend **hides every model whose `minimal_client_version` exceeds it**, so **raise it when OpenAI ships a newer Codex app** (no redeploy). Blank resets to the default; a malformed value is rejected with `system.vendor_openai_codex_client_version_invalid`. VERIFY-LIVE. |
 
