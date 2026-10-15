@@ -54,3 +54,28 @@ func isAdmin(p auth.Token) bool {
 func hasGatewayUse(p auth.Token) bool {
 	return p.HasScope("gateway:use")
 }
+
+// principalMayManageTokenSetting reports whether the caller may change a token
+// setting that is reserved for MANAGEMENT principals — today
+// claude_effort_compatibility. The HTTP gate in front of the token routes
+// (requireWebScope(gateway:use)) is no help here: every user bearer carries
+// gateway:use, so it admits an inference-only token editing its own settings.
+// This is the check that tells the two apart, and it lives in the service
+// layer so no caller can skip it.
+//
+// Two kinds of principal qualify:
+//   - an authorized portal session — and the gateway's own trusted loopback,
+//     which is built the same way. Both come from sessionPrincipal, which
+//     leaves auth.Token.ID empty: there is no api_tokens row behind them. The
+//     cookie + CSRF check has already happened by the time one reaches here.
+//   - a bearer that holds the admin scope. A bearer's principal always carries
+//     the token's own non-empty id (store LookupBearer / auth.TokenStore), so a
+//     non-empty ID means "authenticated by a token secret"; such a token is
+//     management-capable only if it was minted with the admin scope.
+//
+// An inference-only bearer (gateway:use / llm:invoke, ID != "", no admin)
+// never qualifies — including for the token it IS. Do not widen this to
+// hasGatewayUse: that is exactly the scope the bearer already holds.
+func principalMayManageTokenSetting(owner auth.Token) bool {
+	return owner.ID == "" || isAdmin(owner)
+}

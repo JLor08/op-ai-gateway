@@ -94,6 +94,17 @@ func (s *Server) handlePortalTokens(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusNotFound, apierror.Response("project.not_found", "project not found", ""))
 				return
 			}
+			// claude_effort_compatibility is management-only: an inference-only
+			// bearer creating a token with the opt-in is refused by the service
+			// layer with ErrPrincipalForbidden. The PATCH path maps it through
+			// sharedErrorMap (via writeMappedError); this handler's hand-inlined
+			// ladder has no such fallback, so without its own row the refusal
+			// came back as the generic 500 "token could not be created" instead
+			// of 403.
+			if errors.Is(err, portal.ErrPrincipalForbidden) {
+				writeJSON(w, http.StatusForbidden, apierror.Response(portal.CodePrincipalForbidden, notAllowedMsg, ""))
+				return
+			}
 			if errors.Is(err, store.ErrConflict) {
 				writeJSON(w, http.StatusConflict, apierror.Response("portal.token_conflict", "token could not be created", ""))
 				return

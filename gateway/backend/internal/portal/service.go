@@ -1630,6 +1630,13 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 }
 
 func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateTokenRequest) (CreateTokenResponse, error) {
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): creating a token WITH the opt-in is
+	// refused to an inference-only bearer. Checked first, before any lookup or
+	// the record is assembled, so a refused request has no side effect at all.
+	if req.ClaudeEffortCompatibility && !principalMayManageTokenSetting(owner) {
+		return CreateTokenResponse{}, ErrPrincipalForbidden
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return CreateTokenResponse{}, ErrTokenNameRequired
@@ -1721,6 +1728,17 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	record, err := s.tokens.TokenByID(ctx, tokenID)
 	if err != nil || record.UserID != owner.UserID {
 		return TokenDTO{}, ErrTokenNotFound
+	}
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): ANY change to it — on or off, on this
+	// token or a sibling, including a token editing itself — is refused to an
+	// inference-only bearer. Ownership is checked first so a foreign token id
+	// is still a plain not-found. The whole request is rejected here, before
+	// the first field is applied: the record is mutated in memory below and
+	// persisted once at the end, so nothing — this flag or any other field in
+	// the same request — can be half-written on a refusal.
+	if req.ClaudeEffortCompatibility != nil && !principalMayManageTokenSetting(owner) {
+		return TokenDTO{}, ErrPrincipalForbidden
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)

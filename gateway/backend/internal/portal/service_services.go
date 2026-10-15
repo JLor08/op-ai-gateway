@@ -700,6 +700,16 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): a delegate reaching this endpoint with an
+	// inference-only BEARER may not mint a token with the opt-in; the same
+	// delegate through a portal session, or an admin-scope bearer, may. Checked
+	// after the object gate, so a principal with no access to the service still
+	// gets the same not-found as without the flag (no existence leak), and
+	// before anything is looked up or written.
+	if req.ClaudeEffortCompatibility && !principalMayManageTokenSetting(principal) {
+		return CreateServiceTokenResponse{}, ErrPrincipalForbidden
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return CreateServiceTokenResponse{}, ErrServiceValidation
