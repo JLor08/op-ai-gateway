@@ -143,27 +143,41 @@ func claudeAliasMap(eligible []string, reserved map[string]bool, displayName fun
 				"claude alias %q for %q skipped: it equals an existing model, group or manual override name",
 				d.aliasID, d.gatewayID))
 		case len(owners[d.aliasID]) > 1:
-			var others []string
-			for _, other := range owners[d.aliasID] {
-				if other != d.gatewayID {
-					others = append(others, fmt.Sprintf("%q", other))
-				}
-			}
-			diagnostics = append(diagnostics, fmt.Sprintf(
-				"claude alias %q for %q skipped: it is also derived from %s, so none of them gets it",
-				d.aliasID, d.gatewayID, strings.Join(others, ", ")))
+			diagnostics = append(diagnostics, claudeAliasCollisionDiagnostic(d.aliasID, d.gatewayID, owners[d.aliasID]))
 		default:
-			label := ""
-			if displayName != nil {
-				label = displayName(d.gatewayID)
-			}
-			if strings.TrimSpace(label) == "" {
-				label = d.gatewayID
-			}
-			aliases[d.aliasID] = claudeAlias{OriginalID: d.gatewayID, DisplayName: label}
+			aliases[d.aliasID] = claudeAlias{OriginalID: d.gatewayID, DisplayName: claudeAliasLabel(d.gatewayID, displayName)}
 		}
 	}
 	return aliases, diagnostics
+}
+
+// claudeAliasCollisionDiagnostic is the diagnostic for a gateway id skipped
+// because other ids derive the same alias id. owners is every gateway id that
+// derives aliasID (ascending, including gatewayID itself); the message names
+// the others, in that order.
+func claudeAliasCollisionDiagnostic(aliasID, gatewayID string, owners []string) string {
+	var others []string
+	for _, other := range owners {
+		if other != gatewayID {
+			others = append(others, fmt.Sprintf("%q", other))
+		}
+	}
+	return fmt.Sprintf(
+		"claude alias %q for %q skipped: it is also derived from %s, so none of them gets it",
+		aliasID, gatewayID, strings.Join(others, ", "))
+}
+
+// claudeAliasLabel is the honest label of an alias onto gatewayID: what
+// displayName returns for it, or the gateway id itself when displayName is nil
+// or its label is blank.
+func claudeAliasLabel(gatewayID string, displayName func(string) string) string {
+	if displayName == nil {
+		return gatewayID
+	}
+	if label := displayName(gatewayID); strings.TrimSpace(label) != "" {
+		return label
+	}
+	return gatewayID
 }
 
 // claudeAliasEligible returns, sorted, the gateway model/group ids of a token's
@@ -263,6 +277,15 @@ func (s *Service) claudeAliasesFromListing(ctx context.Context, token auth.Token
 	if !token.ClaudeModelAliases || !overlayLoaded {
 		return nil, nil
 	}
+	// Fail-posture asymmetry: vendorModelFlavorSets returns an empty (or partial)
+	// set when the vendor store read errors, so the vendor-shadow exclusion (here,
+	// and in claudeAliasEligible) fails OPEN: for that moment a local name the
+	// owner's own vendor account also serves could be offered and resolved as an
+	// alias.
+	// That is inherited from the vendor overlay's established fail-open posture,
+	// unlike the group/visibility overlay (overlayLoaded above), which fails this
+	// derivation CLOSED. It stays same-principal and transient and grants nothing
+	// the token could not already reach, so there is no privilege escalation.
 	vendor := s.vendorModelFlavorSets(ctx, token)
 	reserved := make(map[string]bool, len(preSuppress)+len(vendor)+len(token.ModelOverrideRules))
 	for name := range preSuppress {
