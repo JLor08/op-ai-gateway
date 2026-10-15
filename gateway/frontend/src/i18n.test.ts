@@ -1839,6 +1839,7 @@ describe('groups i18n keys', () => {
       'groupsPermServers',
       'groupsPermServices',
       'groupsPermResources',
+      'groupsPermVendorAccounts',
       'groupsActionRename',
       'groupsActionMembers',
       'groupsActionDelete',
