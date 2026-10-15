@@ -48,14 +48,16 @@ type groupMembersRequest struct {
 // is authoritative). Per-Admin-Group co-manager permissions, spec 2026-08-10
 // + Phase B 2026-08-10 (CanManageServers) + Phase C 2026-08-10
 // (CanManageServices) + Resource Groups Phase 1 2026-08-11
-// (CanManageResources).
+// (CanManageResources) + shared vendor accounts, issue #183
+// (CanManageVendorAccounts).
 type groupManagerRequest struct {
-	UserID             string `json:"user_id"`
-	CanManageUsers     bool   `json:"can_manage_users"`
-	CanManageGroup     bool   `json:"can_manage_group"`
-	CanManageServers   bool   `json:"can_manage_servers"`
-	CanManageServices  bool   `json:"can_manage_services"`
-	CanManageResources bool   `json:"can_manage_resources"`
+	UserID                  string `json:"user_id"`
+	CanManageUsers          bool   `json:"can_manage_users"`
+	CanManageGroup          bool   `json:"can_manage_group"`
+	CanManageServers        bool   `json:"can_manage_servers"`
+	CanManageServices       bool   `json:"can_manage_services"`
+	CanManageResources      bool   `json:"can_manage_resources"`
+	CanManageVendorAccounts bool   `json:"can_manage_vendor_accounts"`
 }
 
 // handlePortalGroups backs GET (list the caller's group landscape) / POST
@@ -308,7 +310,7 @@ func (s *Server) handlePortalGroupManagers(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 		return
 	}
-	if err := s.Portal.PromoteManager(r.Context(), token, id, req.UserID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources); err != nil {
+	if err := s.Portal.PromoteManager(r.Context(), token, id, req.UserID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources, req.CanManageVendorAccounts); err != nil {
 		writeGroupError(w, err, "group.promote_failed")
 		return
 	}
@@ -338,7 +340,7 @@ func (s *Server) handlePortalGroupManagerSingle(w http.ResponseWriter, r *http.R
 			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 			return
 		}
-		if err := s.Portal.SetManagerPermissions(r.Context(), token, id, userID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources); err != nil {
+		if err := s.Portal.SetManagerPermissions(r.Context(), token, id, userID, req.CanManageUsers, req.CanManageGroup, req.CanManageServers, req.CanManageServices, req.CanManageResources, req.CanManageVendorAccounts); err != nil {
 			writeGroupError(w, err, "group.set_manager_permissions_failed")
 			return
 		}

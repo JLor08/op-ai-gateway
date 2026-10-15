@@ -56,10 +56,10 @@ func setupSvcRGFixture(e *groupTestEnv) svcRGFixture {
 	e.mustAddMembers(owner2, ag2.ID, "usr_cms2")
 	// can_manage_services ONLY: neither can_manage_resources nor anything else,
 	// proving the self-service needs no resource-management permission.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, false, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, false, true, false, true); err != nil {
 		e.t.Fatalf("promote usr_cms: %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner2, ag2.ID, "usr_cms2", false, false, false, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner2, ag2.ID, "usr_cms2", false, false, false, true, false, true); err != nil {
 		e.t.Fatalf("promote usr_cms2: %v", err)
 	}
 
@@ -240,7 +240,7 @@ func TestServiceResourceGroupsNonManagerIsDenied(t *testing.T) {
 	e.createUser("usr_cmg", "admin")
 	e.mustAddMembers(token("usr_s", "system", "admin"), f.sg.ID, "usr_cmg")
 	e.mustAddMembers(token("usr_owner", "admin"), f.ag.ID, "usr_cmg")
-	if err := e.svc.PromoteManager(e.ctx, token("usr_owner", "admin"), f.ag.ID, "usr_cmg", false, true, false, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, token("usr_owner", "admin"), f.ag.ID, "usr_cmg", false, true, false, false, true, true); err != nil {
 		t.Fatalf("promote usr_cmg: %v", err)
 	}
 	// usr_full: Full-Delegate of svc_a AND a member of AG (so the RG is reachable).

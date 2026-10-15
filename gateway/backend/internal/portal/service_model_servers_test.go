@@ -166,10 +166,10 @@ func TestModelServersCanLoadIsTheLoadStartersAuthorization(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_ag_owner", "usr_servers", "usr_users")
 	ag := e.mustCreateGroup(agOwner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(agOwner, ag.ID, "usr_servers", "usr_users")
-	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_servers", false, false, true, false, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_servers", false, false, true, false, false, true); err != nil {
 		t.Fatalf("PromoteManager(usr_servers): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_users", true, false, false, false, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_users", true, false, false, false, false, true); err != nil {
 		t.Fatalf("PromoteManager(usr_users): %v", err)
 	}
 	seedOffering(t, e.routes, e.now, "srv-a", "app-a", "map-a", "shared", "up-a", 0)

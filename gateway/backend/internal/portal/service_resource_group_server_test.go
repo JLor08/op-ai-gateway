@@ -151,7 +151,7 @@ func TestSetResourceGroupServersAdminGroupPathSucceeds(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_cmr")
 	e.mustAddMembers(owner, ag.ID, "usr_cmr")
 	// can_manage_servers=true, can_manage_resources=true (positions 3 and 5).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmr", false, false, true, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmr", false, false, true, false, true, true); err != nil {
 		t.Fatalf("PromoteManager(cmr): %v", err)
 	}
 	cmr := token("usr_cmr", "admin")

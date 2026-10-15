@@ -55,10 +55,10 @@ func TestServerManageGroupIDs(t *testing.T) {
 	}
 	e.mustAddMembers(owner, ag.ID, "usr_cms", "usr_cmg", "usr_pm")
 
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, true, true, true, true); err != nil {
 		t.Fatalf("promote usr_cms (can_manage_servers only): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", false, true, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmg", false, true, false, true, true, true); err != nil {
 		t.Fatalf("promote usr_cmg (can_manage_group only): %v", err)
 	}
 
@@ -124,10 +124,10 @@ func TestAuthorizeServerMatrix(t *testing.T) {
 	// serverManageGroupIDs) stay independent in this matrix.
 	ag := e.mustCreateGroup(agOwner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(agOwner, ag.ID, "usr_cms", "usr_cmg")
-	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_cms", false, false, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_cms", false, false, true, true, true, true); err != nil {
 		t.Fatalf("promote usr_cms: %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_cmg", false, true, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, agOwner, ag.ID, "usr_cmg", false, true, false, true, true, true); err != nil {
 		t.Fatalf("promote usr_cmg: %v", err)
 	}
 
