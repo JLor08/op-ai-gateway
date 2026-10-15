@@ -26,24 +26,37 @@ func TestApplyChatTemplateEffortPolicy(t *testing.T) {
 	vllm := routing.Target{Provider: routing.ProviderVLLM}
 	agentLlama := routing.Target{Provider: routing.ProviderServerAgent, LiveProgressSpecType: string(routing.RuntimeSpecTypeLlamaCpp)}
 	cases := []struct {
-		name   string
-		target routing.Target
-		req    inference.Request
-		want   bool
+		name string
+		// target and req are the inputs; want is the directive the policy must set,
+		// wantEffort is the ReasoningEffort the policy must LEAVE on the request.
+		// For an Anthropic-translate request whose target does NOT read
+		// chat_template_kwargs the effort is cleared (confining the whole feature --
+		// top-level reasoning_effort, the kwargs directive, and the Gemini/Responses
+		// renderings -- to capable targets); every other row leaves it untouched.
+		target     routing.Target
+		req        inference.Request
+		want       bool
+		wantEffort string
 	}{
-		{"anthropic + effort + llama.cpp", llama, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, true},
-		{"anthropic + effort + vLLM", vllm, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "high"}, true},
-		{"anthropic + effort + agent-managed llama.cpp", agentLlama, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "medium"}, true},
-		{"anthropic + effort + ollama (does not read the kwarg)", routing.Target{Provider: routing.ProviderOllama}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false},
-		{"anthropic + effort + llama_swap (not llama.cpp)", routing.Target{Provider: routing.ProviderLlamaSwap}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false},
-		{"anthropic + effort + vendor OpenAI", routing.Target{Provider: routing.ProviderVendorOpenAI}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false},
-		{"anthropic + effort + zero target", routing.Target{}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false},
-		{"anthropic + no effort + llama.cpp", llama, inference.Request{APIFlavor: "anthropic_messages"}, false},
+		{"anthropic + effort + llama.cpp", llama, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, true, "low"},
+		{"anthropic + effort + vLLM", vllm, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "high"}, true, "high"},
+		{"anthropic + effort + agent-managed llama.cpp", agentLlama, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "medium"}, true, "medium"},
+		// Non-capable Anthropic-translate targets: the effort is CLEARED, so it never
+		// reaches the generic-OpenAI top-level field, the Gemini thinkingConfig, or a
+		// Responses reasoning.effort. (§3 scope / §4.7 "other backends unchanged".)
+		{"anthropic + effort + ollama (does not read the kwarg)", routing.Target{Provider: routing.ProviderOllama}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false, ""},
+		{"anthropic + effort + llama_swap (not llama.cpp)", routing.Target{Provider: routing.ProviderLlamaSwap}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false, ""},
+		{"anthropic + effort + vendor OpenAI (no top-level reasoning_effort leak)", routing.Target{Provider: routing.ProviderVendorOpenAI}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false, ""},
+		{"anthropic + effort + vendor Gemini (no thinkingConfig leak)", routing.Target{Provider: routing.ProviderVendorGemini}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false, ""},
+		{"anthropic + effort + zero target", routing.Target{}, inference.Request{APIFlavor: "anthropic_messages", ReasoningEffort: "low"}, false, ""},
+		{"anthropic + no effort + llama.cpp", llama, inference.Request{APIFlavor: "anthropic_messages"}, false, ""},
 		// The direct-OpenAI guard: reasoning_effort set, capable target, wrong flavor.
-		{"direct openai chat + reasoning_effort + llama.cpp", llama, inference.Request{APIFlavor: "openai_chat_completions", ReasoningEffort: "low"}, false},
-		{"direct openai chat + reasoning_effort + vLLM", vllm, inference.Request{APIFlavor: "openai_chat_completions", ReasoningEffort: "high"}, false},
-		{"openai responses + reasoning.effort + llama.cpp", llama, inference.Request{APIFlavor: inference.APIFlavorOpenAIResponses, ReasoningEffort: "low"}, false},
-		{"unset flavor + effort + llama.cpp", llama, inference.Request{ReasoningEffort: "low"}, false},
+		// These early-return on the APIFlavor gate, so the effort is left as the
+		// caller sent it -- the gateway must not touch a direct request's own field.
+		{"direct openai chat + reasoning_effort + llama.cpp", llama, inference.Request{APIFlavor: "openai_chat_completions", ReasoningEffort: "low"}, false, "low"},
+		{"direct openai chat + reasoning_effort + vLLM", vllm, inference.Request{APIFlavor: "openai_chat_completions", ReasoningEffort: "high"}, false, "high"},
+		{"openai responses + reasoning.effort + llama.cpp", llama, inference.Request{APIFlavor: inference.APIFlavorOpenAIResponses, ReasoningEffort: "low"}, false, "low"},
+		{"unset flavor + effort + llama.cpp", llama, inference.Request{ReasoningEffort: "low"}, false, "low"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -52,8 +65,8 @@ func TestApplyChatTemplateEffortPolicy(t *testing.T) {
 			if req.ReasoningEffortViaTemplateKwargs != tc.want {
 				t.Fatalf("ReasoningEffortViaTemplateKwargs = %v, want %v", req.ReasoningEffortViaTemplateKwargs, tc.want)
 			}
-			if req.ReasoningEffort != tc.req.ReasoningEffort {
-				t.Fatalf("the policy must not rewrite ReasoningEffort: got %q, want %q", req.ReasoningEffort, tc.req.ReasoningEffort)
+			if req.ReasoningEffort != tc.wantEffort {
+				t.Fatalf("ReasoningEffort = %q, want %q", req.ReasoningEffort, tc.wantEffort)
 			}
 		})
 	}
@@ -162,15 +175,20 @@ func TestTranslateEffortReachesTheProviderAtBothDispatchSites(t *testing.T) {
 			}
 		})
 
-		t.Run("flag on + non-capable target keeps the effort but not the directive"+suffix, func(t *testing.T) {
+		t.Run("flag on + non-capable target clears the effort and sets no directive"+suffix, func(t *testing.T) {
+			// A non-capable Anthropic-translate target (ollama here, same for
+			// generic-OpenAI and Gemini) must see NEITHER the directive NOR a
+			// surviving ReasoningEffort: a leaked effort would turn into a top-level
+			// reasoning_effort (openAISamplingFields) or a Gemini thinkingConfig on a
+			// backend the operator never opted that route into (§3 scope / §4.7).
 			prov := &completeRecorder{}
 			srv := newEffortCompatTestServer(t, prov, effortSeed{appType: routing.ProviderOllama, flag: true, translate: true})
 			if rec := postTo(srv, "/v1/messages", translateMessagesBody(stream, `{"effort":"low"}`)); rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
 			got := prov.only(t)
-			if got.ReasoningEffort != "low" || got.ReasoningEffortViaTemplateKwargs {
-				t.Fatalf("provider request effort=%q directive=%v, want low + NO directive", got.ReasoningEffort, got.ReasoningEffortViaTemplateKwargs)
+			if got.ReasoningEffort != "" || got.ReasoningEffortViaTemplateKwargs {
+				t.Fatalf("provider request effort=%q directive=%v, want empty effort + NO directive", got.ReasoningEffort, got.ReasoningEffortViaTemplateKwargs)
 			}
 		})
 
