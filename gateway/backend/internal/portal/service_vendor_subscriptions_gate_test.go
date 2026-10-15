@@ -371,3 +371,91 @@ func TestConnectVendorAccountRefusedWhenSubscriptionsOff(t *testing.T) {
 		t.Fatalf("import after switching subscriptions back on: %v", err)
 	}
 }
+
+// A preset vendor (xai, openrouter, ...) can never be a subscription, so a
+// subscription create for one is ErrVendorAccountAuthTypeInvalid (a 400) whatever
+// the vendor_subscriptions_enabled switch says: the switch must not turn a
+// malformed request into a misleading 409.
+func TestCreateVendorAccountPresetVendorSubscriptionIsAuthTypeInvalidWhateverTheSwitch(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+
+	for _, on := range []bool{true, false} {
+		setVendorSubscriptionsEnabled(t, svc, on)
+		for _, vendor := range []string{routing.VendorXAI, routing.VendorOpenRouter} {
+			_, err := svc.CreateVendorAccount(ctx, ownerToken(), CreateVendorAccountRequest{Vendor: vendor, AuthType: routing.VendorAuthSubscription, Name: "Preset sub", APIKey: vendorAccountTestKey})
+			if !errors.Is(err, ErrVendorAccountAuthTypeInvalid) {
+				t.Errorf("create %s subscription with the switch on=%v: err = %v, want ErrVendorAccountAuthTypeInvalid", vendor, on, err)
+			}
+		}
+	}
+	if rows, err := routeStore.VendorAccounts(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("rows after refused creates = %#v, %v, want none persisted", rows, err)
+	}
+}
+
+// countingSettingsStore counts SystemSettings reads (each one an uncached
+// full-table SELECT in production).
+type countingSettingsStore struct {
+	*MemorySystemSettings
+	reads int
+}
+
+func (c *countingSettingsStore) SystemSettings(ctx context.Context) (map[string]string, error) {
+	c.reads++
+	return c.MemorySystemSettings.SystemSettings(ctx)
+}
+
+// ownVendorAccountModels derives the master flag AND the subscriptions switch from
+// ONE settings read (two uncached full-table reads per listing would double the
+// cost of every model listing), and keeps its gating semantics: master flag off ->
+// nothing (after one read), unreadable or missing store -> fails closed like the
+// master flag.
+func TestOwnVendorAccountModelsReadsTheSettingsOnce(t *testing.T) {
+	f := newSubscriptionGateListingFixture(t)
+	ctx := context.Background()
+	counting := &countingSettingsStore{MemorySystemSettings: NewMemorySystemSettings()}
+	if err := counting.SetSystemSetting(ctx, vendorAccountsEnabledKey, "true", time.Time{}); err != nil {
+		t.Fatalf("SetSystemSetting: %v", err)
+	}
+	f.svc.settings = counting
+
+	owned, loaded := f.svc.ownVendorAccountModels(ctx, f.owner)
+	if !loaded || len(owned) != 3 {
+		t.Fatalf("ownVendorAccountModels = %d accounts, loaded=%v, want 3 accounts, loaded", len(owned), loaded)
+	}
+	if counting.reads != 1 {
+		t.Fatalf("settings reads = %d, want 1 (flag and switch from the same read)", counting.reads)
+	}
+
+	// Subscriptions off: still one read, subscription accounts dropped.
+	if err := counting.SetSystemSetting(ctx, vendorSubscriptionsEnabledKey, "false", time.Time{}); err != nil {
+		t.Fatalf("SetSystemSetting: %v", err)
+	}
+	counting.reads = 0
+	owned, _ = f.svc.ownVendorAccountModels(ctx, f.owner)
+	if len(owned) != 1 || counting.reads != 1 {
+		t.Fatalf("subscriptions off: %d accounts / %d reads, want 1 account (api_key) / 1 read", len(owned), counting.reads)
+	}
+
+	// Master flag off: nothing, after one read.
+	if err := counting.SetSystemSetting(ctx, vendorAccountsEnabledKey, "false", time.Time{}); err != nil {
+		t.Fatalf("SetSystemSetting: %v", err)
+	}
+	counting.reads = 0
+	if owned, loaded = f.svc.ownVendorAccountModels(ctx, f.owner); owned != nil || !loaded || counting.reads != 1 {
+		t.Fatalf("master flag off: owned=%v loaded=%v reads=%d, want nil/true/1", owned, loaded, counting.reads)
+	}
+
+	// An unreadable store fails closed on the master flag (nil, true), as before.
+	f.svc.settings = failingSettingsReadStore{NewMemorySystemSettings()}
+	if owned, loaded = f.svc.ownVendorAccountModels(ctx, f.owner); owned != nil || !loaded {
+		t.Fatalf("unreadable store: owned=%v loaded=%v, want nil/true (fail closed on the master flag)", owned, loaded)
+	}
+	// And a service with no settings store at all behaves the same.
+	f.svc.settings = nil
+	if owned, loaded = f.svc.ownVendorAccountModels(ctx, f.owner); owned != nil || !loaded {
+		t.Fatalf("nil store: owned=%v loaded=%v, want nil/true", owned, loaded)
+	}
+}

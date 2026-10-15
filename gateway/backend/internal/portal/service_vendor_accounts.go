@@ -388,12 +388,13 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 	return dto, nil
 }
 
-// CreateVendorAccount creates an account owned by the calling principal
-// (ErrVendorAccountsDisabled while the master flag is off; ErrVendorSubscriptionsDisabled
-// for a subscription account while vendor_subscriptions_enabled is off). Any authenticated user may create their own (no admin requirement); a principal
-// with no user identity cannot own one. The api key is sealed BEFORE the store
-// write, so a keyless disk store fails with capture.ErrKeyRequired and persists
-// nothing.
+// CreateVendorAccount creates an account owned by the calling principal.
+// ErrVendorAccountsDisabled while the master flag is off, and
+// ErrVendorSubscriptionsDisabled for a subscription account while
+// vendor_subscriptions_enabled is off. Any authenticated user may create their
+// own (no admin requirement); a principal with no user identity cannot own one.
+// The api key is sealed BEFORE the store write, so a keyless disk store fails
+// with capture.ErrKeyRequired and persists nothing.
 func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token, req CreateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
@@ -413,12 +414,6 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
-	// created (an api_key one is unaffected). Checked before anything is built or
-	// stored, so a refusal persists nothing.
-	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
-		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
-	}
 	// A preset vendor (OpenAI-compatible or native Gemini) is api-key only (it has
 	// no subscription/OAuth flow) and carries an immutable root url. openai and
 	// anthropic keep their fixed hosts: a supplied base_url is ignored and BaseURL
@@ -431,6 +426,15 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		if baseURL, err = normalizeVendorAccountBaseURL(vendor, req.BaseURL); err != nil {
 			return VendorAccountDTO{}, err
 		}
+	}
+	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
+	// created (an api_key one is unaffected). It sits AFTER the preset block on
+	// purpose: a preset vendor can never be a subscription and has already been
+	// answered with ErrVendorAccountAuthTypeInvalid (a 400) whatever the switch
+	// says, so only openai and anthropic reach this check. Checked before anything
+	// is built or stored, so a refusal persists nothing.
+	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
+		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
 	}
 	status := strings.TrimSpace(req.Status)
 	if status == "" {

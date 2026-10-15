@@ -97,15 +97,18 @@ func TestVendorAccountEndpointsFollowTheMasterFlagLive(t *testing.T) {
 	}
 }
 
-// GET /api/portal/vendor-accounts/enabled is the boolean-only module flag the
-// portal shell reads (any authenticated user, no config leak) to show or hide
-// the "Anbieter" menu item. It answers while the module is off (that is its
-// whole point) and is not shadowed by the {id} item route.
+// GET /api/portal/vendor-accounts/enabled is the boolean-only probe the portal
+// shell and the Anbieter page read (any authenticated user, no config leak): the
+// module flag shows or hides the "Anbieter" menu item, and subscriptions_enabled
+// (the vendor_subscriptions_enabled switch, default on) lets the page explain why
+// subscription accounts are inert, without the system-scoped settings read. It
+// answers while the module is off (that is its whole point) and is not shadowed
+// by the {id} item route. The body is exactly those two booleans.
 func TestVendorAccountsEnabledEndpoint(t *testing.T) {
 	srv, _, _ := newVendorAccountSettingsTestServer(t, true)
 	const path = "/api/portal/vendor-accounts/enabled"
 
-	moduleEnabled := func(secret string) bool {
+	probe := func(secret string) (moduleEnabled, subscriptionsEnabled bool) {
 		t.Helper()
 		rec := vaDo(t, srv, http.MethodGet, path, secret, "")
 		if rec.Code != http.StatusOK {
@@ -115,23 +118,46 @@ func TestVendorAccountsEnabledEndpoint(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
 		}
-		if len(body) != 1 {
-			t.Fatalf("body = %v, want exactly the module_enabled boolean", body)
+		if len(body) != 2 {
+			t.Fatalf("body = %v, want exactly the module_enabled and subscriptions_enabled booleans", body)
 		}
-		enabled, ok := body["module_enabled"].(bool)
+		module, ok := body["module_enabled"].(bool)
 		if !ok {
 			t.Fatalf("module_enabled = %#v, want a boolean (%s)", body["module_enabled"], rec.Body.String())
 		}
-		return enabled
+		subscriptions, ok := body["subscriptions_enabled"].(bool)
+		if !ok {
+			t.Fatalf("subscriptions_enabled = %#v, want a boolean (%s)", body["subscriptions_enabled"], rec.Body.String())
+		}
+		return module, subscriptions
 	}
 
-	if moduleEnabled(vaOwnerSecret) {
-		t.Fatal("module_enabled = true by default, want false (opt-in)")
+	if module, subscriptions := probe(vaOwnerSecret); module || !subscriptions {
+		t.Fatalf("defaults module/subscriptions = %v/%v, want false (opt-in) / true (opt-out)", module, subscriptions)
 	}
 	enableVendorAccountsFlag(t, srv)
-	if !moduleEnabled(vaOwnerSecret) || !moduleEnabled(vaOtherSecret) {
-		t.Fatal("module_enabled = false after enabling, want true for every authenticated user")
+	for _, secret := range []string{vaOwnerSecret, vaOtherSecret} {
+		if module, subscriptions := probe(secret); !module || !subscriptions {
+			t.Fatalf("after enabling module/subscriptions = %v/%v, want true/true for every authenticated user", module, subscriptions)
+		}
 	}
+
+	// The subscriptions switch is read live (the PUT is visible on the next probe),
+	// independently of the module flag, and by a plain user, not only a system one.
+	putVendorSubscriptionsEnabled(t, srv, false)
+	for _, secret := range []string{vaOwnerSecret, vaOtherSecret} {
+		if module, subscriptions := probe(secret); !module || subscriptions {
+			t.Fatalf("subscriptions off module/subscriptions = %v/%v, want true/false", module, subscriptions)
+		}
+	}
+	if rec := vaDo(t, srv, http.MethodPut, "/api/system/settings", vaSystemSecret, `{"vendor_accounts_enabled":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("disable module = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if module, subscriptions := probe(vaOtherSecret); module || subscriptions {
+		t.Fatalf("module+subscriptions off probe = %v/%v, want false/false (still answers while the module is off)", module, subscriptions)
+	}
+	putVendorSubscriptionsEnabled(t, srv, true)
+	enableVendorAccountsFlag(t, srv)
 
 	if rec := vaDo(t, srv, http.MethodGet, path, "", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("anonymous GET = %d, want 401", rec.Code)

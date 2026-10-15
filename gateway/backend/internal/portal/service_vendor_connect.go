@@ -228,7 +228,8 @@ type ConnectVendorAccountImportRequest struct {
 // never fail the import. The write is OWNER-ONLY and the response is the
 // credential-free DTO (SubscriptionConnected=true, never a token, with the
 // discovered models when the discovery produced any). ErrVendorAccountsDisabled
-// while the master flag is off.
+// while the master flag is off and ErrVendorSubscriptionsDisabled while
+// vendor_subscriptions_enabled is off.
 func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID string, req ConnectVendorAccountImportRequest) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -289,7 +290,8 @@ func importedTokenSet(vendor, access string, req ConnectVendorAccountImportReque
 // same account replaces the first. A store that cannot seal the eventual token
 // set (a keyless disk store) fails here, before the user signs in, with
 // ErrVendorAccountConnectKeyRequired. OWNER-ONLY; ErrVendorAccountsDisabled while
-// the master flag is off.
+// the master flag is off and ErrVendorSubscriptionsDisabled while
+// vendor_subscriptions_enabled is off.
 func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.Token, accountID string) (string, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -343,7 +345,8 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 // (ErrVendorAccountConnectKeyRequired) never costs the user their one-time code.
 // Once the tokens are stored a best-effort model discovery runs (see
 // ConnectVendorAccountImport); it never fails the connect.
-// OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off.
+// OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off and
+// ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal auth.Token, accountID, codeAndState string) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {

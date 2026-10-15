@@ -163,7 +163,8 @@ func (s *Service) terminalDeviceError(accountID, deviceAuthID string, err error)
 // user approves anything. A fresh begin replaces any previous pending entry for
 // the account. A vendor refusal is ErrVendorAccountConnectRejected, any other
 // vendor failure ErrVendorAccountConnectUpstream. OWNER-ONLY; OpenAI-only;
-// ErrVendorAccountsDisabled while the master flag is off.
+// ErrVendorAccountsDisabled while the master flag is off and
+// ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (userCode, verificationURL string, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -200,7 +201,8 @@ func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal
 // ErrVendorAccountDeviceConnectState. The poll that connects the account also runs
 // a best-effort model discovery (see ConnectVendorAccountImport) before it
 // answers; it never fails the connect. The response never carries a token.
-// OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the master flag is off.
+// OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the master flag is off
+// and ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (connected bool, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
