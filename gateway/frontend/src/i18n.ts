@@ -2515,6 +2515,10 @@ const de = {
   vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
   vendorAccountSubscriptionCreateNote:
     'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
+  // Shown on every subscription account while the system admin has turned
+  // vendor_subscriptions_enabled off: the account is kept but cannot be used.
+  vendorAccountSubscriptionsDisabledNotice:
+    'Abonnement-Konten sind derzeit deaktiviert. Dieses Konto kann nicht genutzt werden, bis ein Systemadministrator sie wieder zulässt.',
   // The optional model-id prefix of an account, plus the Models panel (the
   // account's current models and the "refresh models" action).
   vendorAccountModelPrefixLabel: 'Modell-Präfix (optional)',
@@ -2669,6 +2673,8 @@ const de = {
     'Zum Speichern eines API-Schlüssels ist ein Verschlüsselungsschlüssel auf dem Gateway erforderlich',
   errorVendorAccountsModuleDisabled:
     'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
+  errorVendorSubscriptionsDisabled:
+    'Abonnement-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen zulassen. Konten mit API-Schlüssel sind nicht betroffen.',
   errorVendorAccountNotSubscription:
     'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
   errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
@@ -2707,6 +2713,9 @@ const de = {
   systemVendorAccountsEnabledLabel: 'Anbieter aktivieren',
   systemVendorAccountsEnabledNote:
     'Aus (Standard): Der Menüpunkt „Anbieter“ ist ausgeblendet und alle Anbieter-Funktionen sind deaktiviert. Bereits angelegte Konten bleiben erhalten.',
+  systemVendorSubscriptionsEnabledLabel: 'Abonnement-Konten zulassen',
+  systemVendorSubscriptionsEnabledNote:
+    'Abonnement-Konten (OAuth-Anmeldung mit einem ChatGPT- oder Claude-Abonnement) sind experimentell und verstoßen gegen die Nutzungsbedingungen der Anbieter für Privatkunden. Aus: Abonnement-Konten können weder angelegt noch verbunden oder genutzt werden; bereits angelegte Konten bleiben erhalten, sind aber nicht nutzbar. Konten mit API-Schlüssel sind nicht betroffen.',
   systemVendorAccountRoutingModeLabel: 'Vorrang bei der Anbieter-Auswahl',
   systemVendorAccountRoutingModeNote:
     'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
@@ -5257,6 +5266,10 @@ const en: PortalMessages = {
   vendorAccountDeleteConfirm: 'Delete this provider account?',
   vendorAccountSubscriptionCreateNote:
     'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
+  // Shown on every subscription account while the system admin has turned
+  // vendor_subscriptions_enabled off: the account is kept but cannot be used.
+  vendorAccountSubscriptionsDisabledNotice:
+    'Subscription accounts are currently disabled. This account cannot be used until a system administrator allows them again.',
   // The optional model-id prefix of an account, plus the Models panel (the
   // account's current models and the "refresh models" action).
   vendorAccountModelPrefixLabel: 'Model prefix (optional)',
@@ -5404,6 +5417,8 @@ const en: PortalMessages = {
     'An encryption key is required on the gateway to store an API key',
   errorVendorAccountsModuleDisabled:
     'Provider accounts are disabled. A system administrator can enable them in the system settings.',
+  errorVendorSubscriptionsDisabled:
+    'Subscription accounts are disabled. A system administrator can allow them in the system settings. API-key accounts are not affected.',
   errorVendorAccountNotSubscription:
     'Only an account with subscription authentication can be connected to a subscription',
   errorVendorAccountConnectTokenRequired: 'An access token is required',
@@ -5442,6 +5457,9 @@ const en: PortalMessages = {
   systemVendorAccountsEnabledLabel: 'Enable providers',
   systemVendorAccountsEnabledNote:
     'Off (default): the "Providers" menu item is hidden and all provider features are disabled. Existing accounts are kept.',
+  systemVendorSubscriptionsEnabledLabel: 'Allow subscription accounts',
+  systemVendorSubscriptionsEnabledNote:
+    "Subscription accounts (OAuth sign-in with a ChatGPT or Claude subscription) are experimental and against the vendors' consumer terms. Off: subscription accounts can no longer be created, connected or used; existing ones are kept but cannot be used. API-key accounts are not affected.",
   systemVendorAccountRoutingModeLabel: 'Provider routing precedence',
   systemVendorAccountRoutingModeNote:
     "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",

@@ -81,6 +81,13 @@ export type SystemSettings = {
   // the "Anbieter" nav item is hidden and every vendor-account call answers 409
   // vendor_accounts.module_disabled.
   vendor_accounts_enabled: boolean;
+  // Subscription-type vendor accounts switch, ON by default (opt-out) and
+  // strictly narrower than vendor_accounts_enabled: inside an enabled vendor
+  // module, turning it off blocks creating and connecting subscription (OAuth)
+  // accounts (409 vendor_accounts.subscriptions_disabled) and stops existing ones
+  // from being used; they stay listed and nothing is deleted. api_key accounts
+  // are never affected.
+  vendor_subscriptions_enabled: boolean;
   // Anthropic prompt caching flag, off by default (opt-in, experimental). While on,
   // the gateway's Anthropic translate path places cache_control breakpoints so
   // repeated context is billed at cache rates.
@@ -501,6 +508,7 @@ export function systemApi(fetcher: Fetcher) {
       // Vendor accounts master flag + routing precedence (unknown routing mode
       // is rejected with 400 system.vendor_account_routing_mode_invalid).
       vendor_accounts_enabled?: boolean;
+      vendor_subscriptions_enabled?: boolean;
       anthropic_prompt_caching_enabled?: boolean;
       vendor_account_routing_mode?: VendorAccountRoutingMode;
       // Omitted keeps the stored value, "" resets to the built-in default.

@@ -646,6 +646,14 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     );
   });
 
+  // The vendor_subscriptions_enabled switch is off: creating or connecting a
+  // subscription account is a 409 with this code (portalVendorAccountErrRows).
+  it('maps the vendor subscriptions-disabled refusal by its exact wire string', () => {
+    expect(errorLabelByCode['vendor_accounts.subscriptions_disabled']).toBe(
+      'errorVendorSubscriptionsDisabled',
+    );
+  });
+
   // The per-token vendor-access refusals (`portal.token_vendor_access_*`, the
   // errRow table in portal_token_endpoints.go), pinned as literals: a code the
   // map does not carry falls back to the raw English the server sent.

@@ -167,6 +167,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       testConnection?: PortalApi['testConnection'];
       refreshModels?: PortalApi['refreshModels'];
       refreshUsage?: PortalApi['refreshUsage'];
+      // The vendor_subscriptions_enabled switch as the shell reads it; omitted =
+      // the prop's own default (on).
+      subscriptionsEnabled?: boolean;
     } = {},
   ) {
     const accounts = opts.accounts ?? [makeVendorAccount()];
@@ -259,7 +262,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     };
     const view = render(
       <ToastProvider>
-        <VendorAccountsView t={t} api={fakeApi} />
+        <VendorAccountsView
+          t={t}
+          api={fakeApi}
+          {...(opts.subscriptionsEnabled === undefined
+            ? {}
+            : { subscriptionsEnabled: opts.subscriptionsEnabled })}
+        />
       </ToastProvider>,
     );
     return { fakeApi, ...view };
@@ -303,6 +312,83 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const row = screen.getByText('Sub').closest('tr')!;
       expect(within(row).getByText(t.vendorAccountStatusNeedsReconnect)).toBeInTheDocument();
       expect(within(row).queryByText(t.statusActive)).not.toBeInTheDocument();
+    });
+
+    describe('with vendor_subscriptions_enabled off', () => {
+      const subscriptionAccount = () =>
+        makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true });
+
+      it('flags every subscription account as unusable and shows it inactive, still listed', async () => {
+        renderView({
+          accounts: [
+            subscriptionAccount(),
+            makeVendorAccount({ ...SUBSCRIPTION, id: 'va_sub2', name: 'Second Claude' }),
+          ],
+          subscriptionsEnabled: false,
+        });
+
+        await screen.findByText('Team Claude Max');
+        for (const name of ['Team Claude Max', 'Second Claude']) {
+          const row = screen.getByText(name).closest('tr')!;
+          expect(within(row).getByText(t.vendorAccountSubscriptionsDisabledNotice)).toBeVisible();
+          // Visibly inactive: the muted (standby) disabled chip, never the stored
+          // "active" one.
+          expect(within(row).getByText(t.statusDisabled)).toHaveAttribute('data-status', 'standby');
+          expect(within(row).queryByText(t.statusActive)).not.toBeInTheDocument();
+        }
+      });
+
+      it('never flags an api_key account, which the switch does not touch', async () => {
+        renderView({
+          accounts: [subscriptionAccount(), makeVendorAccount({ name: 'Plain Key' })],
+          subscriptionsEnabled: false,
+        });
+
+        await screen.findByText('Plain Key');
+        const row = screen.getByText('Plain Key').closest('tr')!;
+        expect(
+          within(row).queryByText(t.vendorAccountSubscriptionsDisabledNotice),
+        ).not.toBeInTheDocument();
+        expect(within(row).getByText(t.statusActive)).toHaveAttribute('data-status', 'active');
+        expect(screen.getAllByText(t.vendorAccountSubscriptionsDisabledNotice)).toHaveLength(1);
+      });
+
+      it('repeats the notice on the subscription account detail view', async () => {
+        renderView({ accounts: [subscriptionAccount()], subscriptionsEnabled: false });
+
+        fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+        await screen.findByText(t.vendorAccountSettingsTitle);
+        expect(screen.getByText(t.vendorAccountSubscriptionsDisabledNotice)).toBeVisible();
+      });
+
+      it('keeps the notice off an api_key account detail view', async () => {
+        renderView({ accounts: [makeVendorAccount()], subscriptionsEnabled: false });
+
+        fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+        await screen.findByText(t.vendorAccountSettingsTitle);
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsDisabledNotice),
+        ).not.toBeInTheDocument();
+      });
+    });
+
+    describe('with vendor_subscriptions_enabled on', () => {
+      it.each([
+        ['explicitly on', true],
+        ['left to the default', undefined],
+      ])('shows no notice and the stored status (%s)', async (_label, subscriptionsEnabled) => {
+        renderView({
+          accounts: [makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true })],
+          subscriptionsEnabled,
+        });
+
+        await screen.findByText('Team Claude Max');
+        const row = screen.getByText('Team Claude Max').closest('tr')!;
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsDisabledNotice),
+        ).not.toBeInTheDocument();
+        expect(within(row).getByText(t.statusActive)).toHaveAttribute('data-status', 'active');
+      });
     });
 
     it('offers the create action to every user (no role gate)', async () => {

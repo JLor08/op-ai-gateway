@@ -272,6 +272,12 @@ let netbirdRawCheckboxMock: boolean | null = null;
 // saved vendor_accounts_enabled in the System-settings PUT below flips it, like
 // the NetBird checkbox, so the shell's post-save re-fetch sees the new value.
 let vendorAccountsEnabledMock = false;
+// The vendor_subscriptions_enabled switch as the same portal-scoped endpoint
+// reports it (`subscriptions_enabled`). undefined = the field is absent from the
+// answer, which the shell must read as ON (the default).
+let vendorSubscriptionsEnabledMock: boolean | undefined = undefined;
+// The caller's own accounts as GET /api/portal/vendor-accounts lists them.
+let vendorAccountsListMock: Array<Record<string, unknown>> = [];
 // Drives CurrentUser.system_admin_mode on the mocked /api/auth/session +
 // /api/portal/me responses. A system_admin session starts NOT elevated
 // (matches the backend default), so only tests that specifically need the
@@ -309,6 +315,8 @@ beforeEach(() => {
   netbirdModuleEnabledMock = false;
   netbirdRawCheckboxMock = null;
   vendorAccountsEnabledMock = false;
+  vendorSubscriptionsEnabledMock = undefined;
+  vendorAccountsListMock = [];
   systemAdminModeMock = false;
   window.sessionStorage.clear();
   // The reworked Chat persists its transcript + settings to localStorage. jsdom
@@ -574,10 +582,15 @@ beforeEach(() => {
       // Vendor accounts ("Anbieter"): the master flag the shell gates the nav item
       // on, and the (empty) account list the providers view loads once it is open.
       if (path === '/api/portal/vendor-accounts/enabled') {
-        return jsonResponse({ module_enabled: vendorAccountsEnabledMock });
+        return jsonResponse({
+          module_enabled: vendorAccountsEnabledMock,
+          ...(vendorSubscriptionsEnabledMock === undefined
+            ? {}
+            : { subscriptions_enabled: vendorSubscriptionsEnabledMock }),
+        });
       }
       if (path === '/api/portal/vendor-accounts' && (!init?.method || init.method === 'GET')) {
-        return jsonResponse({ data: [] });
+        return jsonResponse({ data: vendorAccountsListMock });
       }
       if (path === '/v1/chat/completions' && init?.method === 'POST') {
         const body = JSON.parse(String(init?.body)) as { model: string };
@@ -2822,6 +2835,75 @@ describe('App', () => {
     expect(await screen.findByText(messages.de.vendorAccountListEmpty)).toBeInTheDocument();
   });
 
+  // A subscription account (and an api_key one) as the backend lists them, for
+  // the vendor_subscriptions_enabled notice tests below.
+  const vendorAccountRows = [
+    {
+      id: 'va_sub',
+      vendor: 'anthropic',
+      auth_type: 'subscription',
+      name: 'Team Claude Max',
+      status: 'active',
+      model_prefix: '',
+      base_url: '',
+      api_key_set: false,
+      subscription_connected: true,
+      models: [],
+      created_at: '2026-09-01T12:00:00Z',
+      updated_at: '2026-09-01T12:00:00Z',
+    },
+    {
+      id: 'va_key',
+      vendor: 'openai',
+      auth_type: 'api_key',
+      name: 'Plain Key',
+      status: 'active',
+      model_prefix: '',
+      base_url: '',
+      api_key_set: true,
+      subscription_connected: false,
+      models: [],
+      created_at: '2026-09-01T12:00:00Z',
+      updated_at: '2026-09-01T12:00:00Z',
+    },
+  ];
+
+  it('flags the subscription accounts on the providers page once the shell reads vendor_subscriptions_enabled off', async () => {
+    vendorAccountsEnabledMock = true;
+    vendorSubscriptionsEnabledMock = false;
+    vendorAccountsListMock = vendorAccountRows;
+    currentRole = 'user';
+    renderApp();
+    await screen.findByText('Dev User');
+    await gotoNav(messages.de.providers);
+    await screen.findByText('Team Claude Max');
+    // Only the subscription account is flagged; the api_key one is untouched.
+    expect(screen.getAllByText(messages.de.vendorAccountSubscriptionsDisabledNotice)).toHaveLength(
+      1,
+    );
+    const row = screen.getByText('Team Claude Max').closest('tr')!;
+    expect(
+      within(row).getByText(messages.de.vendorAccountSubscriptionsDisabledNotice),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ['reported on', true],
+    ['absent from the answer (default on)', undefined],
+  ])('shows no subscription notice while vendor_subscriptions_enabled is %s', async (_l, flag) => {
+    vendorAccountsEnabledMock = true;
+    vendorSubscriptionsEnabledMock = flag;
+    vendorAccountsListMock = vendorAccountRows;
+    currentRole = 'user';
+    renderApp();
+    await screen.findByText('Dev User');
+    await gotoNav(messages.de.providers);
+    await screen.findByText('Team Claude Max');
+    expect(
+      screen.queryByText(messages.de.vendorAccountSubscriptionsDisabledNotice),
+    ).not.toBeInTheDocument();
+  });
+
   it('keeps the providers nav item hidden when the flag probe fails (fail closed)', async () => {
     vendorAccountsEnabledMock = true;
     const baseFetch = fetch as unknown as (
@@ -2939,6 +3021,7 @@ describe('App', () => {
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
+      vendor_subscriptions_enabled: true,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3031,6 +3114,7 @@ describe('App', () => {
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
+      vendor_subscriptions_enabled: true,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3085,6 +3169,7 @@ describe('App', () => {
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
+      vendor_subscriptions_enabled: true,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3160,6 +3245,7 @@ describe('App', () => {
       route_affinity_session_mode: 'client_session',
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
+      vendor_subscriptions_enabled: true,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,

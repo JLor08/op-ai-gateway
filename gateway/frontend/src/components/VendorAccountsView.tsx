@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState, type SubmitEvent } from 'react';
-import { Box, Button, Typography } from '@mui/material';
+import { Alert, Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
@@ -108,8 +108,13 @@ function hasCredential(account: VendorAccount): boolean {
 export function VendorAccountsView({
   t,
   api,
+  subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
+  // The vendor_subscriptions_enabled system switch (on by default). While it is
+  // off every subscription account is shown inactive with a notice: the backend
+  // no longer routes it, nor lets it be created or connected, but it stays listed.
+  subscriptionsEnabled?: boolean;
   api: Pick<
     PortalApi,
     | 'vendorAccounts'
@@ -141,6 +146,10 @@ export function VendorAccountsView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [error]);
   const accounts = accountsData ?? [];
+  // A subscription account is unusable while the subscriptions switch is off;
+  // an api_key account never is.
+  const subscriptionBlocked = (account: VendorAccount) =>
+    !subscriptionsEnabled && account.auth_type === 'subscription';
 
   const [mode, setMode] = useState<Mode>('list');
   // The latest mode, for callbacks an async connect holds across renders: the
@@ -409,7 +418,25 @@ export function VendorAccountsView({
       enumLabel: (v) => authTypeLabel(t, v),
       render: (a) => authTypeLabel(t, a.auth_type),
     },
-    { id: 'name', label: t.tableName, value: (a) => a.name, filter: 'text' },
+    {
+      id: 'name',
+      label: t.tableName,
+      value: (a) => a.name,
+      filter: 'text',
+      render: (a) =>
+        subscriptionBlocked(a) ? (
+          <Box>
+            <Typography component="span" variant="body2" color="text.secondary">
+              {a.name}
+            </Typography>
+            <Typography variant="caption" color="warning.dark" sx={{ display: 'block' }}>
+              {t.vendorAccountSubscriptionsDisabledNotice}
+            </Typography>
+          </Box>
+        ) : (
+          a.name
+        ),
+    },
     {
       id: 'status',
       label: t.tableStatus,
@@ -417,9 +444,12 @@ export function VendorAccountsView({
       filter: 'enum',
       searchable: false,
       enumLabel: (v) => vendorStatusLabel(t, v),
-      render: (a) => (
-        <StatusChip status={vendorStatusBadge(a.status)} label={vendorStatusLabel(t, a.status)} />
-      ),
+      // A blocked subscription account reads as disabled whatever its stored
+      // status: it cannot be used until the switch is turned back on.
+      render: (a) => {
+        const shown = subscriptionBlocked(a) ? 'disabled' : a.status;
+        return <StatusChip status={vendorStatusBadge(shown)} label={vendorStatusLabel(t, shown)} />;
+      },
     },
     {
       id: 'credential',
@@ -586,6 +616,11 @@ export function VendorAccountsView({
           backLabel={t.back}
           items={[{ label: t.providers, onClick: backToList }, { label: account.name }]}
         />
+        {subscriptionBlocked(account) && (
+          <Alert severity="warning" role="status" sx={{ mb: 2.25 }}>
+            {t.vendorAccountSubscriptionsDisabledNotice}
+          </Alert>
+        )}
         <Panel
           titleId="vendor-account-settings-heading"
           title={t.vendorAccountSettingsTitle}

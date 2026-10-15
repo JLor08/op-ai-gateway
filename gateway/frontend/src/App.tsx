@@ -89,6 +89,10 @@ export default function App() {
   // flags above there is no admin requirement -- every user manages their own
   // accounts once it is on.
   const [vendorAccountsEnabled, setVendorAccountsEnabled] = useState(false);
+  // The narrower vendor_subscriptions_enabled switch (on by default), read from
+  // the same portal-scoped probe. It does not gate any nav item: the providers
+  // page uses it to flag its subscription accounts as unusable while it is off.
+  const [vendorSubscriptionsEnabled, setVendorSubscriptionsEnabled] = useState(true);
   const t = messages[locale];
   const tRef = useRef(t);
   tRef.current = t;
@@ -286,7 +290,11 @@ export default function App() {
   const refreshVendorAccountsModule = useCallback(() => {
     api
       .vendorAccountsEnabled()
-      .then((r) => setVendorAccountsEnabled(Boolean(r.module_enabled)))
+      .then((r) => {
+        setVendorAccountsEnabled(Boolean(r.module_enabled));
+        // Absent = on (the default), so an older backend never shows the notice.
+        setVendorSubscriptionsEnabled(r.subscriptions_enabled !== false);
+      })
       .catch(() => {
         /* not reachable → the "Anbieter" nav item stays hidden */
       });
@@ -414,6 +422,7 @@ export default function App() {
   };
   const renderCtx: ViewRenderCtx = {
     ...gateCtx,
+    vendorSubscriptionsEnabled,
     t,
     api,
     locale,
