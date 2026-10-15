@@ -426,15 +426,20 @@ type Resolver struct {
 	groups            GroupResolver
 	warmer            ModelWarmer
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
-	// vendorEnabled / vendorRoutingMode gate and steer the per-user vendor-account
-	// branch (resolveVendorAccount). Both are injected by the gateway from a CACHED
-	// read of the vendor_accounts_enabled master flag and the
-	// vendor_account_routing_mode setting (SetVendorAccountAccessors). Both are
+	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
+	// the per-user vendor-account branch (resolveVendorAccount). All three are
+	// injected by the gateway from a CACHED read of the vendor_accounts_enabled
+	// master flag, the vendor_account_routing_mode setting and the
+	// vendor_subscriptions_enabled switch (SetVendorAccountAccessors). Each is
 	// nil-safe: a nil vendorEnabled means the whole branch is OFF (the no-op
 	// invariant — a resolver built without these accessors is byte-identical to
 	// today), and a nil / unknown vendorRoutingMode means vendor_first.
 	vendorEnabled     func() bool
 	vendorRoutingMode func() string
+	// vendorSubscriptionsAllowed reports the vendor_subscriptions_enabled switch.
+	// Unlike vendorEnabled it is default-ON and nil-safe in that direction: a nil
+	// accessor means subscription accounts are allowed (see subscriptionsAllowed).
+	vendorSubscriptionsAllowed func() bool
 }
 
 // Vendor-account routing modes, mirrored as local string literals so routing
@@ -521,23 +526,36 @@ func (r *Resolver) SetModelWarmer(w ModelWarmer) { r.warmer = w }
 // extracted ClientSessionID. Safe to call live (atomic).
 func (r *Resolver) SetAffinitySessionMode(legacy bool) { r.legacyAffinity.Store(legacy) }
 
-// SetVendorAccountAccessors installs the two accessors that gate and steer the
+// SetVendorAccountAccessors installs the three accessors that gate and steer the
 // per-user vendor-account branch: enabled reports the vendor_accounts_enabled
-// master flag, mode reports the vendor_account_routing_mode. The gateway wires
-// these from a CACHED read of system settings (invalidated on a settings PUT),
-// so resolveVendorAccount never issues a settings store read on the hot path.
-// Leaving them unset (nil) keeps the branch OFF (nil enabled) and the mode at
-// vendor_first (nil mode) — the no-op invariant a resolver built without them
-// relies on. Mirrors the other optional-dependency setters above.
-func (r *Resolver) SetVendorAccountAccessors(enabled func() bool, mode func() string) {
+// master flag, mode reports the vendor_account_routing_mode, and
+// subscriptionsAllowed reports the vendor_subscriptions_enabled switch that
+// gates only the subscription-type accounts. The gateway wires these from a
+// CACHED read of system settings (invalidated on a settings PUT), so
+// resolveVendorAccount never issues a settings store read on the hot path.
+// Leaving them unset (nil) keeps the branch OFF (nil enabled), the mode at
+// vendor_first (nil mode) and subscription accounts ALLOWED (nil
+// subscriptionsAllowed: the switch is default-on, so a resolver built without it
+// must not drop them) — the no-op invariant a resolver built without them relies
+// on. Mirrors the other optional-dependency setters above.
+func (r *Resolver) SetVendorAccountAccessors(enabled func() bool, mode func() string, subscriptionsAllowed func() bool) {
 	r.vendorEnabled = enabled
 	r.vendorRoutingMode = mode
+	r.vendorSubscriptionsAllowed = subscriptionsAllowed
 }
 
 // vendorOn reports whether the vendor-account branch is enabled. Nil-safe: a
 // resolver with no enabled accessor is OFF.
 func (r *Resolver) vendorOn() bool {
 	return r.vendorEnabled != nil && r.vendorEnabled()
+}
+
+// subscriptionsAllowed reports whether subscription-type vendor accounts may
+// serve. Nil-safe in the OPPOSITE direction to vendorOn: the
+// vendor_subscriptions_enabled setting is default-on, so a resolver with no
+// accessor allows them.
+func (r *Resolver) subscriptionsAllowed() bool {
+	return r.vendorSubscriptionsAllowed == nil || r.vendorSubscriptionsAllowed()
 }
 
 // vendorMode reports the effective vendor routing mode, defaulting to
@@ -821,6 +839,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // It matches only when EVERY precondition holds, each a deliberate guard:
 //   - r.vendorOn(): the vendor_accounts_enabled master flag is on. Off → the
 //     whole branch is invisible (the no-op invariant).
+//   - r.subscriptionsAllowed() (per account): the vendor_subscriptions_enabled
+//     switch (default on) is on, or the account is an api_key one. Off → every
+//     subscription account is skipped, exactly like a needs_reconnect one.
 //   - token.UserID != "": the principal is a USER. A SERVICE token (UserID=="")
 //     owns no vendor accounts and must never borrow a user's — service dispatch
 //     is a later milestone.
@@ -858,6 +879,15 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 		// disabled accounts are skipped and fall through to the standard path.
 		if acc.Status != VendorAccountStatusActive {
+			continue
+		}
+		// The vendor_subscriptions_enabled switch: while it is off a SUBSCRIPTION
+		// account does not serve (api_key accounts are untouched) and falls through
+		// to the standard path like any other skipped account. The account is not
+		// deleted, so switching the setting back on restores it. The model listing
+		// applies the same skip (portal ownVendorAccountModels); the two must move
+		// together or served_flavors parity breaks.
+		if acc.AuthType == VendorAuthSubscription && !r.subscriptionsAllowed() {
 			continue
 		}
 		// Per-token access (the boundary): a token only reaches the accounts its

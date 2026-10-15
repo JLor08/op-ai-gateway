@@ -24,10 +24,15 @@ import (
 //
 // Returns nil (nothing to overlay) unless the vendor_accounts_enabled master flag
 // is on, the principal is a USER (a service token has no UserID and owns no vendor
-// accounts), and a routing store is wired. Best-effort and FAIL-OPEN like the
-// group overlay: a store error yields what was read so far (nil on the first
-// read) rather than blanking the whole listing, and an account whose model rows
-// cannot be read is skipped.
+// accounts), and a routing store is wired. While the vendor_subscriptions_enabled
+// switch is off, the owner's SUBSCRIPTION accounts are left out too (their api_key
+// accounts are not), mirroring the resolver's skip so that no model is advertised
+// that cannot be routed. Both switches come from ONE settings read, because the
+// store read is an uncached full-table SELECT.
+//
+// Best-effort and FAIL-OPEN like the group overlay: a store error yields what was
+// read so far (nil on the first read) rather than blanking the whole listing, and
+// an account whose model rows cannot be read is skipped.
 //
 // The second result, loaded, says whether that set is COMPLETE, so a consumer
 // that must not act on a partial one can tell. It is true when no vendor ACCOUNT
@@ -38,12 +43,20 @@ import (
 // overlays ignore it and stay fail-open; the generated-alias derivation fails
 // CLOSED on it, because its vendor-shadow exclusion needs the whole set.
 //
-// The vendor_accounts_enabled master-flag read is NOT covered: VendorAccountsEnabled
-// reports false for a settings store it cannot read, which lands in the
-// no-vendor-access case above (nil, true), so a failed flag read stays fail-open
-// for the alias derivation too, as it does in the resolver.
+// The vendor_accounts_enabled master-flag read is NOT covered: a missing or
+// unreadable settings store counts as the flag being off (it fails closed, like
+// Service.VendorAccountsEnabled), which lands in the no-vendor-access case above
+// (nil, true), so a failed flag read stays fail-open for the alias derivation too,
+// as it does in the resolver.
 func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) (owned []vendorAccountModels, loaded bool) {
-	if s.routes == nil || token.UserID == "" || !s.VendorAccountsEnabled(ctx) {
+	if s.routes == nil || token.UserID == "" || s.settings == nil {
+		return nil, true
+	}
+	// One settings read for both switches: the master flag (off when the store
+	// cannot be read) and the subscriptions switch (the pure readers, so default-on
+	// for an absent or unparseable value).
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil || !VendorAccountsEnabled(values) {
 		return nil, true
 	}
 	accounts, err := s.routes.VendorAccountsByOwner(ctx, token.UserID)
@@ -51,9 +64,16 @@ func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) 
 		return nil, false
 	}
 	loaded = true
+	// While vendor_subscriptions_enabled is off a SUBSCRIPTION account is not
+	// advertised, exactly as the resolver (resolveVendorAccount) no longer routes it,
+	// so the two stay in lock-step. api_key accounts are untouched.
+	subscriptionsOn := VendorSubscriptionsEnabled(values)
 	var out []vendorAccountModels
 	for _, acc := range accounts {
 		if acc.Status != routing.VendorAccountStatusActive {
+			continue
+		}
+		if acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn {
 			continue
 		}
 		prefix, allowed := routing.TokenVendorPrefix(token.VendorAccess, acc)

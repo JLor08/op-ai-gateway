@@ -250,8 +250,16 @@ export function vendorAccountsApi(fetcher: Fetcher) {
     // module_enabled and certificatesEnabled gate theirs. It answers while the
     // module is off; every other vendor-account call then answers 409
     // vendor_accounts.module_disabled.
+    //
+    // subscriptions_enabled mirrors the narrower vendor_subscriptions_enabled
+    // system switch (on by default) the same way, so every user's Anbieter page
+    // can flag its subscription accounts without the system-scoped settings read.
+    // Optional on the wire: a response without it means the switch is on.
     vendorAccountsEnabled: () =>
-      request<{ module_enabled: boolean }>(fetcher, '/api/portal/vendor-accounts/enabled'),
+      request<{ module_enabled: boolean; subscriptions_enabled?: boolean }>(
+        fetcher,
+        '/api/portal/vendor-accounts/enabled',
+      ),
     // The caller's OWN accounts, oldest first -- system scope does not widen
     // the list (the page is a personal one and the DTO carries no owner).
     vendorAccounts: () =>

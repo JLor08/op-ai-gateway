@@ -482,6 +482,23 @@ describe('Claude Code effort compatibility i18n keys', () => {
   });
 });
 
+describe('vendor subscriptions toggle i18n keys', () => {
+  it('defines the System-settings toggle, the Anbieter notice and the 409 message in de and en', () => {
+    const keys = [
+      'systemVendorSubscriptionsEnabledLabel',
+      'systemVendorSubscriptionsEnabledNote',
+      'vendorAccountSubscriptionsDisabledNotice',
+      'errorVendorSubscriptionsDisabled',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('configurable-root vendor i18n keys', () => {
   it('defines the provider labels, base-URL strings and base-URL errors in de and en', () => {
     const keys = [

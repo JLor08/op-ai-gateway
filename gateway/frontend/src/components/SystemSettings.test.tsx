@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SystemSettings } from './SystemSettings';
 import { ToastProvider } from './shared/ToastProvider';
@@ -40,6 +40,7 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     route_affinity_session_mode: 'client_session',
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
+    vendor_subscriptions_enabled: true,
     anthropic_prompt_caching_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
     vendor_openai_codex_client_version: '26.930.61225',
@@ -426,6 +427,74 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(
           (screen.getByLabelText(t.systemVendorAccountsEnabledLabel) as HTMLInputElement).checked,
         ).toBe(true),
+      );
+    });
+  });
+
+  describe(`SystemSettings vendor subscriptions [${locale}]`, () => {
+    it('places the subscriptions toggle directly beneath the providers toggle, ON by default', async () => {
+      renderSystemSettings(makeSettings());
+      const accounts = (await screen.findByLabelText(
+        t.systemVendorAccountsEnabledLabel,
+      )) as HTMLInputElement;
+      const toggle = screen.getByRole('checkbox', {
+        name: t.systemVendorSubscriptionsEnabledLabel,
+      }) as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+      expect(screen.getByText(t.systemVendorSubscriptionsEnabledNote)).toBeInTheDocument();
+      // Same panel, and the next checkbox after the providers one.
+      const checkboxes = within(accounts.closest('section') ?? document.body).getAllByRole(
+        'checkbox',
+      );
+      expect(checkboxes.indexOf(toggle)).toBe(checkboxes.indexOf(accounts) + 1);
+    });
+
+    it('renders checked when the server does not send the field (default on)', async () => {
+      renderSystemSettings(makeSettings({ vendor_subscriptions_enabled: undefined }));
+      const toggle = (await screen.findByRole('checkbox', {
+        name: t.systemVendorSubscriptionsEnabledLabel,
+      })) as HTMLInputElement;
+      expect(toggle.checked).toBe(true);
+    });
+
+    it('reflects a stored OFF value', async () => {
+      renderSystemSettings(makeSettings({ vendor_subscriptions_enabled: false }));
+      const toggle = (await screen.findByRole('checkbox', {
+        name: t.systemVendorSubscriptionsEnabledLabel,
+      })) as HTMLInputElement;
+      expect(toggle.checked).toBe(false);
+    });
+
+    it('sends the stored value unchanged on a save that does not touch it', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const save = await screen.findByRole('button', { name: t.save });
+      await waitFor(() => expect(save).not.toBeDisabled());
+      fireEvent.click(save);
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_subscriptions_enabled: true,
+      });
+    });
+
+    it('saves the toggled value, notifies the shell and keeps it shown after the reset', async () => {
+      const { updateSystemSettings, onSaved } = renderSystemSettings(makeSettings());
+      fireEvent.click(
+        await screen.findByRole('checkbox', { name: t.systemVendorSubscriptionsEnabledLabel }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_subscriptions_enabled: false,
+      });
+      await waitFor(() => expect(onSaved).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(
+          (
+            screen.getByRole('checkbox', {
+              name: t.systemVendorSubscriptionsEnabledLabel,
+            }) as HTMLInputElement
+          ).checked,
+        ).toBe(false),
       );
     });
   });

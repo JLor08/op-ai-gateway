@@ -76,6 +76,10 @@ export function SystemSettings({
   const [pendingVendorAccountsEnabled, setPendingVendorAccountsEnabled] = useState<boolean | null>(
     null,
   );
+  // Subscription-type vendor accounts switch (on by default). Null = untouched.
+  const [pendingVendorSubscriptionsEnabled, setPendingVendorSubscriptionsEnabled] = useState<
+    boolean | null
+  >(null);
   const [pendingVendorRoutingMode, setPendingVendorRoutingMode] =
     useState<VendorAccountRoutingMode | null>(null);
   // Anthropic prompt caching flag (experimental, off by default). Null = untouched.
@@ -157,6 +161,11 @@ export function SystemSettings({
   // to the own account winning -- both mirror the backend defaults.
   const vendorAccountsEnabled =
     pendingVendorAccountsEnabled ?? settings?.vendor_accounts_enabled ?? false;
+  // Unlike the master flag, the subscriptions switch is opt-OUT: on unless the
+  // admin turns it off (the backend default, and the value an older server that
+  // does not send the field implies).
+  const vendorSubscriptionsEnabled =
+    pendingVendorSubscriptionsEnabled ?? settings?.vendor_subscriptions_enabled ?? true;
   const vendorRoutingMode: VendorAccountRoutingMode =
     pendingVendorRoutingMode ?? settings?.vendor_account_routing_mode ?? 'vendor_first';
   // Opt-in like the vendor-accounts flag: off unless the admin turns it on.
@@ -253,6 +262,7 @@ export function SystemSettings({
         route_affinity_session_mode: affinityMode,
         vision_probe_mode: visionProbeMode,
         vendor_accounts_enabled: vendorAccountsEnabled,
+        vendor_subscriptions_enabled: vendorSubscriptionsEnabled,
         anthropic_prompt_caching_enabled: anthropicPromptCaching,
         vendor_account_routing_mode: vendorRoutingMode,
         // Only when edited: the loaded value is the EFFECTIVE one, so re-sending it
@@ -291,6 +301,7 @@ export function SystemSettings({
       setPendingAffinityMode(null);
       setPendingVisionProbeMode(null);
       setPendingVendorAccountsEnabled(null);
+      setPendingVendorSubscriptionsEnabled(null);
       setPendingVendorRoutingMode(null);
       setPendingAnthropicPromptCaching(null);
       setPendingCodexClientVersion(null);
@@ -539,6 +550,20 @@ export function SystemSettings({
               />
               <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
                 {t.systemVendorAccountsEnabledNote}
+              </FormHelperText>
+            </Box>
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={vendorSubscriptionsEnabled}
+                    onChange={(e) => setPendingVendorSubscriptionsEnabled(e.target.checked)}
+                  />
+                }
+                label={t.systemVendorSubscriptionsEnabledLabel}
+              />
+              <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
+                {t.systemVendorSubscriptionsEnabledNote}
               </FormHelperText>
             </Box>
             <SelectField

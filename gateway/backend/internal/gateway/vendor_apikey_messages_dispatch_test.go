@@ -70,7 +70,7 @@ func resolveAPIKeyAnthropicTarget(t *testing.T, cipher *capture.Cipher, fineFlav
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	seedAPIKeyAnthropicAccount(t, store, cipher, apiKeyAnthropicOwnerID, now)
 	resolver := routing.NewResolver(store, func() time.Time { return now }, nil)
-	resolver.SetVendorAccountAccessors(func() bool { return true }, nil) // flag on, mode defaults to vendor_first
+	resolver.SetVendorAccountAccessors(func() bool { return true }, nil, nil) // flag on, mode defaults to vendor_first
 
 	target, err := resolver.Resolve(context.Background(), auth.Token{ID: "tok_apikey_anthropic", UserID: apiKeyAnthropicOwnerID, Active: true, VendorAccess: auth.VendorAccess{All: true}}, inference.Request{Model: apiKeyAnthropicModel, APIFlavor: fineFlavor})
 	if err != nil {

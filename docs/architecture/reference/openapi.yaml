@@ -1424,6 +1424,9 @@ paths:
       Per-user external vendor accounts ("Anbieter"). Owner-only inside
       portal.Service; secrets are write-only; the whole surface 409s with
       vendor_account(s).module_disabled while vendor_accounts_enabled is off.
+      The narrower vendor_subscriptions_enabled switch (default on) additionally
+      409s creating a subscription account and every connect operation with
+      vendor_accounts.subscriptions_disabled while it is off.
       See api-surface.md for the request/response shapes and error codes.
     get:
       tags: [portal]
@@ -1461,10 +1464,16 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/enabled:
     get:
       tags: [portal]
-      summary: Whether the vendor-accounts module is enabled (boolean only)
+      summary: Whether the vendor-accounts module is enabled, and whether subscription accounts are allowed
+      description: >
+        Two booleans and nothing else: module_enabled (the vendor_accounts_enabled
+        master flag) and subscriptions_enabled (the vendor_subscriptions_enabled
+        switch, default true). Answers for any portal user even while the module
+        is off.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
@@ -1534,6 +1543,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/check:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1697,6 +1707,7 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/connect/complete:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1715,6 +1726,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/connect/device/begin:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1724,6 +1736,7 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/connect/device/poll:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1733,6 +1746,7 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
 
   # ── 3. Portal: feature flags / read-only status ───────────────────────────
   /api/portal/netbird/enabled:
@@ -1827,6 +1841,12 @@ paths:
       translate request builder to place prompt-cache breakpoints on eligible
       requests (native /v1/messages passthrough is unaffected). On the PUT an
       omitted or null value keeps the stored one.
+      They also include the boolean vendor_subscriptions_enabled (default true,
+      always present in the GET, writable on the PUT; omitted or null keeps the
+      stored value): while false, creating or connecting a subscription vendor
+      account is a 409 vendor_accounts.subscriptions_disabled and existing
+      subscription accounts stop routing and being listed. It only has an effect
+      while the vendor_accounts_enabled master flag is on.
     get:
       tags: [system]
       summary: System-wide settings (SMTP, NetBird, certificate gates, currency, …)
@@ -2366,6 +2386,21 @@ components:
       description: >
         Invalid request payload — the Error envelope carries the stable
         validation code (see api-surface.md).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    VendorAccountsUnavailable:
+      description: >
+        The vendor-accounts feature refuses the operation -- the Error envelope
+        carries the stable code: vendor_accounts.module_disabled while the
+        vendor_accounts_enabled master flag is off, or
+        vendor_accounts.subscriptions_disabled while the
+        vendor_subscriptions_enabled switch is off and the operation creates or
+        connects a subscription account. The subscriptions code is checked
+        late (on a connect after the owner and subscription-only checks, on a
+        create after the request validation), so a non-owner still gets 404, an
+        api-key account is never refused with it, and a malformed request keeps
+        its 400.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

@@ -73,6 +73,9 @@ export type ViewGateCtx = {
 // ViewGateCtx since several renders also branch on the same flags (e.g. the
 // admin/non-admin split on `users`, or `isAdmin` picking manageModels).
 export type ViewRenderCtx = ViewGateCtx & {
+  // The vendor_subscriptions_enabled switch (on by default). Render-only: it
+  // gates no nav item, the providers page uses it to flag subscription accounts.
+  vendorSubscriptionsEnabled: boolean;
   t: Translation;
   api: PortalApi;
   locale: Locale;
@@ -239,7 +242,13 @@ export const viewRegistry: Record<View, ViewEntry> = {
     href: '/providers',
     icon: Cloud,
     gate: (ctx) => ctx.vendorAccountsEnabled,
-    render: (ctx) => <VendorAccountsView t={ctx.t} api={ctx.api} />,
+    render: (ctx) => (
+      <VendorAccountsView
+        t={ctx.t}
+        api={ctx.api}
+        subscriptionsEnabled={ctx.vendorSubscriptionsEnabled}
+      />
+    ),
   },
   resourceGroups: {
     id: 'resourceGroups',

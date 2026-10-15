@@ -84,7 +84,14 @@ below are migration 82 (migration 83 adds `vendor_accounts.model_prefix` and
 credit-state columns of `vendor_account_usage`; migration 86 adds
 `vendor_accounts.base_url`). Which of a user's accounts an API
 token may use is **not** stored on these tables: it is the token's own
-`api_tokens.vendor_provider_access` column (migration 85, above).
+`api_tokens.vendor_provider_access` column (migration 85, above). Neither are the
+switches that turn the feature, or only its subscription accounts, off: the master flag
+`vendor_accounts_enabled` and the narrower `vendor_subscriptions_enabled` are ordinary
+rows of the schemaless `system_settings` key/value table
+([config](config-env.md#vendor-accounts-system-settings-no-env-var-form)), so the
+latter needed no migration, and turning it off keeps every `vendor_accounts` row
+(a subscription account stops routing and being listed, nothing is deleted or
+rewritten).
 
 | Table | Purpose |
 |---|---|

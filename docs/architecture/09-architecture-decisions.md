@@ -3292,7 +3292,10 @@ reverse-engineered.
   default **off**). When off the "Anbieter" nav item is hidden, the CRUD/connect/check
   endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor
   branch and the model-listing overlay are no-ops — the same module-enable posture
-  as the NetBird and certificate modules.
+  as the NetBird and certificate modules. A finer switch for the ToS-restricted
+  subscription path alone, `vendor_subscriptions_enabled` (default **on**), turns
+  off only subscription-type accounts and leaves api-key ones untouched (see
+  [External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)).
 
 **Consequence:** the new serving path reuses the existing credential sealing
 ([ADR-007](#adr-007--secrets-at-rest-the-encplain-scheme)), the routing `Target`

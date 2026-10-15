@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState, type SubmitEvent } from 'react';
-import { Box, Button, Typography } from '@mui/material';
+import { Alert, Box, Button, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
@@ -108,8 +108,16 @@ function hasCredential(account: VendorAccount): boolean {
 export function VendorAccountsView({
   t,
   api,
+  subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
+  // The vendor_subscriptions_enabled system switch (on by default). While it is
+  // off every subscription account is shown inactive with a notice: the backend
+  // no longer routes it, nor lets it be created or connected, but it stays listed.
+  // The UI follows suit: the create form disables the Subscription option and the
+  // detail view drops the connect panel, so nothing invites a request that would
+  // be refused with a 409.
+  subscriptionsEnabled?: boolean;
   api: Pick<
     PortalApi,
     | 'vendorAccounts'
@@ -141,6 +149,16 @@ export function VendorAccountsView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [error]);
   const accounts = accountsData ?? [];
+  // A subscription account is unusable while the subscriptions switch is off;
+  // an api_key account never is.
+  const subscriptionBlocked = (account: VendorAccount) =>
+    !subscriptionsEnabled && account.auth_type === 'subscription';
+  // The status a row shows AND filters on: a blocked subscription account that is
+  // stored active reads disabled (it cannot be used until the switch is back on).
+  // A stored disabled or needs_reconnect status is kept as it is: needs_reconnect
+  // is system-managed and must not be masked, or its reconnect hint would vanish.
+  const effectiveStatus = (account: VendorAccount) =>
+    subscriptionBlocked(account) && account.status === 'active' ? 'disabled' : account.status;
 
   const [mode, setMode] = useState<Mode>('list');
   // The latest mode, for callbacks an async connect holds across renders: the
@@ -177,8 +195,10 @@ export function VendorAccountsView({
   const rootVendor = isConfigurableRootVendor(vendor);
   // Custom has no default root, so a blank base URL cannot be created.
   const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
-  // A configurable-root vendor is api-key only, whatever the select last said.
-  const createAuthType = rootVendor ? 'api_key' : authType;
+  // A configurable-root vendor is api-key only, whatever the select last said --
+  // and so is every vendor while the subscriptions switch is off (a subscription
+  // create would only be refused with a 409).
+  const createAuthType = rootVendor || !subscriptionsEnabled ? 'api_key' : authType;
   const baseUrlNote =
     vendor === 'openai_compatible' ? t.vendorAccountBaseUrlCustomNote : t.vendorAccountBaseUrlNote;
 
@@ -409,17 +429,38 @@ export function VendorAccountsView({
       enumLabel: (v) => authTypeLabel(t, v),
       render: (a) => authTypeLabel(t, a.auth_type),
     },
-    { id: 'name', label: t.tableName, value: (a) => a.name, filter: 'text' },
+    {
+      id: 'name',
+      label: t.tableName,
+      value: (a) => a.name,
+      filter: 'text',
+      render: (a) =>
+        subscriptionBlocked(a) ? (
+          <Box>
+            <Typography component="span" variant="body2" color="text.secondary">
+              {a.name}
+            </Typography>
+            <Typography variant="caption" color="warning.dark" sx={{ display: 'block' }}>
+              {t.vendorAccountSubscriptionsDisabledNotice}
+            </Typography>
+          </Box>
+        ) : (
+          a.name
+        ),
+    },
     {
       id: 'status',
       label: t.tableStatus,
-      value: (a) => a.status,
+      value: effectiveStatus,
       filter: 'enum',
       searchable: false,
       enumLabel: (v) => vendorStatusLabel(t, v),
-      render: (a) => (
-        <StatusChip status={vendorStatusBadge(a.status)} label={vendorStatusLabel(t, a.status)} />
-      ),
+      // The cell and the filter share effectiveStatus, so filtering on "Disabled"
+      // finds exactly the rows labelled Disabled.
+      render: (a) => {
+        const shown = effectiveStatus(a);
+        return <StatusChip status={vendorStatusBadge(shown)} label={vendorStatusLabel(t, shown)} />;
+      },
     },
     {
       id: 'credential',
@@ -491,15 +532,24 @@ export function VendorAccountsView({
               <SelectField
                 id="vendor-account-auth-type"
                 label={t.vendorAccountAuthTypeLabel}
-                value={authType}
+                value={createAuthType}
                 onChange={(e) => {
                   setAuthType(e.target.value);
                   // Never carry a typed key into a subscription account.
                   resetKeyInput();
                 }}
+                helperText={
+                  subscriptionsEnabled ? undefined : t.vendorAccountSubscriptionsUnavailableNote
+                }
               >
                 {AUTH_TYPES.map((a) => (
-                  <option value={a} key={a}>
+                  // While the switch is off Subscription stays listed but not
+                  // choosable: the helper text says why.
+                  <option
+                    value={a}
+                    key={a}
+                    disabled={a === 'subscription' && !subscriptionsEnabled}
+                  >
                     {authTypeLabel(t, a)}
                   </option>
                 ))}
@@ -586,6 +636,11 @@ export function VendorAccountsView({
           backLabel={t.back}
           items={[{ label: t.providers, onClick: backToList }, { label: account.name }]}
         />
+        {subscriptionBlocked(account) && (
+          <Alert severity="warning" role="status" sx={{ mb: 2.25 }}>
+            {t.vendorAccountSubscriptionsDisabledNotice}
+          </Alert>
+        )}
         <Panel
           titleId="vendor-account-settings-heading"
           title={t.vendorAccountSettingsTitle}
@@ -719,6 +774,7 @@ export function VendorAccountsView({
             account={account}
             busy={busy}
             onRefresh={refreshAccountModels}
+            subscriptionsEnabled={subscriptionsEnabled}
           />
         </Box>
 
@@ -746,7 +802,9 @@ export function VendorAccountsView({
           onRefresh={refreshAccountUsage}
         />
 
-        {account.auth_type === 'subscription' && (
+        {/* No connect panel while the subscriptions switch is off: every connect
+            flow would be refused with a 409, and the notice above says why. */}
+        {account.auth_type === 'subscription' && !subscriptionBlocked(account) && (
           <Box sx={{ mt: 3 }}>
             <VendorSubscriptionConnect
               t={t}

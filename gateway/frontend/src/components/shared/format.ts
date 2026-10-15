@@ -197,6 +197,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // although the portal hides the area in that state: a stale tab or a flag
   // flipped mid-session still reaches it.
   'vendor_accounts.module_disabled': 'errorVendorAccountsModuleDisabled',
+  // The vendor_subscriptions_enabled switch is off: creating or connecting a
+  // subscription account is refused (same 409 row table; api_key accounts never
+  // are). Mapped for the same stale-tab reason as the master flag.
+  'vendor_accounts.subscriptions_disabled': 'errorVendorSubscriptionsDisabled',
   // System settings: a Codex client_version the OpenAI model discovery would
   // send that is not version-shaped (400). The portal checks the same shape
   // inline, so this is the backstop.

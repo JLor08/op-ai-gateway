@@ -127,7 +127,9 @@ func vendorConnectExpired(p pendingVendorConnect, now time.Time) bool {
 // connectableVendorAccount is the gate every connect method runs: the master
 // flag first, then OWNER-ONLY authorization (a stranger and an unknown id are
 // both ErrVendorAccountNotFound, even for a body that is invalid anyway), then
-// the subscription-only check. It returns the freshly loaded account.
+// the subscription-only check, then the vendor_subscriptions_enabled switch
+// (ErrVendorSubscriptionsDisabled while it is off). It returns the freshly loaded
+// account.
 func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return routing.VendorAccount{}, err
@@ -138,6 +140,13 @@ func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.T
 	}
 	if acc.AuthType != routing.VendorAuthSubscription {
 		return routing.VendorAccount{}, ErrVendorAccountNotSubscription
+	}
+	// vendor_subscriptions_enabled: while off, no connect flow (token import,
+	// code-paste, device) may run. Checked after the owner and subscription-only
+	// checks, so a stranger or an unknown id is still a not-found and an api_key
+	// account still "not a subscription account" (the switch masks neither).
+	if !s.VendorSubscriptionsEnabled(ctx) {
+		return routing.VendorAccount{}, ErrVendorSubscriptionsDisabled
 	}
 	return acc, nil
 }
@@ -219,7 +228,8 @@ type ConnectVendorAccountImportRequest struct {
 // never fail the import. The write is OWNER-ONLY and the response is the
 // credential-free DTO (SubscriptionConnected=true, never a token, with the
 // discovered models when the discovery produced any). ErrVendorAccountsDisabled
-// while the master flag is off.
+// while the master flag is off and ErrVendorSubscriptionsDisabled while
+// vendor_subscriptions_enabled is off.
 func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth.Token, accountID string, req ConnectVendorAccountImportRequest) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -280,7 +290,8 @@ func importedTokenSet(vendor, access string, req ConnectVendorAccountImportReque
 // same account replaces the first. A store that cannot seal the eventual token
 // set (a keyless disk store) fails here, before the user signs in, with
 // ErrVendorAccountConnectKeyRequired. OWNER-ONLY; ErrVendorAccountsDisabled while
-// the master flag is off.
+// the master flag is off and ErrVendorSubscriptionsDisabled while
+// vendor_subscriptions_enabled is off.
 func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.Token, accountID string) (string, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -334,7 +345,8 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 // (ErrVendorAccountConnectKeyRequired) never costs the user their one-time code.
 // Once the tokens are stored a best-effort model discovery runs (see
 // ConnectVendorAccountImport); it never fails the connect.
-// OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off.
+// OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off and
+// ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal auth.Token, accountID, codeAndState string) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {

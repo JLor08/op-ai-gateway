@@ -11,13 +11,19 @@ import (
 	"strings"
 )
 
-// Vendor accounts ("Anbieter") system settings. Three keys, all ordinary
+// Vendor accounts ("Anbieter") system settings. Four keys, all ordinary
 // system-settings rows read through the settings store at request time:
 //
 //   - vendor_accounts_enabled is the MASTER flag, a module-enable switch like
 //     netbird_enabled / cert_enabled. It is OFF by default (opt-in): while off,
 //     the portal hides the "Anbieter" menu item and every vendor-account
 //     service method refuses with ErrVendorAccountsDisabled.
+//   - vendor_subscriptions_enabled gates ONLY the subscription-type accounts
+//     (VendorAuthSubscription) within an enabled module, leaving api_key accounts
+//     alone. It is ON by default (opt-out): while off, creating or connecting a
+//     subscription account is refused (ErrVendorSubscriptionsDisabled) and the
+//     existing ones stop routing and stop being advertised. Nothing is deleted, so
+//     switching it back on restores them.
 //   - vendor_account_routing_mode is the routing precedence between a caller's
 //     own vendor accounts and the self-hosted/shared routes. The resolver
 //     consults it; this file only persists, validates and exposes it.
@@ -25,6 +31,7 @@ import (
 //     subscription model-discovery call sends (see below).
 const (
 	vendorAccountsEnabledKey             = "vendor_accounts_enabled"
+	vendorSubscriptionsEnabledKey        = "vendor_subscriptions_enabled"
 	vendorAccountRoutingModeKey          = "vendor_account_routing_mode"
 	vendorOpenAICodexClientVersionKey    = "vendor_openai_codex_client_version"
 	maxVendorOpenAICodexClientVersionLen = 64
@@ -95,6 +102,21 @@ func VendorAccountsEnabled(values map[string]string) bool {
 	return v
 }
 
+// VendorSubscriptionsEnabled interprets the vendor_subscriptions_enabled switch.
+// Defaults to TRUE (opt-out) when absent, blank, or unparseable, so only an
+// explicit false switches the subscription accounts off.
+func VendorSubscriptionsEnabled(values map[string]string) bool {
+	raw, ok := values[vendorSubscriptionsEnabledKey]
+	if !ok {
+		return true
+	}
+	v, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return true
+	}
+	return v
+}
+
 // VendorAccountRoutingMode interprets the persisted vendor_account_routing_mode
 // system setting, defaulting to "vendor_first" when absent, blank, or not one of
 // the known modes (lenient read).
@@ -156,6 +178,26 @@ func (s *Service) VendorAccountsEnabled(ctx context.Context) bool {
 		return false
 	}
 	return VendorAccountsEnabled(values)
+}
+
+// VendorSubscriptionsEnabled reports whether subscription-type vendor accounts may
+// be created, connected, routed and advertised. Like VendorAccountsEnabled it is
+// read from the settings store on every call (the gateway's resolver reads it
+// through a short-TTL cache that a settings PUT invalidates). Unlike it, the area
+// is opt-OUT: a service with no settings store, or a store that cannot be read,
+// reports TRUE, so a transient read failure never silently disables the
+// operator's subscription accounts. (An unreadable master flag still fails closed,
+// which switches the whole vendor area off; this switch only ever restricts
+// further within an enabled one.)
+func (s *Service) VendorSubscriptionsEnabled(ctx context.Context) bool {
+	if s.settings == nil {
+		return true
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		return true
+	}
+	return VendorSubscriptionsEnabled(values)
 }
 
 // VendorAccountRoutingMode is the effective vendor_account_routing_mode, the

@@ -32,14 +32,17 @@ const (
 	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
 )
 
-// handlePortalVendorAccountsEnabled reports whether the vendor-accounts master
-// flag (system setting vendor_accounts_enabled) is on, for any portal user
-// (gateway:use, GET-only). It returns ONLY that boolean -- no routing mode or
-// other setting -- so any user's shell can show or hide the "Anbieter" nav item
-// without being granted the system-scoped settings read. It answers while the
-// module is off (that is its purpose), and the exact-path route registered for
-// it wins over the "/api/portal/vendor-accounts/{id}" subtree (account ids are
-// "va_"-prefixed, so none can be called "enabled").
+// handlePortalVendorAccountsEnabled reports two booleans for any portal user
+// (gateway:use, GET-only): module_enabled, the vendor-accounts master flag (system
+// setting vendor_accounts_enabled), and subscriptions_enabled, the
+// vendor_subscriptions_enabled switch (default on) that gates only subscription
+// accounts. It returns ONLY those two -- no routing mode or other setting -- so
+// any user's shell can show or hide the "Anbieter" nav item, and the Anbieter page
+// can explain why subscription accounts are inert, without being granted the
+// system-scoped settings read. It answers while the module is off (that is its
+// purpose), and the exact-path route registered for it wins over the
+// "/api/portal/vendor-accounts/{id}" subtree (account ids are "va_"-prefixed, so
+// none can be called "enabled").
 func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireWebScope(w, r, scopeGatewayUse); !ok {
 		return
@@ -47,7 +50,10 @@ func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *htt
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"module_enabled": s.Portal.VendorAccountsEnabled(r.Context())})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"module_enabled":        s.Portal.VendorAccountsEnabled(r.Context()),
+		"subscriptions_enabled": s.Portal.VendorSubscriptionsEnabled(r.Context()),
+	})
 }
 
 // handlePortalVendorAccounts is the vendor-account ("Anbieter") collection
@@ -419,6 +425,9 @@ var portalVendorAccountErrRows = []errRow{
 	// netbird.module_disabled. The portal hides the area in that state, so this
 	// is reached by a stale tab or a direct API client.
 	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: "vendor_accounts.module_disabled", msg: "vendor accounts are not enabled"},
+	// The vendor_subscriptions_enabled switch is off: creating or connecting a
+	// SUBSCRIPTION account is a 409 too (api_key accounts are never refused).
+	{err: portal.ErrVendorSubscriptionsDisabled, status: http.StatusConflict, code: "vendor_accounts.subscriptions_disabled", msg: "vendor subscription accounts are not enabled"},
 	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
 	{err: portal.ErrVendorAccountNameRequired, status: http.StatusBadRequest, code: "vendor_account.name_required", msg: "vendor account name is required"},
 	{err: portal.ErrVendorAccountVendorInvalid, status: http.StatusBadRequest, code: "vendor_account.vendor_invalid", msg: "vendor account vendor is invalid"},

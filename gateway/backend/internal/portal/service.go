@@ -160,6 +160,11 @@ var (
 	// the flag is off. Mirrors ErrNetbirdModuleDisabled; mapped to a 409.
 	ErrVendorAccountsDisabled = errors.New("vendor_accounts.module_disabled")
 
+	// ErrVendorSubscriptionsDisabled refuses creating or connecting a
+	// SUBSCRIPTION vendor account while the vendor_subscriptions_enabled setting
+	// (on by default) is off. api_key accounts are never affected. Mapped to a 409.
+	ErrVendorSubscriptionsDisabled = errors.New("vendor_accounts.subscriptions_disabled")
+
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
 	// subscription account only (the auth type is immutable, so an api_key account

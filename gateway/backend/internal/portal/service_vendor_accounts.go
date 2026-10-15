@@ -388,11 +388,13 @@ func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id
 	return dto, nil
 }
 
-// CreateVendorAccount creates an account owned by the calling principal
-// (ErrVendorAccountsDisabled while the master flag is off). Any authenticated user may create their own (no admin requirement); a principal
-// with no user identity cannot own one. The api key is sealed BEFORE the store
-// write, so a keyless disk store fails with capture.ErrKeyRequired and persists
-// nothing.
+// CreateVendorAccount creates an account owned by the calling principal.
+// ErrVendorAccountsDisabled while the master flag is off, and
+// ErrVendorSubscriptionsDisabled for a subscription account while
+// vendor_subscriptions_enabled is off. Any authenticated user may create their
+// own (no admin requirement); a principal with no user identity cannot own one.
+// The api key is sealed BEFORE the store write, so a keyless disk store fails
+// with capture.ErrKeyRequired and persists nothing.
 func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token, req CreateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
@@ -439,6 +441,17 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey != "" && authType != routing.VendorAuthAPIKey {
 		return VendorAccountDTO{}, ErrVendorAccountAPIKeyNotAllowed
+	}
+	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
+	// created (an api_key one is unaffected). It is deliberately the LAST check,
+	// after every request validation, so it masks no other answer: a malformed
+	// create (bad status, bad model_prefix, a supplied api_key) keeps its specific
+	// 400, and the preset block above has already answered a preset vendor with
+	// ErrVendorAccountAuthTypeInvalid (a 400) whatever the switch says, so only a
+	// well-formed openai or anthropic subscription create reaches it. Checked
+	// before the key is sealed or anything is stored, so a refusal persists nothing.
+	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
+		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
 	}
 	sealedKey, err := s.sealVendorAPIKey(apiKey)
 	if err != nil {
