@@ -174,9 +174,39 @@ func requireCapabilityKeysUntouched(t *testing.T, id string, entry map[string]js
 	}
 }
 
-// anthropicModelEntryByID GETs /anthropic/v1/models as the token whose secret is
-// secret and returns the data entries indexed by id, in raw JSON form.
+// requireAnthropicListingIDsAreModelsForFlavor is the Anthropic twin of
+// requireListingIDsAreModelsForFlavor: it pins the data source of
+// /anthropic/v1/models. The handler lists the portal Models() rows narrowed to
+// the anthropic flavor (it needs each row's metadata), no longer the ids-only
+// Portal.ModelsForFlavor(token, anthropic); the ids it returns, IN ORDER, must
+// still be exactly what that reference returns for the same token, so neither
+// a dropped or added name nor a reordering goes unnoticed.
+func requireAnthropicListingIDsAreModelsForFlavor(t *testing.T, srv *Server, secret string) {
+	t.Helper()
+	token, ok := srv.Tokens.LookupBearer("Bearer " + secret)
+	if !ok {
+		t.Fatalf("token for %q not found", secret)
+	}
+	want := srv.Portal.ModelsForFlavor(context.Background(), token, routing.APIFlavorAnthropic)
+	entries := anthropicModelEntries(t, srv, secret)
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, rawString(t, entry["id"], "id"))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GET /anthropic/v1/models ids = %q, want ModelsForFlavor(anthropic) = %q", got, want)
+	}
+}
+
+// anthropicModelEntryByID is anthropicModelEntries indexed by id.
 func anthropicModelEntryByID(t *testing.T, srv *Server, secret string) map[string]openAIModelEntry {
+	t.Helper()
+	return openAIModelEntryByID(t, anthropicModelEntries(t, srv, secret))
+}
+
+// anthropicModelEntries GETs /anthropic/v1/models as the token whose secret is
+// secret and returns the data array in the listing's own order, in raw JSON form.
+func anthropicModelEntries(t *testing.T, srv *Server, secret string) []openAIModelEntry {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+secret)
@@ -191,7 +221,7 @@ func anthropicModelEntryByID(t *testing.T, srv *Server, secret string) map[strin
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("GET /anthropic/v1/models: unmarshal: %v", err)
 	}
-	return openAIModelEntryByID(t, body.Data)
+	return body.Data
 }
 
 // TestOpenAIModelsAliasRowCarriesOriginalModelIDAndDisplayName: for a token with
@@ -252,6 +282,9 @@ func TestOpenAIModelsAliasRowCarriesOriginalModelIDAndDisplayName(t *testing.T) 
 			if !sameStrings(gotIDs, wantIDs) {
 				t.Fatalf("GET %s ids = %q, want %q (no anthropic-only / images-only rows)", path, gotIDs, wantIDs)
 			}
+			// And, in order, exactly what the ids-only ModelsForFlavor(openai)
+			// reference answers for the same token.
+			requireListingIDsAreModelsForFlavor(t, srv, claudeListingAliasSecret, path)
 		})
 	}
 }
@@ -367,7 +400,7 @@ func TestLMStudioV1ModelsAliasRowCarriesOriginalModelID(t *testing.T) {
 // label -- while keeping the Anthropic shape (id, type "model", display_name,
 // created_at). Non-alias rows keep exactly that shape and their id as label.
 // Both eligible models get an alias here, including the anthropic-only one the
-// openai-flavored listings leave out, and the ids are still exactly
+// openai-flavored listings leave out, and the ids are still exactly, in order,
 // Portal.ModelsForFlavor(anthropic).
 func TestAnthropicModelsAliasRowsCarryOriginalModelID(t *testing.T) {
 	srv := newClaudeAliasListingServer(t)
@@ -407,20 +440,10 @@ func TestAnthropicModelsAliasRowsCarryOriginalModelID(t *testing.T) {
 		}
 	}
 
-	token, ok := srv.Tokens.LookupBearer("Bearer " + claudeListingAliasSecret)
-	if !ok {
-		t.Fatal("alias token not found")
-	}
-	want := srv.Portal.ModelsForFlavor(context.Background(), token, routing.APIFlavorAnthropic)
-	got := make([]string, 0, len(byID))
-	for id := range byID {
-		got = append(got, id)
-	}
-	if !sameStrings(got, want) {
-		t.Fatalf("/anthropic/v1/models ids = %q, want ModelsForFlavor(anthropic) = %q", got, want)
-	}
-	if len(got) != 4 {
-		t.Fatalf("listing has %d entries, want the 2 anthropic models and their 2 aliases: %v", len(got), got)
+	// The ids, in order, are exactly the ids-only ModelsForFlavor reference.
+	requireAnthropicListingIDsAreModelsForFlavor(t, srv, claudeListingAliasSecret)
+	if len(byID) != 4 {
+		t.Fatalf("listing has %d entries, want the 2 anthropic models and their 2 aliases: %v", len(byID), byID)
 	}
 }
 
@@ -428,6 +451,7 @@ func TestAnthropicModelsAliasRowsCarryOriginalModelID(t *testing.T) {
 // Anthropic listing is what it always was.
 func TestAnthropicModelsFlagOffTokenHasNoAliasMetadata(t *testing.T) {
 	srv := newClaudeAliasListingServer(t)
+	requireAnthropicListingIDsAreModelsForFlavor(t, srv, claudeListingPlainSecret)
 	byID := anthropicModelEntryByID(t, srv, claudeListingPlainSecret)
 	if len(byID) != 2 {
 		t.Fatalf("listing has %d entries, want the 2 real anthropic models: %v", len(byID), byID)

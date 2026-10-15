@@ -82,9 +82,10 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 // member set here would mean duplicating modelGroupOverlay's whole rule set in the
 // gateway layer (member order, loaded_only, per-member suppression) -- a second copy
 // of a non-trivial rule, for a yellow count on a synthetic row. A group whose member
-// is mid-launch therefore shows "Lädt" on the member's own row only. Per-token
-// override ALIAS rows, by contrast, need no such re-derivation and are handled: see
-// loadingCountModelKey.
+// is mid-launch therefore shows "Lädt" on the member's own row only. Alias rows, by
+// contrast, need no such re-derivation and are handled: a per-token override alias
+// is redirected through its rule, and a generated Claude alias (issue #225) through
+// the OriginalModelID its row carries -- see loadingCountModelKey.
 //
 // PERFORMANCE (Task 5 review fix, "Fix round 1"): the original implementation called
 // Portal.ModelServers once per DISTINCT MODEL ROW, and ModelServers internally re-walks

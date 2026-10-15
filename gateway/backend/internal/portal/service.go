@@ -4197,8 +4197,9 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 //	                                                                                                                                       (plus the alias's loaded/offered/context/
 //	                                                                                                                                        vision/is-group row data, copied from
 //	                                                                                                                                        the target so the alias row looks like it)
-//	ModelsForFlavor() (/anthropic/v1/models, per   yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
-//	  flavor; /v1/models reads Models() instead)
+//	ModelsForFlavor() (ids-only per-flavor list;   yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	  the reference /anthropic/v1/models and
+//	  /v1/models, which read Models(), are pinned to)
 //	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass         no — keyed by a REAL model name; an alias
 //	  (handlePortalModelServers /                                                                                                              is not one, and the name it hides stays
 //	   handlePortalModelServersEvents)                                                                                                          fully callable (see below)
@@ -4280,8 +4281,10 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 // of them, so a flavor missing here is a flavor no listing reports -- an
 // images-only model would reach the chat with no flavors at all. A model
 // carries the ones dispatch serves it under (routing.MappingServesAPIFlavor),
-// and each per-flavor listing (ModelsForFlavor, i.e. /anthropic/v1/models) asks
-// for its OWN flavor, so an images-only model never appears in a text listing.
+// and each per-flavor listing (/anthropic/v1/models and /v1/models, narrowed
+// from the Models() rows, and the ids-only ModelsForFlavor they are pinned
+// against) asks for its OWN flavor, so an images-only model never appears in a
+// text listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
 var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
@@ -4315,18 +4318,21 @@ func isSeedAPIFlavor(flavor string) bool {
 // not routable under that name, while a name the last two layers removed stays
 // fully callable. ModelOffering.Callable is the set that answers reach.
 //
-// Drives per-flavor discovery (ModelsForFlavor(), i.e. /anthropic/v1/models);
-// the portal Models() overview, which /v1/models and /api/v1/models list from,
-// builds its own view via modelsResponse, applying the same three layers (see
-// the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
+// Drives ModelsForFlavor(), the ids-only per-flavor list. That list is the
+// REFERENCE the HTTP listings are pinned against, not their production source:
+// /anthropic/v1/models, /v1/models and /api/v1/models all list from the portal
+// Models() overview (narrowed by flavor), which builds its own view via
+// modelsResponse, applying the same three layers (see the VISIBILITY-SURFACE
+// MATRIX on visibleMappingViews) and the generated Claude aliases' metadata.
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
 	if err != nil {
 		return sets, err
 	}
 	// Owner overlay: fold in the principal's own vendor-account models (Milestone
-	// 3) so the per-flavor listings (/v1/models, the Anthropic list) advertise
-	// exactly what resolveVendorAccount will dispatch for them. Applied here, on
+	// 3) so the per-flavor listings (/v1/models, the Anthropic list, and the
+	// ModelsForFlavor reference they are pinned against) advertise exactly what
+	// resolveVendorAccount will dispatch for them. Applied here, on
 	// the public method ModelsForFlavor consumes, rather than inside
 	// modelFlavorSetsWithPreSuppress, so the override-alias overlay's preSuppress
 	// stays the pure server/group composition. The unknown-model redirect needs
@@ -4733,6 +4739,12 @@ var seedModelNames = []string{"gpt-oss-20b", "qwen-coder"}
 // It reads the runtime specs of the views it lists (runtimeSpecIndexForViews).
 // Falls back to the seed models (which expose the text flavors,
 // seedAPIFlavors) when no routing store is configured.
+//
+// This is the ids-only reference of the per-flavor listings, not their
+// production source: the gateway's /v1/models, /api/v1/models and
+// /anthropic/v1/models list from Models() rows narrowed by flavor (they need
+// each row's metadata), and tests pin that the ids they list are exactly what
+// this returns for the same token and flavor.
 func (s *Service) ModelsForFlavor(ctx context.Context, token auth.Token, flavor string) []string {
 	if s.routes != nil {
 		if sets, err := s.modelFlavorSets(ctx, token); err == nil {
