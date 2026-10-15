@@ -574,7 +574,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   // C + Resource Groups Phase 1, spec 2026-08-11 + shared vendor accounts,
   // #183): the SIX roster-table permission checkboxes (Benutzer-Verwaltung /
   // Gruppen-Änderung / Server-Verwaltung / Dienst-Verwaltung /
-  // Ressourcen-Verwaltung / Vendor-Account-Verwaltung).
+  // Ressourcen-Verwaltung / Anbieter-Konten-Verwaltung).
   function permRoster(): GroupMember[] {
     return [
       makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
@@ -782,6 +782,61 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: true,
           canManageServices: true,
           canManageResources: true,
+          canManageVendorAccounts: true,
+        }),
+      );
+    });
+
+    // Carry-over of a TRUE vendor-accounts value. permRoster()'s manager has
+    // can_manage_vendor_accounts=false, so on its own it cannot tell a real
+    // carry-over from a hard-coded false. Here the co-manager HOLDS the flag
+    // and the admin toggles a DIFFERENT checkbox (servers): the PATCH must
+    // still send canManageVendorAccounts=true, or toggling any other facet
+    // would silently strip the co-manager's vendor-account permission. The
+    // other five values are deliberately mixed (not all true) so no flag can
+    // be defaulted without the assertion noticing.
+    it('owner: toggling another flag carries over a TRUE can_manage_vendor_accounts (the PATCH must not drop it)', async () => {
+      const { fakeApi } = renderGroupsView({
+        role: 'user',
+        landscape: makeOwnedGroupLandscape(),
+        overrides: {
+          groupMembers: vi.fn(async () => [
+            makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
+            makeMember({
+              user_id: 'usr_vendor_manager',
+              display_name: 'Vendor Manager',
+              is_manager: true,
+              can_manage_users: false,
+              can_manage_group: true,
+              can_manage_servers: false,
+              can_manage_services: true,
+              can_manage_resources: false,
+              can_manage_vendor_accounts: true,
+            }),
+          ]),
+        },
+      });
+
+      await openMembers();
+      await screen.findByText('Vendor Manager');
+
+      const vendorAccountsBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermVendorAccounts} – Vendor Manager`,
+      });
+      expect(vendorAccountsBox).toBeChecked();
+
+      const serversBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermServers} – Vendor Manager`,
+      });
+      expect(serversBox).not.toBeChecked();
+      fireEvent.click(serversBox);
+      await waitFor(() =>
+        expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_vendor_manager', {
+          canManageUsers: false,
+          canManageGroup: true,
+          canManageServers: true,
+          canManageServices: true,
+          canManageResources: false,
           canManageVendorAccounts: true,
         }),
       );
