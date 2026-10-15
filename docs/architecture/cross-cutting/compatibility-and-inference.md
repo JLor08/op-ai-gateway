@@ -1778,7 +1778,13 @@ On the translate path a malformed effort is judged where the parser reads it:
 for an opted-in token a non-string `output_config.effort`, or an `output_config`
 that is neither an object nor `null`, is `400 messages.invalid_output_config` whatever backend
 the request resolved to. It is a plain parse failure, so, like every
-`request.*` body error (§13), it leaves no usage row.
+`request.*` body error (§13), it leaves no usage row. This is deliberately
+stricter than the native relay above, which checks only after resolution and only
+for a capable target, so the very same malformed body bound for a non-llama.cpp
+/vLLM backend is forwarded by the native path and refused by the translate parser.
+The asymmetry follows from each path reading `output_config` at a different point —
+the parser before resolution, the native edit after — and is immaterial to a real
+Claude Code client, whose `effort` is always a well-formed string.
 
 **The on/off contract.** With the flag off, every path keeps its exact previous
 behavior: a native body is never inspected, the translate parser never reads
