@@ -91,7 +91,10 @@ func wantsChatTemplateEffort(token auth.Token, target routing.Target, apiFlavor 
 //
 // The merge into chat_template_kwargs, once there is an effort to deliver:
 //
-//   - absent: the object is created holding only reasoning_effort;
+//   - absent, or JSON null: the object is created holding only reasoning_effort.
+//     null is read as absent here exactly as output_config.effort:null is above:
+//     it carries no value, so there is nothing to overwrite, and reading the two
+//     sibling nulls opposite ways in one helper would be an internal contradiction;
 //   - an object: reasoning_effort is added next to whatever else it holds, which
 //     is kept as is;
 //   - an object already holding the SAME string: the body is returned unchanged
@@ -100,9 +103,8 @@ func wantsChatTemplateEffort(token auth.Token, target routing.Target, apiFlavor 
 //     different string, a non-string, null: errReasoningEffortConflict. The
 //     client set that value deliberately, and overwriting it would be the silent
 //     rewriting of a client request that this path refuses to do;
-//   - anything that is not an object, JSON null included:
-//     errChatTemplateKwargsNotObject. Reading null as "absent" would quietly
-//     replace a value the client sent; no real client sends it.
+//   - anything else that is not an object (a string, number, array, bool):
+//     errChatTemplateKwargsNotObject.
 //
 // The body is returned unchanged, with false and a nil error, when it is not a
 // JSON object or decodes to a nil map (a bare `null`). Those are
@@ -131,7 +133,7 @@ func injectChatTemplateReasoningEffort(raw []byte) ([]byte, bool, error) {
 	}
 
 	kwargs := map[string]any{}
-	if existing, present := obj[chatTemplateKwargsKey]; present {
+	if existing, present := obj[chatTemplateKwargsKey]; present && existing != nil {
 		asObject, isObject := existing.(map[string]any)
 		if !isObject {
 			return raw, false, errChatTemplateKwargsNotObject

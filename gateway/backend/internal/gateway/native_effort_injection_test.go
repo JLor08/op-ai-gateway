@@ -174,12 +174,15 @@ func TestInjectChatTemplateReasoningEffort(t *testing.T) {
 		{name: "kwargs is an array", in: `{"output_config":{"effort":"low"},"chat_template_kwargs":[]}`, wantErr: errChatTemplateKwargsNotObject},
 		{name: "kwargs is a number", in: `{"output_config":{"effort":"low"},"chat_template_kwargs":1}`, wantErr: errChatTemplateKwargsNotObject},
 		{
-			// null is not an object either. Treating it as "absent" would quietly
-			// replace a value the client sent; rejecting is the literal reading of
-			// the contract and costs nothing for any real client.
-			name:    "kwargs is null",
-			in:      `{"output_config":{"effort":"low"},"chat_template_kwargs":null}`,
-			wantErr: errChatTemplateKwargsNotObject,
+			// A JSON null carries no value, so it is read as absent and a fresh
+			// kwargs object is injected. output_config.effort:null already means
+			// "absent" in this same helper, and reading the sibling null the
+			// opposite way would be an internal contradiction. No real client
+			// sends chat_template_kwargs at all, so nothing is overwritten.
+			name:         "kwargs is null is treated as absent and injected",
+			in:           `{"output_config":{"effort":"low"},"chat_template_kwargs":null}`,
+			want:         `{"output_config":{"effort":"low"},"chat_template_kwargs":{"reasoning_effort":"low"}}`,
+			wantInjected: true,
 		},
 
 		// --- malformed effort ---
