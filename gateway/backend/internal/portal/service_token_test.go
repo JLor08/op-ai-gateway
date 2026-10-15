@@ -667,3 +667,175 @@ func TestCreateServiceTokenClaudeModelAliases(t *testing.T) {
 		t.Fatalf("listed default service token claude_model_aliases = %v (present=%v), want false", v, ok)
 	}
 }
+
+// storedClaudeEffortCompatibility reads a token's persisted
+// claude_effort_compatibility flag back out of the store, so the tests below
+// prove persistence and not merely that the DTO echoes the request.
+func storedClaudeEffortCompatibility(t *testing.T, dir *MemoryDirectory, id string) bool {
+	t.Helper()
+	record, err := dir.TokenByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("TokenByID %s: %v", id, err)
+	}
+	return record.ClaudeEffortCompatibility
+}
+
+// TestCreateTokenClaudeEffortCompatibility pins the opt-in flag on the
+// user-token create + read path: it is persisted when requested, off when
+// omitted, and it reads back through both the create response and the token
+// listing. It is a separate switch from claude_model_aliases, so enabling one
+// must never turn the other on.
+func TestCreateTokenClaudeEffortCompatibility(t *testing.T) {
+	ctx := context.Background()
+	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
+
+	on, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "effort-on", Scopes: []string{"gateway:use"}, ClaudeEffortCompatibility: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(on): %v", err)
+	}
+	if !on.Token.ClaudeEffortCompatibility {
+		t.Fatalf("create response claude_effort_compatibility = false, want true: %+v", on.Token)
+	}
+	if on.Token.ClaudeModelAliases || storedClaudeModelAliases(t, f.dir, on.Token.ID) {
+		t.Fatalf("claude_effort_compatibility leaked into claude_model_aliases: %+v", on.Token)
+	}
+	if !storedClaudeEffortCompatibility(t, f.dir, on.Token.ID) {
+		t.Fatal("claude_effort_compatibility was not persisted for the opted-in token")
+	}
+
+	off, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "effort-off", Scopes: []string{"gateway:use"},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(off): %v", err)
+	}
+	if off.Token.ClaudeEffortCompatibility {
+		t.Fatalf("create response claude_effort_compatibility = true for an omitted flag: %+v", off.Token)
+	}
+	if storedClaudeEffortCompatibility(t, f.dir, off.Token.ID) {
+		t.Fatal("claude_effort_compatibility persisted true for a token created without it")
+	}
+
+	list, err := f.svc.tokensForUser(ctx, "usr_1")
+	if err != nil {
+		t.Fatalf("tokensForUser: %v", err)
+	}
+	got := map[string]bool{}
+	for _, dto := range list.Data {
+		got[dto.ID] = dto.ClaudeEffortCompatibility
+	}
+	if v, ok := got[on.Token.ID]; !ok || !v {
+		t.Fatalf("listed opted-in token claude_effort_compatibility = %v (present=%v), want true", v, ok)
+	}
+	if v, ok := got[off.Token.ID]; !ok || v {
+		t.Fatalf("listed default token claude_effort_compatibility = %v (present=%v), want false", v, ok)
+	}
+}
+
+// TestUpdateTokenClaudeEffortCompatibility pins the PATCH semantics of the
+// flag: nil (field omitted) keeps whatever is stored — in BOTH directions, so
+// an unrelated update can neither switch it on nor clear it — while a non-nil
+// value replaces it.
+func TestUpdateTokenClaudeEffortCompatibility(t *testing.T) {
+	ctx := context.Background()
+	f := newTokenSettingsFixture(t, openAIModel("qwen3-32b"))
+
+	enabled, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "enabled", Scopes: []string{"gateway:use"}, ClaudeEffortCompatibility: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(enabled): %v", err)
+	}
+	disabled, err := f.svc.CreateToken(ctx, f.owner, CreateTokenRequest{
+		Name: "disabled", Scopes: []string{"gateway:use"},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(disabled): %v", err)
+	}
+
+	// Omitted: an unrelated update leaves both values exactly as stored.
+	dto, err := f.svc.UpdateToken(ctx, f.owner, enabled.Token.ID, UpdateTokenRequest{LogCommunication: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(enabled, unrelated): %v", err)
+	}
+	if !dto.ClaudeEffortCompatibility || !storedClaudeEffortCompatibility(t, f.dir, enabled.Token.ID) {
+		t.Fatalf("an unrelated update cleared claude_effort_compatibility: dto=%+v", dto)
+	}
+	dto, err = f.svc.UpdateToken(ctx, f.owner, disabled.Token.ID, UpdateTokenRequest{LogCommunication: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(disabled, unrelated): %v", err)
+	}
+	if dto.ClaudeEffortCompatibility || storedClaudeEffortCompatibility(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("an unrelated update switched claude_effort_compatibility on: dto=%+v", dto)
+	}
+
+	// Explicit false clears it; explicit true sets it.
+	dto, err = f.svc.UpdateToken(ctx, f.owner, enabled.Token.ID, UpdateTokenRequest{ClaudeEffortCompatibility: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("UpdateToken(enabled, false): %v", err)
+	}
+	if dto.ClaudeEffortCompatibility || storedClaudeEffortCompatibility(t, f.dir, enabled.Token.ID) {
+		t.Fatalf("explicit false did not clear claude_effort_compatibility: dto=%+v", dto)
+	}
+	dto, err = f.svc.UpdateToken(ctx, f.owner, disabled.Token.ID, UpdateTokenRequest{ClaudeEffortCompatibility: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateToken(disabled, true): %v", err)
+	}
+	if !dto.ClaudeEffortCompatibility || !storedClaudeEffortCompatibility(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("explicit true did not set claude_effort_compatibility: dto=%+v", dto)
+	}
+	if dto.ClaudeModelAliases || storedClaudeModelAliases(t, f.dir, disabled.Token.ID) {
+		t.Fatalf("setting claude_effort_compatibility switched claude_model_aliases on: dto=%+v", dto)
+	}
+}
+
+// TestCreateServiceTokenClaudeEffortCompatibility is the service-token half:
+// the flag is accepted on create and read back through both the create
+// response and the listing. Service tokens have no field-PATCH, so there is no
+// update to pin.
+func TestCreateServiceTokenClaudeEffortCompatibility(t *testing.T) {
+	ctx := context.Background()
+	svc, dir, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := createTestService(t, ctx, svc)
+
+	on, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{
+		Name: "effort-on", ClaudeEffortCompatibility: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateServiceToken(on): %v", err)
+	}
+	if !on.Token.ClaudeEffortCompatibility {
+		t.Fatalf("create response claude_effort_compatibility = false, want true: %+v", on.Token)
+	}
+	if on.Token.ClaudeModelAliases || storedClaudeModelAliases(t, dir, on.Token.ID) {
+		t.Fatalf("claude_effort_compatibility leaked into claude_model_aliases: %+v", on.Token)
+	}
+	if !storedClaudeEffortCompatibility(t, dir, on.Token.ID) {
+		t.Fatal("claude_effort_compatibility was not persisted for the opted-in service token")
+	}
+
+	off, err := svc.CreateServiceToken(ctx, svcAdminToken(), created.ID, CreateServiceTokenRequest{Name: "effort-off"})
+	if err != nil {
+		t.Fatalf("CreateServiceToken(off): %v", err)
+	}
+	if off.Token.ClaudeEffortCompatibility || storedClaudeEffortCompatibility(t, dir, off.Token.ID) {
+		t.Fatalf("a service token created without the flag reads on: %+v", off.Token)
+	}
+
+	list, err := svc.ListServiceTokens(ctx, svcAdminToken(), created.ID)
+	if err != nil {
+		t.Fatalf("ListServiceTokens: %v", err)
+	}
+	got := map[string]bool{}
+	for _, dto := range list {
+		got[dto.ID] = dto.ClaudeEffortCompatibility
+	}
+	if v, ok := got[on.Token.ID]; !ok || !v {
+		t.Fatalf("listed opted-in service token claude_effort_compatibility = %v (present=%v), want true", v, ok)
+	}
+	if v, ok := got[off.Token.ID]; !ok || v {
+		t.Fatalf("listed default service token claude_effort_compatibility = %v (present=%v), want false", v, ok)
+	}
+}
