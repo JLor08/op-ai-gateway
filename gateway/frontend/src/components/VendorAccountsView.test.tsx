@@ -573,6 +573,142 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(document.getElementById('vendor-account-api-key')).toHaveValue('');
     });
 
+    // While vendor_subscriptions_enabled is off a subscription create is refused
+    // with 409 vendor_accounts.subscriptions_disabled, so the form must not offer it.
+    describe('with vendor_subscriptions_enabled off', () => {
+      const off = { subscriptionsEnabled: false };
+
+      async function subscriptionOption() {
+        fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+        return screen.findByRole('option', { name: t.vendorAuthSubscription });
+      }
+
+      it('disables the Subscription option, still offers api key, and says why inline', async () => {
+        renderView({ accounts: [], ...off });
+        await openCreate();
+
+        // The reason is visible without opening the menu.
+        expect(screen.getByText(t.vendorAccountSubscriptionsUnavailableNote)).toBeVisible();
+        expect(await subscriptionOption()).toHaveAttribute('aria-disabled', 'true');
+        expect(screen.getByRole('option', { name: t.vendorAuthApiKey })).not.toHaveAttribute(
+          'aria-disabled',
+        );
+      });
+
+      it('defaults to api key, with the key field', async () => {
+        renderView({ accounts: [], ...off });
+        await openCreate();
+
+        expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveTextContent(
+          t.vendorAuthApiKey,
+        );
+        expect(document.getElementById('vendor-account-api-key')).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorAccountSubscriptionCreateNote)).not.toBeInTheDocument();
+      });
+
+      it('cannot be submitted as a subscription, even if the disabled option is clicked anyway', async () => {
+        const { fakeApi } = renderView({ accounts: [], ...off });
+        await openCreate();
+
+        fireEvent.click(await subscriptionOption());
+        // A disabled option is inert, so the menu may still be open: Escape closes it
+        // (and is a no-op if it is already closed) before the form is read again.
+        fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+        await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+        // Still an api_key form: the key field stays, the subscription note never shows.
+        expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveTextContent(
+          t.vendorAuthApiKey,
+        );
+        expect(document.getElementById('vendor-account-api-key')).toBeInTheDocument();
+        expect(screen.queryByText(t.vendorAccountSubscriptionCreateNote)).not.toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.createVendorAccount).toHaveBeenCalledWith({
+          vendor: 'openai',
+          auth_type: 'api_key',
+          name: 'Work',
+          api_key: 'sk-test-123',
+        });
+      });
+
+      // The switch can turn off while the form is open (the shell re-reads it): a
+      // Subscription choice made before then must not survive into the submit.
+      it('falls back to api key when the switch turns off with Subscription already chosen', async () => {
+        const { fakeApi, rerender } = renderView({ accounts: [] });
+        await openCreate();
+        await chooseSubscription();
+        expect(screen.getByText(t.vendorAccountSubscriptionCreateNote)).toBeInTheDocument();
+
+        rerender(
+          <ToastProvider>
+            <VendorAccountsView t={t} api={fakeApi} subscriptionsEnabled={false} />
+          </ToastProvider>,
+        );
+
+        expect(screen.getByLabelText(t.vendorAccountAuthTypeLabel)).toHaveTextContent(
+          t.vendorAuthApiKey,
+        );
+        expect(screen.queryByText(t.vendorAccountSubscriptionCreateNote)).not.toBeInTheDocument();
+        fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+          target: { value: 'Work' },
+        });
+        fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+          target: { value: 'sk-test-123' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+        await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+        expect(fakeApi.createVendorAccount.mock.calls[0][0]).toMatchObject({
+          auth_type: 'api_key',
+          api_key: 'sk-test-123',
+        });
+      });
+
+      it('shows no reason on a configurable-root vendor, which has no authentication choice', async () => {
+        renderView({ accounts: [], ...off });
+        await openCreate();
+
+        fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountVendorLabel));
+        fireEvent.click(await screen.findByRole('option', { name: t.vendorXAI }));
+        await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+
+        expect(screen.queryByLabelText(t.vendorAccountAuthTypeLabel)).not.toBeInTheDocument();
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsUnavailableNote),
+        ).not.toBeInTheDocument();
+      });
+    });
+
+    describe('with vendor_subscriptions_enabled on', () => {
+      it.each([
+        ['explicitly on', { subscriptionsEnabled: true }],
+        ['left to the default', {}],
+      ])('keeps the Subscription option selectable, with no reason (%s)', async (_label, opts) => {
+        renderView({ accounts: [], ...opts });
+        await openCreate();
+
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsUnavailableNote),
+        ).not.toBeInTheDocument();
+        fireEvent.mouseDown(screen.getByLabelText(t.vendorAccountAuthTypeLabel));
+        const option = await screen.findByRole('option', { name: t.vendorAuthSubscription });
+        expect(option).not.toHaveAttribute('aria-disabled');
+
+        fireEvent.click(option);
+        await waitFor(() => expect(screen.queryByRole('listbox', { hidden: true })).toBeNull());
+        expect(screen.getByText(t.vendorAccountSubscriptionCreateNote)).toBeInTheDocument();
+        expect(document.getElementById('vendor-account-api-key')).not.toBeInTheDocument();
+      });
+    });
+
     it('does not keep a typed key when the form is cancelled and reopened', async () => {
       renderView({ accounts: [] });
       await openCreate();
@@ -839,6 +975,108 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(chip).toBeDefined();
         expect(screen.getByText(t.vendorConnectNeedsReconnectNote)).toBeInTheDocument();
         expect(screen.queryByText(t.vendorConnectReconnectNote)).not.toBeInTheDocument();
+      });
+    });
+
+    // While vendor_subscriptions_enabled is off every connect flow is refused with
+    // 409 vendor_accounts.subscriptions_disabled, so the detail view must not offer
+    // one; owner management (rename, status, delete) is unaffected.
+    describe('with vendor_subscriptions_enabled off', () => {
+      const off = { subscriptionsEnabled: false };
+
+      // Every affordance of the connect panel, whichever of its three methods.
+      function expectNoConnectAffordance() {
+        expect(screen.queryByText(t.vendorConnectTitle)).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.vendorConnectBeginAction })).toBeNull();
+        expect(screen.queryByRole('button', { name: t.vendorConnectBeginAgainAction })).toBeNull();
+        expect(
+          screen.queryByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).not.toBeInTheDocument();
+        expect(screen.queryByText(t.vendorConnectDeviceTitle)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.vendorConnectAccessTokenLabel)).not.toBeInTheDocument();
+      }
+
+      it('keeps the notice but offers no connect panel for a disconnected subscription', async () => {
+        renderSubscription({}, off);
+        await openDetail();
+
+        expect(screen.getByText(t.vendorAccountSubscriptionsDisabledNotice)).toBeVisible();
+        expectNoConnectAffordance();
+      });
+
+      it('offers no reconnect for a connected subscription either', async () => {
+        renderSubscription({ subscription_connected: true }, off);
+        await openDetail();
+
+        expect(screen.getByText(t.vendorAccountSubscriptionsDisabledNotice)).toBeVisible();
+        expect(screen.queryByText(t.vendorConnectReconnectNote)).not.toBeInTheDocument();
+        expectNoConnectAffordance();
+      });
+
+      it('offers no device connect for an OpenAI subscription', async () => {
+        renderSubscription({ vendor: 'openai', subscription_connected: true }, off);
+        await openDetail();
+
+        expect(screen.getByText(t.vendorAccountSubscriptionsDisabledNotice)).toBeVisible();
+        expectNoConnectAffordance();
+      });
+
+      it('offers no reconnect for a subscription that needs one', async () => {
+        renderSubscription({ subscription_connected: true, status: 'needs_reconnect' }, off);
+        await openDetail();
+
+        expect(screen.queryByText(t.vendorConnectNeedsReconnectNote)).not.toBeInTheDocument();
+        expectNoConnectAffordance();
+      });
+
+      it('leaves rename, status and delete available', async () => {
+        renderSubscription({ subscription_connected: true }, off);
+        await openDetail();
+
+        expect(screen.getByLabelText(t.vendorAccountNameLabel)).toBeEnabled();
+        expect(screen.getByLabelText(t.vendorAccountStatusLabel)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+        expect(screen.getByRole('button', { name: t.vendorAccountActionDelete })).toBeEnabled();
+      });
+
+      it('does not touch an api_key account, which never has a connect panel', async () => {
+        renderView({ accounts: [makeVendorAccount()], ...off });
+        await openDetail();
+
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsDisabledNotice),
+        ).not.toBeInTheDocument();
+        expect(screen.getByLabelText(t.vendorAccountApiKeyLabel)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+        expectNoConnectAffordance();
+      });
+    });
+
+    describe('with vendor_subscriptions_enabled on', () => {
+      it.each([
+        ['explicitly on', { subscriptionsEnabled: true }],
+        ['left to the default', {}],
+      ])('still offers every connect method (%s)', async (_label, opts) => {
+        renderSubscription({ vendor: 'openai' }, opts);
+        await openDetail();
+
+        expect(
+          screen.queryByText(t.vendorAccountSubscriptionsDisabledNotice),
+        ).not.toBeInTheDocument();
+        expect(screen.getByText(t.vendorConnectTitle)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.vendorConnectBeginAction })).toBeEnabled();
+        expect(
+          screen.getByRole('button', { name: t.vendorConnectDeviceStartAction }),
+        ).toBeEnabled();
+        expect(screen.getByLabelText(t.vendorConnectAccessTokenLabel)).toBeInTheDocument();
+      });
+
+      it('still offers reconnecting a connected subscription', async () => {
+        renderSubscription({ subscription_connected: true }, { subscriptionsEnabled: true });
+        await openDetail();
+
+        expect(screen.getByText(t.vendorConnectReconnectNote)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.vendorConnectBeginAction })).toBeEnabled();
       });
     });
 

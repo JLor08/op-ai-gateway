@@ -114,6 +114,9 @@ export function VendorAccountsView({
   // The vendor_subscriptions_enabled system switch (on by default). While it is
   // off every subscription account is shown inactive with a notice: the backend
   // no longer routes it, nor lets it be created or connected, but it stays listed.
+  // The UI follows suit: the create form disables the Subscription option and the
+  // detail view drops the connect panel, so nothing invites a request that would
+  // be refused with a 409.
   subscriptionsEnabled?: boolean;
   api: Pick<
     PortalApi,
@@ -192,8 +195,10 @@ export function VendorAccountsView({
   const rootVendor = isConfigurableRootVendor(vendor);
   // Custom has no default root, so a blank base URL cannot be created.
   const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
-  // A configurable-root vendor is api-key only, whatever the select last said.
-  const createAuthType = rootVendor ? 'api_key' : authType;
+  // A configurable-root vendor is api-key only, whatever the select last said --
+  // and so is every vendor while the subscriptions switch is off (a subscription
+  // create would only be refused with a 409).
+  const createAuthType = rootVendor || !subscriptionsEnabled ? 'api_key' : authType;
   const baseUrlNote =
     vendor === 'openai_compatible' ? t.vendorAccountBaseUrlCustomNote : t.vendorAccountBaseUrlNote;
 
@@ -527,15 +532,24 @@ export function VendorAccountsView({
               <SelectField
                 id="vendor-account-auth-type"
                 label={t.vendorAccountAuthTypeLabel}
-                value={authType}
+                value={createAuthType}
                 onChange={(e) => {
                   setAuthType(e.target.value);
                   // Never carry a typed key into a subscription account.
                   resetKeyInput();
                 }}
+                helperText={
+                  subscriptionsEnabled ? undefined : t.vendorAccountSubscriptionsUnavailableNote
+                }
               >
                 {AUTH_TYPES.map((a) => (
-                  <option value={a} key={a}>
+                  // While the switch is off Subscription stays listed but not
+                  // choosable: the helper text says why.
+                  <option
+                    value={a}
+                    key={a}
+                    disabled={a === 'subscription' && !subscriptionsEnabled}
+                  >
                     {authTypeLabel(t, a)}
                   </option>
                 ))}
@@ -787,7 +801,9 @@ export function VendorAccountsView({
           onRefresh={refreshAccountUsage}
         />
 
-        {account.auth_type === 'subscription' && (
+        {/* No connect panel while the subscriptions switch is off: every connect
+            flow would be refused with a 409, and the notice above says why. */}
+        {account.auth_type === 'subscription' && !subscriptionBlocked(account) && (
           <Box sx={{ mt: 3 }}>
             <VendorSubscriptionConnect
               t={t}

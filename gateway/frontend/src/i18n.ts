@@ -2519,6 +2519,9 @@ const de = {
   // vendor_subscriptions_enabled off: the account is kept but cannot be used.
   vendorAccountSubscriptionsDisabledNotice:
     'Abonnement-Konten sind derzeit deaktiviert. Dieses Konto kann nicht genutzt werden, bis ein Systemadministrator sie wieder zulässt.',
+  // The create form's reason for the disabled "Subscription" authentication option.
+  vendorAccountSubscriptionsUnavailableNote:
+    'Abonnement-Konten sind derzeit von einem Systemadministrator deaktiviert, daher ist nur die Anmeldung mit einem API-Schlüssel möglich.',
   // The optional model-id prefix of an account, plus the Models panel (the
   // account's current models and the "refresh models" action).
   vendorAccountModelPrefixLabel: 'Modell-Präfix (optional)',
@@ -5270,6 +5273,9 @@ const en: PortalMessages = {
   // vendor_subscriptions_enabled off: the account is kept but cannot be used.
   vendorAccountSubscriptionsDisabledNotice:
     'Subscription accounts are currently disabled. This account cannot be used until a system administrator allows them again.',
+  // The create form's reason for the disabled "Subscription" authentication option.
+  vendorAccountSubscriptionsUnavailableNote:
+    'Subscription accounts are currently disabled by a system administrator, so only API key authentication is available.',
   // The optional model-id prefix of an account, plus the Models panel (the
   // account's current models and the "refresh models" action).
   vendorAccountModelPrefixLabel: 'Model prefix (optional)',
