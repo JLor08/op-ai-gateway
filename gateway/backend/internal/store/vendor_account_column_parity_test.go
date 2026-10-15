@@ -141,7 +141,8 @@ func findVendorAccountByID(accounts []routing.VendorAccount, id string) (routing
 // fixture to the LIVE migrated schema (the #84 guard): a column added to
 // vendor_accounts and wired into scanVendorAccount but not into the fixture
 // above would read back its zero from every reader and stay green. The table has
-// no integer-boolean column, so every column is seeded.
+// no integer-boolean column, so every column is seeded -- except the two share
+// columns migration 91 added, which no reader selects yet (see ignored below).
 func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		assertColumnCoverage(context.Background(), t, s, "vendor_accounts", columnCoverage{
@@ -150,7 +151,16 @@ func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 				"api_key", "auth_type", "base_url", "created_at", "id", "model_prefix", "name", "oauth_tokens",
 				"owner_user_id", "status", "updated_at", "vendor",
 			},
-			ignored: map[string]string{},
+			ignored: map[string]string{
+				// migration 91 is schema only: vendorAccountColumns and
+				// scanVendorAccount do not select these two yet, and no writer names
+				// them (both rely on their column DEFAULTs). The task that adds them
+				// to routing.VendorAccount and the readers must move them to seeded
+				// and seed a distinct value per row, so a reader that drops one fails
+				// the parity test above instead of staying green.
+				"share_level":     "added by migration 91 (schema only); not yet read or written by any store accessor",
+				"system_group_id": "added by migration 91 (schema only); not yet read or written by any store accessor",
+			},
 		})
 	})
 }
