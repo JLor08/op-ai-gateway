@@ -118,8 +118,12 @@ func (s *Server) injectLoadingOnCounts(ctx context.Context, token auth.Token, ro
 }
 
 // loadingCountModelKey returns the model name whose starting-server set this row's
-// count comes from: the row's own id, EXCEPT for a per-token override alias row,
-// which takes its target's.
+// count comes from: the row's own id, EXCEPT for an alias row, which takes its
+// target's. Two kinds of alias row exist on the principal-facing listing: a
+// per-token override alias (the token's model_override_map offers the row's id
+// and names the target in its rule) and a generated Claude alias (issue #225;
+// the row carries OriginalModelID, the real gateway id it stands for, and the
+// token holds no rule for its id).
 //
 // modelsResponse's alias overlay already copies the target's whole listing payload
 // (loaded/loaded_on, offered_on_count, context size, vision, is_group) onto the alias
@@ -138,6 +142,13 @@ func loadingCountModelKey(token auth.Token, row portal.ModelDTO, aliasesApply bo
 	}
 	if rule, ok := token.ModelOverrideRules[row.ID]; ok && rule.Offer && rule.To != "" {
 		return rule.To
+	}
+	// A generated alias row is the target's row filed under an alias id: the
+	// overlay copies the same payload onto it, so the same count belongs with it.
+	// The manual rule above wins when both apply, but they cannot both name the
+	// row: a generated alias is never created for an id a manual rule is keyed on.
+	if row.OriginalModelID != "" {
+		return row.OriginalModelID
 	}
 	return row.ID
 }
