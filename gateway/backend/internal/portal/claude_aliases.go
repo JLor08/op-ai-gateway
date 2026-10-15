@@ -281,21 +281,23 @@ func listingLabel(id string) string { return id }
 // here; a nil vendor (flag off, service token, no vendor access) means the
 // token has none.
 //
+// vendorLoaded is that read's second result: whether vendor is the COMPLETE set.
+// It is true for a nil vendor that merely means "no vendor access", and false
+// when a vendor store read failed (vendor is then nil or partial). The
+// vendor-shadow exclusion (here, and in claudeAliasEligible) and the reserved
+// names need the whole set, so a vendor-read error fails the derivation CLOSED,
+// exactly like !overlayLoaded: a local name the owner's own vendor account also
+// serves must not be offered, or resolved, as an alias while the set is unknown
+// (the resolver would send it to the vendor first). The vendor LISTING overlay
+// stays fail-open: it uses the nil or partial set as it is, so the real listing
+// still renders.
+//
 // The second result is one human-readable diagnostic per skipped id; callers log
 // them with logClaudeAliasDiagnostics.
-func claudeAliasesFromListing(token auth.Token, listed, preSuppress, vendor map[string]map[string]struct{}, overlayLoaded bool) (map[string]claudeAlias, []string) {
-	if !token.ClaudeModelAliases || !overlayLoaded {
+func claudeAliasesFromListing(token auth.Token, listed, preSuppress, vendor map[string]map[string]struct{}, overlayLoaded, vendorLoaded bool) (map[string]claudeAlias, []string) {
+	if !token.ClaudeModelAliases || !overlayLoaded || !vendorLoaded {
 		return nil, nil
 	}
-	// Fail-posture asymmetry: vendorModelFlavorSets (the caller's read of vendor)
-	// returns an empty (or partial) set when the vendor store read errors, so the
-	// vendor-shadow exclusion (here, and in claudeAliasEligible) fails OPEN: for
-	// that moment a local name the owner's own vendor account also serves could be
-	// offered and resolved as an alias.
-	// That is inherited from the vendor overlay's established fail-open posture,
-	// unlike the group/visibility overlay (overlayLoaded above), which fails this
-	// derivation CLOSED. It stays same-principal and transient and grants nothing
-	// the token could not already reach, so there is no privilege escalation.
 	reserved := make(map[string]bool, len(preSuppress)+len(vendor)+len(token.ModelOverrideRules))
 	for name := range preSuppress {
 		reserved[name] = true
@@ -321,7 +323,9 @@ func claudeAliasesFromListing(token auth.Token, listed, preSuppress, vendor map[
 // caller on the request path should check the cheap preconditions (the setting,
 // and that the requested id starts with claudeAliasIDPrefix) before calling it.
 //
-// A store error yields no aliases (fail closed).
+// A store error yields no aliases (fail closed), the vendor-model read's
+// included: an incomplete vendor set cannot say which local names a vendor
+// account shadows (see claudeAliasesFromListing).
 func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (map[string]claudeAlias, []string) {
 	if !token.ClaudeModelAliases || s.routes == nil {
 		return nil, nil
@@ -335,7 +339,8 @@ func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (
 		return nil, nil
 	}
 	sets, preSuppress := baseFlavorSets(views, s.runtimeSpecIndexForViews(ctx, views), &overlay)
-	return claudeAliasesFromListing(token, sets, preSuppress, s.vendorModelFlavorSets(ctx, token), true)
+	vendor, vendorLoaded := s.vendorModelFlavorSets(ctx, token)
+	return claudeAliasesFromListing(token, sets, preSuppress, vendor, true, vendorLoaded)
 }
 
 // ClaudeAliasTarget is the inference-side accessor of the generated aliases: it

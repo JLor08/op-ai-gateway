@@ -784,6 +784,205 @@ func TestClaudeAliasDiscoveryReadsTheVendorSetOnce(t *testing.T) {
 	}
 }
 
+// failingVendorAccountModelsStore fails the per-account vendor model read of the
+// named accounts only, so the other accounts' models are still read: the PARTIAL
+// vendor-set case.
+type failingVendorAccountModelsStore struct {
+	*routing.MemoryStore
+	failFor map[string]bool
+	err     error
+}
+
+func (f *failingVendorAccountModelsStore) VendorAccountModels(ctx context.Context, accountID string) ([]routing.VendorAccountModel, error) {
+	if f.failFor[accountID] {
+		return nil, f.err
+	}
+	return f.MemoryStore.VendorAccountModels(ctx, accountID)
+}
+
+// seedClaudeVendorAccount gives usr_cla an active api_key vendor account that
+// serves one model under prefix+upstream.
+func seedClaudeVendorAccount(t *testing.T, rs *routing.MemoryStore, id, vendor, prefix, upstream string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := rs.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: id, OwnerUserID: "usr_cla", Vendor: vendor, AuthType: routing.VendorAuthAPIKey,
+		Name: id, Status: routing.VendorAccountStatusActive, ModelPrefix: prefix,
+		CreatedAt: offeringTime, UpdatedAt: offeringTime,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount %s: %v", id, err)
+	}
+	if err := rs.SetVendorAccountModels(ctx, id, []routing.VendorAccountModel{
+		{GatewayModel: prefix + upstream, UpstreamModel: upstream, APIFlavor: routing.APIFlavorAnthropic},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels %s: %v", id, err)
+	}
+}
+
+// vendorShadowWorld seeds the vendor-shadow fixture on rs: two local models,
+// local-ok and shadowed, and a bare-prefix vendor account of usr_cla that also
+// serves "shadowed" (so the shadow exclusion keeps it out of the aliases). It
+// returns the alias-enabled token that may use every account of its owner.
+func vendorShadowWorld(t *testing.T, rs *routing.MemoryStore) auth.Token {
+	t.Helper()
+	both := []string{flavorOpenAI, flavorAnthropic}
+	seedClaudeModel(t, rs, 0, claudeModelSpec{name: "local-ok", flavors: both})
+	seedClaudeModel(t, rs, 1, claudeModelSpec{name: "shadowed", flavors: both})
+	seedClaudeVendorAccount(t, rs, "acc_bare", routing.VendorOpenAI, "", "shadowed")
+	token := claudeToken(nil)
+	token.VendorAccess = auth.VendorAccess{All: true}
+	return token
+}
+
+// assertNoClaudeAliasAnywhere pins the fail-CLOSED outcome on every surface the
+// derivation reaches: no generated row in Models(), no alias id in the
+// per-flavor listing, nothing derived by claudeAliasesForToken, and neither the
+// local model's nor the shadowed name's alias id resolves.
+func assertNoClaudeAliasAnywhere(t *testing.T, svc *Service, token auth.Token) {
+	t.Helper()
+	ctx := context.Background()
+	resp := svc.Models(ctx, token)
+	if rows := claudeAliasRows(resp); len(rows) != 0 {
+		t.Errorf("Models() lists aliases for %v", sortedKeys(rows))
+	}
+	for _, d := range resp.Data {
+		if strings.HasPrefix(d.ID, claudeAliasIDPrefix) {
+			t.Errorf("Models() lists the alias id %s", d.ID)
+		}
+	}
+	for _, id := range svc.ModelsForFlavor(ctx, token, flavorAnthropic) {
+		if strings.HasPrefix(id, claudeAliasIDPrefix) {
+			t.Errorf("the anthropic listing carries the alias id %s", id)
+		}
+	}
+	if aliases, _ := svc.claudeAliasesForToken(ctx, token); len(aliases) != 0 {
+		t.Errorf("claudeAliasesForToken derives %v", aliases)
+	}
+	for _, name := range []string{"local-ok", "shadowed"} {
+		if target, ok := svc.ClaudeAliasTarget(ctx, token, claudeAliasIDOf(t, name)); ok {
+			t.Errorf("the alias id of %s resolves to %q", name, target)
+		}
+	}
+}
+
+// TestClaudeAliasFailsClosedWhenTheVendorSetCannotBeRead (issue #227): the
+// vendor-shadow exclusion reads the token's own vendor models. When that read
+// fails the exclusion cannot tell a shadowed name from a plain one, and failing
+// open would offer (and resolve) an alias for a name the resolver would send to
+// the vendor first. Like the visibility overlay, the derivation fails CLOSED:
+// no aliases at all, on every surface, while the real listing stays as it is.
+func TestClaudeAliasFailsClosedWhenTheVendorSetCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	token := vendorShadowWorld(t, rs)
+	working := offerSvc(rs, nil)
+	setVendorAccountsEnabled(t, working, true)
+	if got, want := sortedKeys(claudeAliasRows(working.Models(ctx, token))), []string{"local-ok"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("precondition: the working store aliases %v, want only %v", got, want)
+	}
+
+	svc := offerSvc(&failingVendorReadsStore{MemoryStore: rs, ownerErr: errors.New("vendor accounts unavailable")}, nil)
+	setVendorAccountsEnabled(t, svc, true)
+	assertNoClaudeAliasAnywhere(t, svc, token)
+
+	// The listing itself fails OPEN: the real rows are all there, exactly what a
+	// token without the setting is listed under the same failure.
+	plain := token
+	plain.ClaudeModelAliases = false
+	got, want := sortedKeys(modelsByID(svc.Models(ctx, token))), sortedKeys(modelsByID(svc.Models(ctx, plain)))
+	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(got, []string{"local-ok", "shadowed"}) {
+		t.Fatalf("listing under the vendor read error = %v, want the real rows %v (= the alias-free listing %v)", got, []string{"local-ok", "shadowed"}, want)
+	}
+	if got, want := svc.ModelsForFlavor(ctx, token, flavorAnthropic), []string{"local-ok", "shadowed"}; !reflect.DeepEqual(sortedCopy(got), want) {
+		t.Fatalf("anthropic listing under the vendor read error = %v, want %v", got, want)
+	}
+}
+
+// TestClaudeAliasFailsClosedOnAPartialVendorRead: one account's model read fails
+// while another's succeeds. The partial set is not trustworthy for the shadow
+// exclusion (the failed account may be the one that serves the name), so the
+// derivation is closed here too. The vendor LISTING overlay still folds in what
+// it could read: its fail-open posture is unchanged.
+func TestClaudeAliasFailsClosedOnAPartialVendorRead(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	token := vendorShadowWorld(t, rs)
+	seedClaudeVendorAccount(t, rs, "acc_readable", routing.VendorAnthropic, "ok/", "vendor-only")
+	svc := offerSvc(&failingVendorAccountModelsStore{MemoryStore: rs, failFor: map[string]bool{"acc_bare": true}, err: errors.New("vendor models unavailable")}, nil)
+	setVendorAccountsEnabled(t, svc, true)
+
+	assertNoClaudeAliasAnywhere(t, svc, token)
+	byID := modelsByID(svc.Models(ctx, token))
+	for _, id := range []string{"local-ok", "shadowed", "ok/vendor-only"} {
+		if _, ok := byID[id]; !ok {
+			t.Errorf("listing lost %s on a partial vendor read: %v", id, sortedKeys(byID))
+		}
+	}
+	if !containsString(svc.ModelsForFlavor(ctx, token, flavorAnthropic), "ok/vendor-only") {
+		t.Error("the per-flavor listing dropped the readable account's model on a partial vendor read")
+	}
+}
+
+// TestClaudeAliasDerivesWhenThereIsNoVendorAccess: "no vendor access" is not a
+// read failure. A flag-off master switch, a user with no vendor accounts, a
+// service principal and a token the owner's accounts are not granted to all
+// mean there are legitimately no vendor models to exclude, so aliases derive
+// for every eligible model exactly as before.
+func TestClaudeAliasDerivesWhenThereIsNoVendorAccess(t *testing.T) {
+	ctx := context.Background()
+	both := []string{flavorOpenAI, flavorAnthropic}
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, svc *Service, rs *routing.MemoryStore) auth.Token
+	}{
+		{"flag off", func(t *testing.T, svc *Service, rs *routing.MemoryStore) auth.Token {
+			seedClaudeVendorAccount(t, rs, "acc_bare", routing.VendorOpenAI, "", "shadowed")
+			token := claudeToken(nil)
+			token.VendorAccess = auth.VendorAccess{All: true}
+			return token
+		}},
+		{"flag on, no accounts", func(t *testing.T, svc *Service, rs *routing.MemoryStore) auth.Token {
+			setVendorAccountsEnabled(t, svc, true)
+			return claudeToken(nil)
+		}},
+		{"flag on, token has no vendor access", func(t *testing.T, svc *Service, rs *routing.MemoryStore) auth.Token {
+			setVendorAccountsEnabled(t, svc, true)
+			seedClaudeVendorAccount(t, rs, "acc_bare", routing.VendorOpenAI, "", "shadowed")
+			return claudeToken(nil) // strict default: no vendor access
+		}},
+		{"flag on, service principal", func(t *testing.T, svc *Service, rs *routing.MemoryStore) auth.Token {
+			setVendorAccountsEnabled(t, svc, true)
+			seedClaudeVendorAccount(t, rs, "acc_bare", routing.VendorOpenAI, "", "shadowed")
+			token := claudeToken(nil)
+			token.UserID = ""
+			return token
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := routing.NewMemoryStore()
+			seedClaudeModel(t, rs, 0, claudeModelSpec{name: "local-ok", flavors: both})
+			seedClaudeModel(t, rs, 1, claudeModelSpec{name: "shadowed", flavors: both})
+			svc := offerSvc(rs, nil)
+			token := tc.setup(t, svc, rs)
+
+			want := []string{"local-ok", "shadowed"}
+			if got := sortedKeys(claudeAliasRows(svc.Models(ctx, token))); !reflect.DeepEqual(got, want) {
+				t.Errorf("Models() aliases %v, want %v", got, want)
+			}
+			derived, _ := svc.claudeAliasesForToken(ctx, token)
+			originals := make([]string, 0, len(derived))
+			for _, alias := range derived {
+				originals = append(originals, alias.OriginalID)
+			}
+			slices.Sort(originals)
+			if !reflect.DeepEqual(originals, want) {
+				t.Errorf("claudeAliasesForToken targets %v, want %v", originals, want)
+			}
+		})
+	}
+}
+
 // TestClaudeAliasEligible pins the eligibility rules as a pure unit: the
 // alias-free listing's names that serve the anthropic flavor, minus every name a
 // manual rule is keyed on or hides and every name a vendor account serves.

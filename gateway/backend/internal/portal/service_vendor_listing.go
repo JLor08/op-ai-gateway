@@ -28,14 +28,23 @@ import (
 // group overlay: a store error yields what was read so far (nil on the first
 // read) rather than blanking the whole listing, and an account whose model rows
 // cannot be read is skipped.
-func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) []vendorAccountModels {
+//
+// The second result, loaded, says whether that set is COMPLETE, so a consumer
+// that must not act on a partial one can tell. It is true when nothing went
+// wrong, INCLUDING the no-vendor-access cases above (a legitimately empty set is
+// not a failure), and false when the owner's accounts could not be read (nil, false)
+// or an account's model rows could not (the partial set, false). The listing
+// overlays ignore it and stay fail-open; the generated-alias derivation fails
+// CLOSED on it, because its vendor-shadow exclusion needs the whole set.
+func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) (owned []vendorAccountModels, loaded bool) {
 	if s.routes == nil || token.UserID == "" || !s.VendorAccountsEnabled(ctx) {
-		return nil
+		return nil, true
 	}
 	accounts, err := s.routes.VendorAccountsByOwner(ctx, token.UserID)
 	if err != nil {
-		return nil
+		return nil, false
 	}
+	loaded = true
 	var out []vendorAccountModels
 	for _, acc := range accounts {
 		if acc.Status != routing.VendorAccountStatusActive {
@@ -47,6 +56,9 @@ func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) 
 		}
 		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
 		if err != nil {
+			// Keep collecting the accounts that can be read (the listing overlay
+			// folds in what it has), but the set is no longer complete.
+			loaded = false
 			continue
 		}
 		// Token-effective public names (prefix + upstream model). With All or no
@@ -55,7 +67,7 @@ func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) 
 		models, _ = relabelVendorModels(models, prefix)
 		out = append(out, vendorAccountModels{Account: acc, Models: models})
 	}
-	return out
+	return out, loaded
 }
 
 // vendorAccountModels is one active vendor account with the models it serves.
@@ -81,10 +93,16 @@ type vendorAccountModels struct {
 //     /anthropic/v1/models where an anthropic call then 404s, breaking parity.
 //
 // Gating, owner scope and the fail-open behaviour are ownVendorAccountModels's.
-func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) map[string]map[string]struct{} {
-	owned := s.ownVendorAccountModels(ctx, token)
+//
+// loaded is ownVendorAccountModels's: false exactly when the set is incomplete
+// because a vendor store read failed (the map is then nil or partial), true for a
+// complete set and for the legitimately empty no-vendor-access one. The listing
+// overlay uses the map either way (fail-open); the alias derivation refuses an
+// incomplete one (fail-closed).
+func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) (sets map[string]map[string]struct{}, loaded bool) {
+	owned, loaded := s.ownVendorAccountModels(ctx, token)
 	if owned == nil {
-		return nil
+		return nil, loaded
 	}
 	out := make(map[string]map[string]struct{})
 	for _, am := range owned {
@@ -100,7 +118,7 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 			}
 		}
 	}
-	return out
+	return out, loaded
 }
 
 // vendorDashboardRoutes is the dashboard half of the owner overlay: one row per
@@ -116,7 +134,8 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) m
 // are the principal's own), and it never reaches the admin management surface.
 func (s *Service) vendorDashboardRoutes(ctx context.Context, token auth.Token) []RouteDTO {
 	var out []RouteDTO
-	for _, am := range s.ownVendorAccountModels(ctx, token) {
+	owned, _ := s.ownVendorAccountModels(ctx, token) // best-effort listing: a partial set is shown as is
+	for _, am := range owned {
 		for _, m := range am.Models {
 			out = append(out, RouteDTO{
 				ID:       am.Account.ID + ":" + m.GatewayModel,
@@ -154,6 +173,10 @@ func vendorAccountServedFlavors(acc routing.VendorAccount) []string {
 // derivation (claudeAliasesFromListing) too, so a listing costs one vendor
 // store read, not one per consumer. vendor is only read here, and each flavor is
 // copied into sets, so sets never aliases it.
+//
+// It overlays whatever vendor holds, nil or partial after a vendor store-read
+// error included: the listing fails OPEN and never blanks. It is the alias
+// derivation, not this overlay, that refuses an incomplete set (vendorLoaded).
 func overlayVendorModels(sets, vendor map[string]map[string]struct{}) {
 	for name, flavors := range vendor {
 		set := sets[name]

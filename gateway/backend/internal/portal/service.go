@@ -2676,15 +2676,21 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			//
 			// The principal's vendor model set is read ONCE here and feeds both the
 			// alias derivation (vendor-shadow exclusion, reserved names) and the owner
-			// overlay below, so a listing costs one vendor store read.
+			// overlay below, so a listing costs one vendor store read. The overlay
+			// takes the set as it is (a failed read just overlays fewer rows: the
+			// listing fails open), the derivation also takes vendorLoaded and fails
+			// closed when the set is incomplete.
 			var (
 				generated map[string]claudeAlias
 				vendor    map[string]map[string]struct{}
 			)
 			if suppress {
-				var diagnostics []string
-				vendor = s.vendorModelFlavorSets(ctx, token)
-				generated, diagnostics = claudeAliasesFromListing(token, flavors, preSuppress, vendor, overlayLoaded)
+				var (
+					diagnostics  []string
+					vendorLoaded bool
+				)
+				vendor, vendorLoaded = s.vendorModelFlavorSets(ctx, token)
+				generated, diagnostics = claudeAliasesFromListing(token, flavors, preSuppress, vendor, overlayLoaded, vendorLoaded)
 				logClaudeAliasDiagnostics(diagnostics)
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
 				// An alias name added to the flavor map still needs the target's
@@ -4334,9 +4340,10 @@ func isSeedAPIFlavor(flavor string) bool {
 // MATRIX on visibleMappingViews) and the generated Claude aliases' metadata.
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
 	// The vendor model set is read once and feeds both the generated-alias
-	// derivation inside modelFlavorSetsWithPreSuppress and the overlay below.
-	vendor := s.vendorModelFlavorSets(ctx, token)
-	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token, vendor)
+	// derivation inside modelFlavorSetsWithPreSuppress (which fails closed on
+	// !vendorLoaded) and the overlay below (which takes the set as it is: fail open).
+	vendor, vendorLoaded := s.vendorModelFlavorSets(ctx, token)
+	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token, vendor, vendorLoaded)
 	if err != nil {
 		return sets, err
 	}
@@ -4374,9 +4381,10 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 // model_settings merely hides from DISPLAY, which stays callable. It is not an
 // offering, though: never use it to answer "what does this principal see".
 //
-// vendor is the token's vendor model set (vendorModelFlavorSets), read by the
-// caller, which also needs it for the vendor overlay; see claudeAliasesFromListing.
-func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token, vendor map[string]map[string]struct{}) (sets, preSuppress map[string]map[string]struct{}, err error) {
+// vendor and vendorLoaded are the token's vendor model set and its completeness
+// flag (vendorModelFlavorSets), read by the caller, which also needs the set for
+// the vendor overlay; see claudeAliasesFromListing.
+func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token, vendor map[string]map[string]struct{}, vendorLoaded bool) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {
 		return nil, nil, err
@@ -4395,9 +4403,10 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	// they are derived before the manual override overlay adds or removes a name,
 	// and they fail closed when the overlay was unavailable (overlay == nil: no
 	// hidden/locked suppression happened, so the sets cannot be trusted to say
-	// what is offered). Both overlays then apply in the order flavorSetsFromViews
-	// documents, the generated one last.
-	generated, diagnostics := claudeAliasesFromListing(token, sets, preSuppress, vendor, overlay != nil)
+	// what is offered) or when the vendor set was incomplete (!vendorLoaded: the
+	// shadow exclusion cannot be trusted). Both overlays then apply in the order
+	// flavorSetsFromViews documents, the generated one last.
+	generated, diagnostics := claudeAliasesFromListing(token, sets, preSuppress, vendor, overlay != nil, vendorLoaded)
 	logClaudeAliasDiagnostics(diagnostics)
 	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
 	applyGeneratedClaudeAliases(sets, preSuppress, generated)
