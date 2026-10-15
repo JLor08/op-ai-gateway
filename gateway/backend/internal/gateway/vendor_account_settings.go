@@ -12,13 +12,14 @@ import (
 // vendorSettingsCacheTTL bounds how long the resolver's vendor-account accessors
 // reuse a cached read of vendor_accounts_enabled / vendor_subscriptions_enabled /
 // vendor_account_routing_mode.
-// Both live in system_settings, whose store read is an uncached full-table
+// All three live in system_settings, whose store read is an uncached full-table
 // SELECT, and the per-user vendor branch runs on EVERY inference resolve, so
 // reading them per request would add a database round-trip to the hot path.
 // handleSystemSettings invalidates the caches explicitly after a successful PUT
-// that carried either key, so an operator toggling them in the portal sees the
-// effect immediately; the TTL only bounds how stale an OUT-OF-BAND change (a
-// direct database edit) can be. Matches edgeSchemeSwitchTTL for the same reason.
+// that carried any of the three keys, so an operator toggling them in the portal
+// sees the effect immediately; the TTL only bounds how stale an OUT-OF-BAND
+// change (a direct database edit) can be. Matches edgeSchemeSwitchTTL for the
+// same reason.
 const vendorSettingsCacheTTL = 5 * time.Second
 
 // vendorAccountsEnabledCached reports the vendor_accounts_enabled master flag

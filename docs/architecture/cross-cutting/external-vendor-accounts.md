@@ -1906,13 +1906,15 @@ reflects off. Create, connect and the listing read it uncached through
 likewise treated as on).
 
 **What "off" does not stop.** Turning subscriptions off blocks inference routing,
-model advertising, create and connect, and nothing else. The owner-initiated **test
-connection**, **model refresh** and **usage refresh** on an *existing* subscription
-account (§8) are not gated by it: each still opens the stored OAuth credential and
-sends it to the vendor, and a refresh may renew and so rotate the stored token set
-(§3.4). "Off" is therefore not "the gateway never contacts the vendor's subscription
-endpoints". An operator who needs that turns the master flag off (which blocks those
-actions too) or deletes the account.
+model advertising, create and connect, and nothing else. The **test connection**,
+**model refresh** and **usage refresh** on an *existing* subscription account (§8)
+are not gated by it: each still opens the stored OAuth credential and sends it to
+the vendor, and a refresh may renew and so rotate the stored token set (§3.4). That
+includes the owner's explicit clicks and also the automatic, TTL-throttled usage
+pull that fires, with no click, whenever an OpenAI subscription account's detail
+page is opened (§5.5). "Off" is therefore not "the gateway never contacts the
+vendor's subscription endpoints". An operator who needs that turns the master flag
+off (which blocks those actions too) or deletes the account.
 
 The frontend reads both switches through a portal-scoped
 `GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled}`,
@@ -1926,7 +1928,7 @@ The same master flag gates the **model-listing owner overlay** and the dashboard
 rows that carry an account's models (§6.7); for a subscription account the
 subscriptions switch gates them too.
 
-A fourth system setting, `anthropic_prompt_caching_enabled` (bool, **off**,
+A further system setting, `anthropic_prompt_caching_enabled` (bool, **off**,
 experimental), is not part of the vendor-account policy but applies to its Anthropic
 targets: it lets the translate path place prompt-cache breakpoints. Like the first
 three it is read on the hot path through a TTL cache that is invalidated on a PUT

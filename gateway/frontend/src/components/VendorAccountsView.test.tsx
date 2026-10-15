@@ -353,6 +353,59 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getAllByText(t.vendorAccountSubscriptionsDisabledNotice)).toHaveLength(1);
       });
 
+      // The status column's filter matches what the cell shows: a blocked
+      // subscription account reads "Disabled", so the "Disabled" filter finds it
+      // and the "Active" filter does not (the stored status is still "active").
+      it('filters the status column on the displayed status of a blocked account', async () => {
+        renderView({
+          accounts: [
+            subscriptionAccount(),
+            makeVendorAccount({ id: 'va_plain_a', name: 'Plain Active' }),
+            makeVendorAccount({ id: 'va_plain_d', name: 'Plain Disabled', status: 'disabled' }),
+          ],
+          subscriptionsEnabled: false,
+        });
+
+        await screen.findByText('Plain Active');
+        fireEvent.click(screen.getByRole('button', { name: `${t.listFilter}: ${t.tableStatus}` }));
+
+        fireEvent.click(await screen.findByRole('checkbox', { name: t.statusDisabled }));
+        expect(screen.getByText('Team Claude Max')).toBeInTheDocument();
+        expect(screen.getByText('Plain Disabled')).toBeInTheDocument();
+        expect(screen.queryByText('Plain Active')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('checkbox', { name: t.statusDisabled }));
+        fireEvent.click(screen.getByRole('checkbox', { name: t.statusActive }));
+        expect(screen.getByText('Plain Active')).toBeInTheDocument();
+        expect(screen.queryByText('Team Claude Max')).not.toBeInTheDocument();
+        expect(screen.queryByText('Plain Disabled')).not.toBeInTheDocument();
+      });
+
+      // needs_reconnect is not "active", so the switch changes nothing about it:
+      // the reconnect hint stays visible (not masked as "Disabled") and the
+      // filter finds it under its own status.
+      it('keeps a blocked needs_reconnect account labelled and filterable as such', async () => {
+        renderView({
+          accounts: [
+            makeVendorAccount({ ...SUBSCRIPTION, status: 'needs_reconnect' }),
+            makeVendorAccount({ id: 'va_plain_a', name: 'Plain Active' }),
+          ],
+          subscriptionsEnabled: false,
+        });
+
+        await screen.findByText('Plain Active');
+        const row = screen.getByText('Team Claude Max').closest('tr')!;
+        expect(within(row).getByText(t.vendorAccountStatusNeedsReconnect)).toBeInTheDocument();
+        expect(within(row).queryByText(t.statusDisabled)).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: `${t.listFilter}: ${t.tableStatus}` }));
+        fireEvent.click(
+          await screen.findByRole('checkbox', { name: t.vendorAccountStatusNeedsReconnect }),
+        );
+        expect(screen.getByText('Team Claude Max')).toBeInTheDocument();
+        expect(screen.queryByText('Plain Active')).not.toBeInTheDocument();
+      });
+
       it('repeats the notice on the subscription account detail view', async () => {
         renderView({ accounts: [subscriptionAccount()], subscriptionsEnabled: false });
 

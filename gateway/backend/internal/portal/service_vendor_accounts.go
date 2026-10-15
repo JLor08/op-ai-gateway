@@ -427,15 +427,6 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 			return VendorAccountDTO{}, err
 		}
 	}
-	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
-	// created (an api_key one is unaffected). It sits AFTER the preset block on
-	// purpose: a preset vendor can never be a subscription and has already been
-	// answered with ErrVendorAccountAuthTypeInvalid (a 400) whatever the switch
-	// says, so only openai and anthropic reach this check. Checked before anything
-	// is built or stored, so a refusal persists nothing.
-	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
-		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
-	}
 	status := strings.TrimSpace(req.Status)
 	if status == "" {
 		status = routing.VendorAccountStatusActive
@@ -450,6 +441,17 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey != "" && authType != routing.VendorAuthAPIKey {
 		return VendorAccountDTO{}, ErrVendorAccountAPIKeyNotAllowed
+	}
+	// vendor_subscriptions_enabled: while off, a SUBSCRIPTION account cannot be
+	// created (an api_key one is unaffected). It is deliberately the LAST check,
+	// after every request validation, so it masks no other answer: a malformed
+	// create (bad status, bad model_prefix, a supplied api_key) keeps its specific
+	// 400, and the preset block above has already answered a preset vendor with
+	// ErrVendorAccountAuthTypeInvalid (a 400) whatever the switch says, so only a
+	// well-formed openai or anthropic subscription create reaches it. Checked
+	// before the key is sealed or anything is stored, so a refusal persists nothing.
+	if authType == routing.VendorAuthSubscription && !s.VendorSubscriptionsEnabled(ctx) {
+		return VendorAccountDTO{}, ErrVendorSubscriptionsDisabled
 	}
 	sealedKey, err := s.sealVendorAPIKey(apiKey)
 	if err != nil {

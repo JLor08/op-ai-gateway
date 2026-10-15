@@ -150,6 +150,12 @@ export function VendorAccountsView({
   // an api_key account never is.
   const subscriptionBlocked = (account: VendorAccount) =>
     !subscriptionsEnabled && account.auth_type === 'subscription';
+  // The status a row shows AND filters on: a blocked subscription account that is
+  // stored active reads disabled (it cannot be used until the switch is back on).
+  // A stored disabled or needs_reconnect status is kept as it is: needs_reconnect
+  // is system-managed and must not be masked, or its reconnect hint would vanish.
+  const effectiveStatus = (account: VendorAccount) =>
+    subscriptionBlocked(account) && account.status === 'active' ? 'disabled' : account.status;
 
   const [mode, setMode] = useState<Mode>('list');
   // The latest mode, for callbacks an async connect holds across renders: the
@@ -440,14 +446,14 @@ export function VendorAccountsView({
     {
       id: 'status',
       label: t.tableStatus,
-      value: (a) => a.status,
+      value: effectiveStatus,
       filter: 'enum',
       searchable: false,
       enumLabel: (v) => vendorStatusLabel(t, v),
-      // A blocked subscription account reads as disabled whatever its stored
-      // status: it cannot be used until the switch is turned back on.
+      // The cell and the filter share effectiveStatus, so filtering on "Disabled"
+      // finds exactly the rows labelled Disabled.
       render: (a) => {
-        const shown = subscriptionBlocked(a) ? 'disabled' : a.status;
+        const shown = effectiveStatus(a);
         return <StatusChip status={vendorStatusBadge(shown)} label={vendorStatusLabel(t, shown)} />;
       },
     },

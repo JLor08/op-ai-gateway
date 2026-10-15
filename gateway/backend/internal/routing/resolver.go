@@ -426,19 +426,19 @@ type Resolver struct {
 	groups            GroupResolver
 	warmer            ModelWarmer
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
-	// vendorEnabled / vendorRoutingMode gate and steer the per-user vendor-account
-	// branch (resolveVendorAccount). Both are injected by the gateway from a CACHED
-	// read of the vendor_accounts_enabled master flag and the
-	// vendor_account_routing_mode setting (SetVendorAccountAccessors). Both are
+	// vendorEnabled / vendorRoutingMode / vendorSubscriptionsAllowed gate and steer
+	// the per-user vendor-account branch (resolveVendorAccount). All three are
+	// injected by the gateway from a CACHED read of the vendor_accounts_enabled
+	// master flag, the vendor_account_routing_mode setting and the
+	// vendor_subscriptions_enabled switch (SetVendorAccountAccessors). Each is
 	// nil-safe: a nil vendorEnabled means the whole branch is OFF (the no-op
 	// invariant — a resolver built without these accessors is byte-identical to
 	// today), and a nil / unknown vendorRoutingMode means vendor_first.
 	vendorEnabled     func() bool
 	vendorRoutingMode func() string
-	// vendorSubscriptionsAllowed reports the vendor_subscriptions_enabled switch,
-	// injected the same way (a cached read). Unlike the two above it is default-ON
-	// and nil-safe in that direction: a nil accessor means subscription accounts
-	// are allowed (see subscriptionsAllowed).
+	// vendorSubscriptionsAllowed reports the vendor_subscriptions_enabled switch.
+	// Unlike vendorEnabled it is default-ON and nil-safe in that direction: a nil
+	// accessor means subscription accounts are allowed (see subscriptionsAllowed).
 	vendorSubscriptionsAllowed func() bool
 }
 

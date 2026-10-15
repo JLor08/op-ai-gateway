@@ -295,6 +295,41 @@ func TestCreateVendorAccountSubscriptionRefusedWhenSubscriptionsOff(t *testing.T
 	}
 }
 
+// The create-time gate sits AFTER the request validation (the docs promise "a
+// malformed request keeps its 400"): with the switch off, a subscription create
+// carrying an invalid status, an invalid model_prefix or a supplied api_key is
+// answered with that specific validation error, never the 409. A VALID
+// subscription create with the switch off is still the 409.
+func TestCreateVendorAccountSubscriptionGateRunsAfterRequestValidation(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newVendorAccountTestService(t, now)
+	ctx := context.Background()
+	setVendorSubscriptionsEnabled(t, svc, false)
+
+	for _, tc := range []struct {
+		label string
+		req   CreateVendorAccountRequest
+		want  error
+	}{
+		{"invalid status", CreateVendorAccountRequest{Status: "bogus"}, ErrVendorAccountStatusInvalid},
+		{"invalid model_prefix", CreateVendorAccountRequest{ModelPrefix: "bad prefix"}, ErrVendorAccountModelPrefixInvalid},
+		{"api_key on a subscription", CreateVendorAccountRequest{APIKey: "sk-not-allowed"}, ErrVendorAccountAPIKeyNotAllowed},
+		{"valid", CreateVendorAccountRequest{}, ErrVendorSubscriptionsDisabled},
+	} {
+		for _, vendor := range []string{routing.VendorOpenAI, routing.VendorAnthropic} {
+			req := tc.req
+			req.Vendor, req.AuthType, req.Name = vendor, routing.VendorAuthSubscription, "Sub "+vendor
+			_, err := svc.CreateVendorAccount(ctx, ownerToken(), req)
+			if !errors.Is(err, tc.want) {
+				t.Errorf("%s %s subscription create with the switch off: err = %v, want %v", tc.label, vendor, err, tc.want)
+			}
+		}
+	}
+	if rows, err := routeStore.VendorAccounts(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("rows after refused creates = %#v, %v, want none persisted", rows, err)
+	}
+}
+
 // The master flag keeps its precedence: with it off the refusal is still
 // ErrVendorAccountsDisabled, whatever the subscriptions setting says.
 func TestCreateVendorAccountMasterFlagOffStillWinsOverSubscriptionsGate(t *testing.T) {
