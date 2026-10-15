@@ -213,10 +213,10 @@ func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		if req.CertMeshRequireTLS != nil {
 			s.invalidateMeshRequireTLSCache()
 		}
-		// Drop the resolver's cached vendor-account flag/mode reads so a toggle of
-		// the master flag, the subscriptions switch or the routing mode takes effect
-		// on the very next resolve rather than after vendorSettingsCacheTTL.
-		if req.VendorAccountsEnabled != nil || req.VendorSubscriptionsEnabled != nil || req.VendorAccountRoutingMode != nil {
+		// Drop the cached vendor-account flag/mode reads so a toggle of the master
+		// flag, the subscriptions switch, the sharing switch or the routing mode
+		// takes effect on the very next read rather than after vendorSettingsCacheTTL.
+		if req.VendorAccountsEnabled != nil || req.VendorSubscriptionsEnabled != nil || req.VendorAccountSharingEnabled != nil || req.VendorAccountRoutingMode != nil {
 			s.invalidateVendorSettingsCache()
 		}
 		// Same for the Anthropic prompt-caching flag the dispatch policy reads.

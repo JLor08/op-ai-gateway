@@ -2496,6 +2496,12 @@ func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 stri
 	return _d.API.VendorAccountRoutingMode(ctx)
 }
 
+func (_d *APIWithTracing) VendorAccountSharingEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountSharingEnabled")
+	defer span.End()
+	return _d.API.VendorAccountSharingEnabled(ctx)
+}
+
 func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsEnabled")
 	defer span.End()

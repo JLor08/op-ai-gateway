@@ -243,6 +243,7 @@ type API interface {
 	UserPreferences(context.Context, string) (map[string]json.RawMessage, error)
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
 	VendorAccountRoutingMode(context.Context) string
+	VendorAccountSharingEnabled(context.Context) bool
 	VendorAccountsEnabled(context.Context) bool
 	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)

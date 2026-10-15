@@ -627,6 +627,11 @@ type Server struct {
 	// the resolver's third injected accessor reads; invalidateVendorSettingsCache
 	// drops it after a PUT that carried the switch.
 	vendorSubscriptionsEnabledCache settingCache[bool]
+	// vendorAccountSharingEnabledCache is the same kind of cache for the
+	// vendor_account_sharing_enabled switch (sharing a vendor account with a
+	// resource group; default OFF, so its accessor fails closed);
+	// invalidateVendorSettingsCache drops it after a PUT that carried the switch.
+	vendorAccountSharingEnabledCache settingCache[bool]
 	// anthropicPromptCachingCache is the TTL cache (settingCache, invalidatable
 	// mode) behind anthropicPromptCachingEnabledCached, so the Anthropic
 	// prompt-cache policy (applyAnthropicCachePolicy) does not issue a

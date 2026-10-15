@@ -944,6 +944,11 @@ type SystemSettingsDTO struct {
 	// account is refused with 409 vendor_accounts.subscriptions_disabled and the
 	// existing ones stop routing and stop being advertised (nothing is deleted).
 	VendorSubscriptionsEnabled bool `json:"vendor_subscriptions_enabled"`
+	// VendorAccountSharingEnabled is the vendor_account_sharing_enabled master
+	// switch for sharing a vendor account with a resource group; default false
+	// (opt-in, fail-closed). Sharing stays unavailable until a system admin
+	// enables it.
+	VendorAccountSharingEnabled bool `json:"vendor_account_sharing_enabled"`
 	// AnthropicPromptCachingEnabled is the anthropic_prompt_caching_enabled
 	// MASTER flag for prompt caching on the Anthropic translate path; default
 	// false (opt-in). While off no cache_control breakpoints are placed.
@@ -1125,6 +1130,8 @@ type UpdateSystemSettingsRequest struct {
 	VendorAccountRoutingMode *string `json:"vendor_account_routing_mode"`
 	// VendorSubscriptionsEnabled: nil = keep the stored value (a plain boolean).
 	VendorSubscriptionsEnabled *bool `json:"vendor_subscriptions_enabled"`
+	// VendorAccountSharingEnabled: nil = keep the stored value (a plain boolean).
+	VendorAccountSharingEnabled *bool `json:"vendor_account_sharing_enabled"`
 	// AnthropicPromptCachingEnabled: nil = keep the stored value.
 	AnthropicPromptCachingEnabled *bool `json:"anthropic_prompt_caching_enabled"`
 	// VendorOpenAICodexClientVersion: nil = keep the stored value. Trimmed; blank
@@ -1651,8 +1658,9 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 
 		RouteAffinitySessionMode: s.RouteAffinitySessionMode(ctx),
 
-		// The vendor-accounts flag is off (zero value), the subscriptions switch is
-		// on, and the routing mode is the default when the store is absent/unreadable.
+		// The vendor-accounts flag and the sharing switch are off (zero value), the
+		// subscriptions switch is on, and the routing mode is the default when the
+		// store is absent/unreadable.
 		VendorSubscriptionsEnabled:     true,
 		VendorAccountRoutingMode:       DefaultVendorAccountRoutingMode,
 		VendorOpenAICodexClientVersion: DefaultVendorOpenAICodexClientVersion,
@@ -1665,6 +1673,7 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 		if values, err := s.settings.SystemSettings(ctx); err == nil {
 			dto.VendorAccountsEnabled = VendorAccountsEnabled(values)
 			dto.VendorSubscriptionsEnabled = VendorSubscriptionsEnabled(values)
+			dto.VendorAccountSharingEnabled = VendorAccountSharingEnabled(values)
 			dto.AnthropicPromptCachingEnabled = AnthropicPromptCachingEnabled(values)
 			dto.VendorAccountRoutingMode = VendorAccountRoutingMode(values)
 			dto.VendorOpenAICodexClientVersion = VendorOpenAICodexClientVersion(values)
@@ -1856,6 +1865,9 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 	}
 	if req.VendorSubscriptionsEnabled != nil {
 		writes = append(writes, settingWrite{vendorSubscriptionsEnabledKey, strconv.FormatBool(*req.VendorSubscriptionsEnabled)})
+	}
+	if req.VendorAccountSharingEnabled != nil {
+		writes = append(writes, settingWrite{vendorAccountSharingEnabledKey, strconv.FormatBool(*req.VendorAccountSharingEnabled)})
 	}
 	if req.AnthropicPromptCachingEnabled != nil {
 		writes = append(writes, settingWrite{anthropicPromptCachingEnabledKey, strconv.FormatBool(*req.AnthropicPromptCachingEnabled)})
