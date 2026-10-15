@@ -508,6 +508,109 @@ func testTokenClaudeModelAliasesRoundTrip(t *testing.T, s *SQLStore) {
 	}
 }
 
+// TestConformanceTokenClaudeEffortCompatibilityRoundTrip proves the opt-in
+// api_tokens.claude_effort_compatibility flag (#230) is carried by the whole
+// token path on both dialects, so the Postgres leg exercises the widened
+// INSERT/SELECT/UPDATE lock-step and not only the SQLite one: written by
+// CreatePlainToken, read back by TokenByID, TokensByUser and the request-time
+// LookupBearer (which assembles the auth.Token the effort-delivery path
+// reads), and rewritten in BOTH directions by UpdateTokenMetadata. A token
+// created without the field must read false everywhere -- the flag defaults
+// off, and "off" has to be the stored value, not merely the Go zero value a
+// dropped column would also produce. The flag is independent of
+// claude_model_aliases, which both tokens leave off here.
+func TestConformanceTokenClaudeEffortCompatibilityRoundTrip(t *testing.T) {
+	forEachDialect(t, testTokenClaudeEffortCompatibilityRoundTrip)
+}
+
+func testTokenClaudeEffortCompatibilityRoundTrip(t *testing.T, s *SQLStore) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateUser(ctx, newTestUser("usr_cec", "cec@example.test", now)); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	on := TokenRecord{ID: "tok_cec_on", UserID: "usr_cec", Name: "on", CreatedAt: now, UpdatedAt: now, ClaudeEffortCompatibility: true}
+	off := TokenRecord{ID: "tok_cec_off", UserID: "usr_cec", Name: "off", CreatedAt: now, UpdatedAt: now}
+	if err := s.CreatePlainToken(ctx, on, "cec-on-secret"); err != nil {
+		t.Fatalf("CreatePlainToken(on): %v", err)
+	}
+	if err := s.CreatePlainToken(ctx, off, "cec-off-secret"); err != nil {
+		t.Fatalf("CreatePlainToken(off): %v", err)
+	}
+
+	gotOn, err := s.TokenByID(ctx, "tok_cec_on")
+	if err != nil {
+		t.Fatalf("TokenByID(on): %v", err)
+	}
+	if !gotOn.ClaudeEffortCompatibility {
+		t.Fatalf("claude_effort_compatibility did not round-trip through TokenByID: %+v", gotOn)
+	}
+	if gotOn.ClaudeModelAliases {
+		t.Fatalf("claude_effort_compatibility leaked into claude_model_aliases: %+v", gotOn)
+	}
+	gotOff, err := s.TokenByID(ctx, "tok_cec_off")
+	if err != nil {
+		t.Fatalf("TokenByID(off): %v", err)
+	}
+	if gotOff.ClaudeEffortCompatibility {
+		t.Fatalf("a token created without the flag reads true: %+v", gotOff)
+	}
+
+	byUser, err := s.TokensByUser(ctx, "usr_cec")
+	if err != nil {
+		t.Fatalf("TokensByUser: %v", err)
+	}
+	listed := map[string]bool{}
+	for _, rec := range byUser {
+		listed[rec.ID] = rec.ClaudeEffortCompatibility
+	}
+	if len(listed) != 2 || !listed["tok_cec_on"] || listed["tok_cec_off"] {
+		t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
+	}
+
+	// The request path: LookupBearer hands the effort-delivery path an auth.Token.
+	bearerOn, ok := s.LookupBearer("Bearer cec-on-secret")
+	if !ok || !bearerOn.ClaudeEffortCompatibility {
+		t.Fatalf("LookupBearer(on) ok=%v ClaudeEffortCompatibility=%v, want true", ok, bearerOn.ClaudeEffortCompatibility)
+	}
+	if bearerOn.ClaudeModelAliases {
+		t.Fatalf("LookupBearer(on) leaked ClaudeEffortCompatibility into ClaudeModelAliases")
+	}
+	bearerOff, ok := s.LookupBearer("Bearer cec-off-secret")
+	if !ok || bearerOff.ClaudeEffortCompatibility {
+		t.Fatalf("LookupBearer(off) ok=%v ClaudeEffortCompatibility=%v, want false", ok, bearerOff.ClaudeEffortCompatibility)
+	}
+
+	// UpdateTokenMetadata rewrites the flag in both directions.
+	gotOn.ClaudeEffortCompatibility = false
+	gotOn.UpdatedAt = now.Add(time.Minute)
+	if err := s.UpdateTokenMetadata(ctx, gotOn); err != nil {
+		t.Fatalf("UpdateTokenMetadata(on->off): %v", err)
+	}
+	gotOff.ClaudeEffortCompatibility = true
+	gotOff.UpdatedAt = now.Add(time.Minute)
+	if err := s.UpdateTokenMetadata(ctx, gotOff); err != nil {
+		t.Fatalf("UpdateTokenMetadata(off->on): %v", err)
+	}
+	afterOn, err := s.TokenByID(ctx, "tok_cec_on")
+	if err != nil || afterOn.ClaudeEffortCompatibility {
+		t.Fatalf("after on->off: err=%v ClaudeEffortCompatibility=%v, want false", err, afterOn.ClaudeEffortCompatibility)
+	}
+	afterOff, err := s.TokenByID(ctx, "tok_cec_off")
+	if err != nil || !afterOff.ClaudeEffortCompatibility {
+		t.Fatalf("after off->on: err=%v ClaudeEffortCompatibility=%v, want true", err, afterOff.ClaudeEffortCompatibility)
+	}
+	bearerOn, ok = s.LookupBearer("Bearer cec-on-secret")
+	if !ok || bearerOn.ClaudeEffortCompatibility {
+		t.Fatalf("LookupBearer(on->off) ok=%v ClaudeEffortCompatibility=%v, want false", ok, bearerOn.ClaudeEffortCompatibility)
+	}
+	bearerOff, ok = s.LookupBearer("Bearer cec-off-secret")
+	if !ok || !bearerOff.ClaudeEffortCompatibility {
+		t.Fatalf("LookupBearer(off->on) ok=%v ClaudeEffortCompatibility=%v, want true", ok, bearerOff.ClaudeEffortCompatibility)
+	}
+}
+
 // TestConformanceTokenVendorProviderAccessUpdateAndLookup proves
 // api_tokens.vendor_provider_access is rewritten by UpdateTokenMetadata (it is
 // user-editable, unlike last_used_model) and decoded onto the auth.Token that
@@ -6133,6 +6236,10 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		// ...and v88's per-token Claude model aliases opt-in.
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column claude_model_aliases integer not null default 0`); err != nil {
 			t.Fatalf("reapply api_tokens.claude_model_aliases after migration40RawUp: %v", err)
+		}
+		// ...and v89's per-token Claude Code effort compatibility opt-in.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column claude_effort_compatibility integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.claude_effort_compatibility after migration40RawUp: %v", err)
 		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW

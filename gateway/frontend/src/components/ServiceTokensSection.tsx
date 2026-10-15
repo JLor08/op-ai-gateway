@@ -121,6 +121,8 @@ export function ServiceTokensSection({
   const [tokenUnknownFallback, setTokenUnknownFallback] = useState('');
   // Opt-in Claude-compatible model aliases — see TokenList.
   const [tokenClaudeAliases, setTokenClaudeAliases] = useState(false);
+  // Opt-in Claude Code effort compatibility — see TokenList.
+  const [tokenClaudeEffort, setTokenClaudeEffort] = useState(false);
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -139,6 +141,7 @@ export function ServiceTokensSection({
     setTokenUnknownRedirectBlocked(false);
     setTokenUnknownFallback('');
     setTokenClaudeAliases(false);
+    setTokenClaudeEffort(false);
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
     setTokenFormOpen(true);
@@ -159,6 +162,7 @@ export function ServiceTokensSection({
         unknown_model_redirect_blocked: tokenUnknownRedirectBlocked,
         unknown_model_fallback: tokenUnknownFallback,
         claude_model_aliases: tokenClaudeAliases,
+        claude_effort_compatibility: tokenClaudeEffort,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
       });
@@ -430,6 +434,20 @@ export function ServiceTokensSection({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenClaudeAliasesHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenClaudeEffort}
+                    onChange={(e) => setTokenClaudeEffort(e.target.checked)}
+                  />
+                }
+                label={t.tokenClaudeEffort}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenClaudeEffortHint}
               </Typography>
             </Box>
             <FormControlLabel

@@ -156,6 +156,10 @@ type ServiceTokenDTO struct {
 	// identical in meaning to TokenDTO's — see there. Settable on create only: a
 	// service token has no field-level update.
 	ClaudeModelAliases bool `json:"claude_model_aliases"`
+	// ClaudeEffortCompatibility opts the token into Claude Code effort
+	// compatibility, identical in meaning to TokenDTO's — see there. Settable on
+	// create only, like ClaudeModelAliases.
+	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
 }
 
 // CreateServiceTokenRequest is CreateServiceToken's body (§6.3): scopes are
@@ -178,6 +182,9 @@ type CreateServiceTokenRequest struct {
 	// ClaudeModelAliases opts the new token into the Claude-compatible model
 	// aliases (see TokenDTO). Off when omitted.
 	ClaudeModelAliases bool `json:"claude_model_aliases"`
+	// ClaudeEffortCompatibility opts the new token into Claude Code effort
+	// compatibility (see TokenDTO). Off when omitted.
+	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -693,6 +700,16 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): a delegate reaching this endpoint with an
+	// inference-only BEARER may not mint a token with the opt-in; the same
+	// delegate through a portal session, or an admin-scope bearer, may. Checked
+	// after the object gate, so a principal with no access to the service still
+	// gets the same not-found as without the flag (no existence leak), and
+	// before anything is looked up or written.
+	if req.ClaudeEffortCompatibility && !principalMayManageTokenSetting(principal) {
+		return CreateServiceTokenResponse{}, ErrPrincipalForbidden
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return CreateServiceTokenResponse{}, ErrServiceValidation
@@ -768,6 +785,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
 		ClaudeModelAliases:          req.ClaudeModelAliases,
+		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateServiceTokenResponse{}, err
@@ -1076,6 +1094,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		UnknownModelRedirectBlocked: record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:        record.UnknownModelFallback,
 		ClaudeModelAliases:          record.ClaudeModelAliases,
+		ClaudeEffortCompatibility:   record.ClaudeEffortCompatibility,
 	}
 }
 

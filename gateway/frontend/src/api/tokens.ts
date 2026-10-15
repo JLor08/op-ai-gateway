@@ -75,6 +75,12 @@ export type PortalToken = {
   // inference additionally offer neutral anthropic-local-… aliases of the
   // models this token may use (the originals stay available).
   claude_model_aliases?: boolean;
+  // Opt-in Claude Code reasoning-effort compatibility: when true, the effort
+  // Claude Code selects is delivered to chat-template-driven local backends
+  // (Qwen on llama.cpp/vLLM) as chat_template_kwargs.reasoning_effort. Changing
+  // it is a management operation on the server (portal session or admin
+  // bearer), unlike claude_model_aliases.
+  claude_effort_compatibility?: boolean;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -108,6 +114,8 @@ export type CreateTokenRequest = {
   unknown_model_fallback?: string;
   // Claude-compatible model aliases (see PortalToken); omitted = off.
   claude_model_aliases?: boolean;
+  // Claude Code effort compatibility (see PortalToken); omitted = off.
+  claude_effort_compatibility?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -140,6 +148,9 @@ export type UpdateTokenRequest = {
   // Claude-compatible model aliases (see PortalToken). Omitted = keep the
   // current value.
   claude_model_aliases?: boolean;
+  // Claude Code effort compatibility (see PortalToken). Omitted = keep the
+  // current value.
+  claude_effort_compatibility?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;

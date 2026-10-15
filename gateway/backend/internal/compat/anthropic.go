@@ -21,6 +21,37 @@ type anthropicMessagesRequest struct {
 	Stream        bool                 `json:"stream"`
 	Temperature   *float64             `json:"temperature"`
 	StopSequences []string             `json:"stop_sequences"`
+	// OutputConfig is kept RAW and sub-decoded only when the effort switch is on
+	// (see outputConfigEffort): a typed field here would make json.Unmarshal of
+	// the whole body fail on a malformed output_config even with the switch off,
+	// newly rejecting requests the parser has always accepted.
+	OutputConfig json.RawMessage `json:"output_config"`
+}
+
+// outputConfig is the part of Anthropic's `output_config` the effort switch
+// reads. Effort is a pointer so absent and null are distinguishable from a
+// value, and a non-string value makes the decode fail.
+type outputConfig struct {
+	Effort *string `json:"effort"`
+}
+
+// outputConfigEffort extracts the trimmed `output_config.effort` from the raw
+// field (empty when absent, null or blank). The value is passed on verbatim, with
+// no enum check: the upstream decides which levels it knows. A body whose
+// output_config is not an object, or whose effort is not a string, is an invalid
+// request. Called only when the effort switch is on.
+func outputConfigEffort(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var cfg outputConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return "", &inference.Error{Code: "messages.invalid_output_config", Message: "output_config must be an object whose effort, when present, is a string"}
+	}
+	if cfg.Effort == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*cfg.Effort), nil
 }
 
 type anthropicMessage struct {
@@ -48,12 +79,36 @@ type anthropicToolChoice struct {
 // is TOLERANT of block types it does not model (image, thinking, …): those are
 // skipped, never rejected, so an evolving client is never blocked.
 func ParseAnthropicMessages(raw []byte) (inference.Request, error) {
+	return ParseAnthropicMessagesWithOptions(raw, ParseAnthropicOptions{})
+}
+
+// ParseAnthropicOptions are the per-request switches of the Messages parser. The
+// zero value is today's behavior exactly.
+type ParseAnthropicOptions struct {
+	// EffortTranslationEnabled, set from the token's Claude-effort-compatibility
+	// flag, makes the parser read `output_config.effort` into
+	// inference.Request.ReasoningEffort and reject a non-string effort. When false
+	// `output_config` is not inspected at all, so a request carrying one -- even
+	// a malformed one -- parses exactly as it did before the feature existed.
+	EffortTranslationEnabled bool
+}
+
+// ParseAnthropicMessagesWithOptions is ParseAnthropicMessages with opts; see
+// ParseAnthropicOptions and outputConfigEffort for what the effort switch adds.
+func ParseAnthropicMessagesWithOptions(raw []byte, opts ParseAnthropicOptions) (inference.Request, error) {
 	var input anthropicMessagesRequest
 	if err := json.Unmarshal(raw, &input); err != nil {
 		return inference.Request{}, err
 	}
 	if len(input.Messages) == 0 {
 		return inference.Request{}, &inference.Error{Code: "request.messages_required", Message: "at least one message is required"}
+	}
+	var effort string
+	if opts.EffortTranslationEnabled {
+		var err error
+		if effort, err = outputConfigEffort(input.OutputConfig); err != nil {
+			return inference.Request{}, err
+		}
 	}
 
 	messages := make([]inference.Message, 0, len(input.Messages)+1)
@@ -79,6 +134,8 @@ func ParseAnthropicMessages(raw []byte) (inference.Request, error) {
 		Stream:      input.Stream,
 		Temperature: input.Temperature,
 		Stop:        input.StopSequences,
+		// ReasoningEffort stays empty unless the effort switch was on.
+		ReasoningEffort: effort,
 	}
 	for _, tool := range input.Tools {
 		if strings.TrimSpace(tool.Name) == "" {

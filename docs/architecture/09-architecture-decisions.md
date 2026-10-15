@@ -582,7 +582,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -638,7 +638,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -807,7 +807,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -992,7 +992,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1207,7 +1207,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-88-migrations),
+[§4](reference/data-model.md#4-migration-history-89-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1433,7 +1433,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-88-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-89-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1558,7 +1558,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-88-migrations),
+[§4](reference/data-model.md#4-migration-history-89-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3477,7 +3477,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-88-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-89-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3684,7 +3684,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-88-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-89-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4681,5 +4681,131 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
+
+## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
+
+**Context:** Claude Code states its reasoning effort (`/effort low|medium|xhigh`)
+as `output_config.effort` on every Messages request. A local Qwen served by
+llama.cpp or vLLM ignores it: Qwen's chat template, including the fixed one
+this deployment runs (`froggeric/Qwen-Fixed-Chat-Templates`), reads effort only
+from the jinja variable `reasoning_effort`, which the server fills from
+`chat_template_kwargs`, and llama.cpp's Anthropic-to-OpenAI converter at the
+pinned build (`08698c81`) drops both `output_config.effort` and a top-level
+`reasoning_effort`. Issue #230 asked for a per-token opt-in that makes the
+picked level reach the template, on native passthrough and on translation,
+without touching any other backend. Each decision below has a cheaper obvious
+answer that is wrong in a way no happy-path test would catch.
+
+**(a) One mechanism, on both paths: `chat_template_kwargs.reasoning_effort`.**
+It is the only field that reaches Qwen's template on every backend and build
+the gateway targets, so it is the one lever on both paths: a value-lossless
+body edit on the native relay and a provider emission on the translate path. The
+translate path also keeps sending the top-level `reasoning_effort`, which is
+harmless and enough for llama.cpp and the newest vLLM, but it is not the lever
+because a released vLLM needs the kwargs.
+
+**(b) Scope is llama.cpp and vLLM, selected by the resolved target's effective
+kind.** `targetUsesChatTemplateKwargs` reads `Target.Provider`, or
+`Target.LiveProgressSpecType` when the provider is the literal `server_agent`,
+and accepts exactly `llama_cpp` and `vllm`: direct and agent-managed alike. It
+follows the `wantsResponsesLiveTimings` precedent and is never inferred from an
+alias name, a model family or the presence of `/v1/messages`. It excludes
+`llama_swap` (it proxies to an arbitrary downstream), Ollama, generic
+OpenAI-compatible applications, native Anthropic and vendor accounts. It is a
+separate predicate from `routing.LiveTimingsCapableKind`, whose membership only
+coincides with it today, and a cross-vocabulary test pins that
+`RuntimeSpecTypeLlamaCpp` and `RuntimeSpecTypeVLLM` spell the same strings as
+`ProviderLlamaCPP` and `ProviderVLLM`.
+
+**(c) The effort is forwarded verbatim.** It is a trimmed JSON string passed on
+by name, with no enum and no `high`-to-`xhigh` mapping: the template aliases
+names itself, and a mapping would be the gateway guessing about a template it
+cannot see. A missing, `null` or blank effort injects nothing and invents no
+default.
+
+**(d) The native edit is a third, separate edit, and the only one that can
+reject.** `proxyNative`'s edits are the model rewrite, llama.cpp's
+`timings_per_token` and this one, each in its own step and each returning a
+**fresh** slice, so the client's bytes (`rel.raw`), which the payload capture
+reads after dispatch, are never written to. It runs only when the token opted
+in, the target is capable and the request is the Anthropic Messages flavor, so
+any other request is not even inspected. A malformed effort, a non-object
+`chat_template_kwargs` or a `chat_template_kwargs.reasoning_effort` that
+conflicts is `400 messages.invalid_output_config`, because the alternative is
+to overwrite or drop a value the client sent. A JSON `null` kwargs is read as
+absent, as `effort: null` is, so the two sibling nulls are not read opposite
+ways. The rejection uses `writeJSONCaptured` and `recordUsage`, like the
+endpoint-disabled refusal and unlike `writeRequestError`, so an operator can see
+it in Activity and Logs.
+
+**(e) The translate request stays provider-neutral, and the effort is cleared
+off scope.** The parser takes a bool option (`ParseAnthropicMessagesWithOptions`)
+and never token storage, and reads `output_config.effort` into the neutral
+`ReasoningEffort` only when it is on; with it off `output_config` is not
+inspected, so no request is newly rejected. A policy step after resolution
+(`applyChatTemplateEffortPolicy`, the shape of `applyAnthropicCachePolicy`) works
+on the upstream copy: for a capable target it sets the internal directive
+`ReasoningEffortViaTemplateKwargs` (`json:"-"`), and for **any other** target it
+**clears** the effort. That clearing is the decision that is easy to omit,
+because the field is only ever filled by this feature on this path, and leaving
+it would leak the setting off its scope: a top-level `reasoning_effort` to a
+generic or vendor OpenAI-compatible target, a `thinkingConfig` to Gemini, an
+overridden default to an OpenAI Responses target. A direct OpenAI request that
+sets its own effort is exempt, because the policy acts only on the Anthropic
+Messages flavor.
+
+**(f) Setting it is management-only, enforced in the service layer, and distinct
+from the alias flag.** The token routes are gated by `requireWebScope(gateway:use)`,
+which every user bearer carries, so an inference-only bearer could otherwise
+turn on, or off, a switch that changes what the gateway sends upstream, for its
+own token. `principalMayManageTokenSetting` (`owner.ID == "" || isAdmin(owner)`)
+allows a portal session, whose principal has an empty token id, and an
+admin-scope bearer, and nothing else, on `CreateToken` (only when enabling),
+`UpdateToken` (any present value) and `CreateServiceToken` (when enabling),
+before anything is applied. The refusal is `403 portal.principal_forbidden`, which
+makes the sentinel HTTP-reachable for the first time: the create handler needed
+its own error-ladder row, or the refusal would have been a 500. `claude_model_aliases`
+keeps its non-gated behavior, since it changes a name and not what is sent
+upstream.
+
+**(g) It is its own flag and its own column (migration 89).** `integer not null
+default 0` through `addColumnIfMissing`, the shape of migration 88, so the default
+backfills every token to off. It is independent of `claude_model_aliases`:
+enabling one never enables the other, and an alias-less token can use it.
+
+**Consequence.** A token without the setting pays one boolean test on the native
+path and the parser's option check; a flag-off request, whatever its
+`output_config`, behaves exactly as before. An opted-in request to a capable
+native target pays one JSON decode of the body to find the effort (a re-marshal
+only when it adds the kwarg), and the re-serialized body is value-identical, not
+byte-identical. The feature depends on what the deployed template and build do
+with the value: a template that reads only `low`, `medium` and `high` would see a
+raw `xhigh`, and a later llama.cpp that maps `output_config.effort` itself would
+make the native edit redundant, so a smoke test that the template consumes the
+injected value is the check to run.
+
+**Rejected:** **A top-level `reasoning_effort` only** — llama.cpp's Messages
+converter drops it and a released vLLM does not read it. — **Relying on
+`output_config` passing through** — no template reads it. — **A llama.cpp-only
+selector** — vLLM serves the same template and needs the same value. — **An enum
+or `high`-to-`xhigh` remap in the gateway** — it second-guesses a template it
+cannot see. — **Selecting by alias name, model family or endpoint** — none of
+them says what serves the request. — **Leaving the effort on a non-capable
+translate target** — it leaks as a top-level field, a Gemini `thinkingConfig` or
+a Responses effort. — **Always validating `output_config`** — a flag-off token
+would be newly rejected for a field it has always been free to send.
+— **Silently overwriting a conflicting `reasoning_effort` or a non-object
+`chat_template_kwargs`** — it discards what the client chose. — **Gating the
+setting on the HTTP scope only** — an inference-only bearer holds it. — **Gating
+it on the alias flag, or folding both into one setting** — they are independent
+decisions with different authority.
+
+→ [API Compatibility & Inference
+§9.2](cross-cutting/compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility),
+[Security, Authentication & Authorization
+§4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
+[Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
+[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).

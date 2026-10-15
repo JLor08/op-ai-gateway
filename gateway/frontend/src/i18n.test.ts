@@ -470,6 +470,18 @@ describe('Claude model aliases i18n keys', () => {
   });
 });
 
+describe('Claude Code effort compatibility i18n keys', () => {
+  it('defines the token toggle label and helper text in de and en', () => {
+    const keys = ['tokenClaudeEffort', 'tokenClaudeEffortHint'] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('configurable-root vendor i18n keys', () => {
   it('defines the provider labels, base-URL strings and base-URL errors in de and en', () => {
     const keys = [

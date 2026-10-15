@@ -1114,6 +1114,13 @@ type TokenDTO struct {
 	// anthropic-local-<hash> ids. Plain opt-in flag, off by default; always
 	// emitted so a client reading a token and writing it back preserves it.
 	ClaudeModelAliases bool `json:"claude_model_aliases"`
+	// ClaudeEffortCompatibility opts the token into Claude Code effort
+	// compatibility: an Anthropic-style output_config.effort is forwarded to a
+	// llama.cpp/vLLM target as chat_template_kwargs.reasoning_effort. A separate
+	// switch from ClaudeModelAliases (enabling one never enables the other).
+	// Plain opt-in flag, off by default; always emitted so a client reading a
+	// token and writing it back preserves it.
+	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1177,6 +1184,9 @@ type CreateTokenRequest struct {
 	// ClaudeModelAliases opts the token into the Claude-compatible model aliases
 	// (see TokenDTO). Off when omitted.
 	ClaudeModelAliases bool `json:"claude_model_aliases"`
+	// ClaudeEffortCompatibility opts the token into Claude Code effort
+	// compatibility (see TokenDTO). Off when omitted.
+	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
 }
 
 type CreateTokenResponse struct {
@@ -1216,6 +1226,9 @@ type UpdateTokenRequest struct {
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 	// ClaudeModelAliases: nil = keep the stored flag, a non-nil value replaces it.
 	ClaudeModelAliases *bool `json:"claude_model_aliases,omitempty"`
+	// ClaudeEffortCompatibility: nil = keep the stored flag, a non-nil value
+	// replaces it.
+	ClaudeEffortCompatibility *bool `json:"claude_effort_compatibility,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1617,6 +1630,13 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 }
 
 func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateTokenRequest) (CreateTokenResponse, error) {
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): creating a token WITH the opt-in is
+	// refused to an inference-only bearer. Checked first, before any lookup or
+	// the record is assembled, so a refused request has no side effect at all.
+	if req.ClaudeEffortCompatibility && !principalMayManageTokenSetting(owner) {
+		return CreateTokenResponse{}, ErrPrincipalForbidden
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return CreateTokenResponse{}, ErrTokenNameRequired
@@ -1688,6 +1708,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		UnknownModelFallback:        fallback,
 		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
 		ClaudeModelAliases:          req.ClaudeModelAliases,
+		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1707,6 +1728,17 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	record, err := s.tokens.TokenByID(ctx, tokenID)
 	if err != nil || record.UserID != owner.UserID {
 		return TokenDTO{}, ErrTokenNotFound
+	}
+	// claude_effort_compatibility is a management setting (see
+	// principalMayManageTokenSetting): ANY change to it — on or off, on this
+	// token or a sibling, including a token editing itself — is refused to an
+	// inference-only bearer. Ownership is checked first so a foreign token id
+	// is still a plain not-found. The whole request is rejected here, before
+	// the first field is applied: the record is mutated in memory below and
+	// persisted once at the end, so nothing — this flag or any other field in
+	// the same request — can be half-written on a refusal.
+	if req.ClaudeEffortCompatibility != nil && !principalMayManageTokenSetting(owner) {
+		return TokenDTO{}, ErrPrincipalForbidden
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -1779,6 +1811,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.ClaudeModelAliases != nil {
 		record.ClaudeModelAliases = *req.ClaudeModelAliases
+	}
+	if req.ClaudeEffortCompatibility != nil {
+		record.ClaudeEffortCompatibility = *req.ClaudeEffortCompatibility
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -4821,6 +4856,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
+		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -4857,6 +4893,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
 		ClaudeModelAliases:             record.ClaudeModelAliases,
+		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 	}
 }
 

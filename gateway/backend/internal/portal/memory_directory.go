@@ -156,6 +156,7 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		UnknownModelFallback:           token.UnknownModelFallback,
 		VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 		ClaudeModelAliases:             token.ClaudeModelAliases,
+		ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 	}, secret)
 	return nil
 }
@@ -214,6 +215,7 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			UnknownModelFallback:           token.UnknownModelFallback,
 			VendorAccess:                   store.DecodeVendorAccess(token.VendorProviderAccess),
 			ClaudeModelAliases:             token.ClaudeModelAliases,
+			ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 		})
 	}
 	return nil
@@ -302,6 +304,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.UnknownModelFallback = token.UnknownModelFallback
 	existing.VendorProviderAccess = token.VendorProviderAccess
 	existing.ClaudeModelAliases = token.ClaudeModelAliases
+	existing.ClaudeEffortCompatibility = token.ClaudeEffortCompatibility
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -331,6 +334,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		UnknownModelFallback:           existing.UnknownModelFallback,
 		VendorAccess:                   store.DecodeVendorAccess(existing.VendorProviderAccess),
 		ClaudeModelAliases:             existing.ClaudeModelAliases,
+		ClaudeEffortCompatibility:      existing.ClaudeEffortCompatibility,
 	})
 	return nil
 }

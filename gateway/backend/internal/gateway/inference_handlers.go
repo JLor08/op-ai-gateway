@@ -189,7 +189,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	req, err := compat.ParseAnthropicMessages(raw)
+	// The token's Claude-effort-compatibility flag is the only thing that makes
+	// the parser read output_config.effort (translate path); with it off the body
+	// parses exactly as before, whatever output_config carries.
+	req, err := compat.ParseAnthropicMessagesWithOptions(raw, compat.ParseAnthropicOptions{EffortTranslationEnabled: token.ClaudeEffortCompatibility})
 	if err != nil {
 		slog.Warn("inference request rejected: invalid body", "path", r.URL.Path, "api_flavor", "anthropic_messages", "err", err,
 			"hint", "for a Claude Code client, enable native passthrough (Claude Code) on the application serving this model; set log level to debug to see why passthrough did not apply")

@@ -107,10 +107,19 @@ paths:
         Bearer-only, scope `gateway:use` or `llm:invoke`. Native passthrough
         when the target application supports it — the only path where
         Anthropic streaming works end-to-end. Alias: /anthropic/v1/messages.
+        A token with the claude_effort_compatibility setting additionally has
+        the request's `output_config.effort` delivered to a llama.cpp or vLLM
+        target as `chat_template_kwargs.reasoning_effort` (on native
+        passthrough and on translation alike; the value is forwarded
+        verbatim). On that opted-in route a non-string effort, a
+        non-object `chat_template_kwargs` or a `chat_template_kwargs.reasoning_effort`
+        that conflicts with the effort is a 400 `messages.invalid_output_config`;
+        a token without the setting is never rejected for `output_config`.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /anthropic/v1/messages:
     post:
@@ -120,6 +129,7 @@ paths:
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/images/generations:
     post:
@@ -493,7 +503,15 @@ paths:
       carries the opt-in claude_model_aliases flag (default false, always
       present on a read): when true, its eligible local models and groups are
       additionally listed and resolved under generated `anthropic-local-<hash>`
-      ids (see the OriginalModelId schema and api-surface.md).
+      ids (see the OriginalModelId schema and api-surface.md). A token also
+      carries the opt-in claude_effort_compatibility flag (default false,
+      always present on a read): when true, Claude Code's output_config.effort
+      is delivered to a llama.cpp or vLLM target as
+      chat_template_kwargs.reasoning_effort. Unlike claude_model_aliases it is
+      MANAGEMENT-ONLY to set: only a portal session or an admin-scope bearer
+      may create a token with it true or send it on an update; an
+      inference-only bearer (even on its own token) gets 403
+      portal.principal_forbidden and nothing is written.
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -520,6 +538,7 @@ paths:
                       properties:
                         vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
                         claude_model_aliases: { type: boolean }
+                        claude_effort_compatibility: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)
@@ -533,7 +552,9 @@ paths:
         portal.token_vendor_access_conflict. all=true is stored without
         per-account validation. A failure to read the caller's accounts is a
         500, not one of these; a failure to read one account's models is
-        logged and skipped.
+        logged and skipped. A claude_effort_compatibility of true is a
+        management setting: an inference-only bearer is refused with 403
+        portal.principal_forbidden and no token is created.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:
         required: true
@@ -543,16 +564,25 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access and claude_model_aliases are modeled here.
+                only vendor_access, claude_model_aliases and
+                claude_effort_compatibility are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
                 claude_model_aliases:
                   type: boolean
                   description: Opt into the generated Claude model aliases. Absent means off.
+                claude_effort_compatibility:
+                  type: boolean
+                  description: >
+                    Opt into Claude Code effort compatibility. Absent means
+                    off. MANAGEMENT-ONLY: true is accepted only from a portal
+                    session or an admin-scope bearer (otherwise 403
+                    portal.principal_forbidden); false needs no privilege.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/portal/tokens/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -564,7 +594,9 @@ paths:
         REPLACES it wholesale (an empty one resets to the strict default of no
         vendor access) after the same validation as on create
         (portal.token_vendor_access_invalid / portal.token_vendor_access_conflict,
-        both 400).
+        both 400). A present claude_effort_compatibility is a management
+        setting: an inference-only bearer is refused with 403
+        portal.principal_forbidden before any field is applied.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:
         required: true
@@ -574,16 +606,27 @@ paths:
               type: object
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
-                only vendor_access and claude_model_aliases are modeled here.
+                only vendor_access, claude_model_aliases and
+                claude_effort_compatibility are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
                 claude_model_aliases:
                   type: boolean
                   description: Replaces the stored flag when present; absent keeps it.
+                claude_effort_compatibility:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. MANAGEMENT-ONLY: ANY present value, on
+                    this token or another, is accepted only from a portal
+                    session or an admin-scope bearer (otherwise 403
+                    portal.principal_forbidden, and no other field of the same
+                    request is applied either).
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
     delete:
       tags: [portal]
       summary: Delete an own API token
@@ -1249,7 +1292,11 @@ paths:
       api-surface.md): tokens, admin-groups. A service token takes the same
       claude_model_aliases flag as a user token, on create only
       (POST /api/portal/services/{id}/tokens; there is no field-level update),
-      and reads it back on the token list.
+      and reads it back on the token list. It takes claude_effort_compatibility
+      the same way, with the same management-only rule: creating a service
+      token with it true from an inference-only bearer is a 403
+      portal.principal_forbidden, while a portal session or an admin-scope
+      bearer may.
     get:
       tags: [portal]
       summary: List services

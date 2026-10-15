@@ -121,6 +121,7 @@ var migrations = []migration{
 	{version: 86, name: "vendor_account_base_url", up: migration86Up},
 	{version: 87, name: "chat_blobs", up: migration87Up},
 	{version: 88, name: "token_claude_model_aliases", up: migration88Up},
+	{version: 89, name: "token_claude_effort_compatibility", up: migration89Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4028,4 +4029,14 @@ func migration87Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // changes no behavior. addColumnIfMissing keeps it re-runnable.
 func migration88Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_model_aliases integer not null default 0")
+}
+
+// migration89Up adds the opt-in api_tokens.claude_effort_compatibility flag
+// (#230): when set, Claude Code's output_config.effort is delivered to
+// llama.cpp / vLLM backends as chat_template_kwargs.reasoning_effort. A boolean
+// is `integer not null default 0` on both dialects (ADR-005's wide-column rule
+// is about numeric widths, not flags), and existing tokens land on 0 = off, so
+// the upgrade changes no behavior. addColumnIfMissing keeps it re-runnable.
+func migration89Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_effort_compatibility integer not null default 0")
 }

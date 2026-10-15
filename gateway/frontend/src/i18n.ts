@@ -2083,6 +2083,9 @@ const de = {
   tokenClaudeAliases: 'Claude-Desktop-Modell-Aliase',
   tokenClaudeAliasesHint:
     'Bietet zusätzlich zu jedem Modell, das dieser Token nutzen darf, einen neutralen Alias (anthropic-local-…) an, damit Claude Desktop und Claude Code lokale Modelle auswählen können, deren Namen sie sonst ausfiltern. Die Anzeigenamen bleiben ehrlich, und die Originalmodelle bleiben unverändert verfügbar.',
+  tokenClaudeEffort: 'Claude-Code-Effort-Kompatibilität',
+  tokenClaudeEffortHint:
+    'Reicht die in Claude Code gewählte Denktiefe (Effort) an das lokale Modell weiter, damit sie dessen Reasoning tatsächlich steuert. Das Upstream-Modell muss Reasoning-Effort unterstützen, etwa Qwen auf llama.cpp oder vLLM.',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -4825,6 +4828,9 @@ const en: PortalMessages = {
   tokenClaudeAliases: 'Claude Desktop model aliases',
   tokenClaudeAliasesHint:
     'In addition to every model this token may use, offers a neutral alias (anthropic-local-…) so Claude Desktop and Claude Code can select local models whose names they would otherwise filter out. Display names stay honest, and the original models remain available unchanged.',
+  tokenClaudeEffort: 'Claude Code effort compatibility',
+  tokenClaudeEffortHint:
+    'Passes the reasoning effort chosen in Claude Code on to the local model so it actually controls its reasoning. The upstream model must support reasoning effort, for example Qwen on llama.cpp or vLLM.',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',

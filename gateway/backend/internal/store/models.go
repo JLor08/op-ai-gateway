@@ -177,6 +177,13 @@ type TokenRecord struct {
 	// model ids by family can still select them. Stored as
 	// api_tokens.claude_model_aliases; off means no behaviour change.
 	ClaudeModelAliases bool
+	// ClaudeEffortCompatibility is the opt-in (default false) that delivers
+	// Claude Code's `output_config.effort` to llama.cpp / vLLM backends as
+	// `chat_template_kwargs.reasoning_effort` (the field Qwen's chat template
+	// reads), on both the native Messages passthrough and the Anthropic ->
+	// OpenAI translate path. Stored as api_tokens.claude_effort_compatibility;
+	// off means no behaviour change. Independent of ClaudeModelAliases.
+	ClaudeEffortCompatibility bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored
