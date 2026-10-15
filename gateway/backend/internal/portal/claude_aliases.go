@@ -271,22 +271,28 @@ func listingLabel(id string) string { return id }
 // of this token's view (preSuppress, hidden ones included), the names of the
 // token's vendor accounts, and its manual rule keys.
 //
+// vendor is the token's vendor model set (vendorModelFlavorSets), read by the
+// CALLER, not here: the discovery paths already need the same set for the vendor
+// overlay and read it once for both (overlayVendorModels), while
+// claudeAliasesForToken, which has no overlay, reads it itself. It is only read
+// here; a nil vendor (flag off, service token, no vendor access) means the
+// token has none.
+//
 // The second result is one human-readable diagnostic per skipped id; callers log
 // them with logClaudeAliasDiagnostics.
-func (s *Service) claudeAliasesFromListing(ctx context.Context, token auth.Token, listed, preSuppress map[string]map[string]struct{}, overlayLoaded bool) (map[string]claudeAlias, []string) {
+func claudeAliasesFromListing(token auth.Token, listed, preSuppress, vendor map[string]map[string]struct{}, overlayLoaded bool) (map[string]claudeAlias, []string) {
 	if !token.ClaudeModelAliases || !overlayLoaded {
 		return nil, nil
 	}
-	// Fail-posture asymmetry: vendorModelFlavorSets returns an empty (or partial)
-	// set when the vendor store read errors, so the vendor-shadow exclusion (here,
-	// and in claudeAliasEligible) fails OPEN: for that moment a local name the
-	// owner's own vendor account also serves could be offered and resolved as an
-	// alias.
+	// Fail-posture asymmetry: vendorModelFlavorSets (the caller's read of vendor)
+	// returns an empty (or partial) set when the vendor store read errors, so the
+	// vendor-shadow exclusion (here, and in claudeAliasEligible) fails OPEN: for
+	// that moment a local name the owner's own vendor account also serves could be
+	// offered and resolved as an alias.
 	// That is inherited from the vendor overlay's established fail-open posture,
 	// unlike the group/visibility overlay (overlayLoaded above), which fails this
 	// derivation CLOSED. It stays same-principal and transient and grants nothing
 	// the token could not already reach, so there is no privilege escalation.
-	vendor := s.vendorModelFlavorSets(ctx, token)
 	reserved := make(map[string]bool, len(preSuppress)+len(vendor)+len(token.ModelOverrideRules))
 	for name := range preSuppress {
 		reserved[name] = true
@@ -307,10 +313,10 @@ func (s *Service) claudeAliasesFromListing(ctx context.Context, token auth.Token
 // reads the token's visible mapping views and the group overlay itself and
 // composes the same alias-free listing discovery does (baseFlavorSets), then
 // asks claudeAliasesFromListing. It is the accessor inference resolution uses,
-// so it costs one mapping traversal, one overlay load and one runtime-spec read
-// per call (like ModelOfferingFor, nothing is cached): a caller on the request
-// path should check the cheap preconditions (the setting, and that the requested
-// id starts with claudeAliasIDPrefix) before calling it.
+// so it costs one mapping traversal, one overlay load, one runtime-spec read and
+// one vendor-model read per call (like ModelOfferingFor, nothing is cached): a
+// caller on the request path should check the cheap preconditions (the setting,
+// and that the requested id starts with claudeAliasIDPrefix) before calling it.
 //
 // A store error yields no aliases (fail closed).
 func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (map[string]claudeAlias, []string) {
@@ -326,7 +332,7 @@ func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (
 		return nil, nil
 	}
 	sets, preSuppress := baseFlavorSets(views, s.runtimeSpecIndexForViews(ctx, views), &overlay)
-	return s.claudeAliasesFromListing(ctx, token, sets, preSuppress, true)
+	return claudeAliasesFromListing(token, sets, preSuppress, s.vendorModelFlavorSets(ctx, token), true)
 }
 
 // ClaudeAliasTarget is the inference-side accessor of the generated aliases: it

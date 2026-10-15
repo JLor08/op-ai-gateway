@@ -2673,10 +2673,18 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// added and no target hidden yet), and offered AFTER the manual
 			// overlay, in addition to their targets. A token without the setting,
 			// and ManageModels(), get none.
-			var generated map[string]claudeAlias
+			//
+			// The principal's vendor model set is read ONCE here and feeds both the
+			// alias derivation (vendor-shadow exclusion, reserved names) and the owner
+			// overlay below, so a listing costs one vendor store read.
+			var (
+				generated map[string]claudeAlias
+				vendor    map[string]map[string]struct{}
+			)
 			if suppress {
 				var diagnostics []string
-				generated, diagnostics = s.claudeAliasesFromListing(ctx, token, flavors, preSuppress, overlayLoaded)
+				vendor = s.vendorModelFlavorSets(ctx, token)
+				generated, diagnostics = claudeAliasesFromListing(token, flavors, preSuppress, vendor, overlayLoaded)
 				logClaudeAliasDiagnostics(diagnostics)
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
 				// An alias name added to the flavor map still needs the target's
@@ -2746,7 +2754,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// gets a fresh row that the assembly below renders with the zero listing
 			// data (not loaded, offered-on 0, context unknown), Visibility "shown".
 			if suppress {
-				s.overlayVendorModels(ctx, token, flavors)
+				overlayVendorModels(flavors, vendor)
 			}
 			ids := make([]string, 0, len(flavors))
 			for id := range flavors {
@@ -4325,7 +4333,10 @@ func isSeedAPIFlavor(flavor string) bool {
 // modelsResponse, applying the same three layers (see the VISIBILITY-SURFACE
 // MATRIX on visibleMappingViews) and the generated Claude aliases' metadata.
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
-	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
+	// The vendor model set is read once and feeds both the generated-alias
+	// derivation inside modelFlavorSetsWithPreSuppress and the overlay below.
+	vendor := s.vendorModelFlavorSets(ctx, token)
+	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token, vendor)
 	if err != nil {
 		return sets, err
 	}
@@ -4340,7 +4351,7 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 	// way — folded straight into ModelOffering.Callable/Existing in
 	// ModelOfferingFor — because treating a routable vendor model as unknown
 	// would reroute it to the fallback.
-	s.overlayVendorModels(ctx, token, sets)
+	overlayVendorModels(sets, vendor)
 	return sets, nil
 }
 
@@ -4362,7 +4373,10 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 // while the only thing it still carries that `sets` does not is what
 // model_settings merely hides from DISPLAY, which stays callable. It is not an
 // offering, though: never use it to answer "what does this principal see".
-func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token) (sets, preSuppress map[string]map[string]struct{}, err error) {
+//
+// vendor is the token's vendor model set (vendorModelFlavorSets), read by the
+// caller, which also needs it for the vendor overlay; see claudeAliasesFromListing.
+func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token, vendor map[string]map[string]struct{}) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {
 		return nil, nil, err
@@ -4383,7 +4397,7 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	// hidden/locked suppression happened, so the sets cannot be trusted to say
 	// what is offered). Both overlays then apply in the order flavorSetsFromViews
 	// documents, the generated one last.
-	generated, diagnostics := s.claudeAliasesFromListing(ctx, token, sets, preSuppress, overlay != nil)
+	generated, diagnostics := claudeAliasesFromListing(token, sets, preSuppress, vendor, overlay != nil)
 	logClaudeAliasDiagnostics(diagnostics)
 	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
 	applyGeneratedClaudeAliases(sets, preSuppress, generated)

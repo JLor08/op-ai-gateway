@@ -690,6 +690,82 @@ func TestClaudeAliasesForTokenIsWhatDiscoveryLists(t *testing.T) {
 	}
 }
 
+// countingVendorOwnerReadsStore counts the per-owner vendor-account reads, the
+// store call every vendor model set (vendorModelFlavorSets) starts with.
+type countingVendorOwnerReadsStore struct {
+	*routing.MemoryStore
+	ownerReads int
+}
+
+func (c *countingVendorOwnerReadsStore) VendorAccountsByOwner(ctx context.Context, userID string) ([]routing.VendorAccount, error) {
+	c.ownerReads++
+	return c.MemoryStore.VendorAccountsByOwner(ctx, userID)
+}
+
+// TestClaudeAliasDiscoveryReadsTheVendorSetOnce: a listing needs the principal's
+// vendor model set twice (the alias derivation's vendor-shadow exclusion and the
+// owner overlay), and reads it ONCE for both. The derivation resolution runs
+// (claudeAliasesForToken) has no overlay and reads it itself, once. The answers
+// the single read feeds are unchanged: the vendor-served name is still listed
+// from the vendor and still gets no alias.
+func TestClaudeAliasDiscoveryReadsTheVendorSetOnce(t *testing.T) {
+	ctx := context.Background()
+	rs := routing.NewMemoryStore()
+	both := []string{flavorOpenAI, flavorAnthropic}
+	seedClaudeModel(t, rs, 0, claudeModelSpec{name: "local-ok", flavors: both})
+	seedClaudeModel(t, rs, 1, claudeModelSpec{name: "shadowed", flavors: both})
+	counting := &countingVendorOwnerReadsStore{MemoryStore: rs}
+	svc := offerSvc(counting, nil)
+	setVendorAccountsEnabled(t, svc, true)
+	if err := rs.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: "acc_bare", OwnerUserID: "usr_cla", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "acc_bare", Status: routing.VendorAccountStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if err := rs.SetVendorAccountModels(ctx, "acc_bare", []routing.VendorAccountModel{
+		{GatewayModel: "shadowed", UpstreamModel: "shadowed", APIFlavor: routing.APIFlavorAnthropic},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+	aliased := claudeToken(nil)
+	aliased.VendorAccess = auth.VendorAccess{All: true}
+	plain := auth.Token{UserID: "usr_cla", VendorAccess: auth.VendorAccess{All: true}}
+
+	reads := func(call func()) int {
+		counting.ownerReads = 0
+		call()
+		return counting.ownerReads
+	}
+	cases := []struct {
+		name string
+		call func()
+	}{
+		{"Models with aliases", func() { svc.Models(ctx, aliased) }},
+		{"Models without aliases", func() { svc.Models(ctx, plain) }},
+		{"ModelsForFlavor with aliases", func() { svc.ModelsForFlavor(ctx, aliased, flavorAnthropic) }},
+		{"ModelsForFlavor without aliases", func() { svc.ModelsForFlavor(ctx, plain, flavorAnthropic) }},
+		{"claudeAliasesForToken", func() { svc.claudeAliasesForToken(ctx, aliased) }},
+	}
+	for _, tc := range cases {
+		if got := reads(tc.call); got != 1 {
+			t.Errorf("%s read the vendor set %d times, want 1", tc.name, got)
+		}
+	}
+	// The admin management surface never reads a principal's vendor models.
+	if got := reads(func() { svc.ManageModels(ctx, aliased) }); got != 0 {
+		t.Errorf("ManageModels read the vendor set %d times, want 0", got)
+	}
+	// The one read still feeds both consumers.
+	rows := claudeAliasRows(svc.Models(ctx, aliased))
+	if got, want := sortedKeys(rows), []string{"local-ok"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("aliased targets = %v, want only %v (the vendor-served name gets no alias)", got, want)
+	}
+	if _, ok := modelsByID(svc.Models(ctx, aliased))["shadowed"]; !ok {
+		t.Fatal("the vendor-served name is not listed")
+	}
+}
+
 // TestClaudeAliasEligible pins the eligibility rules as a pure unit: the
 // alias-free listing's names that serve the anthropic flavor, minus every name a
 // manual rule is keyed on or hides and every name a vendor account serves.

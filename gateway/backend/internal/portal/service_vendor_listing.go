@@ -140,17 +140,22 @@ func vendorAccountServedFlavors(acc routing.VendorAccount) []string {
 	return []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}
 }
 
-// overlayVendorModels unions the principal's vendor-model flavor overlay into an
-// existing per-name flavor set map, in place. Both listing paths use it: the
-// per-flavor path (modelFlavorSets → ModelsForFlavor, the ids-only reference the
-// HTTP listings are pinned against; no gateway handler reads it) and the DTO
-// path (modelsResponse → Models() → the chat picker, plus /v1/models,
-// /api/v1/models and /anthropic/v1/models through openAIModelDTOs and
-// anthropicModelDTOs). A name a vendor account shares with a self-hosted model
-// simply gets the union of their flavors, so there is one entry per name
-// (deduped).
-func (s *Service) overlayVendorModels(ctx context.Context, token auth.Token, sets map[string]map[string]struct{}) {
-	for name, flavors := range s.vendorModelFlavorSets(ctx, token) {
+// overlayVendorModels unions a principal's vendor-model flavor overlay (the
+// vendorModelFlavorSets result the caller has read) into an existing per-name
+// flavor set map, in place. Both listing paths use it: the per-flavor path
+// (modelFlavorSets → ModelsForFlavor, the ids-only reference the HTTP listings
+// are pinned against; no gateway handler reads it) and the DTO path
+// (modelsResponse → Models() → the chat picker, plus /v1/models, /api/v1/models
+// and /anthropic/v1/models through openAIModelDTOs and anthropicModelDTOs). A
+// name a vendor account shares with a self-hosted model simply gets the union of
+// their flavors, so there is one entry per name (deduped).
+//
+// The caller reads vendor once and hands the same set to the generated-alias
+// derivation (claudeAliasesFromListing) too, so a listing costs one vendor
+// store read, not one per consumer. vendor is only read here, and each flavor is
+// copied into sets, so sets never aliases it.
+func overlayVendorModels(sets, vendor map[string]map[string]struct{}) {
+	for name, flavors := range vendor {
 		set := sets[name]
 		if set == nil {
 			set = make(map[string]struct{})
