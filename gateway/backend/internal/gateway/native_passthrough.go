@@ -372,11 +372,14 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 // streams the raw response back byte-for-byte, so protocol-specific content (Codex
 // tool calls, reasoning items, Claude Code content blocks) is preserved exactly. It
 // mirrors completeStream's idle-watchdog / write-deadline / capture / usage-record
-// machinery. Exactly two body edits are possible HERE, both value-lossless and
-// both described at the body-building step below: the `model` field is rewritten
-// to the upstream's mapped name, and -- only where the operator switched it on for
-// a capable upstream -- llama.cpp's `timings_per_token` is added. Every other
-// field reaches the upstream as the client wrote it. One more edit can happen
+// machinery. Exactly three body edits are possible HERE, all value-lossless and
+// all described at the body-building step below: the `model` field is rewritten
+// to the upstream's mapped name; -- only where the operator switched it on for
+// a capable upstream -- llama.cpp's `timings_per_token` is added; and -- only
+// for a token that opted in, on a chat_template_kwargs-capable target, for an
+// Anthropic Messages request -- Claude Code's `output_config.effort` is also
+// delivered as `chat_template_kwargs.reasoning_effort`. Every other field
+// reaches the upstream as the client wrote it. One more edit can happen
 // below this layer, in the provider client rather than here: an Anthropic
 // subscription target (Masquerade == claude_code) has the Claude-Code system
 // block injected by AnthropicClient.ProxyNative (also value-lossless, idempotent);
@@ -430,10 +433,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		return
 	}
 
-	// The only two edits ever made to a relayed body. Passthrough still means
+	// The only three edits ever made to a relayed body. Passthrough still means
 	// the client's bytes reach the upstream as the client wrote them, apart
-	// from the mapped model name and -- under the operator's opt-in below --
-	// llama.cpp's `timings_per_token`.
+	// from the mapped model name, -- under the operator's opt-in below --
+	// llama.cpp's `timings_per_token`, and -- under the token's opt-in, third
+	// below -- Claude Code's effort as `chat_template_kwargs.reasoning_effort`.
+	// The first two are described here; the third has its own paragraph after
+	// them.
 	//
 	// That flag is what makes llama.cpp attach a top-level `timings` object to
 	// PARTIAL frames, and such an object is the only thing that can put a live
@@ -474,11 +480,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// below is where an operator debugging a 400 learns that the gateway added
 	// a key at all.
 	//
-	// Both edits are JSON edits. A relay that carries a distinct upstream body or
-	// a non-JSON content type (the multipart image edit; see nativeRelay) is
-	// handed to the upstream exactly as its caller built it: rewriteModelField
-	// reads a JSON object, and the caller that chose a multipart body has already
-	// decided what the upstream sees as the model.
+	// All three edits are JSON edits. A relay that carries a distinct upstream
+	// body or a non-JSON content type (the multipart image edit; see
+	// nativeRelay) is handed to the upstream exactly as its caller built it:
+	// rewriteModelField reads a JSON object, and the caller that chose a
+	// multipart body has already decided what the upstream sees as the model.
 	relayContentType := rel.contentType
 	if relayContentType == "" {
 		relayContentType = jsonContentType
@@ -491,18 +497,19 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		upstreamBody = rewriteModelField(upstreamBody, rel.target.ProviderModel)
 	}
 
-	// The operator's opt-in, applied as a SECOND, separate edit rather than
-	// folded into the rewrite above. rewriteModelField returns the client's own
-	// slice unchanged from three no-op branches, and one of them -- a provider
-	// model that already equals the body's model -- is an ordinary
-	// configuration the portal's application auto-sync produces, so an
-	// injection placed inside that helper would silently never fire for those
-	// mappings.
+	// The operator's opt-in, applied as the SECOND of the three edits and as a
+	// separate one rather than folded into the rewrite above. rewriteModelField
+	// returns the client's own slice unchanged from three no-op branches, and
+	// one of them -- a provider model that already equals the body's model --
+	// is an ordinary configuration the portal's application auto-sync
+	// produces, so an injection placed inside that helper would silently never
+	// fire for those mappings.
 	//
 	// The argument order matters: the injection runs over the REWRITTEN body,
-	// so a request that needs both edits gets both. Both helpers return a fresh
-	// slice when they change anything and the original otherwise, so `raw` --
-	// still read further down to build the payload capture, and handed to the
+	// so a request that needs both edits gets both (the third edit, below, runs
+	// over their output in the same way). Every one of the three helpers returns
+	// a fresh slice when it changes anything and the original otherwise, so `raw`
+	// -- still read further down to build the payload capture, and handed to the
 	// HTTP transport as `upstreamBody` while the request is in flight -- is
 	// never written to.
 	//
@@ -520,6 +527,45 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	injectedLiveTimings := false
 	if relayContentType == jsonContentType && wantsResponsesLiveTimings(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream) && !liveProgressRejectedFor(s.Provider, rel.target) {
 		upstreamBody, injectedLiveTimings = injectTimingsPerToken(upstreamBody)
+	}
+
+	// The THIRD edit (#230), the token-level opt-in that delivers Claude Code's
+	// effort to a chat-template backend. Claude Code states its reasoning effort
+	// as `output_config.effort`, which llama.cpp and vLLM do not read, so
+	// without this the level the user picked never reaches the model's chat
+	// template. With it the same value also travels as
+	// `chat_template_kwargs.reasoning_effort`, the one field their templates
+	// consume; `output_config` and everything else stay exactly as the client
+	// wrote them.
+	//
+	// Three things must all hold, none of which this request path can infer
+	// later: the TOKEN opted in (an operator's decision per credential, off by
+	// default), the resolved target is a chat_template_kwargs reader -- llama.cpp
+	// or vLLM, direct or agent-managed, see targetUsesChatTemplateKwargs -- and
+	// the flavor is Anthropic Messages. With any of them false the body is not
+	// even inspected, so a request carrying a malformed output_config is never
+	// newly rejected on a route this feature does not apply to.
+	//
+	// Applied last, over the body the two edits above produced, so a request
+	// that needs several gets all of them; and, like them, via a helper that
+	// returns a fresh slice when it changes anything and the original otherwise,
+	// so `raw` is never written to.
+	//
+	// It is the only one of the three edits that can REJECT. A conflicting
+	// reasoning_effort, a non-object chat_template_kwargs and a non-string effort
+	// are invalid requests, and delivering the effort would mean overriding or
+	// discarding a value the client sent. They are refused here -- before the
+	// deadline policy, before the active row is added, before anything is sent
+	// upstream -- so a rejection costs the upstream nothing; see
+	// rejectInvalidOutputConfig.
+	injectedReasoningEffort := false
+	if relayContentType == jsonContentType && wantsChatTemplateEffort(rel.token, rel.target, rel.pfReq.APIFlavor) {
+		var effortErr error
+		upstreamBody, injectedReasoningEffort, effortErr = injectChatTemplateReasoningEffort(upstreamBody)
+		if effortErr != nil {
+			s.rejectInvalidOutputConfig(w, r, ex, effortErr)
+			return
+		}
 	}
 
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
@@ -560,7 +606,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
-	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings)
+	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings, "reasoning_effort_injected", injectedReasoningEffort)
 
 	// Attach the resolved application's per-app upstream credential (fail-open),
 	// plus -- for an Anthropic passthrough only -- the client's anthropic-beta
@@ -737,7 +783,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 // one caller whose body is not JSON (the multipart image edit). Both are
 // optional and both default to "what every other relay does": an empty
 // contentType means application/json, and a nil upstreamBody means "relay raw
-// (JSON: with its model rewritten to the mapped name)". raw is always the
+// (JSON: with its model rewritten to the mapped name and, where their own gates
+// pass, the other two body edits proxyNative documents -- llama.cpp's
+// timings_per_token and the token-level effort delivery as
+// chat_template_kwargs.reasoning_effort)". raw is always the
 // CLIENT's bytes -- it is what the payload capture and the session extractor
 // read -- so a caller that must send something else (a multipart form rebuilt
 // with the mapped model name) supplies it as upstreamBody rather than replacing
