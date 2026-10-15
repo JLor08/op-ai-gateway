@@ -30,12 +30,18 @@ import (
 // cannot be read is skipped.
 //
 // The second result, loaded, says whether that set is COMPLETE, so a consumer
-// that must not act on a partial one can tell. It is true when nothing went
-// wrong, INCLUDING the no-vendor-access cases above (a legitimately empty set is
-// not a failure), and false when the owner's accounts could not be read (nil, false)
-// or an account's model rows could not (the partial set, false). The listing
+// that must not act on a partial one can tell. It is true when no vendor ACCOUNT
+// or MODEL read failed, INCLUDING the no-vendor-access cases above (a
+// legitimately empty set is not a failure), and false when the owner's accounts
+// could not be read (VendorAccountsByOwner: nil, false) or an account's model
+// rows could not (VendorAccountModels: the partial set, false). The listing
 // overlays ignore it and stay fail-open; the generated-alias derivation fails
 // CLOSED on it, because its vendor-shadow exclusion needs the whole set.
+//
+// The vendor_accounts_enabled master-flag read is NOT covered: VendorAccountsEnabled
+// reports false for a settings store it cannot read, which lands in the
+// no-vendor-access case above (nil, true), so a failed flag read stays fail-open
+// for the alias derivation too, as it does in the resolver.
 func (s *Service) ownVendorAccountModels(ctx context.Context, token auth.Token) (owned []vendorAccountModels, loaded bool) {
 	if s.routes == nil || token.UserID == "" || !s.VendorAccountsEnabled(ctx) {
 		return nil, true
@@ -95,10 +101,11 @@ type vendorAccountModels struct {
 // Gating, owner scope and the fail-open behaviour are ownVendorAccountModels's.
 //
 // loaded is ownVendorAccountModels's: false exactly when the set is incomplete
-// because a vendor store read failed (the map is then nil or partial), true for a
-// complete set and for the legitimately empty no-vendor-access one. The listing
-// overlay uses the map either way (fail-open); the alias derivation refuses an
-// incomplete one (fail-closed).
+// because a vendor account or model read failed (the map is then nil or partial),
+// true for a complete set and for the legitimately empty no-vendor-access one
+// (an unreadable vendor_accounts_enabled flag counts as that, fail-open like the
+// resolver). The listing overlay uses the map either way (fail-open); the alias
+// derivation refuses an incomplete one (fail-closed).
 func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) (sets map[string]map[string]struct{}, loaded bool) {
 	owned, loaded := s.ownVendorAccountModels(ctx, token)
 	if owned == nil {
