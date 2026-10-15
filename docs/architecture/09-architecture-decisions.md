@@ -582,7 +582,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -638,7 +638,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -807,7 +807,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -992,7 +992,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-87-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1207,7 +1207,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-87-migrations),
+[§4](reference/data-model.md#4-migration-history-88-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1433,7 +1433,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-87-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-88-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1558,7 +1558,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-87-migrations),
+[§4](reference/data-model.md#4-migration-history-88-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -2465,9 +2465,10 @@ whose spec read failed) replaces the flavor-only map and is handed as one
 value to `perNameFlavors`, `flavorSetsFromViews`, `existingNamesForFlavor`,
 `capableNames` and `imageFlagsByName`; `modelsResponse` reuses the read it
 already made, and `capableNames` loses its own. The served rule drives the
-`flavors` of `Models()` and `ManageModels()`, `ModelsForFlavor` (behind
-`/anthropic/v1/models`, and the name set a test pins the `openai` listings to;
-Amended by (h): `/v1/models` itself now reads the `Models()` rows),
+`flavors` of `Models()` and `ManageModels()`, `ModelsForFlavor` (the name set
+a test pins every listing to; it was the source behind `/anthropic/v1/models`
+and, before (h), `/v1/models`, both of which now read the `Models()` rows —
+`/anthropic/v1/models` since issue #225, (h) item 5),
 `ModelOffering.Callable` and the group fold of `Capable`, and through them
 `callableModelNames` and the redirect, with no code change there. `Existing`
 uses the flavor half, for its names and for its group overlay alike: a name
@@ -2656,11 +2657,25 @@ decisions, which leave (a) to (g) as they are:
    tools. No current deployment runs one; making the flag truthful is tracked as
    issue #219 and is out of scope here.
 
+5. **`/anthropic/v1/models` follows the same pattern (issue #225).**
+   `handleAnthropicModels` no longer calls the ids-only `ModelsForFlavor`: it
+   keeps the `Models()` rows whose `flavors` contain `anthropic`
+   (`anthropicModelDTOs`, the twin of `openAIModelDTOs` over one shared
+   `modelDTOsOnFlavor`), so that a generated Claude alias row keeps the
+   `original_model_id` and the honest `display_name` its `ModelDTO` carries
+   ([ADR-058](#adr-058--claude-model-aliases-are-computed-per-token-from-one-shared-derivation-hashed-over-the-gateway-id-and-carried-as-sibling-metadata)).
+   `ModelsForFlavor` stays, as the ids-only reference and `portal.API` method
+   that all three listings are pinned against — the anthropic ids in order, for
+   a token with and without the setting — and no longer as the production
+   source of any listing. The cost is the one item 3 describes for
+   `/v1/models`, now also paid by every `/anthropic/v1/models` call.
+
 **Consequence.** An unknown window still has one fix for both listings: set the
 mapping's `context_size`, by the `/props` probe or by hand. A vendor-only
 model has no `context_size`, so it lists without `context_length` and with
 `max_context_length: 0`. `/v1/models` now does one `Models()` read where it
-did a `ModelsForFlavor` read, and `Models()` does more than the ids-only list:
+did a `ModelsForFlavor` read (and `/anthropic/v1/models` likewise since issue
+#225, item 5), and `Models()` does more than the ids-only list:
 on top of the visible views, group overlay and runtime-spec read both share, it
 adds a batch capability read (`MappingCapabilitiesForMappings`, for the
 `vision`, `image` and `image_edit` flags — which, since issue #222, the OpenAI
@@ -3462,7 +3477,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-87-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-88-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3669,7 +3684,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-87-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-88-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4552,3 +4567,119 @@ unit is output images, and a two-input edit bills like a zero-input generation.
 [Configuration Reference](reference/config-env.md),
 [HTTP API Surface
 §1](reference/api-surface.md#1-inference--compatibility-endpoints).
+
+## ADR-058 — Claude model aliases are computed per token from one shared derivation, hashed over the gateway id, and carried as sibling metadata
+
+**Context:** Claude Desktop 2.37337.1 and Claude Code 2.1.295 (checked
+2026-10-15) filter the `id` of a discovered model and reject several
+non-Anthropic family names such as `qwen` and `gpt`, so a local model under its
+real id cannot be selected. They accept a neutral id such as
+`anthropic-local-556f772a70b1`, do not scan `display_name` or unknown extension
+attributes for those names, and discard unknown discovery attributes they do not
+use (an observation of the tested versions, not a documented guarantee). Issue
+#225 asked for a per-token opt-in that offers every eligible local model under
+such an id, in discovery **and** in inference, with the real id recoverable from
+discovery alone so a config-sync script needs only an inference token. Each
+decision below has a cheaper obvious answer that is wrong in a way no
+happy-path test would catch.
+
+**(a) Aliases are computed on every use, never materialized.** They are derived
+from the token's current, alias-free listing and are never written into its
+`model_override_map`. A new eligible model appears and a removed one disappears
+without any sync step, the operator's manual rules stay exactly as written, and
+disabling the setting removes the generated rows and the generated resolution
+together.
+
+**(b) One derivation feeds both callers, so a listed alias is a resolvable
+alias.** `claudeAliasesFromListing` (`internal/portal/claude_aliases.go`) is
+called by both discovery paths (`modelsResponse` and
+`modelFlavorSetsWithPreSuppress`, which hold the listing in hand) and, through
+`claudeAliasesForToken`, by `Service.ClaudeAliasTarget`, which inference
+resolution calls from `resolveModelOverride`. It reads the **alias-free** listing
+(after the group overlay and the visibility suppression, before any alias), so
+no alias is derived from another alias or from a manual one, and resolution is a
+single lookup of the requested id whose result is returned as it is. The
+resolution sits in the shared preflight, so every gate judges the target and
+`RequestedModel` keeps the alias for usage.
+
+**(c) The identity is the gateway id; the encoding is hexadecimal with a sliding
+window; it is a compatibility contract.** The alias is `anthropic-local-` plus
+the first 12 lowercase hex characters of the SHA-256 of the UTF-8 gateway model
+or group id — never the upstream model name, a label, a list position or the
+loaded state, so it is stable across reordering, restarts, metadata, load events
+and group-member changes. If a window contains a denylisted family marker (only
+`abab` is expressible in hex), the window **slides** along the 64-character
+digest and the id stays hexadecimal, rather than switching encodings; a digest
+with no clean window skips the alias with a diagnostic. Clients persist alias
+ids, so the prefix, the hash, the window length and order and the hex-expressible
+denylist entries are pinned by tests. Distinct ids that derive the same alias are
+**both** skipped, and an alias equal to a real name or a manual rule is skipped
+with the real identity or the rule winning, because routing one alias to two
+targets, or letting a generated id shadow a configured one, is worse than a
+missing alias.
+
+**(d) Precedence: an explicit rule, then the generated alias, then the catch-all,
+then the unknown-model redirect.** A manual rule always wins, so the derivation
+also gives no alias to a name a rule is keyed on or hides with `hide_target`
+(the alias would disagree with the rule, and its `original_model_id` would reveal
+a target the rule keeps out of discovery). The generated alias beats the
+catch-all because an alias names one specific model, while the catch-all
+rewrites whatever nothing more specific claims.
+
+**(e) Eligibility is decided by composition and fails in the safe direction.**
+"Local" holds because the alias-free listing is composed only of mapping views
+and the groups over them, never of vendor accounts, so no display label is
+interpreted; a vendor-account model, an Anthropic account's included, never
+receives an alias. A name a vendor account of the token also serves is excluded
+**whatever the vendor mode**, because the mode is runtime-configurable and an
+alias offered under `fallback_only` would dispatch to the vendor after a flip to
+`vendor_first`. When the visibility overlay cannot be loaded the listing fails
+open but the derivation fails closed, because an alias would reveal what the
+operator hid.
+
+**(f) The metadata is two top-level siblings of `capabilities`, on generated
+rows only.** `original_model_id` and the honest `display_name` are written by one
+helper, `addClaudeAliasMetadata`, for `/v1/models`, `/openai/v1/models`,
+`/api/v1/models` and `/anthropic/v1/models`, so the listings cannot drift. They
+reuse the existing extension layer of the row rather than a new vendor
+namespace, and a manual override alias never carries them, since it may
+intentionally hide its target. The label is the target's own, never a Claude
+model name, so the alias row cannot pass for a genuine Anthropic model.
+
+**(g) `/anthropic/v1/models` lists from the `Models()` rows.** Only a row carries
+the alias metadata, so `handleAnthropicModels` moves to the pattern ADR-045 (h)
+gave `/v1/models` (the `Models()` rows narrowed by flavor), and `ModelsForFlavor`
+stays as the ids-only reference the listings are pinned to.
+
+**Consequence.** A token without the setting pays one boolean test. An opted-in
+token pays a derivation (one mapping traversal, one group-overlay load, one
+runtime-spec read per `server_agent` application and the vendor read, uncached)
+only for a requested id that starts with `anthropic-local-`, and on every listing
+call. The migration is one `integer not null default 0` column whose default is
+the backfill (v88). The feature leans on an observed client filter: a client that
+changes it can break the aliases without any gateway change, and the setting
+stays opt-in for that reason.
+
+**Rejected:** **Writing the aliases into `model_override_map`** — the manual map
+would drift from the models and the operator's own rules would be mixed with
+generated ones. — **Two derivations, one for the listing and one for the
+resolver** — a listed alias could stop resolving, or a resolvable one go
+unlisted. — **A decimal or other non-hex fallback encoding** — the ids would stop
+being uniformly hexadecimal and the fallback would be a second format to
+maintain. — **Metadata nested under a vendor namespace, or on every override
+alias** — the sibling keys reuse the existing row, and a manual alias may hide
+its target on purpose. — **Rewriting the response `model` back to the alias** —
+the tested client accepts the served id, so it is not required. — **Failing open
+when visibility is unknown** — the alias would reveal a hidden model. — **A
+vendor-mode-dependent shadow check** — the mode can flip between discovery and
+resolution.
+
+→ [API Compatibility & Inference
+§9.1](cross-cutting/compatibility-and-inference.md#91-generated-claude-model-aliases),
+[Routing & Model Selection
+§2.4](cross-cutting/routing-and-model-selection.md#24-generated-claude-model-aliases),
+[Security, Authentication & Authorization
+§4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
+[Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
+[Data Model §4](reference/data-model.md#4-migration-history-88-migrations),
+[HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).

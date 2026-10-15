@@ -1109,6 +1109,11 @@ type TokenDTO struct {
 	// VendorAccess is the token's vendor-account (Anbieter) access policy; nil is
 	// the strict default (no vendor-account models).
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases opts the token into the Claude-compatible model aliases:
+	// eligible local models and groups are additionally exposed under stable
+	// anthropic-local-<hash> ids. Plain opt-in flag, off by default; always
+	// emitted so a client reading a token and writing it back preserves it.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1169,6 +1174,9 @@ type CreateTokenRequest struct {
 	// field omitted) is the strict default: no vendor-account access. Validated
 	// by validateVendorAccess.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases opts the token into the Claude-compatible model aliases
+	// (see TokenDTO). Off when omitted.
+	ClaudeModelAliases bool `json:"claude_model_aliases"`
 }
 
 type CreateTokenResponse struct {
@@ -1206,6 +1214,8 @@ type UpdateTokenRequest struct {
 	// VendorAccess: nil = keep the stored policy; a non-nil value REPLACES it
 	// wholesale (an empty one resets to the strict default) after validation.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+	// ClaudeModelAliases: nil = keep the stored flag, a non-nil value replaces it.
+	ClaudeModelAliases *bool `json:"claude_model_aliases,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1290,6 +1300,12 @@ type ModelDTO struct {
 	// model on one server that opted out and one that did not is served by the
 	// gate but advertised false here: the safe direction.
 	ImageEdit bool `json:"image_edit"`
+	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
+	// claude_model_aliases setting): the real gateway model/group id the
+	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
+	// target's honest label. Every other row, manual override aliases included,
+	// leaves it empty: a manual alias may intentionally hide its target.
+	OriginalModelID string `json:"original_model_id,omitempty"`
 }
 
 type ServerOwnerDTO struct {
@@ -1671,6 +1687,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
 		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
+		ClaudeModelAliases:          req.ClaudeModelAliases,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -1759,6 +1776,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.Secret != nil {
 		record.Secret = *req.Secret
+	}
+	if req.ClaudeModelAliases != nil {
+		record.ClaudeModelAliases = *req.ClaudeModelAliases
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -2524,7 +2544,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			for name, f := range flavors {
 				preSuppress[name] = f
 			}
+			// overlayLoaded records that the group/visibility overlay below was
+			// available. The listing fails open without it (no groups, no
+			// hidden/locked suppression), but the generated Claude aliases must
+			// not: with visibility unknown they cannot tell a hidden model from a
+			// shown one (see claudeAliasesFromListing).
+			overlayLoaded := false
 			if entries, suppressSet, gErr := s.modelGroupOverlay(ctx, flavors); gErr == nil {
+				overlayLoaded = true
 				// A group is "loaded" iff its highest-priority OFFERABLE member is
 				// loaded -- except for a loaded_only group, where ANY loaded member
 				// is what will actually be served, so any of them makes it loaded
@@ -2638,23 +2665,65 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// system's real models, which must never be filled with one token's
 			// aliases. A token without override rules is unaffected either way:
 			// applyOverrideAliases is a no-op on an empty rule set.
+			//
+			// The token's GENERATED Claude aliases (its claude_model_aliases
+			// setting) ride the same usage-only gate. They are derived FIRST, from
+			// flavors as it stands here, still ALIAS-FREE (the group overlay and
+			// the hidden/locked suppression are done, no manual alias has been
+			// added and no target hidden yet), and offered AFTER the manual
+			// overlay, in addition to their targets. A token without the setting,
+			// and ManageModels(), get none.
+			//
+			// The principal's vendor model set is read ONCE here and feeds both the
+			// alias derivation (vendor-shadow exclusion, reserved names) and the owner
+			// overlay below, so a listing costs one vendor store read.
+			var (
+				generated map[string]claudeAlias
+				vendor    map[string]map[string]struct{}
+			)
 			if suppress {
+				var diagnostics []string
+				vendor = s.vendorModelFlavorSets(ctx, token)
+				generated, diagnostics = claudeAliasesFromListing(token, flavors, preSuppress, vendor, overlayLoaded)
+				logClaudeAliasDiagnostics(diagnostics)
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
-				// applyOverrideAliases only touches the flavor map; an alias name
-				// added there still needs the target's OTHER listing data (loaded
-				// state, offered-on count, context size, vision, and whether the
-				// target is itself a model GROUP) copied over under the alias name
-				// -- the alias entry is meant to look exactly like its target's
-				// row, just filed under a different name (this is a display, not a
-				// leak: the alias really does route to this target). Models and
-				// groups share one namespace, so rule.To naming a group is a
-				// legitimate, tested target (TestOfferedAliasOntoAGroup in Task 4);
-				// an alias onto one really does fail over across the group's
-				// members, so IsGroup must say so too, or the alias would
-				// understate what it does. Checking flavors[name] reuses
-				// applyOverrideAliases's own decision of which aliases actually got
-				// added (Offer set AND the target existed in preSuppress) instead
-				// of re-deriving it here.
+				// An alias name added to the flavor map still needs the target's
+				// OTHER listing data (loaded state, offered-on count, context size,
+				// vision/image/image_edit, and whether the target is itself a model
+				// GROUP) copied over under the alias name -- the alias entry is
+				// meant to look exactly like its target's row, just filed under a
+				// different name (this is a display, not a leak: the alias really
+				// does route to this target). Models and groups share one
+				// namespace, so a target naming a group is legitimate, and an alias
+				// onto one really does fail over across the group's members, so
+				// IsGroup must say so too, or the alias would understate what it
+				// does.
+				inheritTargetRow := func(name, target string) {
+					if servers, ok := loadedOn[target]; ok {
+						loadedOn[name] = servers
+					}
+					if servers, ok := offeredOn[target]; ok {
+						offeredOn[name] = servers
+					}
+					if cs, ok := contextSizeOn[target]; ok {
+						contextSizeOn[name] = cs
+					}
+					if v, ok := visionOn[target]; ok {
+						visionOn[name] = v
+					}
+					if v, ok := imageOn[target]; ok {
+						imageOn[name] = v
+					}
+					if v, ok := imageEditOn[target]; ok {
+						imageEditOn[name] = v
+					}
+					if _, ok := isGroup[target]; ok {
+						isGroup[name] = struct{}{}
+					}
+				}
+				// Checking flavors[name] reuses applyOverrideAliases's own decision
+				// of which aliases actually got added (Offer set AND the target
+				// existed in preSuppress) instead of re-deriving it here.
 				for name, rule := range token.ModelOverrideRules {
 					if !rule.Offer {
 						continue
@@ -2662,26 +2731,15 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if _, ok := flavors[name]; !ok {
 						continue
 					}
-					if servers, ok := loadedOn[rule.To]; ok {
-						loadedOn[name] = servers
-					}
-					if servers, ok := offeredOn[rule.To]; ok {
-						offeredOn[name] = servers
-					}
-					if cs, ok := contextSizeOn[rule.To]; ok {
-						contextSizeOn[name] = cs
-					}
-					if v, ok := visionOn[rule.To]; ok {
-						visionOn[name] = v
-					}
-					if v, ok := imageOn[rule.To]; ok {
-						imageOn[name] = v
-					}
-					if v, ok := imageEditOn[rule.To]; ok {
-						imageEditOn[name] = v
-					}
-					if _, ok := isGroup[rule.To]; ok {
-						isGroup[name] = struct{}{}
+					inheritTargetRow(name, rule.To)
+				}
+				// A generated alias row is its target's row filed under the alias
+				// id: same flavors (from preSuppress), same row data. Only the
+				// final DTO below gives it its own OriginalModelID and label.
+				applyGeneratedClaudeAliases(flavors, preSuppress, generated)
+				for aliasID, alias := range generated {
+					if _, ok := flavors[aliasID]; ok {
+						inheritTargetRow(aliasID, alias.OriginalID)
 					}
 				}
 			}
@@ -2696,7 +2754,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// gets a fresh row that the assembly below renders with the zero listing
 			// data (not loaded, offered-on 0, context unknown), Visibility "shown".
 			if suppress {
-				s.overlayVendorModels(ctx, token, flavors)
+				overlayVendorModels(flavors, vendor)
 			}
 			ids := make([]string, 0, len(flavors))
 			for id := range flavors {
@@ -2705,7 +2763,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			sort.Strings(ids)
 			out := make([]ModelDTO, 0, len(ids))
 			for _, id := range ids {
-				dto := ModelDTO{ID: id, DisplayName: id, Flavors: sortedFlavorSet(flavors[id]), Visibility: "shown"}
+				dto := ModelDTO{ID: id, DisplayName: listingLabel(id), Flavors: sortedFlavorSet(flavors[id]), Visibility: "shown"}
+				if alias, ok := generated[id]; ok {
+					// A generated Claude alias row: the target's own label (never a
+					// Claude model name) and the real gateway id it resolves to. No
+					// other row ever carries original_model_id.
+					dto.DisplayName = alias.DisplayName
+					dto.OriginalModelID = alias.OriginalID
+				}
 				if servers := loadedOn[id]; len(servers) > 0 {
 					dto.Loaded = true
 					dto.LoadedOn = sortedStringSet(servers)
@@ -4140,8 +4205,9 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 //	                                                                                                                                       (plus the alias's loaded/offered/context/
 //	                                                                                                                                        vision/is-group row data, copied from
 //	                                                                                                                                        the target so the alias row looks like it)
-//	ModelsForFlavor() (/anthropic/v1/models, per   yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
-//	  flavor; /v1/models reads Models() instead)
+//	ModelsForFlavor() (ids-only per-flavor list;   yes — visibleMappingViews                   yes — modelFlavorSets (unconditional)       yes — flavorSetsFromViews (unconditional)
+//	  the reference /anthropic/v1/models and
+//	  /v1/models, which read Models(), are pinned to)
 //	ModelServers() + its SSE variant                yes — filterAllowedModelServerRows          yes — principal-aware, admin bypass         no — keyed by a REAL model name; an alias
 //	  (handlePortalModelServers /                                                                                                              is not one, and the name it hides stays
 //	   handlePortalModelServersEvents)                                                                                                          fully callable (see below)
@@ -4172,6 +4238,13 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // mapping regardless of resource-group provisioning, its own hidden/locked
 // state, or one particular token's aliases — see ManageModels's own
 // doc-comment.)
+//
+// (A token with the claude_model_aliases setting gets a second, GENERATED kind
+// of (c): one anthropic-local-<hash> alias row per eligible local model/group,
+// added next to its target by Models() and ModelsForFlavor() and never by
+// ManageModels(). Where they are derived from, and why a hidden, locked,
+// vendor-served, images-only or Messages-disabled name never gets one, is
+// claudeAliasesFromListing's contract.)
 //
 // (c) is a DISPLAY overlay and never an access control. HideTarget removes a
 // name from one token's listing; that same name keeps routing normally for
@@ -4216,8 +4289,10 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 // of them, so a flavor missing here is a flavor no listing reports -- an
 // images-only model would reach the chat with no flavors at all. A model
 // carries the ones dispatch serves it under (routing.MappingServesAPIFlavor),
-// and each per-flavor listing (ModelsForFlavor, i.e. /anthropic/v1/models) asks
-// for its OWN flavor, so an images-only model never appears in a text listing.
+// and each per-flavor listing (/anthropic/v1/models and /v1/models, narrowed
+// from the Models() rows, and the ids-only ModelsForFlavor they are pinned
+// against) asks for its OWN flavor, so an images-only model never appears in a
+// text listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
 var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
@@ -4242,25 +4317,33 @@ func isSeedAPIFlavor(flavor string) bool {
 // model-group overlay (active groups added by flavor union, hidden/locked
 // names dropped), then the PER-TOKEN override-alias overlay — each Offer
 // rule's requested name added with its target's flavors, each HideTarget
-// rule's target removed (applyOverrideAliases).
+// rule's target removed (applyOverrideAliases) — and last, for a token with the
+// claude_model_aliases setting, its GENERATED Claude aliases, each added next to
+// its target with the target's flavors (applyGeneratedClaudeAliases).
 //
 // So the result is a LISTING, per principal AND per token, not a set of names
 // the principal may reach: an alias in it is rewritten before routing and is
 // not routable under that name, while a name the last two layers removed stays
 // fully callable. ModelOffering.Callable is the set that answers reach.
 //
-// Drives per-flavor discovery (ModelsForFlavor(), i.e. /anthropic/v1/models);
-// the portal Models() overview, which /v1/models and /api/v1/models list from,
-// builds its own view via modelsResponse, applying the same three layers (see
-// the VISIBILITY-SURFACE MATRIX on visibleMappingViews).
+// Drives ModelsForFlavor(), the ids-only per-flavor list. That list is the
+// REFERENCE the HTTP listings are pinned against, not their production source:
+// /anthropic/v1/models, /v1/models and /api/v1/models all list from the portal
+// Models() overview (narrowed by flavor), which builds its own view via
+// modelsResponse, applying the same three layers (see the VISIBILITY-SURFACE
+// MATRIX on visibleMappingViews) and the generated Claude aliases' metadata.
 func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[string]map[string]struct{}, error) {
-	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token)
+	// The vendor model set is read once and feeds both the generated-alias
+	// derivation inside modelFlavorSetsWithPreSuppress and the overlay below.
+	vendor := s.vendorModelFlavorSets(ctx, token)
+	sets, _, err := s.modelFlavorSetsWithPreSuppress(ctx, token, vendor)
 	if err != nil {
 		return sets, err
 	}
 	// Owner overlay: fold in the principal's own vendor-account models (Milestone
-	// 3) so the per-flavor listings (/v1/models, the Anthropic list) advertise
-	// exactly what resolveVendorAccount will dispatch for them. Applied here, on
+	// 3) so the per-flavor listings (/v1/models, the Anthropic list, and the
+	// ModelsForFlavor reference they are pinned against) advertise exactly what
+	// resolveVendorAccount will dispatch for them. Applied here, on
 	// the public method ModelsForFlavor consumes, rather than inside
 	// modelFlavorSetsWithPreSuppress, so the override-alias overlay's preSuppress
 	// stays the pure server/group composition. The unknown-model redirect needs
@@ -4268,7 +4351,7 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 	// way — folded straight into ModelOffering.Callable/Existing in
 	// ModelOfferingFor — because treating a routable vendor model as unknown
 	// would reroute it to the fallback.
-	s.overlayVendorModels(ctx, token, sets)
+	overlayVendorModels(sets, vendor)
 	return sets, nil
 }
 
@@ -4290,7 +4373,10 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 // while the only thing it still carries that `sets` does not is what
 // model_settings merely hides from DISPLAY, which stays callable. It is not an
 // offering, though: never use it to answer "what does this principal see".
-func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token) (sets, preSuppress map[string]map[string]struct{}, err error) {
+//
+// vendor is the token's vendor model set (vendorModelFlavorSets), read by the
+// caller, which also needs it for the vendor overlay; see claudeAliasesFromListing.
+func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth.Token, vendor map[string]map[string]struct{}) (sets, preSuppress map[string]map[string]struct{}, err error) {
 	views, err := s.visibleMappingViews(ctx, token)
 	if err != nil {
 		return nil, nil, err
@@ -4304,7 +4390,17 @@ func (s *Service) modelFlavorSetsWithPreSuppress(ctx context.Context, token auth
 	if loaded, gErr := s.loadGroupOverlayInputs(ctx); gErr == nil {
 		overlay = &loaded
 	}
-	sets, preSuppress = flavorSetsFromViews(views, s.runtimeSpecIndexForViews(ctx, views), overlay, token)
+	sets, preSuppress = baseFlavorSets(views, s.runtimeSpecIndexForViews(ctx, views), overlay)
+	// The generated Claude aliases come from the ALIAS-FREE sets just composed, so
+	// they are derived before the manual override overlay adds or removes a name,
+	// and they fail closed when the overlay was unavailable (overlay == nil: no
+	// hidden/locked suppression happened, so the sets cannot be trusted to say
+	// what is offered). Both overlays then apply in the order flavorSetsFromViews
+	// documents, the generated one last.
+	generated, diagnostics := claudeAliasesFromListing(token, sets, preSuppress, vendor, overlay != nil)
+	logClaudeAliasDiagnostics(diagnostics)
+	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
+	applyGeneratedClaudeAliases(sets, preSuppress, generated)
 	return sets, preSuppress, nil
 }
 
@@ -4356,7 +4452,27 @@ func perNameFlavors(views []mappingView, idx runtimeSpecIndex, rule flavorRule) 
 //
 // Factored out so ModelOfferingFor can compose the same listing from views it
 // has already read, instead of walking the mapping store a second time.
+//
+// It carries the token's MANUAL override aliases only. The GENERATED Claude
+// aliases (the token's claude_model_aliases setting) need a vendor-account read,
+// so they are not composed here: modelFlavorSetsWithPreSuppress derives them from
+// baseFlavorSets and overlays them itself. ModelOfferingFor, which reads only
+// preSuppress, never wants them: an alias is not a routable name.
 func flavorSetsFromViews(views []mappingView, idx runtimeSpecIndex, overlay *groupOverlayInputs, token auth.Token) (sets, preSuppress map[string]map[string]struct{}) {
+	sets, preSuppress = baseFlavorSets(views, idx, overlay)
+	// Per-token override aliases (offered requested names + hidden targets).
+	// Last, so it overlays the finished listing: a name the token explicitly
+	// offers survives the group/visibility suppression above.
+	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
+	return sets, preSuppress
+}
+
+// baseFlavorSets is the ALIAS-FREE half of flavorSetsFromViews: the per-name
+// flavors dispatch serves, the group overlay and the hidden/locked suppression,
+// with no per-token alias of any kind applied. Its sets are what the generated
+// Claude aliases are derived from (claudeAliasEligible), so a manual or a
+// generated alias can never become the target of one.
+func baseFlavorSets(views []mappingView, idx runtimeSpecIndex, overlay *groupOverlayInputs) (sets, preSuppress map[string]map[string]struct{}) {
 	sets = perNameFlavors(views, idx, routing.MappingServesAPIFlavor)
 	preSuppress = make(map[string]map[string]struct{}, len(sets))
 	for name, flavors := range sets {
@@ -4382,10 +4498,6 @@ func flavorSetsFromViews(views []mappingView, idx runtimeSpecIndex, overlay *gro
 			sets[e.Name] = e.Flavors
 		}
 	}
-	// Per-token override aliases (offered requested names + hidden targets).
-	// Last, so it overlays the finished listing: a name the token explicitly
-	// offers survives the group/visibility suppression above.
-	applyOverrideAliases(sets, preSuppress, token.ModelOverrideRules)
 	return sets, preSuppress
 }
 
@@ -4641,6 +4753,12 @@ var seedModelNames = []string{"gpt-oss-20b", "qwen-coder"}
 // It reads the runtime specs of the views it lists (runtimeSpecIndexForViews).
 // Falls back to the seed models (which expose the text flavors,
 // seedAPIFlavors) when no routing store is configured.
+//
+// This is the ids-only reference of the per-flavor listings, not their
+// production source: the gateway's /v1/models, /api/v1/models and
+// /anthropic/v1/models list from Models() rows narrowed by flavor (they need
+// each row's metadata), and tests pin that the ids they list are exactly what
+// this returns for the same token and flavor.
 func (s *Service) ModelsForFlavor(ctx context.Context, token auth.Token, flavor string) []string {
 	if s.routes != nil {
 		if sets, err := s.modelFlavorSets(ctx, token); err == nil {
@@ -4693,6 +4811,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   store.DecodeVendorAccess(record.VendorProviderAccess),
+		ClaudeModelAliases:             record.ClaudeModelAliases,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -4728,6 +4847,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		UnknownModelRedirectBlocked:    record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:           record.UnknownModelFallback,
 		VendorAccess:                   decodeVendorAccessDTO(record.VendorProviderAccess),
+		ClaudeModelAliases:             record.ClaudeModelAliases,
 	}
 }
 

@@ -1543,6 +1543,7 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		if m.ContextSize > 0 {
 			item["context_length"] = m.ContextSize
 		}
+		addClaudeAliasMetadata(item, m)
 		data = append(data, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -1566,6 +1567,24 @@ func modelCapabilities(m portal.ModelDTO) map[string]any {
 	}
 }
 
+// addClaudeAliasMetadata adds the two keys that mark a GENERATED Claude alias
+// row (issue #225) to one listing item: original_model_id, the real gateway
+// model/group id the alias resolves to, and display_name, the honest label
+// (the target's own label, never a Claude model name). They are top-level
+// siblings of capabilities -- not nested and not under a vendor namespace -- and
+// every listing that serves the alias row uses this one function so the three
+// stay in lockstep. A row without OriginalModelID gets nothing: only generated
+// alias rows carry it (a manual override alias may intentionally hide its
+// target, so it never says what it points to), and a row that is not an alias
+// keeps whatever display_name its listing already gives it.
+func addClaudeAliasMetadata(item map[string]any, m portal.ModelDTO) {
+	if m.OriginalModelID == "" {
+		return
+	}
+	item["original_model_id"] = m.OriginalModelID
+	item["display_name"] = m.DisplayName
+}
+
 // lmStudioV1ModelsFromDTOs maps portal model rows into the item shape of LM
 // Studio's native v2 GET /api/v1/models listing, which is where an LM Studio
 // client (a current opencode, per issue #171's reading of its source) learns
@@ -1583,7 +1602,8 @@ func modelCapabilities(m portal.ModelDTO) map[string]any {
 // non-nil even for no rows, so both encode as [] rather than null. capabilities
 // is the shared modelCapabilities object (vision/image/image_edit +
 // trained_for_tool_use); opencode reads vision and trained_for_tool_use and
-// ignores the image/image_edit extensions.
+// ignores the image/image_edit extensions. A generated Claude alias row also
+// carries original_model_id (addClaudeAliasMetadata); no other row does.
 func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -1591,14 +1611,16 @@ func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 		if m.Loaded {
 			loaded = append(loaded, map[string]any{"config": map[string]any{"context_length": m.ContextSize}})
 		}
-		out = append(out, map[string]any{
+		item := map[string]any{
 			"type":               "llm",
 			"key":                m.ID,
 			"display_name":       m.DisplayName,
 			"max_context_length": m.ContextSize,
 			"loaded_instances":   loaded,
 			"capabilities":       modelCapabilities(m),
-		})
+		}
+		addClaudeAliasMetadata(item, m)
+		out = append(out, item)
 	}
 	return out
 }
@@ -1613,9 +1635,25 @@ func lmStudioV1ModelsFromDTOs(models []portal.ModelDTO) []map[string]any {
 // override aliases as ModelsForFlavor, so the rows kept are exactly the names
 // /v1/models lists.
 func openAIModelDTOs(models []portal.ModelDTO) []portal.ModelDTO {
+	return modelDTOsOnFlavor(models, routing.APIFlavorOpenAI)
+}
+
+// anthropicModelDTOs is openAIModelDTOs for the Anthropic Messages flavor: the
+// portal model rows whose flavors carry anthropic, which are exactly the names
+// ModelsForFlavor(anthropic) lists (a test pins it). /anthropic/v1/models lists
+// from these rows rather than from that ids-only list so a generated Claude
+// alias row keeps the metadata (original_model_id, the honest label) its
+// ModelDTO carries.
+func anthropicModelDTOs(models []portal.ModelDTO) []portal.ModelDTO {
+	return modelDTOsOnFlavor(models, routing.APIFlavorAnthropic)
+}
+
+// modelDTOsOnFlavor keeps, in order, the rows whose flavors carry flavor. The
+// result is non-nil even when no row qualifies.
+func modelDTOsOnFlavor(models []portal.ModelDTO, flavor string) []portal.ModelDTO {
 	out := make([]portal.ModelDTO, 0, len(models))
 	for _, m := range models {
-		if slices.Contains(m.Flavors, routing.APIFlavorOpenAI) {
+		if slices.Contains(m.Flavors, flavor) {
 			out = append(out, m)
 		}
 	}
@@ -1648,12 +1686,20 @@ func (s *Server) handleAnthropicModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ids := s.Portal.ModelsForFlavor(r.Context(), token, routing.APIFlavorAnthropic)
+	// The rows are the portal's Models() narrowed to the anthropic flavor, which
+	// anthropicModelDTOs documents as exactly the names ModelsForFlavor lists;
+	// unlike that ids-only list they carry the metadata of a generated Claude
+	// alias row. A row's display_name stays its id, except for an alias row,
+	// whose id is an opaque hash: addClaudeAliasMetadata gives it the honest
+	// label and the original_model_id.
+	models := anthropicModelDTOs(s.Portal.Models(r.Context(), token).Data)
 	// created_at is a fixed placeholder: model mappings carry no per-model
 	// creation time, and the Anthropic models contract only requires the field.
-	data := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		data = append(data, map[string]any{"id": id, "type": "model", "display_name": id, "created_at": "2026-07-09T00:00:00Z"})
+	data := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		item := map[string]any{"id": m.ID, "type": "model", "display_name": m.ID, "created_at": "2026-07-09T00:00:00Z"}
+		addClaudeAliasMetadata(item, m)
+		data = append(data, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": data})
 }

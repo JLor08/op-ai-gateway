@@ -351,6 +351,12 @@ func (_d *APIWithTracing) CheckpointAssistant(ctx context.Context, t1 auth.Token
 	return _d.API.CheckpointAssistant(ctx, t1, s1, a1)
 }
 
+func (_d *APIWithTracing) ClaudeAliasTarget(ctx context.Context, t1 auth.Token, s1 string) (s2 string, b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ClaudeAliasTarget")
+	defer span.End()
+	return _d.API.ClaudeAliasTarget(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) CommitAssistant(ctx context.Context, t1 auth.Token, s1 string, a1 AssistantTurn, s2 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.CommitAssistant")
 	defer span.End()

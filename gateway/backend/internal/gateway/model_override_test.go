@@ -41,7 +41,7 @@ func TestResolveModelOverride(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := resolveModelOverride(tt.token, tt.requested); got != tt.want {
+			if got := resolveModelOverride(context.Background(), tt.token, tt.requested, nil); got != tt.want {
 				t.Fatalf("resolveModelOverride(%q) = %q, want %q", tt.requested, got, tt.want)
 			}
 		})

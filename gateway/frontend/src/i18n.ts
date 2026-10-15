@@ -2080,6 +2080,9 @@ const de = {
   tokenUnknownFallback: 'Fallback-Modell',
   tokenLastUsedModel: 'Zuletzt genutztes Modell',
   tokenLastUsedModelNone: 'Noch nicht verwendet',
+  tokenClaudeAliases: 'Claude-Desktop-Modell-Aliase',
+  tokenClaudeAliasesHint:
+    'Bietet zusätzlich zu jedem Modell, das dieser Token nutzen darf, einen neutralen Alias (anthropic-local-…) an, damit Claude Desktop und Claude Code lokale Modelle auswählen können, deren Namen sie sonst ausfiltern. Die Anzeigenamen bleiben ehrlich, und die Originalmodelle bleiben unverändert verfügbar.',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -4819,6 +4822,9 @@ const en: PortalMessages = {
   tokenUnknownFallback: 'Fallback model',
   tokenLastUsedModel: 'Last used model',
   tokenLastUsedModelNone: 'Not used yet',
+  tokenClaudeAliases: 'Claude Desktop model aliases',
+  tokenClaudeAliasesHint:
+    'In addition to every model this token may use, offers a neutral alias (anthropic-local-…) so Claude Desktop and Claude Code can select local models whose names they would otherwise filter out. Display names stay honest, and the original models remain available unchanged.',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',

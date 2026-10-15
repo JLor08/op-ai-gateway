@@ -678,3 +678,49 @@ func TestLoadingOnCountFollowsAnOfferedOverrideAlias(t *testing.T) {
 		t.Fatalf("manage-branch row loading_on_count = %d, want 0 (the manage listing shows real models; a token's alias rule must not repoint a row there)", manageRows[0].LoadingOnCount)
 	}
 }
+
+// TestLoadingOnCountFollowsAGeneratedClaudeAlias is the generated-alias twin of
+// the manual-alias test above (issue #225). A generated Claude alias row is its
+// target's row filed under an anthropic-local-<hash> id, carrying the target's
+// loaded/offered payload, so its loading count must be the target's too. The
+// row's only link to the target is OriginalModelID -- the token holds no rule
+// for the alias id -- so the redirect has to follow that field, or the alias
+// would be the one row of the listing that understates what it does.
+//
+// A row WITHOUT OriginalModelID keeps its own id as the key, and an alias row
+// whose target is not starting anywhere stays at 0.
+func TestLoadingOnCountFollowsAGeneratedClaudeAlias(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := newLoadingOnCountFixture(t)
+	const specID = "rspec_ml_generated_alias"
+	if err := s.Routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+		ID: specID, MappingID: mlMappingA, Enabled: true, Binary: "/usr/bin/vllm", Args: "[]", Env: "{}",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertRuntimeSpec: %v", err)
+	}
+	s.RuntimeStatus.publish(mlServerA, []RuntimeStatusDTO{{SpecID: specID, Model: mlAppModel, State: "starting"}})
+
+	// No manual rule at all: the alias is generated, not configured.
+	token := auth.Token{UserID: "usr_ml", ClaudeModelAliases: true}
+	rows := []portal.ModelDTO{
+		{ID: "anthropic-local-556f772a70b1", OriginalModelID: mlModel},
+		{ID: mlModel},
+		{ID: "anthropic-local-aaaaaaaaaaaa", OriginalModelID: "idle-model"},
+		{ID: "unrelated"},
+	}
+	s.injectLoadingOnCounts(ctx, token, rows, true)
+	if rows[0].LoadingOnCount != 1 {
+		t.Fatalf("generated alias row loading_on_count = %d, want 1 (the alias carries its target's row data)", rows[0].LoadingOnCount)
+	}
+	if rows[1].LoadingOnCount != 1 {
+		t.Fatalf("target row loading_on_count = %d, want 1 (the alias must not move the count off the target)", rows[1].LoadingOnCount)
+	}
+	if rows[2].LoadingOnCount != 0 {
+		t.Fatalf("alias row of an idle target loading_on_count = %d, want 0", rows[2].LoadingOnCount)
+	}
+	if rows[3].LoadingOnCount != 0 {
+		t.Fatalf("unrelated row loading_on_count = %d, want 0", rows[3].LoadingOnCount)
+	}
+}

@@ -120,6 +120,7 @@ var migrations = []migration{
 	{version: 85, name: "api_token_vendor_provider_access", up: migration85Up},
 	{version: 86, name: "vendor_account_base_url", up: migration86Up},
 	{version: 87, name: "chat_blobs", up: migration87Up},
+	{version: 88, name: "token_claude_model_aliases", up: migration88Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4017,4 +4018,14 @@ func migration87Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration88Up adds the opt-in api_tokens.claude_model_aliases flag (#225):
+// when set, the token's eligible local models and groups are auto-exposed
+// under stable `anthropic-local-<hash>` ids. A boolean is `integer not null
+// default 0` on both dialects (ADR-005's wide-column rule is about numeric
+// widths, not flags), and existing tokens land on 0 = off, so the upgrade
+// changes no behavior. addColumnIfMissing keeps it re-runnable.
+func migration88Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_model_aliases integer not null default 0")
 }

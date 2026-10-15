@@ -112,6 +112,7 @@ principal, or the internal loopback all eventually resolve into. Key fields:
 | `Kind` | `""`/`"user"` for a normal token, `"service"` for a service-account token (see [§12](#12-delegated--resource-scoped-authorization)) |
 | `ModelOverride` / `ModelOverrideRules` | catch-all / per-requested-name rewrite applied before routing; a rule is `{to, offer, hide_target}`, the two switches shaping only this token's model *listing* |
 | `UnknownModelRedirect` / `UnknownModelRedirectBlocked` / `UnknownModelFallback` / `LastUsedModel` | the opt-in unknown-model redirect and the marker it aims at — see [Routing & Model Selection §2.1](routing-and-model-selection.md) |
+| `ClaudeModelAliases` | the opt-in (default off) that additionally offers the token's eligible local models and groups under generated `anthropic-local-<hash>` ids, in discovery and in resolution — see [below](#claude-model-aliases-are-discovery-and-resolution-not-authorization) |
 | `AllowedModels` | non-empty only on a service token; a per-model allowlist (empty = every model) |
 | `LogCommunication`, `Secret` | this principal's opt-in/secret-visibility flags for [payload capture](#14-capture-redaction-of-sensitive-headers) |
 | `ProjectID` | usage-attribution project, user tokens only |
@@ -135,6 +136,45 @@ its creator more than the creator already has. Service tokens
 different: they are always minted with the single, hardcoded scope
 `llm:invoke` — there is no "requested scopes" step for a service token at
 all.
+
+#### Claude model aliases are discovery and resolution, not authorization
+
+The per-token `claude_model_aliases` setting (a plain boolean, default off)
+exists on user tokens and on service tokens, written at creation for a service
+token like every other setting of one ([HTTP API Surface, Token model
+settings](../reference/api-surface.md#token-model-settings)). It serves
+**external bearer-token clients**, such as Claude Desktop, that cannot select a
+local model under its real id: the token's eligible local models and groups
+appear a second time as `anthropic-local-<hash>`, with the real id in
+`original_model_id`, and a request naming such an id is resolved to its target
+([API Compatibility & Inference
+§9.1](compatibility-and-inference.md#91-generated-claude-model-aliases), [Routing
+& Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases)).
+It changes **which name** is requested and listed, never **what a token may
+reach**:
+
+- **Access checks run on the effective target.** The alias is resolved in the
+  shared inference preflight, before every gate, so the service-token allowlist
+  (`modelAllowed`), locked models, the server override, resource-group
+  provisioning, capability checks and the principal's rate, quota and budget
+  limits all judge the real model. `RequestedModel` keeps the alias the client
+  sent, so the usage record carries both names.
+- **The discovery-versus-invocation distinction is unchanged.** A listing is
+  still a display: an allowlist restricts invocation, not discovery, and an alias
+  row is listed because its target is offered to this token under its own name.
+  Aliasing adds no reach: a model the token is not offered (hidden, locked,
+  outside its resource-group provisioning, or hidden by one of its own
+  `hide_target` rules) gets no alias, so `original_model_id` discloses no real id
+  the token could not already see, and another token cannot use an alias id it
+  computes itself to reach a model it is not offered.
+- **A session principal gets no aliases.** The portal session principal
+  (`sessionPrincipal`, also behind the loopback pair) never carries the setting,
+  so the portal UI lists and resolves no alias. A run-as token does carry its
+  token's setting onto the run (`AuthorizeRunAsToken`), exactly like its other
+  settings.
+- **Both gates fail closed.** With the visibility overlay unreadable, or on a
+  store error during resolution, no alias is derived — it would otherwise reveal
+  what an operator hid.
 
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
@@ -658,7 +698,8 @@ status, delegate list, model allowlist, and admin-group links.
 model is permitted (the default, and the only state a *user* token is ever
 in — the check is skipped entirely for `Kind != "service"`), while a
 non-empty allowlist is checked **after** the whole per-token model-name
-resolution — override rules, catch-all, and unknown-model redirect alike — so
+resolution — override rules, generated Claude aliases, catch-all, and
+unknown-model redirect alike — so
 neither an override nor a redirect can ever be used to route around it. That
 is the general invariant of
 [Routing & Model Selection §2.1](routing-and-model-selection.md): those

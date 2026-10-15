@@ -969,6 +969,77 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`TokenList Claude model aliases toggle (#225) [${locale}]`, () => {
+    function updateBody(fakeApi: { updateToken: unknown }) {
+      const [, body] = (fakeApi.updateToken as { mock: { calls: unknown[][] } }).mock.calls[0];
+      return body;
+    }
+
+    it('defaults to off and sends claude_model_aliases: false on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(screen.getByRole('checkbox', { name: t.tokenClaudeAliases })).not.toBeChecked();
+      expect(screen.getByText(t.tokenClaudeAliasesHint)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_model_aliases: false });
+    });
+
+    it('sends claude_model_aliases: true on create once the checkbox is toggled', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenClaudeAliases }));
+      expect(screen.getByRole('checkbox', { name: t.tokenClaudeAliases })).toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_model_aliases: true });
+    });
+
+    it("seeds the checkbox from the token's current value on edit and resends it on save", async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_edit', claude_model_aliases: true })],
+      });
+
+      openEdit();
+      expect(screen.getByRole('checkbox', { name: t.tokenClaudeAliases })).toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(updateBody(fakeApi)).toMatchObject({ claude_model_aliases: true });
+    });
+
+    it('sends the toggled value in the update body when the checkbox is changed on edit', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_edit', claude_model_aliases: true })],
+      });
+
+      openEdit();
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenClaudeAliases }));
+      expect(screen.getByRole('checkbox', { name: t.tokenClaudeAliases })).not.toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(updateBody(fakeApi)).toMatchObject({ claude_model_aliases: false });
+    });
+
+    it('treats a token without the field as off on edit and enables it on save when toggled', async () => {
+      const { fakeApi } = renderTokenList({ tokens: [makeToken({ id: 'tok_edit' })] });
+
+      openEdit();
+      expect(screen.getByRole('checkbox', { name: t.tokenClaudeAliases })).not.toBeChecked();
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenClaudeAliases }));
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(updateBody(fakeApi)).toMatchObject({ claude_model_aliases: true });
+    });
+  });
+
   describe(`TokenList override pickers offer only names served under an API [${locale}]`, () => {
     it('leaves such a name out of a rule target', async () => {
       renderTokenList({ models: pickerModels });
