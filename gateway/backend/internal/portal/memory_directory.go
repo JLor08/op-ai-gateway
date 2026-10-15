@@ -786,15 +786,17 @@ func (m *MemoryDirectory) UserGroupsForUser(ctx context.Context, userID, tier, s
 // userGroupManagerEntry is the memory-driver's co-manager row: its
 // permission flags (per-Admin-Group co-manager permissions, spec 2026-08-10 +
 // Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1
-// 2026-08-11) plus the time it was first added, mirroring the SQL row's
-// can_manage_users/can_manage_group/can_manage_servers/can_manage_services/can_manage_resources/created_at.
+// 2026-08-11 + shared vendor accounts #183) plus the time it was first added,
+// mirroring the SQL row's
+// can_manage_users/can_manage_group/can_manage_servers/can_manage_services/can_manage_resources/can_manage_vendor_accounts/created_at.
 type userGroupManagerEntry struct {
-	canManageUsers     bool
-	canManageGroup     bool
-	canManageServers   bool
-	canManageServices  bool
-	canManageResources bool
-	createdAt          time.Time
+	canManageUsers          bool
+	canManageGroup          bool
+	canManageServers        bool
+	canManageServices       bool
+	canManageResources      bool
+	canManageVendorAccounts bool
+	createdAt               time.Time
 }
 
 func (m *MemoryDirectory) SetUserGroupManager(ctx context.Context, groupID, userID string) error {
@@ -806,15 +808,16 @@ func (m *MemoryDirectory) SetUserGroupManager(ctx context.Context, groupID, user
 	// Mirrors the SQL "on conflict (group_id, user_id) do nothing": an
 	// EXISTING row's permission flags are left untouched by a re-set; only a
 	// brand-new row picks up the "full co-manager rights" default (mirrors
-	// migration v48/v49/v51/v53's `default 1` on all five columns).
+	// migration v48/v49/v51/v53/v90's `default 1` on all six columns).
 	if _, ok := m.managers[groupID][userID]; !ok {
 		m.managers[groupID][userID] = userGroupManagerEntry{
-			canManageUsers:     true,
-			canManageGroup:     true,
-			canManageServers:   true,
-			canManageServices:  true,
-			canManageResources: true,
-			createdAt:          time.Now().UTC(),
+			canManageUsers:          true,
+			canManageGroup:          true,
+			canManageServers:        true,
+			canManageServices:       true,
+			canManageResources:      true,
+			canManageVendorAccounts: true,
+			createdAt:               time.Now().UTC(),
 		}
 	}
 	return nil
@@ -855,12 +858,13 @@ func (m *MemoryDirectory) UserGroupManagerPerms(ctx context.Context, groupID str
 	for userID, e := range m.managers[groupID] {
 		entries = append(entries, indexed{
 			perm: store.UserGroupManagerPerm{
-				UserID:             userID,
-				CanManageUsers:     e.canManageUsers,
-				CanManageGroup:     e.canManageGroup,
-				CanManageServers:   e.canManageServers,
-				CanManageServices:  e.canManageServices,
-				CanManageResources: e.canManageResources,
+				UserID:                  userID,
+				CanManageUsers:          e.canManageUsers,
+				CanManageGroup:          e.canManageGroup,
+				CanManageServers:        e.canManageServers,
+				CanManageServices:       e.canManageServices,
+				CanManageResources:      e.canManageResources,
+				CanManageVendorAccounts: e.canManageVendorAccounts,
 			},
 			createdAt: e.createdAt,
 		})
@@ -882,7 +886,7 @@ func (m *MemoryDirectory) UserGroupManagerPerms(ctx context.Context, groupID str
 // it updates an EXISTING co-manager row's permission flags and returns
 // ErrNotFound (never creates a row) when the group/user pair has none —
 // the memory-driver analog of a zero-rows-affected SQL UPDATE. perm.UserID
-// identifies the row; perm's five Can* flags are the new values.
+// identifies the row; perm's six Can* flags are the new values.
 func (m *MemoryDirectory) SetUserGroupManagerPermissions(ctx context.Context, groupID string, perm store.UserGroupManagerPerm) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -899,6 +903,7 @@ func (m *MemoryDirectory) SetUserGroupManagerPermissions(ctx context.Context, gr
 	e.canManageServers = perm.CanManageServers
 	e.canManageServices = perm.CanManageServices
 	e.canManageResources = perm.CanManageResources
+	e.canManageVendorAccounts = perm.CanManageVendorAccounts
 	group[perm.UserID] = e
 	return nil
 }
