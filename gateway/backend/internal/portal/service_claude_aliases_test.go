@@ -764,6 +764,24 @@ func TestClaudeAliasDiscoveryReadsTheVendorSetOnce(t *testing.T) {
 	if _, ok := modelsByID(svc.Models(ctx, aliased))["shadowed"]; !ok {
 		t.Fatal("the vendor-served name is not listed")
 	}
+	// The resolution path gets the same answer through the set it read itself:
+	// the vendor-served name is excluded from what resolves, not just from what
+	// is listed. (A read count alone would not catch a wrong set handed to the
+	// derivation.)
+	derived, _ := svc.claudeAliasesForToken(ctx, aliased)
+	originals := make([]string, 0, len(derived))
+	for _, alias := range derived {
+		originals = append(originals, alias.OriginalID)
+	}
+	if want := []string{"local-ok"}; !reflect.DeepEqual(originals, want) {
+		t.Fatalf("claudeAliasesForToken targets = %v, want only %v (the vendor-served name gets no alias)", originals, want)
+	}
+	if target, ok := svc.ClaudeAliasTarget(ctx, aliased, claudeAliasIDOf(t, "local-ok")); !ok || target != "local-ok" {
+		t.Errorf("the local model's alias resolves to (%q, %v), want (local-ok, true)", target, ok)
+	}
+	if target, ok := svc.ClaudeAliasTarget(ctx, aliased, claudeAliasIDOf(t, "shadowed")); ok {
+		t.Errorf("the vendor-served name's alias id resolves to %q, want no resolution", target)
+	}
 }
 
 // TestClaudeAliasEligible pins the eligibility rules as a pure unit: the

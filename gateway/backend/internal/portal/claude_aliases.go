@@ -21,9 +21,12 @@ import (
 // discovery and resolution use, so they cannot disagree. It has three layers:
 // the pure encoding and collision policy over plain strings (claudeAliasID,
 // claudeAliasMap), the eligibility rules over a token's alias-free listing
-// (claudeAliasEligible), and the token-scoped Service entry points that apply
-// them (claudeAliasesFromListing for the discovery paths that already hold the
-// listing, claudeAliasesForToken for a caller that has only the token).
+// (claudeAliasEligible), and the derivation that applies them. That derivation
+// is claudeAliasesFromListing, a plain function over the listing and the vendor
+// model set its caller already holds (the discovery paths, which read the vendor
+// set once for it and for the vendor overlay). The token-scoped Service entry
+// points are claudeAliasesForToken, which reads what it needs from the token
+// itself, and ClaudeAliasTarget, which inference resolution calls through it.
 //
 // The encoding is a compatibility contract: clients persist alias ids, so
 // changing the prefix, the hash, the window length, the window order or the
