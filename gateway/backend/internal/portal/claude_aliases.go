@@ -213,6 +213,11 @@ func claudeAliasEligible(listed map[string]map[string]struct{}, rules map[string
 		if _, hides := hidden[name]; hides {
 			continue
 		}
+		// Unconditional of vendorMode: a name a vendor account also serves is dropped
+		// even in fallback_only, where it would resolve locally. That is the safe
+		// direction: vendorMode is runtime-configurable and could flip to
+		// vendor_first between discovery and a later resolution, when an offered
+		// alias would route to the vendor.
 		if _, vendorServed := vendor[name]; vendorServed {
 			continue
 		}
@@ -299,6 +304,35 @@ func (s *Service) claudeAliasesForToken(ctx context.Context, token auth.Token) (
 	}
 	sets, preSuppress := baseFlavorSets(views, s.runtimeSpecIndexForViews(ctx, views), &overlay)
 	return s.claudeAliasesFromListing(ctx, token, sets, preSuppress, true)
+}
+
+// ClaudeAliasTarget is the inference-side accessor of the generated aliases: it
+// returns the real gateway model/group id the generated alias `requested`
+// stands for on this token's behalf, and ok=false when `requested` is not one
+// of the token's generated aliases. The gateway's inference preflight calls it
+// (see resolveModelOverride) to resolve an alias once, before every access
+// gate, so an alias is never anything but its real target downstream.
+//
+// It answers from the very derivation discovery lists (claudeAliasesForToken),
+// so a resolvable alias is exactly an offered one: an alias a manual rule owns,
+// a real name, an ambiguous one, or one whose target is hidden, locked or no
+// longer Messages-capable is not in the map and does not resolve. Nothing is
+// ever resolved for a token without the setting.
+//
+// It runs on the inference hot path for every request, and the derivation costs
+// store reads, so it answers before deriving anything when the call cannot be
+// an alias: the setting is off, or `requested` lacks claudeAliasIDPrefix (every
+// ordinary model name).
+func (s *Service) ClaudeAliasTarget(ctx context.Context, token auth.Token, requested string) (original string, ok bool) {
+	if !token.ClaudeModelAliases || !strings.HasPrefix(requested, claudeAliasIDPrefix) {
+		return "", false
+	}
+	aliases, _ := s.claudeAliasesForToken(ctx, token)
+	alias, found := aliases[requested]
+	if !found {
+		return "", false
+	}
+	return alias.OriginalID, true
 }
 
 // logClaudeAliasDiagnostics logs the skipped-alias diagnostics of a derivation.

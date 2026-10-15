@@ -213,16 +213,43 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// claudeAliasResolver resolves a generated Claude alias id (issue #225) to the
+// real gateway model/group it stands for on one token's behalf. portal.API is
+// the implementation; the interface keeps resolveModelOverride testable without
+// the portal's derivation.
+type claudeAliasResolver interface {
+	ClaudeAliasTarget(ctx context.Context, token auth.Token, requested string) (original string, ok bool)
+}
+
 // resolveModelOverride returns the gateway model to use for a REQUESTED model given
-// the token's override configuration: an exact per-model rule entry wins; otherwise
-// the catch-all (token.ModelOverride) applies; otherwise the requested model is
-// returned unchanged. It is the single source of truth for the one shared gate
-// (inferencePreflight) both the translate handlers and native passthrough
-// (tryProxyNative, via the preflight it consumes) resolve their effective model
-// through.
-func resolveModelOverride(token auth.Token, requested string) string {
+// the token's override configuration, in this precedence:
+//
+//  1. an exact per-model rule entry (token.ModelOverrideRules) with a non-blank target;
+//  2. a generated Claude alias (aliases.ClaudeAliasTarget), only for a token with
+//     the claude_model_aliases setting;
+//  3. the catch-all (token.ModelOverride);
+//  4. the requested model, unchanged (the unknown-model redirect, if the token has
+//     it, then judges that name downstream in inferencePreflight).
+//
+// A generated alias is resolved ONCE, in a single lookup of the REQUESTED id. Its
+// result is a real gateway id and is returned as is: no rule and no catch-all is
+// applied to it afterwards, so an alias never chains into another name. A rule
+// keyed on the alias id (step 1) always wins, and a token without the setting
+// never reaches step 2, so an alias it was not offered resolves to nothing and
+// follows the same unknown-model path as any other name. aliases may be nil (a
+// Server without a portal).
+//
+// It is the single source of truth for the one shared gate (inferencePreflight)
+// both the translate handlers and native passthrough (tryProxyNative, via the
+// preflight it consumes) resolve their effective model through.
+func resolveModelOverride(ctx context.Context, token auth.Token, requested string, aliases claudeAliasResolver) string {
 	if rule, ok := token.ModelOverrideRules[requested]; ok && strings.TrimSpace(rule.To) != "" {
 		return rule.To
+	}
+	if token.ClaudeModelAliases && aliases != nil {
+		if original, ok := aliases.ClaudeAliasTarget(ctx, token, requested); ok {
+			return original
+		}
 	}
 	if token.ModelOverride != "" {
 		return token.ModelOverride
@@ -479,6 +506,10 @@ type inferenceShape struct {
 //     model (an unparseable/malformed body, or one with no usable "model"
 //     field at all) -- that case must bail out before ANY gate runs (see the
 //     callers below), so a parse failure never consumes admission budget.
+//     This is also where a generated Claude alias (anthropic-local-<hash>,
+//     issue #225) becomes its real target, once: every gate below, the
+//     allowlist and the principal limits included, then judges the target,
+//     while req.RequestedModel keeps the alias the client sent.
 //  2. redirectUnknownModel (per-token unknown-model redirect) -- OPT-IN, and
 //     for every other token a single boolean test with no store work at all.
 //     It runs here, BEFORE the gates below, on purpose: it changes WHICH model
@@ -505,7 +536,7 @@ type inferenceShape struct {
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
-	req := inference.Request{Model: resolveModelOverride(token, shape.model), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities}
+	req := inference.Request{Model: resolveModelOverride(r.Context(), token, shape.model, s.Portal), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities}
 	// Only tokens that opted in pay for the offering lookup; for every other
 	// token this is a single boolean test. req.RequestedModel keeps the client's
 	// original wish either way — the usage events already carry it, so a

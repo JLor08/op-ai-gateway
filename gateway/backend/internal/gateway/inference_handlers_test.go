@@ -10,6 +10,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"testing"
 )
 
@@ -270,4 +271,189 @@ func TestPreflightRedirectsACapabilityCarryingRequestOnlyToACapableCandidate(t *
 	if len(fp.required) != 1 || fp.required[0] != routing.CapabilityImage {
 		t.Fatalf("offering asked for capabilities %v, want [%s]", fp.required, routing.CapabilityImage)
 	}
+}
+
+// aliasTargetCall is one ClaudeAliasTarget call a fakeAliasPortal saw.
+type aliasTargetCall struct {
+	token     auth.Token
+	requested string
+}
+
+// fakeAliasPortal is a portal.API stand-in for the generated Claude alias
+// resolution (issue #225). ClaudeAliasTarget answers from a fixed alias ->
+// target table, with no derivation, so a test can pin the preflight's own
+// precedence and single-resolution rules independently of the discovery
+// derivation (which resolves in the real portal tests); it records every call.
+// It embeds the offering fake so a redirect can be exercised beside it.
+type fakeAliasPortal struct {
+	*fakeOfferingPortal
+	targets map[string]string
+	calls   []aliasTargetCall
+}
+
+func (f *fakeAliasPortal) ClaudeAliasTarget(_ context.Context, token auth.Token, requested string) (string, bool) {
+	f.calls = append(f.calls, aliasTargetCall{token: token, requested: requested})
+	target, ok := f.targets[requested]
+	return target, ok
+}
+
+func newFakeAliasPortal(targets map[string]string, offered ...string) *fakeAliasPortal {
+	return &fakeAliasPortal{fakeOfferingPortal: newOfferingPortal(offered...), targets: targets}
+}
+
+// TestResolveModelOverrideWithGeneratedAliases pins the resolution precedence
+// of generated Claude aliases: an explicit model_override_map entry, then the
+// generated alias (only for a token with the setting), then the catch-all, then
+// the requested name unchanged. The alias is resolved ONCE: its target is a real
+// gateway id that no rule and no catch-all rewrites again.
+func TestResolveModelOverrideWithGeneratedAliases(t *testing.T) {
+	const aliasA, aliasB, aliasZ = "anthropic-local-aaaaaaaaaaaa", "anthropic-local-bbbbbbbbbbbb", "anthropic-local-zzzzzzzzzzzz"
+	rules := map[string]auth.ModelOverrideRule{
+		aliasA: {To: "manual-target"},
+		"real": {To: "elsewhere"}, // a rule keyed on the generated alias's TARGET
+	}
+	targets := map[string]string{aliasA: "real", aliasB: "real"}
+	token := func(aliases bool, catchAll string) auth.Token {
+		return auth.Token{ClaudeModelAliases: aliases, ModelOverride: catchAll, ModelOverrideRules: rules}
+	}
+	tests := []struct {
+		name      string
+		token     auth.Token
+		requested string
+		want      string
+		wantCalls []string // the requested ids the portal was asked about
+	}{
+		{"explicit entry wins over the generated alias, which is not even asked for", token(true, "catch-all"), aliasA, "manual-target", nil},
+		{"generated alias resolves once to its real target: the rule keyed on that target is not applied", token(true, ""), aliasB, "real", []string{aliasB}},
+		{"generated alias beats the catch-all", token(true, "catch-all"), aliasB, "real", []string{aliasB}},
+		{"unresolvable alias-shaped id falls to the catch-all", token(true, "catch-all"), aliasZ, "catch-all", []string{aliasZ}},
+		{"unresolvable alias-shaped id without catch-all stays as requested", token(true, ""), aliasZ, aliasZ, []string{aliasZ}},
+		{"an ordinary name still gets the catch-all", token(true, "catch-all"), "ordinary", "catch-all", []string{"ordinary"}},
+		{"an ordinary name with a rule still gets the rule", token(true, "catch-all"), "real", "elsewhere", nil},
+		{"setting off: the alias is not resolved, the catch-all applies", token(false, "catch-all"), aliasB, "catch-all", nil},
+		{"setting off, no catch-all: the alias stays unresolved", token(false, ""), aliasB, aliasB, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fp := newFakeAliasPortal(targets)
+			if got := resolveModelOverride(context.Background(), tt.token, tt.requested, fp); got != tt.want {
+				t.Fatalf("resolveModelOverride(%q) = %q, want %q", tt.requested, got, tt.want)
+			}
+			var asked []string
+			for _, call := range fp.calls {
+				asked = append(asked, call.requested)
+			}
+			if !reflect.DeepEqual(asked, tt.wantCalls) {
+				t.Fatalf("ClaudeAliasTarget asked about %q, want %q (one lookup of the REQUESTED id, never of a resolved target)", asked, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestResolveModelOverrideWithoutAPortal: ServerDeps.Portal is optional, so a
+// token with the setting on a Server without one resolves like a token without
+// it, instead of panicking.
+func TestResolveModelOverrideWithoutAPortal(t *testing.T) {
+	token := auth.Token{ClaudeModelAliases: true, ModelOverride: "catch-all"}
+	if got := resolveModelOverride(context.Background(), token, "anthropic-local-aaaaaaaaaaaa", nil); got != "catch-all" {
+		t.Fatalf("resolveModelOverride without a portal = %q, want catch-all", got)
+	}
+}
+
+// TestPreflightResolvesAGeneratedAliasKeepingTheRequestedName: the preflight's
+// effective model is the alias's real target, and the request keeps the alias
+// the client sent, which is what the usage events record.
+func TestPreflightResolvesAGeneratedAliasKeepingTheRequestedName(t *testing.T) {
+	const alias = "anthropic-local-aaaaaaaaaaaa"
+	s := &Server{Portal: newFakeAliasPortal(map[string]string{alias: "real"}, "real")}
+	pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t),
+		auth.Token{ClaudeModelAliases: true}, nil, inferenceShape{model: alias, apiFlavor: "anthropic_messages"})
+	if handled {
+		t.Fatal("preflight refused the request")
+	}
+	if pf.Req.Model != "real" || pf.Req.RequestedModel != alias {
+		t.Fatalf("(Model, RequestedModel) = (%q, %q), want (real, %s)", pf.Req.Model, pf.Req.RequestedModel, alias)
+	}
+}
+
+// TestPreflightAllowlistJudgesTheResolvedTargetNotTheAlias: modelAllowed runs on
+// the EFFECTIVE model. A service token whose allowlist names the target may
+// reach it through the alias although the alias id is not on the list, and an
+// allowlist that names only the alias (or some other model) does not let the
+// alias through to a target it excludes.
+func TestPreflightAllowlistJudgesTheResolvedTargetNotTheAlias(t *testing.T) {
+	const alias = "anthropic-local-aaaaaaaaaaaa"
+	tests := []struct {
+		name        string
+		allowed     []string
+		wantHandled bool
+	}{
+		{"target allowed", []string{"real"}, false},
+		{"target allowed among others", []string{"other", "real"}, false},
+		{"only the alias is listed: the alias id grants nothing", []string{alias}, true},
+		{"another model is listed", []string{"other"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{Portal: newFakeAliasPortal(map[string]string{alias: "real"}, "real")}
+			token := auth.Token{Kind: "service", ClaudeModelAliases: true, AllowedModels: tt.allowed}
+			rec := httptest.NewRecorder()
+			pf, handled := s.inferencePreflight(rec, newInferenceRequest(t), token, nil, inferenceShape{model: alias, apiFlavor: "anthropic_messages"})
+			if handled != tt.wantHandled {
+				t.Fatalf("handled = %v (status %d), want %v", handled, rec.Code, tt.wantHandled)
+			}
+			if tt.wantHandled && rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 model.not_allowed", rec.Code)
+			}
+			if !tt.wantHandled && pf.Req.Model != "real" {
+				t.Fatalf("effective model = %q, want real", pf.Req.Model)
+			}
+		})
+	}
+}
+
+// TestPreflightUnresolvedAliasFollowsTheUnknownModelRedirect: a generated alias
+// that no longer resolves (setting off, or the model went away) is just an
+// unknown name, so the existing unknown-model redirect applies to it exactly as
+// to any other unknown name -- and a resolved alias is NOT unknown, so the
+// redirect leaves it alone. There is no alias-specific fallback.
+func TestPreflightUnresolvedAliasFollowsTheUnknownModelRedirect(t *testing.T) {
+	const alias = "anthropic-local-aaaaaaaaaaaa"
+	t.Run("unresolved alias is redirected like any unknown name", func(t *testing.T) {
+		s := &Server{Portal: newFakeAliasPortal(nil, "last-model")}
+		token := auth.Token{ClaudeModelAliases: true, UnknownModelRedirect: true, LastUsedModel: "last-model"}
+		pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, inferenceShape{model: alias, apiFlavor: "anthropic_messages"})
+		if handled {
+			t.Fatal("preflight refused the request")
+		}
+		if pf.Req.Model != "last-model" || pf.Req.RequestedModel != alias {
+			t.Fatalf("(Model, RequestedModel) = (%q, %q), want (last-model, %s)", pf.Req.Model, pf.Req.RequestedModel, alias)
+		}
+	})
+	t.Run("a resolved alias is not unknown and is not redirected", func(t *testing.T) {
+		s := &Server{Portal: newFakeAliasPortal(map[string]string{alias: "real"}, "real", "last-model")}
+		token := auth.Token{ClaudeModelAliases: true, UnknownModelRedirect: true, LastUsedModel: "last-model"}
+		pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, inferenceShape{model: alias, apiFlavor: "anthropic_messages"})
+		if handled {
+			t.Fatal("preflight refused the request")
+		}
+		if pf.Req.Model != "real" {
+			t.Fatalf("effective model = %q, want real", pf.Req.Model)
+		}
+	})
+	t.Run("setting off: the alias is not asked for and is redirected as unknown", func(t *testing.T) {
+		fp := newFakeAliasPortal(map[string]string{alias: "real"}, "last-model")
+		s := &Server{Portal: fp}
+		token := auth.Token{UnknownModelRedirect: true, LastUsedModel: "last-model"}
+		pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, inferenceShape{model: alias, apiFlavor: "anthropic_messages"})
+		if handled {
+			t.Fatal("preflight refused the request")
+		}
+		if pf.Req.Model != "last-model" {
+			t.Fatalf("effective model = %q, want last-model (the alias must not resolve with the setting off)", pf.Req.Model)
+		}
+		if len(fp.calls) != 0 {
+			t.Fatalf("ClaudeAliasTarget called %d times for a token without the setting, want 0", len(fp.calls))
+		}
+	})
 }
