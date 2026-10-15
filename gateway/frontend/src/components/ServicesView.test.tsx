@@ -978,6 +978,51 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ServiceTokensSection Claude Code effort compatibility toggle (#230) [${locale}]`, () => {
+    async function openCreateDialog(id: string) {
+      const { fakeApi } = renderServicesView({
+        services: [makeService({ id })],
+        overrides: {
+          createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+      const createDialog = within(screen.getByRole('dialog'));
+      fireEvent.change(createDialog.getByLabelText(t.tokenNameLabel), {
+        target: { value: 'Batch Token' },
+      });
+      return { fakeApi, createDialog };
+    }
+
+    it('defaults to off and sends claude_effort_compatibility: false when creating a service token', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog('svc_effort_default');
+      expect(createDialog.getByRole('checkbox', { name: t.tokenClaudeEffort })).not.toBeChecked();
+      expect(createDialog.getByText(t.tokenClaudeEffortHint)).toBeInTheDocument();
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_effort_default',
+        expect.objectContaining({ claude_effort_compatibility: false }),
+      );
+    });
+
+    it('sends claude_effort_compatibility: true when the checkbox is toggled before creating', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog('svc_effort_on');
+      fireEvent.click(createDialog.getByRole('checkbox', { name: t.tokenClaudeEffort }));
+      expect(createDialog.getByRole('checkbox', { name: t.tokenClaudeEffort })).toBeChecked();
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_effort_on',
+        expect.objectContaining({ claude_effort_compatibility: true }),
+      );
+    });
+  });
+
   describe(`ServiceTokensSection override pickers offer only names served under an API [${locale}]`, () => {
     // Opens the create-token dialog of a service whose models include
     // 'sd-child' and returns the dialog.

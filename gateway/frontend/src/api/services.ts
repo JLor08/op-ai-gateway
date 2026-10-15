@@ -110,6 +110,9 @@ export type ServiceTokenDTO = {
   // Opt-in Claude-compatible model aliases, identical in meaning to
   // PortalToken's.
   claude_model_aliases?: boolean;
+  // Opt-in Claude Code effort compatibility, identical in meaning to
+  // PortalToken's.
+  claude_effort_compatibility?: boolean;
 };
 
 export type CreateServiceTokenRequest = {
@@ -127,6 +130,8 @@ export type CreateServiceTokenRequest = {
   unknown_model_fallback?: string;
   // Claude-compatible model aliases (see ServiceTokenDTO); omitted = off.
   claude_model_aliases?: boolean;
+  // Claude Code effort compatibility (see ServiceTokenDTO); omitted = off.
+  claude_effort_compatibility?: boolean;
 };
 
 // The one-time reveal response for both create and rotate.

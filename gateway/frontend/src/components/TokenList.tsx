@@ -167,6 +167,9 @@ export function TokenList({
   // Opt-in Claude-compatible model aliases: also offers neutral
   // anthropic-local-… aliases of the models this token may use.
   const [claudeAliases, setClaudeAliases] = useState(false);
+  // Opt-in Claude Code effort compatibility: delivers the reasoning effort
+  // Claude Code selects to chat-template-driven local backends.
+  const [claudeEffort, setClaudeEffort] = useState(false);
   const [logCommunication, setLogCommunication] = useState(false);
   const [secret, setSecret] = useState(false);
   // Project attribution (spec: 2026-08-08-projects-design.md §6): "" = no project.
@@ -270,6 +273,7 @@ export function TokenList({
     setUnknownRedirectBlocked(false);
     setUnknownFallback('');
     setClaudeAliases(false);
+    setClaudeEffort(false);
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
@@ -304,6 +308,7 @@ export function TokenList({
     setUnknownRedirectBlocked(row.unknown_model_redirect_blocked ?? false);
     setUnknownFallback(row.unknown_model_fallback ?? '');
     setClaudeAliases(row.claude_model_aliases ?? false);
+    setClaudeEffort(row.claude_effort_compatibility ?? false);
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
@@ -379,6 +384,7 @@ export function TokenList({
         unknown_model_redirect_blocked: unknownRedirectBlocked,
         unknown_model_fallback: unknownFallback,
         claude_model_aliases: claudeAliases,
+        claude_effort_compatibility: claudeEffort,
         log_communication: logCommunication,
         secret,
         project_id: projectId,
@@ -412,6 +418,7 @@ export function TokenList({
       body.unknown_model_redirect_blocked = unknownRedirectBlocked;
       body.unknown_model_fallback = unknownFallback;
       body.claude_model_aliases = claudeAliases;
+      body.claude_effort_compatibility = claudeEffort;
       body.log_communication = logCommunication;
       body.secret = secret;
       body.project_id = projectId;
@@ -745,6 +752,20 @@ export function TokenList({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenClaudeAliasesHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={claudeEffort}
+                    onChange={(e) => setClaudeEffort(e.target.checked)}
+                  />
+                }
+                label={t.tokenClaudeEffort}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenClaudeEffortHint}
               </Typography>
             </Box>
             {/* The vendor-access section is hidden entirely while the vendor-accounts
