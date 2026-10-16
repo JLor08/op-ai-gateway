@@ -192,12 +192,38 @@ func (e *vendorGrantEnv) requireRoutable(label string, svc *Service, principal a
 	}
 }
 
+// fixtureOptIn is the vendor policy of a principal that has opted into EVERYTHING the
+// grant fixture seeds, so that REACH (the grant under test) is the only variable the grant
+// and listing tests below can see: all:true covers the principal's own accounts, and an
+// explicit per-account entry covers each shared one, because a shared account is used
+// only when the token names it (the per-account opt-in, pinned in
+// service_vendor_sharing_optin_test.go). Naming an account the principal cannot reach
+// is harmless: the grant still denies it.
+func fixtureOptIn() auth.VendorAccess {
+	access := auth.VendorAccess{All: true}
+	for _, id := range allFixtureAccounts {
+		access.Accounts = append(access.Accounts, auth.VendorAccessEntry{AccountID: id})
+	}
+	return access
+}
+
+// withOptIn is p additionally opted into the named accounts, for a test that seeds
+// accounts beyond the fixture's.
+func withOptIn(p auth.Token, accountIDs ...string) auth.Token {
+	access := auth.VendorAccess{All: p.VendorAccess.All, Accounts: append([]auth.VendorAccessEntry(nil), p.VendorAccess.Accounts...)}
+	for _, id := range accountIDs {
+		access.Accounts = append(access.Accounts, auth.VendorAccessEntry{AccountID: id})
+	}
+	p.VendorAccess = access
+	return p
+}
+
 func userPrincipal(id string) auth.Token {
-	return auth.Token{ID: "tok_" + id, UserID: id, Active: true, VendorAccess: auth.VendorAccess{All: true}}
+	return auth.Token{ID: "tok_" + id, UserID: id, Active: true, VendorAccess: fixtureOptIn()}
 }
 
 func servicePrincipal(id string) auth.Token {
-	return auth.Token{ID: "tok_" + id, Kind: "service", ServiceID: id, Active: true, VendorAccess: auth.VendorAccess{All: true}}
+	return auth.Token{ID: "tok_" + id, Kind: "service", ServiceID: id, Active: true, VendorAccess: fixtureOptIn()}
 }
 
 // resolver is a REAL routing.Resolver over the fixture's store with vendor routing on

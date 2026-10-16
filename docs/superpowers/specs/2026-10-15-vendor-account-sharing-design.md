@@ -230,7 +230,12 @@ requires `token.UserID != ""`. Phase 2 introduces **two** enumerators and the gr
   against the **token's own principal** (the owning user for a user token, the service identity
   for a service token) — not the editing admin. Naming a non-reachable shared account is
   harmless (routing re-checks and denies), so the save-time check is advisory; routing is the
-  sole security gate.
+  sole security gate. The own-versus-shared line is `TokenOwnsVendorAccount` (the account's
+  owner is the token's user; a service owns nothing), used by routing, the listing and the
+  save-time check alike. An `all:true` policy may also carry explicit entries: an entry naming
+  an own account is ignored (all wins, as before sharing), an entry naming any other account is
+  a live opt-in to a shared one and is validated like an `all:false` entry (an unreachable id
+  is refused as an unknown one, so it is no longer stored inert).
 - **Service tokens (A = option a):** a service reaches a shared account only when the
   **service is directly provisioned into a containing resource group** (`ProvisionKindService`)
   — exactly how a service reaches servers; a service is in no management/user group, so there

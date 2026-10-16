@@ -56,15 +56,27 @@ const (
 	sharingServiceA = "svc_a"
 )
 
-// borrowerToken is a user token with the same all-accounts policy the owner's carries;
-// the per-token opt-in for SHARED accounts is a later task, so here the only thing that
-// decides reach is the seam.
-func borrowerToken() auth.Token {
-	return auth.Token{ID: "tok_borrower", UserID: sharingBorrower, Active: true, VendorAccess: auth.VendorAccess{All: true}}
+// optedIn is the explicit per-account policy: each named account opted in under its
+// native prefix. A SHARED account is used only when the token's policy names it (all:true
+// covers a principal's own accounts only), so a test whose borrower is to use an account
+// the seam grants must name it; the seam decides REACH, the policy decides USE.
+func optedIn(accountIDs ...string) auth.VendorAccess {
+	access := auth.VendorAccess{}
+	for _, id := range accountIDs {
+		access.Accounts = append(access.Accounts, auth.VendorAccessEntry{AccountID: id})
+	}
+	return access
 }
 
-func serviceToken(serviceID string) auth.Token {
-	return auth.Token{ID: "tok_svc", Kind: "service", ServiceID: serviceID, Active: true, VendorAccess: auth.VendorAccess{All: true}}
+// borrowerToken is a user token (it owns none of the fixture's accounts) that opted in
+// to the named accounts.
+func borrowerToken(accountIDs ...string) auth.Token {
+	return auth.Token{ID: "tok_borrower", UserID: sharingBorrower, Active: true, VendorAccess: optedIn(accountIDs...)}
+}
+
+// serviceToken is a service token that opted in to the named accounts.
+func serviceToken(serviceID string, accountIDs ...string) auth.Token {
+	return auth.Token{ID: "tok_svc", Kind: "service", ServiceID: serviceID, Active: true, VendorAccess: optedIn(accountIDs...)}
 }
 
 func sharingRequest() inference.Request {
@@ -99,7 +111,7 @@ func TestVendorSharingSeamBorrowerResolvesSharedAccount(t *testing.T) {
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 	resolver.SetVendorAccountEnumerator(enum)
 
-	target, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest())
+	target, err := resolver.Resolve(ctx, borrowerToken("acc_shared"), sharingRequest())
 	if err != nil {
 		t.Fatalf("Resolve = %v, want the shared account's vendor target", err)
 	}
@@ -125,7 +137,7 @@ func TestVendorSharingSeamEmptyAnswerDeniesEvenWhenStoreHoldsAccounts(t *testing
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 	resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{})
 
-	if _, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+	if _, err := resolver.Resolve(ctx, borrowerToken("acc_private"), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
 		t.Fatalf("Resolve = %v, want ErrNoModelRoute (the seam returned nothing)", err)
 	}
 	// The seam REPLACES the owner-only read: the owner is not resolved by a fallback
@@ -151,7 +163,7 @@ func TestVendorSharingSeamOwnBlockWinsNameCollision(t *testing.T) {
 	t.Run("own first", func(t *testing.T) {
 		resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 		resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{accounts: []VendorAccount{own, shared}})
-		target, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest())
+		target, err := resolver.Resolve(ctx, borrowerToken("acc_a", "acc_z"), sharingRequest())
 		if err != nil {
 			t.Fatalf("Resolve = %v", err)
 		}
@@ -163,7 +175,7 @@ func TestVendorSharingSeamOwnBlockWinsNameCollision(t *testing.T) {
 	t.Run("among shared accounts the first by the seam's order wins", func(t *testing.T) {
 		resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 		resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{accounts: []VendorAccount{shared, own}})
-		target, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest())
+		target, err := resolver.Resolve(ctx, borrowerToken("acc_a", "acc_z"), sharingRequest())
 		if err != nil {
 			t.Fatalf("Resolve = %v", err)
 		}
@@ -184,7 +196,7 @@ func TestVendorSharingSeamErrorPropagates(t *testing.T) {
 	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 	resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{err: boom})
 
-	_, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest())
+	_, err := resolver.Resolve(ctx, borrowerToken("acc_shared"), sharingRequest())
 	if !errors.Is(err, boom) {
 		t.Fatalf("Resolve = %v, want the seam's error propagated", err)
 	}
@@ -227,7 +239,7 @@ func TestVendorSharingEligibilityGuard(t *testing.T) {
 		enum := &fakeVendorEnumerator{accounts: accounts}
 		resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
 		resolver.SetVendorAccountEnumerator(enum)
-		target, err := resolver.Resolve(ctx, serviceToken(sharingServiceA), sharingRequest())
+		target, err := resolver.Resolve(ctx, serviceToken(sharingServiceA, "acc_shared"), sharingRequest())
 		if err != nil {
 			t.Fatalf("Resolve = %v, want the account the seam granted the service", err)
 		}
@@ -262,20 +274,100 @@ func TestVendorSharingNilSeamIsOwnerOnly(t *testing.T) {
 	})
 
 	t.Run("another user resolves nothing (not allow-all)", func(t *testing.T) {
-		if _, err := resolver.Resolve(ctx, borrowerToken(), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+		if _, err := resolver.Resolve(ctx, borrowerToken("acc_owned"), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
 			t.Fatalf("Resolve(borrower) = %v, want ErrNoModelRoute: a nil seam is owner-only, never allow-all", err)
 		}
 	})
 
 	t.Run("a service token resolves nothing and never reads by an empty owner", func(t *testing.T) {
 		store.owners = nil
-		if _, err := resolver.Resolve(ctx, serviceToken(sharingServiceA), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+		if _, err := resolver.Resolve(ctx, serviceToken(sharingServiceA, "acc_owned"), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
 			t.Fatalf("Resolve(service) = %v, want ErrNoModelRoute (a service owns no account)", err)
 		}
 		for _, owner := range store.owners {
 			if owner == "" {
 				t.Errorf("VendorAccountsByOwner was asked for the empty owner %q", owner)
 			}
+		}
+	})
+}
+
+// TestVendorSharingOptInAllTrueNeverAutoBorrows is the Review-Focus all:true case at the
+// resolver: the seam GRANTS the account (reach), but a principal that does not own it and
+// holds only an all:true policy does not use it. all:true covers the principal's own
+// accounts; a shared account must be named.
+func TestVendorSharingOptInAllTrueNeverAutoBorrows(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	accounts := seededAccounts(t, store, now, "acc_shared") // owned by vendorOwner
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+	resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{accounts: accounts})
+
+	allTrue := auth.VendorAccess{All: true}
+	for name, token := range map[string]auth.Token{
+		"a user that does not own the account": {ID: "tok_b", UserID: sharingBorrower, Active: true, VendorAccess: allTrue},
+		"a service token":                      {ID: "tok_s", Kind: "service", ServiceID: sharingServiceA, Active: true, VendorAccess: allTrue},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := resolver.Resolve(ctx, token, sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+				t.Fatalf("Resolve = %v, want ErrNoModelRoute: all:true must not auto-borrow a shared account", err)
+			}
+		})
+	}
+
+	t.Run("the account's own owner is covered by all:true", func(t *testing.T) {
+		target, err := resolver.Resolve(ctx, auth.Token{ID: "tok_o", UserID: vendorOwner, Active: true, VendorAccess: allTrue}, sharingRequest())
+		if err != nil || target.VendorAccountID != "acc_shared" {
+			t.Fatalf("Resolve(owner, all:true) = (%q, %v), want acc_shared", target.VendorAccountID, err)
+		}
+	})
+
+	t.Run("all:true plus a named shared account uses it", func(t *testing.T) {
+		token := auth.Token{
+			ID: "tok_b", UserID: sharingBorrower, Active: true,
+			VendorAccess: auth.VendorAccess{All: true, Accounts: []auth.VendorAccessEntry{{AccountID: "acc_shared"}}},
+		}
+		target, err := resolver.Resolve(ctx, token, sharingRequest())
+		if err != nil || target.VendorAccountID != "acc_shared" {
+			t.Fatalf("Resolve = (%q, %v), want acc_shared through the explicit entry", target.VendorAccountID, err)
+		}
+	})
+}
+
+// TestVendorSharingOptInNamesAndPrefixOverride: a token that names a granted shared
+// account uses it, only it, and under the override prefix when one is set; naming an
+// account the seam did not grant routes nothing (the grant is the gate).
+func TestVendorSharingOptInNamesAndPrefixOverride(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	accounts := seededAccounts(t, store, now, "acc_a", "acc_b") // both serve gpt-4o
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+	resolver.SetVendorAccountEnumerator(&fakeVendorEnumerator{accounts: accounts[:1]}) // the seam grants acc_a only
+
+	t.Run("a named granted account", func(t *testing.T) {
+		target, err := resolver.Resolve(ctx, borrowerToken("acc_a"), sharingRequest())
+		if err != nil || target.VendorAccountID != "acc_a" {
+			t.Fatalf("Resolve = (%q, %v), want acc_a", target.VendorAccountID, err)
+		}
+	})
+
+	t.Run("a named account the seam did not grant routes nothing", func(t *testing.T) {
+		if _, err := resolver.Resolve(ctx, borrowerToken("acc_b"), sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+			t.Fatalf("Resolve = %v, want ErrNoModelRoute (naming an ungranted account is harmless)", err)
+		}
+	})
+
+	t.Run("the override prefix is the public name; the native name stops routing", func(t *testing.T) {
+		token := borrowerToken()
+		token.VendorAccess = auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: "acc_a", OverrideEnabled: true, OverridePrefix: "team/"}}}
+		target, err := resolver.Resolve(ctx, token, inference.Request{Model: "team/gpt-4o", APIFlavor: "openai_chat"})
+		if err != nil || target.VendorAccountID != "acc_a" {
+			t.Fatalf("Resolve(team/gpt-4o) = (%q, %v), want acc_a", target.VendorAccountID, err)
+		}
+		if _, err := resolver.Resolve(ctx, token, sharingRequest()); !errors.Is(err, ErrNoModelRoute) {
+			t.Fatalf("Resolve(gpt-4o) = %v, want ErrNoModelRoute under an override prefix", err)
 		}
 	})
 }

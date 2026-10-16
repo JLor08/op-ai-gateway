@@ -1173,15 +1173,20 @@ type TokenDTO struct {
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
-// grants every owner account under its own model_prefix (Accounts is then
-// ignored); otherwise Accounts lists the opted-in accounts. Mirrors the stored
+// grants every account the token's principal OWNS under its own model_prefix
+// (Accounts is then ignored for those); otherwise Accounts lists the opted-in
+// accounts. An account SHARED with the principal (owned by someone else) is never
+// covered by All: it is used only when Accounts names it, with an optional prefix
+// override (the per-account opt-in, ADR-050). Mirrors the stored
 // vendor_provider_access shape (see store.DecodeVendorAccess).
 type VendorAccessDTO struct {
 	All      bool                   `json:"all"`
 	Accounts []VendorAccessEntryDTO `json:"accounts"`
 }
 
-// VendorAccessEntryDTO opts one vendor account in, by its stable account id.
+// VendorAccessEntryDTO opts one vendor account in, by its stable account id: one
+// the principal owns, or one shared with it (the id must be reachable for the
+// token's principal when the policy is saved, and is re-checked on every request).
 // A nil PrefixOverride (or one with Enabled=false) uses the account's own
 // model_prefix.
 type VendorAccessEntryDTO struct {
@@ -1716,7 +1721,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
-	if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+	if err := s.validateVendorAccess(ctx, userTokenPrincipal(owner), req.VendorAccess); err != nil {
 		return CreateTokenResponse{}, err
 	}
 	projectID, err := s.assignTokenProject(ctx, owner.UserID, req.ProjectID)
@@ -1847,7 +1852,7 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
 	}
 	if req.VendorAccess != nil {
-		if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+		if err := s.validateVendorAccess(ctx, userTokenPrincipal(owner), req.VendorAccess); err != nil {
 			return TokenDTO{}, err
 		}
 		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
@@ -4994,26 +4999,59 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	return d
 }
 
-// validateVendorAccess checks a token's requested vendor-access policy against
-// the owner's own accounts: every account_id must be one the owner owns (and
-// appear once), every ENABLED override prefix must pass
-// normalizeVendorAccountModelPrefix, and (all=false) the effective public names
-// -- effective prefix + upstream model id -- must not collide across the selected
-// accounts' current models. A nil policy, all=true (the resolver ignores the
-// account list and keeps first-wins + dedup) and an empty list need no checks.
+// userTokenPrincipal is the principal a USER token acts as: the owning user, and
+// nothing the creating caller's own auth.Token happens to carry (scopes, a kind). It
+// is who the routing grant is asked about when a user token's policy is validated.
+func userTokenPrincipal(owner auth.Token) auth.Token {
+	return auth.Token{UserID: owner.UserID}
+}
+
+// serviceTokenPrincipal is the principal a SERVICE token acts as: the service
+// identity itself. It owns no vendor account and is provisioned into resource groups
+// only as a service (ProvisionKindService), exactly as the resolver asks the grant
+// about the token at request time.
+func serviceTokenPrincipal(serviceID string) auth.Token {
+	return auth.Token{Kind: store.TokenKindService, ServiceID: serviceID}
+}
+
+// validateVendorAccess checks a token's requested vendor-access policy against the
+// accounts the token's PRINCIPAL can reach (VendorAccountsForRouting: its own accounts
+// plus the ones shared with it through a resource group it is provisioned into): every
+// account_id must be one of them (and appear once), every ENABLED override prefix
+// must pass normalizeVendorAccountModelPrefix, and the effective public names --
+// effective prefix + upstream model id -- must not collide across the checked
+// accounts' current models. principal is the TOKEN's own identity (userTokenPrincipal,
+// serviceTokenPrincipal), never the caller who happens to be saving it: an admin
+// editing a token does not lend it their own reach.
+//
+// A nil policy and an empty list need no checks. With all=true the principal's OWN
+// accounts are covered by the switch and the list is ignored for them (so an entry
+// naming one is neither validated nor collision-checked, as before sharing); an entry
+// naming any other account is a live opt-in to a SHARED account (all:true never
+// covers one), so it is held to the same checks as under all=false.
+//
+// The check is ADVISORY, not the security gate: it keeps unreachable ids out of a new
+// policy as an unknown own id always was, but the gate is the routing grant, which is
+// re-evaluated live on every request -- a policy that names an account that stops
+// being reachable (a downgrade, a pause, a removed provision) simply routes nothing.
 // A collision that only emerges later (a vendor ships a new model after save) is
-// caught by the routing backstop, so a per-account models-read failure is logged
-// and skipped rather than failing the save; a failure to read the owner's
-// accounts at all is an infrastructure error and is returned raw (a 500, not the
-// 400 reserved for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict).
-func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d *VendorAccessDTO) error {
-	if d == nil || d.All || len(d.Accounts) == 0 {
+// caught by the routing backstop, so a per-account models-read failure is logged and
+// skipped rather than failing the save; a failure to read the principal's own accounts
+// at all is an infrastructure error and is returned raw (a 500, not the 400 reserved
+// for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict). The shared arm of
+// the grant fails CLOSED (VendorAccountsForRouting), so a store error there reads as
+// "not reachable" -- the same answer routing gives in that window.
+func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token, d *VendorAccessDTO) error {
+	if d == nil || len(d.Accounts) == 0 {
 		return nil
 	}
 	if s.routes == nil {
+		if d.All {
+			return nil
+		}
 		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
 	}
-	byID, err := s.ownerVendorAccountsByID(ctx, owner.UserID)
+	byID, err := s.reachableVendorAccountsByID(ctx, principal)
 	if err != nil {
 		return err
 	}
@@ -5023,6 +5061,9 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 		names: make(map[string]string),
 	}
 	for _, e := range d.Accounts {
+		if d.All && coveredByAll(principal, byID, e) {
+			continue
+		}
 		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
 			return err
 		}
@@ -5030,18 +5071,27 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 	return nil
 }
 
+// coveredByAll reports whether policy entry e names one of principal's OWN accounts,
+// the only kind an all=true policy covers (and so ignores the entry for).
+func coveredByAll(principal auth.Token, byID map[string]routing.VendorAccount, e VendorAccessEntryDTO) bool {
+	acc, ok := byID[strings.TrimSpace(e.AccountID)]
+	return ok && routing.TokenOwnsVendorAccount(principal, acc)
+}
+
 // vendorAccessCheck is the working state of one validateVendorAccess run.
 type vendorAccessCheck struct {
-	byID  map[string]routing.VendorAccount // the owner's accounts by id
+	byID  map[string]routing.VendorAccount // the accounts the principal can reach, by id
 	seen  map[string]struct{}              // account ids already listed in the policy
 	names map[string]string                // effective public name -> id of the account that first produced it
 }
 
-// ownerVendorAccountsByID loads userID's vendor accounts keyed by id. A read
-// failure is an infrastructure error and is returned raw, so the endpoints answer
-// 500 rather than a 400 the client cannot act on.
-func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (map[string]routing.VendorAccount, error) {
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, userID)
+// reachableVendorAccountsByID loads the accounts principal can reach keyed by id:
+// the routing grant, own accounts and the accounts shared with it, which is the very
+// set the resolver enumerates for it. A read failure of its own accounts is an
+// infrastructure error and is returned raw, so the endpoints answer 500 rather than
+// a 400 the client cannot act on.
+func (s *Service) reachableVendorAccountsByID(ctx context.Context, principal auth.Token) (map[string]routing.VendorAccount, error) {
+	accounts, err := s.VendorAccountsForRouting(ctx, principal)
 	if err != nil {
 		return nil, err
 	}
@@ -5053,9 +5103,11 @@ func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (m
 }
 
 // checkVendorAccessEntry validates one policy entry in order -- the account is
-// owned, is listed once, carries a valid override prefix, and its effective public
-// names do not collide with those already claimed by earlier entries -- so the
-// first failure is the one reported. An unreadable model list skips the collision
+// reachable by the principal (its own, or shared with it), is listed once, carries a
+// valid override prefix, and its effective public names do not collide with those
+// already claimed by earlier entries -- so the first failure is the one reported. An
+// id the principal cannot reach is "unknown", the same answer for a missing account
+// and a foreign one (no existence leak). An unreadable model list skips the collision
 // check for that account only (logged; the routing backstop still applies).
 func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAccessCheck, e VendorAccessEntryDTO) error {
 	id := strings.TrimSpace(e.AccountID)

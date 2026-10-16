@@ -449,7 +449,7 @@ func TestVendorListingFlavorSetIsPerDialectRoutable(t *testing.T) {
 		e.flags(true, true) // a shared subscription account is routable only with this
 		const subID = "vacc_g_00_subshared"
 		e.openAISubscriptionAccount(subID, grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
-		member := userPrincipal(grantAdminMember)
+		member := withOptIn(userPrincipal(grantAdminMember), subID) // the extra shared account must be named too
 		r := e.liveResolver(e.svc)
 		accounts := append([]string{subID}, allFixtureAccounts...)
 
@@ -494,7 +494,7 @@ func TestVendorListingFlavorSetIsPerDialectRoutable(t *testing.T) {
 		const subID = "vacc_g_00_subshared"
 		e.openAISubscriptionAccount(subID, grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
 		// grantDirect owns grantOwnAccount (api_key, both dialects) and is provisioned.
-		direct := userPrincipal(grantDirect)
+		direct := withOptIn(userPrincipal(grantDirect), subID)
 		r := e.liveResolver(e.svc)
 		if got := e.flavorsOf(direct, grantDupModel); !slices.Equal(got, both) {
 			t.Errorf("%s flavors = %v, want %v", grantDupModel, got, both)

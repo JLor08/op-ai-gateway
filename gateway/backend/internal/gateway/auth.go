@@ -269,7 +269,10 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 	// default for API tokens, but the owner's own interactive session (and the
 	// trusted loopback chat that acts for it) has no api_tokens row to opt in on and
 	// must keep seeing all of the user's own active vendor accounts under their
-	// native prefixes -- the chat picker and dashboard depend on it.
+	// native prefixes -- the chat picker and dashboard depend on it. All covers
+	// the user's OWN accounts only: an account shared with the user is used only
+	// through an explicit per-account entry on a token, which a session never has
+	// (routing.TokenVendorPrefix, spec 2026-10-15 section 8).
 	return auth.Token{
 		UserID:           user.ID,
 		Name:             user.DisplayName,

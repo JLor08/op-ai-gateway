@@ -160,6 +160,14 @@ type ServiceTokenDTO struct {
 	// compatibility, identical in meaning to TokenDTO's — see there. Settable on
 	// create only, like ClaudeModelAliases.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// VendorAccess is the token's vendor-account access policy, the same shape and
+	// meaning as TokenDTO's: nil is the strict default (no vendor-account models).
+	// A service owns no vendor account, so the only accounts it can use are the ones
+	// SHARED with it (its service provisioned into a containing resource group) and
+	// it must NAME each (all:true covers nothing for a service). Settable on create
+	// only: a service token has no field-level update, so changing the opt-in means
+	// recreating the token; a rotation preserves it.
+	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 }
 
 // CreateServiceTokenRequest is CreateServiceToken's body (§6.3): scopes are
@@ -185,6 +193,13 @@ type CreateServiceTokenRequest struct {
 	// ClaudeEffortCompatibility opts the new token into Claude Code effort
 	// compatibility (see TokenDTO). Off when omitted.
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
+	// VendorAccess optionally opts the new token into shared vendor accounts (see
+	// ServiceTokenDTO); nil (omitted) is the strict default, no vendor access. Each
+	// named account must be reachable for THIS SERVICE (its service provisioned into
+	// a resource group that contains it), not for the admin or delegate creating the
+	// token: that advisory check is validateVendorAccess's, and routing re-checks on
+	// every request. It is create-only, see ServiceTokenDTO.
+	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -756,6 +771,12 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 	if err != nil {
 		return CreateServiceTokenResponse{}, err
 	}
+	// The vendor opt-in is checked for reach against the SERVICE the token acts as,
+	// never against `principal` (the admin or delegate minting it): a token does not
+	// inherit its creator's reach. Advisory like the user token's; routing is the gate.
+	if err := s.validateVendorAccess(ctx, serviceTokenPrincipal(svc.ID), req.VendorAccess); err != nil {
+		return CreateServiceTokenResponse{}, err
+	}
 	now := s.clock().UTC()
 	secret, err := s.secretGenerator()
 	if err != nil {
@@ -784,6 +805,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		UnknownModelRedirect:        redirect,
 		UnknownModelRedirectBlocked: redirectBlocked,
 		UnknownModelFallback:        fallback,
+		VendorProviderAccess:        encodeVendorAccessDTO(req.VendorAccess),
 		ClaudeModelAliases:          req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:   req.ClaudeEffortCompatibility,
 	}
@@ -815,7 +837,11 @@ func (s *Service) ListServiceTokens(ctx context.Context, principal auth.Token, s
 }
 
 // RotateServiceToken replaces tokenID's secret in place (same id/name/scopes/
-// settings), returning the fresh plaintext secret once — mirrors RotateToken.
+// settings), returning the fresh plaintext secret once — mirrors RotateToken. The
+// vendor-account opt-in is one of those settings and is PRESERVED: the rotation
+// writes only the secret columns (RotateTokenSecret), so the stored policy, the
+// bearer's policy and the returned DTO's all stay as created. (A service token's
+// opt-in is create-only; this is the one write that touches the row afterwards.)
 // tokenID MUST belong to serviceID (no cross-service access): a token of a
 // DIFFERENT service (or an unknown id) is ErrTokenNotFound, matching
 // RotateToken's own not-found sentinel for the analogous user-token case.
@@ -1093,6 +1119,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		UnknownModelRedirect:        record.UnknownModelRedirect,
 		UnknownModelRedirectBlocked: record.UnknownModelRedirectBlocked,
 		UnknownModelFallback:        record.UnknownModelFallback,
+		VendorAccess:                decodeVendorAccessDTO(record.VendorProviderAccess),
 		ClaudeModelAliases:          record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:   record.ClaudeEffortCompatibility,
 	}

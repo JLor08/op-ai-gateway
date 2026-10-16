@@ -111,7 +111,7 @@ func (s *Service) advertisedVendorAccountModels(ctx context.Context, token auth.
 		if acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn {
 			continue
 		}
-		prefix, allowed := routing.TokenVendorPrefix(token.VendorAccess, acc)
+		prefix, allowed := routing.TokenVendorPrefix(token, acc)
 		if !allowed {
 			continue
 		}

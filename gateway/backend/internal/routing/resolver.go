@@ -896,7 +896,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // ones (id order) -- and the FIRST active account with a model row whose
 // token-effective public name (prefix + UpstreamModel, see vendorAccountModelMatch)
 // equals the request model wins, so an own account wins a name collision with a
-// shared one; a token only sees the accounts its VendorAccess policy allows.
+// shared one; a token only uses the accounts its VendorAccess policy allows (all:true
+// covers the principal's own accounts, a shared account must be named, see
+// TokenVendorPrefix).
 // Dispatch trusts the Target's VendorAccountID and is owner-agnostic: the sealed
 // credential opens only at the dispatch edge, so a borrower never sees it.
 func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
@@ -922,12 +924,14 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		if acc.AuthType == VendorAuthSubscription && !r.subscriptionsAllowed() {
 			continue
 		}
-		// Per-token access (the boundary): a token only reaches the accounts its
-		// VendorAccess policy lists (or all of them), under the token-effective
-		// prefix. The zero policy denies every account, so a token that was never
-		// granted vendor access resolves nothing here. TokenVendorPrefix is the same
-		// helper the model listing uses, so advertised names equal routable names.
-		prefix, allowed := TokenVendorPrefix(token.VendorAccess, acc)
+		// Per-token access (the opt-in): the grant above decided REACH; a token only
+		// USES the accounts its VendorAccess policy covers, under the token-effective
+		// prefix. all:true covers the principal's OWN accounts only; an account
+		// shared with it is used only when the policy names it (per-account opt-in).
+		// The zero policy denies every account, so a token that was never granted
+		// vendor access resolves nothing here. TokenVendorPrefix is the same helper
+		// the model listing uses, so advertised names equal routable names.
+		prefix, allowed := TokenVendorPrefix(token, acc)
 		if !allowed {
 			continue
 		}
