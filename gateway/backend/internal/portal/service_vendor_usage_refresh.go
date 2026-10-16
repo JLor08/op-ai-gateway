@@ -181,8 +181,9 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 // Authorized by authorizeVendorAccountOperate: the owner, or a CM while the account
 // is shared/full. System scope is NOT let through: it opens the owner's sealed
 // credential and sends it to the vendor from the gateway, so it is authorized like a
-// write (an unknown id and a stranger's account are both ErrVendorAccountNotFound).
-// A SUBSCRIPTION account is owner-only on top of that
+// write (an unknown id and a stranger's account are both ErrVendorAccountNotFound; a
+// MEMBER of the shared account, who can already read it, gets ErrVendorAccountForbidden
+// from the operate gate). A SUBSCRIPTION account is owner-only on top of that
 // (requireOwnerForSubscriptionOperate): the pull renews an expired token first, so a
 // CM who can see the account gets ErrVendorAccountForbidden, the lazy on-view pull
 // included, and nothing is renewed or written. ErrVendorAccountsDisabled while the
