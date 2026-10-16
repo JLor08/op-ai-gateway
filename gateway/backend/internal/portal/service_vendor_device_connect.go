@@ -239,7 +239,7 @@ func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal 
 	if err != nil {
 		return false, err
 	}
-	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, principal, acc, ts)
 	if err != nil {
 		return false, err
 	}

@@ -2851,6 +2851,12 @@ describe('App', () => {
       models: [],
       created_at: '2026-09-01T12:00:00Z',
       updated_at: '2026-09-01T12:00:00Z',
+      share_level: 'none',
+      admin_groups: [],
+      system_group_id: '',
+      system_group_name: '',
+      is_owner: true,
+      shared_by: '',
     },
     {
       id: 'va_key',
@@ -2865,6 +2871,12 @@ describe('App', () => {
       models: [],
       created_at: '2026-09-01T12:00:00Z',
       updated_at: '2026-09-01T12:00:00Z',
+      share_level: 'none',
+      admin_groups: [],
+      system_group_id: '',
+      system_group_name: '',
+      is_owner: true,
+      shared_by: '',
     },
   ];
 

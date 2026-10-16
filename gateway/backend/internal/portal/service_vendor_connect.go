@@ -186,7 +186,7 @@ func (s *Service) requireVendorTokensSealable() error {
 // active subscription account and writes it. The token set is sealed BEFORE the
 // store write, so a keyless disk store fails with ErrVendorAccountConnectKeyRequired
 // and persists nothing (never plaintext).
-func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) (VendorAccountDTO, error) {
+func (s *Service) persistVendorTokens(ctx context.Context, principal auth.Token, acc routing.VendorAccount, ts vendorauth.TokenSet) (VendorAccountDTO, error) {
 	sealed, err := vendorauth.SealTokenSet(s.cipher, s.settingsVolatile, ts)
 	if err != nil {
 		return VendorAccountDTO{}, vendorSealError(err)
@@ -201,7 +201,7 @@ func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAcc
 		}
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	return s.vendorAccountDTO(ctx, principal, acc)
 }
 
 // ConnectVendorAccountImportRequest carries the tokens of a token import. Both
@@ -263,7 +263,7 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, principal, acc, ts)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -390,7 +390,7 @@ func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal au
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, principal, acc, ts)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}

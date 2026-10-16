@@ -48,6 +48,11 @@ export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
 // user can only ever set active or disabled.
 export type VendorAccountStatus = 'active' | 'disabled' | 'needs_reconnect';
+// How far an account is shared (portal.VendorAccountDTO.ShareLevel): `none` is
+// personal (owner-only), `shared` lets the co-managers of its management groups
+// read and operate it, `full` also delegates its credential and sharing to them.
+// The backend reports the STORED level and an unrecognised stored value as `none`.
+export type VendorAccountShareLevel = 'none' | 'shared' | 'full';
 
 // One gateway model an account serves -- mirrors portal.VendorAccountModelDTO.
 // gateway_model is the id a client requests at the gateway: the account's
@@ -120,6 +125,21 @@ export type VendorAccount = {
   usage?: VendorAccountUsage;
   created_at: string;
   updated_at: string;
+  // Sharing (spec 2026-10-15 sections 6 and 10). The DTO is rendered FOR the
+  // viewer, and it is credential-free for every viewer: a co-manager (CM) of a
+  // shared account receives exactly these fields with is_owner false, never the
+  // owner's secret (only the api_key_set / subscription_connected booleans above).
+  share_level: VendorAccountShareLevel;
+  // The management groups (id + name; always an array, [] when the account is not
+  // shared) and their parent system group, the containment root ("" / "" when
+  // there is none; the name is a best-effort lookup).
+  admin_groups: { id: string; name: string }[];
+  system_group_id: string;
+  system_group_name: string;
+  // Whether the viewer owns the account; shared_by is the owner's display name
+  // for a viewer who does not ("" for the owner, or when the name is unknown).
+  is_owner: boolean;
+  shared_by: string;
 };
 
 // POST /api/portal/vendor-accounts body. status defaults to active when

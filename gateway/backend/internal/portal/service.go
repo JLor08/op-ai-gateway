@@ -2294,11 +2294,12 @@ func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 // and the name is a transient display field: never persisted, never selected
 // by a store.
 //
-// Visibility follows authorizeVendorAccount's read rule, because an account is a
-// personal credential, not shared infrastructure: the name is set only when the
-// principal owns the account or is a system admin. For anyone else (a plain
-// admin or a project member looking at someone else's row) it stays empty — the
-// row's AccountID is still on the wire, only the name is withheld.
+// Visibility follows authorizeVendorAccountRead's read rule, because an account is a
+// personal credential unless it has been shared: the name is set only when the
+// principal owns the account, manages it as a CM while it is shared or full, or is
+// a system admin. For anyone else (a plain admin or a project member looking at
+// someone else's row) it stays empty — the row's AccountID is still on the wire,
+// only the name is withheld.
 //
 // Everything else is fail-soft and leaves the name empty rather than failing
 // the list: a nil routing store, an account that no longer exists (usage_events.
@@ -2326,12 +2327,15 @@ func (s *Service) attachUsageAccountNames(ctx context.Context, principal auth.To
 }
 
 // visibleVendorAccountName returns the name of the vendor account id when the
-// principal may see it (owner, or system scope — authorizeVendorAccount's read
-// rule), else "". A missing account and a stranger's account are both
+// principal may see it (the owner, a CM of the account while it is shared or full by
+// its effective level, or system scope — authorizeVendorAccountRead's read rule),
+// else "". A missing account and a stranger's account are both
 // ErrVendorAccountNotFound and both yield ""; any other lookup error is logged
-// and also yields "" (the Activity list must never fail over a display name).
+// and also yields "" (the Activity list must never fail over a display name). A
+// member (an account reached through a resource group) joins the read rule with the
+// routing grant.
 func (s *Service) visibleVendorAccountName(ctx context.Context, principal auth.Token, id string) string {
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
+	acc, err := s.authorizeVendorAccountRead(ctx, principal, id)
 	if err != nil {
 		if !errors.Is(err, ErrVendorAccountNotFound) {
 			log.Printf("portal: usage account-name lookup failed for %q: %v", id, err)

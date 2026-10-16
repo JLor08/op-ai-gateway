@@ -296,7 +296,7 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
-	dto, result, err := s.applyVendorModelDiscovery(ctx, acc, found, note)
+	dto, result, err := s.applyVendorModelDiscovery(ctx, principal, acc, found, note)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -309,20 +309,21 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 
 // applyVendorModelDiscovery turns discoverVendorModels' answer (found models, or a
 // note saying why none) into the refresh's outcome: the fail-soft kept-models answer,
-// or the rows replaced by what the vendor listed.
-func (s *Service) applyVendorModelDiscovery(ctx context.Context, acc routing.VendorAccount, found []vendorauth.DiscoveredModel, note string) (VendorAccountDTO, RefreshResult, error) {
+// or the rows replaced by what the vendor listed. The account's view is rendered for
+// principal (a CM may run the refresh).
+func (s *Service) applyVendorModelDiscovery(ctx context.Context, principal auth.Token, acc routing.VendorAccount, found []vendorauth.DiscoveredModel, note string) (VendorAccountDTO, RefreshResult, error) {
 	if note != "" {
-		return s.keptVendorModels(ctx, acc.ID, note)
+		return s.keptVendorModels(ctx, principal, acc.ID, note)
 	}
 	rows, dropped := vendorModelRows(acc, found)
 	if len(rows) == 0 {
-		return s.keptVendorModels(ctx, acc.ID, "the vendor listed no usable model")
+		return s.keptVendorModels(ctx, principal, acc.ID, "the vendor listed no usable model")
 	}
 	acc, rows, err := s.storeDiscoveredVendorModels(ctx, acc.ID, rows)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
-	dto, err := s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -372,12 +373,12 @@ func notFoundAsVendorAccountNotFound(err error) error {
 // refresh token the vendor rejected flips the account to needs_reconnect), and the
 // answer must report the status it has now. An account deleted meanwhile is
 // ErrVendorAccountNotFound.
-func (s *Service) keptVendorModels(ctx context.Context, id, why string) (VendorAccountDTO, RefreshResult, error) {
+func (s *Service) keptVendorModels(ctx context.Context, principal auth.Token, id, why string) (VendorAccountDTO, RefreshResult, error) {
 	acc, err := s.routes.VendorAccountByID(ctx, id)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, notFoundAsVendorAccountNotFound(err)
 	}
-	dto, err := s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
@@ -999,7 +1000,7 @@ func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token
 		} else {
 			slog.Warn("vendor model discovery after connect/create failed; the account keeps its current models", "account", dto.ID, "err", err)
 		}
-		return s.currentConnectedVendorAccount(requestCtx, dto)
+		return s.currentConnectedVendorAccount(requestCtx, principal, dto)
 	}
 	slog.Info("vendor model discovery after connect/create", "account", dto.ID, "status", result.Status, "discovered", result.Discovered)
 	return refreshed
@@ -1010,12 +1011,12 @@ func (s *Service) discoverAfterConnect(ctx context.Context, principal auth.Token
 // discovery's token refresh set). Best effort on the REQUEST's context, not the
 // discovery's (which may be the very thing that ended): any failure returns dto as
 // it was, the connect itself having succeeded.
-func (s *Service) currentConnectedVendorAccount(ctx context.Context, dto VendorAccountDTO) VendorAccountDTO {
+func (s *Service) currentConnectedVendorAccount(ctx context.Context, principal auth.Token, dto VendorAccountDTO) VendorAccountDTO {
 	acc, err := s.routes.VendorAccountByID(ctx, dto.ID)
 	if err != nil {
 		return dto
 	}
-	current, err := s.vendorAccountDTO(ctx, acc)
+	current, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
 		return dto
 	}

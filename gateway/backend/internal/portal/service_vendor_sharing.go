@@ -164,7 +164,7 @@ func (s *Service) RaiseVendorAccountShareLevel(ctx context.Context, principal au
 	if err := s.routes.UpdateVendorAccountShareLevel(ctx, acc.ID, target); err != nil {
 		return VendorAccountDTO{}, notFoundAsVendorAccountNotFound(err)
 	}
-	return s.vendorAccountDTOByID(ctx, acc.ID)
+	return s.vendorAccountDTOByID(ctx, principal, acc.ID)
 }
 
 // LowerVendorAccountShareLevel lowers an account to `shared` (from `full`) or to
@@ -209,7 +209,7 @@ func (s *Service) LowerVendorAccountShareLevel(ctx context.Context, principal au
 	if err != nil {
 		return VendorAccountDTO{}, notFoundAsVendorAccountNotFound(err)
 	}
-	return s.vendorAccountDTOByID(ctx, acc.ID)
+	return s.vendorAccountDTOByID(ctx, principal, acc.ID)
 }
 
 // authorizeVendorAccountRaise is the gate of RAISING a level: the owner, who must be
@@ -343,7 +343,7 @@ func (s *Service) SetVendorAccountAdminGroups(ctx context.Context, principal aut
 	if err := s.replaceVendorAccountAdminGroups(ctx, acc.ID, ids); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTOByID(ctx, acc.ID)
+	return s.vendorAccountDTOByID(ctx, principal, acc.ID)
 }
 
 // VendorAccountAdminGroupCandidates lists the admin-tier groups the caller may name as
@@ -467,11 +467,11 @@ func (s *Service) replaceVendorAccountAdminGroups(ctx context.Context, accountID
 }
 
 // vendorAccountDTOByID re-reads the account (the write may have moved columns the
-// caller's copy does not have) and renders its credential-free view.
-func (s *Service) vendorAccountDTOByID(ctx context.Context, id string) (VendorAccountDTO, error) {
+// caller's copy does not have) and renders its credential-free view for principal.
+func (s *Service) vendorAccountDTOByID(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
 	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	return s.vendorAccountDTO(ctx, principal, acc)
 }

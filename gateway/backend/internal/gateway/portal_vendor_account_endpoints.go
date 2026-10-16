@@ -68,10 +68,11 @@ func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *htt
 }
 
 // handlePortalVendorAccounts is the vendor-account ("Anbieter") collection
-// endpoint: GET lists the caller's OWN accounts, POST creates one owned by the
-// caller. Both are gated only by the session-scope check (gateway:use); the
-// per-account owner gate (404-no-leak) lives in portal.Service, and the api_key
-// is write-only -- no response ever carries it.
+// endpoint: GET lists the caller's OWN accounts plus, for a non-system caller, the
+// shared accounts they manage as a co-manager, POST creates one owned by the caller.
+// Both are gated only by the session-scope check (gateway:use); the per-account
+// gates (owner, or a CM of a shared account; 404-no-leak) live in portal.Service, and
+// the api_key is write-only -- no response ever carries it, to the owner or to a CM.
 func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
