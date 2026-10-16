@@ -83,8 +83,10 @@ type transcriptionForm struct {
 	// streamFormat is the stream_format field. The endpoint has no streamed answer,
 	// so the only question about it is whether it was set at all.
 	streamFormat string
-	// files counts the NON-EMPTY parts under `file` or `file[]`, the two spellings
-	// multipart clients use for the audio upload.
+	// files counts the NON-EMPTY parts named `file`, the one field OpenAI's API and
+	// the audio.cpp server read the upload from. (There is no `file[]` spelling: a
+	// part under it is just another part the handler does not own, so a form that
+	// carries only one has no file.) Validation requires exactly one.
 	files int
 }
 
@@ -127,7 +129,7 @@ func readTranscriptionBody(w http.ResponseWriter, r *http.Request, limit int64) 
 // relay it verbatim or to rebuild it).
 //
 // Only the fields the handler owns are read into memory, each bounded by
-// maxTranscriptionFieldBytes; the audio parts are counted and skipped, and every
+// maxTranscriptionFieldBytes; the `file` parts are counted and skipped, and every
 // other part is skipped untouched. Each of model, language, prompt,
 // response_format, stream and stream_format may appear ONCE: the model decides
 // routing and the allowlist and is peeked again downstream (the agent's router), so
@@ -172,14 +174,14 @@ func parseTranscriptionForm(contentType string, raw []byte) (transcriptionForm, 
 }
 
 // readPart reads one part of the form into f, by the field it is: the six text
-// fields are read and kept, the audio parts are counted and skipped, and any other
+// fields are read and kept, the `file` parts are counted and skipped, and any other
 // part is skipped untouched. seen is the set of the single-use fields already met.
 func (f *transcriptionForm) readPart(part *multipart.Part, seen map[string]bool) error {
 	name := part.FormName()
 	switch name {
 	case "model", "language", "prompt", "response_format", "stream", "stream_format":
 		return f.readTextField(part, name, seen)
-	case "file", "file[]":
+	case "file":
 		return countNonEmptyTranscriptionPart(part, &f.files)
 	default:
 		_, err := discardTranscriptionPart(part)
@@ -252,9 +254,15 @@ func readTranscriptionField(part *multipart.Part) (string, error) {
 
 // validateTranscriptionRequest is validateImageEditRequest's twin for the
 // transcription form, and validateSpeechRequest's in its policy: a non-empty model
-// and at least one non-empty audio file are required, and every other field (language,
-// prompt, temperature, ...) is the client's own business and reaches the upstream
-// unexamined, with two exceptions.
+// and EXACTLY ONE non-empty `file` part are required, and every other field
+// (language, prompt, temperature, ...) is the client's own business and reaches the
+// upstream unexamined, with two exceptions.
+//
+// file decision: none is transcriptionFileRequired; more than one is refused with
+// invalidTranscriptionRequest (a form with two audio files is two answers to "which
+// audio", not one request, and the upstream reads a single file). Only the `file`
+// field counts, as in OpenAI's API and audio.cpp's own server: a `file[]` part is
+// not a file here, so a form with only that one gets transcriptionFileRequired.
 //
 // response_format decision: only "json" (or an absent value) is accepted, and EVERY
 // other value -- verbose_json, text, srt, vtt, and anything that is no
@@ -285,7 +293,10 @@ func validateTranscriptionRequest(form transcriptionForm) *inference.Error {
 		return &inference.Error{Code: transcriptionModelRequired, Message: "model is required"}
 	}
 	if form.files == 0 {
-		return &inference.Error{Code: transcriptionFileRequired, Message: "at least one non-empty audio file is required (form field \"file\" or \"file[]\")"}
+		return &inference.Error{Code: transcriptionFileRequired, Message: "a non-empty audio \"file\" field is required"}
+	}
+	if form.files > 1 {
+		return invalidTranscription("exactly one audio file is required")
 	}
 	if format := strings.TrimSpace(form.responseFormat); format != "" && format != "json" {
 		return &inference.Error{Code: transcriptionResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"json\" is", format)}
