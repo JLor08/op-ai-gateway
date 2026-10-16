@@ -369,27 +369,9 @@ func (s *Service) VendorAccountAdminGroupCandidates(ctx context.Context, princip
 	if s.groups == nil {
 		return out, nil
 	}
-	var groups []store.UserGroup
-	if isSystem(principal) {
-		all, err := s.groups.ListUserGroupsByTier(ctx, store.GroupTierAdmin)
-		if err != nil {
-			return nil, err
-		}
-		groups = all
-	} else {
-		manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
-		if err != nil {
-			return nil, err
-		}
-		for gid := range manageGroups {
-			g, err := s.groups.UserGroupByID(ctx, gid)
-			if err != nil {
-				// The group vanished between the enumeration and this lookup; skip
-				// it rather than fail the whole list.
-				continue
-			}
-			groups = append(groups, g)
-		}
+	groups, err := s.vendorAccountAdminGroupCandidateGroups(ctx, principal)
+	if err != nil {
+		return nil, err
 	}
 	for _, g := range groups {
 		parentName := ""
@@ -404,6 +386,30 @@ func (s *Service) VendorAccountAdminGroupCandidates(ctx context.Context, princip
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// vendorAccountAdminGroupCandidateGroups collects the admin-tier groups a principal may
+// name as a vendor account's management groups: every admin-tier group for a system
+// caller, else the groups through which the caller manages vendor accounts. A group that
+// vanishes between the enumeration and its lookup is skipped, not fatal. The caller
+// guarantees s.groups is non-nil.
+func (s *Service) vendorAccountAdminGroupCandidateGroups(ctx context.Context, principal auth.Token) ([]store.UserGroup, error) {
+	if isSystem(principal) {
+		return s.groups.ListUserGroupsByTier(ctx, store.GroupTierAdmin)
+	}
+	manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
+	groups := make([]store.UserGroup, 0, len(manageGroups))
+	for gid := range manageGroups {
+		g, err := s.groups.UserGroupByID(ctx, gid)
+		if err != nil {
+			continue
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
 }
 
 // validateVendorAccountAdminGroupIDs validates the management-group set of a vendor
