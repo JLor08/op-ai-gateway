@@ -110,6 +110,74 @@ func TestRuntimeSpecTypeStableDiffusionCpp(t *testing.T) {
 	}
 }
 
+// TestDetectRuntimeSpecTypeAudioCpp covers detection of the audio.cpp server
+// from the launched binary's basename: the observed binary is
+// audiocpp_server (audiocpp_server.exe on Windows), and "audio.cpp" is the
+// project-name alias, mirroring how sd-server pairs with stable-diffusion.
+// Every other row is a near-miss negative or an existing detection that must
+// not shift: "audiocpp" alone and "audio-server" name no audio.cpp binary, so
+// a mutation widening the match to Contains(name, "audio") or
+// Contains(name, "audiocpp") must fail a row here.
+func TestDetectRuntimeSpecTypeAudioCpp(t *testing.T) {
+	for _, binary := range []string{
+		"audiocpp_server",
+		"/opt/audiocpp/audiocpp_server",
+		`C:\audiocpp\audiocpp_server.exe`,
+		"AudioCpp_Server",
+		"audio.cpp",
+		"/usr/local/bin/audio.cpp-server",
+	} {
+		if got := DetectRuntimeSpecType(binary); got != RuntimeSpecTypeAudioCpp {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", binary, got, RuntimeSpecTypeAudioCpp)
+		}
+	}
+	if RuntimeSpecTypeAudioCpp != "audio_cpp" {
+		t.Errorf("RuntimeSpecTypeAudioCpp = %q, want %q", RuntimeSpecTypeAudioCpp, "audio_cpp")
+	}
+
+	for binary, want := range map[string]RuntimeSpecType{
+		"/usr/bin/audiocpp":        RuntimeSpecTypeCustom,
+		"/usr/bin/audio-server":    RuntimeSpecTypeCustom,
+		"/usr/bin/whisper-server":  RuntimeSpecTypeCustom,
+		"/opt/tools/audacity":      RuntimeSpecTypeCustom,
+		"/opt/sd/sd-server":        RuntimeSpecTypeStableDiffusionCpp,
+		"/usr/bin/llama-server":    RuntimeSpecTypeLlamaCpp,
+		"/usr/bin/vllm":            RuntimeSpecTypeVLLM,
+		"text-generation-launcher": RuntimeSpecTypeTGI,
+		"/usr/local/bin/ollama":    RuntimeSpecTypeOllama,
+	} {
+		if got := DetectRuntimeSpecType(binary); got != want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", binary, got, want)
+		}
+	}
+
+	// An explicit Type wins over the binary, and a spec with no Type is
+	// detected from it, as for every other kind.
+	if got := EffectiveRuntimeSpecType(RuntimeSpec{Binary: "/usr/bin/anything", Type: "audio_cpp"}); got != RuntimeSpecTypeAudioCpp {
+		t.Errorf("EffectiveRuntimeSpecType(explicit audio_cpp) = %q, want %q", got, RuntimeSpecTypeAudioCpp)
+	}
+	if got := EffectiveRuntimeSpecType(RuntimeSpec{Binary: "/opt/audiocpp/audiocpp_server"}); got != RuntimeSpecTypeAudioCpp {
+		t.Errorf("EffectiveRuntimeSpecType(detected audio_cpp) = %q, want %q", got, RuntimeSpecTypeAudioCpp)
+	}
+}
+
+// TestDeriveProbePathsAudioCpp pins the audio.cpp probe paths: an
+// audiocpp_server serves no Prometheus-style /metrics, and a speech model has
+// no context window to probe, so both defaults are empty (same as
+// stable_diffusion_cpp), while an explicit override still wins per field.
+func TestDeriveProbePathsAudioCpp(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeAudioCpp, "", "")
+	if metrics != "" || context != "" {
+		t.Fatalf("probe paths = (%q, %q), want both empty", metrics, context)
+	}
+	if m, c := DeriveProbePaths(RuntimeSpecTypeAudioCpp, "/m", "/c"); m != "/m" || c != "/c" {
+		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
+	}
+	if m, c := DeriveProbePaths(RuntimeSpecTypeAudioCpp, "/m", ""); m != "/m" || c != "" {
+		t.Fatalf("metrics-only override = (%q, %q), want (/m, \"\")", m, c)
+	}
+}
+
 func TestRuntimeSpecType_DeriveProbePaths(t *testing.T) {
 	cases := []struct {
 		name            string
