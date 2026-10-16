@@ -438,6 +438,44 @@ func TestLoadMaxImageEditBodyBytesFallsBackOnJunk(t *testing.T) {
 	}
 }
 
+// The audio-transcription upload cap is its own setting, not the image-edit
+// one: operators size audio independently.
+func TestLoadMaxAudioTranscriptionBodyBytesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", "")
+	if err := os.Unsetenv("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxAudioTranscriptionBodyBytes != 32<<20 {
+		t.Fatalf("MaxAudioTranscriptionBodyBytes = %d, want %d (32 MiB, the agent router's own cap)", cfg.MaxAudioTranscriptionBodyBytes, 32<<20)
+	}
+}
+
+func TestLoadMaxAudioTranscriptionBodyBytesOverride(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", "67108864")
+	t.Setenv("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", "")
+
+	cfg := mustLoad(t)
+
+	if cfg.MaxAudioTranscriptionBodyBytes != 67108864 {
+		t.Fatalf("MaxAudioTranscriptionBodyBytes = %d, want 67108864", cfg.MaxAudioTranscriptionBodyBytes)
+	}
+	if cfg.MaxImageEditBodyBytes != 32<<20 {
+		t.Fatalf("MaxImageEditBodyBytes = %d, want the untouched 32 MiB default (the two caps are independent)", cfg.MaxImageEditBodyBytes)
+	}
+}
+
+func TestLoadMaxAudioTranscriptionBodyBytesFallsBackOnJunk(t *testing.T) {
+	for _, v := range []string{"", "   ", "garbage", "0", "-5"} {
+		t.Setenv("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", v)
+		if got := mustLoad(t).MaxAudioTranscriptionBodyBytes; got != 32<<20 {
+			t.Fatalf("value %q: MaxAudioTranscriptionBodyBytes = %d, want %d", v, got, 32<<20)
+		}
+	}
+}
+
 func TestLoadLogLevelDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_LOG_LEVEL", "")
 	if got := mustLoad(t).LogLevel; got != "info" {
