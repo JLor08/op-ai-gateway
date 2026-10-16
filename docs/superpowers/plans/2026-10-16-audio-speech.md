@@ -113,6 +113,33 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `feat(health): write the speech capability verdict from audio.cpp probes`
 
+### Task 2b: `ProviderAudioCpp` application/provider type
+
+(Added 2026-10-16 by ruling — Task 4 revealed that the health-loop verdict writer
+only reaches an app whose `app.Type` triggers the probe. sd-server uses a dedicated
+`ProviderStableDiffusionCpp` app type; audio needs the mirror, or a static
+operator-run audio.cpp server is never probed and every speech request 404s. This
+task runs after Task 4 and before Task 6/7; it supersedes Task 4's stopgap probe
+gate and subsumes Task 10's timeout.)
+
+**Files (mirror `ProviderStableDiffusionCpp` — grep it for the full set):**
+- Modify: `gateway/backend/internal/routing/store.go` (add `ProviderAudioCpp = "audio_cpp"` + doc, next to `ProviderStableDiffusionCpp` ~31)
+- Modify: `gateway/backend/cmd/gateway/main.go` (register `routing.ProviderAudioCpp: openAICompatible` in the client map ~1296 — `OpenAICompatibleClient` already implements `AudioCppModelsProber`)
+- Modify: `gateway/backend/cmd/gateway/app_health.go` (REWRITE the audio probe gate from `app.Type == ProviderServerAgent` + spec-kind to `app.Type == ProviderAudioCpp`, probing all active mappings like the sdcpp pass; keep the per-mapping `AppModelName` probe loop, since the audio verdict is per-model)
+- Modify: `gateway/backend/internal/portal/service_applications.go` (`normalizeProviderType`/validation ~1518; `applicationTimeoutDefaultFor` ~1863 → `600000`, add `defaultAudioCppTimeoutMS` — this subsumes Task 10)
+- Check & mirror if needed: `gateway/backend/internal/gateway/portal_model_endpoints.go:572` (provider-type branch); `modelDiscoveryFor` (`provider/openai_compatible.go:195`) needs NO audio branch (audio.cpp uses the default `/v1/models` discovery).
+- Test: `app_health_test.go` (gate now fires for a `ProviderAudioCpp` app with no spec; update the Task 4 gate tests that used `ProviderServerAgent`), `service_applications_test.go` (timeout default; provider-type validation).
+
+**Interfaces:**
+- Produces: `routing.ProviderAudioCpp = "audio_cpp"`.
+- Consumes: `provider.AudioCppModelsProber`/`Multiplexer.ProbeAudioCppModels` (Task 3), the Task 4 projector.
+
+- [ ] **Step 1: Write failing tests** — a `ProviderAudioCpp` app (static, NO runtime spec) with active mappings is probed and its `speech` verdict written (update/replace the Task 4 gate tests that asserted the `ProviderServerAgent`+spec gate); `applicationTimeoutDefaultFor(ProviderAudioCpp) == 600000`; the provider type validates/normalizes.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement** — mirror `ProviderStableDiffusionCpp` at every site above; rewrite the probe gate to `app.Type == ProviderAudioCpp`.
+- [ ] **Step 4: Run, verify pass** (`cmd/gateway`, `internal/portal`, and the provider package).
+- [ ] **Step 5: Commit** — `feat(provider): add the audio_cpp application type and probe static audio.cpp servers`
+
 ## Phase C — The endpoint
 
 ### Task 5: Endpoint plumbing (`endpointSpeech`, session switches, `upstreamPath`, route)
@@ -221,17 +248,12 @@ chat-prompt background jobs would ping audio models.)
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `feat(gateway): skip binary capture and normalise upstream speech errors`
 
-### Task 10: Long-synthesis timeout default
+### Task 10: Long-synthesis timeout default — SUBSUMED into Task 2b
 
-**Files:**
-- Modify: `gateway/backend/internal/portal/service_applications.go` (`applicationTimeoutDefaultFor` ~1848–1857; const block ~333–363)
-- Test: `gateway/backend/internal/portal/service_applications_test.go`
-
-- [ ] **Step 1: Write failing test** — `applicationTimeoutDefaultFor(<audio provider/appType>) == 600000` (mirror `stable_diffusion_cpp`). First confirm which provider/appType serves audio.cpp (spec §8.2): a new `ProviderAudioCpp`, or the generic native provider. If a new provider type is needed, add it here and add its const (`defaultAudioCppTimeoutMS = 600000`).
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** the case.
-- [ ] **Step 4: Run, verify pass.**
-- [ ] **Step 5: Commit** — `feat(portal): give audio.cpp applications a long synthesis timeout`
+(Resolved 2026-10-16: audio.cpp is served by the new `ProviderAudioCpp` app type
+added in Task 2b, so its `applicationTimeoutDefaultFor` → `600000` default lands
+there alongside the rest of the provider-type wiring. No separate task. Task 2b's
+tests cover the timeout default; the whole-branch review confirms it.)
 
 ## Phase D — Operator configuration (portal backend)
 
