@@ -615,6 +615,15 @@ function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
   return type === 'stable_diffusion_cpp' ? '/v1/models' : '/health';
 }
 
+// The Type select's helper text: the note of a kind whose defaults diverge
+// from the stock text server's (sd-server and audio.cpp each serve one non-text
+// API), nothing for every other kind, Auto included.
+function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string | undefined {
+  if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
+  if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;
+  return undefined;
+}
+
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
@@ -2412,13 +2421,12 @@ export function RuntimeAdminSection({
   }, [specFlavorRefusals]);
   const [specResponsesMode, setSpecResponsesMode] = useState<EndpointMode>('passthrough');
   const [specMessagesMode, setSpecMessagesMode] = useState<EndpointMode>('passthrough');
-  // The API-variant values a switch of Type to stable_diffusion_cpp replaced,
-  // so a switch back can restore them (specFlavorsAfterTypeSwitch). null when
-  // no such switch happened since the form opened, or after a switch back
-  // restored them.
-  const [specFlavorsBeforeSd, setSpecFlavorsBeforeSd] = useState<RuntimeSpecFlavorValues | null>(
-    null,
-  );
+  // The API-variant values a switch of Type to stable_diffusion_cpp or
+  // audio_cpp replaced, so a switch back can restore them
+  // (specFlavorsAfterTypeSwitch). null when no such switch happened since the
+  // form opened, or after a switch back restored them.
+  const [specFlavorsBeforeKindDefault, setSpecFlavorsBeforeKindDefault] =
+    useState<RuntimeSpecFlavorValues | null>(null);
   // The Type, binary and resolved type of the spec the form was hydrated from,
   // for the sd flavor hint under Auto (formSpecIsStableDiffusion). null on
   // Create.
@@ -2535,7 +2543,7 @@ export function RuntimeAdminSection({
     setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
-    setSpecFlavorsBeforeSd(null);
+    setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType(null);
   }
 
@@ -2590,7 +2598,7 @@ export function RuntimeAdminSection({
     setSpecFirstWrite(!spec.configured);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
-    setSpecFlavorsBeforeSd(null);
+    setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType({
       type: spec.type,
       binary: spec.binary,
@@ -2994,8 +3002,8 @@ export function RuntimeAdminSection({
 
   // The Type select's API-variant defaults (specFlavorsAfterTypeSwitch, which
   // holds the rule): the sd default on a switch to stable_diffusion_cpp, the
-  // replaced values on a switch back, and nothing for values the operator
-  // changed.
+  // audio default on a switch to audio_cpp, the replaced values on a switch
+  // back, and nothing for values the operator changed.
   function applySpecTypeFlavorDefaults(next: RuntimeSpec['type']) {
     const change = specFlavorsAfterTypeSwitch({
       from: specType,
@@ -3006,13 +3014,13 @@ export function RuntimeAdminSection({
         messagesMode: specMessagesMode,
       },
       template: runtimeSpecTemplate(application),
-      remembered: specFlavorsBeforeSd,
+      remembered: specFlavorsBeforeKindDefault,
     });
     if (change === null) return;
     setSpecApiFlavors(change.values.apiFlavors);
     setSpecResponsesMode(change.values.responsesMode);
     setSpecMessagesMode(change.values.messagesMode);
-    setSpecFlavorsBeforeSd(change.remembered);
+    setSpecFlavorsBeforeKindDefault(change.remembered);
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -4251,11 +4259,7 @@ export function RuntimeAdminSection({
                 setSpecType(next);
               }}
               sx={{ maxWidth: 340 }}
-              helperText={
-                specType === 'stable_diffusion_cpp'
-                  ? t.runtimeSpecTypeStableDiffusionCppNote
-                  : undefined
-              }
+              helperText={runtimeSpecTypeNote(specType, t)}
             >
               <option value="">{t.runtimeSpecTypeAuto}</option>
               <option value="vllm">{t.runtimeSpecTypeVllm}</option>
@@ -4263,6 +4267,7 @@ export function RuntimeAdminSection({
               <option value="tgi">{t.runtimeSpecTypeTgi}</option>
               <option value="ollama">{t.runtimeSpecTypeOllama}</option>
               <option value="stable_diffusion_cpp">{t.runtimeSpecTypeStableDiffusionCpp}</option>
+              <option value="audio_cpp">{t.runtimeSpecTypeAudioCpp}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field

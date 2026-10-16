@@ -192,3 +192,55 @@ describe('stable_diffusion_cpp defaults', () => {
     expect(applicationTypeDefaults.llama_cpp.contextProbePath).toBe('/props');
   });
 });
+
+// audio_cpp mirrors stable_diffusion_cpp's reasoning for two of the three
+// diverging fields, and differs on the third: audio.cpp answers GET /health
+// (probed), so the stock health_path mode works and is NOT overridden.
+describe('audio_cpp defaults', () => {
+  it('defaults away from the two fields whose stock value breaks this type', () => {
+    const d = applicationTypeDefaults.audio_cpp;
+    // Speech only: the stock text pair would make it a text candidate.
+    expect(d.apiFlavors).toEqual(['openai_audio']);
+    // A synthesis can run far past 30s; matches the backend's default.
+    expect(d.timeoutMs).toBe(600000);
+    // Serves GET /health, so the stock mode stays.
+    expect(d.healthCheckMode).toBe('health_path');
+    // No chat or messages endpoint to translate to.
+    expect(d.responsesMode).toBe('disabled');
+    expect(d.messagesMode).toBe('disabled');
+    // /v1/models lists the loaded models in the standard OpenAI shape.
+    expect(d.loadedModelsPath).toBe('/v1/models');
+    expect(d.loadedModelsFormat).toBe('openai');
+    // No /props.
+    expect(d.contextProbePath).toBe('');
+  });
+
+  it('migrates an untouched text form to the audio flavor and timeout on a type switch', () => {
+    const current = { ...applicationTypeDefaults.ollama };
+    const patch = migrateTypeFields('ollama', 'audio_cpp', current);
+    expect(patch.apiFlavors).toEqual(['openai_audio']);
+    expect(patch.timeoutMs).toBe(600000);
+    // health_path is shared with ollama, so there is nothing to move.
+    expect(patch.healthCheckMode).toBe('health_path');
+  });
+
+  it('migrates the same set in another order, as it does for stable_diffusion_cpp', () => {
+    const current: TypeDefaults = {
+      ...applicationTypeDefaults.ollama,
+      apiFlavors: ['anthropic', 'openai'],
+    };
+    expect(migrateTypeFields('ollama', 'audio_cpp', current).apiFlavors).toEqual(['openai_audio']);
+  });
+
+  it('preserves a customized flavor selection across a switch to audio_cpp', () => {
+    const current: TypeDefaults = { ...applicationTypeDefaults.ollama, apiFlavors: ['anthropic'] };
+    expect(migrateTypeFields('ollama', 'audio_cpp', current).apiFlavors).toBeUndefined();
+  });
+
+  it('moves an untouched audio_cpp form back to the stock text pair when the type switches away', () => {
+    const current = { ...applicationTypeDefaults.audio_cpp };
+    const patch = migrateTypeFields('audio_cpp', 'vllm', current);
+    expect(patch.apiFlavors).toEqual(['openai', 'anthropic']);
+    expect(patch.timeoutMs).toBe(30000);
+  });
+});

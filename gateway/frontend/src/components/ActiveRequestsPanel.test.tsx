@@ -492,4 +492,82 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(noneRow).getAllByRole('cell')[countIndex].textContent).toBe('—');
     });
   });
+
+  // A request billed in a non-token unit (an image, a second of speech) has no
+  // token count at all: the live row's zero is "not applicable", not "nothing
+  // reported yet". The completed-row tables already dash such a count with a
+  // tooltip; this column follows the same per-row rule, off the row's own
+  // `billing_unit` (empty or absent = token-metered).
+  describe(`ActiveRequestsPanel non-token rows in the output-tokens column [${locale}]`, () => {
+    // Seeds every optional column visible (see the test above for why this is
+    // seeded rather than clicked) and addresses the cell by column index.
+    function countCell(model: string): HTMLElement {
+      const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
+      const countIndex = headers.findIndex((h) => h.includes(t.activityColLiveOutputTokens));
+      expect(countIndex).toBeGreaterThanOrEqual(0);
+      const row = screen.getByRole('cell', { name: model }).closest('tr')!;
+      return within(row).getAllByRole('cell')[countIndex];
+    }
+
+    function renderRows() {
+      window.localStorage.setItem('op.pref.table.op.activeRequests.hidden', JSON.stringify([]));
+      render(
+        <ActiveRequestsPanel
+          t={t}
+          active={[
+            makeActive({
+              id: 'act_chat',
+              model: 'chat-model',
+              output_tokens: 12,
+              billing_unit: '',
+            }),
+            makeActive({
+              id: 'act_older',
+              model: 'older-gateway-model',
+              output_tokens: 7,
+              // No billing_unit key at all: a gateway older than the field.
+            }),
+            makeActive({
+              id: 'act_speech',
+              model: 'speech-model',
+              api_flavor: 'openai_audio',
+              req_path: '/v1/audio/speech',
+              provider_path: '/v1/audio/speech',
+              billing_unit: 'audio_second',
+            }),
+            makeActive({
+              id: 'act_image',
+              model: 'image-model',
+              api_flavor: 'openai_images',
+              req_path: '/v1/images/generations',
+              provider_path: '/v1/images/generations',
+              billing_unit: 'image',
+            }),
+          ]}
+          effectiveScope="own"
+        />,
+      );
+    }
+
+    it('shows the count for a token-metered row, with or without the billing_unit key', () => {
+      renderRows();
+      expect(countCell('chat-model').textContent).toBe('12');
+      expect(countCell('older-gateway-model').textContent).toBe('7');
+    });
+
+    it('dashes the count of a non-token row instead of printing a measured-looking zero', () => {
+      renderRows();
+      expect(countCell('speech-model').textContent).toBe('—');
+      expect(countCell('image-model').textContent).toBe('—');
+      expect(within(countCell('speech-model')).queryByText('0')).not.toBeInTheDocument();
+    });
+
+    it('explains the dash with the not-token-metered tooltip, for a non-token row only', async () => {
+      renderRows();
+      fireEvent.mouseOver(within(countCell('speech-model')).getByText('—'));
+      expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
+      // The token-metered cell has nothing to explain.
+      expect(within(countCell('chat-model')).queryByText('—')).not.toBeInTheDocument();
+    });
+  });
 }

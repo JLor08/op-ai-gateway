@@ -336,6 +336,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // refused click's toast say the same thing.
     it.each([
       ['images_only', 'errorBenchmarkImagesOnly'],
+      ['audio_only', 'errorBenchmarkAudioOnly'],
       ['agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
       ['spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
     ] as const)('disables Laden for a %s row, with %s as its tooltip', async (refusal, key) => {

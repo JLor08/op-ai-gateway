@@ -2,12 +2,14 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useReducer } from 'react';
+import { Tooltip } from '@mui/material';
 import type { ActiveRequest } from '../api';
 import type { Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import { formatMetric } from './shared/format';
 import { formatElapsed } from './shared/elapsed';
+import { isTokenMetered } from './billingUnit';
 import type { ActivityScope } from './ActivityToolbar';
 
 // A MEASURED rate must never be indistinguishable from a measured zero — that is
@@ -234,13 +236,29 @@ export function ActiveRequestsPanel({
     // `elapsed` — for an operator who has ever reordered or reset. Both are
     // inherited by every optional column in this codebase rather than anything this
     // one does, and the column menu's reset restores both to the values here.
+    //
+    // A row that is not token-metered (an image, a second of speech: its
+    // billing_unit is non-empty) has no token count at all, so its zero is NOT
+    // APPLICABLE rather than "nothing reported yet": an em dash with the same
+    // not-token-metered tooltip the completed-row tables use. The two dashes are
+    // different states -- the tooltip is what tells them apart -- and both sort
+    // the same way, since '—' is not a number. The rule is per ROW, off the
+    // row's own unit, so a token-metered row beside it still shows its count.
     {
       id: 'output_tokens',
       label: t.activityColLiveOutputTokens,
-      value: (a) => formatMetric(a.output_tokens, 0),
+      value: (a) => (isTokenMetered(a) ? formatMetric(a.output_tokens, 0) : '—'),
       searchable: false,
       numeric: true,
       defaultHidden: true,
+      render: (a) =>
+        isTokenMetered(a) ? (
+          formatMetric(a.output_tokens, 0)
+        ) : (
+          <Tooltip title={t.activityNotTokenMetered}>
+            <span>—</span>
+          </Tooltip>
+        ),
     },
     {
       id: 'ttft',

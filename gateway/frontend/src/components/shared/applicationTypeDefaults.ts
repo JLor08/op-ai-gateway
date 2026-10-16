@@ -39,6 +39,13 @@ import type {
 // current effective values for healthCheckMode ('health_path') and
 // apiFlavors (['openai', 'anthropic']), so this widening changes nothing for
 // them.
+//
+// audio_cpp is the second type to diverge, on two of the three: its stock
+// apiFlavors pair would offer a speech-only server as a text candidate (it
+// serves speech only, via the coarse 'openai_audio' flavor, which is opt-in
+// everywhere else for the same reason as 'openai_images'), and its timeout is
+// a long synthesis's, not 30s. It keeps the stock healthCheckMode: audio.cpp
+// answers GET /health, so 'health_path' works for it.
 export interface TypeDefaults {
   port: number;
   scheme: ApplicationScheme;
@@ -161,6 +168,29 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     timeoutMs: 600000,
     healthCheckMode: 'model_sync',
     apiFlavors: ['openai_images'],
+  },
+  // audio.cpp (audiocpp_server), probed live: GET /health answers
+  // {"status":"ok",...}, so the stock health_path mode stays; GET /v1/models
+  // lists the LOADED models in the standard OpenAI shape, which is exactly what
+  // the loaded-models indicator reads (format 'openai'); there is no /props and
+  // no chat endpoint, so the context probe is empty and both coding-agent
+  // endpoint modes are 'disabled' (the openai and anthropic flavors are off by
+  // default, and a gated dropdown shows Deaktiviert anyway). timeout_ms matches
+  // the backend's default for this type (portal service_applications.go,
+  // defaultAudioCppTimeoutMS): a long synthesis routinely outlasts 30s. Port
+  // 8080 is a conventional placeholder, not a property of the binary -- the
+  // operator sets the port the server was started on.
+  audio_cpp: {
+    port: 8080,
+    scheme: 'http',
+    responsesMode: 'disabled',
+    messagesMode: 'disabled',
+    loadedModelsPath: '/v1/models',
+    loadedModelsFormat: 'openai',
+    contextProbePath: '',
+    timeoutMs: 600000,
+    healthCheckMode: 'health_path',
+    apiFlavors: ['openai_audio'],
   },
 };
 

@@ -817,6 +817,7 @@ describe('model-mapping performance-metric i18n keys', () => {
       'mappingProbeContextFailed',
       'mappingContextProbePending',
       'mappingProbeContextImagesOnly',
+      'mappingProbeContextAudioOnly',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');
@@ -862,11 +863,14 @@ describe('benchmark i18n keys', () => {
       'errorBenchmarkNoModels',
       'errorBenchmarkRequestFailed',
       'errorBenchmarkImagesOnly',
+      'errorBenchmarkAudioOnly',
       'errorBenchmarkAgentEnsureUnsupported',
       'errorBenchmarkSpecForceStopped',
       'benchmarkResultSkippedImagesOnly',
+      'benchmarkResultSkippedAudioOnly',
       'benchmarkNotMeasured',
       'benchmarkImagesOnlyHint',
+      'benchmarkAudioOnlyHint',
       'benchmarkArea',
       'benchmarkScope',
       'benchmarkScopeServer',
@@ -998,6 +1002,45 @@ describe('images-only and Load-refusal i18n keys', () => {
     ] as const)(`names the API flavors field and openai_images in %s (${locale})`, (key) => {
       expect(t[key]).toContain(t.applicationFlavors);
       expect(t[key]).toContain('openai_images');
+    });
+
+    // The speech twins name the same field and the one flavor their rule looks
+    // for, openai_audio.
+    it.each([
+      'errorBenchmarkAudioOnly',
+      'benchmarkAudioOnlyHint',
+      'mappingProbeContextAudioOnly',
+    ] as const)(`names the API flavors field and openai_audio in %s (${locale})`, (key) => {
+      expect(t[key]).toContain(t.applicationFlavors);
+      expect(t[key]).toContain('openai_audio');
+      // It is the speech sentence, not the images one reworded.
+      expect(t[key]).not.toContain('openai_images');
+    });
+
+    it(`names the whole-scope case in the audio-only refusal (${locale})`, () => {
+      const sentence =
+        locale === 'de'
+          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Sprache erzeugt.'
+          : 'An application or server run is refused this way when every model in it only generates speech.';
+      expect(t.errorBenchmarkAudioOnly.endsWith(` ${sentence}`), t.errorBenchmarkAudioOnly).toBe(
+        true,
+      );
+    });
+
+    it(`labels the skipped audio-only result as a skip, distinct from the images one (${locale})`, () => {
+      expect(t.benchmarkResultSkippedAudioOnly).not.toBe(t.benchmarkResultSkippedImagesOnly);
+      expect(t.benchmarkResultSkippedAudioOnly.length).toBeGreaterThan(0);
+    });
+
+    // The ensure refusal is answered for an audio-only agent child as well as
+    // an images-only one, so its sentence must not claim images alone.
+    it(`words the ensure refusal for both kinds of model (${locale})`, () => {
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
+        locale === 'de' ? 'Bilder' : 'images',
+      );
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
+        locale === 'de' ? 'Sprache' : 'speech',
+      );
     });
 
     // The gateway keeps the agents' features in memory, so right after a
@@ -3380,6 +3423,46 @@ describe('stable-diffusion.cpp strings name what the operator sees', () => {
     // without a request, named by the label the form shows.
     it(`names the pinned control for a launch spec that has never run in the mapping hint (${locale})`, () => {
       expect(t.mappingImageCapableUnknownHint).toContain(t.runtimeSpecPinned);
+    });
+  }
+});
+
+// The audio.cpp strings send the operator to controls on the form, so they name
+// those controls by the labels the operator actually sees, read from the label
+// keys themselves (the stable-diffusion.cpp block above is the model).
+describe('audio.cpp strings name what the operator sees', () => {
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    const t = messages[locale];
+
+    it(`labels the openai_audio box with its API value and its purpose (${locale})`, () => {
+      expect(t.applicationFlavorOpenaiAudio).toContain('openai_audio');
+      expect(t.applicationFlavorOpenaiAudio).not.toBe('openai_audio');
+      expect(t.applicationFlavorOpenaiAudio).not.toBe(t.applicationFlavorOpenaiImages);
+      expect(t.applicationFlavorOpenaiAudio.toLowerCase()).toContain(
+        locale === 'de' ? 'sprachsynthese' : 'speech synthesis',
+      );
+    });
+
+    // The note also shows on an edit, where the operator may have changed
+    // every one of these values, so it describes the type's defaults and not
+    // the form's current state.
+    it(`states defaults rather than current values in the application note (${locale})`, () => {
+      expect(t.applicationTypeAudioCppNote).toContain(
+        locale === 'de' ? 'standardmäßig' : 'defaults to',
+      );
+      expect(t.applicationTypeAudioCppNote).toContain('openai_audio');
+    });
+
+    // audio.cpp answers GET /health, so the note must not tell the operator
+    // the health check mode was moved, as the sd note does.
+    it(`does not claim a health check mode override in the application note (${locale})`, () => {
+      expect(t.applicationTypeAudioCppNote).not.toContain(t.applicationHealthModeModelSync);
+    });
+
+    it(`says which flavor boxes to tick, on the spec and on its parent, in the launch-spec note (${locale})`, () => {
+      expect(t.runtimeSpecTypeAudioCppNote).toContain(t.applicationFlavors);
+      expect(t.runtimeSpecTypeAudioCppNote).toContain(t.applicationFlavorOpenaiAudio);
+      expect(t.runtimeSpecTypeAudioCppNote).toContain('server_agent');
     });
   }
 });

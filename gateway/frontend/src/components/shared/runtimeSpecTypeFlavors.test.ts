@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  audioCppSpecFlavorDefaults,
   flavorsAreImagesOnly,
   formSpecIsStableDiffusion,
   specFlavorsAfterTypeSwitch,
@@ -253,5 +254,187 @@ describe('specFlavorsAfterTypeSwitch', () => {
       remembered: null,
     });
     expect(toSd?.values.apiFlavors).not.toBe(stableDiffusionSpecFlavorDefaults.apiFlavors);
+  });
+});
+
+// audio_cpp is the second kind whose spec form defaults the API-variant block
+// (speech only, both coding-agent modes disabled), under the same preservation
+// contract as stable_diffusion_cpp: only values the form put there move.
+describe('specFlavorsAfterTypeSwitch for audio_cpp', () => {
+  const template: RuntimeSpecFlavorValues = {
+    apiFlavors: ['openai', 'anthropic'],
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
+  };
+  const audioDefault: RuntimeSpecFlavorValues = {
+    apiFlavors: ['openai_audio'],
+    responsesMode: 'disabled',
+    messagesMode: 'disabled',
+  };
+  const sdDefault: RuntimeSpecFlavorValues = {
+    apiFlavors: ['openai_images'],
+    responsesMode: 'disabled',
+    messagesMode: 'disabled',
+  };
+
+  it('is the audio default: openai_audio with both modes disabled', () => {
+    expect(audioCppSpecFlavorDefaults).toEqual(audioDefault);
+  });
+
+  it('sets the audio default and remembers the values when switching to audio_cpp untouched', () => {
+    const current: RuntimeSpecFlavorValues = {
+      apiFlavors: ['anthropic', 'openai'],
+      responsesMode: 'translate',
+      messagesMode: 'passthrough',
+    };
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'llama_cpp',
+        to: 'audio_cpp',
+        current,
+        template,
+        remembered: null,
+      }),
+    ).toEqual({ values: audioDefault, remembered: current });
+  });
+
+  it('moves nothing when switching to audio_cpp with flavors other than the template', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: '',
+        to: 'audio_cpp',
+        current: { ...template, apiFlavors: ['openai'] },
+        template,
+        remembered: null,
+      }),
+    ).toBeNull();
+  });
+
+  it('restores the remembered values when switching from audio_cpp to an explicit type untouched', () => {
+    const remembered: RuntimeSpecFlavorValues = { ...template, responsesMode: 'translate' };
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'audio_cpp',
+        to: 'vllm',
+        current: audioDefault,
+        template,
+        remembered,
+      }),
+    ).toEqual({ values: remembered, remembered: null });
+  });
+
+  it('restores the template when nothing is remembered (a spec loaded as audio_cpp)', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'audio_cpp',
+        to: 'llama_cpp',
+        current: audioDefault,
+        template,
+        remembered: null,
+      }),
+    ).toEqual({ values: template, remembered: null });
+  });
+
+  it('moves nothing when switching from audio_cpp with values other than the audio default', () => {
+    for (const current of [
+      { ...audioDefault, apiFlavors: ['openai_audio', 'openai'] },
+      { ...audioDefault, messagesMode: 'passthrough' as const },
+      { ...audioDefault, responsesMode: 'translate' as const },
+    ]) {
+      expect(
+        specFlavorsAfterTypeSwitch({
+          from: 'audio_cpp',
+          to: 'llama_cpp',
+          current,
+          template,
+          remembered: template,
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it('moves nothing on a switch to Auto, and nothing when the type does not change', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'audio_cpp',
+        to: '',
+        current: audioDefault,
+        template,
+        remembered: template,
+      }),
+    ).toBeNull();
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'audio_cpp',
+        to: 'audio_cpp',
+        current: template,
+        template,
+        remembered: null,
+      }),
+    ).toBeNull();
+  });
+
+  // Between the two flavor-defaulting kinds the replaced values must survive
+  // the hop: the remembered slot keeps what the operator had BEFORE the first
+  // default, so the trip back to an ordinary type still restores it.
+  it('hops from the sd default to the audio default without forgetting the original values', () => {
+    const original: RuntimeSpecFlavorValues = { ...template, responsesMode: 'translate' };
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'stable_diffusion_cpp',
+        to: 'audio_cpp',
+        current: sdDefault,
+        template,
+        remembered: original,
+      }),
+    ).toEqual({ values: audioDefault, remembered: original });
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'audio_cpp',
+        to: 'stable_diffusion_cpp',
+        current: audioDefault,
+        template,
+        remembered: original,
+      }),
+    ).toEqual({ values: sdDefault, remembered: original });
+  });
+
+  it('moves nothing on a hop between the two kinds when the values are not the default', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'stable_diffusion_cpp',
+        to: 'audio_cpp',
+        current: { ...sdDefault, apiFlavors: ['openai_images', 'openai'] },
+        template,
+        remembered: template,
+      }),
+    ).toBeNull();
+  });
+
+  it("does not remember the sd default as the operator's values when the parent is images-only", () => {
+    // The template's flavors equal the sd default's here, so judging the hop
+    // against the template would remember the sd default itself; the hop is
+    // judged against the kind it leaves first.
+    const imagesTemplate: RuntimeSpecFlavorValues = { ...sdDefault };
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'stable_diffusion_cpp',
+        to: 'audio_cpp',
+        current: sdDefault,
+        template: imagesTemplate,
+        remembered: null,
+      }),
+    ).toEqual({ values: audioDefault, remembered: null });
+  });
+
+  it('returns copies, never the default arrays', () => {
+    const toAudio = specFlavorsAfterTypeSwitch({
+      from: '',
+      to: 'audio_cpp',
+      current: template,
+      template,
+      remembered: null,
+    });
+    expect(toAudio?.values.apiFlavors).not.toBe(audioCppSpecFlavorDefaults.apiFlavors);
   });
 });

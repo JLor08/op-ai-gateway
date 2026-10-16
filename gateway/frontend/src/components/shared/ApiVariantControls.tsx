@@ -11,11 +11,23 @@ import type { Translation } from './types';
 
 // The API-Varianten capability checkboxes. openai gates /v1/responses (Codex)
 // AND /v1/chat/completions; anthropic gates /v1/messages (Claude Code);
-// openai_images gates /v1/images/generations. The last is a coarse flavor of
-// its own with no endpoint-mode dropdown (images have no translate path to
-// choose), and it is opt-in: nothing here ticks it -- only the
-// stable_diffusion_cpp type default and an operator do.
-const apiVariantFlavorOptions = ['openai', 'anthropic', 'openai_images'];
+// openai_images gates /v1/images/generations; openai_audio gates
+// /v1/audio/speech. The last two are coarse flavors of their own with no
+// endpoint-mode dropdown (images and speech have no translate path to
+// choose), and both are opt-in: nothing here ticks them -- only the
+// stable_diffusion_cpp / audio_cpp type defaults and an operator do.
+const apiVariantFlavorOptions = ['openai', 'anthropic', 'openai_images', 'openai_audio'];
+
+// The flavors whose checkbox label says more than the API value: it names the
+// purpose too, because the value alone does not say what it unlocks. openai and
+// anthropic are not here and show their raw value.
+const flavorLabelKey: Record<
+  string,
+  'applicationFlavorOpenaiImages' | 'applicationFlavorOpenaiAudio'
+> = {
+  openai_images: 'applicationFlavorOpenaiImages',
+  openai_audio: 'applicationFlavorOpenaiAudio',
+};
 const endpointModeOptions: EndpointMode[] = ['disabled', 'translate', 'passthrough'];
 
 const endpointModeLabelByKey: Record<
@@ -32,8 +44,8 @@ function toggleFlavor(list: string[], flavor: string): string[] {
 }
 
 /**
- * The shared "API-Varianten" control block: the openai/anthropic/openai_images
- * capability checkboxes plus one three-state endpoint-mode dropdown per
+ * The shared "API-Varianten" control block: the openai/anthropic/openai_images/
+ * openai_audio capability checkboxes plus one three-state endpoint-mode dropdown per
  * coding-agent API.
  * Both ApplicationSection and RuntimeAdminSection render it, so the two forms
  * stay identical (design §5.1).
@@ -90,7 +102,7 @@ export function ApiVariantControls({
         legend={t.applicationFlavors}
         options={apiVariantFlavorOptions.map((f) => ({
           value: f,
-          label: f === 'openai_images' ? t.applicationFlavorOpenaiImages : f,
+          label: flavorLabelKey[f] ? t[flavorLabelKey[f]] : f,
         }))}
         selected={apiFlavors}
         onToggle={(v) => onFlavorsChange(toggleFlavor(apiFlavors, v))}

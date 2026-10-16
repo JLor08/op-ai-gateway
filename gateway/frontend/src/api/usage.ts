@@ -186,6 +186,13 @@ export type ActiveRequest = {
   tokens_per_second: number;
   tokens_per_second_source: string;
   ttft_ms: number;
+  // The non-token billable unit this request will be billed in ("image",
+  // "audio_second"), or "" when it is token-metered (chat). The in-flight twin
+  // of the completed row's `UsageEvent.billing_unit`: both say whether the
+  // token columns apply at all. Always present on the real wire DTO; optional
+  // here so existing fixtures, and a gateway older than the field, read as
+  // token-metered (isTokenMetered treats absent like empty).
+  billing_unit?: string;
 };
 
 export type CaptureDetail = {

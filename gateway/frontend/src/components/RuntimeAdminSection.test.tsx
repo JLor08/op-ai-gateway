@@ -8698,6 +8698,7 @@ function flavorBoxes() {
     openai: screen.getByRole('checkbox', { name: 'openai' }),
     anthropic: screen.getByRole('checkbox', { name: 'anthropic' }),
     images: screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiImages }),
+    audio: screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiAudio }),
   };
 }
 
@@ -9107,5 +9108,219 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
     expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
     expect(putSpecs[0].body.responses_mode).toBe('passthrough');
     expect(putSpecs[0].body.messages_mode).toBe('passthrough');
+  });
+});
+
+// audio_cpp is the second launch-spec kind whose form defaults the API-variant
+// block: speech only, both coding-agent modes disabled. The rule is the sd one
+// (only values the form put there move), and audio.cpp answers GET /health, so
+// unlike sd its health path default stays /health.
+describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, () => {
+  async function openCreateWithBinary(
+    parent: Partial<PortalApplication> = { api_flavors: ['openai', 'anthropic'] },
+    binary = '/opt/audiocpp/audiocpp_server',
+  ) {
+    const rendered = renderSection({ application: { ...application, ...parent } });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), { target: { value: binary } });
+    return rendered;
+  }
+
+  it('offers audio_cpp in the Type select', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.runtimeSpecType }));
+    expect(
+      await screen.findByRole('option', { name: t.runtimeSpecTypeAudioCpp }),
+    ).toBeInTheDocument();
+  });
+
+  it('shows the audio.cpp note as the type select description, and only for audio_cpp', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecTypeAudioCppNote)).not.toBeInTheDocument();
+
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    const typeCombo = screen.getByRole('combobox', { name: t.runtimeSpecType });
+    expect(typeCombo).toHaveAccessibleDescription(t.runtimeSpecTypeAudioCppNote);
+
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(screen.queryByText(t.runtimeSpecTypeAudioCppNote)).not.toBeInTheDocument();
+  });
+
+  it('sets openai_audio with both modes disabled when an untouched Create switches to audio_cpp', async () => {
+    const { putSpecs } = await openCreateWithBinary();
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+
+    expect(flavorBoxes().audio).toBeChecked();
+    expect(flavorBoxes().openai).not.toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('audio_cpp');
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_audio']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+  });
+
+  // audio.cpp answers GET /health (probed), so the sd health path move must not
+  // fire for it.
+  it('leaves an untouched health path at /health when audio_cpp is selected', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/health',
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    const field = screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement;
+    expect(field.value).toBe('/health');
+    expect(field).toHaveAttribute('placeholder', '/health');
+  });
+
+  it('restores the replaced values, not the template, on a switch back to an explicit type', async () => {
+    const { putSpecs } = await openCreateWithBinary();
+    fireEvent.click(flavorBoxes().openai);
+    fireEvent.click(flavorBoxes().openai);
+    await pickFlavorFormMode(t.applicationResponsesMode, t.applicationModeTranslate);
+
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    expect(flavorBoxes().audio).toBeChecked();
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().audio).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['anthropic', 'openai']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+  });
+
+  it('keeps the original values across a hop from the sd default to the audio default and back out', async () => {
+    const { putSpecs } = await openCreateWithBinary();
+    await pickFlavorFormMode(t.applicationResponsesMode, t.applicationModeTranslate);
+
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(flavorBoxes().images).toBeChecked();
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    expect(flavorBoxes().audio).toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().audio).not.toBeChecked();
+    expect(flavorBoxes().images).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+  });
+
+  it('restores the parent template when a spec loaded as audio_cpp switches to an explicit type', async () => {
+    const { putSpecs } = await openFlavorSpecEdit(
+      {
+        binary: '/opt/audiocpp/audiocpp_server',
+        type: 'audio_cpp',
+        effective_type: 'audio_cpp',
+        api_flavors: ['openai_audio'],
+        responses_mode: 'disabled',
+        messages_mode: 'disabled',
+      },
+      {
+        ...application,
+        api_flavors: ['openai', 'anthropic', 'openai_audio'],
+        responses_mode: 'translate',
+        messages_mode: 'passthrough',
+      },
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeVllm);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    expect(flavorBoxes().audio).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(putSpecs[0].body.responses_mode).toBe('translate');
+  });
+
+  it('leaves flavors other than the template alone on a switch to audio_cpp', async () => {
+    await openCreateWithBinary();
+    fireEvent.click(flavorBoxes().anthropic);
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    expect(flavorBoxes().audio).not.toBeChecked();
+  });
+
+  // The spec's own flavor authority must be able to carry openai_audio: the
+  // speech relay refuses an agent-launched child whose spec does not declare it.
+  it('sends openai_audio in the spec PUT body once its checkbox is ticked', async () => {
+    const { putSpecs } = await openCreateWithBinary();
+    const audio = flavorBoxes().audio;
+    // Opt-in: the parent application does not declare it, so it starts unticked.
+    expect(audio).not.toBeChecked();
+    fireEvent.click(audio);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic', 'openai_audio']);
+  });
+
+  it('does not carry the parent application openai_audio into a new spec', async () => {
+    const { putSpecs } = await openCreateWithBinary(
+      { api_flavors: ['openai', 'anthropic', 'openai_audio'] },
+      '/usr/bin/llama-server',
+    );
+    expect(flavorBoxes().audio).not.toBeChecked();
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'anthropic']);
+  });
+
+  // Under a parent whose flavors are EXACTLY [openai_audio], dropping the
+  // opt-in flavor would open the spec with nothing ticked, a state the form
+  // refuses to save: inherit it as-is, as for an images-only parent.
+  it('inherits openai_audio into a new spec when the parent application is audio-only', async () => {
+    const { putSpecs } = await openCreateWithBinary({ api_flavors: ['openai_audio'] });
+    expect(flavorBoxes().audio).toBeChecked();
+    expect(flavorBoxes().openai).not.toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai_audio']);
+  });
+
+  it('warns when the switch to audio_cpp ticks openai_audio under a parent without it', async () => {
+    await openCreateWithBinary({ api_flavors: ['openai', 'anthropic'] });
+    expect(screen.queryByText(t.runtimeSpecFlavorsNotOnApplicationHint)).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    expect(screen.getByText(t.runtimeSpecFlavorsNotOnApplicationHint)).toBeInTheDocument();
+  });
+
+  it('shows a stored spec openai_audio as ticked, and unticking it removes it from the PUT', async () => {
+    const { putSpecs } = await openFlavorSpecEdit(
+      {
+        binary: '/opt/audiocpp/audiocpp_server',
+        type: 'audio_cpp',
+        effective_type: 'audio_cpp',
+        api_flavors: ['openai', 'openai_audio'],
+      },
+      { ...application, api_flavors: ['openai', 'anthropic', 'openai_audio'] },
+    );
+    expect(flavorBoxes().audio).toBeChecked();
+    fireEvent.click(flavorBoxes().audio);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
   });
 });

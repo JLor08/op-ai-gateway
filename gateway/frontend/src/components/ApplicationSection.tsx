@@ -46,17 +46,19 @@ const applicationTypeOptions: ApplicationType[] = [
   'litellm',
   'server_agent',
   'stable_diffusion_cpp',
+  'audio_cpp',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 // Seeds a fresh create form's flavor checkboxes (openCreate always starts
-// from ollama or server_agent, never stable_diffusion_cpp -- see
+// from ollama or server_agent, never stable_diffusion_cpp or audio_cpp -- see
 // managedRuntimeOnly below -- so this pair is that seed, not a master list of
-// every valid flavor). 'openai_images' is deliberately NOT added here: it is
-// opt-in everywhere, and seeding it would make every freshly created
-// application, of any type, an image candidate. An operator ticks its own
-// checkbox (ApiVariantControls), and stable_diffusion_cpp gets it from
+// every valid flavor). 'openai_images' and 'openai_audio' are deliberately NOT
+// added here: they are opt-in everywhere, and seeding either would make every
+// freshly created application, of any type, an image or speech candidate. An
+// operator ticks their own checkboxes (ApiVariantControls), and
+// stable_diffusion_cpp / audio_cpp get theirs from
 // applicationTypeDefaults.apiFlavors via handleTypeChange, the moment the
-// type select is switched to it.
+// type select is switched to them.
 const applicationFlavorOptions = ['openai', 'anthropic'];
 
 // Three states, not two. The previous binary derivation rendered four
@@ -496,8 +498,8 @@ export function ApplicationSection({
   // An empty flavor list cannot be saved honestly: the backend stores [] as
   // [openai, anthropic] (normalizeFlavors, the migration-safety default), so
   // a form showing nothing ticked would save a text candidate -- on a
-  // stable_diffusion_cpp application, exactly the trap its type default
-  // exists to prevent. The save is refused and the reason shown instead.
+  // stable_diffusion_cpp or audio_cpp application, exactly the trap its type
+  // default exists to prevent. The save is refused and the reason shown instead.
   function flavorsMissing(): boolean {
     if (flavors.length > 0) return false;
     setFlavorsTouched(true);
@@ -747,11 +749,13 @@ export function ApplicationSection({
     // preferences -- see applicationTypeDefaults.ts. This is the only place
     // that tells the operator so; the values themselves are silent. Riding the
     // same slot is what gets it announced with the field (aria-describedby),
-    // as the launch-spec form's type note is.
+    // as the launch-spec form's type note is. audio_cpp's two diverging
+    // defaults (API flavors, timeout) are explained the same way.
     const typeDescriptions = [
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
       type === 'stable_diffusion_cpp' ? t.applicationTypeStableDiffusionCppNote : undefined,
+      type === 'audio_cpp' ? t.applicationTypeAudioCppNote : undefined,
     ].filter((reason): reason is string => reason !== undefined);
     // The scheme is the GATEWAY's field only while the application actually
     // takes part in the proxy on a server that runs one. In every other case --
