@@ -25,10 +25,17 @@ export type VendorAccessAccountDTO = {
 };
 
 // A token's per-vendor-account ("Anbieter") access. `all` = every account the
-// owner has (also future ones) under its own prefix; otherwise `accounts` is the
-// explicit opt-in list. A read ALWAYS carries `accounts` as an array (empty when
-// `all` is true); a write may omit it when `all` is true. A token that omits
-// vendor_access on create has no vendor access.
+// token's OWN user owns (also future ones) under its own prefix; it never covers a
+// SHARED account (one somebody else owns and shares through a resource group), nor
+// anything for a service token, which owns nothing. A shared account is reached
+// only by its explicit per-account entry in `accounts`, which is read next to
+// `all` too (an entry naming an own account is ignored under `all`: all wins, an
+// entry naming any other account is a live opt-in, and an account the token's
+// principal cannot reach is refused as unknown: 400
+// portal.token_vendor_access_invalid). Without `all`, `accounts` is the whole
+// explicit opt-in list. A read ALWAYS carries `accounts` as an array; a write may
+// omit it when `all` is true. A token that omits vendor_access on create has no
+// vendor access.
 export type VendorAccessDTO = {
   all: boolean;
   accounts?: VendorAccessAccountDTO[];

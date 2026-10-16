@@ -2099,14 +2099,29 @@ const de = {
   errorTokenProjectNotMember: 'Sie sind kein Mitglied dieses Projekts.',
   tokenVendorAccessLabel: 'Anbieter-Zugriff',
   tokenVendorAccessNote: 'Wähle, welche Anbieter dieser Token nutzen darf.',
-  tokenVendorAccessAll: 'Alle Anbieter (auch künftige)',
-  tokenVendorAccessAllHint: 'Nutzt alle verbundenen Konten unter ihrem eigenen Prefix.',
-  tokenVendorAccessAccountsLabel: 'Verfügbare Anbieter',
+  // "Alle" deckt nur die eigenen Konten des Token-Besitzers ab; ein geteiltes Konto
+  // (ADR-050) braucht immer seinen eigenen Eintrag, auch neben "Alle".
+  tokenVendorAccessAll: 'Alle eigenen Anbieter (auch künftige)',
+  tokenVendorAccessAllHint:
+    'Nutzt alle eigenen Konten unter ihrem eigenen Prefix. Mit dir geteilte Anbieter gehören nicht dazu: Sie werden unten einzeln gewählt.',
+  tokenVendorAccessAccountsLabel: 'Eigene Anbieter',
+  tokenVendorAccessSharedLabel: 'Mit mir geteilte Anbieter',
+  tokenVendorAccessSharedHint:
+    'Ein geteilter Anbieter wird nie automatisch freigeschaltet, auch nicht mit „Alle eigenen Anbieter“. Nutzbar ist er nur, wenn du ihn über eine Ressourcengruppe erreichst; sonst wird das Speichern abgelehnt.',
   tokenVendorAccessPrefixToggle: 'Prefix überschreiben',
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Leer = Modelle unter Originalnamen ohne Prefix.',
   tokenVendorAccessNone: 'Keine Anbieter verbunden.',
-  errorTokenVendorAccessInvalid: 'Anbieter-Zugriff ungültig.',
+  // Service-Token: ein Dienst besitzt keine Konten, der Anbieter-Zugriff gilt nur beim
+  // Erstellen (kein Bearbeiten), eine Rotation behält ihn.
+  serviceTokenVendorAccessNote:
+    'Ein Dienst besitzt keine eigenen Anbieter-Konten. Nutzbar sind nur Konten, die mit diesem Dienst geteilt sind (der Dienst gehört zu einer Ressourcengruppe, die das Konto enthält); jedes wird einzeln gewählt. Die Auswahl gilt nur beim Erstellen: Eine Rotation behält sie bei, zum Ändern muss ein neuer Token erstellt werden.',
+  serviceTokenVendorAccessAccountsLabel: 'Geteilte Anbieter',
+  serviceTokenVendorAccessNone: 'Es sind keine geteilten Anbieter verfügbar.',
+  serviceTokenRotateKeepsVendorAccess:
+    'Der Anbieter-Zugriff des Tokens bleibt bei der Rotation unverändert.',
+  errorTokenVendorAccessInvalid:
+    'Anbieter-Zugriff ungültig: Ein gewähltes Konto ist für diesen Token nicht erreichbar, oder ein Prefix ist ungültig.',
   errorTokenVendorAccessConflict:
     'Zwei Anbieter liefern denselben Modellnamen — vergib einen eigenen Prefix.',
   activityEmpty: 'Keine Anfragen',
@@ -4943,14 +4958,29 @@ const en: PortalMessages = {
   errorTokenProjectNotMember: 'You are not a member of that project.',
   tokenVendorAccessLabel: 'Provider access',
   tokenVendorAccessNote: 'Choose which providers this token may use.',
-  tokenVendorAccessAll: 'All providers (incl. future)',
-  tokenVendorAccessAllHint: 'Uses every connected account under its own prefix.',
-  tokenVendorAccessAccountsLabel: 'Available providers',
+  // "All" covers only the token owner's own accounts; a shared account (ADR-050)
+  // always needs its own entry, also next to "All".
+  tokenVendorAccessAll: 'All own providers (incl. future)',
+  tokenVendorAccessAllHint:
+    'Uses every own account under its own prefix. Providers shared with you are not part of it: you pick them one by one below.',
+  tokenVendorAccessAccountsLabel: 'Own providers',
+  tokenVendorAccessSharedLabel: 'Providers shared with me',
+  tokenVendorAccessSharedHint:
+    'A shared provider is never enabled automatically, not even by "All own providers". It is usable only when you reach it through a resource group; otherwise saving is refused.',
   tokenVendorAccessPrefixToggle: 'Override prefix',
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Empty = models under their original names, no prefix.',
   tokenVendorAccessNone: 'No providers connected.',
-  errorTokenVendorAccessInvalid: 'Provider access is invalid.',
+  // Service token: a service owns no accounts, the provider access is set at create
+  // only (no edit), and a rotation keeps it.
+  serviceTokenVendorAccessNote:
+    'A service owns no provider accounts of its own. Only accounts shared with this service (the service belongs to a resource group that contains the account) can be used, each chosen individually. The selection applies at creation only: a rotation keeps it, and changing it means creating a new token.',
+  serviceTokenVendorAccessAccountsLabel: 'Shared providers',
+  serviceTokenVendorAccessNone: 'No shared providers are available.',
+  serviceTokenRotateKeepsVendorAccess:
+    'The provider access of this token stays unchanged by the rotation.',
+  errorTokenVendorAccessInvalid:
+    'Provider access is invalid: a selected account is not reachable for this token, or a prefix is invalid.',
   errorTokenVendorAccessConflict:
     'Two providers serve the same model name — give one a distinct prefix.',
   activityEmpty: 'No requests yet',

@@ -276,6 +276,7 @@ export const viewRegistry: Record<View, ViewEntry> = {
         models={ctx.models}
         role={ctx.role}
         userId={ctx.userId}
+        vendorAccountsEnabled={ctx.vendorAccountsEnabled}
       />
     ),
   },

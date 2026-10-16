@@ -60,6 +60,7 @@ export function ServicesView({
   models,
   role,
   userId,
+  vendorAccountsEnabled = false,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -78,10 +79,15 @@ export function ServicesView({
     | 'services'
     | 'setServiceAdminGroups'
     | 'updateService'
+    | 'vendorAccounts'
   >;
   models: ModelOption[];
   role: string;
   userId: string;
+  // The vendor-accounts MASTER flag (system setting vendor_accounts_enabled),
+  // handed to the token section's vendor-access picker (see TokenList). Optional so
+  // pre-existing renders keep working; defaults to false.
+  vendorAccountsEnabled?: boolean;
 }>) {
   const isAdmin = role === 'admin' || role === 'system_admin';
   const { showError, showSuccess } = useToast();
@@ -679,6 +685,7 @@ export function ServicesView({
           api={api}
           service={svc}
           models={models}
+          vendorAccountsEnabled={vendorAccountsEnabled}
           onTokenCountChanged={(delta) =>
             setServicesData((current) =>
               (current ?? []).map((s) =>

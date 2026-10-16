@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useState, type SubmitEvent } from 'react';
+import { useEffect, useRef, useState, type SubmitEvent } from 'react';
 import {
   Box,
   Button,
@@ -18,11 +18,18 @@ import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
-import type { ModelOption, PortalService, ServiceTokenDTO } from '../api';
+import type {
+  ModelOption,
+  PortalService,
+  ServiceTokenDTO,
+  VendorAccessDTO,
+  VendorAccount,
+} from '../api';
 import type { MessageKey, Translation, PortalApi } from './shared/types';
 import { formatPortalError, formatDate } from './shared/format';
 import { Panel } from './shared/Panel';
 import { Field } from './shared/Field';
+import { CheckboxGroup } from './shared/CheckboxGroup';
 import { StatusChip } from './shared/StatusChip';
 import { SecretReveal } from './shared/SecretReveal';
 import { ConfirmDialog } from './shared/ConfirmDialog';
@@ -36,6 +43,16 @@ import {
   type OverrideRow,
 } from './shared/ModelOverrideEditor';
 import { OverrideTargetSelect, overrideTargets } from './shared/OverrideTargetSelect';
+import {
+  offerableVendorAccounts,
+  patchVendorAccessEntry,
+  toggleVendorAccessEntry,
+  vendorAccessEntryDTO,
+  vendorAccessEntryInvalid,
+  vendorAccountOptionLabel,
+  type VendorAccessEntryState,
+} from './shared/vendorAccessAccounts';
+import { VendorAccessEntryGroups } from './shared/VendorAccessEntryGroups';
 import { useToast } from './shared/ToastProvider';
 
 const serviceTokenStatusLabelByKey: Record<string, MessageKey> = {
@@ -66,21 +83,38 @@ function serviceTokenCurlCommand(secret: string): string {
  * `token_count` display in sync via `onTokenCountChanged`, called with +1 on
  * create and -1 on delete (mirroring the exact clamped update ServicesView
  * used to perform inline: `Math.max(0, token_count + delta)`).
+ *
+ * Vendor access (#183 sharing): while the vendor-accounts master flag is on, the
+ * create dialog also offers the accounts a service could be given, each named
+ * explicitly with an optional prefix override. A service owns no account, so these
+ * are accounts SHARED with it (the service provisioned into a resource group that
+ * contains them). The opt-in is create-only, like every other setting of a service
+ * token: there is no edit action, and a rotation keeps it.
  */
 export function ServiceTokensSection({
   t,
   api,
   service,
   models,
+  vendorAccountsEnabled = false,
   onTokenCountChanged,
 }: Readonly<{
   t: Translation;
   api: Pick<
     PortalApi,
-    'createServiceToken' | 'deleteServiceToken' | 'rotateServiceToken' | 'serviceTokens'
+    | 'createServiceToken'
+    | 'deleteServiceToken'
+    | 'rotateServiceToken'
+    | 'serviceTokens'
+    | 'vendorAccounts'
   >;
   service: PortalService;
   models: ModelOption[];
+  // The vendor-accounts MASTER flag (see TokenList): off hides the vendor-access
+  // picker, skips the account fetch (the endpoint 409s while the flag is off) and
+  // keeps vendor_access out of the create body. Optional so pre-existing renders
+  // keep working; defaults to false.
+  vendorAccountsEnabled?: boolean;
   onTokenCountChanged?: (delta: number) => void;
 }>) {
   const { showError } = useToast();
@@ -127,6 +161,37 @@ export function ServiceTokensSection({
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
   const tokenOverrideRowsInvalid = overrideRowsInvalid(tokenOverrideRows);
+  // Vendor access (flag-gated, see vendorAccountsEnabled): the explicit per-account
+  // opt-in. There is no `all` for a service (it owns no account, so `all` would
+  // cover nothing). vendorAccounts is the CREATOR's account list
+  // api.vendorAccounts() returns, loaded each time the dialog opens with a
+  // latest-wins guard; null = not loaded for this open (in flight or failed). It
+  // is the best the portal can offer: whether the SERVICE reaches an account is
+  // decided by its resource-group provisioning, which the list does not carry, so
+  // the backend save check (an unreachable id is a 400) and routing are the gate.
+  const [tokenVaEntries, setTokenVaEntries] = useState<VendorAccessEntryState[]>([]);
+  const [vendorAccounts, setVendorAccounts] = useState<VendorAccount[] | null>(null);
+  const vendorAccountsReqIdRef = useRef(0);
+  const sharedVendorAccounts = offerableVendorAccounts(vendorAccounts ?? [], 'service').shared;
+  // The entries the create carries: only accounts the dialog offered (a picked entry
+  // can only come from an offered one, so this guards a list that reloaded).
+  const offeredVaIds = new Set(sharedVendorAccounts.map((acc) => acc.id));
+  const sentVaEntries = tokenVaEntries.filter((entry) => offeredVaIds.has(entry.accountId));
+  const tokenVendorAccessInvalid =
+    vendorAccountsEnabled && sentVaEntries.some(vendorAccessEntryInvalid);
+
+  useEffect(() => {
+    if (!tokenFormOpen || !vendorAccountsEnabled) return;
+    const reqId = ++vendorAccountsReqIdRef.current;
+    api
+      .vendorAccounts()
+      .then((resp) => {
+        if (vendorAccountsReqIdRef.current === reqId) setVendorAccounts(resp.data);
+      })
+      .catch(() => {
+        /* best-effort: the picker stays without options and the token is created without vendor access */
+      });
+  }, [tokenFormOpen, api, vendorAccountsEnabled]);
 
   // The one-time reveal (create or rotate) — empty = closed.
   const [revealedSecret, setRevealedSecret] = useState('');
@@ -144,7 +209,18 @@ export function ServiceTokensSection({
     setTokenClaudeEffort(false);
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
+    setTokenVaEntries([]);
+    setVendorAccounts(null);
     setTokenFormOpen(true);
+  }
+
+  // The vendor_access create value: undefined while the flag is off or nothing is
+  // picked (the strict default: no vendor access, which an omitted field means);
+  // otherwise the explicit list, `all` off. An override that is off omits
+  // prefix_override entirely, an enabled one sends its trimmed value.
+  function buildVendorAccess(): VendorAccessDTO | undefined {
+    if (!vendorAccountsEnabled || sentVaEntries.length === 0) return undefined;
+    return { all: false, accounts: sentVaEntries.map(vendorAccessEntryDTO) };
   }
 
   async function submitCreateToken(event: SubmitEvent<HTMLFormElement>) {
@@ -165,6 +241,7 @@ export function ServiceTokensSection({
         claude_effort_compatibility: tokenClaudeEffort,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
+        vendor_access: buildVendorAccess(),
       });
       setTokens((current) => [resp.token, ...current]);
       onTokenCountChanged?.(1);
@@ -450,6 +527,57 @@ export function ServiceTokensSection({
                 {t.tokenClaudeEffortHint}
               </Typography>
             </Box>
+            {/* Hidden entirely while the vendor-accounts master flag is off. Create
+                only: a service token has no edit action and a rotation keeps the
+                opt-in (the note says so). Account names are owner-supplied text:
+                rendered as text only. */}
+            {vendorAccountsEnabled && (
+              <Box
+                role="group"
+                aria-labelledby="service-token-vendor-access-heading"
+                sx={{ display: 'grid', gap: 1 }}
+              >
+                <Typography id="service-token-vendor-access-heading" variant="subtitle2">
+                  {t.tokenVendorAccessLabel}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {t.serviceTokenVendorAccessNote}
+                </Typography>
+                {vendorAccounts !== null && sharedVendorAccounts.length === 0 && (
+                  <Typography variant="body2" color="text.secondary">
+                    {t.serviceTokenVendorAccessNone}
+                  </Typography>
+                )}
+                {sharedVendorAccounts.length > 0 && (
+                  <CheckboxGroup
+                    legend={t.serviceTokenVendorAccessAccountsLabel}
+                    options={sharedVendorAccounts.map((acc) => ({
+                      value: acc.id,
+                      label: vendorAccountOptionLabel(acc, t),
+                    }))}
+                    selected={tokenVaEntries.map((entry) => entry.accountId)}
+                    onToggle={(accountId) =>
+                      setTokenVaEntries((current) => toggleVendorAccessEntry(current, accountId))
+                    }
+                  />
+                )}
+                <VendorAccessEntryGroups
+                  items={sharedVendorAccounts.flatMap((acc) => {
+                    const entry = tokenVaEntries.find((e) => e.accountId === acc.id);
+                    return entry
+                      ? [{ id: acc.id, label: vendorAccountOptionLabel(acc, t), entry }]
+                      : [];
+                  })}
+                  idPrefix="service-token-va"
+                  onChange={(accountId, patch) =>
+                    setTokenVaEntries((current) =>
+                      patchVendorAccessEntry(current, accountId, patch),
+                    )
+                  }
+                  t={t}
+                />
+              </Box>
+            )}
             <FormControlLabel
               control={
                 <Checkbox
@@ -476,7 +604,7 @@ export function ServiceTokensSection({
             <Button
               type="submit"
               variant="contained"
-              disabled={tokenBusy || tokenOverrideRowsInvalid}
+              disabled={tokenBusy || tokenOverrideRowsInvalid || tokenVendorAccessInvalid}
             >
               {t.serviceTokenCreate}
             </Button>
@@ -497,7 +625,11 @@ export function ServiceTokensSection({
       <ConfirmDialog
         open={confirmingTokenRotateId !== ''}
         title={t.tokenRotateConfirmTitle}
-        body={t.tokenRotateConfirmBody}
+        body={
+          vendorAccountsEnabled
+            ? `${t.tokenRotateConfirmBody} ${t.serviceTokenRotateKeepsVendorAccess}`
+            : t.tokenRotateConfirmBody
+        }
         confirmLabel={t.tokenRotateConfirm}
         cancelLabel={t.cancel}
         onConfirm={() => void rotateToken(confirmingTokenRotateId)}
